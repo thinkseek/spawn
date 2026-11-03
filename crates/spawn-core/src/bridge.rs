@@ -693,8 +693,13 @@ impl Bridge {
 
 /// Hook settings passed to Claude Code.
 ///
-/// `--settings` takes inline JSON. The hook command is an absolute path, so a
-/// `PATH` change inside the sandbox cannot break event capture.
+/// `--settings` takes inline JSON, and that JSON replaces the user's settings
+/// file for the session. The permission keys must therefore be repeated here:
+/// without them the engine stops on a startup dialog and never reads the
+/// prompt the Bridge types into the pane.
+///
+/// The hook command is an absolute path, so a `PATH` change inside the sandbox
+/// cannot break event capture.
 pub fn claude_settings(spawn_program: &str) -> String {
     let command = format!("{} hook", shell_quote(spawn_program));
     let entry = json!([{ "hooks": [{ "type": "command", "command": command }] }]);
@@ -711,7 +716,15 @@ pub fn claude_settings(spawn_program: &str) -> String {
     for event in events {
         hooks.insert(event.to_string(), entry.clone());
     }
-    json!({ "hooks": hooks }).to_string()
+    // `--settings` replaces the user settings file for this session, so the
+    // first-run prompts have to be silenced here. A prompt in the pane blocks
+    // the Bridge, which types the task prompt next and never answers it.
+    json!({
+        "permissions": { "defaultMode": "bypassPermissions" },
+        "skipDangerousModePermissionPrompt": true,
+        "hooks": hooks,
+    })
+    .to_string()
 }
 
 /// Claude arguments. The prompt is typed into the pane, never passed here.
