@@ -99,7 +99,8 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "tick" => cmd_tick(&Flags::parse(&rest)?),
         "loop" => cmd_loop(&Flags::parse(&rest)?),
         "serve" => serve::serve(&Flags::parse(&rest)?),
-        "evolve" => evolve::evolve(&Flags::parse(&rest)?),
+        "evolve" => evolve::evolve(&Flags::parse(&rest)?)
+            .map(|code| if code == evolve::IDLE { 0 } else { code }),
         "rsi-loop" => cmd_rsi_loop(&Flags::parse(&rest)?),
         "status" => cmd_status(&Flags::parse(&rest)?),
         "fleet" => cmd_fleet(),
@@ -364,6 +365,12 @@ fn cmd_rsi_loop(flags: &Flags) -> Result<i32, String> {
             Ok(2) => {
                 eprintln!("spawn rsi-loop: RSI halted; a person must clear it");
                 return Ok(2);
+            }
+            // Nothing to do until the backlog changes; look again in a minute.
+            Ok(evolve::IDLE) => {
+                failures = 0;
+                std::thread::sleep(std::time::Duration::from_mins(1));
+                continue;
             }
             Ok(_) => failures = 0,
             Err(error) => {
