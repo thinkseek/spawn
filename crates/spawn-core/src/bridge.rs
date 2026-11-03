@@ -49,6 +49,9 @@ pub struct BridgeConfig {
     /// Extra environment for the engine process, for example the database
     /// URL that the hook and the runner need.
     pub environment: Vec<(String, String)>,
+    /// Environment that replaces entries of `environment` for one session,
+    /// for example a different database login for the supervisor.
+    pub session_environment: Vec<(String, Vec<(String, String)>)>,
     /// Worker name recorded in the lease.
     pub worker: String,
     /// Lease duration of one command.
@@ -69,6 +72,7 @@ impl BridgeConfig {
             claude_program: "claude".to_string(),
             codex_program: "codex".to_string(),
             environment: Vec::new(),
+            session_environment: Vec::new(),
             worker: worker.to_string(),
             lease_ttl: Duration::from_mins(2),
             max_commands_per_tick: 16,
@@ -537,6 +541,15 @@ impl Bridge {
             Engine::Codex => codex_arguments(native, prompt),
         });
         let mut environment = self.config.environment.clone();
+        for (session, overrides) in &self.config.session_environment {
+            if session != claimed.session_id.as_str() {
+                continue;
+            }
+            for (name, value) in overrides {
+                environment.retain(|(known, _)| known != name);
+                environment.push((name.clone(), value.clone()));
+            }
+        }
         environment.push(("SPAWN_AGENT_ID".to_string(), claimed.agent_id.to_string()));
         environment.push((
             "SPAWN_SESSION_ID".to_string(),
