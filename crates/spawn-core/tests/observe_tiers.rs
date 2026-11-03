@@ -526,3 +526,44 @@ fn a_tie_goes_to_the_rules_guess() {
     let (state, _) = narrow(Ambiguity::ExitedOnItsOwn, SemanticState::Completed, &tie);
     assert_eq!(state, SemanticState::Completed);
 }
+
+#[test]
+fn a_restarted_observer_corrects_a_stale_row() {
+    // A row an older build wrote: WAITING for a session the Bridge stopped.
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Stopped,
+            exit_code: None,
+        },
+    );
+    append(
+        &fixture.store,
+        Source::Observer,
+        EventKind::ObservationRecorded {
+            observation: Observation::basic(
+                SemanticState::Waiting,
+                None,
+                spawn_core::event::SessionSeq(2),
+                confidence(0.6),
+                "jev",
+            ),
+        },
+    );
+    let log: Arc<dyn EventLog> = fixture.store.clone();
+    let mut fresh = Observer::new(log, judge.clone()).with_clock(fixture.clock.clone());
+    assert_eq!(fresh.tick().expect("tick"), 1);
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Completed);
+    assert_eq!(last.judge, "rules");
+    assert_eq!(judge.calls(), 0);
+
+    // And a second restart writes nothing.
+    let log: Arc<dyn EventLog> = fixture.store.clone();
+    let mut again = Observer::new(log, judge).with_clock(fixture.clock.clone());
+    assert_eq!(again.tick().expect("tick"), 0);
+}

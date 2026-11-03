@@ -78,15 +78,21 @@ fn handle(request: Request, web: &Path) -> Result<(), String> {
     let answer = match path {
         "/api/overview" => overview(),
         "/api/rsi" => rsi_overview(),
-        "/api/rsi/pane" => rsi_pane(),
-        _ => match (
-            path.strip_prefix("/api/session/"),
-            path.strip_prefix("/api/rsi/iteration/"),
-        ) {
-            (Some(id), _) => session(id, query),
-            (_, Some(number)) => rsi_iteration(number),
-            _ => return static_file(request, web, path),
-        },
+        "/api/rsi/pane" => pane(RSI_SESSION),
+        "/api/fleet" => fleet(),
+        _ => {
+            if let Some(id) = path.strip_prefix("/api/session/") {
+                session(id, query)
+            } else if let Some(number) = path.strip_prefix("/api/rsi/iteration/") {
+                rsi_iteration(number)
+            } else if let Some(id) = path.strip_prefix("/api/pane/") {
+                pane(id)
+            } else if let Some(rest) = path.strip_prefix("/api/fleet/") {
+                fleet_session(rest, query)
+            } else {
+                return static_file(request, web, path);
+            }
+        }
     };
     let (status, body) = match answer {
         Ok(body) => (200, body),
@@ -318,21 +324,57 @@ fn rsi_iteration(number: &str) -> Result<Value, String> {
     Ok(body)
 }
 
-/// The tail of the RSI agent's terminal, read from tmux. Capturing a pane
-/// changes nothing, so the API stays read-only.
-fn rsi_pane() -> Result<Value, String> {
+/// The fleet board: every session with its judgement and activity, plus
+/// fleet health and the decision ladder. Computed by SQL from storage.
+fn fleet() -> Result<Value, String> {
     let store = open_store()?;
-    let session = SessionId::new(RSI_SESSION).map_err(err)?;
+    Ok(json!({
+        "agents": store.fleet_board().map_err(err)?,
+        "health": store.fleet_health().map_err(err)?,
+    }))
+}
+
+/// `/api/fleet/<session>/judgements` and `/api/fleet/<session>/commands`.
+fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
+    let (id, what) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("unknown fleet path {rest}"))?;
+    let session = SessionId::new(id).map_err(err)?;
+    let limit = parameter(query, "limit")
+        .and_then(|text| text.parse::<u32>().ok())
+        .unwrap_or(50)
+        .min(500);
+    let store = open_store()?;
+    match what {
+        "judgements" => store.judgements_json(session.as_str(), limit).map_err(err),
+        "commands" => store.commands_json(session.as_str(), limit).map_err(err),
+        other => Err(format!("unknown fleet view {other}")),
+    }
+}
+
+/// The tail of a session's terminal, read from tmux: a live peek at compute,
+/// not storage. Capturing a pane changes nothing, so the API stays read-only.
+fn pane(id: &str) -> Result<Value, String> {
+    let store = open_store()?;
+    let session = SessionId::new(id).map_err(err)?;
     let latest = store.executions(&session).map_err(err)?.into_iter().next();
     let Some(execution) = latest else {
         return Ok(
             json!({ "live": false, "terminal": null, "captured_at_ms": now_ms(), "text": "" }),
         );
     };
+    let Some(agent) = store
+        .state(&session)
+        .map_err(err)?
+        .map(|state| state.agent_id.to_string())
+        .or_else(|| (id == RSI_SESSION).then(|| RSI_AGENT.to_string()))
+    else {
+        return Err(format!("{id} has no owner"));
+    };
     let live = execution.ended_at.is_none();
     let terminal = TerminalName::for_execution(&execution.execution_id);
     let root = env_or("SPAWN_WORKSPACE_ROOT", "/tmp");
-    let workspace = WorkspaceId::new(format!("{RSI_AGENT}:{root}/{RSI_AGENT}")).map_err(err)?;
+    let workspace = WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(err)?;
     let program = env_or("SPAWN_TMUX_PROGRAM", "tmux");
     let socket = env_value("SPAWN_TMUX_SOCKET");
     let host = match env_value("SPAWN_EXEC_IMAGE") {

@@ -680,8 +680,13 @@ impl Observer {
                 // an observation is ignored.
                 if record.event.source == Source::Observer {
                     if let EventKind::ObservationRecorded { observation } = &record.event.kind {
+                        // `judged_seq` is not restored: a new process checks
+                        // every session once. A rules case costs nothing and
+                        // writes only if the state changed; a model case is
+                        // skipped by its fingerprint. A row from an older
+                        // build that the current rules disagree with is thus
+                        // corrected instead of trusted forever.
                         tracked.last = Some(key_of(observation));
-                        tracked.judged_seq = observation.based_on_seq;
                         tracked.judged_at = Some(record.recorded_at);
                         // The live process also reads back its own rows, so
                         // this records that the judge failed, not how often.
