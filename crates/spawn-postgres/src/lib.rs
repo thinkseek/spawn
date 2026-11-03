@@ -104,11 +104,18 @@ impl PostgresStore {
 /// append engine events.
 #[must_use]
 pub fn terminal_url(controller: &str) -> String {
+    role_url(controller, "spawn_terminal")
+}
+
+/// The controller URL with its credentials replaced by one of the schema's
+/// fixed-password roles (`spawn_terminal`, `spawn_supervisor`). The boundary
+/// is the role's privileges, not the password.
+pub fn role_url(controller: &str, role: &str) -> String {
     let Some((scheme, rest)) = controller.split_once("://") else {
         return controller.to_string();
     };
     let host = rest.split_once('@').map_or(rest, |(_, tail)| tail);
-    format!("{scheme}://spawn_terminal:spawn_terminal@{host}")
+    format!("{scheme}://{role}:{role}@{host}")
 }
 
 fn record_from_row(row: &Row) -> Result<EventRecord, StoreError> {
@@ -330,6 +337,29 @@ pub struct TimelineEntry {
     pub recorded_at: Timestamp,
 }
 
+/// What the supervisor's liveness rule knows about its session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessFacts {
+    /// A command for the session is pending or leased.
+    pub open_command: bool,
+    /// Newest execution.
+    pub execution_id: Option<String>,
+    /// The newest execution has not ended.
+    pub live: bool,
+    /// How the newest execution ended.
+    pub cause: Option<String>,
+    /// Principal of the newest command.
+    pub last_principal: Option<String>,
+    /// Action type of the newest command.
+    pub last_kind: Option<String>,
+    /// The engine reported a native session at least once.
+    pub native_bound: bool,
+    /// Failed revivals since the newest execution started.
+    pub failures: u32,
+    /// When the latest failed revival finished.
+    pub last_failure_ms: Option<i64>,
+}
+
 /// One execution, from `agent_executions`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionRow {
@@ -483,6 +513,166 @@ impl PostgresStore {
     }
 
     /// Executions of one session, newest first.
+    /// Facts the supervisor's liveness rule decides from, all from storage.
+    pub fn liveness_facts(
+        &self,
+        session: &SessionId,
+        reviver: &str,
+    ) -> Result<LivenessFacts, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_one(
+                "with last_exec as (
+                    select e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause
+                      from agent_executions e
+                     where e.session_id = $1
+                     order by e.started_at_ms desc, e.execution_id desc limit 1
+                 ), last_cmd as (
+                    select c.principal, c.action ->> 'type' as kind
+                      from spawn_commands c where c.session_id = $1
+                     order by c.id desc limit 1
+                 )
+                 select
+                    exists (select 1 from spawn_commands c
+                             where c.session_id = $1 and c.state <> 'finished') as open_command,
+                    (select execution_id from last_exec) as execution_id,
+                    coalesce((select ended_at_ms is null from last_exec), false) as live,
+                    (select cause from last_exec) as cause,
+                    (select principal from last_cmd) as last_principal,
+                    (select kind from last_cmd) as last_kind,
+                    exists (select 1 from spawn_events e
+                             where e.session_id = $1
+                               and e.event_name = 'session.native_started') as native_bound,
+                    (select count(*) from spawn_commands c
+                      where c.session_id = $1 and c.principal = $2 and c.succeeded = false
+                        and c.created_at_ms > coalesce((select started_at_ms from last_exec), 0)
+                    ) as failures,
+                    (select max(c.finished_at_ms) from spawn_commands c
+                      where c.session_id = $1 and c.principal = $2 and c.succeeded = false
+                    ) as last_failure_ms",
+                &[&session.as_str(), &reviver],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(LivenessFacts {
+            open_command: row.get("open_command"),
+            execution_id: row.get("execution_id"),
+            live: row.get("live"),
+            cause: row.get("cause"),
+            last_principal: row.get("last_principal"),
+            last_kind: row.get("last_kind"),
+            native_bound: row.get("native_bound"),
+            failures: u32::try_from(row.get::<_, i64>("failures")).unwrap_or(u32::MAX),
+            last_failure_ms: row.get("last_failure_ms"),
+        })
+    }
+
+    /// Commands one principal submitted, newest first, as JSON.
+    pub fn commands_by(
+        &self,
+        principal: &str,
+        limit: i64,
+    ) -> Result<serde_json::Value, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_one(
+                "select coalesce(jsonb_agg(c order by c.id desc), '[]'::jsonb) as commands
+                   from (select id, agent_id, session_id, action, state, succeeded, error, created_at_ms
+                           from spawn_commands where principal = $1
+                          order by id desc limit $2) c",
+                &[&principal, &limit],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.get("commands"))
+    }
+
+    /// The fleet as one JSON array, read through the grant-filtered
+    /// `spawn_read_*` functions, so it shows exactly what the caller's login
+    /// may see.
+    pub fn fleet_json(&self) -> Result<serde_json::Value, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_one(
+                "select coalesce(jsonb_agg(row_to_json(f) order by f.session_id), '[]'::jsonb) as fleet
+                   from (
+                     select s.session_id, s.agent_id, s.state, s.live, s.engine,
+                            s.started_at_ms, s.ended_at_ms, s.last_event_at_ms,
+                            st.observation ->> 'judge' as judge,
+                            (st.observation ->> 'confidence')::float8 as confidence,
+                            coalesce((st.observation ->> 'attention')::boolean, false) as attention,
+                            (st.observation ->> 'needs_human')::float8 as needs_human,
+                            (st.observation ->> 'stuck')::float8 as stuck,
+                            st.observation ->> 'ambiguity' as ambiguity,
+                            (select left(t.prompt, 300) from spawn_read_tasks() t
+                              where t.session_id = s.session_id and t.prompt is not null
+                              order by t.command_id desc limit 1) as task
+                       from spawn_read_status() s
+                       left join spawn_read_state() st using (session_id)
+                   ) f",
+                &[],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.get("fleet"))
+    }
+
+    /// One session's latest judgement (with the screen the judge saw) and
+    /// its newest events, through the grant-filtered readers.
+    pub fn tail_json(
+        &self,
+        session: &SessionId,
+        events: i64,
+    ) -> Result<serde_json::Value, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_one(
+                "select jsonb_build_object(
+                    'session_id', $1::text,
+                    'judgement', (select j.observation from spawn_read_judgements($1) j
+                                   order by j.session_seq desc limit 1),
+                    'events', coalesce((select jsonb_agg(e order by e.session_seq)
+                                 from (select t.session_seq, t.source, t.event_name, t.detail, t.recorded_at_ms
+                                         from spawn_read_timeline($1) t
+                                        order by t.session_seq desc limit $2) e), '[]'::jsonb)
+                 ) as tail",
+                &[&session.as_str(), &events],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.get("tail"))
+    }
+
+    /// Submit through the `agent_commands` gateway. The principal is the
+    /// database login, checked against `spawn_grants`; the caller cannot name
+    /// another one.
+    pub fn submit_via_gateway(&self, submission: &Submission) -> Result<CommandId, StoreError> {
+        let action = serde_json::to_value(&submission.action)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let mut client = self.lock();
+        // No RETURNING: that needs SELECT on the view, which a restricted
+        // login does not hold. The id is read back through the grant-filtered
+        // reader instead.
+        client
+            .execute(
+                "insert into agent_commands (agent_id, session_id, idempotency_key, action)
+                 values ($1, $2, $3, $4)",
+                &[
+                    &submission.agent_id.as_str(),
+                    &submission.session_id.as_str(),
+                    &submission.idempotency_key.as_str(),
+                    &action,
+                ],
+            )
+            .map_err(|error| backend(&error))?;
+        let row = client
+            .query_opt(
+                "select command_id from spawn_read_tasks()
+                  where session_id = $1 order by command_id desc limit 1",
+                &[&submission.session_id.as_str()],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(CommandId(row.map_or(0, |row| {
+            row.get::<_, i64>("command_id").unsigned_abs()
+        })))
+    }
+
     /// The latest task typed into a session: the prompt of its newest start,
     /// resume or input command.
     pub fn latest_task(&self, session: &SessionId) -> Result<Option<String>, StoreError> {

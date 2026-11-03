@@ -34,6 +34,7 @@ use spawn_postgres::PostgresStore;
 mod context;
 mod evolve;
 mod serve;
+mod supervise;
 mod trace;
 use trace::Timed;
 
@@ -87,7 +88,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         return Err(
-            "usage: spawn <init-db|submit|tick|loop|evolve|serve|status|hook|run|version>"
+            "usage: spawn <init-db|submit|tick|loop|evolve|serve|status|fleet|tail|hook|run|version>"
                 .to_string(),
         );
     };
@@ -100,6 +101,8 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "serve" => serve::serve(&Flags::parse(&rest)?),
         "evolve" => evolve::evolve(&Flags::parse(&rest)?),
         "status" => cmd_status(&Flags::parse(&rest)?),
+        "fleet" => cmd_fleet(),
+        "tail" => cmd_tail(&Flags::parse(&rest)?),
         "hook" => cmd_hook(),
         "run" => cmd_run(&rest),
         "version" => cmd_version(&rest),
@@ -158,8 +161,14 @@ fn cmd_submit(flags: &Flags) -> Result<i32, String> {
         idempotency_key: key,
         action,
     };
-    let id = trace::time("queue.submit", || store.submit(&principal, &submission))
-        .map_err(|error| error.to_string())?;
+    // A restricted login (the supervisor's terminal) submits through the
+    // gateway, which takes the principal from the login and checks grants.
+    let id = if env_value("SPAWN_GATEWAY").is_some() {
+        trace::time("queue.submit", || store.submit_via_gateway(&submission))
+    } else {
+        trace::time("queue.submit", || store.submit(&principal, &submission))
+    }
+    .map_err(|error| error.to_string())?;
     println!("command={}", id.0);
     Ok(0)
 }
@@ -217,6 +226,18 @@ fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     config.environment.push((
         "SPAWN_DATABASE_URL".to_string(),
         spawn_postgres::terminal_url(&required_env("SPAWN_DATABASE_URL")?),
+    ));
+    // The supervisor's pane gets its own login: it reads the fleet and
+    // commands workers through the gateway, nothing more.
+    config.session_environment.push((
+        supervise::SUPERVISOR_SESSION.to_string(),
+        vec![
+            (
+                "SPAWN_DATABASE_URL".to_string(),
+                spawn_postgres::role_url(&required_env("SPAWN_DATABASE_URL")?, "spawn_supervisor"),
+            ),
+            ("SPAWN_GATEWAY".to_string(), "1".to_string()),
+        ],
     ));
 
     let mut log: Arc<dyn EventLog> = store.clone();
@@ -308,6 +329,16 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
         if let Err(error) = observer.tick() {
             eprintln!("spawn loop: observer: {error}");
         }
+        if env_value("SPAWN_SUPERVISOR").is_some() {
+            match supervise::keep_alive() {
+                Ok(Some(line)) => println!("{line}"),
+                Ok(None) => {}
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    eprintln!("spawn loop: supervise: {error}");
+                }
+            }
+        }
         match evolve::evolve(flags) {
             Ok(2) => {
                 eprintln!("spawn loop: RSI halted after repeated rejections");
@@ -324,6 +355,36 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
         let pause = interval.saturating_mul(failures.clamp(1, 30));
         std::thread::sleep(pause);
     }
+}
+
+/// The fleet as JSON: one object per session the login may read.
+fn cmd_fleet() -> Result<i32, String> {
+    let store = open_store()?;
+    let fleet = store.fleet_json().map_err(|error| error.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&fleet).unwrap_or_else(|_| "[]".to_string())
+    );
+    Ok(0)
+}
+
+/// One session's latest judgement and newest events as JSON.
+fn cmd_tail(flags: &Flags) -> Result<i32, String> {
+    let store = open_store()?;
+    let session = SessionId::new(flags.required("session")?).map_err(|error| error.to_string())?;
+    let events = flags
+        .get("events")
+        .and_then(|text| text.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 200);
+    let tail = store
+        .tail_json(&session, events)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&tail).unwrap_or_else(|_| "{}".to_string())
+    );
+    Ok(0)
 }
 
 fn cmd_status(_flags: &Flags) -> Result<i32, String> {
