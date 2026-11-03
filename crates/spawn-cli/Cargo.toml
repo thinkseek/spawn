@@ -1,0 +1,23 @@
+[package]
+name = "spawn-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spawn"
+path = "src/main.rs"
+
+[dependencies]
+spawn-types = { path = "../spawn-types" }
+spawn-store = { path = "../spawn-store" }
+spawn-store-postgres = { path = "../spawn-store-postgres" }
+spawn-engine = { path = "../spawn-engine" }
+spawn-observer = { path = "../spawn-observer" }
+spawn-judge-jev = { path = "../spawn-judge-jev" }
+spawn-projector = { path = "../spawn-projector" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
