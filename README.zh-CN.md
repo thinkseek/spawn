@@ -5,7 +5,7 @@
 Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
 
 - 调用方向 PostgreSQL 中的队列提交命令（start、input、resume、stop）。
-- `spawn tick` 领取命令，fork 一个 LayerFS 分支，mount 工作区，在 tmux 会话中启动引擎。
+- `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 tmux 会话中启动引擎。
 - Claude Code hooks、Codex JSON 输出与终端屏尾转为日志中的类型化事件。
 - Observer 判定每个会话的状态（可输入、运行中、阻塞、失败），并把结论作为事件写回。
 
@@ -18,7 +18,8 @@ Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它
 | Rust | 1.95 及以上 | 编译 |
 | PostgreSQL | 16 及以上 | 事件日志、命令队列、视图 |
 | tmux | 3.x | 终端 |
-| LayerFS CLI | `PATH` 中的 `layerfs` | 分支与工作区 |
+| git | 2.30 及以上 | 分支与工作区 |
+| docker | 可选 | 设置 `SPAWN_EXEC_IMAGE` 时在容器内运行引擎 |
 | Claude Code 和/或 Codex CLI | 当前版本 | 引擎 |
 
 ## 安装
@@ -47,7 +48,7 @@ spawn submit --agent agent_demo --session session_demo --key demo-1 --action '{"
 运行一轮 Bridge 与 Observer：
 
 ```bash
-spawn tick --project shop
+spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws
 ```
 
 打印每个会话的最新判定：
@@ -64,7 +65,7 @@ spawn status
 | --- | --- |
 | `init-db` | 安装或更新 SQL schema，可重复执行 |
 | `submit` | 向队列写一条命令。参数：`--agent`、`--session`、`--key`、`--action`、`--principal`（默认 `spawn`） |
-| `tick` | 领取并执行排队命令，推进活跃执行，记录判定。参数：`--project`、`--judge-url` |
+| `tick` | 领取并执行排队命令，推进活跃执行，记录判定。参数：`--repo`、`--root`、`--judge-url` |
 | `status` | 打印每个会话的最新判定 |
 | `hook` | 从标准输入读取一条 Claude Code hook 载荷。由 Spawn 配置，无需手动调用 |
 | `run` | 在终端内运行引擎并记录退出。由 Spawn 配置，无需手动调用 |
@@ -83,12 +84,13 @@ spawn status
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | 必填 | PostgreSQL 连接串 |
-| `SPAWN_PROJECT` | 无 | LayerFS 项目，未传 `--project` 时使用 |
+| `SPAWN_GIT_REPO` | 必填 | 存放基线 commit 的裸仓库 |
+| `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_WORKER` | `spawn-worker` | 领取命令时记录的 worker 名 |
-| `SPAWN_LAYERFS_PROGRAM` | `layerfs` | LayerFS CLI 路径 |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 路径 |
 | `SPAWN_TMUX_SOCKET` | 默认 socket | tmux `-L` socket 名 |
-| `SPAWN_TMUX_IN_WORKSPACE` | 未设置 | 设置后 tmux 经 `layerfs workspace exec` 运行 |
+| `SPAWN_EXEC_IMAGE` | 未设置 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
+| `SPAWN_DOCKER_PROGRAM` | `docker` | docker 路径 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
 | `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI 路径 |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
@@ -103,7 +105,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据库，缺失时测试失败而非跳过。`scripts/e2e-smoke.sh` 用真实 PostgreSQL 与 tmux 跑端到端流程。`scripts/remote-gate.sh` 在远端主机上运行全部检查。
+PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据库，缺失时测试失败而非跳过。`scripts/e2e-smoke.sh` 用真实 PostgreSQL 与 tmux 跑端到端流程。`scripts/run-gate-on-remote.sh` 在远端主机上运行全部检查。
 
 ## 文档
 

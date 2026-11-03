@@ -8,10 +8,10 @@
 //!
 //! - local: tmux runs on the same machine, and the engine starts in that
 //!   terminal.
-//! - in workspace: tmux runs inside the sandbox, so every tmux call is
-//!   wrapped by the LayerFS `workspace exec` prefix of the terminal's
-//!   workspace. Every port call names the workspace, so the host keeps no
-//!   state and works the same in a new process.
+//! - in workspace: tmux runs inside the execution's container, so every tmux
+//!   call is wrapped by a `docker exec` prefix. Every port call names the
+//!   workspace, so the host keeps no state and works the same in a new
+//!   process.
 
 use std::process::Command;
 use std::sync::Arc;
@@ -134,6 +134,8 @@ impl TerminalHost for TmuxHost {
             WIDTH.to_string(),
             "-y".to_string(),
             HEIGHT.to_string(),
+            "-c".to_string(),
+            launch.cwd.clone(),
         ];
         for (key, value) in &launch.environment {
             arguments.push("-e".to_string());
@@ -165,35 +167,51 @@ impl TerminalHost for TmuxHost {
     ) -> Result<(), TerminalError> {
         let prefix = self.prefix(workspace);
         let target = Self::pane(terminal);
-        for line in text.lines() {
-            let literal = vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                target.clone(),
-                "-l".to_string(),
-                "--".to_string(),
-                line.to_string(),
-            ];
-            let run = self.run(&prefix, &literal)?;
-            if run.code != Some(0) {
-                return Err(TerminalError(format!(
-                    "send-keys failed: {}",
-                    run.stderr.trim()
-                )));
-            }
-            let enter = vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                target.clone(),
-                "Enter".to_string(),
-            ];
-            let run = self.run(&prefix, &enter)?;
-            if run.code != Some(0) {
-                return Err(TerminalError(format!(
-                    "send-keys Enter failed: {}",
-                    run.stderr.trim()
-                )));
-            }
+        // One bracketed paste, then one Enter. Typing a line and pressing
+        // Enter per line would submit a multi-paragraph prompt in pieces.
+        let buffer = format!("spawn-{}", terminal.as_str());
+        let set = vec![
+            "set-buffer".to_string(),
+            "-b".to_string(),
+            buffer.clone(),
+            "--".to_string(),
+            text.to_string(),
+        ];
+        let run = self.run(&prefix, &set)?;
+        if run.code != Some(0) {
+            return Err(TerminalError(format!(
+                "set-buffer failed: {}",
+                run.stderr.trim()
+            )));
+        }
+        let paste = vec![
+            "paste-buffer".to_string(),
+            "-p".to_string(),
+            "-d".to_string(),
+            "-b".to_string(),
+            buffer,
+            "-t".to_string(),
+            target.clone(),
+        ];
+        let run = self.run(&prefix, &paste)?;
+        if run.code != Some(0) {
+            return Err(TerminalError(format!(
+                "paste-buffer failed: {}",
+                run.stderr.trim()
+            )));
+        }
+        let enter = vec![
+            "send-keys".to_string(),
+            "-t".to_string(),
+            target,
+            "Enter".to_string(),
+        ];
+        let run = self.run(&prefix, &enter)?;
+        if run.code != Some(0) {
+            return Err(TerminalError(format!(
+                "send-keys Enter failed: {}",
+                run.stderr.trim()
+            )));
         }
         Ok(())
     }

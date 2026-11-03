@@ -88,7 +88,7 @@ struct Active {
     /// A tool or turn finished after the last commit.
     // ponytail: an `Unchanged` commit writes no event, so after a refold an
     // idle session repeats one no-op commit per tick; record attempts if
-    // LayerFS calls get expensive.
+    // Workspace calls get expensive.
     checkpoint: Option<CheckpointReason>,
     /// The runner reported the engine exit; cleanup is still due.
     reported_end: Option<(EndCause, Option<i32>)>,
@@ -374,7 +374,7 @@ impl Bridge {
                     agent_id,
                     session,
                     Some(&active.execution_id),
-                    Source::Layerfs,
+                    Source::Bridge,
                     Some(format!("commit:{}", artifact.commit)),
                     EventKind::ArtifactCommitted { reason, artifact },
                 )?;
@@ -550,6 +550,7 @@ impl Bridge {
         Launch {
             terminal: active.terminal.clone(),
             workspace: active.workspace.clone(),
+            cwd: active.workspace.path().to_string(),
             program: self.config.spawn_program.clone(),
             arguments,
             environment,
@@ -715,8 +716,11 @@ pub fn claude_settings(spawn_program: &str) -> String {
 
 /// Claude arguments. The prompt is typed into the pane, never passed here.
 pub fn claude_arguments(spawn_program: &str, native: Option<&str>) -> Vec<String> {
+    // The engine runs in a container with no credentials of its own, so the
+    // permission prompts have nowhere to go. The sandbox is the boundary.
     let mut arguments = vec![
         "--ax-screen-reader".to_string(),
+        "--allow-dangerously-skip-permissions".to_string(),
         "--settings".to_string(),
         claude_settings(spawn_program),
     ];

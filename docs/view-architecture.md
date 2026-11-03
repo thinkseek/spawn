@@ -14,7 +14,7 @@
 | 端口定义 | [port.rs:39](../crates/spawn-core/src/port.rs#L39) 起 | `EventLog`、`CommandQueue`、`WorkspaceStore`、`TerminalHost` |
 | 一致性套件 | [contract.rs:36](../crates/spawn-core/src/contract.rs#L36) 起 | 四个写端口的共用断言，内存实现与 PG 实现都跑 |
 | 查询子命令 | [main.rs:224](../crates/spawn-cli/src/main.rs#L224) | `status` 目前分页扫描全部原始事件 |
-| 门禁 | [remote-gate.sh](../scripts/remote-gate.sh)（同步后在 digest 上跑 [gate-on-digest.sh](../scripts/gate-on-digest.sh)）、[e2e-smoke.sh](../scripts/e2e-smoke.sh) | fmt、clippy、测试、黑盒 |
+| 门禁 | [run-gate-on-remote.sh](../scripts/run-gate-on-remote.sh)（同步后在 digest 上跑 [run-gate.sh](../scripts/run-gate.sh)）、[e2e-smoke.sh](../scripts/e2e-smoke.sh) | fmt、clippy、测试、黑盒 |
 | 现有测试 | [spawn-postgres/tests/api.rs](../crates/spawn-postgres/tests/api.rs)、[spawn-core/tests/api.rs](../crates/spawn-core/tests/api.rs) | 断言落点 |
 | 事件与 SQL 口径 | [design.md 第 9 节](./design.md) | 表、函数、视图的现有描述 |
 | 架构总览 | [architecture.md 第 3、6 节](./architecture.md) | 运行链路与接口表 |
@@ -127,7 +127,7 @@ Observer 只在结论变化时写 `observation.recorded`。因此 `agent_state.b
 | 四态覆盖 | `spawn_finish` 的 `done`、`already`、`stale`、`missing` 各一条 | 同上 |
 | 授权用例 | 无 grant 读函数报 `42501`，有 grant 只返回本 agent 的行 | 同上 |
 | 计划检查 | 万级事件上 `explain` `agent_state`。现有索引是 `(session_id, event_name, id)`，跨会话查询用不上前缀；按需加部分索引 `on (session_id, session_seq desc) where event_name = 'observation.recorded'` | 门禁一次性检查 |
-| 全量门禁 | `bash scripts/remote-gate.sh` | 每轮必跑 |
+| 全量门禁 | `bash scripts/run-gate-on-remote.sh` | 每轮必跑 |
 
 现有覆盖：全部视图与六个读方法、列集快照、投影与日志折叠逐行相等（含守卫与回填）、`spawn_finish` 四态、`agent_commands` 无授权被拒与有授权写入、非 owner 直查视图报 `42501`、读函数无授权为空与按 agent 过滤。
 

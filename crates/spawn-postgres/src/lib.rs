@@ -16,6 +16,9 @@ use spawn_core::observation::Observation;
 use spawn_core::port::{CommandQueue, EventLog, StoreError};
 use spawn_core::time::Timestamp;
 
+mod rsi;
+pub use rsi::{RSI_AGENT, RSI_SESSION, RsiCommand, RsiIteration, RsiState};
+
 /// Schema installed by [`PostgresStore::migrate`].
 const SCHEMA: &str = include_str!("../sql/schema.sql");
 

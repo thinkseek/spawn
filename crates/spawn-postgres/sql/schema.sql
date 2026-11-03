@@ -622,3 +622,46 @@ begin
     end loop;
 end
 $$;
+
+-- RSI controller state.
+--
+-- These tables are not events: EventKind is a closed serde enum, and an
+-- unknown event name makes the next tick fail with a corrupt row. The
+-- controller therefore keeps its own state here and never writes rsi.* to
+-- spawn_events.
+create table if not exists rsi_state (
+    id                   integer primary key check (id = 1),
+    baseline_commit      text   not null,
+    iteration            integer not null default 0,
+    consecutive_rejected integer not null default 0
+);
+
+-- One iteration of the loop. `phase` drives the controller.
+create table if not exists rsi_iterations (
+    iteration     integer primary key,
+    task_id       integer not null,
+    phase         text    not null,
+    agent_id      text    not null,
+    session_id    text    not null,
+    command_id    bigint,
+    patch         text,
+    candidate     text,
+    note          text,
+    updated_at_ms bigint  not null
+);
+
+create index if not exists rsi_iterations_phase on rsi_iterations (phase);
+
+-- Every attempt at a task, successful or not. The controller feeds the
+-- failures back into the next prompt.
+create table if not exists rsi_attempts (
+    task_id       integer not null,
+    attempt       integer not null,
+    iteration     integer not null,
+    diff          text,
+    gate_log      text,
+    classifier    text,
+    accept_ok     boolean,
+    created_at_ms bigint  not null,
+    primary key (task_id, attempt)
+);

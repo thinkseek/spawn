@@ -89,19 +89,19 @@ impl<T: WorkspaceStore + ?Sized> WorkspaceStore for Timed<T> {
     }
 
     fn ensure_branch(&self, branch: &BranchName) -> Result<(), WorkspaceError> {
-        time("layerfs.ensure_branch", || self.0.ensure_branch(branch))
+        time("git.ensure_branch", || self.0.ensure_branch(branch))
     }
 
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
-        time("layerfs.mount", || self.0.mount(branch))
+        time("git.mount", || self.0.mount(branch))
     }
 
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
-        time("layerfs.commit", || self.0.commit(workspace, message))
+        time("git.commit", || self.0.commit(workspace, message))
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
-        time("layerfs.unmount", || self.0.unmount(workspace))
+        time("git.unmount", || self.0.unmount(workspace))
     }
 }
 

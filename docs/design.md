@@ -1,6 +1,6 @@
 # Spawn 技术方案与接口契约
 
-结论：Spawn 用 5 个 crate 连接现成组件。`spawn-core` 不碰 IO，只定义类型、端口与编排逻辑；实现层分别是 PostgreSQL、HTTP 判定、tmux 与 LayerFS 子进程；`spawn-cli` 做装配。全部代码同步阻塞。本文给出 crate 边界、ADT、端口契约、SQL 对象与验收口径，代码按本文实现。
+结论：Spawn 用 5 个 crate 连接现成组件。`spawn-core` 不碰 IO，只定义类型、端口与编排逻辑；实现层分别是 PostgreSQL、HTTP 判定、tmux 与 git 子进程；`spawn-cli` 做装配。全部代码同步阻塞。本文给出 crate 边界、ADT、端口契约、SQL 对象与验收口径，代码按本文实现。
 
 ## 1. 模块边界
 
@@ -9,7 +9,7 @@
 | `spawn-core` | ADT、端口、事件归一、Bridge、Observer、内存实现、一致性套件 | 文件、网络、进程 IO；依赖驱动 |
 | `spawn-postgres` | `EventLog` 与 `CommandQueue` 实现、`schema.sql` | 编排逻辑、投影规则 |
 | `spawn-jev` | 判定 HTTP 客户端 | 持有会话状态 |
-| `spawn-host` | tmux 与 `layerfs` CLI 适配 | 解释事件内容 |
+| `spawn-host` | tmux 与 git 工作区适配 | 解释事件内容 |
 | `spawn-cli` | 子命令与配置装配 | 业务规则 |
 
 依赖单向：
@@ -53,7 +53,7 @@ spawn-core
 
 信封 `NewEvent { agent_id, session_id, execution_id, source, source_event_id, kind }`，写入返回 `EventRecord { position, session_seq, recorded_at, event }` 与 `Appended { record, inserted }`。
 
-`Source`：Claude、Codex、Bridge、Layerfs、Observer、Gateway。
+`Source`：Claude、Codex、Bridge、Observer、Gateway。`Layerfs` 只为旧行保留，新写入不再使用。
 
 | 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |
@@ -91,7 +91,7 @@ spawn-core
 | `CommandQueue` | `submit(principal, submission)` | 幂等提交，同时写 `command.accepted` |
 | | `claim(worker, ttl)` | 领取最老且无活跃租约的会话首条命令 |
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
-| `WorkspaceStore` | `ensure_branch`、`mount`、`commit`、`unmount` | LayerFS 的四个动作；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
+| `WorkspaceStore` | `ensure_branch`、`mount`、`commit`、`unmount` | 工作区的四个动作；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | `TerminalHost` | `start`、`submit_text`、`is_alive`、`capture_tail`、`terminate` | 终端生命周期与屏尾读取；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 
 错误类型：
@@ -241,33 +241,33 @@ Observer 每次 tick：
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
 
-## 10. tmux 与 LayerFS 契约
+## 10. tmux 与 git 契约
 
 tmux：
 
 | 调用 | 要点 |
 | --- | --- |
-| `new-session -d -s <name> -x 200 -y 50 [-e K=V] -- prog …` | 每次执行一个会话 |
+| `new-session -d -s <name> -x 200 -y 50 -c <cwd> [-e K=V] -- prog …` | 每次执行一个会话，`-c` 设置起始目录 |
 | `has-session`、`kill-session` | 会话 target：`=<name>` |
 | `send-keys`、`capture-pane` | pane target：`=<name>:`，即当前窗口的活跃 pane；裸 `=<name>` 会被当作 pane 规格而报错，`:.0` 在 `pane-base-index 1` 下失效 |
 | 重复会话 | stderr 为 `duplicate session: …`，适配层归一为 `already exists` |
 
-LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
+git：一个裸仓库持有全部基线 commit，每个分支一份工作树。工作树由 `git archive` 导出，**不含 `.git`**，引擎读不到历史、其他分支和控制器的 ref。
 
-| 退出码 | 含义 |
+`WorkspaceId` 是 `<branch>:<绝对目录>`；分支在冒号前，容器名由它派生为 `spawn-exec-<branch>`，任何进程只凭标识符就能重建映射。
+
+| 方法 | 命令 |
 | --- | --- |
-| 0 | 成功，stdout 是裸 JSON |
-| 2 | 用法错误，未执行任何操作 |
-| 125 | 拒绝或失败，stderr 是 `{code,message,detail}` |
+| `ensure_branch` | 无 `refs/heads/main` 时用 `mktree` + `commit-tree` 建根提交；再 `git branch <b> main` |
+| `mount` | `git archive refs/heads/<b> \| tar -x -C <dir>`；配置了镜像时再 `docker run -d -v <dir>:<dir> -w <dir>` |
+| `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A` → `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref` |
+| `unmount` | `docker rm -f`，再删工作树目录 |
 
-| 调用 | 响应 | 映射 |
-| --- | --- | --- |
-| `sandbox create` | `{"sandbox":"9"}` | 沙箱编号 |
-| `workspace mount <sb> <branch>` | `{"ws":"9:/workspaces/9"}` | `WorkspaceId` |
-| `workspace commit … -m <msg>` | `{"commit":{"id":"c_9"}}` 或 `{"upToDate":true}` | `Created` 或 `Unchanged` |
-| 无变更 | `NoCommit` 拒绝码 | `Unchanged` |
+容器把工作树挂到**同一绝对路径**，所以两侧路径一致，不需要任何翻译。
 
-`exec_prefix` 为 `layerfs --project <p> workspace exec <ws> --stream --`，共 8 段；tmux 命令整体作为一段传入前缀程序。
+`docker_prefix` 为 `docker exec -i -t <容器> sh -c`，共 7 段；tmux 命令整体作为一段传入。
+
+不用 FUSE，也不用 overlay：`git archive` 与 `tar` 在 macOS 和 Linux 上行为一致，无需 `SYS_ADMIN`。
 
 ## 11. 编译与磁盘策略
 
@@ -288,7 +288,7 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | crate | 覆盖 |
 | --- | --- |
 | `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
-| `spawn-host` | LayerFS 三种退出码与全部 JSON 形态、tmux 精确名匹配、前缀注入与跨进程调用、真实 tmux 生命周期 |
+| `spawn-host` | git 分支创建、archive 导出、无变更判定、分支前移、容器前缀、tmux 精确名匹配与跨进程调用、真实 tmux 生命周期 |
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
 | `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（列集快照、投影等于日志折叠、状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、非 owner 直查视图被拒、有授权写入与读函数过滤、共享一致性套件 |
 
@@ -305,7 +305,7 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | 格式 | `cargo fmt --all -- --check` |
 | 静态检查 | `cargo clippy --workspace --all-targets -- -D warnings` |
 | 测试 | `cargo test --workspace --no-fail-fast` |
-| 端到端 | `scripts/e2e-smoke.sh`：真 PG、真 tmux、假 LayerFS、假 Claude 屏，断言 `--ax-screen-reader`、前缀调用、提示落到屏、observation 入库；按阶段打印 calls、total、max 与 submit 到回显的延迟 |
+| 端到端 | `scripts/e2e-smoke.sh`：真 PG、真 git、真 tmux、假 Claude 屏，断言 `--ax-screen-reader`、基线树被导出且不含 `.git`、提示落到屏、observation 入库；按阶段打印 calls、total、max 与 submit 到回显的延迟 |
 
 缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 
@@ -317,12 +317,12 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | 租约续期 | Bridge 不续租；单条命令超过 `lease_ttl`（2 分钟）会被别的 worker 重取 | tick 内续租，或缩短单命令时长 |
 | 重试上限 | `spawn_claim` 无最大 attempt，坏命令会被反复领取 | 加 `max_attempts`，超限直接 `finish(failed)` |
 | schema 版本 | `migrate` 每次整体执行 `schema.sql`，无版本表 | 编号迁移文件与版本表 |
-| 子进程超时 | `layerfs`、`tmux` 调用没有超时 | `wait_timeout` 或独立线程计时 |
+| 子进程超时 | `git`、`docker`、`tmux` 调用没有超时 | `wait_timeout` 或独立线程计时 |
 | 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 由 hooks 的 `turn.failed` 取代 |
 | 视图读取 | 状态与新鲜度读投影表，其余视图读时折叠；迁移每次按会话聚合全量日志 | 日志很大时加迁移版本号，只跑一次，见 [view-architecture.md](./view-architecture.md) |
 | 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 | 接入 `LISTEN/NOTIFY` |
 | 写入串行 | `spawn_append` 用一把全局 advisory lock | 按会话分锁 |
 | 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 | 用真实服务做契约测试 |
-| LayerFS | `unmount` 会顺带 `sandbox close`；复用已有沙箱时可能误关 | 分开 unmount 与 close |
+| 大文件 | git 按内容寻址，改动一次就整份重存；工作树里不应放大文件 | 需要时接 git LFS |
 | tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 | `paste-buffer` |
 | mount 泄漏 | mount 与 `execution.started` 之间崩溃会遗留一个 mount | 启动时清扫未记录的 mount |

@@ -201,6 +201,7 @@ pub fn terminal(tag: &str, terminals: &dyn TerminalHost) {
     let launch = Launch {
         terminal: terminal.clone(),
         workspace: workspace.clone(),
+        cwd: "/".to_string(),
         program: "true".to_string(),
         arguments: Vec::new(),
         environment: Vec::new(),
