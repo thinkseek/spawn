@@ -213,7 +213,12 @@ const TRUST_ANSWER: &str = "Yes, I trust this folder";
 /// The dialog reads keystrokes, not pasted text: a bracketed paste of `y`
 /// gets "Please answer y or n". Answer it with [`TRUST_KEYS`].
 pub fn is_trust_dialog(pane: &str) -> bool {
-    let lines: Vec<String> = pane.lines().map(strip_ansi).collect();
+    let mut lines: Vec<String> = pane.lines().map(strip_ansi).collect();
+    // The dialog sits at the top of a fresh pane. Blank rows below it would
+    // push it out of the tail window, as in `read_claude_screen`.
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
     let start = lines.len().saturating_sub(TAIL_LINES);
     lines[start..]
         .iter()
@@ -306,6 +311,12 @@ Enter to confirm · Esc to cancel
     fn the_trust_dialog_is_recognized_and_not_ready() {
         assert!(is_trust_dialog(DIALOG));
         assert!(!read_claude_screen(DIALOG).state.accepts_input());
+    }
+
+    #[test]
+    fn the_trust_dialog_is_found_above_blank_rows_of_a_tall_pane() {
+        let pane = format!("{DIALOG}{}", "\n".repeat(40));
+        assert!(is_trust_dialog(&pane));
     }
 
     #[test]
