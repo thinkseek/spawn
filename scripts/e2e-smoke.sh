@@ -98,7 +98,7 @@ step() {
 step init_db "$bin" init-db >/dev/null
 # A fresh database works too; reset only when psql is reachable.
 if [ -n "$psql" ]; then
-  $psql "delete from spawn_commands; delete from spawn_events;" >/dev/null
+  $psql "delete from spawn_commands; delete from spawn_events; delete from spawn_session_state;" >/dev/null
 fi
 
 command=$(step submit "$bin" submit --principal spawn --agent "$agent" --session "$session" \
