@@ -194,6 +194,12 @@ fn busy_line(line: &str) -> bool {
 
 fn error_line(line: &str) -> bool {
     let trimmed = line.trim();
+    // A failed tool call is part of the transcript, not an engine error. The
+    // screen-reader layout prints it as `tool error: <tool> (...)` followed by
+    // `Error: Exit code <n>`, and a resumed session redraws it from history.
+    if trimmed.starts_with("Error: Exit code") {
+        return false;
+    }
     let marker = trimmed.starts_with('⎿')
         || trimmed.starts_with("Error")
         || trimmed.starts_with("API Error");
@@ -325,5 +331,35 @@ Enter to confirm · Esc to cancel
             format!("{DIALOG}Claude Code v2.1.317\n/tmp/ws/agent_rsi\n$ \nbypass permissions on\n");
         assert!(!is_trust_dialog(&pane));
         assert_eq!(read_claude_screen(&pane).state, ScreenState::Ready);
+    }
+}
+
+#[cfg(test)]
+mod tool_error_tests {
+    use super::{ScreenState, read_claude_screen};
+
+    /// A resumed session, captured from v2.1.317: the redrawn transcript ends
+    /// with a failed Bash call, and the input box is empty and idle.
+    const RESUMED_AFTER_TOOL_ERROR: &str =
+        "tool error: Bash (rm -f .spawn/done; cat crates/spawn-core/src/ingest.rs)
+Error: Exit code 2
+//! Normalization of native engine events into [`EventKind`].
+… +267 lines (ctrl+o to expand)
+Listed 1 directory (ctrl+o to expand)
+bypass permissions on (shift+tab to cycle)
+$";
+
+    #[test]
+    fn a_failed_tool_call_in_the_transcript_does_not_block_input() {
+        assert_eq!(
+            read_claude_screen(RESUMED_AFTER_TOOL_ERROR).state,
+            ScreenState::Ready
+        );
+    }
+
+    #[test]
+    fn an_api_error_still_reads_as_an_error() {
+        let pane = "API Error: 529 overloaded_error\n$ \nbypass permissions on";
+        assert_eq!(read_claude_screen(pane).state, ScreenState::Error);
     }
 }
