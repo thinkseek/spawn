@@ -1,0 +1,15 @@
+[package]
+name = "spawn-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+spawn-types = { path = "../spawn-types" }
+spawn-store = { path = "../spawn-store" }
+spawn-projector = { path = "../spawn-projector" }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
