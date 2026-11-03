@@ -6,8 +6,6 @@
 capture "$SPAWN_BIN" init-db
 assert_eq "$status" 0 "init-db exit"
 
-before=$(scalar 'select count(*) from spawn_events')
-
 # A port derived from the scenario pid keeps parallel scenarios apart.
 port=$((20000 + ($$ % 20000)))
 web=$WORK/web
@@ -51,6 +49,10 @@ printf '%s' '{"hook_event_name":"UserPromptSubmit"}' | \
 capture "$SPAWN_BIN" tick
 assert_eq "$status" 0 "tick exit"
 
+# Snapshot after the only writers (hook, tick). Every request below is a read
+# and must leave this count alone.
+before=$(scalar 'select count(*) from spawn_events')
+
 curl -fsS "http://127.0.0.1:$port/api/overview" >"$WORK/overview.json" 2>/dev/null
 assert_contains "$(cat "$WORK/overview.json")" '"session_id":"session_serve"' \
     "overview shows the judged session"
@@ -70,6 +72,5 @@ assert_contains "$(cat "$WORK/index.html")" "spawn" "index served from the web d
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/../Cargo.toml")
 [ "$code" = 404 ] || fail "path traversal returned $code, expected 404"
 
-# The API is read-only.
 assert_eq "$(scalar 'select count(*) from spawn_events')" "$before" \
     "serving appended no event"
