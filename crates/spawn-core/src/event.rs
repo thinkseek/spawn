@@ -1,6 +1,6 @@
 //! Unified event vocabulary and stored event records.
 //!
-//! Every producer (engine hooks, Codex stream, Bridge, LayerFS, Observer,
+//! Every producer (engine hooks, Codex stream, Bridge, Observer,
 //! SQL gateway) writes the same [`EventKind`] values. The store assigns the
 //! per-session sequence, the global position and the record time; producer
 //! clocks never decide order.
@@ -34,7 +34,10 @@ pub enum Source {
     Codex,
     /// Agent Bridge lifecycle facts.
     Bridge,
-    /// LayerFS commits recorded by the Bridge.
+    /// Workspace commits recorded by an older build.
+    ///
+    /// New commits are recorded with [`Source::Bridge`]; this value stays so
+    /// stored rows keep parsing.
     Layerfs,
     /// Observer judgements.
     Observer,
@@ -111,10 +114,10 @@ pub enum EndCause {
     Lost,
 }
 
-/// One LayerFS commit linked to the event that records why it happened.
+/// One workspace commit linked to the event that records why it happened.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtifactRef {
-    /// LayerFS project.
+    /// Store name.
     pub project: String,
     /// Branch that received the commit.
     pub branch: BranchName,
@@ -202,7 +205,7 @@ pub enum EventKind {
         engine: Engine,
         /// Terminal session that hosts the process.
         terminal: TerminalName,
-        /// Mounted LayerFS workspace.
+        /// Mounted workspace.
         workspace: WorkspaceId,
         /// Command that created the execution.
         command_id: CommandId,
@@ -215,7 +218,7 @@ pub enum EventKind {
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
     },
-    /// LayerFS persisted a checkpoint.
+    /// The workspace store persisted a checkpoint.
     #[serde(rename = "artifact.committed")]
     ArtifactCommitted {
         /// Trigger of the checkpoint.

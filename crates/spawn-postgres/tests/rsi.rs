@@ -1,0 +1,140 @@
+//! Controller state tests.
+//!
+//! The loop keeps its state outside `spawn_events`, so these cases check the
+//! tables and the transitions the controller drives. A real database is
+//! required, as in `api.rs`.
+
+use spawn_core::command::CommandAction;
+use spawn_core::event::Engine;
+use spawn_postgres::PostgresStore;
+
+/// First command of an iteration.
+fn start(prompt: &str) -> CommandAction {
+    CommandAction::Start {
+        engine: Engine::Claude,
+        prompt: prompt.to_string(),
+        parent_session_id: None,
+    }
+}
+
+fn url() -> String {
+    std::env::var("SPAWN_TEST_DATABASE_URL")
+        .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip")
+}
+
+fn store(case: &str) -> PostgresStore {
+    let schema = format!("spawn_rsi_{}_{case}", std::process::id());
+    PostgresStore::connect_in_schema(&url(), &schema).expect("connect and migrate")
+}
+
+#[test]
+fn the_lock_admits_one_controller_at_a_time() {
+    let first = store("lock");
+    let second = store("lock");
+    assert!(first.rsi_try_lock().expect("first lock"));
+    assert!(!second.rsi_try_lock().expect("second lock"));
+}
+
+#[test]
+fn seeding_keeps_the_first_baseline() {
+    let store = store("seed");
+    assert_eq!(store.rsi_state().expect("read state"), None);
+    store.rsi_seed_baseline("aaa").expect("seed");
+    store.rsi_seed_baseline("bbb").expect("seed again");
+    let state = store.rsi_state().expect("read state").expect("seeded");
+    assert_eq!(state.baseline, "aaa");
+    assert_eq!(state.iteration, 0);
+}
+
+#[test]
+fn beginning_an_iteration_writes_the_row_and_its_command() {
+    let store = store("begin");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    let command = store
+        .rsi_begin_iteration(7, 1, start("do the task"))
+        .expect("begin");
+
+    let open = store
+        .rsi_open_iteration()
+        .expect("open")
+        .expect("one open iteration");
+    assert_eq!(open.iteration, 1);
+    assert_eq!(open.task_id, 7);
+    assert_eq!(open.phase, "Starting");
+    assert_eq!(open.agent_id, spawn_postgres::RSI_AGENT);
+    assert_eq!(open.command_id, Some(command));
+
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.iteration, 1);
+
+    let row = store
+        .rsi_command_state(command)
+        .expect("command")
+        .expect("queued");
+    assert_eq!(row.state, "pending");
+    assert_eq!(row.succeeded, None);
+}
+
+#[test]
+fn landing_advances_the_baseline_and_clears_the_failure_counter() {
+    let store = store("land");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    store
+        .rsi_begin_iteration(7, 1, start("first"))
+        .expect("begin");
+    store
+        .rsi_close_iteration(1, "Rejected", "gate said no")
+        .expect("close");
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.consecutive_rejected, 1);
+
+    store
+        .rsi_begin_iteration(7, 2, start("second"))
+        .expect("begin");
+    assert!(store.rsi_advance_baseline(2, "aaa", "bbb").expect("land"));
+
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.baseline, "bbb");
+    assert_eq!(state.consecutive_rejected, 0);
+    assert_eq!(store.rsi_open_iteration().expect("open"), None);
+}
+
+#[test]
+fn landing_refuses_a_baseline_that_moved() {
+    let store = store("stale");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    store
+        .rsi_begin_iteration(7, 1, start("task"))
+        .expect("begin");
+    assert!(!store.rsi_advance_baseline(1, "zzz", "bbb").expect("land"));
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.baseline, "aaa");
+}
+
+#[test]
+fn a_recorded_attempt_feeds_the_next_prompt() {
+    let store = store("attempt");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    store
+        .rsi_record_attempt(
+            7,
+            1,
+            1,
+            Some("diff one"),
+            Some("gate one"),
+            "rejected",
+            false,
+        )
+        .expect("record");
+    assert_eq!(store.rsi_count_attempts(7).expect("count"), 1);
+    assert_eq!(store.rsi_solved_tasks().expect("solved"), Vec::<u32>::new());
+    assert_eq!(
+        store.rsi_last_attempt_of(7).expect("last"),
+        Some(("diff one".to_string(), "gate one".to_string()))
+    );
+
+    store
+        .rsi_record_attempt(7, 2, 2, Some("diff two"), None, "accepted", true)
+        .expect("record");
+    assert_eq!(store.rsi_solved_tasks().expect("solved"), vec![7]);
+}

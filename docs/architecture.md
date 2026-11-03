@@ -2,14 +2,14 @@
 
 [English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md)
 
-结论：Spawn 用 5 个 Rust crate 连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，LayerFS 提供工作区，PostgreSQL 保存事件并对外提供 SQL 视图，Jev 判定语义状态，`spawn` 二进制只做装配。全部代码同步阻塞，不使用 async。
+结论：Spawn 用 5 个 Rust crate 连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件并对外提供 SQL 视图，Jev 判定语义状态，`spawn` 二进制只做装配。全部代码同步阻塞，不使用 async。
 
 ## 1. 能力与边界
 
 | 能力 | 实现方 | Spawn 做的事 |
 | --- | --- | --- |
 | 计算 | Claude Code、Codex CLI | 启动进程、投递提示、采集 hooks |
-| 工作区 | LayerFS | 调用 `layerfs` CLI 完成 fork、mount、commit、unmount |
+| 工作区 | git | 裸仓库加每分支一份工作树，`git archive` 导出、`commit-tree` 收口 |
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
 | 语义状态 | 判定模型 `/v1/systemone` 或内置规则 | 发一次 HTTP 请求，写一条 observation |
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
@@ -24,7 +24,7 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 | `spawn-core` | 类型、端口、事件归一、Bridge、Observer、内存实现、一致性套件。零 IO | serde、serde_json、thiserror |
 | `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`schema.sql` | spawn-core、postgres |
 | `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde_json |
-| `spawn-host` | tmux 与 `layerfs` 子进程适配 | spawn-core、serde_json |
+| `spawn-host` | tmux 与 git 工作区适配 | spawn-core |
 | `spawn-cli` | 二进制 `spawn`，装配上述实现 | 全部 |
 
 ```mermaid
@@ -50,7 +50,7 @@ flowchart LR
 spawn_submit(principal, key, agent, session, action)
   → command.accepted          PG 事务，幂等
   → spawn_claim(worker, ttl)  单会话串行，租约 fencing
-  → layerfs branch fork / workspace mount
+  → git branch / archive 导出工作树
   → tmux new-session          运行 spawn run -- claude --ax-screen-reader
   → 屏尾判定 Ready            capture-pane 尾行解析
   → tmux send-keys            投递提示
@@ -109,12 +109,13 @@ Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信
 
 ```bash
 export SPAWN_DATABASE_URL=postgres://postgres:spawn@127.0.0.1:15432/spawn
-export SPAWN_PROJECT=shop
+export SPAWN_GIT_REPO=/data/spawn/repo.git
+export SPAWN_WORKSPACE_ROOT=/data/spawn/ws
 
 spawn init-db
 spawn submit --agent agent_001 --session session_001 --key k1 \
   --action '{"type":"start","engine":"claude","prompt":"整理最近三个提交"}'
-spawn tick --project shop
+spawn tick
 spawn status
 ```
 
@@ -126,26 +127,31 @@ spawn status
 | `status` | 扫描全部事件，打印每会话最新一条 observation |
 | `hook` | 从标准输入接收一条 Claude hook 载荷 |
 | `run` | 在终端内启动引擎，退出时写 `execution.ended{Exited}`，转发退出码 |
+| `evolve` | 推进一步递归自改循环：开迭代、收补丁、跑黑盒门禁、前移基线 |
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | 必填 | PG 连接串 |
-| `SPAWN_PROJECT` | 无 | LayerFS 项目名 |
+| `SPAWN_GIT_REPO` | 必填 | 存放基线 commit 的裸仓库 |
+| `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
 | `SPAWN_CODEX_PROGRAM` | `codex` | Codex 可执行文件 |
-| `SPAWN_LAYERFS_PROGRAM` | `layerfs` | LayerFS CLI |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件 |
 | `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket |
-| `SPAWN_TMUX_IN_WORKSPACE` | 未设 | 设置后 tmux 经 LayerFS 前缀在沙箱内运行 |
+| `SPAWN_EXEC_IMAGE` | 未设 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
+| `SPAWN_DOCKER_PROGRAM` | `docker` | docker 可执行文件 |
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_TRACE` | 未设 | 设置后每次端口调用向 stderr 打印一行 `spawn-trace <stage> <us>` |
+| `SPAWN_RSI_BACKLOG` | `rsi/backlog` | 任务定义目录，agent 不可写 |
+| `SPAWN_RSI_SCENARIOS` | `rsi/scenarios` | 黑盒场景目录，agent 不可写 |
+| `SPAWN_RSI_JUDGE` | `scripts/rsi/judge-candidate.sh` | 门禁脚本，输出一行 JSON 判定 |
 
 ## 8. 验证
 
 ```bash
-scripts/remote-gate.sh     # 同步到 digest 并跑门禁
-scripts/e2e-smoke.sh       # 真 PG + 真 tmux + 假 LayerFS + 假 Claude 屏
+scripts/run-gate-on-remote.sh     # 同步到 digest 并跑门禁
+scripts/e2e-smoke.sh       # 真 PG + 真 git + 真 tmux + 假 Claude 屏
 ```
 
 门禁顺序：工具链、临时 PG 容器、`cargo fmt --check`、`cargo clippy -D warnings`、`cargo test --workspace`、端到端冒烟。冒烟脚本按阶段计时，输出 calls、total、max 三列，并单列 `submit` 到屏上回显的延迟。

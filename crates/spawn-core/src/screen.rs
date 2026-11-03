@@ -20,14 +20,28 @@ pub const TAIL_LINES: usize = 40;
 /// Body lines inspected above the input box.
 const BODY_WINDOW: usize = 14;
 
-/// Prompt marker of the input box.
-const PROMPT: char = '❯';
+/// Prompt markers of the input box.
+///
+/// `❯` is the boxed layout. The screen-reader layout draws `$` and keeps the
+/// status lines below it, so the marker is not the last line of the pane.
+const PROMPTS: [char; 2] = ['❯', '$'];
 
 /// Spinner glyphs of a running turn.
 const SPINNERS: [char; 8] = ['✻', '✽', '✳', '✢', '✶', '✷', '✸', '✹'];
 
 /// Marker of a finished turn in the spinner line.
 const FINISHED: &str = "· done";
+
+/// Markers of a running turn in the screen-reader layout.
+///
+/// That layout prints words instead of spinner glyphs, so the glyph test in
+/// [`busy_line`] never fires on it. Captured from Claude Code v2.1.316.
+const SCREEN_READER_BUSY: [&str; 4] = [
+    "Running…",
+    "Nucleating…",
+    "ctrl+x ctrl+s to send now",
+    "(ctrl+b ctrl+b",
+];
 
 /// What the pane shows right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,10 +141,19 @@ fn is_rule(line: &str) -> bool {
 }
 
 /// Prompt text after the marker, trimmed.
+///
+/// `$` needs a following space: pasted shell output contains `$VAR` lines.
 fn prompt_body(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    let rest = trimmed.strip_prefix(PROMPT)?;
-    Some(rest.trim())
+    for marker in PROMPTS {
+        let Some(rest) = trimmed.strip_prefix(marker) else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with(' ') {
+            return Some(rest.trim());
+        }
+    }
+    None
 }
 
 fn is_choice_line(text: &str) -> bool {
@@ -154,6 +177,12 @@ fn busy_line(line: &str) -> bool {
         return false;
     }
     if trimmed.contains("esc to interrupt") {
+        return true;
+    }
+    if SCREEN_READER_BUSY
+        .iter()
+        .any(|marker| trimmed.contains(marker))
+    {
         return true;
     }
     let mut chars = trimmed.chars();
@@ -186,9 +215,7 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
         return ScreenReading::unknown();
     }
 
-    let prompt_index = tail
-        .iter()
-        .rposition(|line| line.trim_start().starts_with(PROMPT));
+    let prompt_index = tail.iter().rposition(|line| prompt_body(line).is_some());
     let Some(index) = prompt_index else {
         return ScreenReading::unknown();
     };

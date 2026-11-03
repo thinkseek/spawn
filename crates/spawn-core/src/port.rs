@@ -83,40 +83,40 @@ pub trait CommandQueue: Send + Sync {
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError>;
 }
 
-/// LayerFS refusal or failure.
+/// Workspace store refusal or failure.
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
-    /// LayerFS refused the call with a structured code.
-    #[error("layerfs refused: {code}: {message}")]
+    /// The store refused the call with a structured code.
+    #[error("workspace refused: {code}: {message}")]
     Refused {
-        /// LayerFS error code, for example `NoSuchBranch`.
+        /// Backend error code, for example `NoCommit`.
         code: String,
-        /// LayerFS message.
+        /// Backend message.
         message: String,
     },
-    /// The CLI could not run or printed an unexpected answer.
-    #[error("layerfs unavailable: {0}")]
+    /// The backend could not run or printed an unexpected answer.
+    #[error("workspace unavailable: {0}")]
     Unavailable(String),
 }
 
 /// Result of a workspace commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Commit {
-    /// LayerFS published a new commit.
+    /// The workspace store published a new commit.
     Created(CommitId),
     /// The workspace had no changes.
     Unchanged,
 }
 
-/// LayerFS operations used by the Bridge, in one project.
+/// Versioned file storage used by the Bridge.
 pub trait WorkspaceStore: Send + Sync {
-    /// Project name.
+    /// Name of the store, recorded with every artifact.
     fn project(&self) -> &str;
 
-    /// Fork `branch` from `main` unless it exists.
+    /// Create `branch` from the base unless it exists.
     fn ensure_branch(&self, branch: &BranchName) -> Result<(), WorkspaceError>;
 
-    /// Start a sandbox and mount `branch` in it.
+    /// Materialize `branch` where the engine can run.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError>;
 
     /// Commit the workspace. No changes is [`Commit::Unchanged`].
@@ -138,6 +138,8 @@ pub struct Launch {
     pub terminal: TerminalName,
     /// Workspace the process runs in.
     pub workspace: WorkspaceId,
+    /// Directory the process starts in, as seen by the terminal host.
+    pub cwd: String,
     /// Executable.
     pub program: String,
     /// Arguments, passed without shell interpretation.

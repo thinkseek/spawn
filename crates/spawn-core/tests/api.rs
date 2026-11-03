@@ -33,6 +33,22 @@ const HOOK_ERROR: &str = "⎿ UserPromptSubmit hook error\nFailed with non-block
 /// A permission dialog above the input box.
 const PERMISSION: &str = "Do you want to allow this tool call?\n❯ 1. Yes\n  2. No";
 
+/// The screen-reader layout: `$` prompt above the status lines.
+const SCREEN_READER: &str =
+    "$ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知\nbypass permissions on\nultracode";
+
+/// A running turn in the screen-reader layout, captured from v2.1.316.
+///
+/// That layout prints words, not spinner glyphs, so this pane carries no
+/// glyph the boxed layout would match.
+const SCREEN_READER_BUSY: &str = "you: run sleep 20\nThought for 2s (ctrl+o to expand)\ntool: Bash (sleep 20)\nRunning…  (16s)\n(ctrl+b ctrl+b (twice) to run in background)\nNucleating…\ndeepseek-ai/DeepSeek-V4.1-Flash · 余量未知\nbypass permissions on (shift+tab to cycle)\nultracode\n$";
+
+/// A message typed during a running turn. The engine queues it.
+const SCREEN_READER_QUEUED: &str = "you: run sleep 20\ntool: Bash (sleep 20)\nRunning…  (16s)\nyou: SECOND\nctrl+x ctrl+s to send now\nNucleating…\ndeepseek-ai/DeepSeek-V4.1-Flash · 余量未知\nbypass permissions on (shift+tab to cycle)\nultracode\n$";
+
+/// The same session after the turn ended.
+const SCREEN_READER_DONE: &str = "you: SECOND\nclaude: DONE\nCrunched for 24s · done 9:20 PM\ndeepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 318 tok/s\nbypass permissions on (shift+tab to cycle)\nultracode\n$";
+
 fn store() -> Arc<MemoryStore> {
     let clock: Arc<ManualClock> = Arc::new(ManualClock::new(Timestamp(1_000)));
     Arc::new(MemoryStore::new("shop", clock))
@@ -98,6 +114,31 @@ fn screen_reads_the_tail_not_the_history() {
         ScreenState::Permission
     );
     assert_eq!(read_claude_screen("❯ hello").state, ScreenState::Drafted);
+
+    // The screen-reader layout draws `$` and puts its status lines below it.
+    assert_eq!(read_claude_screen(SCREEN_READER).state, ScreenState::Ready);
+    // That layout prints words, not spinner glyphs, so a glyph test alone
+    // reads a running turn as ready.
+    assert_eq!(
+        read_claude_screen(SCREEN_READER_BUSY).state,
+        ScreenState::Busy
+    );
+    // A message typed during a running turn is queued, and the turn still runs.
+    assert_eq!(
+        read_claude_screen(SCREEN_READER_QUEUED).state,
+        ScreenState::Busy
+    );
+    assert_eq!(
+        read_claude_screen(SCREEN_READER_DONE).state,
+        ScreenState::Ready
+    );
+    assert_eq!(
+        read_claude_screen("$ hello\ndeepseek-ai").state,
+        ScreenState::Drafted
+    );
+    // `$VAR` in pasted shell output is not the input box.
+    assert_eq!(read_claude_screen("$HOME/x").state, ScreenState::Unknown);
+
     assert_eq!(read_claude_screen("").state, ScreenState::Unknown);
     assert_eq!(
         read_claude_screen("no prompt here").state,
@@ -139,12 +180,13 @@ fn screen_reads_the_tail_not_the_history() {
 fn claude_arguments_carry_the_flag_and_absolute_hooks() {
     let arguments = claude_arguments("/opt/spawn", Some("native-1"));
     assert_eq!(arguments[0], "--ax-screen-reader");
-    assert_eq!(arguments[1], "--settings");
-    let settings = &arguments[2];
+    assert_eq!(arguments[1], "--allow-dangerously-skip-permissions");
+    assert_eq!(arguments[2], "--settings");
+    let settings = &arguments[3];
     assert!(settings.contains("/opt/spawn"), "hook command is absolute");
     assert!(settings.contains("UserPromptSubmit"));
-    assert_eq!(arguments[3], "--resume");
-    assert_eq!(arguments[4], "native-1");
+    assert_eq!(arguments[4], "--resume");
+    assert_eq!(arguments[5], "native-1");
     assert!(!claude_arguments("/opt/spawn", None).contains(&"--resume".to_string()));
 }
 

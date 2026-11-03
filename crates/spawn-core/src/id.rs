@@ -1,7 +1,7 @@
 //! Identifier and label newtypes.
 //!
 //! Spawn-owned identifiers carry a fixed prefix and use only `[A-Za-z0-9_-]`,
-//! so they are safe as tmux session names, LayerFS branch names and
+//! so they are safe as tmux session names, git branch names and
 //! environment values. Opaque labels wrap values owned by other systems and
 //! only reject empty, oversized or control-character input. Deserialization
 //! runs the same validation as construction.
@@ -53,7 +53,7 @@ fn validate(raw: &str, prefix: &'static str) -> Result<(), InvalidLabel> {
     }
 }
 
-/// Check the `<sandbox>:<path>` shape that LayerFS requires.
+/// Check the `<workspace>:<path>` shape a workspace identifier requires.
 fn check_workspace(raw: &str) -> Result<(), InvalidLabel> {
     let Some((sandbox, path)) = raw.split_once(':') else {
         return Err(InvalidLabel::Format("<sandbox>:<path>"));
@@ -132,17 +132,17 @@ label!(
     "spawn-"
 );
 label!(
-    /// LayerFS branch name.
+    /// Branch name.
     BranchName,
     ""
 );
 label!(
-    /// LayerFS commit identifier.
+    /// Commit identifier.
     CommitId,
     ""
 );
 label!(
-    /// LayerFS workspace reference in `<sandbox>:<path>` form.
+    /// Workspace reference in `<workspace>:<path>` form.
     WorkspaceId,
     "",
     check_workspace

@@ -5,6 +5,7 @@
 //! - `init-db` installs the SQL schema.
 //! - `submit` writes one command to the queue.
 //! - `tick` runs one Bridge and Observer pass.
+//! - `evolve` advances the recursive self-improvement loop by one step.
 //! - `status` prints the latest observation per session.
 //! - `hook` ingests one Claude Code hook payload from standard input.
 //! - `run` starts the engine inside the terminal, records its exit, and
@@ -21,14 +22,15 @@ use std::sync::Arc;
 use spawn_core::bridge::{Bridge, BridgeConfig};
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{EndCause, EventKind, NewEvent, Source};
-use spawn_core::id::{AgentId, ExecutionId, IdempotencyKey, Principal, SessionId};
+use spawn_core::id::{AgentId, ExecutionId, IdempotencyKey, Principal, SessionId, WorkspaceId};
 use spawn_core::ingest::{claude_hook, codex_line};
 use spawn_core::observe::{HeuristicJudge, Observer, StateJudge};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
-use spawn_host::{LayerFsCli, TmuxHost};
+use spawn_host::{GitWorkspace, TmuxHost, docker_prefix};
 use spawn_jev::{JevConfig, JevJudge};
 use spawn_postgres::PostgresStore;
 
+mod evolve;
 mod trace;
 use trace::Timed;
 
@@ -45,7 +47,7 @@ fn main() {
 
 /// Parsed arguments.
 #[derive(Debug, Default)]
-struct Flags {
+pub(crate) struct Flags {
     values: HashMap<String, String>,
 }
 
@@ -68,7 +70,7 @@ impl Flags {
         Ok(flags)
     }
 
-    fn get(&self, name: &str) -> Option<String> {
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
         self.values.get(name).cloned()
     }
 
@@ -78,16 +80,17 @@ impl Flags {
     }
 }
 
-fn dispatch() -> Result<i32, String> {
+pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
-        return Err("usage: spawn <init-db|submit|tick|status|hook|run>".to_string());
+        return Err("usage: spawn <init-db|submit|tick|evolve|status|hook|run>".to_string());
     };
     let rest: Vec<String> = arguments.collect();
     match command.as_str() {
         "init-db" => cmd_init_db(&Flags::parse(&rest)?),
         "submit" => cmd_submit(&Flags::parse(&rest)?),
         "tick" => cmd_tick(&Flags::parse(&rest)?),
+        "evolve" => evolve::evolve(&Flags::parse(&rest)?),
         "status" => cmd_status(&Flags::parse(&rest)?),
         "hook" => cmd_hook(),
         "run" => cmd_run(&rest),
@@ -95,11 +98,11 @@ fn dispatch() -> Result<i32, String> {
     }
 }
 
-fn env_value(name: &str) -> Option<String> {
+pub(crate) fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-fn env_or(name: &str, fallback: &str) -> String {
+pub(crate) fn env_or(name: &str, fallback: &str) -> String {
     env_value(name).unwrap_or_else(|| fallback.to_string())
 }
 
@@ -107,7 +110,7 @@ fn required_env(name: &str) -> Result<String, String> {
     env_value(name).ok_or_else(|| format!("{name} is not set"))
 }
 
-fn open_store() -> Result<PostgresStore, String> {
+pub(crate) fn open_store() -> Result<PostgresStore, String> {
     let url = required_env("SPAWN_DATABASE_URL")?;
     trace::time("pg.connect", || PostgresStore::connect(&url)).map_err(|error| error.to_string())
 }
@@ -146,24 +149,36 @@ fn cmd_submit(flags: &Flags) -> Result<i32, String> {
 
 fn cmd_tick(flags: &Flags) -> Result<i32, String> {
     let store = Arc::new(open_store()?);
-    let project = flags
-        .get("project")
-        .or_else(|| env_value("SPAWN_PROJECT"))
-        .ok_or_else(|| "--project or SPAWN_PROJECT is required".to_string())?;
-    let layerfs = env_or("SPAWN_LAYERFS_PROGRAM", "layerfs");
+    let repo = flags
+        .get("repo")
+        .or_else(|| env_value("SPAWN_GIT_REPO"))
+        .ok_or_else(|| "--repo or SPAWN_GIT_REPO is required".to_string())?;
+    let root = flags
+        .get("root")
+        .or_else(|| env_value("SPAWN_WORKSPACE_ROOT"))
+        .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
     let tmux = env_or("SPAWN_TMUX_PROGRAM", "tmux");
     let socket = env_value("SPAWN_TMUX_SOCKET");
+    let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
+    let image = env_value("SPAWN_EXEC_IMAGE");
 
-    let workspaces: Arc<dyn WorkspaceStore> = Arc::new(LayerFsCli::new(&layerfs, &project));
-    let terminals: Arc<dyn TerminalHost> = if env_value("SPAWN_TMUX_IN_WORKSPACE").is_some() {
-        let prefix = LayerFsCli::new(&layerfs, &project);
-        Arc::new(TmuxHost::in_workspaces(
+    // The engine runs in a container when an image is configured. That
+    // container also hosts tmux, so the terminal host needs the same image.
+    let workspaces: Arc<dyn WorkspaceStore> = Arc::new(match image.as_ref() {
+        Some(image) => GitWorkspace::with_container(&repo, &root, &docker, image),
+        None => GitWorkspace::new(&repo, &root),
+    });
+    let terminals: Arc<dyn TerminalHost> = match image.as_ref() {
+        Some(_) => Arc::new(TmuxHost::in_workspaces(
             &tmux,
-            Arc::new(move |workspace| prefix.exec_prefix(workspace)),
+            Arc::new(move |workspace: &WorkspaceId| docker_prefix(&docker, workspace.sandbox())),
             socket.clone(),
-        ))
-    } else {
-        Arc::new(TmuxHost::local(&tmux))
+        )),
+        None => Arc::new(TmuxHost::in_workspaces(
+            &tmux,
+            Arc::new(|_: &WorkspaceId| Vec::new()),
+            socket,
+        )),
     };
 
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));

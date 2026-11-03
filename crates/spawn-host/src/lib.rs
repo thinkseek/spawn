@@ -1,10 +1,10 @@
-//! Host adapters: tmux terminals and the LayerFS command line.
+//! Host adapters: tmux terminals and the git workspace store.
 //!
 //! Both adapters call an external program and read its exit code, so they
 //! share the same failure rules as the programs they wrap.
 
-pub mod layerfs;
+pub mod git;
 pub mod tmux;
 
-pub use layerfs::LayerFsCli;
+pub use git::{GitWorkspace, container_name, docker_prefix};
 pub use tmux::{PrefixBuilder, TmuxHost};

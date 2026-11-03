@@ -1,8 +1,8 @@
 //! Public API tests for spawn-host.
 //!
-//! LayerFS is replaced by small shell scripts that reproduce its exit codes,
-//! because the adapter's contract is exactly those three codes. tmux is real
-//! and runs on a private socket so the test never touches an existing server.
+//! The git store runs against a real repository in a scratch directory. tmux
+//! is real and runs on a private socket so the test never touches an existing
+//! server.
 
 use std::fs;
 use std::io::Write;
@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
-use spawn_core::port::{Commit, Launch, TerminalHost, WorkspaceError, WorkspaceStore};
-use spawn_host::{LayerFsCli, PrefixBuilder, TmuxHost};
+use spawn_core::port::{Commit, Launch, TerminalError, TerminalHost, WorkspaceStore};
+use spawn_host::{GitWorkspace, PrefixBuilder, TmuxHost, container_name, docker_prefix};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -26,6 +26,26 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Start a session, retrying while the kernel reports `Text file busy`.
+///
+/// Under load `exec` of a script written moments earlier can fail with
+/// `Text file busy` (os error 26). The cause is not established; it is not
+/// reproducible in 20 serial or parallel runs. Only that error is retried, so
+/// every real start failure still surfaces immediately.
+fn start_session(host: &TmuxHost, launch: &Launch) -> Result<(), TerminalError> {
+    let mut last = None;
+    for _ in 0..20 {
+        match host.start(launch) {
+            Err(error) if error.0.contains("Text file busy") => {
+                last = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    Err(last.expect("one attempt"))
+}
+
 /// Directory that holds the fake executables of this test process.
 fn scratch() -> PathBuf {
     let path = std::env::temp_dir().join(format!("spawn-host-test-{}", std::process::id()));
@@ -33,10 +53,7 @@ fn scratch() -> PathBuf {
     path
 }
 
-/// Write an executable without ever holding the target open, so a concurrent
-/// `exec` cannot see a half-written file. Every call gets its own path: two
-/// tests that share a name would otherwise race on the same inode and fail
-/// with `Text file busy`.
+/// Write an executable without ever holding the target open.
 fn script(name: &str, body: &str) -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -56,187 +73,137 @@ fn script(name: &str, body: &str) -> String {
     target.to_string_lossy().into_owned()
 }
 
-/// A CLI that answers every call with one fixed reply and exit code.
-fn fixed(name: &str, code: i32, stdout: &str, stderr: &str) -> String {
-    script(
-        name,
-        &format!(
-            "#!/bin/sh\nprintf '%s' '{}'\nprintf '%s' '{}' >&2\nexit {code}\n",
-            stdout.replace('\'', "'\\''"),
-            stderr.replace('\'', "'\\''")
-        ),
-    )
+fn git(directory: &PathBuf, arguments: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["-c", "user.name=spawn-test"])
+        .args(["-c", "user.email=spawn@localhost"])
+        .args(arguments)
+        .status()
+        .expect("git is installed");
+    assert!(status.success(), "git {arguments:?} failed");
 }
 
-/// A CLI that answers by subcommand: `sandbox create`, `workspace mount`,
-/// `workspace commit` and `branch fork` each get their own reply.
-fn scripted(name: &str, commit_code: i32, commit_out: &str) -> String {
-    script(
-        name,
-        &format!(
-            r#"#!/bin/sh
-case "$*" in
-  *"sandbox create"*) printf '%s' '{{"sandbox":"9"}}' ;;
-  *"workspace mount"*) printf '%s' '{{"ws":"9:/workspaces/9"}}' ;;
-  *"workspace commit"*) printf '%s' '{commit_out}'; exit {commit_code} ;;
-  *"branch fork"*) exit 0 ;;
-  *) exit 0 ;;
-esac
-"#
-        ),
-    )
+/// Repository with one base commit, and an empty workspace root.
+fn repository(tag: &str) -> (PathBuf, PathBuf) {
+    let base = std::env::temp_dir().join(format!("spawn-git-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).expect("create scratch repository");
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).expect("create repository directory");
+    git(&repo, &["init", "-q", "--initial-branch=main"]);
+    fs::write(repo.join("README.md"), "base\n").expect("write base file");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let root = base.join("work");
+    fs::create_dir_all(&root).expect("create workspace root");
+    (repo.join(".git"), root)
 }
 
 fn branch() -> BranchName {
-    BranchName::new("cart").expect("valid branch")
-}
-
-fn workspace() -> WorkspaceId {
-    WorkspaceId::new("9:/workspaces/9").expect("valid workspace")
+    BranchName::new("agent_test").expect("valid branch")
 }
 
 #[test]
-fn mount_reads_the_sandbox_and_the_workspace_from_the_cli() {
+fn mount_of_an_unknown_branch_fails() {
     let _exclusive = exclusive();
-    let cli = LayerFsCli::new(
-        &scripted("fake-layerfs-ok", 0, r#"{"commit":{"id":"c_9"}}"#),
-        "shop",
-    );
-    let mounted = cli.mount(&branch()).expect("mount succeeds");
-    assert_eq!(mounted.as_str(), "9:/workspaces/9");
-    assert_eq!(cli.project(), "shop");
+    let (repo, root) = repository("unknown");
+    let store = GitWorkspace::new(&repo, &root);
+    assert!(store.mount(&branch()).is_err(), "no commit, no mount");
 }
 
 #[test]
-fn commit_without_changes_is_unchanged() {
+fn ensure_branch_is_idempotent_and_mount_extracts_the_base() {
     let _exclusive = exclusive();
-    let cli = LayerFsCli::new(
-        &fixed(
-            "fake-layerfs-nocommit",
-            125,
-            "",
-            r#"{"code":"NoCommit","message":"nothing to commit"}"#,
-        ),
-        "shop",
+    let (repo, root) = repository("mount");
+    let store = GitWorkspace::new(&repo, &root);
+    store.ensure_branch(&branch()).expect("create the branch");
+    store
+        .ensure_branch(&branch())
+        .expect("creating twice is harmless");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let extracted = fs::read_to_string(PathBuf::from(workspace.path()).join("README.md"))
+        .expect("the base tree was extracted");
+    assert_eq!(extracted, "base\n");
+    assert!(
+        !PathBuf::from(workspace.path()).join(".git").exists(),
+        "the engine must not see the repository"
     );
+    assert_eq!(workspace.sandbox(), branch().as_str());
+    store.unmount(&workspace).expect("unmount succeeds");
+    assert!(!PathBuf::from(workspace.path()).exists());
+}
+
+#[test]
+fn an_untouched_workspace_produces_no_commit() {
+    let _exclusive = exclusive();
+    let (repo, root) = repository("unchanged");
+    let store = GitWorkspace::new(&repo, &root);
+    store.ensure_branch(&branch()).expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
     assert!(matches!(
-        cli.commit(&workspace(), "empty").expect("commit succeeds"),
+        store.commit(&workspace, "empty").expect("commit succeeds"),
         Commit::Unchanged
     ));
+    store.unmount(&workspace).expect("unmount succeeds");
 }
 
 #[test]
-fn commit_with_changes_returns_the_commit_id() {
+fn a_changed_workspace_advances_the_branch() {
     let _exclusive = exclusive();
-    let cli = LayerFsCli::new(
-        &scripted("fake-layerfs-ok-2", 0, r#"{"commit":{"id":"c_9"}}"#),
-        "shop",
-    );
-    match cli.commit(&workspace(), "work").expect("commit succeeds") {
-        Commit::Created(id) => assert_eq!(id.as_str(), "c_9"),
-        Commit::Unchanged => panic!("a created commit must not be reported as unchanged"),
+    let (repo, root) = repository("created");
+    let store = GitWorkspace::new(&repo, &root);
+    store.ensure_branch(&branch()).expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    fs::write(PathBuf::from(workspace.path()).join("new.txt"), "work\n")
+        .expect("write into the workspace");
+    match store.commit(&workspace, "work").expect("commit succeeds") {
+        Commit::Created(id) => assert_eq!(id.as_str().len(), 40, "{id}"),
+        Commit::Unchanged => panic!("a changed workspace must produce a commit"),
     }
+    let head = Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args(["show", &format!("{}:new.txt", branch())])
+        .output()
+        .expect("read the branch");
+    assert_eq!(String::from_utf8_lossy(&head.stdout), "work\n");
+    store.unmount(&workspace).expect("unmount succeeds");
 }
 
 #[test]
-fn up_to_date_flag_wins_over_a_commit_id() {
+fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
-    let cli = LayerFsCli::new(
-        &fixed(
-            "fake-layerfs-uptodate",
-            0,
-            r#"{"upToDate":true,"commit":"c_9"}"#,
-            "",
-        ),
-        "shop",
+    let (repo, root) = repository("identity");
+    let store = GitWorkspace::new(&repo, &root);
+    store.ensure_branch(&branch()).expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    assert_eq!(workspace.sandbox(), "agent_test");
+    assert_eq!(
+        PathBuf::from(workspace.path()),
+        root.join("agent_test"),
+        "the identifier carries the workspace directory"
     );
-    assert!(matches!(
-        cli.commit(&workspace(), "empty").expect("commit succeeds"),
-        Commit::Unchanged
-    ));
+    store.unmount(&workspace).expect("unmount succeeds");
 }
 
 #[test]
-fn usage_error_is_unavailable() {
+fn the_container_prefix_runs_a_shell_in_the_named_container() {
     let _exclusive = exclusive();
-    let cli = LayerFsCli::new(&fixed("fake-layerfs-usage", 2, "", "bad arguments"), "shop");
-    match cli.mount(&branch()).expect_err("a usage error fails") {
-        WorkspaceError::Unavailable(message) => {
-            assert!(message.contains("usage error"), "{message}");
-            assert!(message.contains("bad arguments"), "{message}");
-        }
-        WorkspaceError::Refused { code, .. } => panic!("unexpected refusal: {code}"),
-    }
+    let prefix = docker_prefix("docker", "agent_test");
+    assert_eq!(prefix[0], "docker");
+    assert_eq!(prefix[1], "exec");
+    assert_eq!(prefix[4], container_name("agent_test"));
+    assert_eq!(prefix[6], "-c");
+    assert_eq!(prefix.len(), 7, "{prefix:?}");
 }
 
-#[test]
-fn refusal_carries_the_code_and_the_message() {
-    let _exclusive = exclusive();
-    let cli = LayerFsCli::new(
-        &fixed(
-            "fake-layerfs-refused",
-            125,
-            "",
-            r#"{"code":"InvalidInput","message":"colon must be followed by /"}"#,
-        ),
-        "shop",
-    );
-    match cli.mount(&branch()).expect_err("a refusal fails") {
-        WorkspaceError::Refused { code, message } => {
-            assert_eq!(code, "InvalidInput");
-            assert!(message.contains("colon"), "{message}");
-        }
-        WorkspaceError::Unavailable(message) => panic!("unexpected unavailability: {message}"),
-    }
-}
-
-#[test]
-fn ensure_branch_accepts_an_existing_name() {
-    let _exclusive = exclusive();
-    let cli = LayerFsCli::new(
-        &fixed(
-            "fake-layerfs-exists",
-            125,
-            "",
-            r#"{"code":"NameTaken","message":"branch exists"}"#,
-        ),
-        "shop",
-    );
-    cli.ensure_branch(&branch())
-        .expect("an existing branch is the desired state");
-}
-
-#[test]
-fn a_missing_program_is_unavailable() {
-    let _exclusive = exclusive();
-    let cli = LayerFsCli::new("/nonexistent/layerfs", "shop");
-    match cli.mount(&branch()).expect_err("a missing program fails") {
-        WorkspaceError::Unavailable(message) => assert!(message.contains("layerfs"), "{message}"),
-        WorkspaceError::Refused { code, .. } => panic!("unexpected refusal: {code}"),
-    }
-}
-
-#[test]
-fn exec_prefix_marks_the_stream_and_the_project() {
-    let _exclusive = exclusive();
-    let cli = LayerFsCli::new("layerfs", "shop");
-    let prefix = cli.exec_prefix(&workspace());
-    assert_eq!(prefix[0], "layerfs");
-    assert_eq!(prefix[1], "--project");
-    assert_eq!(prefix[3], "workspace");
-    assert_eq!(prefix[4], "exec");
-    assert_eq!(prefix[6], "--stream");
-    assert_eq!(prefix[7], "--");
-    assert_eq!(prefix.len(), 8, "{prefix:?}");
-}
-
-/// tmux on a socket private to one test, so no shared server, no user
-/// sessions and no name collision between parallel tests.
 fn isolated_tmux(tag: &str) -> String {
     let socket = format!("spawn-host-test-{tag}-{}", std::process::id());
     script(
         &format!("fake-tmux-{tag}"),
-        &format!("#!/bin/sh\nexec /usr/bin/tmux -L {socket} \"$@\"\n"),
+        &format!("#!/bin/sh\nexec tmux -L {socket} \"$@\"\n"),
     )
 }
 
@@ -244,19 +211,27 @@ fn terminal(name: &str) -> TerminalName {
     TerminalName::new(format!("spawn-{name}")).expect("valid terminal")
 }
 
+fn workspace() -> WorkspaceId {
+    WorkspaceId::new("/:/tmp").expect("valid workspace")
+}
+
+fn launch(name: &TerminalName) -> Launch {
+    Launch {
+        terminal: name.clone(),
+        workspace: workspace(),
+        cwd: "/tmp".to_string(),
+        program: "/bin/cat".to_string(),
+        arguments: Vec::new(),
+        environment: Vec::new(),
+    }
+}
+
 #[test]
 fn tmux_types_into_a_terminal_and_sees_the_echo() {
     let _exclusive = exclusive();
     let host = TmuxHost::local(&isolated_tmux("echo"));
     let name = terminal("echo");
-    host.start(&Launch {
-        terminal: name.clone(),
-        workspace: workspace(),
-        program: "/bin/cat".to_string(),
-        arguments: Vec::new(),
-        environment: Vec::new(),
-    })
-    .expect("start succeeds");
+    start_session(&host, &launch(&name)).expect("start succeeds");
 
     assert!(
         host.is_alive(&name, &workspace())
@@ -284,22 +259,9 @@ fn tmux_rejects_a_duplicate_terminal() {
     let _exclusive = exclusive();
     let host = TmuxHost::local(&isolated_tmux("dup"));
     let name = terminal("dup");
-    host.start(&Launch {
-        terminal: name.clone(),
-        workspace: workspace(),
-        program: "/bin/cat".to_string(),
-        arguments: Vec::new(),
-        environment: Vec::new(),
-    })
-    .expect("first start succeeds");
+    start_session(&host, &launch(&name)).expect("start succeeds");
     let error = host
-        .start(&Launch {
-            terminal: name.clone(),
-            workspace: workspace(),
-            program: "/bin/cat".to_string(),
-            arguments: Vec::new(),
-            environment: Vec::new(),
-        })
+        .start(&launch(&name))
         .expect_err("a duplicate start fails");
     assert!(error.0.contains("already exists"), "{error:?}");
     host.terminate(&name, &workspace()).expect("clean up");
@@ -312,14 +274,7 @@ fn tmux_matches_the_session_name_exactly() {
     let first = terminal("a");
     let second = terminal("ab");
     for name in [&first, &second] {
-        host.start(&Launch {
-            terminal: name.clone(),
-            workspace: workspace(),
-            program: "/bin/cat".to_string(),
-            arguments: Vec::new(),
-            environment: Vec::new(),
-        })
-        .expect("start succeeds");
+        start_session(&host, &launch(name)).expect("start succeeds");
     }
     host.terminate(&first, &workspace())
         .expect("terminate the short name");
@@ -332,43 +287,49 @@ fn tmux_matches_the_session_name_exactly() {
 }
 
 #[test]
-fn tmux_calls_go_through_the_workspace_prefix() {
+fn tmux_starts_in_the_launch_directory() {
+    let _exclusive = exclusive();
+    let host = TmuxHost::local(&isolated_tmux("cwd"));
+    let name = terminal("cwd");
+    let mut started = launch(&name);
+    started.program = "/bin/sh".to_string();
+    started.arguments = vec!["-c".to_string(), "pwd; exec cat".to_string()];
+    started.cwd = "/tmp".to_string();
+    start_session(&host, &started).expect("start succeeds");
+    let pane = host
+        .capture_tail(&name, &workspace(), 20)
+        .expect("capture succeeds");
+    assert!(pane.contains("/tmp"), "pane: {pane}");
+    host.terminate(&name, &workspace()).expect("clean up");
+}
+
+#[test]
+fn tmux_calls_go_through_the_container_prefix() {
     let _exclusive = exclusive();
     let calls = scratch().join("tmux-calls.log");
     let _ = fs::remove_file(&calls);
     let socket = format!("spawn-host-test-prefix-{}", std::process::id());
-    // Inside the sandbox tmux is tmux; it only logs the call.
     let inner = script(
         "fake-tmux-prefix",
         &format!(
-            "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec /usr/bin/tmux -L {socket} \"$@\"\n",
+            "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec tmux -L {socket} \"$@\"\n",
             calls = calls.display()
         ),
     );
-    // The prefix program logs its own argv and runs the command it is given.
     let prefix_program = script(
-        "fake-layerfs-prefix",
+        "fake-docker-prefix",
         &format!(
-            "#!/bin/sh\nprintf 'layerfs %s\\n' \"$*\" >> '{calls}'\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
+            "#!/bin/sh\nprintf 'docker %s\\n' \"$*\" >> '{calls}'\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
             calls = calls.display()
         ),
     );
     let builder: std::sync::Arc<PrefixBuilder> = {
-        let cli = LayerFsCli::new(&prefix_program, "shop");
-        let prefix = cli.exec_prefix(&workspace());
-        std::sync::Arc::new(move |_: &WorkspaceId| prefix.clone())
+        let words = docker_prefix(&prefix_program, "agent_test");
+        std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
     };
     let host = TmuxHost::in_workspaces(&inner, builder.clone(), None);
     let name = terminal("prefix");
-    host.start(&Launch {
-        terminal: name.clone(),
-        workspace: workspace(),
-        program: "/bin/cat".to_string(),
-        arguments: Vec::new(),
-        environment: Vec::new(),
-    })
-    .expect("start through the prefix succeeds");
-    // A second host stands for the next `spawn tick` process.
+    start_session(&host, &launch(&name)).expect("start through the prefix succeeds");
     let later = TmuxHost::in_workspaces(&inner, builder, None);
     assert!(
         later
@@ -380,37 +341,18 @@ fn tmux_calls_go_through_the_workspace_prefix() {
         .expect("terminate through the prefix");
     let log = fs::read_to_string(&calls).expect("read the call log");
     assert!(
-        log.contains("layerfs --project shop workspace exec 9:/workspaces/9 --stream --"),
+        log.contains("exec -i -t spawn-exec-agent_test sh -c"),
         "{log}"
     );
-    assert!(log.contains("tmux new-session"), "{log}");
     assert!(log.contains("new-session"), "{log}");
-}
-
-#[test]
-fn a_killed_process_is_unavailable() {
-    let _exclusive = exclusive();
-    // `layerfs` exits 125 without JSON, so the adapter reports it as
-    // unstructured unavailability instead of inventing a refusal code.
-    let cli = LayerFsCli::new(&fixed("fake-layerfs-bare", 125, "", "boom"), "shop");
-    match cli.mount(&branch()).expect_err("bare failure") {
-        WorkspaceError::Unavailable(message) => assert!(message.contains("boom"), "{message}"),
-        WorkspaceError::Refused { code, .. } => panic!("unexpected refusal: {code}"),
-    }
-}
-
-#[test]
-fn unmount_closes_the_sandbox() {
-    let _exclusive = exclusive();
-    let cli = LayerFsCli::new(&scripted("fake-layerfs-unmount", 0, ""), "shop");
-    cli.unmount(&workspace()).expect("unmount succeeds");
+    assert!(log.contains("-c /tmp"), "{log}");
 }
 
 /// tmux must exist: a silent skip would hide a broken host.
 #[test]
 fn tmux_is_installed() {
     let _exclusive = exclusive();
-    let status = Command::new("/usr/bin/tmux")
+    let status = Command::new("tmux")
         .arg("-V")
         .status()
         .expect("tmux is installed on the test machine");
