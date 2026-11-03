@@ -29,7 +29,35 @@ fn input() -> JudgeInput {
         turn: None,
         last_error: None,
         evidence_seq: spawn_core::event::SessionSeq(1),
+        ambiguity: None,
+        quiet_ms: None,
+        task: None,
+        screen_tail: None,
     }
+}
+
+/// A live three-question answer, captured from jev-1.14.0 on 2026-11-04.
+const THREE_ANSWERS: &str = r#"{"model":"jev-1.14.0","answers":{"semantic_state":{"type":"choice","choice":"BLOCKED","confidence":0.77,"probabilities":{"WORKING":0.0,"WAITING":0.18,"BLOCKED":0.82,"COMPLETED":0.0,"UNKNOWN":0.0}},"needs_human":{"type":"noul","noul":0.96},"stuck":{"type":"noul","noul":0.22}},"usage":{"input_tokens":550,"output_tokens":98}}"#;
+
+#[test]
+fn reply_carries_the_distribution_and_both_yes_no_answers() {
+    let judgement = parse_reply(THREE_ANSWERS).expect("three answers parse");
+    assert_eq!(judgement.state, SemanticState::Blocked);
+    let distribution = judgement.probabilities.expect("a distribution");
+    assert!(
+        (distribution[2] - 0.82).abs() < 1e-9,
+        "BLOCKED is the third state"
+    );
+    assert_eq!(judgement.needs_human, Some(0.96));
+    assert_eq!(judgement.stuck, Some(0.22));
+}
+
+#[test]
+fn request_asks_the_state_and_two_yes_no_questions() {
+    let body = build_request(&input());
+    let value: Value = serde_json::from_str(&body).expect("request is JSON");
+    assert_eq!(value["questions"]["needs_human"]["type"], "noul");
+    assert_eq!(value["questions"]["stuck"]["type"], "noul");
 }
 
 /// One-shot stub: accepts a single request, replies, returns base URL and the

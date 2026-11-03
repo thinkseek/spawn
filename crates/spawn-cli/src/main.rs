@@ -31,6 +31,7 @@ use spawn_host::{GitWorkspace, TmuxHost, docker_prefix};
 use spawn_jev::{JevConfig, JevJudge};
 use spawn_postgres::PostgresStore;
 
+mod context;
 mod evolve;
 mod serve;
 mod trace;
@@ -228,7 +229,13 @@ fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         workspaces = Arc::new(Timed(workspaces));
         terminals = Arc::new(Timed(terminals));
     }
-    let mut bridge = Bridge::new(Arc::clone(&log), queue, workspaces, terminals, config);
+    let mut bridge = Bridge::new(
+        Arc::clone(&log),
+        queue,
+        workspaces,
+        Arc::clone(&terminals),
+        config,
+    );
     trace::time("bridge.recover", || bridge.recover()).map_err(|error| error.to_string())?;
 
     let mut judge: Arc<dyn StateJudge> = match flags
@@ -247,7 +254,8 @@ fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     if tracing {
         judge = Arc::new(Timed(judge));
     }
-    let mut observer = Observer::new(log, judge);
+    let context = context::HostContext::new(open_store()?, terminals);
+    let mut observer = Observer::new(log, judge).with_context(Arc::new(context));
     trace::time("observer.recover", || observer.recover()).map_err(|error| error.to_string())?;
     Ok((bridge, observer))
 }

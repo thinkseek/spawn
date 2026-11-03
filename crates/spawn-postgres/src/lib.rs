@@ -483,6 +483,48 @@ impl PostgresStore {
     }
 
     /// Executions of one session, newest first.
+    /// The latest task typed into a session: the prompt of its newest start,
+    /// resume or input command.
+    pub fn latest_task(&self, session: &SessionId) -> Result<Option<String>, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_opt(
+                "select coalesce(action ->> 'prompt', action ->> 'text') as task
+                   from spawn_commands
+                  where session_id = $1
+                    and action ->> 'type' in ('start', 'resume', 'input')
+                    and coalesce(action ->> 'prompt', action ->> 'text') is not null
+                  order by id desc limit 1",
+                &[&session.as_str()],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.and_then(|row| row.get("task")))
+    }
+
+    /// Terminal and workspace of a session's newest execution.
+    pub fn latest_terminal(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_opt(
+                "select kind -> 'detail' ->> 'terminal' as terminal,
+                        kind -> 'detail' ->> 'workspace' as workspace
+                   from spawn_events
+                  where session_id = $1 and event_name = 'execution.started'
+                  order by id desc limit 1",
+                &[&session.as_str()],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.and_then(|row| {
+            Some((
+                row.get::<_, Option<String>>("terminal")?,
+                row.get::<_, Option<String>>("workspace")?,
+            ))
+        }))
+    }
+
     pub fn executions(&self, session: &SessionId) -> Result<Vec<ExecutionRow>, StoreError> {
         let rows = self
             .lock()

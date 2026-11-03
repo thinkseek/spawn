@@ -296,9 +296,17 @@ fn tmux_starts_in_the_launch_directory() {
     started.arguments = vec!["-c".to_string(), "pwd; exec cat".to_string()];
     started.cwd = "/tmp".to_string();
     start_session(&host, &started).expect("start succeeds");
-    let pane = host
-        .capture_tail(&name, &workspace(), 20)
-        .expect("capture succeeds");
+    // The shell prints after tmux returns; poll instead of racing it.
+    let mut pane = String::new();
+    for _ in 0..50 {
+        pane = host
+            .capture_tail(&name, &workspace(), 20)
+            .expect("capture succeeds");
+        if pane.contains("/tmp") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
     assert!(pane.contains("/tmp"), "pane: {pane}");
     host.terminate(&name, &workspace()).expect("clean up");
 }
