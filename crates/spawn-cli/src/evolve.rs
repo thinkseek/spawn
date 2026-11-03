@@ -486,6 +486,7 @@ struct GateVerdict {
 }
 
 /// Why the gate produced no verdict.
+#[derive(Debug)]
 enum GateFailure {
     /// The gate ran past `GATE_WALL_CLOCK`. Infrastructure, not the candidate.
     Timeout,
@@ -649,4 +650,31 @@ fn next_open_task(directory: &Path, solved: &[u32]) -> Result<Option<Task>, Stri
     }
     tasks.sort_by_key(|task| task.id);
     Ok(tasks.into_iter().find(|task| !solved.contains(&task.id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GateFailure, run_bounded};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[test]
+    fn a_command_past_its_deadline_is_killed() {
+        let started = Instant::now();
+        let killed = run_bounded(shell("exec sleep 30"), Duration::from_millis(300));
+        assert!(matches!(killed, Err(GateFailure::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_command_inside_its_deadline_returns_its_output() {
+        let output = run_bounded(shell("echo accepted"), Duration::from_secs(10)).expect("output");
+        assert!(output.contains("accepted"));
+    }
 }
