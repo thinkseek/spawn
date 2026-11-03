@@ -16,6 +16,7 @@ use spawn_core::observation::Observation;
 use spawn_core::port::{CommandQueue, EventLog, StoreError};
 use spawn_core::time::Timestamp;
 
+mod fleet;
 mod rsi;
 pub use rsi::{
     RSI_AGENT, RSI_SESSION, RsiAttempt, RsiCommand, RsiIteration, RsiIterationRow, RsiState,
