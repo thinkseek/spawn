@@ -46,8 +46,19 @@ pub fn endpoint(base_url: &str) -> String {
     format!("{}/v1/systemone", base_url.trim_end_matches('/'))
 }
 
-/// Request body for one snapshot.
+/// Model the hosted service answers with when the caller names none.
+///
+/// The hosted endpoint rejects a request without `model` (422, read from
+/// the live service on 2026-11-04).
+pub const DEFAULT_MODEL: &str = "jev-latest";
+
+/// Request body for one snapshot, naming [`DEFAULT_MODEL`].
 pub fn build_request(input: &JudgeInput) -> String {
+    build_request_for(input, DEFAULT_MODEL)
+}
+
+/// Request body for one snapshot, answered by `model`.
+pub fn build_request_for(input: &JudgeInput, model: &str) -> String {
     let state = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
     let mut criteria = String::from("{");
     for (index, candidate) in SemanticState::ALL.iter().enumerate() {
@@ -62,8 +73,9 @@ pub fn build_request(input: &JudgeInput) -> String {
     }
     criteria.push('}');
     let instructions = serde_json::to_string(INSTRUCTIONS).unwrap_or_default();
+    let model = serde_json::to_string(model).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "{{\"state\":{state},\"questions\":{{\"{QUESTION}\":{{\"type\":\"choice\",\"instructions\":{instructions},\"criteria\":{criteria}}}}}}}"
+        "{{\"model\":{model},\"state\":{state},\"questions\":{{\"{QUESTION}\":{{\"type\":\"choice\",\"instructions\":{instructions},\"criteria\":{criteria}}}}}}}"
     )
 }
 
@@ -114,6 +126,8 @@ pub struct JevConfig {
     pub base_url: String,
     /// Whole request timeout.
     pub timeout: Duration,
+    /// Model named in every request.
+    pub model: String,
 }
 
 impl JevConfig {
@@ -122,6 +136,7 @@ impl JevConfig {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             timeout: Duration::from_secs(10),
+            model: DEFAULT_MODEL.to_string(),
         }
     }
 }
@@ -145,7 +160,7 @@ impl StateJudge for JevJudge {
     }
 
     fn judge(&self, input: &JudgeInput) -> Result<Judgement, JudgeError> {
-        let body = build_request(input);
+        let body = build_request_for(input, &self.config.model);
         let text = post_json(&endpoint(&self.config.base_url), &body, self.config.timeout)
             .map_err(JudgeError::Unavailable)?;
         parse_reply(&text)

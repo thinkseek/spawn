@@ -235,7 +235,13 @@ fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         .get("judge-url")
         .or_else(|| env_value("SPAWN_JUDGE_URL"))
     {
-        Some(url) => Arc::new(JevJudge::new(JevConfig::new(&url))),
+        Some(url) => {
+            let mut config = JevConfig::new(&url);
+            if let Some(model) = env_value("SPAWN_JUDGE_MODEL") {
+                config.model = model;
+            }
+            Arc::new(JevJudge::new(config))
+        }
         None => Arc::new(HeuristicJudge),
     };
     if tracing {

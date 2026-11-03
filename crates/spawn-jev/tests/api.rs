@@ -97,6 +97,10 @@ fn request_names_one_choice_question_in_declaration_order() {
     let body = build_request(&input());
     let value: Value = serde_json::from_str(&body).expect("request is JSON");
     assert_eq!(value["state"]["agent_id"], "agent_one");
+    assert_eq!(
+        value["model"], "jev-latest",
+        "the hosted service requires a model"
+    );
     let question = &value["questions"]["semantic_state"];
     assert_eq!(question["type"], "choice");
     assert!(question["criteria"].is_object(), "criteria is an object");
