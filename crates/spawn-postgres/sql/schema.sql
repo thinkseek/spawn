@@ -268,7 +268,9 @@ select distinct on (e.session_id)
     (e.kind -> 'detail' -> 'observation' ->> 'based_on_seq')::bigint as based_on_seq,
     e.kind -> 'detail' -> 'observation' ->> 'judge'      as judge,
     e.session_seq,
-    e.recorded_at_ms
+    e.recorded_at_ms,
+    e.id as event_id,
+    e.kind -> 'detail' -> 'observation' as observation
 from spawn_events e
 where e.event_name = 'observation.recorded'
 order by e.session_id, e.session_seq desc;
@@ -284,7 +286,24 @@ select
     e.event_name,
     e.kind -> 'detail' as detail,
     e.recorded_at_ms
-from spawn_events e;
+from spawn_events e
+where e.source <> 'observer';
+
+-- Judgements are read apart from the timeline: they describe the session
+-- instead of being part of it.
+create or replace view agent_judgements as
+select
+    e.session_id,
+    e.session_seq,
+    e.id as event_id,
+    e.agent_id,
+    e.kind -> 'detail' -> 'observation' ->> 'state'  as state,
+    e.kind -> 'detail' -> 'observation' ->> 'reason' as reason,
+    (e.kind -> 'detail' -> 'observation' ->> 'based_on_seq')::bigint as based_on_seq,
+    e.kind -> 'detail' -> 'observation' as observation,
+    e.recorded_at_ms
+from spawn_events e
+where e.event_name = 'observation.recorded';
 
 create or replace view agent_tasks as
 select
@@ -321,7 +340,9 @@ select
           and r.session_id = s.session_id
           and r.execution_id = s.execution_id
           and r.source <> 'bridge'
-    ) as exit_reported
+    ) as exit_reported,
+    x.recorded_at_ms - s.recorded_at_ms as duration_ms,
+    (s.kind -> 'detail' ->> 'command_id')::bigint as command_id
 from spawn_events s
 left join lateral (
     select e.kind, e.recorded_at_ms
@@ -358,12 +379,95 @@ select
 from spawn_events e
 where e.event_name = 'session.linked';
 
+-- One row per (session, ancestor). Depth 1 is the parent.
+-- ponytail: the depth cap of 64 stops a link cycle; reject cycles at write
+-- time if a deeper tree appears.
+create or replace view agent_lineage as
+with recursive parent as (
+    select distinct on (r.session_id) r.session_id, r.agent_id, r.parent_session_id
+    from agent_relations r
+    order by r.session_id, r.recorded_at_ms desc
+), chain (session_id, agent_id, ancestor_session_id, depth) as (
+    select p.session_id, p.agent_id, p.parent_session_id, 1
+    from parent p
+    union all
+    select c.session_id, c.agent_id, p.parent_session_id, c.depth + 1
+    from chain c
+    join parent p on p.session_id = c.ancestor_session_id
+    where c.depth < 64
+)
+select session_id, agent_id, ancestor_session_id, depth from chain;
+
+-- Events of one command: its gateway events and every event of the
+-- execution it created.
+create or replace view agent_task_events as
+select
+    coalesce((e.kind -> 'detail' ->> 'command_id')::bigint,
+             (s.kind -> 'detail' ->> 'command_id')::bigint) as command_id,
+    e.session_id,
+    e.agent_id,
+    e.session_seq,
+    e.id as event_id,
+    e.execution_id,
+    e.event_name,
+    e.recorded_at_ms
+from spawn_events e
+left join spawn_events s
+    on s.event_name = 'execution.started'
+   and s.session_id = e.session_id
+   and s.execution_id = e.execution_id
+where e.event_name in ('command.accepted', 'command.finished') or s.id is not null;
+
+-- Tool calls started and not completed or failed, in executions the Bridge
+-- has not ended.
+create or replace view agent_open_tools as
+select
+    s.session_id,
+    s.agent_id,
+    s.execution_id,
+    s.kind -> 'detail' ->> 'tool_use_id' as tool_use_id,
+    s.kind -> 'detail' ->> 'tool_name'   as tool_name,
+    s.session_seq,
+    s.recorded_at_ms as started_at_ms
+from spawn_events s
+where s.event_name = 'tool.started'
+  and not exists (
+      select 1 from spawn_events c
+      where c.session_id = s.session_id
+        and c.event_name in ('tool.completed', 'tool.failed')
+        and c.kind -> 'detail' ->> 'tool_use_id' = s.kind -> 'detail' ->> 'tool_use_id'
+  )
+  and not exists (
+      select 1 from spawn_events x
+      where x.session_id = s.session_id
+        and x.event_name = 'execution.ended'
+        and x.source = 'bridge'
+        and x.execution_id = s.execution_id
+  );
+
+-- Position of the log per session. This is not judgement lag; see
+-- docs/view-architecture.md section 4.1.
+create or replace view agent_freshness as
+select
+    e.session_id,
+    min(e.agent_id) as agent_id,
+    max(e.session_seq) as last_session_seq,
+    max(e.id) as last_event_id,
+    max(e.recorded_at_ms) as last_event_at_ms,
+    count(*) as event_count
+from spawn_events e
+group by e.session_id;
+
 -- Views are public; the raw tables and writes stay with the owner. The
 -- gateway trigger runs as the owner and checks `session_user` against
 -- `spawn_grants`.
 revoke all on spawn_events, spawn_commands, spawn_grants from public;
-grant select on agent_state, agent_timeline, agent_tasks,
-    agent_executions, agent_artifacts, agent_relations
+-- ponytail: the views stay public next to the grant-filtered
+-- `spawn_read_*` functions below, so current SQL readers keep working.
+-- For multi-tenant use, revoke select on these views from public.
+grant select on agent_state, agent_timeline, agent_judgements, agent_tasks,
+    agent_task_events, agent_executions, agent_artifacts, agent_relations,
+    agent_lineage, agent_open_tools, agent_freshness
     to public;
 grant insert on agent_commands to public;
 
@@ -381,5 +485,33 @@ begin
         'alter function spawn_gateway_insert() set search_path = %I, pg_temp',
         current_schema()
     );
+end
+$$;
+
+-- Grant-filtered readers: `spawn_read_<view>()` for the views that list
+-- sessions, `spawn_read_<view>(session_id)` for per-session views. Each
+-- returns the rows whose agent `session_user` holds a grant for.
+do $$
+declare
+    v_view text;
+    v_filter constant text :=
+        'exists (select 1 from spawn_grants g where g.principal = session_user::text'
+        ' and g.agent_id in (r.agent_id, ''*''))';
+begin
+    foreach v_view in array array['state', 'tasks', 'relations', 'freshness'] loop
+        execute format(
+            'create or replace function spawn_read_%1$s() returns setof agent_%1$s'
+            ' language sql stable security definer set search_path = %2$I, pg_temp'
+            ' as $f$ select r.* from agent_%1$s r where %3$s $f$',
+            v_view, current_schema(), v_filter);
+    end loop;
+    foreach v_view in array array['timeline', 'judgements', 'executions', 'artifacts',
+                                  'task_events', 'lineage', 'open_tools'] loop
+        execute format(
+            'create or replace function spawn_read_%1$s(p_session text) returns setof agent_%1$s'
+            ' language sql stable security definer set search_path = %2$I, pg_temp'
+            ' as $f$ select r.* from agent_%1$s r where r.session_id = p_session and %3$s $f$',
+            v_view, current_schema(), v_filter);
+    end loop;
 end
 $$;

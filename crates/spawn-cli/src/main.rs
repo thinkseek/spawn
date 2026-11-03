@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use spawn_core::bridge::{Bridge, BridgeConfig};
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::{EndCause, EventKind, GlobalPosition, NewEvent, Source};
+use spawn_core::event::{EndCause, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, ExecutionId, IdempotencyKey, Principal, SessionId};
 use spawn_core::ingest::{claude_hook, codex_line};
 use spawn_core::observe::{HeuristicJudge, Observer, StateJudge};
@@ -222,33 +222,13 @@ fn cmd_tick(flags: &Flags) -> Result<i32, String> {
 }
 
 fn cmd_status(_flags: &Flags) -> Result<i32, String> {
-    const PAGE: usize = 1000;
-    // ponytail: scans the whole log; read the `agent_state` view once the
-    // log outgrows one pass. The cap bounds the scan at 10 million events.
-    const MAX_PAGES: usize = 10_000;
     let store = open_store()?;
-    let mut last: HashMap<String, String> = HashMap::new();
-    let mut cursor = GlobalPosition(0);
-    for _ in 0..MAX_PAGES {
-        let events = store
-            .read_global(cursor, PAGE)
-            .map_err(|error| error.to_string())?;
-        for record in &events {
-            if record.event.kind.name() == "observation.recorded" {
-                let kind =
-                    serde_json::to_string(&record.event.kind).unwrap_or_else(|_| "{}".to_string());
-                last.insert(record.event.session_id.to_string(), kind);
-            }
-        }
-        match events.last() {
-            Some(record) if events.len() == PAGE => cursor = record.position,
-            _ => break,
-        }
-    }
-    let mut lines: Vec<_> = last.into_iter().collect();
-    lines.sort();
-    for (session, line) in lines {
-        println!("{session}\t{line}");
+    for state in store.states().map_err(|error| error.to_string())? {
+        let kind = EventKind::ObservationRecorded {
+            observation: state.observation,
+        };
+        let line = serde_json::to_string(&kind).unwrap_or_else(|_| "{}".to_string());
+        println!("{}\t{line}", state.session_id);
     }
     Ok(0)
 }

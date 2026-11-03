@@ -12,6 +12,7 @@ use spawn_core::event::{
     Appended, EventKind, EventRecord, GlobalPosition, NewEvent, SessionSeq, Source,
 };
 use spawn_core::id::{AgentId, CommandId, ExecutionId, Principal, SessionId};
+use spawn_core::observation::Observation;
 use spawn_core::port::{CommandQueue, EventLog, StoreError};
 use spawn_core::time::Timestamp;
 
@@ -270,5 +271,272 @@ impl CommandQueue for PostgresStore {
             }),
             other => Err(StoreError::Backend(format!("finish returned {other}"))),
         }
+    }
+}
+
+/// Current judgement of one session, from `agent_state`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionState {
+    /// Session.
+    pub session_id: SessionId,
+    /// Agent that owns the session.
+    pub agent_id: AgentId,
+    /// Latest judgement.
+    pub observation: Observation,
+    /// Sequence of the observation event.
+    pub session_seq: SessionSeq,
+    /// Global position of the observation event.
+    pub event_id: GlobalPosition,
+    /// Time the observation was recorded.
+    pub recorded_at: Timestamp,
+}
+
+/// One non-Observer event, from `agent_timeline`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineEntry {
+    /// Sequence in the session; the keyset cursor.
+    pub session_seq: SessionSeq,
+    /// Global position.
+    pub event_id: GlobalPosition,
+    /// Execution the event belongs to.
+    pub execution_id: Option<ExecutionId>,
+    /// Writer of the event.
+    pub source: Source,
+    /// Dotted event name.
+    pub event_name: String,
+    /// Event payload without the name.
+    pub detail: Option<serde_json::Value>,
+    /// Time the event was recorded.
+    pub recorded_at: Timestamp,
+}
+
+/// One execution, from `agent_executions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRow {
+    /// Execution.
+    pub execution_id: ExecutionId,
+    /// Command that created it.
+    pub command_id: Option<CommandId>,
+    /// Engine wire name.
+    pub engine: Option<String>,
+    /// Start time.
+    pub started_at: Timestamp,
+    /// Time the Bridge ended it; `None` while it runs.
+    pub ended_at: Option<Timestamp>,
+    /// End cause wire name.
+    pub cause: Option<String>,
+    /// Process exit code.
+    pub exit_code: Option<i32>,
+    /// The runner reported an engine exit.
+    pub exit_reported: bool,
+    /// `ended_at - started_at` in milliseconds.
+    pub duration_ms: Option<i64>,
+}
+
+/// One tool call without a result, from `agent_open_tools`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTool {
+    /// Execution of the call.
+    pub execution_id: Option<ExecutionId>,
+    /// Engine tool call identifier.
+    pub tool_use_id: String,
+    /// Engine tool name.
+    pub tool_name: Option<String>,
+    /// Sequence of the start event.
+    pub session_seq: SessionSeq,
+    /// Start time.
+    pub started_at: Timestamp,
+}
+
+/// Position of a session's log, from `agent_freshness`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Freshness {
+    /// Highest session sequence.
+    pub last_session_seq: SessionSeq,
+    /// Highest global position.
+    pub last_event_id: GlobalPosition,
+    /// Time of the latest event.
+    pub last_event_at: Timestamp,
+    /// Number of events.
+    pub event_count: u64,
+}
+
+fn corrupt(error: impl std::fmt::Display) -> StoreError {
+    StoreError::Corrupt(error.to_string())
+}
+
+fn seq(row: &Row, column: &str) -> SessionSeq {
+    SessionSeq(row.get::<_, i64>(column).unsigned_abs())
+}
+
+fn position(row: &Row, column: &str) -> GlobalPosition {
+    GlobalPosition(row.get::<_, i64>(column).unsigned_abs())
+}
+
+fn execution(row: &Row) -> Result<Option<ExecutionId>, StoreError> {
+    row.get::<_, Option<String>>("execution_id")
+        .map(ExecutionId::new)
+        .transpose()
+        .map_err(corrupt)
+}
+
+fn state_from_row(row: &Row) -> Result<SessionState, StoreError> {
+    Ok(SessionState {
+        session_id: SessionId::new(row.get::<_, String>("session_id")).map_err(corrupt)?,
+        agent_id: AgentId::new(row.get::<_, String>("agent_id")).map_err(corrupt)?,
+        observation: serde_json::from_value(row.get("observation")).map_err(corrupt)?,
+        session_seq: seq(row, "session_seq"),
+        event_id: position(row, "event_id"),
+        recorded_at: Timestamp(row.get("recorded_at_ms")),
+    })
+}
+
+/// Read side. The queries go through the `agent_*` views, so the SQL
+/// definitions stay the one source of each fold.
+///
+/// ponytail: methods on the store, no port; promote to a trait when a second
+/// reader (for example an HTTP read service) appears.
+impl PostgresStore {
+    /// Current judgement of every session, ordered by session.
+    pub fn states(&self) -> Result<Vec<SessionState>, StoreError> {
+        let rows = self
+            .lock()
+            .query(
+                "select session_id, agent_id, observation, session_seq, event_id, recorded_at_ms
+                   from agent_state order by session_id",
+                &[],
+            )
+            .map_err(|error| backend(&error))?;
+        rows.iter().map(state_from_row).collect()
+    }
+
+    /// Current judgement of one session.
+    pub fn state(&self, session: &SessionId) -> Result<Option<SessionState>, StoreError> {
+        let row = self
+            .lock()
+            .query_opt(
+                "select session_id, agent_id, observation, session_seq, event_id, recorded_at_ms
+                   from agent_state where session_id = $1",
+                &[&session.as_str()],
+            )
+            .map_err(|error| backend(&error))?;
+        row.as_ref().map(state_from_row).transpose()
+    }
+
+    /// Up to `limit` timeline entries after `after`, in sequence order.
+    pub fn timeline(
+        &self,
+        session: &SessionId,
+        after: SessionSeq,
+        limit: usize,
+    ) -> Result<Vec<TimelineEntry>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let after = i64::try_from(after.0).unwrap_or(i64::MAX);
+        let rows = self
+            .lock()
+            .query(
+                "select session_seq, id, execution_id, source, event_name, detail, recorded_at_ms
+                   from agent_timeline
+                  where session_id = $1 and session_seq > $2
+                  order by session_seq
+                  limit $3",
+                &[&session.as_str(), &after, &limit],
+            )
+            .map_err(|error| backend(&error))?;
+        rows.iter()
+            .map(|row| {
+                let source: String = row.get("source");
+                Ok(TimelineEntry {
+                    session_seq: seq(row, "session_seq"),
+                    event_id: position(row, "id"),
+                    execution_id: execution(row)?,
+                    source: Source::parse(&source)
+                        .ok_or_else(|| corrupt(format!("unknown source {source}")))?,
+                    event_name: row
+                        .get::<_, Option<String>>("event_name")
+                        .unwrap_or_default(),
+                    detail: row.get("detail"),
+                    recorded_at: Timestamp(row.get("recorded_at_ms")),
+                })
+            })
+            .collect()
+    }
+
+    /// Executions of one session, newest first.
+    pub fn executions(&self, session: &SessionId) -> Result<Vec<ExecutionRow>, StoreError> {
+        let rows = self
+            .lock()
+            .query(
+                "select execution_id, command_id, engine, started_at_ms, ended_at_ms, cause,
+                        exit_code, exit_reported, duration_ms
+                   from agent_executions
+                  where session_id = $1
+                  order by started_at_ms desc, execution_id",
+                &[&session.as_str()],
+            )
+            .map_err(|error| backend(&error))?;
+        rows.iter()
+            .map(|row| {
+                Ok(ExecutionRow {
+                    execution_id: execution(row)?
+                        .ok_or_else(|| corrupt("execution.started without execution_id"))?,
+                    command_id: row
+                        .get::<_, Option<i64>>("command_id")
+                        .map(|id| CommandId(id.unsigned_abs())),
+                    engine: row.get("engine"),
+                    started_at: Timestamp(row.get("started_at_ms")),
+                    ended_at: row.get::<_, Option<i64>>("ended_at_ms").map(Timestamp),
+                    cause: row.get("cause"),
+                    exit_code: row.get("exit_code"),
+                    exit_reported: row.get("exit_reported"),
+                    duration_ms: row.get("duration_ms"),
+                })
+            })
+            .collect()
+    }
+
+    /// Tool calls of one session that have no result, in sequence order.
+    pub fn open_tools(&self, session: &SessionId) -> Result<Vec<OpenTool>, StoreError> {
+        let rows = self
+            .lock()
+            .query(
+                "select execution_id, tool_use_id, tool_name, session_seq, started_at_ms
+                   from agent_open_tools
+                  where session_id = $1
+                  order by session_seq",
+                &[&session.as_str()],
+            )
+            .map_err(|error| backend(&error))?;
+        rows.iter()
+            .map(|row| {
+                Ok(OpenTool {
+                    execution_id: execution(row)?,
+                    tool_use_id: row
+                        .get::<_, Option<String>>("tool_use_id")
+                        .ok_or_else(|| corrupt("tool.started without tool_use_id"))?,
+                    tool_name: row.get("tool_name"),
+                    session_seq: seq(row, "session_seq"),
+                    started_at: Timestamp(row.get("started_at_ms")),
+                })
+            })
+            .collect()
+    }
+
+    /// Position of one session's log; `None` when it has no events.
+    pub fn freshness(&self, session: &SessionId) -> Result<Option<Freshness>, StoreError> {
+        let row = self
+            .lock()
+            .query_opt(
+                "select last_session_seq, last_event_id, last_event_at_ms, event_count
+                   from agent_freshness where session_id = $1",
+                &[&session.as_str()],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.map(|row| Freshness {
+            last_session_seq: seq(&row, "last_session_seq"),
+            last_event_id: position(&row, "last_event_id"),
+            last_event_at: Timestamp(row.get("last_event_at_ms")),
+            event_count: row.get::<_, i64>("event_count").unsigned_abs(),
+        }))
     }
 }
