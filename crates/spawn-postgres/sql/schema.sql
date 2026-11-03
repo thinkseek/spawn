@@ -5,6 +5,18 @@
 -- "id order equals commit order" true, which lets a global reader store its
 -- last position and never skip an event.
 
+-- A connection whose search_path names a schema that does not exist yet
+-- (an isolated test run) gets it created, so everything below lands there.
+do $$
+declare
+    v_first text := trim(both ' "' from split_part(current_setting('search_path'), ',', 1));
+begin
+    if current_schema() is null and v_first <> '' and v_first not like '%$user%' then
+        execute format('create schema if not exists %I', v_first);
+    end if;
+end
+$$;
+
 create or replace function spawn_now_ms() returns bigint
 language sql volatile as $$
     select (extract(epoch from clock_timestamp()) * 1000)::bigint
@@ -471,7 +483,8 @@ select
     c.error,
     c.created_at_ms,
     c.finished_at_ms,
-    coalesce(c.action ->> 'prompt', c.action ->> 'text') as prompt
+    coalesce(c.action ->> 'prompt', c.action ->> 'text') as prompt,
+    c.principal
 from spawn_commands c;
 
 create or replace view agent_executions as
