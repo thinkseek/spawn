@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::event::{
@@ -68,7 +68,12 @@ pub enum JudgeError {
 }
 
 /// Facts one judgement uses. The shape is the judge's input contract.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// It is stored as the evidence of every model judgement and read back for
+/// replay, so every field defaults: a row written before a field existed
+/// still replays.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JudgeInput {
     /// Owning agent.
     pub agent_id: String,
@@ -107,7 +112,7 @@ pub struct JudgeInput {
 }
 
 /// How the latest turn ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnFact {
     /// The model finished a turn.
@@ -342,14 +347,29 @@ pub fn needs_attention(
     confidence: Confidence,
     judgement: &Judgement,
 ) -> bool {
-    if matches!(state, SemanticState::Blocked | SemanticState::Unknown)
-        || judgement.needs_human.is_some_and(|value| value >= LIKELY)
-        || judgement.stuck.is_some_and(|value| value >= LIKELY)
-    {
-        return true;
+    attention_reason(ambiguity, state, confidence, judgement).is_some()
+}
+
+/// Why [`needs_attention`] holds, in one word, or `None`.
+pub fn attention_reason(
+    ambiguity: Option<Ambiguity>,
+    state: SemanticState,
+    confidence: Confidence,
+    judgement: &Judgement,
+) -> Option<&'static str> {
+    match state {
+        SemanticState::Blocked => return Some("blocked"),
+        SemanticState::Unknown => return Some("unknown"),
+        _ => {}
+    }
+    if judgement.needs_human.is_some_and(|value| value >= LIKELY) {
+        return Some("needs_human");
+    }
+    if judgement.stuck.is_some_and(|value| value >= LIKELY) {
+        return Some("stuck");
     }
     let Some(probabilities) = judgement.probabilities else {
-        return confidence.value() < CONFIDENT;
+        return (confidence.value() < CONFIDENT).then_some("low_confidence");
     };
     let allowed = ambiguity.map_or(&SemanticState::ALL[..], Ambiguity::allowed);
     let weight = |candidate: &SemanticState| {
@@ -361,14 +381,36 @@ pub fn needs_attention(
     let total: f64 = allowed.iter().map(weight).sum();
     let everything: f64 = SemanticState::ALL.iter().map(weight).sum();
     if total <= 0.0 || total < everything * LIKELY {
-        return true;
+        return Some("disagreement");
     }
     let risky: f64 = allowed
         .iter()
         .filter(|candidate| matches!(candidate, SemanticState::Blocked | SemanticState::Unknown))
         .map(weight)
         .sum();
-    risky / total >= LIKELY
+    (risky / total >= LIKELY).then_some("risky")
+}
+
+/// For a session that never ends (the supervisor), COMPLETED only means it
+/// waits for its next instruction: fold that mass into WAITING.
+fn fold_completed(judgement: &Judgement) -> Judgement {
+    let index = |wanted: SemanticState| {
+        SemanticState::ALL
+            .iter()
+            .position(|state| *state == wanted)
+            .unwrap_or(0)
+    };
+    let mut folded = *judgement;
+    if let Some(mut probabilities) = folded.probabilities {
+        let (waiting, completed) = (index(SemanticState::Waiting), index(SemanticState::Completed));
+        probabilities[waiting] += probabilities[completed];
+        probabilities[completed] = 0.0;
+        folded.probabilities = Some(probabilities);
+    }
+    if folded.state == SemanticState::Completed {
+        folded.state = SemanticState::Waiting;
+    }
+    folded
 }
 
 /// Context the model judge needs and the log does not hold.
@@ -378,21 +420,33 @@ pub trait ObservationContext: Send + Sync {
 
     /// The latest task typed into the session.
     fn task(&self, session: &SessionId) -> Option<String>;
+
+    /// Whether the session is meant never to end (the supervisor). Its
+    /// COMPLETED is read as WAITING.
+    fn perpetual(&self, _session: &SessionId) -> bool {
+        false
+    }
 }
 
 /// Whether the screen ends with a question for a person: a line that starts
 /// with `HUMAN:` (after an optional `claude:` speaker tag), below the last
 /// line the user typed. An answered question no longer counts.
 pub fn asks_human(screen_tail: &str) -> bool {
+    human_question(screen_tail).is_some()
+}
+
+/// The last unanswered `HUMAN:` question on the screen, without the tag.
+pub fn human_question(screen_tail: &str) -> Option<String> {
     let lines: Vec<&str> = screen_tail.lines().collect();
     let start = lines
         .iter()
         .rposition(|line| line.trim_start().starts_with("you:"))
         .map_or(0, |index| index + 1);
-    lines[start..].iter().any(|line| {
+    lines[start..].iter().rev().find_map(|line| {
         let text = line.trim_start();
         let text = text.strip_prefix("claude:").map_or(text, str::trim_start);
-        text.starts_with("HUMAN:")
+        text.strip_prefix("HUMAN:")
+            .map(|question| head_chars(question.trim(), 300))
     })
 }
 
@@ -502,6 +556,16 @@ impl Snapshot {
                 }
             }
             EventKind::MessageReceived => {
+                self.turn = None;
+            }
+            // The Bridge reads the pane as ready only right before it types
+            // input. A command that then succeeds delivered that input: the
+            // ready screen is consumed and a new turn begins, even though the
+            // engine's own hook for it may land a moment later.
+            EventKind::CommandFinished {
+                succeeded: true, ..
+            } if self.screen == Some(ScreenState::Ready) => {
+                self.screen = None;
                 self.turn = None;
             }
             _ => {}
@@ -773,6 +837,9 @@ impl Observer {
                     "rules",
                 );
                 observation.attention = state == SemanticState::Blocked;
+                if observation.attention {
+                    observation.attention_reason = Some("permission".to_string());
+                }
                 (observation, None, 0)
             }
             RulesVerdict::Ambiguous { ambiguity, guess } => {
@@ -794,10 +861,16 @@ impl Observer {
                     }
                     return Ok(0);
                 }
-                let (mut observation, failed) = self.ask_model(&input, ambiguity, guess, seq);
-                if input.screen_tail.as_deref().is_some_and(asks_human) {
-                    observation.asks_human = true;
+                let perpetual = self
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| context.perpetual(session));
+                let (mut observation, failed) =
+                    self.ask_model(&input, ambiguity, guess, seq, perpetual);
+                if let Some(question) = input.screen_tail.as_deref().and_then(human_question) {
+                    observation.human_question = Some(question);
                     observation.attention = true;
+                    observation.attention_reason = Some("human_question".to_string());
                 }
                 if failed {
                     (observation, previous_ask, failures.saturating_add(1))
@@ -843,6 +916,7 @@ impl Observer {
         ambiguity: Ambiguity,
         guess: SemanticState,
         seq: SessionSeq,
+        perpetual: bool,
     ) -> (Observation, bool) {
         let started = Instant::now();
         let answer = self.judge.judge(input);
@@ -860,8 +934,16 @@ impl Observer {
             observation.rules_state = Some(guess);
             observation.latency_ms = Some(latency);
             observation.attention = true;
+            observation.attention_reason = Some("judge_unavailable".to_string());
             observation.evidence = evidence;
             return (observation, true);
+        };
+        // The raw answer is stored; the folded one is what counts.
+        let raw = judgement;
+        let judgement = if perpetual {
+            fold_completed(&raw)
+        } else {
+            raw
         };
         let (state, confidence) = narrow(ambiguity, guess, &judgement);
         let mut observation = Observation::basic(
@@ -873,7 +955,7 @@ impl Observer {
         );
         observation.ambiguity = Some(ambiguity);
         observation.rules_state = Some(guess);
-        observation.probabilities = judgement.probabilities.map(|values| {
+        observation.probabilities = raw.probabilities.map(|values| {
             SemanticState::ALL
                 .iter()
                 .zip(values)
@@ -885,9 +967,12 @@ impl Observer {
         observation.latency_ms = Some(latency);
         // A process that exited with a failing status gets a look whatever
         // the model says about it.
-        observation.attention = needs_attention(Some(ambiguity), state, confidence, &judgement)
-            || (ambiguity == Ambiguity::ExitedOnItsOwn
-                && input.exit_code.is_some_and(|code| code != 0));
+        let failing_exit =
+            ambiguity == Ambiguity::ExitedOnItsOwn && input.exit_code.is_some_and(|code| code != 0);
+        let reason = attention_reason(Some(ambiguity), state, confidence, &judgement)
+            .or(failing_exit.then_some("failing_exit"));
+        observation.attention = reason.is_some();
+        observation.attention_reason = reason.map(str::to_string);
         observation.evidence = evidence;
         (observation, false)
     }

@@ -189,11 +189,17 @@ pub struct Observation {
     /// The input the model judge saw, for audit and replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<serde_json::Value>,
-    /// The agent's screen ends with a question for a person (a line that
+    /// Why `attention` is set, in one word: `permission`, `blocked`,
+    /// `unknown`, `needs_human`, `stuck`, `risky`, `disagreement`,
+    /// `low_confidence`, `judge_unavailable`, `failing_exit`, or
+    /// `human_question`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_reason: Option<String>,
+    /// The question for a person the agent's screen ends with (a line that
     /// starts with `HUMAN:` after the last input). A rule over evidence: it
     /// asks for attention whatever the model says.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub asks_human: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_question: Option<String>,
     /// Stable digest of that input. A restarted Observer does not ask the
     /// model again about evidence it already judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,7 +229,8 @@ impl Observation {
             latency_ms: None,
             attention: false,
             evidence: None,
-            asks_human: false,
+            attention_reason: None,
+            human_question: None,
             fingerprint: None,
         }
     }
