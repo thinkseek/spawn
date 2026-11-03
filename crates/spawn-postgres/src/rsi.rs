@@ -38,6 +38,19 @@ pub struct RsiState {
     pub iteration: u32,
     /// Rejections in a row, toward the halt threshold.
     pub consecutive_rejected: u32,
+    /// Scenario files the previous round saw. The next round must not fall
+    /// below it. Zero means the floor is not set yet.
+    pub scenario_count: u32,
+}
+
+/// Resource use of one iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsiBudget {
+    /// Milliseconds since the iteration started. `None` when the row was
+    /// written before `started_at_ms` existed, in which case no limit applies.
+    pub elapsed_ms: Option<i64>,
+    /// `tool.started` events recorded since the iteration started.
+    pub tool_calls: u32,
 }
 
 /// One iteration.
@@ -83,6 +96,7 @@ fn state_of(row: &Row) -> RsiState {
         baseline: row.get("baseline_commit"),
         iteration: number(row, "iteration"),
         consecutive_rejected: number(row, "consecutive_rejected"),
+        scenario_count: number(row, "scenario_count"),
     }
 }
 
@@ -125,6 +139,45 @@ impl PostgresStore {
             .query("select * from rsi_state where id = 1", &[])
             .map_err(|error| backend(&error))?;
         Ok(rows.first().map(state_of))
+    }
+
+    /// Wall clock and tool calls of one iteration.
+    ///
+    /// Both limits measure from `started_at_ms` on the database clock, so the
+    /// controller and the store cannot disagree about when the iteration
+    /// began. A row written before that column existed carries zero and
+    /// reports no elapsed time, which disables both limits.
+    pub fn rsi_iteration_budget(&self, iteration: u32) -> Result<Option<RsiBudget>, StoreError> {
+        let mut client = self.lock();
+        let rows = client
+            .query(
+                "select case when i.started_at_ms = 0 then null
+                             else greatest(spawn_now_ms() - i.started_at_ms, 0)
+                        end as elapsed_ms,
+                        (select count(*) from spawn_events e
+                          where e.session_id = i.session_id
+                            and e.event_name = 'tool.started'
+                            and e.recorded_at_ms >= i.started_at_ms) as tool_calls
+                   from rsi_iterations i where i.iteration = $1",
+                &[&i32::try_from(iteration).unwrap_or(i32::MAX)],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(rows.first().map(|row| RsiBudget {
+            elapsed_ms: row.get("elapsed_ms"),
+            tool_calls: u32::try_from(row.get::<_, i64>("tool_calls")).unwrap_or(u32::MAX),
+        }))
+    }
+
+    /// Record the scenario count this round saw.
+    pub fn rsi_set_scenario_count(&self, count: u32) -> Result<(), StoreError> {
+        let mut client = self.lock();
+        client
+            .execute(
+                "update rsi_state set scenario_count = $1 where id = 1",
+                &[&i32::try_from(count).unwrap_or(i32::MAX)],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(())
     }
 
     /// Seed the baseline. Harmless when a row already exists.
@@ -237,8 +290,9 @@ impl PostgresStore {
         transaction
             .execute(
                 "insert into rsi_iterations
-                     (iteration, task_id, phase, agent_id, session_id, command_id, updated_at_ms)
-                 values ($1, $2, 'Starting', $3, $4, $5, spawn_now_ms())",
+                     (iteration, task_id, phase, agent_id, session_id, command_id,
+                      started_at_ms, updated_at_ms)
+                 values ($1, $2, 'Starting', $3, $4, $5, spawn_now_ms(), spawn_now_ms())",
                 &[
                     &i32::try_from(iteration).unwrap_or(i32::MAX),
                     &i32::try_from(task_id).unwrap_or(i32::MAX),

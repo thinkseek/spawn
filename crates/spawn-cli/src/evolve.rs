@@ -11,11 +11,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use spawn_core::command::CommandAction;
+use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::Engine;
-use spawn_core::id::WorkspaceId;
-use spawn_core::port::WorkspaceStore;
+use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId, WorkspaceId};
+use spawn_core::port::{CommandQueue, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
@@ -26,6 +27,16 @@ const HALT_AFTER: u32 = 3;
 
 /// Guard the candidate tree against runaway growth.
 const MAX_PATCH_BYTES: usize = 1 << 20;
+
+/// Wall clock of one iteration, from `docs/rsi.md` §9.
+const ITERATION_WALL_CLOCK: Duration = Duration::from_mins(45);
+
+/// Tool calls one iteration may make, from `docs/rsi.md` §9.
+const ITERATION_TOOL_CALLS: u32 = 60;
+
+/// Wall clock of one gate run. Two cargo builds fit well inside it, and a
+/// hung build must not block the loop forever.
+const GATE_WALL_CLOCK: Duration = Duration::from_mins(20);
 
 /// One backlog task.
 struct Task {
@@ -67,6 +78,16 @@ pub fn evolve(flags: &Flags) -> Result<i32, String> {
         .rsi_state()
         .map_err(describe_error)?
         .ok_or_else(|| "rsi_state is not seeded".to_string())?;
+
+    // A candidate that deletes the scenario that judges it passes the gate by
+    // removing the work, so the count of scenario files may not fall.
+    if scenario_floor(&store, &scenarios, state.scenario_count)? {
+        println!(
+            "evolve: HALT: scenarios fell below {}",
+            state.scenario_count
+        );
+        return Ok(2);
+    }
 
     match store.rsi_open_iteration().map_err(describe_error)? {
         None => start_iteration(&store, &root, &state, &backlog),
@@ -180,6 +201,23 @@ fn advance_iteration(
     state: &spawn_postgres::RsiState,
     iteration: &spawn_postgres::RsiIteration,
 ) -> Result<(), String> {
+    // An iteration that runs past its budget is aborted before the next
+    // transition. Without this, one hung agent stops the loop forever.
+    if let Some(budget) = store
+        .rsi_iteration_budget(iteration.iteration)
+        .map_err(describe_error)?
+    {
+        if let Some(elapsed) = budget.elapsed_ms {
+            let millis = u64::try_from(elapsed).unwrap_or(0);
+            if Duration::from_millis(millis) > ITERATION_WALL_CLOCK {
+                return abort_iteration(store, iteration, "iteration exceeded its wall clock");
+            }
+        }
+        if budget.elapsed_ms.is_some() && budget.tool_calls > ITERATION_TOOL_CALLS {
+            return abort_iteration(store, iteration, "iteration exceeded its tool-call budget");
+        }
+    }
+
     match iteration.phase.as_str() {
         "Starting" => settle_started(store, iteration),
         "Working" => capture_candidate(store, workspaces, root, scenarios, gate, state, iteration),
@@ -316,7 +354,12 @@ fn settle_gating(
         iteration,
     ) {
         Ok(verdict) => verdict,
-        Err(error) => {
+        // A gate that never returns says nothing about the candidate, so it
+        // aborts instead of counting as a rejection.
+        Err(GateFailure::Timeout) => {
+            return abort_iteration(store, iteration, "gate exceeded its wall clock");
+        }
+        Err(GateFailure::Failed(error)) => {
             return reject_iteration(store, iteration, patch, &format!("gate failed: {error}"));
         }
     };
@@ -354,6 +397,43 @@ fn has_running_execution(
         spawn_core::id::SessionId::new(&iteration.session_id).map_err(|error| error.to_string())?;
     let executions = store.executions(&session).map_err(describe_error)?;
     Ok(executions.first().is_none_or(|row| row.ended_at.is_none()))
+}
+
+/// Close an iteration as `Aborted` and stop its agent.
+///
+/// An abort is not a rejection: the candidate was never judged, so it must not
+/// count toward `HALT_AFTER`. The stop is best effort; a failed submission
+/// only leaves the agent running, which the next iteration resumes into.
+fn abort_iteration(
+    store: &PostgresStore,
+    iteration: &spawn_postgres::RsiIteration,
+    note: &str,
+) -> Result<(), String> {
+    stop_execution(store, iteration);
+    store
+        .rsi_close_iteration(iteration.iteration, "Aborted", note)
+        .map_err(describe_error)?;
+    println!("evolve: iteration {} aborted: {note}", iteration.iteration);
+    Ok(())
+}
+
+fn stop_execution(store: &PostgresStore, iteration: &spawn_postgres::RsiIteration) {
+    let key = format!("rsi-{}-abort", iteration.iteration);
+    let submission = (|| {
+        Some(Submission {
+            agent_id: AgentId::new(iteration.agent_id.clone()).ok()?,
+            session_id: SessionId::new(iteration.session_id.clone()).ok()?,
+            idempotency_key: IdempotencyKey::new(key).ok()?,
+            action: CommandAction::Stop,
+        })
+    })();
+    let Some(submission) = submission else {
+        return;
+    };
+    let Ok(principal) = Principal::new("spawn") else {
+        return;
+    };
+    let _ = store.submit(&principal, &submission);
 }
 
 fn reject_iteration(
@@ -405,6 +485,14 @@ struct GateVerdict {
     output: String,
 }
 
+/// Why the gate produced no verdict.
+enum GateFailure {
+    /// The gate ran past `GATE_WALL_CLOCK`. Infrastructure, not the candidate.
+    Timeout,
+    /// The gate could not start or printed no verdict.
+    Failed(String),
+}
+
 fn judge_candidate(
     gate: &Path,
     workspaces: &GitWorkspace,
@@ -412,25 +500,23 @@ fn judge_candidate(
     candidate: &str,
     scenarios: &Path,
     iteration: &spawn_postgres::RsiIteration,
-) -> Result<GateVerdict, String> {
+) -> Result<GateVerdict, GateFailure> {
     let scenario = scenarios.join(format!("{:03}.sh", iteration.task_id));
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg(gate)
         .arg(workspaces.project())
         .arg(baseline)
         .arg(candidate)
-        .arg(&scenario)
-        .output()
-        .map_err(|error| format!("run {}: {error}", gate.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let line = stdout
+        .arg(&scenario);
+    let output = run_bounded(command, GATE_WALL_CLOCK)?;
+    let line = output
         .lines()
         .rev()
         .find(|line| line.trim_start().starts_with('{'))
-        .ok_or_else(|| format!("gate produced no verdict: {stderr}"))?;
-    let verdict: serde_json::Value =
-        serde_json::from_str(line).map_err(|error| format!("gate verdict: {error}"))?;
+        .ok_or_else(|| GateFailure::Failed("gate produced no verdict".to_string()))?;
+    let verdict: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| GateFailure::Failed(format!("gate verdict: {error}")))?;
     Ok(GateVerdict {
         accepted: verdict.get("verdict").and_then(|v| v.as_str()) == Some("accepted"),
         reason: verdict
@@ -438,8 +524,79 @@ fn judge_candidate(
             .and_then(|v| v.as_str())
             .unwrap_or("gate rejected the candidate")
             .to_string(),
-        output: format!("{stdout}{stderr}"),
+        output,
     })
+}
+
+/// Run a command with a wall clock, returning its combined output.
+///
+/// The child writes to files, not to pipes: a pipe that fills up would block
+/// the child while this loop waits for it to exit.
+fn run_bounded(mut command: Command, limit: Duration) -> Result<String, GateFailure> {
+    let failed = |error: std::io::Error| GateFailure::Failed(error.to_string());
+    let directory = std::env::temp_dir().join(format!("spawn-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).map_err(failed)?;
+    let out_path = directory.join("stdout");
+    let err_path = directory.join("stderr");
+    let stdout = std::fs::File::create(&out_path).map_err(failed)?;
+    let stderr = std::fs::File::create(&err_path).map_err(failed)?;
+    let mut child = command
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .map_err(failed)?;
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GateFailure::Timeout);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(error) => return Err(failed(error)),
+        }
+    }
+    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    Ok(format!("{stdout}{stderr}"))
+}
+
+/// Scenario files in the controller's checkout.
+fn count_scenarios(directory: &Path) -> Result<u32, String> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("read {}: {error}", directory.display())),
+    };
+    let mut count = 0;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("read {}: {error}", directory.display()))?
+            .path();
+        if path.extension().and_then(|text| text.to_str()) == Some("sh") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Whether the scenario count fell below the recorded floor.
+///
+/// A zero floor means no round has recorded one yet, so the current count
+/// becomes the floor.
+fn scenario_floor(store: &PostgresStore, directory: &Path, floor: u32) -> Result<bool, String> {
+    let count = count_scenarios(directory)?;
+    if floor != 0 && count < floor {
+        return Ok(true);
+    }
+    if count != floor {
+        store
+            .rsi_set_scenario_count(count)
+            .map_err(describe_error)?;
+    }
+    Ok(false)
 }
 
 fn check_halt(store: &PostgresStore) -> Result<i32, String> {

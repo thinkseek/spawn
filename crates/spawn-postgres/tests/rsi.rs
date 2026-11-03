@@ -138,3 +138,34 @@ fn a_recorded_attempt_feeds_the_next_prompt() {
         .expect("record");
     assert_eq!(store.rsi_solved_tasks().expect("solved"), vec![7]);
 }
+
+#[test]
+fn the_budget_starts_at_the_iteration_and_counts_from_there() {
+    let store = store("budget");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    store
+        .rsi_begin_iteration(7, 1, start("do the task"))
+        .expect("begin");
+
+    let budget = store
+        .rsi_iteration_budget(1)
+        .expect("budget")
+        .expect("one iteration");
+    // The start is recorded, so a clock that never started cannot excuse a
+    // runaway iteration.
+    let elapsed = budget.elapsed_ms.expect("started_at_ms is set");
+    assert!((0..60_000).contains(&elapsed), "elapsed was {elapsed}");
+    assert_eq!(budget.tool_calls, 0);
+}
+
+#[test]
+fn the_scenario_floor_round_trips() {
+    let store = store("floor");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.scenario_count, 0);
+
+    store.rsi_set_scenario_count(4).expect("set");
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.scenario_count, 4);
+}
