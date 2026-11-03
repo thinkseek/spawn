@@ -25,20 +25,41 @@ rounds=${RSI_ROUNDS:-7}
 seed=${RSI_SEED:-$(date +%s)}
 export RSI_SEED=$seed
 
+# The bench is built in a directory the scenario owns: the baseline tree's
+# manifests, lock file and build configuration, with only the tree's
+# `crates/spawn-core/src` copied in and no build script. A candidate's
+# Cargo.toml, build.rs or .cargo/ therefore cannot change what is compiled
+# or overwrite the bench (review finding: a build.rs could rewrite it).
 build() {
     tree=$1
-    cp "$bench_src" "$tree/crates/spawn-core/examples/rsi_ingest_objective.rs"
-    (cd "$tree" && CARGO_TARGET_DIR="$tree/target" cargo build -q --release \
+    name=$2
+    dir="$candidate/.rsi-bench-$name"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    (cd "$baseline" && tar -cf - --exclude=./target .) | tar -xf - -C "$dir"
+    rm -rf "$dir/crates/spawn-core/src" "$dir/.cargo"
+    find "$dir" -name build.rs -delete
+    cp -r "$tree/crates/spawn-core/src" "$dir/crates/spawn-core/src"
+    cp "$bench_src" "$dir/crates/spawn-core/examples/rsi_ingest_objective.rs"
+    (cd "$dir" && CARGO_TARGET_DIR="$dir/target" cargo build -q --release \
         -p spawn-core --example rsi_ingest_objective) || return 1
-    echo "$tree/target/release/examples/rsi_ingest_objective"
+    echo "$dir/target/release/examples/rsi_ingest_objective"
 }
 
-base_bin=$(build "$baseline") || { echo "baseline bench does not build"; exit 1; }
-cand_bin=$(build "$candidate") || { echo "candidate bench does not build"; exit 1; }
+# Exactly one `total_ns <n>` line per run; anything else fails the run, so
+# code under test cannot print its own number next to the bench's.
+measure() {
+    lines=$("$1" time 2>/dev/null | grep -E '^total_ns [0-9]+$' || true)
+    [ "$(printf '%s\n' "$lines" | grep -c .)" -eq 1 ] || { echo "bench printed no single total" >&2; return 1; }
+    printf '%s\n' "$lines" | awk '{print $2}'
+}
+
+base_bin=$(build "$baseline" base) || { echo "baseline bench does not build"; exit 1; }
+cand_bin=$(build "$candidate" cand) || { echo "candidate bench does not build"; exit 1; }
 
 # 1. Same events on the same corpus.
-"$base_bin" check >"$candidate/.rsi-check-base"
-"$cand_bin" check >"$candidate/.rsi-check-cand"
+"$base_bin" check >"$candidate/.rsi-check-base" 2>/dev/null
+"$cand_bin" check >"$candidate/.rsi-check-cand" 2>/dev/null
 if ! cmp -s "$candidate/.rsi-check-base" "$candidate/.rsi-check-cand"; then
     echo "ingest output differs from the baseline (seed $seed):"
     diff "$candidate/.rsi-check-base" "$candidate/.rsi-check-cand" | head -20
@@ -51,8 +72,8 @@ echo "equivalence: $(wc -l <"$candidate/.rsi-check-base") payloads identical (se
 : >"$candidate/.rsi-cand-times"
 i=0
 while [ "$i" -lt "$rounds" ]; do
-    "$base_bin" time | awk '{print $2}' >>"$candidate/.rsi-base-times"
-    "$cand_bin" time | awk '{print $2}' >>"$candidate/.rsi-cand-times"
+    measure "$base_bin" >>"$candidate/.rsi-base-times" || exit 1
+    measure "$cand_bin" >>"$candidate/.rsi-cand-times" || exit 1
     i=$((i + 1))
 done
 median() { sort -n "$1" | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }

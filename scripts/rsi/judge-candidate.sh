@@ -88,6 +88,16 @@ if [ -n "$touched" ]; then
     exit 0
 fi
 
+# Build scripts and cargo configuration run code at build time, on this host,
+# before any scenario judges the candidate. No task needs them; refuse them.
+buildtime=$(git --git-dir="$repo" diff --name-only "$baseline" "$candidate" \
+    | grep -E '(^|/)build\.rs$|(^|/)\.cargo/' || true)
+if [ -n "$buildtime" ]; then
+    echo "| candidate adds build-time code: $(echo "$buildtime" | tr '\n' ' ')"
+    echo '{"verdict":"rejected","reason":"candidate touches build.rs or .cargo/"}'
+    exit 0
+fi
+
 echo "| == baseline: $(basename "$scenario") must fail"
 red=0
 try "$work/baseline" || red=$?
