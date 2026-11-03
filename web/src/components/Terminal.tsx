@@ -156,13 +156,22 @@ export function TerminalBlock({
   text,
   maxHeight = "16rem",
   className,
+  tail = false,
 }: {
   text: string;
   maxHeight?: string;
   className?: string;
+  /** Open scrolled to the bottom, for screen tails. */
+  tail?: boolean;
 }) {
+  const scroller = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const element = scroller.current;
+    if (tail && element) element.scrollTop = element.scrollHeight;
+  }, [tail, text]);
   return (
     <div
+      ref={scroller}
       className={cx(
         "overflow-auto rounded-md border border-surface-border bg-terminal px-3 py-2.5 font-mono text-[12px] leading-5 text-terminal-foreground",
         className,

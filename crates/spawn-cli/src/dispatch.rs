@@ -84,6 +84,9 @@ pub(crate) struct Facts {
     pub(crate) evidence_seq: Option<u64>,
     #[serde(default)]
     pub(crate) episode: Option<i64>,
+    /// Action of that command (`start`, `input`, `resume`, `stop`).
+    #[serde(default)]
+    pub(crate) episode_action: Option<String>,
     #[serde(default)]
     pub(crate) open_command: bool,
     #[serde(default)]
@@ -342,7 +345,12 @@ fn decide_worker(facts: &Facts, now_ms: i64) -> (Option<Order>, Option<Escalatio
             )),
         );
     }
-    if !facts.live && observation.state == SemanticState::Completed {
+    // An execution someone stopped ended by their decision; telling them
+    // again is noise.
+    if !facts.live
+        && observation.state == SemanticState::Completed
+        && facts.episode_action.as_deref() != Some("stop")
+    {
         return (
             None,
             Some(escalate(
@@ -543,6 +551,7 @@ mod tests {
             observation_at_ms: Some(NOW - 1_000),
             evidence_seq: Some(9),
             episode: Some(7),
+            episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
         }
@@ -562,6 +571,7 @@ mod tests {
             observation_at_ms: Some(NOW - 5_000),
             evidence_seq: Some(9),
             episode: Some(1),
+            episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
         }
@@ -750,6 +760,22 @@ mod tests {
         };
         assert!(text.contains("idle, give it the next step"));
         assert!(text.contains("[spawn:esc session_worker_a idle-7]"));
+    }
+
+    #[test]
+    fn a_worker_someone_stopped_is_not_reported_back() {
+        let mut stopped = worker(Observation::basic(
+            SemanticState::Completed,
+            None,
+            SessionSeq(9),
+            Confidence::new(1.0).expect("valid"),
+            "rules",
+        ));
+        stopped.live = false;
+        stopped.end_cause = Some("stopped".to_string());
+        stopped.episode_action = Some("stop".to_string());
+        let plan = decide(&[stopped, idle_supervisor()], true, NOW, "spawn");
+        assert_eq!(plan, super::Plan::default());
     }
 
     #[test]

@@ -141,6 +141,9 @@ from (
       where e.session_id = s.session_id and e.source <> 'observer') as evidence_seq,
     (select max(c.id) from spawn_commands c
       where c.session_id = s.session_id and c.principal <> 'spawn-dispatch') as episode,
+    (select c.action ->> 'type' from spawn_commands c
+      where c.session_id = s.session_id and c.principal <> 'spawn-dispatch'
+      order by c.id desc limit 1) as episode_action,
     exists (select 1 from spawn_commands c
              where c.session_id = s.session_id and c.state <> 'finished') as open_command,
     (select coalesce(jsonb_agg(jsonb_build_object(
