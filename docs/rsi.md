@@ -215,7 +215,7 @@ create table rsi_attempts (
 - **不写 `rsi.*` 事件。** 封闭枚举，写进去产品链路就停。
 - **不把白盒测试当判据。** 白盒测形状，RSI 改形状。
 - **不从事件里取 commit id。** 事件可伪造，且无改动时不写。
-- **不做 daemon。**
+- **不做不可重启的 daemon。** `spawn loop` 在一个进程里跑 Bridge、Observer 和 `evolve`，但状态全在库里或事件日志里，杀掉即重启，不丢工作。`scripts/rsi/run-loop.sh` 只负责崩溃后拉起。哪些部分能边跑边换、哪些必须停机，见 [rsi-upgrade.md](rsi-upgrade.md)。
 - **不做并行种群。** 门禁是 pass/fail，选不出更好的那个。
 - **不让 agent 改 backlog、场景或门禁脚本。**
 - **不用 FUSE。** 内核的 overlay 在这个存储驱动上挂不上，`SYS_ADMIN` 又抵消隔离；`git archive` 已经够用。
