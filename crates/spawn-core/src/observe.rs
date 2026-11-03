@@ -109,6 +109,10 @@ pub struct JudgeInput {
     pub task: Option<String>,
     /// Tail of the agent's terminal, as a person would see it.
     pub screen_tail: Option<String>,
+    /// The session is meant never to end (the supervisor): it waits for
+    /// instructions rather than completing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub perpetual: bool,
 }
 
 /// How the latest turn ended.
@@ -598,6 +602,7 @@ impl Snapshot {
             quiet_ms: None,
             task: None,
             screen_tail: None,
+            perpetual: false,
         }
     }
 }
@@ -665,6 +670,7 @@ fn fingerprint_of(input: &JudgeInput) -> String {
         input.exit_code,
         input.screen_tail,
         input.task,
+        input.perpetual,
     ]);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in shown.to_string().bytes() {
@@ -852,6 +858,10 @@ impl Observer {
                         .task(session)
                         .map(|text| head_chars(&text, TASK_CHARS));
                 }
+                input.perpetual = self
+                    .context
+                    .as_ref()
+                    .is_some_and(|context| context.perpetual(session));
                 let fingerprint = fingerprint_of(&input);
                 if failures == 0 && previous_ask.as_deref() == Some(fingerprint.as_str()) {
                     // Nothing new to show the model; keep the last answer.
@@ -861,12 +871,8 @@ impl Observer {
                     }
                     return Ok(0);
                 }
-                let perpetual = self
-                    .context
-                    .as_ref()
-                    .is_some_and(|context| context.perpetual(session));
                 let (mut observation, failed) =
-                    self.ask_model(&input, ambiguity, guess, seq, perpetual);
+                    self.ask_model(&input, ambiguity, guess, seq, input.perpetual);
                 if let Some(question) = input.screen_tail.as_deref().and_then(human_question) {
                     observation.human_question = Some(question);
                     observation.attention = true;
