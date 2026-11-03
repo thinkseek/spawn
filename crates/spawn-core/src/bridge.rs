@@ -565,10 +565,14 @@ impl Bridge {
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
         let mut trusted = false;
-        for attempt in 0..self.config.ready_attempts {
+        // The trust dialog comes before the engine starts up, so answering it
+        // restarts the budget instead of spending it.
+        let mut attempt = 0;
+        while attempt < self.config.ready_attempts {
             if attempt > 0 {
                 sleep(self.config.ready_interval);
             }
+            attempt += 1;
             let Ok(pane) =
                 self.terminals
                     .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
@@ -585,6 +589,7 @@ impl Bridge {
                 {
                     return Ok(Outcome::Failed(format!("answer trust dialog: {error}")));
                 }
+                attempt = 1;
                 continue;
             }
             let reading = read_claude_screen(&pane);
