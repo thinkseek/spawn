@@ -104,10 +104,12 @@ parse the log. `EventKind` gains no variant.
 If Jev is down, the rules' best guess is written with
 `reason = JudgeUnavailable`, and the session is retried. It is never marked dead.
 
-Jev's distribution doubles as the escalation signal: when its top state is
-below a confidence threshold, or `needs_human` and the state disagree, the
-observation is marked `escalate` and goes up the ladder instead of being
-acted on.
+Jev's distribution doubles as the attention signal. An observation asks for
+attention when the probability on states that need someone (BLOCKED,
+UNKNOWN), among the states the facts allow, reaches 0.5, or when
+`needs_human` or `stuck` does. Uncertainty between harmless states (WAITING
+0.56 against COMPLETED 0.40 for an idle agent) pages no one: a false alarm
+costs exactly the human attention the system exists to save.
 
 ### 2.1 Trust boundaries
 

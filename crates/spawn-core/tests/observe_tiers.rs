@@ -287,3 +287,23 @@ fn a_silent_live_session_becomes_ambiguous() {
     let seen = judge.seen.lock().expect("lock").clone().expect("input");
     assert_eq!(seen.ambiguity, Some(Ambiguity::QuietLive));
 }
+
+#[test]
+fn an_idle_agent_split_between_harmless_states_pages_no_one() {
+    // Live answer from jev-1.14.0 for an agent that finished and sits idle.
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Waiting,
+        confidence: confidence(0.56),
+        probabilities: Some([0.01, 0.56, 0.01, 0.40, 0.02]),
+        needs_human: Some(0.2),
+        stuck: Some(0.13),
+    }));
+    let mut fixture = fixture(judge);
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Waiting);
+    assert!(!last.attention, "WAITING or COMPLETED, nobody is needed");
+}
