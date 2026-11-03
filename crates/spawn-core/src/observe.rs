@@ -34,7 +34,8 @@ pub const QUIET_AFTER: Duration = Duration::from_mins(2);
 /// silent hang is noticed.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(30);
 
-/// Below this confidence a model judgement asks for attention.
+/// Without a distribution, below this confidence a model judgement asks for
+/// attention.
 pub const CONFIDENT: f64 = 0.6;
 
 /// At or above this probability `needs_human` or `stuck` asks for attention.
@@ -292,16 +293,44 @@ pub fn narrow(
 }
 
 /// Whether an observation should draw a person's or a higher tier's eye.
+///
+/// What matters is the chance that someone is needed, not how sure the model
+/// is about which harmless state applies: WAITING 0.56 against COMPLETED 0.40
+/// is an idle agent either way and must not page anyone. With a distribution,
+/// the mass on BLOCKED and UNKNOWN among the states the facts allow decides;
+/// without one, a low confidence does.
 pub fn needs_attention(
+    ambiguity: Option<Ambiguity>,
     state: SemanticState,
     confidence: Confidence,
-    needs_human: Option<f64>,
-    stuck: Option<f64>,
+    judgement: &Judgement,
 ) -> bool {
-    matches!(state, SemanticState::Blocked | SemanticState::Unknown)
-        || confidence.value() < CONFIDENT
-        || needs_human.is_some_and(|value| value >= LIKELY)
-        || stuck.is_some_and(|value| value >= LIKELY)
+    if matches!(state, SemanticState::Blocked | SemanticState::Unknown)
+        || judgement.needs_human.is_some_and(|value| value >= LIKELY)
+        || judgement.stuck.is_some_and(|value| value >= LIKELY)
+    {
+        return true;
+    }
+    let Some(probabilities) = judgement.probabilities else {
+        return confidence.value() < CONFIDENT;
+    };
+    let allowed = ambiguity.map_or(&SemanticState::ALL[..], Ambiguity::allowed);
+    let weight = |candidate: &SemanticState| {
+        SemanticState::ALL
+            .iter()
+            .position(|known| known == candidate)
+            .map_or(0.0, |index| probabilities[index].max(0.0))
+    };
+    let total: f64 = allowed.iter().map(weight).sum();
+    if total <= 0.0 {
+        return true;
+    }
+    let risky: f64 = allowed
+        .iter()
+        .filter(|candidate| matches!(candidate, SemanticState::Blocked | SemanticState::Unknown))
+        .map(weight)
+        .sum();
+    risky / total >= LIKELY
 }
 
 /// Context the model judge needs and the log does not hold.
@@ -702,8 +731,7 @@ impl Observer {
         observation.needs_human = judgement.needs_human;
         observation.stuck = judgement.stuck;
         observation.latency_ms = Some(latency);
-        observation.attention =
-            needs_attention(state, confidence, judgement.needs_human, judgement.stuck);
+        observation.attention = needs_attention(Some(ambiguity), state, confidence, &judgement);
         observation.evidence = evidence;
         (observation, false)
     }
