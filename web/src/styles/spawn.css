@@ -11,6 +11,7 @@
   --color-terminal-foreground: var(--terminal-foreground);
   --color-border-strong: var(--border-strong);
   --color-chart-line: var(--chart-line);
+  --color-jev: var(--jev);
 }
 
 :root {
@@ -48,6 +49,8 @@
   --warning: oklch(0.81 0.14 78);
   --destructive: oklch(0.69 0.19 24);
   --info: oklch(0.73 0.12 245);
+  /* The model judge, so Jev's calls read apart from the rules' at a glance. */
+  --jev: oklch(0.74 0.13 300);
 
   --chart-line: #c6cbd3;
   --terminal: #08090b;

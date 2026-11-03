@@ -137,6 +137,8 @@ from (
     p.observation,
     p.observation_event_id,
     p.observation_at_ms,
+    (select max(e.session_seq) from spawn_events e
+      where e.session_id = s.session_id and e.source <> 'observer') as evidence_seq,
     (select max(c.id) from spawn_commands c
       where c.session_id = s.session_id and c.principal <> 'spawn-dispatch') as episode,
     exists (select 1 from spawn_commands c

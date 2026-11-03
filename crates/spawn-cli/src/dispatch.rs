@@ -79,6 +79,9 @@ pub(crate) struct Facts {
     pub(crate) observation_event_id: Option<i64>,
     #[serde(default)]
     pub(crate) observation_at_ms: Option<i64>,
+    /// Session position of the latest fact (not an observation).
+    #[serde(default)]
+    pub(crate) evidence_seq: Option<u64>,
     #[serde(default)]
     pub(crate) episode: Option<i64>,
     #[serde(default)]
@@ -293,6 +296,15 @@ fn decide_worker(facts: &Facts, now_ms: i64) -> (Option<Order>, Option<Escalatio
     let Some(observation) = &facts.observation else {
         return (None, None);
     };
+    // A judgement older than the latest fact describes a moment that has
+    // passed (for example the ready screen just before the prompt was typed).
+    // Act only on a current one; the Observer is about to judge again.
+    if facts
+        .evidence_seq
+        .is_some_and(|latest| observation.based_on_seq.0 < latest)
+    {
+        return (None, None);
+    }
     // 2. The one reversible action a Jev judgement may trigger.
     if facts.live && nudgeable(observation) {
         return nudge(facts, observation, now_ms);
@@ -507,6 +519,7 @@ mod tests {
             observation: Some(observation),
             observation_event_id: Some(100),
             observation_at_ms: Some(NOW - 1_000),
+            evidence_seq: Some(9),
             episode: Some(7),
             open_command: false,
             dispatched: Vec::new(),
@@ -525,6 +538,7 @@ mod tests {
             observation: Some(observation),
             observation_event_id: Some(50),
             observation_at_ms: Some(NOW - 5_000),
+            evidence_seq: Some(9),
             episode: Some(1),
             open_command: false,
             dispatched: Vec::new(),
@@ -558,6 +572,16 @@ mod tests {
             }
         );
         assert!(plan.pending.is_empty());
+    }
+
+    #[test]
+    fn a_judgement_older_than_the_latest_fact_is_not_acted_on() {
+        // Live case: the ready screen before the prompt was judged idle, and
+        // the prompt had already arrived when the dispatcher looked.
+        let mut stale = worker(judged(SemanticState::Waiting, 0.9));
+        stale.evidence_seq = Some(10);
+        let plan = decide(&[stale], false, NOW, "spawn");
+        assert_eq!(plan, super::Plan::default());
     }
 
     #[test]
