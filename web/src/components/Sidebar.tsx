@@ -1,4 +1,4 @@
-import { Activity, Orbit, Rows3 } from "lucide-react";
+import { Activity, LayoutGrid, Orbit, Rows3 } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary } from "../api";
@@ -14,6 +14,9 @@ interface SidebarProps {
   view: View;
   rsi: RsiSummary | null;
   error: string | null;
+  /** Agents that need a human, from the fleet poll. */
+  attention: number;
+  onShowFleet: () => void;
   onShowRsi: () => void;
   onShowSessions: () => void;
   onSelect: (sessionId: string) => void;
@@ -38,6 +41,8 @@ export function Sidebar({
   view,
   rsi,
   error,
+  attention,
+  onShowFleet,
   onShowRsi,
   onSelect,
 }: SidebarProps) {
@@ -48,7 +53,14 @@ export function Sidebar({
         <Brand />
       </div>
 
-      <div className="px-2 pt-2 pb-4">
+      <div className="space-y-px px-2 pt-2 pb-4">
+        <NavItem
+          active={view === "fleet"}
+          onClick={onShowFleet}
+          icon={<LayoutGrid size={15} />}
+          label="Fleet"
+          trailing={<AttentionCount count={attention} />}
+        />
         <NavItem
           active={view === "rsi"}
           onClick={onShowRsi}
@@ -181,18 +193,36 @@ function NavItem({
   );
 }
 
+function AttentionCount({ count }: { count: number }) {
+  if (count <= 0) return null;
+  return (
+    <span
+      title={`${count} agent${count === 1 ? "" : "s"} need a human`}
+      className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning"
+    >
+      {count}
+    </span>
+  );
+}
+
 /** Top bar that replaces the sidebar below the `md` breakpoint. */
 export function MobileNav({
   view,
+  attention,
+  onShowFleet,
   onShowRsi,
   onShowSessions,
-}: Pick<SidebarProps, "view" | "onShowRsi" | "onShowSessions">) {
+}: Pick<
+  SidebarProps,
+  "view" | "attention" | "onShowFleet" | "onShowRsi" | "onShowSessions"
+>) {
   return (
     <div className="flex h-12 shrink-0 items-center gap-3 border-b border-sidebar-border bg-sidebar px-3 md:hidden">
       <Brand />
       <div className="ml-auto flex rounded-lg border border-surface-border bg-surface p-0.5">
         {(
           [
+            ["fleet", "Fleet", <LayoutGrid key="f" size={13} />, onShowFleet],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
             ["sessions", "Sessions", <Rows3 key="s" size={13} />, onShowSessions],
           ] as const
@@ -211,6 +241,7 @@ export function MobileNav({
           >
             {icon}
             {label}
+            {id === "fleet" && <AttentionCount count={attention} />}
           </button>
         ))}
       </div>

@@ -7,36 +7,75 @@ import { DetailsRail, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
 import { StateBadge } from "./components/StateDot";
 import { Timeline } from "./components/Timeline";
+import { FleetView } from "./components/fleet/FleetView";
 import { RsiView } from "./components/rsi/RsiView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
+import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
 import { RSI_SESSION } from "./rsi";
 
-export type View = "rsi" | "sessions";
+export type View = "fleet" | "rsi" | "sessions";
 
-function viewFromHash(): View {
-  return window.location.hash.startsWith("#/sessions") ? "sessions" : "rsi";
+interface Route {
+  view: View;
+  /** Agent open in the fleet view's detail drawer. */
+  agent: string | null;
+}
+
+function routeFromHash(): Route {
+  const hash = window.location.hash;
+  if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
+  if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
+  const match = /^#\/fleet\/(.+)$/.exec(hash);
+  let agent: string | null = null;
+  if (match) {
+    try {
+      agent = decodeURIComponent(match[1]);
+    } catch {
+      agent = null;
+    }
+  }
+  return { view: "fleet", agent };
+}
+
+function hashFor(route: Route): string {
+  if (route.view === "fleet") {
+    return route.agent
+      ? `#/fleet/${encodeURIComponent(route.agent)}`
+      : "#/fleet";
+  }
+  return route.view === "rsi" ? "#/rsi" : "#/sessions";
 }
 
 export default function App() {
   const overview = usePoll("overview", fetchOverview);
+  // Polled in every view: the sidebar shows the attention count.
+  const fleet = usePoll("fleet", fetchFleet, 3_000);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [railOpen, setRailOpen] = useState(false);
-  // The RSI view is the landing page; the hash keeps the view across reloads.
-  const [view, setView] = useState<View>(viewFromHash);
+  // The fleet view is the landing page; the hash keeps the view (and the
+  // open agent) across reloads.
+  const [route, setRoute] = useState<Route>(routeFromHash);
+  const view = route.view;
+  const setView = (next: View) => setRoute({ view: next, agent: null });
 
   useEffect(() => {
-    const next = view === "rsi" ? "#/rsi" : "#/sessions";
+    const next = hashFor(route);
     if (window.location.hash !== next) {
       window.history.replaceState(null, "", next);
     }
-  }, [view]);
+  }, [route]);
 
   useEffect(() => {
-    const onHash = () => setView(viewFromHash());
+    const onHash = () => setRoute(routeFromHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
+
+  const openTimeline = (sessionId: string) => {
+    setSelectedId(sessionId);
+    setView("sessions");
+  };
 
   useEffect(() => {
     const data = overview.data;
@@ -78,6 +117,8 @@ export default function App() {
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-app-shell text-label text-foreground md:flex-row">
       <MobileNav
         view={view}
+        attention={fleet.data?.health.attention ?? 0}
+        onShowFleet={() => setView("fleet")}
         onShowRsi={() => setView("rsi")}
         onShowSessions={() => setView("sessions")}
       />
@@ -87,6 +128,8 @@ export default function App() {
         view={view}
         rsi={rsi}
         error={overview.error}
+        attention={fleet.data?.health.attention ?? 0}
+        onShowFleet={() => setView("fleet")}
         onShowRsi={() => setView("rsi")}
         onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
@@ -95,13 +138,15 @@ export default function App() {
         }}
       />
 
-      {view === "rsi" ? (
-        <RsiView
-          onOpenSession={() => {
-            setSelectedId(RSI_SESSION);
-            setView("sessions");
-          }}
+      {view === "fleet" ? (
+        <FleetView
+          fleet={fleet}
+          selectedId={route.agent}
+          onSelect={(agent) => setRoute({ view: "fleet", agent })}
+          onOpenTimeline={openTimeline}
         />
+      ) : view === "rsi" ? (
+        <RsiView onOpenSession={() => openTimeline(RSI_SESSION)} />
       ) : (
         <div className="flex min-h-0 min-w-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col bg-page-canvas">
