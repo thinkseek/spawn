@@ -101,6 +101,9 @@ pub(crate) enum Why {
     ResumeFailed,
     /// The worker finished; someone should review the result.
     Completed,
+    /// The worker stopped at its prompt and nothing allowed a nudge: it
+    /// waits for its next instruction.
+    Idle,
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -320,15 +323,33 @@ fn decide_worker(facts: &Facts, now_ms: i64) -> (Option<Order>, Option<Escalatio
             Some(escalate(facts, id, Why::Attention, describe(observation))),
         );
     }
-    if observation.state == SemanticState::Completed {
-        let episode = facts.episode.unwrap_or(0);
+    let episode = facts.episode.unwrap_or(0);
+    // Stopped at its prompt and not nudged: someone has to give the next
+    // step or review the result. Once per episode.
+    if facts.live && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle) {
+        let (why, line) = if observation.state == SemanticState::Completed {
+            (Why::Completed, "finished its task")
+        } else {
+            (Why::Idle, "stopped at its prompt")
+        };
+        return (
+            None,
+            Some(escalate(
+                facts,
+                format!("idle-{episode}"),
+                why,
+                format!("{line} ({})", describe(observation)),
+            )),
+        );
+    }
+    if !facts.live && observation.state == SemanticState::Completed {
         return (
             None,
             Some(escalate(
                 facts,
                 format!("done-{episode}"),
                 Why::Completed,
-                format!("finished its task ({})", describe(observation)),
+                format!("execution ended, task finished ({})", describe(observation)),
             )),
         );
     }
@@ -396,6 +417,7 @@ fn digest(items: &[Escalation], spawn: &str) -> String {
             Why::NudgeFailed => "nudge did not help",
             Why::ResumeFailed => "resume failed",
             Why::Completed => "completed, review it",
+            Why::Idle => "idle, give it the next step or review it",
         };
         let _ = writeln!(
             text,
@@ -714,6 +736,20 @@ mod tests {
         rsi.session_id = "session_rsi".to_string();
         let plan = decide(&[rsi, idle_supervisor()], true, NOW, "spawn");
         assert_eq!(plan, super::Plan::default());
+    }
+
+    #[test]
+    fn an_idle_worker_too_unsure_to_nudge_is_reported() {
+        // Live case: WAITING 0.64 / COMPLETED 0.32, needs_human 0.28.
+        let mut idle = judged(SemanticState::Waiting, 0.67);
+        idle.needs_human = Some(0.28);
+        let plan = decide(&[worker(idle), idle_supervisor()], true, NOW, "spawn");
+        assert_eq!(plan.orders.len(), 1);
+        let CommandAction::Input { text } = &plan.orders[0].action else {
+            panic!("digest");
+        };
+        assert!(text.contains("idle, give it the next step"));
+        assert!(text.contains("[spawn:esc session_worker_a idle-7]"));
     }
 
     #[test]
