@@ -652,6 +652,12 @@ create table if not exists rsi_iterations (
 
 create index if not exists rsi_iterations_phase on rsi_iterations (phase);
 
+-- `started_at_ms` bounds the wall clock and the tool-call count of one
+-- iteration. `updated_at_ms` moves on every phase change, so it cannot.
+-- `scenario_count` is the floor the next round must not fall below.
+alter table rsi_iterations add column if not exists started_at_ms bigint not null default 0;
+alter table rsi_state add column if not exists scenario_count integer not null default 0;
+
 -- Every attempt at a task, successful or not. The controller feeds the
 -- failures back into the next prompt.
 create table if not exists rsi_attempts (
