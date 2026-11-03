@@ -12,7 +12,25 @@ use spawn_core::event::SessionSeq;
 use spawn_core::id::SessionId;
 use tiny_http::{Header, Request, Response, Server};
 
+use spawn_core::id::{TerminalName, WorkspaceId};
+use spawn_core::port::TerminalHost;
+use spawn_host::{TmuxHost, docker_prefix};
+use spawn_postgres::{RSI_AGENT, RSI_SESSION, RsiIterationRow};
+
+use crate::evolve::{Task, landed_metric, load_backlog, parse_metrics};
 use crate::{Flags, env_or, env_value, open_store};
+
+/// Halt threshold of the controller, mirrored for display.
+const HALT_AFTER: u32 = 3;
+
+/// Iterations the RSI page lists.
+const RSI_ITERATIONS: u32 = 50;
+
+/// Attempts the RSI page reads for its table and chart.
+const RSI_ATTEMPTS: u32 = 500;
+
+/// Pane lines the RSI page shows.
+const PANE_LINES: usize = 120;
 
 /// Default page size of the timeline.
 const DEFAULT_LIMIT: usize = 200;
@@ -49,9 +67,15 @@ fn handle(request: Request, web: &Path) -> Result<(), String> {
     };
     let answer = match path {
         "/api/overview" => overview(),
-        _ => match path.strip_prefix("/api/session/") {
-            Some(id) => session(id, query),
-            None => return static_file(request, web, path),
+        "/api/rsi" => rsi_overview(),
+        "/api/rsi/pane" => rsi_pane(),
+        _ => match (
+            path.strip_prefix("/api/session/"),
+            path.strip_prefix("/api/rsi/iteration/"),
+        ) {
+            (Some(id), _) => session(id, query),
+            (_, Some(number)) => rsi_iteration(number),
+            _ => return static_file(request, web, path),
         },
     };
     let (status, body) = match answer {
@@ -112,6 +136,227 @@ fn overview() -> Result<Value, String> {
                 "patch_bytes": iteration.patch.as_ref().map_or(0, String::len),
             })),
         },
+    }))
+}
+
+fn err(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| {
+            i64::try_from(time.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The objective the loop pursues: the first recurring task in the
+/// controller's backlog that has not met its target, else the last one.
+fn objective(store: &spawn_postgres::PostgresStore) -> Result<Option<Task>, String> {
+    let backlog = PathBuf::from(env_or("SPAWN_RSI_BACKLOG", "rsi/backlog"));
+    let recurring: Vec<Task> = load_backlog(&backlog)?
+        .into_iter()
+        .filter(|task| task.recurring)
+        .collect();
+    for task in &recurring {
+        let met = match (landed_metric(store, task)?, task.target) {
+            (Some(value), Some(target)) => {
+                if task.lower_is_better {
+                    value <= target
+                } else {
+                    value >= target
+                }
+            }
+            _ => false,
+        };
+        if !met {
+            return Ok(Some(task.clone()));
+        }
+    }
+    Ok(recurring.last().cloned())
+}
+
+fn iteration_json(row: &RsiIterationRow) -> Value {
+    let iteration = &row.iteration;
+    json!({
+        "iteration": iteration.iteration,
+        "task_id": iteration.task_id,
+        "phase": iteration.phase,
+        "started_at_ms": row.started_at_ms,
+        "updated_at_ms": row.updated_at_ms,
+        "note": iteration.note,
+        "candidate": iteration.candidate,
+        "patch_bytes": iteration.patch.as_ref().map_or(0, String::len),
+    })
+}
+
+/// Everything the RSI page shows, in one read.
+fn rsi_overview() -> Result<Value, String> {
+    let store = open_store()?;
+    let state = store.rsi_state().map_err(err)?;
+    let objective = objective(&store)?;
+    let iterations: Vec<Value> = store
+        .rsi_iterations(RSI_ITERATIONS)
+        .map_err(err)?
+        .iter()
+        .map(iteration_json)
+        .collect();
+    let attempts = store.rsi_recent_attempts(RSI_ATTEMPTS).map_err(err)?;
+    let unit = objective
+        .as_ref()
+        .map_or(String::new(), |task| task.unit.clone());
+    let attempt_rows: Vec<Value> = attempts
+        .iter()
+        .map(|attempt| {
+            let metrics: serde_json::Map<String, Value> = parse_metrics(&attempt.gate_log)
+                .into_iter()
+                .map(|metric| {
+                    (
+                        metric.name,
+                        json!({ "baseline": metric.baseline, "candidate": metric.candidate, "unit": unit }),
+                    )
+                })
+                .collect();
+            json!({
+                "task_id": attempt.task_id,
+                "attempt": attempt.attempt,
+                "iteration": attempt.iteration,
+                "accepted": attempt.accepted,
+                "created_at_ms": attempt.created_at_ms,
+                "metrics": metrics,
+            })
+        })
+        .collect();
+    let history: Vec<Value> = attempts
+        .iter()
+        .rev()
+        .flat_map(|attempt| {
+            parse_metrics(&attempt.gate_log)
+                .into_iter()
+                .map(move |metric| {
+                    json!({
+                        "iteration": attempt.iteration,
+                        "created_at_ms": attempt.created_at_ms,
+                        "metric": metric.name,
+                        "baseline": metric.baseline,
+                        "candidate": metric.candidate,
+                        "accepted": attempt.accepted,
+                    })
+                })
+        })
+        .collect();
+    let state_json = state.map(|state| {
+        let halt_reason = if state.consecutive_rejected >= HALT_AFTER {
+            Some(format!(
+                "{} rejections in a row",
+                state.consecutive_rejected
+            ))
+        } else if state.infra_failures >= HALT_AFTER {
+            Some(format!("{} aborts in a row", state.infra_failures))
+        } else {
+            None
+        };
+        json!({
+            "baseline": state.baseline,
+            "iteration": state.iteration,
+            "consecutive_rejected": state.consecutive_rejected,
+            "infra_failures": state.infra_failures,
+            "scenario_count": state.scenario_count,
+            "halted": halt_reason.is_some(),
+            "halt_reason": halt_reason,
+        })
+    });
+    Ok(json!({
+        "generated_at_ms": now_ms(),
+        "state": state_json,
+        "objective": objective.map(|task| json!({
+            "task_id": task.id,
+            "title": task.title,
+            "prompt": task.prompt,
+            "metric": task.metric,
+            "unit": task.unit,
+            "direction": if task.lower_is_better { "lower" } else { "higher" },
+            "target": task.target,
+        })),
+        "iterations": iterations,
+        "attempts": attempt_rows,
+        "metric_history": history,
+    }))
+}
+
+/// One iteration with its patch, gate log and prompt.
+fn rsi_iteration(number: &str) -> Result<Value, String> {
+    let number: u32 = number
+        .parse()
+        .map_err(|_| format!("bad iteration {number}"))?;
+    let store = open_store()?;
+    let Some((row, prompt)) = store.rsi_iteration(number).map_err(err)? else {
+        return Err(format!("iteration {number} does not exist"));
+    };
+    let gate_log = store
+        .rsi_attempts_of(row.iteration.task_id, RSI_ATTEMPTS)
+        .map_err(err)?
+        .into_iter()
+        .find(|attempt| attempt.iteration == number)
+        .map(|attempt| attempt.gate_log)
+        .unwrap_or_default();
+    let mut body = iteration_json(&row);
+    body["patch"] = json!(row.iteration.patch.clone().unwrap_or_default());
+    body["gate_log"] = json!(gate_log);
+    body["prompt"] = json!(prompt);
+    Ok(body)
+}
+
+/// The tail of the RSI agent's terminal, read from tmux. Capturing a pane
+/// changes nothing, so the API stays read-only.
+fn rsi_pane() -> Result<Value, String> {
+    let store = open_store()?;
+    let session = SessionId::new(RSI_SESSION).map_err(err)?;
+    let latest = store.executions(&session).map_err(err)?.into_iter().next();
+    let Some(execution) = latest else {
+        return Ok(
+            json!({ "live": false, "terminal": null, "captured_at_ms": now_ms(), "text": "" }),
+        );
+    };
+    let live = execution.ended_at.is_none();
+    let terminal = TerminalName::for_execution(&execution.execution_id);
+    let root = env_or("SPAWN_WORKSPACE_ROOT", "/tmp");
+    let workspace = WorkspaceId::new(format!("{RSI_AGENT}:{root}/{RSI_AGENT}")).map_err(err)?;
+    let program = env_or("SPAWN_TMUX_PROGRAM", "tmux");
+    let socket = env_value("SPAWN_TMUX_SOCKET");
+    let host = match env_value("SPAWN_EXEC_IMAGE") {
+        Some(_) => {
+            let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
+            TmuxHost::in_workspaces(
+                &program,
+                std::sync::Arc::new(move |workspace: &WorkspaceId| {
+                    docker_prefix(&docker, workspace.sandbox())
+                }),
+                socket,
+            )
+        }
+        None => TmuxHost::in_workspaces(
+            &program,
+            std::sync::Arc::new(|_: &WorkspaceId| Vec::new()),
+            socket,
+        ),
+    };
+    let text = if live {
+        host.capture_tail(&terminal, &workspace, PANE_LINES)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut lines: Vec<&str> = text.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    Ok(json!({
+        "live": live && !lines.is_empty(),
+        "terminal": terminal.as_str(),
+        "captured_at_ms": now_ms(),
+        "text": lines.join("\n"),
     }))
 }
 
