@@ -312,13 +312,24 @@ select
     s.recorded_at_ms as started_at_ms,
     x.kind -> 'detail' ->> 'cause'     as cause,
     (x.kind -> 'detail' ->> 'exit_code')::integer as exit_code,
-    x.recorded_at_ms as ended_at_ms
+    x.recorded_at_ms as ended_at_ms,
+    -- The runner reports an engine exit with the engine as source; the
+    -- execution ends only when the Bridge writes its own end event.
+    exists (
+        select 1 from spawn_events r
+        where r.event_name = 'execution.ended'
+          and r.session_id = s.session_id
+          and r.execution_id = s.execution_id
+          and r.source <> 'bridge'
+    ) as exit_reported
 from spawn_events s
 left join lateral (
     select e.kind, e.recorded_at_ms
     from spawn_events e
     where e.event_name = 'execution.ended'
+      and e.session_id = s.session_id
       and e.execution_id = s.execution_id
+      and e.source = 'bridge'
     order by e.id
     limit 1
 ) x on true

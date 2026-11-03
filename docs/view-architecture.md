@@ -29,7 +29,7 @@
 | `agent_state` | [261](../crates/spawn-postgres/sql/schema.sql#L261) | 跨全部会话取 observation 再 `distinct on`；无 `event_id`，无法定位证据 |
 | `agent_timeline` | [276](../crates/spawn-postgres/sql/schema.sql#L276) | 混入 Observer 与 Bridge 噪声；无分页键约束 |
 | `agent_tasks` | [289](../crates/spawn-postgres/sql/schema.sql#L289) | `action` 只保留 type，prompt 丢失 |
-| `agent_executions` | [304](../crates/spawn-postgres/sql/schema.sql#L304) | 结束行取第一条 `execution.ended`，可能是 runner 的退出报告而非 Bridge 的结束事件；无时长列 |
+| `agent_executions` | [304](../crates/spawn-postgres/sql/schema.sql#L304) | 无时长列。结束口径已修：只认 Bridge 的结束事件，runner 的退出报告进 `exit_reported` |
 | `agent_artifacts` | [327](../crates/spawn-postgres/sql/schema.sql#L327) | 无复合主键，路由信息靠文本 |
 | `agent_relations` | [341](../crates/spawn-postgres/sql/schema.sql#L341) | 只有一层父子，查不到祖先链 |
 
@@ -86,7 +86,7 @@ Observer 只在结论变化时写 `observation.recorded`。因此 `agent_state.b
 | `agent_state` 补证据 | 增加 `event_id`，与 `based_on_seq` 并列 | 断言同一 session 的 `event_id` 等于其 observation 事件 id |
 | 新增 `agent_open_tools` | `tool.started` 按 `(session_id, tool_use_id)` 左连 `tool.completed`、`tool.failed`，取未闭合，排除执行已有 Bridge 结束事件的行 | 两个 started 一个 completed，结果恰一行；执行结束后结果为空 |
 | 新增 `agent_freshness` | 每 `session_id` 取 `max(session_seq)`、`max(id)`、`max(recorded_at_ms)`、事件数 | 空会话不出现 |
-| 修 `agent_executions` | 结束行只取 `source = 'bridge'` 的 `execution.ended`；另加 `exit_reported`（存在引擎来源的结束事件）；补 `duration_ms` | runner 已报告退出、Bridge 未结束时 `ended_at_ms` 为空且 `exit_reported` 为真 |
+| 修 `agent_executions`（已完成） | 结束行只取 `source = 'bridge'` 的 `execution.ended`；另加 `exit_reported`（存在引擎来源的结束事件） | runner 已报告退出、Bridge 未结束时 `ended_at_ms` 为空且 `exit_reported` 为真 |
 | 拆时间线 | `agent_timeline` 排除 `source = 'observer'`，判定改走 `agent_judgements` | 时间线不含 observation，判定视图只含 observation |
 
 ## 6. 权限
@@ -134,13 +134,13 @@ Observer 只在结论变化时写 `observation.recorded`。因此 `agent_state.b
 | 计划检查 | 万级事件上 `explain` `agent_state`。现有索引是 `(session_id, event_name, id)`，跨会话查询用不上前缀；按需加部分索引 `on (session_id, session_seq desc) where event_name = 'observation.recorded'` | 门禁一次性检查 |
 | 全量门禁 | `bash scripts/remote-gate.sh` | 每轮必跑 |
 
-现有覆盖缺口：`agent_executions`、`agent_artifacts`、`agent_relations` 与 `spawn_finish` 四态没有断言；`agent_commands` 只有无授权被拒一条。上述视图断言落地时一并补齐。
+现有覆盖：`agent_state`、`agent_timeline`、`agent_executions` 结束口径、`agent_artifacts`、`agent_relations`、`spawn_finish` 四态、`agent_commands` 无授权被拒。缺口：`agent_tasks` 与 `agent_commands` 有授权写入。
 
 ## 9. 演进顺序
 
 | 步 | 内容 | 完成条件 |
 | --- | --- | --- |
-| 1 | 修 `agent_executions` 结束口径，补现有视图断言 | runner 先报告退出、Bridge 后结束的序列有断言 |
+| 1（已完成） | 修 `agent_executions` 结束口径，补现有视图断言 | runner 先报告退出、Bridge 后结束的序列有断言 |
 | 2 | `PostgresStore` 读方法，加 `agent_open_tools`、`agent_freshness`、`agent_state.event_id` | 新视图有断言，`status` 切到 `states()` |
 | 3 | 加 `agent_lineage`、`agent_task_events`，补 `duration_ms` | 深链、命令关联各有断言 |
 | 4 | 收权限，上 `security definer` 读函数 | 授权用例通过，外部消费方已迁移 |
