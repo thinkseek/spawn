@@ -25,7 +25,7 @@ use crate::port::{
     CommandQueue, Commit, EventLog, Launch, StoreError, TerminalHost, WorkspaceError,
     WorkspaceStore,
 };
-use crate::screen::{ScreenState, TAIL_LINES, read_claude_screen};
+use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::shell::shell_quote;
 
 /// Engine choice and prompt of one launch.
@@ -564,6 +564,7 @@ impl Bridge {
         prompt: &str,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
+        let mut trusted = false;
         for attempt in 0..self.config.ready_attempts {
             if attempt > 0 {
                 sleep(self.config.ready_interval);
@@ -574,6 +575,18 @@ impl Bridge {
             else {
                 return Ok(Outcome::Failed("terminal disappeared".to_string()));
             };
+            // The Bridge exported this directory itself, so it trusts it.
+            // Answer once: a second answer would land in the input box.
+            if !trusted && is_trust_dialog(&pane) {
+                trusted = true;
+                if let Err(error) =
+                    self.terminals
+                        .send_keys(&active.terminal, &active.workspace, &TRUST_KEYS)
+                {
+                    return Ok(Outcome::Failed(format!("answer trust dialog: {error}")));
+                }
+                continue;
+            }
             let reading = read_claude_screen(&pane);
             last = reading.state;
             if !reading.state.accepts_input() {

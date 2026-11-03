@@ -234,6 +234,23 @@ impl PostgresStore {
         Ok(u32::try_from(row.get::<_, i64>("n").unsigned_abs()).unwrap_or(u32::MAX))
     }
 
+    /// Whether the loop's session ever bound a native engine session.
+    ///
+    /// Without one, `Resume` fails before it launches anything, so the
+    /// controller must start a new session instead.
+    pub fn rsi_has_native_session(&self) -> Result<bool, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_one(
+                "select exists (select 1 from spawn_events
+                                 where session_id = $1
+                                   and event_name = 'session.native_started') as bound",
+                &[&RSI_SESSION],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.get("bound"))
+    }
+
     /// State of the command that started an iteration.
     pub fn rsi_command_state(&self, command: CommandId) -> Result<Option<RsiCommand>, StoreError> {
         let mut client = self.lock();

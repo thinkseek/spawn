@@ -201,6 +201,33 @@ fn error_line(line: &str) -> bool {
     marker && word
 }
 
+/// Answer line of the workspace trust dialog.
+///
+/// Claude Code asks once per directory whether it trusts the folder, before
+/// it draws the input box. `--settings` cannot silence it: trust lives in the
+/// user's global state, not in settings. Captured from Claude Code v2.1.317.
+const TRUST_ANSWER: &str = "Yes, I trust this folder";
+
+/// Whether the tail shows the workspace trust dialog.
+///
+/// The dialog reads keystrokes, not pasted text: a bracketed paste of `y`
+/// gets "Please answer y or n". Answer it with [`TRUST_KEYS`].
+pub fn is_trust_dialog(pane: &str) -> bool {
+    let lines: Vec<String> = pane.lines().map(strip_ansi).collect();
+    let start = lines.len().saturating_sub(TAIL_LINES);
+    lines[start..]
+        .iter()
+        .any(|line| line.contains(TRUST_ANSWER))
+        && prompt_index(&lines[start..]).is_none()
+}
+
+/// Keys that accept the trust dialog.
+pub const TRUST_KEYS: [&str; 2] = ["y", "Enter"];
+
+fn prompt_index(lines: &[String]) -> Option<usize> {
+    lines.iter().rposition(|line| prompt_body(line).is_some())
+}
+
 /// Parse the pane tail.
 pub fn read_claude_screen(pane: &str) -> ScreenReading {
     let mut stripped: Vec<String> = pane.lines().map(strip_ansi).collect();
@@ -256,5 +283,36 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
         Some("") => ScreenReading::new(ScreenState::Ready, prompt),
         Some(_) => ScreenReading::new(ScreenState::Drafted, prompt),
         None => ScreenReading::unknown(),
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::{ScreenState, is_trust_dialog, read_claude_screen};
+
+    const DIALOG: &str = "[Screen Reader Mode: on via flag]
+Permission Required: Accessing workspace:
+/tmp/ws/agent_rsi
+Quick safety check: Is this a project you created or one you trust?
+Claude Code'll be able to read, edit, and execute files here.
+Security guide
+y. Yes, I trust this folder
+n. No, exit
+Enter y/n:
+Enter to confirm · Esc to cancel
+";
+
+    #[test]
+    fn the_trust_dialog_is_recognized_and_not_ready() {
+        assert!(is_trust_dialog(DIALOG));
+        assert!(!read_claude_screen(DIALOG).state.accepts_input());
+    }
+
+    #[test]
+    fn a_ready_prompt_after_the_dialog_is_not_the_dialog() {
+        let pane =
+            format!("{DIALOG}Claude Code v2.1.317\n/tmp/ws/agent_rsi\n$ \nbypass permissions on\n");
+        assert!(!is_trust_dialog(&pane));
+        assert_eq!(read_claude_screen(&pane).state, ScreenState::Ready);
     }
 }

@@ -216,6 +216,35 @@ impl TerminalHost for TmuxHost {
         Ok(())
     }
 
+    fn send_keys(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        keys: &[&str],
+    ) -> Result<(), TerminalError> {
+        let prefix = self.prefix(workspace);
+        let target = Self::pane(terminal);
+        // One key per call. A dialog reads the first key and redraws; keys
+        // sent in the same burst can arrive before it listens again.
+        for key in keys {
+            let send = vec![
+                "send-keys".to_string(),
+                "-t".to_string(),
+                target.clone(),
+                (*key).to_string(),
+            ];
+            let run = self.run(&prefix, &send)?;
+            if run.code != Some(0) {
+                return Err(TerminalError(format!(
+                    "send-keys {key} failed: {}",
+                    run.stderr.trim()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Ok(())
+    }
+
     fn is_alive(
         &self,
         terminal: &TerminalName,

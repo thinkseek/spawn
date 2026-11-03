@@ -164,6 +164,15 @@ pub trait TerminalHost: Send + Sync {
         text: &str,
     ) -> Result<(), TerminalError>;
 
+    /// Press keys one at a time, without a paste. `keys` uses tmux key
+    /// names (`y`, `Enter`). For dialogs that ignore pasted text.
+    fn send_keys(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        keys: &[&str],
+    ) -> Result<(), TerminalError>;
+
     /// Whether the terminal still exists.
     fn is_alive(
         &self,
