@@ -658,6 +658,11 @@ create index if not exists rsi_iterations_phase on rsi_iterations (phase);
 alter table rsi_iterations add column if not exists started_at_ms bigint not null default 0;
 alter table rsi_state add column if not exists scenario_count integer not null default 0;
 
+-- Aborts in a row toward the infrastructure halt. A candidate is never judged
+-- in an aborted iteration, so these cannot count as rejections: a dead agent
+-- would otherwise mark a good patch as rejected and feed it back as a failure.
+alter table rsi_state add column if not exists infra_failures integer not null default 0;
+
 -- Every attempt at a task, successful or not. The controller feeds the
 -- failures back into the next prompt.
 create table if not exists rsi_attempts (

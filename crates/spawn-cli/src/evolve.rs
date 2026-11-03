@@ -263,10 +263,11 @@ fn settle_started(
             .rsi_set_phase(iteration.iteration, "Working", None, None)
             .map_err(describe_error);
     }
-    reject_iteration(
+    // The agent never ran, so this says nothing about the task. Counting it as
+    // a rejection would feed a good patch back as a failure.
+    abort_iteration(
         store,
         iteration,
-        "",
         row.error.as_deref().unwrap_or("start failed"),
     )
 }
@@ -359,8 +360,9 @@ fn settle_gating(
         Err(GateFailure::Timeout) => {
             return abort_iteration(store, iteration, "gate exceeded its wall clock");
         }
+        // A gate that cannot run never judged the candidate, so it aborts.
         Err(GateFailure::Failed(error)) => {
-            return reject_iteration(store, iteration, patch, &format!("gate failed: {error}"));
+            return abort_iteration(store, iteration, &format!("gate failed: {error}"));
         }
     };
     if !verdict.accepted {
@@ -609,6 +611,15 @@ fn check_halt(store: &PostgresStore) -> Result<i32, String> {
         println!(
             "evolve: HALT after {} rejections in a row",
             state.consecutive_rejected
+        );
+        return Ok(2);
+    }
+    // Aborts are infrastructure. A candidate that can manufacture them would
+    // otherwise bypass the rejection limit, so they halt on their own count.
+    if state.infra_failures >= HALT_AFTER {
+        println!(
+            "evolve: HALT after {} aborts in a row",
+            state.infra_failures
         );
         return Ok(2);
     }

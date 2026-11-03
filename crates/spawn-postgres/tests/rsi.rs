@@ -159,6 +159,38 @@ fn the_budget_starts_at_the_iteration_and_counts_from_there() {
 }
 
 #[test]
+fn an_abort_counts_as_infrastructure_not_as_a_rejection() {
+    let store = store("abort");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    store
+        .rsi_begin_iteration(7, 1, start("do the task"))
+        .expect("begin");
+    store
+        .rsi_close_iteration(1, "Aborted", "agent did not start")
+        .expect("abort");
+
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.infra_failures, 1);
+    assert_eq!(state.consecutive_rejected, 0);
+    // An aborted candidate was never judged, so it is not an attempt.
+    assert_eq!(store.rsi_count_attempts(7).expect("count"), 0);
+
+    // A landing clears the infrastructure counter.
+    store
+        .rsi_begin_iteration(7, 2, start("second"))
+        .expect("begin");
+    assert!(store.rsi_advance_baseline(2, "aaa", "bbb").expect("land"));
+    assert_eq!(
+        store
+            .rsi_state()
+            .expect("state")
+            .expect("seeded")
+            .infra_failures,
+        0
+    );
+}
+
+#[test]
 fn the_scenario_floor_round_trips() {
     let store = store("floor");
     store.rsi_seed_baseline("aaa").expect("seed");
