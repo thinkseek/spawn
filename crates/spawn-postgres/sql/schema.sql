@@ -117,13 +117,25 @@ create or replace function spawn_append(
     out_seq      bigint,
     out_at       bigint,
     out_inserted boolean
-) language plpgsql as $$
+) language plpgsql security definer as $$
 declare
     v_seq bigint;
     v_id  bigint;
     v_at  bigint;
     v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded';
 begin
+    -- The agent's terminal connects as `spawn_terminal`, which owns nothing
+    -- and can only reach this function. It may write engine output, never the
+    -- controller's own facts: a forged `observation.recorded` would let an
+    -- agent report a state it is not in, and the views project from there.
+    -- `session_user` survives SECURITY DEFINER, so it names the real caller.
+    if session_user = 'spawn_terminal' and p_source is distinct from 'claude'
+        and p_source is distinct from 'codex'
+    then
+        raise exception 'spawn_terminal may not write source %', p_source
+            using errcode = '42501';
+    end if;
+
     perform pg_advisory_xact_lock(1399957335);
 
     if p_source_key is not null and exists (
@@ -676,3 +688,40 @@ create table if not exists rsi_attempts (
     created_at_ms bigint  not null,
     primary key (task_id, attempt)
 );
+
+-- The agent's terminal connects with this login. It owns nothing and can
+-- only execute `spawn_append`, so an RSI candidate that reaches the database
+-- cannot write `rsi_state`, the projections, or the controller's own events.
+-- The password is not a secret from the agent: the boundary is the
+-- privileges, not the credential.
+-- ponytail: fixed password; rotate it when the database is reachable beyond
+-- localhost.
+do $$
+begin
+    if not exists (select 1 from pg_roles where rolname = 'spawn_terminal') then
+        create role spawn_terminal login password 'spawn_terminal';
+    end if;
+end
+$$;
+
+do $$
+begin
+    execute format('grant connect on database %I to spawn_terminal', current_database());
+    execute format('grant usage on schema %I to spawn_terminal', current_schema());
+end
+$$;
+
+grant execute on function spawn_append(text, text, text, text, text, jsonb) to spawn_terminal;
+
+-- `spawn_append` is now SECURITY DEFINER, so it must not resolve names
+-- through the caller's `search_path`.
+do $$
+begin
+    execute format(
+        'alter function spawn_append(text, text, text, text, text, jsonb)
+             set search_path = %I, pg_temp',
+        current_schema()
+    );
+end
+$$;
+

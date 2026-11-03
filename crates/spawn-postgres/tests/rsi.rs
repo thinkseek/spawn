@@ -191,6 +191,55 @@ fn an_abort_counts_as_infrastructure_not_as_a_rejection() {
 }
 
 #[test]
+fn the_terminal_login_cannot_write_controller_facts() {
+    // Built here, not through `store()`: that helper builds its own name, and
+    // the role below must enter the same schema.
+    let schema = format!("spawn_terminal_{}", std::process::id());
+    let owner = PostgresStore::connect_in_schema(&url(), &schema).expect("connect and migrate");
+    owner.rsi_seed_baseline("aaa").expect("seed");
+
+    // The agent runs in the pane and reads its environment, so this is the
+    // credential it holds.
+    let url = spawn_postgres::terminal_url(&url());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("terminal connect");
+    client
+        .batch_execute(&format!("set search_path to {schema}"))
+        .expect("search path");
+
+    // The NULLs need types: an untyped call is ambiguous and would fail for
+    // the wrong reason, which is how this test passed once without testing.
+    let forged = client.query(
+        "select * from spawn_append('agent_rsi','session_rsi',null::text,'observer',
+             null::text, '{\"name\":\"observation.recorded\"}'::jsonb)",
+        &[],
+    );
+    // The reason matters: any error would pass a bare `is_err`, including a
+    // missing function or a schema the role never entered.
+    let refused = format!("{forged:?}");
+    assert!(
+        refused.contains("spawn_terminal may not write"),
+        "the whitelist, not some other failure, must refuse it: {refused}"
+    );
+
+    let engine = client.query(
+        "select * from spawn_append('agent_rsi','session_rsi',null::text,'claude',
+             null::text, '{\"name\":\"message.received\"}'::jsonb)",
+        &[],
+    );
+    assert!(
+        engine.is_ok(),
+        "the terminal must still write engine events: {engine:?}"
+    );
+
+    let direct = client.execute("update rsi_state set baseline_commit = 'evil'", &[]);
+    let denied = format!("{direct:?}");
+    assert!(
+        denied.contains("permission denied"),
+        "the table privilege, not a syntax error, must refuse it: {denied}"
+    );
+}
+
+#[test]
 fn the_scenario_floor_round_trips() {
     let store = store("floor");
     store.rsi_seed_baseline("aaa").expect("seed");
