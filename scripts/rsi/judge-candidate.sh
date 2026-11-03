@@ -45,9 +45,15 @@ extract() {
 }
 
 # 0 = scenario passed, 1 = scenario failed, 2 = tree did not build.
+#
+# The target directory is pinned per tree. An inherited `CARGO_TARGET_DIR`
+# would send the binary somewhere else, and both trees would share one output
+# directory, so the candidate build could overwrite the baseline binary the
+# scenario is about to run.
 try() {
     tree=$1
-    if ! (cd "$tree" && cargo build -q --bin spawn) >"$work/build.log" 2>&1; then
+    if ! (cd "$tree" && CARGO_TARGET_DIR="$tree/target" cargo build -q --bin spawn) \
+        >"$work/build.log" 2>&1; then
         return 2
     fi
     (cd "$tree" && SPAWN_BIN="$tree/target/debug/spawn" sh "$scenario") \

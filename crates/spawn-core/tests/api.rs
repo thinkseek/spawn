@@ -185,6 +185,9 @@ fn claude_arguments_carry_the_flag_and_absolute_hooks() {
     let settings = &arguments[3];
     assert!(settings.contains("/opt/spawn"), "hook command is absolute");
     assert!(settings.contains("UserPromptSubmit"));
+    // `--settings` replaces the user settings file, so the engine must not
+    // stop on a permission dialog the Bridge cannot answer.
+    assert!(settings.contains("skipDangerousModePermissionPrompt"));
     assert_eq!(arguments[4], "--resume");
     assert_eq!(arguments[5], "native-1");
     assert!(!claude_arguments("/opt/spawn", None).contains(&"--resume".to_string()));
