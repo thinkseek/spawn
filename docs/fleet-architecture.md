@@ -171,6 +171,17 @@ it, on the same ladder.
   3. *Everything else escalates*: BLOCKED, `needs_human` high, `stuck` high,
      low confidence, Jev unavailable, or a nudge that did not help. The
      escalation goes to the supervisor when there is one, else to a human.
+  As built (`crates/spawn-cli/src/dispatch.rs`, principal `spawn-dispatch`):
+  it acts only on a judgement that covers the session's latest fact; a lost
+  execution is resumed once; the nudge needs Jev's WAITING at an idle prompt
+  with confidence ≥ 0.7, `needs_human` ≤ 0.2 and `stuck` < 0.5, once per
+  episode (the latest non-dispatcher command) and three per agent-hour; a
+  worker idle at its prompt and not nudged, a nudge that did not help, a
+  failed resume, attention, and a finished execution nobody stopped all
+  escalate. Escalations coalesce into one digest typed into the supervisor
+  while it is idle. The dispatcher keeps no state: idempotency keys mark its
+  nudges and resumes, and a `[spawn:esc <session> <id>]` marker per item in
+  each delivered digest marks what the supervisor was told.
 - **Supervisor**: one perpetual Claude Code session (`agent_supervisor`).
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
@@ -221,7 +232,13 @@ Nothing new is stored outside the log. Three derived views make it usable:
 | `interventions` | commands by principal `human`, with the situation before them | principal on the command |
 
 `spawn corpus export` writes episodes (evidence + decision + outcome) as
-JSONL. The RSI controller snapshots a corpus per objective round into its own
+JSONL. As built, an episode is one model judgement; its outcome is measured
+from the evidence it covered (not from when it was written) and labelled
+`continued` (the agent made a tool call before anyone acted), `needed_decision`
+(a human or the supervisor typed next), `needed_input`, `nudged`, `stopped`,
+`ended`, `restarted` (an outage; says nothing about the judged state) or
+`open`. `spawn judge --replay` runs the current rules over a corpus and
+reports coverage and agreement with the model and the outcomes. The RSI controller snapshots a corpus per objective round into its own
 directory, so a candidate cannot edit the data that judges it.
 
 RSI objectives are ratchets over the corpus, judged by black-box replay
@@ -323,6 +340,14 @@ One loop, end to end, before anything else:
 3. One RSI landing on the rules-coverage objective. It moves a class of
    episodes from Jev to rules with agreement kept, and the live share of Jev
    calls drops.
+
+### 7.1 Status (2026-11-04)
+
+| Done-criterion | State |
+| --- | --- |
+| 1. `scripts/mvp-e2e.sh` asserts every hop | **Passes** (~20 s). Not yet run by the RSI gate: a scenario can never be removed once added, so it joins when it has proven stable. |
+| 2. Live run with real Claude workers and hosted Jev, nonzero decisions at every tier, interventions per agent-hour in the UI | Partly: a live supervisor → worker → Jev → digest → review → stop loop ran; rules, Jev, dispatcher, supervisor and liveness all decided; the UI shows the ladder and `human_per_agent_hour`. Needs sustained worker traffic. |
+| 3. One RSI landing on the rules-coverage objective | Not started: the corpus has ~30 episodes; the objective needs a few hundred labelled ones to judge agreement without overfitting. |
 
 ## 8. Build order
 

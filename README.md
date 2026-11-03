@@ -67,6 +67,14 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `submit` | Writes one command to the queue. Flags: `--agent`, `--session`, `--key`, `--action`, `--principal` (default `spawn`). |
 | `tick` | Claims and runs queued commands, advances live executions, records observations. Flags: `--repo`, `--root`, `--judge-url`. |
 | `status` | Prints the latest observation for each session. |
+| `loop` | Runs the fleet until killed: Bridge, Observer, dispatcher, and (with `SPAWN_SUPERVISOR=1`) the supervisor's liveness rule. |
+| `rsi-loop` | Runs the RSI controller (`evolve` in a loop); exits 2 on HALT. |
+| `fleet` | Every session the login may read, with its judgement, as JSON. |
+| `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
+| `dispatch [--dry-run]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. |
+| `corpus export [--since-hours N]` | Model judgements with their evidence and outcome labels, one JSON line each. |
+| `judge --replay <file>` | Runs the current rules over a corpus: which tier decides each episode, coverage, agreement. |
+| `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. |
 | `hook` | Reads one Claude Code hook payload from standard input. Spawn configures this; you do not call it. |
 | `run` | Runs the engine inside the terminal and records its exit. Spawn configures this; you do not call it. |
 
@@ -78,6 +86,9 @@ Actions for `--action`:
 | `input` | `text`; Claude only |
 | `resume` | optional `prompt`; Codex requires it |
 | `stop` | none |
+
+End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s):
+`SPAWN_DATABASE_URL=postgres://.../spawn_test scripts/mvp-e2e.sh`.
 
 ## Configuration
 
