@@ -31,6 +31,7 @@ use spawn_jev::{JevConfig, JevJudge};
 use spawn_postgres::PostgresStore;
 
 mod evolve;
+mod serve;
 mod trace;
 use trace::Timed;
 
@@ -83,13 +84,17 @@ impl Flags {
 pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
-        return Err("usage: spawn <init-db|submit|tick|evolve|status|hook|run>".to_string());
+        return Err(
+            "usage: spawn <init-db|submit|tick|loop|evolve|serve|status|hook|run>".to_string(),
+        );
     };
     let rest: Vec<String> = arguments.collect();
     match command.as_str() {
         "init-db" => cmd_init_db(&Flags::parse(&rest)?),
         "submit" => cmd_submit(&Flags::parse(&rest)?),
         "tick" => cmd_tick(&Flags::parse(&rest)?),
+        "loop" => cmd_loop(&Flags::parse(&rest)?),
+        "serve" => serve::serve(&Flags::parse(&rest)?),
         "evolve" => evolve::evolve(&Flags::parse(&rest)?),
         "status" => cmd_status(&Flags::parse(&rest)?),
         "hook" => cmd_hook(),
@@ -147,7 +152,12 @@ fn cmd_submit(flags: &Flags) -> Result<i32, String> {
     Ok(0)
 }
 
-fn cmd_tick(flags: &Flags) -> Result<i32, String> {
+/// Build the Bridge and the Observer over one store.
+///
+/// Both keep the event-log cursor in memory, so the resident loop builds
+/// them once. Rebuilding them per step would replay the whole log on every
+/// tick, and that cost grows with the log.
+fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     let store = Arc::new(open_store()?);
     let repo = flags
         .get("repo")
@@ -207,10 +217,6 @@ fn cmd_tick(flags: &Flags) -> Result<i32, String> {
     }
     let mut bridge = Bridge::new(Arc::clone(&log), queue, workspaces, terminals, config);
     trace::time("bridge.recover", || bridge.recover()).map_err(|error| error.to_string())?;
-    let report = trace::time("bridge.tick", || bridge.tick()).map_err(|error| error.to_string())?;
-    for warning in &report.warnings {
-        eprintln!("spawn tick warning: {warning}");
-    }
 
     let mut judge: Arc<dyn StateJudge> = match flags
         .get("judge-url")
@@ -224,9 +230,17 @@ fn cmd_tick(flags: &Flags) -> Result<i32, String> {
     }
     let mut observer = Observer::new(log, judge);
     trace::time("observer.recover", || observer.recover()).map_err(|error| error.to_string())?;
+    Ok((bridge, observer))
+}
+
+fn cmd_tick(flags: &Flags) -> Result<i32, String> {
+    let (mut bridge, mut observer) = runtime(flags)?;
+    let report = trace::time("bridge.tick", || bridge.tick()).map_err(|error| error.to_string())?;
+    for warning in &report.warnings {
+        eprintln!("spawn tick warning: {warning}");
+    }
     let observations =
         trace::time("observer.tick", || observer.tick()).map_err(|error| error.to_string())?;
-
     println!(
         "commands={} observations={} sessions={}",
         report.commands,
@@ -234,6 +248,55 @@ fn cmd_tick(flags: &Flags) -> Result<i32, String> {
         bridge.session_count()
     );
     Ok(0)
+}
+
+/// Run the Bridge, the Observer and the RSI controller until killed.
+///
+/// The loop holds one connection and one in-memory cursor, so its cost does
+/// not grow with the event log. A transient store error is logged and
+/// retried with a growing pause. The one exit is a halt from the RSI
+/// controller, which means three rejections in a row; that is a decision for
+/// a human, so the process stops instead of spinning.
+fn cmd_loop(flags: &Flags) -> Result<i32, String> {
+    let interval = std::time::Duration::from_millis(
+        env_value("SPAWN_LOOP_INTERVAL_MS")
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(2000),
+    );
+    let (mut bridge, mut observer) = runtime(flags)?;
+    let mut failures: u32 = 0;
+    loop {
+        match bridge.tick() {
+            Ok(report) => {
+                failures = 0;
+                for warning in &report.warnings {
+                    eprintln!("spawn loop warning: {warning}");
+                }
+            }
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                eprintln!("spawn loop: bridge: {error}");
+            }
+        }
+        if let Err(error) = observer.tick() {
+            eprintln!("spawn loop: observer: {error}");
+        }
+        match evolve::evolve(flags) {
+            Ok(2) => {
+                eprintln!("spawn loop: RSI halted after repeated rejections");
+                return Ok(2);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                eprintln!("spawn loop: evolve: {error}");
+            }
+        }
+        // ponytail: fixed backoff, cap at 30 intervals. A per-error-kind
+        // schedule only matters once a failure class is slow to clear.
+        let pause = interval.saturating_mul(failures.clamp(1, 30));
+        std::thread::sleep(pause);
+    }
 }
 
 fn cmd_status(_flags: &Flags) -> Result<i32, String> {
