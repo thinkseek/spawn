@@ -29,6 +29,8 @@ BASE = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/"
 HOST, _, PORT = os.environ.get("JEV_RELAY_ADDRESS", "127.0.0.1:8790").rpartition(":")
 PATH = "/v1/systemone"
 TIMEOUT = 20
+# A judgement request is a few kilobytes of evidence; refuse anything larger.
+MAX_BODY = 256 * 1024
 
 
 class Relay(BaseHTTPRequestHandler):
@@ -52,8 +54,18 @@ class Relay(BaseHTTPRequestHandler):
         if self.path != PATH:
             self._reply(404, b'{"error":"only POST /v1/systemone is relayed"}')
             return
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._reply(400, b'{"error":"Content-Length is required"}')
+            return
+        if length <= 0 or length > MAX_BODY:
+            self._reply(413, b'{"error":"body is empty or too large"}')
+            return
         body = self.rfile.read(length)
+        if len(body) != length:
+            self._reply(400, b'{"error":"body is shorter than Content-Length"}')
+            return
         request = urllib.request.Request(
             BASE + PATH,
             data=body,

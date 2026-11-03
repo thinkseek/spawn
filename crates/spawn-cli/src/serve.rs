@@ -463,6 +463,17 @@ fn static_file(request: Request, web: &Path, path: &str) -> Result<(), String> {
             .map_err(|error| error.to_string());
     }
     let file = web.join(&relative);
+    // `..` is refused above; a symlink inside the built directory could still
+    // point outside it, so the resolved path must stay under the root.
+    let inside = match (std::fs::canonicalize(&file), std::fs::canonicalize(web)) {
+        (Ok(file), Ok(root)) => file.starts_with(root),
+        _ => false,
+    };
+    if !inside {
+        return request
+            .respond(Response::empty(404))
+            .map_err(|error| error.to_string());
+    }
     let Ok(bytes) = std::fs::read(&file) else {
         return request
             .respond(Response::empty(404))

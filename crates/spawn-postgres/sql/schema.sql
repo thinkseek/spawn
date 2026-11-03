@@ -199,12 +199,26 @@ create or replace function spawn_append(
     out_inserted boolean
 ) language plpgsql security definer as $$
 begin
-    if session_user in ('spawn_terminal', 'spawn_supervisor')
-        and p_source is distinct from 'claude'
-        and p_source is distinct from 'codex'
-    then
-        raise exception '% may not write source %', session_user, p_source
-            using errcode = '42501';
+    if session_user in ('spawn_terminal', 'spawn_supervisor') then
+        if p_source is distinct from 'claude' and p_source is distinct from 'codex' then
+            raise exception '% may not write source %', session_user, p_source
+                using errcode = '42501';
+        end if;
+        -- Engine output only, by name. The runner in the pane reports its own
+        -- exit (`execution.ended`, cause `exited`); any other end, and every
+        -- controller fact, belongs to the Bridge, the Observer or the gateway.
+        -- An unknown name is refused too: one undecodable row would stop
+        -- every reader of the closed EventKind.
+        if (p_kind ->> 'name') is null or (p_kind ->> 'name') not in (
+                'session.native_started', 'session.native_ended', 'message.received',
+                'notification.received', 'tool.started', 'tool.completed', 'tool.failed',
+                'turn.stopped', 'turn.failed', 'execution.ended')
+            or ((p_kind ->> 'name') = 'execution.ended'
+                and (p_kind -> 'detail' ->> 'cause') is distinct from 'exited')
+        then
+            raise exception '% may not write %', session_user, coalesce(p_kind ->> 'name', 'an unnamed event')
+                using errcode = '42501';
+        end if;
     end if;
     return query
         select * from spawn_append_trusted(p_agent, p_session, p_execution, p_source, p_source_key, p_kind);

@@ -200,7 +200,10 @@ pub enum RulesVerdict {
 /// The rules tier: decide what the facts settle, mark the rest ambiguous.
 pub fn rules(input: &JudgeInput) -> RulesVerdict {
     use RulesVerdict::{Ambiguous, Certain};
-    if input.permission_pending || input.screen == Some(ScreenState::Permission) {
+    // A permission dialog is a fact only while its pane exists.
+    if input.execution_active
+        && (input.permission_pending || input.screen == Some(ScreenState::Permission))
+    {
         return Certain {
             state: SemanticState::Blocked,
         };
@@ -275,10 +278,15 @@ pub fn narrow(
         };
         let total: f64 = allowed.iter().map(|state| weight(*state)).sum();
         if total > 0.0 {
+            // On a tie the rules' guess wins: it is the documented fallback.
             let best = allowed
                 .iter()
                 .copied()
-                .max_by(|left, right| weight(*left).total_cmp(&weight(*right)))
+                .max_by(|left, right| {
+                    weight(*left)
+                        .total_cmp(&weight(*right))
+                        .then_with(|| (*left == guess).cmp(&(*right == guess)))
+                })
                 .unwrap_or(guess);
             let confidence = Confidence::new(weight(best) / total).unwrap_or(Confidence::ZERO);
             return (best, confidence);
@@ -399,6 +407,10 @@ impl Snapshot {
                 self.execution_active = false;
                 self.last_end = Some(*cause);
                 self.open_tools.clear();
+                // The pane is gone with the execution; nothing on it is a
+                // current fact any more.
+                self.screen = None;
+                self.permission_pending = false;
             }
             EventKind::NativeSessionStarted { engine, .. } => {
                 self.engine = Some(*engine);

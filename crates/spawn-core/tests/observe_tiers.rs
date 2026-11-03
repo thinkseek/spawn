@@ -5,14 +5,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use spawn_core::event::EndCause;
 use spawn_core::event::{Engine, EventKind, GlobalPosition, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
 use spawn_core::observe::{
-    JudgeError, JudgeInput, Judgement, ObservationContext, Observer, StateJudge,
+    JudgeError, JudgeInput, Judgement, ObservationContext, Observer, StateJudge, narrow,
 };
 use spawn_core::port::EventLog;
+use spawn_core::screen::ScreenState;
 use spawn_core::time::{ManualClock, Timestamp};
 
 /// A model judge that answers from a script and counts its calls.
@@ -306,4 +308,48 @@ fn an_idle_agent_split_between_harmless_states_pages_no_one() {
     let last = observations(&fixture.store).pop().expect("an observation");
     assert_eq!(last.state, SemanticState::Waiting);
     assert!(!last.attention, "WAITING or COMPLETED, nobody is needed");
+}
+
+#[test]
+fn a_permission_screen_dies_with_its_execution() {
+    // Review finding: a permission screen recorded before a stop kept the
+    // session BLOCKED by rule after the pane was gone.
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge);
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ScreenObserved {
+            state: ScreenState::Permission,
+            evidence: "Do you want to proceed?".to_string(),
+        },
+    );
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Stopped,
+            exit_code: None,
+        },
+    );
+
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Completed);
+    assert_eq!(last.judge, "rules");
+    assert!(!last.attention);
+}
+
+#[test]
+fn a_tie_goes_to_the_rules_guess() {
+    let tie = Judgement {
+        state: SemanticState::Blocked,
+        confidence: confidence(0.5),
+        probabilities: Some([0.0, 0.0, 0.5, 0.5, 0.0]),
+        needs_human: None,
+        stuck: None,
+    };
+    let (state, _) = narrow(Ambiguity::ExitedOnItsOwn, SemanticState::Completed, &tie);
+    assert_eq!(state, SemanticState::Completed);
 }
