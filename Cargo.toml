@@ -30,6 +30,17 @@ postgres = { version = "0.19", default-features = false, features = ["with-serde
 debug = "line-tables-only"
 split-debuginfo = "packed"
 
+# SCRAM-SHA-256 login runs 4096 PBKDF2 rounds; unoptimized sha2 makes every
+# PostgreSQL connect take ~50 ms instead of ~5 ms.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.dev.package.postgres-protocol]
+opt-level = 3
+
 [profile.test]
 inherits = "dev"
 
