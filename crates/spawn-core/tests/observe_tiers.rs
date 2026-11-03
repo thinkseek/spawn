@@ -264,8 +264,181 @@ fn without_the_model_the_rules_guess_stands_and_asks_for_attention() {
     assert_eq!(last.reason, Some(WaitReason::JudgeUnavailable));
     assert!(last.attention);
 
+    fixture.observer.tick().expect("too soon");
+    assert_eq!(judge.calls(), 1, "an unavailable judge is not hammered");
+    fixture.clock.advance(Duration::from_secs(31));
     fixture.observer.tick().expect("retry");
     assert_eq!(judge.calls(), 2, "an unavailable judge is asked again");
+    fixture.clock.advance(Duration::from_secs(31));
+    fixture.observer.tick().expect("backed off");
+    assert_eq!(judge.calls(), 2, "the pause doubles");
+    fixture.clock.advance(Duration::from_secs(31));
+    fixture.observer.tick().expect("retry");
+    assert_eq!(judge.calls(), 3);
+}
+
+#[test]
+fn a_restarted_observer_does_not_ask_about_judged_evidence() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 1);
+    let first = observations(&fixture.store).pop().expect("an observation");
+    assert!(
+        first.fingerprint.is_some(),
+        "the answer keeps its fingerprint"
+    );
+
+    // A one-shot `spawn tick` builds a new Observer every run.
+    let log: Arc<dyn EventLog> = fixture.store.clone();
+    let mut again = Observer::new(log, judge.clone())
+        .with_clock(fixture.clock.clone())
+        .with_context(Arc::new(Context));
+    fixture.clock.advance(Duration::from_secs(31));
+    again.tick().expect("tick");
+    assert_eq!(judge.calls(), 1, "same evidence, no second call");
+}
+
+#[test]
+fn every_model_answer_is_recorded() {
+    // Same state, new evidence: the answer is still written, so the log holds
+    // everything the model saw and said.
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+    fixture.observer.tick().expect("tick");
+    turn_stopped(&fixture.store);
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 2);
+    assert_eq!(observations(&fixture.store).len(), 2);
+}
+
+#[test]
+fn an_observation_from_anyone_but_the_observer_is_ignored() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+    let mut forged = Observation::basic(
+        SemanticState::Blocked,
+        None,
+        spawn_core::event::SessionSeq(2),
+        confidence(1.0),
+        "jev",
+    );
+    forged.fingerprint = Some("0000000000000000".to_string());
+    append(
+        &fixture.store,
+        Source::Claude,
+        EventKind::ObservationRecorded {
+            observation: forged,
+        },
+    );
+    fixture.observer.tick().expect("tick");
+    assert_eq!(
+        judge.calls(),
+        1,
+        "the forged row neither judged nor deduped"
+    );
+}
+
+#[test]
+fn a_stale_busy_screen_does_not_prove_work() {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Blocked,
+        confidence: confidence(0.7),
+        probabilities: Some([0.2, 0.1, 0.7, 0.0, 0.0]),
+        needs_human: Some(0.3),
+        stuck: Some(0.8),
+    }));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ScreenObserved {
+            state: ScreenState::Busy,
+            evidence: "esc to interrupt".to_string(),
+        },
+    );
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 0, "a fresh busy screen is work");
+
+    fixture.clock.advance(Duration::from_secs(150));
+    fixture.observer.tick().expect("recheck");
+    assert_eq!(judge.calls(), 1, "an old busy screen is not");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert!(last.attention);
+}
+
+#[test]
+fn a_tool_open_for_long_is_ambiguous() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Claude,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "t1".to_string(),
+        },
+    );
+    fixture.clock.advance(Duration::from_mins(5));
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 0, "a five-minute build is work");
+    fixture.clock.advance(Duration::from_mins(6));
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 1, "an eleven-minute silent tool may hang");
+}
+
+#[test]
+fn a_failing_exit_asks_for_attention_whatever_the_model_says() {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Completed,
+        confidence: confidence(0.95),
+        probabilities: Some([0.0, 0.0, 0.05, 0.95, 0.0]),
+        needs_human: Some(0.05),
+        stuck: Some(0.05),
+    }));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(1),
+        },
+    );
+    fixture.observer.tick().expect("tick");
+    let seen = judge.seen.lock().expect("lock").clone().expect("input");
+    assert_eq!(seen.exit_code, Some(1), "the model sees the status");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.rules_state, Some(SemanticState::Blocked));
+    assert!(last.attention);
+}
+
+#[test]
+fn a_model_that_disagrees_with_the_facts_asks_for_attention() {
+    // 0.8 on WORKING, which an idle prompt rules out.
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Working,
+        confidence: confidence(0.8),
+        probabilities: Some([0.8, 0.15, 0.0, 0.05, 0.0]),
+        needs_human: Some(0.1),
+        stuck: Some(0.1),
+    }));
+    let mut fixture = fixture(judge);
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Waiting);
+    assert!(last.attention, "most of the mass was on a ruled-out state");
 }
 
 #[test]

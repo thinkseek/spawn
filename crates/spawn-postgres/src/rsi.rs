@@ -76,6 +76,8 @@ pub struct RsiIteration {
     pub candidate: Option<String>,
     /// Failure classification or free text.
     pub note: Option<String>,
+    /// Gate output of an accepted candidate that has not landed yet.
+    pub verdict_log: Option<String>,
 }
 
 /// Outcome of the command that started an iteration.
@@ -158,6 +160,7 @@ fn iteration_of(row: &Row) -> RsiIteration {
         patch: row.get("patch"),
         candidate: row.get("candidate"),
         note: row.get("note"),
+        verdict_log: row.try_get("verdict_log").ok().flatten(),
     }
 }
 
@@ -509,6 +512,87 @@ impl PostgresStore {
         }
         transaction.commit().map_err(|error| backend(&error))?;
         Ok(changed == 1)
+    }
+
+    /// Record the gate's acceptance of a `Gating` iteration, before `main`
+    /// moves. False when the iteration was not gating.
+    pub fn rsi_accept(&self, iteration: u32, verdict_log: &str) -> Result<bool, StoreError> {
+        let mut client = self.lock();
+        let changed = client
+            .execute(
+                "update rsi_iterations
+                    set phase = 'Accepted', verdict_log = $2, updated_at_ms = spawn_now_ms()
+                  where iteration = $1 and phase in ('Gating', 'Accepted')",
+                &[&i32::try_from(iteration).unwrap_or(i32::MAX), &verdict_log],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(changed == 1)
+    }
+
+    /// Land an accepted iteration: move the stored baseline, mark the
+    /// iteration `Landed` and record the accepted attempt, in one transaction.
+    ///
+    /// Idempotent: when the iteration already landed on `candidate` it
+    /// returns true and changes nothing. False when the stored baseline is
+    /// neither `expected` nor already `candidate`.
+    pub fn rsi_land(
+        &self,
+        iteration: u32,
+        task_id: u32,
+        expected: &str,
+        candidate: &str,
+        diff: &str,
+        gate_log: &str,
+    ) -> Result<bool, StoreError> {
+        let iteration = i32::try_from(iteration).unwrap_or(i32::MAX);
+        let task_id = i32::try_from(task_id).unwrap_or(i32::MAX);
+        let mut client = self.lock();
+        let mut transaction = client.transaction().map_err(|error| backend(&error))?;
+        let landed: bool = transaction
+            .query_one(
+                "select exists (select 1 from rsi_iterations
+                                 where iteration = $1 and phase = 'Landed' and candidate = $2)",
+                &[&iteration, &candidate],
+            )
+            .map_err(|error| backend(&error))?
+            .get(0);
+        if landed {
+            transaction.commit().map_err(|error| backend(&error))?;
+            return Ok(true);
+        }
+        let changed = transaction
+            .execute(
+                "update rsi_state
+                    set baseline_commit = $2, consecutive_rejected = 0,
+                        infra_failures = 0
+                  where id = 1 and baseline_commit = $1",
+                &[&expected, &candidate],
+            )
+            .map_err(|error| backend(&error))?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "update rsi_iterations
+                    set phase = 'Landed', candidate = $2, updated_at_ms = spawn_now_ms()
+                  where iteration = $1",
+                &[&iteration, &candidate],
+            )
+            .map_err(|error| backend(&error))?;
+        transaction
+            .execute(
+                "insert into rsi_attempts
+                     (task_id, attempt, iteration, diff, gate_log, classifier,
+                      accept_ok, created_at_ms)
+                 select $1, coalesce(max(attempt), 0) + 1, $2, $3, $4, 'accepted', true,
+                        spawn_now_ms()
+                   from rsi_attempts where task_id = $1",
+                &[&task_id, &iteration, &diff, &gate_log],
+            )
+            .map_err(|error| backend(&error))?;
+        transaction.commit().map_err(|error| backend(&error))?;
+        Ok(true)
     }
 
     /// Close one iteration as rejected or aborted, counting the failure.

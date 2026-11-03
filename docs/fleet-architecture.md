@@ -71,13 +71,17 @@ runs, it classifies:
 | Facts | Decided by | State |
 | --- | --- | --- |
 | permission dialog on screen or permission notification | rules | BLOCKED (permission) |
-| a tool call is open, or the pane is busy | rules | WORKING |
+| a tool call is open, or the pane read busy less than 2 min ago | rules | WORKING |
 | execution ended by Stop | rules | COMPLETED |
 | no execution yet | rules | WAITING |
 | turn stopped, prompt idle: finished, asking a question, or waiting? | **Jev** | WAITING / BLOCKED / COMPLETED |
-| execution live, no open tool, pane quiet for long: thinking or hung? | **Jev** | WORKING / BLOCKED |
-| repeated tool failures or engine errors: progressing or stuck? | **Jev** | WORKING / BLOCKED |
-| process lost, screen layout unknown | **Jev** | any |
+| execution live, no open tool, no fact for 2 min (or a tool open and silent for 10 min): thinking or hung? | **Jev** | WORKING / WAITING / BLOCKED |
+| failed turn or an error on screen: progressing or stuck? | **Jev** | WORKING / WAITING / BLOCKED |
+| process exited on its own (a non-zero exit code makes BLOCKED the rules' guess and always asks for attention) | **Jev** | COMPLETED / BLOCKED |
+| process lost | **Jev** | UNKNOWN / BLOCKED / COMPLETED |
+
+A failing tool call alone is not ambiguous: it only becomes the latest error
+that Jev sees when another case asks it.
 
 When rules decide, no model call is made. When they cannot, Jev gets the
 evidence a human would use: the terminal tail, the task, and the recent
@@ -102,12 +106,22 @@ The new fields are optional in the serde payload, so older readers still
 parse the log. `EventKind` gains no variant.
 
 If Jev is down, the rules' best guess is written with
-`reason = JudgeUnavailable`, and the session is retried. It is never marked dead.
+`reason = JudgeUnavailable`, and the session is retried after 30 s, doubling
+to at most 10 min. While retries are pending they replace the 30 s recheck.
+It is never marked dead.
+
+Every Jev answer is written, even when the state did not change, together
+with the evidence and a stable fingerprint of it. That makes the log the full
+record of what the model saw and said, and lets a restarted Observer (or a
+one-shot `spawn tick`) skip evidence it already judged. The Observer restores
+its state only from rows whose source is `observer`, and the projection only
+takes observations from that source.
 
 Jev's distribution doubles as the attention signal. An observation asks for
 attention when the probability on states that need someone (BLOCKED,
 UNKNOWN), among the states the facts allow, reaches 0.5, or when
-`needs_human` or `stuck` does. Uncertainty between harmless states (WAITING
+`needs_human` or `stuck` does, or when more than half of Jev's mass lies on
+states the facts rule out (Jev and the facts disagree). Uncertainty between harmless states (WAITING
 0.56 against COMPLETED 0.40 for an idle agent) pages no one: a false alarm
 costs exactly the human attention the system exists to save.
 
@@ -260,7 +274,8 @@ Known edges, each with its rule:
 - The event log is the only state; every process is restartable.
 - `EventKind` stays closed; observation fields are additive.
 - Facts > rules > Jev; observation never acts; Jev alone triggers only reversible, bounded actions.
-- Only the Bridge writes runtime events and only the Observer writes observations, enforced by DB roles.
+- Agent panes write through restricted logins: `spawn_terminal` (workers) and `spawn_supervisor` may append only engine events by name (no observations, no controller facts, `execution.ended` only as the runner's own exit). The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing.
+- Known limit: all panes share one uid, one login and one tmux server. An agent can append events for another session, or simply `tmux send-keys` into another pane. The DB roles stop a pane from forging controller facts; they do not isolate agents from each other. Isolation between agents needs container mode (`SPAWN_EXEC_IMAGE`) or one uid per agent. The same holds for the RSI gate, which runs candidate code on the host (see docs/rsi.md §5).
 - RSI keeps its black-box gate, host-side commit, baseline compare-and-swap and halt rules.
 
 ## 7. MVP: the minimal closed loop

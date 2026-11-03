@@ -22,6 +22,7 @@ fn input() -> JudgeInput {
         engine: Some(spawn_core::event::Engine::Claude),
         execution_active: true,
         last_end: None,
+        exit_code: None,
         open_tools: 1,
         last_tool: Some("Bash".to_string()),
         permission_pending: false,

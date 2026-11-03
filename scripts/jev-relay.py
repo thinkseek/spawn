@@ -95,6 +95,10 @@ class Relay(BaseHTTPRequestHandler):
 def main():
     if not KEY:
         sys.exit("jev-relay: TYPESAFE_API_KEY is not set")
+    # Whoever reaches the relay spends the key, so it serves loopback only.
+    # An empty host (":8790") would bind every interface.
+    if HOST not in ("127.0.0.1", "::1", "[::1]", "localhost"):
+        sys.exit(f"jev-relay: refusing to listen on {HOST or 'every interface'}; use 127.0.0.1")
     server = ThreadingHTTPServer((HOST, int(PORT)), Relay)
     sys.stderr.write(f"jev-relay: http://{HOST}:{PORT}{PATH} -> {BASE}{PATH}\n")
     server.serve_forever()

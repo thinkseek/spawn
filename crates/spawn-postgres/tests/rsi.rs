@@ -100,6 +100,51 @@ fn landing_advances_the_baseline_and_clears_the_failure_counter() {
 }
 
 #[test]
+fn an_accepted_iteration_lands_once_with_its_attempt() {
+    let store = store("accept");
+    store.rsi_seed_baseline("aaa").expect("seed");
+    store
+        .rsi_begin_iteration(7, 1, start("task"))
+        .expect("begin");
+    store
+        .rsi_set_phase(1, "Gating", Some("diff"), Some("bbb"))
+        .expect("gating");
+    assert!(
+        store
+            .rsi_accept(1, "{\"verdict\":\"accepted\"}")
+            .expect("accept")
+    );
+    let open = store
+        .rsi_open_iteration()
+        .expect("open")
+        .expect("still open");
+    assert_eq!(open.phase, "Accepted", "accepted is not landed yet");
+    assert_eq!(
+        open.verdict_log.as_deref(),
+        Some("{\"verdict\":\"accepted\"}")
+    );
+
+    assert!(
+        store
+            .rsi_land(1, 7, "aaa", "bbb", "diff", "log")
+            .expect("land")
+    );
+    // A controller that stopped after the commit and lands again changes
+    // nothing and records no second attempt.
+    assert!(
+        store
+            .rsi_land(1, 7, "aaa", "bbb", "diff", "log")
+            .expect("again")
+    );
+    let state = store.rsi_state().expect("state").expect("seeded");
+    assert_eq!(state.baseline, "bbb");
+    assert_eq!(store.rsi_open_iteration().expect("open"), None);
+    let attempts = store.rsi_attempts_of(7, 10).expect("attempts");
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].accepted);
+}
+
+#[test]
 fn landing_refuses_a_baseline_that_moved() {
     let store = store("stale");
     store.rsi_seed_baseline("aaa").expect("seed");

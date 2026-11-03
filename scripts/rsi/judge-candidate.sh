@@ -20,7 +20,10 @@
 #   candidate, except ratchet scenarios (a line `# rsi: ratchet`), which
 #   compare against the baseline and so fail on any tree that did not improve.
 #
-# Prints one JSON line, last.
+# Prints one JSON line, last, on stdout. When the candidate run printed a
+# `METRIC` line, the verdict carries it as "metric": the controller reads the
+# metric from the verdict only, never from scenario output, which candidate
+# code controls.
 #
 # ponytail: the gate runs on the host. Move it into a container without the
 # `spawn` binary when a candidate is treated as untrusted.
@@ -48,6 +51,18 @@ if [ ! -f "$scenario" ]; then
     echo '{"verdict":"rejected","reason":"scenario is missing"}'
     exit 0
 fi
+
+# The candidate run's metric line, if any. Restricted to a safe shape so it
+# can be embedded in JSON without escaping.
+metric=""
+
+# verdict <accepted|rejected> [reason]
+verdict() {
+    json="{\"verdict\":\"$1\""
+    [ -n "${2-}" ] && json="$json,\"reason\":\"$2\""
+    [ -n "$metric" ] && json="$json,\"metric\":\"$metric\""
+    echo "$json}"
+}
 
 extract() {
     mkdir -p "$2"
@@ -112,13 +127,17 @@ fi
 
 echo "| == candidate: $(basename "$scenario") must pass"
 green=0
+# A build failure leaves no run log; the baseline's must not be read instead.
+rm -f "$work/run.log"
 try "$work/candidate" || green=$?
+# The scenario prints its METRIC line last; candidate code ran before it.
+metric=$(grep -E '^METRIC [A-Za-z0-9_]+( [a-z]+=[0-9.]+)*$' "$work/run.log" 2>/dev/null | tail -n 1 || true)
 if [ "$green" -eq 2 ]; then
-    echo '{"verdict":"rejected","reason":"candidate does not build"}'
+    verdict rejected "candidate does not build"
     exit 0
 fi
 if [ "$green" -ne 0 ]; then
-    echo '{"verdict":"rejected","reason":"scenario fails on the candidate"}'
+    verdict rejected "scenario fails on the candidate"
     exit 0
 fi
 
@@ -127,8 +146,8 @@ for other in "$(dirname "$scenario")"/*.sh; do
     grep -q '^# rsi: ratchet' "$other" && continue
     echo "| == regression: $(basename "$other") must still pass"
     if ! run_scenario "$work/candidate" "$other"; then
-        echo "{\"verdict\":\"rejected\",\"reason\":\"regression: $(basename "$other") fails on the candidate\"}"
+        verdict rejected "regression: $(basename "$other") fails on the candidate"
         exit 0
     fi
 done
-echo '{"verdict":"accepted"}'
+verdict accepted

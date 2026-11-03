@@ -250,9 +250,15 @@ impl GitWorkspace {
         if output.status.success() {
             return Ok(true);
         }
-        // A lost race and a real failure both exit non-zero. Reading the ref
-        // back separates them.
-        if self.git_output(&["rev-parse", &reference])? != base {
+        // A lost race, a repeat of a move that already happened, and a real
+        // failure all exit non-zero. Reading the ref back separates them.
+        let current = self.git_output(&["rev-parse", &reference])?;
+        if current == candidate {
+            // Already moved, by an earlier call that stopped before its
+            // caller recorded it.
+            return Ok(true);
+        }
+        if current != base {
             return Ok(false);
         }
         report(Ok(output), &format!("update-ref {reference}"))?;

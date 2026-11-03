@@ -11,7 +11,6 @@
 //! `JudgeUnavailable` and asks for attention; it never reports "dead".
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +32,19 @@ pub const QUIET_AFTER: Duration = Duration::from_mins(2);
 /// A live session is classified again this often when no fact arrives, so a
 /// silent hang is noticed.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// A tool open this long with no other fact is ambiguous: it may hang.
+pub const LONG_TOOL: Duration = Duration::from_mins(10);
+
+/// A busy screen reading older than this no longer proves work: the screen is
+/// read only when a command runs, so a hang would keep it forever.
+pub const SCREEN_STALE: Duration = QUIET_AFTER;
+
+/// First pause before asking an unavailable judge again; doubles per failure.
+pub const RETRY_BASE: Duration = Duration::from_secs(30);
+
+/// Longest pause between retries of an unavailable judge.
+pub const RETRY_MAX: Duration = Duration::from_mins(10);
 
 /// Without a distribution, below this confidence a model judgement asks for
 /// attention.
@@ -68,6 +80,8 @@ pub struct JudgeInput {
     pub execution_active: bool,
     /// How the latest execution ended.
     pub last_end: Option<EndCause>,
+    /// Exit status of the latest execution, when its process reported one.
+    pub exit_code: Option<i32>,
     /// Number of tool calls still open.
     pub open_tools: usize,
     /// Tool that started last.
@@ -209,6 +223,17 @@ pub fn rules(input: &JudgeInput) -> RulesVerdict {
         };
     }
     if input.execution_active {
+        let quiet_for = |limit: Duration| {
+            input
+                .quiet_ms
+                .is_some_and(|quiet| Duration::from_millis(quiet) >= limit)
+        };
+        if input.open_tools > 0 && quiet_for(LONG_TOOL) {
+            return Ambiguous {
+                ambiguity: Ambiguity::QuietLive,
+                guess: SemanticState::Working,
+            };
+        }
         if input.open_tools > 0 || input.screen == Some(ScreenState::Busy) {
             return Certain {
                 state: SemanticState::Working,
@@ -226,10 +251,7 @@ pub fn rules(input: &JudgeInput) -> RulesVerdict {
                 guess: SemanticState::Waiting,
             };
         }
-        if input
-            .quiet_ms
-            .is_some_and(|quiet| Duration::from_millis(quiet) >= QUIET_AFTER)
-        {
+        if quiet_for(QUIET_AFTER) {
             return Ambiguous {
                 ambiguity: Ambiguity::QuietLive,
                 guess: SemanticState::Working,
@@ -244,9 +266,14 @@ pub fn rules(input: &JudgeInput) -> RulesVerdict {
         Some(EndCause::Stopped) => Certain {
             state: SemanticState::Completed,
         },
+        // A failing exit status makes "it got stuck" the safer guess.
         Some(EndCause::Exited) => Ambiguous {
             ambiguity: Ambiguity::ExitedOnItsOwn,
-            guess: SemanticState::Completed,
+            guess: if input.exit_code.is_some_and(|code| code != 0) {
+                SemanticState::Blocked
+            } else {
+                SemanticState::Completed
+            },
         },
         Some(EndCause::Lost) => Ambiguous {
             ambiguity: Ambiguity::Lost,
@@ -306,7 +333,9 @@ pub fn narrow(
 /// is about which harmless state applies: WAITING 0.56 against COMPLETED 0.40
 /// is an idle agent either way and must not page anyone. With a distribution,
 /// the mass on BLOCKED and UNKNOWN among the states the facts allow decides;
-/// without one, a low confidence does.
+/// without one, a low confidence does. When most of the model's mass sits on
+/// states the facts rule out, the model and the facts disagree, which is
+/// itself worth a look.
 pub fn needs_attention(
     ambiguity: Option<Ambiguity>,
     state: SemanticState,
@@ -330,7 +359,8 @@ pub fn needs_attention(
             .map_or(0.0, |index| probabilities[index].max(0.0))
     };
     let total: f64 = allowed.iter().map(weight).sum();
-    if total <= 0.0 {
+    let everything: f64 = SemanticState::ALL.iter().map(weight).sum();
+    if total <= 0.0 || total < everything * LIKELY {
         return true;
     }
     let risky: f64 = allowed
@@ -369,8 +399,10 @@ struct Snapshot {
     last_tool: Option<String>,
     permission_pending: bool,
     screen: Option<ScreenState>,
+    screen_at: Option<Timestamp>,
     turn: Option<TurnFact>,
     last_error: Option<String>,
+    exit_code: Option<i32>,
     evidence_seq: SessionSeq,
     last_fact_at: Option<Timestamp>,
 }
@@ -398,14 +430,16 @@ impl Snapshot {
                 self.engine = Some(*engine);
                 self.execution_active = true;
                 self.last_end = None;
+                self.exit_code = None;
                 self.open_tools.clear();
                 self.permission_pending = false;
                 self.screen = None;
                 self.turn = None;
             }
-            EventKind::ExecutionEnded { cause, .. } => {
+            EventKind::ExecutionEnded { cause, exit_code } => {
                 self.execution_active = false;
                 self.last_end = Some(*cause);
+                self.exit_code = *exit_code;
                 self.open_tools.clear();
                 // The pane is gone with the execution; nothing on it is a
                 // current fact any more.
@@ -443,6 +477,7 @@ impl Snapshot {
             }
             EventKind::ScreenObserved { state, .. } => {
                 self.screen = Some(*state);
+                self.screen_at = Some(record.recorded_at);
                 if *state == ScreenState::Permission {
                     self.permission_pending = true;
                 }
@@ -457,17 +492,25 @@ impl Snapshot {
         }
     }
 
-    fn input(&self, agent_id: &AgentId, session_id: &SessionId) -> JudgeInput {
+    fn input(&self, agent_id: &AgentId, session_id: &SessionId, now: Timestamp) -> JudgeInput {
+        let stale = self
+            .screen_at
+            .is_none_or(|at| now.since(at) >= SCREEN_STALE);
+        let screen = match self.screen {
+            Some(ScreenState::Busy) if stale => None,
+            other => other,
+        };
         JudgeInput {
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
             engine: self.engine,
             execution_active: self.execution_active,
             last_end: self.last_end,
+            exit_code: self.exit_code,
             open_tools: self.open_tools.len(),
             last_tool: self.last_tool.clone(),
             permission_pending: self.permission_pending,
-            screen: self.screen,
+            screen,
             turn: self.turn,
             last_error: self.last_error.clone(),
             evidence_seq: self.evidence_seq,
@@ -500,9 +543,34 @@ struct Tracked {
     last: Option<WrittenKey>,
     judged_seq: SessionSeq,
     judged_at: Option<Timestamp>,
-    /// Evidence of the last model call; an identical one is not asked again.
-    asked: Option<u64>,
-    retry: bool,
+    /// Evidence of the last model answer; an identical one is not asked again.
+    asked: Option<String>,
+    /// Consecutive judge failures; the next tick retries after a backoff.
+    failures: u32,
+}
+
+/// Pause before asking an unavailable judge again after `failures` failures.
+fn retry_after(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(8);
+    RETRY_BASE.saturating_mul(1 << doublings).min(RETRY_MAX)
+}
+
+/// Stable digest of what the model is shown (FNV-1a over its JSON), so a
+/// stored fingerprint still matches after a restart or a rebuild.
+fn fingerprint_of(input: &JudgeInput) -> String {
+    let shown = serde_json::json!([
+        input.ambiguity,
+        input.evidence_seq.0,
+        input.exit_code,
+        input.screen_tail,
+        input.task,
+    ]);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in shown.to_string().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// State observer: rules first, the model judge on ambiguity.
@@ -564,12 +632,17 @@ impl Observer {
             .sessions
             .iter()
             .filter(|(_, tracked)| {
-                tracked.retry
-                    || tracked.snapshot.evidence_seq > tracked.judged_seq
-                    || (tracked.snapshot.execution_active
-                        && tracked
-                            .judged_at
-                            .is_none_or(|at| now.since(at) >= RECHECK_EVERY))
+                if tracked.snapshot.evidence_seq > tracked.judged_seq {
+                    return true;
+                }
+                let elapsed =
+                    |pause: Duration| tracked.judged_at.is_none_or(|at| now.since(at) >= pause);
+                // While the judge fails, its backoff replaces the recheck.
+                if tracked.failures > 0 {
+                    elapsed(retry_after(tracked.failures))
+                } else {
+                    tracked.snapshot.execution_active && elapsed(RECHECK_EVERY)
+                }
             })
             .map(|(session, _)| session.clone())
             .collect();
@@ -598,16 +671,30 @@ impl Observer {
                         judged_seq: SessionSeq(0),
                         judged_at: None,
                         asked: None,
-                        retry: false,
+                        failures: 0,
                     });
-                // The Observer's own output restores what it last wrote, so a
-                // new process does not write the same observation again.
-                if let EventKind::ObservationRecorded { observation } = &record.event.kind {
-                    tracked.last = Some(key_of(observation));
-                    tracked.judged_seq = observation.based_on_seq;
-                    tracked.judged_at = Some(record.recorded_at);
-                    tracked.retry = observation.reason == Some(WaitReason::JudgeUnavailable);
-                } else if record.event.source != Source::Observer {
+                // The Observer's own output restores what it last wrote and
+                // what it last asked, so a new process neither writes the same
+                // observation again nor asks the model about the same evidence.
+                // Only the Observer's rows count; anything else claiming to be
+                // an observation is ignored.
+                if record.event.source == Source::Observer {
+                    if let EventKind::ObservationRecorded { observation } = &record.event.kind {
+                        tracked.last = Some(key_of(observation));
+                        tracked.judged_seq = observation.based_on_seq;
+                        tracked.judged_at = Some(record.recorded_at);
+                        // The live process also reads back its own rows, so
+                        // this records that the judge failed, not how often.
+                        if observation.reason == Some(WaitReason::JudgeUnavailable) {
+                            tracked.failures = tracked.failures.max(1);
+                        } else {
+                            tracked.failures = 0;
+                        }
+                        if observation.fingerprint.is_some() {
+                            tracked.asked.clone_from(&observation.fingerprint);
+                        }
+                    }
+                } else if !matches!(record.event.kind, EventKind::ObservationRecorded { .. }) {
                     tracked.snapshot.apply(record);
                 }
             }
@@ -624,17 +711,17 @@ impl Observer {
         let Some(tracked) = self.sessions.get(session) else {
             return Ok(0);
         };
-        let mut input = tracked.snapshot.input(&tracked.agent_id, session);
+        let mut input = tracked.snapshot.input(&tracked.agent_id, session, now);
         input.quiet_ms = tracked
             .snapshot
             .last_fact_at
             .map(|at| u64::try_from(now.since(at).as_millis()).unwrap_or(u64::MAX));
         let agent = tracked.agent_id.clone();
         let seq = tracked.snapshot.evidence_seq;
-        let retry = tracked.retry;
-        let previous_ask = tracked.asked;
+        let failures = tracked.failures;
+        let previous_ask = tracked.asked.clone();
 
-        let (observation, asked, retry_next) = match rules(&input) {
+        let (observation, asked, failures_next) = match rules(&input) {
             RulesVerdict::Certain { state } => {
                 let mut observation = Observation::basic(
                     state,
@@ -644,7 +731,7 @@ impl Observer {
                     "rules",
                 );
                 observation.attention = state == SemanticState::Blocked;
-                (observation, None, false)
+                (observation, None, 0)
             }
             RulesVerdict::Ambiguous { ambiguity, guess } => {
                 input.ambiguity = Some(ambiguity);
@@ -656,10 +743,8 @@ impl Observer {
                         .task(session)
                         .map(|text| head_chars(&text, TASK_CHARS));
                 }
-                let mut hasher = DefaultHasher::new();
-                (ambiguity, seq.0, &input.screen_tail, &input.task).hash(&mut hasher);
-                let fingerprint = hasher.finish();
-                if !retry && previous_ask == Some(fingerprint) {
+                let fingerprint = fingerprint_of(&input);
+                if failures == 0 && previous_ask.as_deref() == Some(fingerprint.as_str()) {
                     // Nothing new to show the model; keep the last answer.
                     if let Some(tracked) = self.sessions.get_mut(session) {
                         tracked.judged_seq = seq;
@@ -667,17 +752,26 @@ impl Observer {
                     }
                     return Ok(0);
                 }
-                let (observation, retry_next) = self.ask_model(&input, ambiguity, guess, seq);
-                let asked = (!retry_next).then_some(fingerprint);
-                (observation, asked, retry_next)
+                let (mut observation, failed) = self.ask_model(&input, ambiguity, guess, seq);
+                if failed {
+                    (observation, previous_ask, failures.saturating_add(1))
+                } else {
+                    observation.fingerprint = Some(fingerprint.clone());
+                    (observation, Some(fingerprint), 0)
+                }
             }
         };
 
         let key = key_of(&observation);
-        let changed = self
-            .sessions
-            .get(session)
-            .is_none_or(|tracked| tracked.last != Some(key));
+        // Every model answer is kept, with its evidence and fingerprint: it is
+        // the record of what the model saw and said, and what a restarted
+        // Observer uses to avoid asking again.
+        let answered = observation.fingerprint.is_some();
+        let changed = answered
+            || self
+                .sessions
+                .get(session)
+                .is_none_or(|tracked| tracked.last != Some(key));
         let written = if changed {
             self.append_observation(&agent, session, observation)?;
             1
@@ -689,7 +783,7 @@ impl Observer {
             tracked.judged_seq = seq;
             tracked.judged_at = Some(now);
             tracked.asked = asked;
-            tracked.retry = retry_next;
+            tracked.failures = failures_next;
         }
         Ok(written)
     }
@@ -743,7 +837,11 @@ impl Observer {
         observation.needs_human = judgement.needs_human;
         observation.stuck = judgement.stuck;
         observation.latency_ms = Some(latency);
-        observation.attention = needs_attention(Some(ambiguity), state, confidence, &judgement);
+        // A process that exited with a failing status gets a look whatever
+        // the model says about it.
+        observation.attention = needs_attention(Some(ambiguity), state, confidence, &judgement)
+            || (ambiguity == Ambiguity::ExitedOnItsOwn
+                && input.exit_code.is_some_and(|code| code != 0));
         observation.evidence = evidence;
         (observation, false)
     }

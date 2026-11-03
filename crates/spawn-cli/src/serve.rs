@@ -18,7 +18,7 @@ use spawn_host::{TmuxHost, docker_prefix};
 use spawn_postgres::{RSI_AGENT, RSI_SESSION, RsiIterationRow};
 
 use crate::evolve::{Task, landed_metric, load_backlog, parse_metrics};
-use crate::{Flags, env_or, env_value, open_store};
+use crate::{Flags, env_or, env_value};
 
 /// Halt threshold of the controller, mirrored for display.
 const HALT_AFTER: u32 = 3;
@@ -57,6 +57,16 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         }
     }
     Ok(0)
+}
+
+/// The dashboard's connection: the read-only `spawn_reader` login, never the
+/// controller's. `serve` answers anyone on the LAN.
+fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
+    let controller = env_value("SPAWN_DATABASE_URL")
+        .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
+    let url = env_value("SPAWN_SERVE_DATABASE_URL")
+        .unwrap_or_else(|| spawn_postgres::role_url(&controller, "spawn_reader"));
+    spawn_postgres::PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 
 fn handle(request: Request, web: &Path) -> Result<(), String> {

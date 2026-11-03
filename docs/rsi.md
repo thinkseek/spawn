@@ -17,12 +17,14 @@ v3 相比 v2 的改动：LayerFS 已删除，工作区换成 git，分支 A/B �
 
 ## 2. 架构
 
-新增一次性进程 `spawn evolve`，与 `spawn tick` 并列由 cron 驱动。
+`spawn evolve` 是一次性进程，推进一步就退出；常驻时由 `spawn rsi-loop` 循环调用，跟舰队的 `spawn loop`（Bridge、Observer、supervisor）分属两个进程、两个 systemd 单元。分开的原因：门禁一跑 20 分钟，不能卡住 Bridge；RSI 的 HALT（退出码 2）只停 RSI，不停舰队。
 
 ```text
-*/1 * * * * spawn tick   --repo <bare> --root <ws>
-*/1 * * * * spawn evolve --repo <bare> --root <ws>
+spawn loop     --repo <bare> --root <ws>   # 舰队，永不自停
+spawn rsi-loop --repo <bare> --root <ws>   # RSI 控制器，HALT 时退出 2
 ```
+
+cron 方式仍可用（`*/1 * * * * spawn evolve ...`）：HALT 是粘性的，每次调用在开新迭代之前先检查，只有人清零计数器才会继续。
 
 `spawn evolve` 每次：取 `pg_try_advisory_xact_lock`（单飞）→ 从 `rsi_*` 表重建状态 → 推进一步 → 退出。不折叠事件日志推导阶段。
 
@@ -107,6 +109,8 @@ candidate_tree := baseline_tree + candidate.patch
 
 门禁容器不给 `spawn` 二进制，是关键的一条：给了等于让候选代码直接调 `spawn hook` 伪造事件。
 
+**现状（未实现容器）：门禁在宿主上以控制器同一 uid 运行。** 已做的缓解：拒绝改 `rsi/`、`scripts/rsi/`、任何 `build.rs` 和 `.cargo/`；ratchet 基准在基线的 manifest 下构建；裁决只取门禁 stdout 的最后一行，指标只取裁决 JSON 里的 `metric` 字段；门禁子进程自成进程组，结束或超时整组杀掉；输出文件放在每次新建的 0700 目录。剩余风险：同 uid 的候选代码仍能经 `/proc` 读写控制器进程的文件和环境、改控制器 checkout。真正的边界是门禁容器。
+
 **不给 `SYS_ADMIN`，不用 FUSE，不用 overlay。** 实测 `--device /dev/fuse --cap-add SYS_ADMIN` 在 `overlay2` 存储驱动上挂 overlay 返回 `Invalid argument`；且 `SYS_ADMIN` 接近宿主 root，抵消隔离。
 
 **代理网络。** agent 容器要连宿主环回口的 ccv42 代理，`rsi.md` v2 的"不挂 host network"因此作废。两种做法：`--network host`，或把代理绑到 docker0 并加 `--add-host`。默认取前者，配置项留出后者。
@@ -176,7 +180,7 @@ create table rsi_attempts (
 | `spawn_controller` | `spawn_submit`/`claim`/`finish`、`rsi_*` 读写、`spawn_grants` 的 `*` |
 | `spawn_terminal` | 只写 hook 来源事件 |
 
-**8.2 写函数改 definer + 白名单。** `spawn_append` 等是 INVOKER，给表权限等于给全部能力。改成 `SECURITY DEFINER` + 固定 `search_path`，按 `session_user` 校验 `(source, event_name)`。`spawn_terminal` 不能写 `observation.recorded`、`execution.ended`、`artifact.committed`。只授 execute 的做法会产生 42501，且被 `main.rs:263-272` 静默吞掉。
+**8.2 写函数改 definer + 白名单（已实现，见 `schema.sql` 的 `spawn_append`）。** `spawn_append` 等是 INVOKER，给表权限等于给全部能力。改成 `SECURITY DEFINER` + 固定 `search_path`，按 `session_user` 校验 `(source, event_name)`。`spawn_terminal` 不能写 `observation.recorded`、`execution.ended`、`artifact.committed`。只授 execute 的做法会产生 42501，且被 `main.rs:263-272` 静默吞掉。
 
 **8.3 控制器的读模型不可伪造。** 阶段从表计算，但 `agent_status`、`agent_executions` 是事件投影。若终端角色能写 `observation.recorded`，agent 就能伪造 `WAITING`。8.2 的白名单是防线。
 
@@ -186,14 +190,17 @@ create table rsi_attempts (
 
 | 条件 | 阈值 | 动作 |
 | --- | --- | --- |
-| 单迭代门禁失败 | 3 | Rejected |
+| 门禁拒绝 | 1 | Rejected |
 | 连续 Rejected | 3 | HALT |
-| 基础设施失败 | 累计 3 | HALT |
+| 连续 Aborted（基础设施失败） | 3 | HALT |
+| `main` 与记录的基线不一致（迭代之间） | 1 | HALT |
 | 单迭代墙钟 | 45 分钟 | Aborted |
 | 单迭代工具调用 | 60 | Aborted |
 | 门禁墙钟 | 20 分钟 | Aborted |
 | 场景文件数下降 | 1 | HALT |
 | 累计迭代 | 可配置 | Idle 停 |
+
+HALT 是粘性的：`spawn evolve` 在开新迭代之前先检查，重启不会多跑一轮。门禁通过后先把裁决写进迭代（`Accepted`），再移动 `main`，再在一个事务里移动记录的基线、标记 `Landed`、写入 attempt；两步都幂等，中途崩溃由下一次调用补完，不会重跑门禁。
 
 基础设施失败必须与候选失败分开，否则一个死掉的代理会把好补丁判成 Rejected；但基础设施连续 3 次也要 HALT，否则候选制造 infra 失败就能绕过停止条件。
 
