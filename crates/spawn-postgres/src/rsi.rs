@@ -89,6 +89,48 @@ pub struct RsiCommand {
     pub error: Option<String>,
 }
 
+/// One judged attempt at a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsiAttempt {
+    /// Task.
+    pub task_id: u32,
+    /// Attempt number within the task.
+    pub attempt: u32,
+    /// Iteration that made it.
+    pub iteration: u32,
+    /// Whether it landed.
+    pub accepted: bool,
+    /// Patch.
+    pub diff: String,
+    /// Gate output, or the rejection note.
+    pub gate_log: String,
+    /// Write time.
+    pub created_at_ms: i64,
+}
+
+/// One iteration as the read API lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RsiIterationRow {
+    /// The iteration.
+    pub iteration: RsiIteration,
+    /// Start time.
+    pub started_at_ms: i64,
+    /// Last phase change.
+    pub updated_at_ms: i64,
+}
+
+fn attempt_of(row: &Row) -> RsiAttempt {
+    RsiAttempt {
+        task_id: number(row, "task_id"),
+        attempt: number(row, "attempt"),
+        iteration: number(row, "iteration"),
+        accepted: row.get::<_, Option<bool>>("accept_ok").unwrap_or(false),
+        diff: row.get::<_, Option<String>>("diff").unwrap_or_default(),
+        gate_log: row.get::<_, Option<String>>("gate_log").unwrap_or_default(),
+        created_at_ms: row.get("created_at_ms"),
+    }
+}
+
 fn number(row: &Row, column: &str) -> u32 {
     row.get::<_, i32>(column).unsigned_abs()
 }
@@ -208,6 +250,83 @@ impl PostgresStore {
             )
             .map_err(|error| backend(&error))?;
         Ok(rows.first().map(iteration_of))
+    }
+
+    /// Attempts at one task, newest first.
+    pub fn rsi_attempts_of(&self, task_id: u32, limit: u32) -> Result<Vec<RsiAttempt>, StoreError> {
+        let mut client = self.lock();
+        let rows = client
+            .query(
+                "select * from rsi_attempts where task_id = $1
+                  order by attempt desc limit $2",
+                &[
+                    &i32::try_from(task_id).unwrap_or(i32::MAX),
+                    &i64::from(limit),
+                ],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(rows.iter().map(attempt_of).collect())
+    }
+
+    /// Attempts at every task, newest first.
+    pub fn rsi_recent_attempts(&self, limit: u32) -> Result<Vec<RsiAttempt>, StoreError> {
+        let mut client = self.lock();
+        let rows = client
+            .query(
+                "select * from rsi_attempts order by created_at_ms desc, attempt desc limit $1",
+                &[&i64::from(limit)],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(rows.iter().map(attempt_of).collect())
+    }
+
+    /// Iterations, newest first.
+    pub fn rsi_iterations(&self, limit: u32) -> Result<Vec<RsiIterationRow>, StoreError> {
+        let mut client = self.lock();
+        let rows = client
+            .query(
+                "select * from rsi_iterations order by iteration desc limit $1",
+                &[&i64::from(limit)],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(rows
+            .iter()
+            .map(|row| RsiIterationRow {
+                iteration: iteration_of(row),
+                started_at_ms: row.get("started_at_ms"),
+                updated_at_ms: row.get("updated_at_ms"),
+            })
+            .collect())
+    }
+
+    /// One iteration, with the prompt of the command that started it.
+    pub fn rsi_iteration(
+        &self,
+        iteration: u32,
+    ) -> Result<Option<(RsiIterationRow, Option<String>)>, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_opt(
+                "select i.*, c.action ->> 'prompt' as prompt_text, c.action ->> 'text' as input_text
+                   from rsi_iterations i
+                   left join spawn_commands c on c.id = i.command_id
+                  where i.iteration = $1",
+                &[&i32::try_from(iteration).unwrap_or(i32::MAX)],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(row.map(|row| {
+            let prompt = row
+                .get::<_, Option<String>>("prompt_text")
+                .or_else(|| row.get::<_, Option<String>>("input_text"));
+            (
+                RsiIterationRow {
+                    iteration: iteration_of(&row),
+                    started_at_ms: row.get("started_at_ms"),
+                    updated_at_ms: row.get("updated_at_ms"),
+                },
+                prompt,
+            )
+        }))
     }
 
     /// Tasks that already produced an accepted patch.

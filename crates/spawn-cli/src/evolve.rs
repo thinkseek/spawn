@@ -9,6 +9,7 @@
 //! outside observer and must fail on the baseline before it is allowed to
 //! pass on the candidate.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -38,10 +39,100 @@ const ITERATION_TOOL_CALLS: u32 = 60;
 /// hung build must not block the loop forever.
 const GATE_WALL_CLOCK: Duration = Duration::from_mins(20);
 
+/// Characters of a previous patch quoted in the next prompt.
+const PROMPT_PATCH_CHARS: usize = 6000;
+
+/// Characters of a previous gate log quoted in the next prompt.
+const PROMPT_LOG_CHARS: usize = 4000;
+
+/// Attempts summarized in a recurring task's prompt.
+const PROMPT_HISTORY: u32 = 6;
+
 /// One backlog task.
-struct Task {
-    id: u32,
-    prompt: String,
+///
+/// A recurring task is an objective: landing once does not solve it. It stays
+/// open until the metric its scenario prints reaches `target`.
+#[derive(Debug, Clone)]
+pub(crate) struct Task {
+    pub(crate) id: u32,
+    pub(crate) title: String,
+    pub(crate) prompt: String,
+    pub(crate) recurring: bool,
+    pub(crate) metric: Option<String>,
+    pub(crate) unit: String,
+    pub(crate) lower_is_better: bool,
+    pub(crate) target: Option<f64>,
+}
+
+impl Task {
+    /// Whether `value` meets the target.
+    fn meets(&self, value: f64) -> bool {
+        self.target.is_some_and(|target| {
+            if self.lower_is_better {
+                value <= target
+            } else {
+                value >= target
+            }
+        })
+    }
+}
+
+/// One `METRIC <name> baseline=<n> candidate=<n>` line of a gate log.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Metric {
+    pub(crate) name: String,
+    pub(crate) baseline: Option<f64>,
+    pub(crate) candidate: Option<f64>,
+}
+
+/// Every metric line in a gate log. The gate prefixes scenario output with
+/// `| `; both forms are read. The last line per name wins, which is the
+/// candidate run.
+pub(crate) fn parse_metrics(log: &str) -> Vec<Metric> {
+    let mut metrics: Vec<Metric> = Vec::new();
+    for line in log.lines() {
+        let line = line.trim_start_matches('|').trim();
+        let Some(rest) = line.strip_prefix("METRIC ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(name) = words.next() else {
+            continue;
+        };
+        let mut metric = Metric {
+            name: name.to_string(),
+            baseline: None,
+            candidate: None,
+        };
+        for word in words {
+            match word.split_once('=') {
+                Some(("baseline", value)) => metric.baseline = value.parse().ok(),
+                Some(("candidate", value)) => metric.candidate = value.parse().ok(),
+                _ => {}
+            }
+        }
+        metrics.retain(|known| known.name != metric.name);
+        metrics.push(metric);
+    }
+    metrics
+}
+
+fn tail_chars(text: &str, limit: usize) -> &str {
+    let count = text.chars().count();
+    if count <= limit {
+        return text;
+    }
+    let skip = text
+        .char_indices()
+        .nth(count - limit)
+        .map_or(0, |(index, _)| index);
+    &text[skip..]
+}
+
+fn head_chars(text: &str, limit: usize) -> &str {
+    text.char_indices()
+        .nth(limit)
+        .map_or(text, |(index, _)| &text[..index])
 }
 
 /// Advance the loop by one step.
@@ -133,25 +224,12 @@ fn start_iteration(
     backlog: &Path,
 ) -> Result<i32, String> {
     let solved = store.rsi_solved_tasks().map_err(describe_error)?;
-    let Some(task) = next_open_task(backlog, &solved)? else {
+    let Some(task) = next_open_task(store, backlog, &solved)? else {
         println!("evolve: backlog has no open task");
         return Ok(0);
     };
     let iteration = state.iteration + 1;
-    let mut prompt = task.prompt.clone();
-    prompt.push_str(
-        "\n\nWork only inside this repository. Do not run git commands and do not \
-         create commits.\n\nWhen the task is finished, create the file `.spawn/done` \
-         at the repository root. That file is the completion signal; without it the \
-         task is treated as unfinished.\n",
-    );
-    if let Some((diff, log)) = store.rsi_last_attempt_of(task.id).map_err(describe_error)? {
-        prompt.push_str("\nThe previous attempt failed.\n\nPatch:\n");
-        prompt.push_str(&diff);
-        prompt.push_str("\n\nGate output:\n");
-        prompt.push_str(&log);
-        prompt.push('\n');
-    }
+    let prompt = task_prompt(store, &task)?;
     // The completion marker belongs to the task that ends. Leaving it in
     // place would make the next task look finished before it starts.
     let marker = root.join(spawn_postgres::RSI_AGENT).join(".spawn/done");
@@ -166,6 +244,95 @@ fn start_iteration(
         .map_err(describe_error)?;
     println!("evolve: iteration {iteration} starts task {}", task.id);
     Ok(0)
+}
+
+/// The prompt of one iteration: the task, the working rules, and what the
+/// previous attempts produced.
+fn task_prompt(store: &PostgresStore, task: &Task) -> Result<String, String> {
+    let mut prompt = task.prompt.clone();
+    prompt.push_str(
+        "\n\nWork only inside this repository. Do not run git commands and do not \
+         create commits. Do not edit `rsi/` or `scripts/rsi/`: the gate rejects any \
+         change there.\n\nWhen the task is finished, create the file `.spawn/done` \
+         at the repository root. That file is the completion signal; without it the \
+         task is treated as unfinished.\n",
+    );
+    let history = store
+        .rsi_attempts_of(task.id, PROMPT_HISTORY)
+        .map_err(describe_error)?;
+    if task.recurring {
+        if let Some(name) = &task.metric {
+            let current = history.iter().find_map(|attempt| {
+                let metric = parse_metrics(&attempt.gate_log)
+                    .into_iter()
+                    .find(|metric| &metric.name == name)?;
+                if attempt.accepted {
+                    metric.candidate
+                } else {
+                    metric.baseline
+                }
+            });
+            let _ = write!(
+                prompt,
+                "\nObjective metric: `{name}` ({} is better).",
+                if task.lower_is_better {
+                    "lower"
+                } else {
+                    "higher"
+                }
+            );
+            if let Some(value) = current {
+                let _ = write!(prompt, " Current baseline: {value} {}.", task.unit);
+            }
+            if let Some(target) = task.target {
+                let _ = write!(prompt, " Target: {target} {}.", task.unit);
+            }
+            prompt.push('\n');
+        }
+        if !history.is_empty() {
+            prompt.push_str("\nPrevious attempts at this objective, newest first:\n");
+            for attempt in &history {
+                let outcome = if attempt.accepted {
+                    "landed"
+                } else {
+                    "rejected"
+                };
+                let reason = attempt
+                    .gate_log
+                    .lines()
+                    .rev()
+                    .find(|line| line.trim_start().starts_with('{') || !line.starts_with('|'))
+                    .unwrap_or("")
+                    .trim();
+                let metrics: Vec<String> = parse_metrics(&attempt.gate_log)
+                    .iter()
+                    .map(|metric| {
+                        format!(
+                            "{} {} -> {}",
+                            metric.name,
+                            metric.baseline.map_or("?".to_string(), |v| v.to_string()),
+                            metric.candidate.map_or("?".to_string(), |v| v.to_string())
+                        )
+                    })
+                    .collect();
+                let _ = writeln!(
+                    prompt,
+                    "- iteration {}: {outcome}; {} {}",
+                    attempt.iteration,
+                    metrics.join(", "),
+                    head_chars(reason, 300)
+                );
+            }
+        }
+    }
+    if let Some(last) = history.first().filter(|attempt| !attempt.accepted) {
+        prompt.push_str("\nThe previous attempt was rejected.\n\nPatch:\n");
+        prompt.push_str(head_chars(&last.diff, PROMPT_PATCH_CHARS));
+        prompt.push_str("\n\nGate output (tail):\n");
+        prompt.push_str(tail_chars(&last.gate_log, PROMPT_LOG_CHARS));
+        prompt.push('\n');
+    }
+    Ok(prompt)
 }
 
 /// Channel into the loop's one long-lived session.
@@ -636,11 +803,11 @@ fn check_halt(store: &PostgresStore) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Lowest-numbered task the loop has not solved, according to its own file.
-fn next_open_task(directory: &Path, solved: &[u32]) -> Result<Option<Task>, String> {
+/// Every task in the controller's backlog directory, by id.
+pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("read {}: {error}", directory.display())),
     };
     let mut tasks = Vec::new();
@@ -655,27 +822,75 @@ fn next_open_task(directory: &Path, solved: &[u32]) -> Result<Option<Task>, Stri
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         let value: serde_json::Value = serde_json::from_str(&text)
             .map_err(|error| format!("parse {}: {error}", path.display()))?;
-        let task = Task {
-            id: value
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|id| u32::try_from(id).ok())
-                .ok_or_else(|| format!("{} has no id", path.display()))?,
-            prompt: value
-                .get("prompt")
-                .and_then(|prompt| prompt.as_str())
-                .ok_or_else(|| format!("{} has no prompt", path.display()))?
-                .to_string(),
-        };
-        tasks.push(task);
+        let text_field = |name: &str| value.get(name).and_then(|v| v.as_str()).map(str::to_string);
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(|| format!("{} has no id", path.display()))?;
+        let prompt =
+            text_field("prompt").ok_or_else(|| format!("{} has no prompt", path.display()))?;
+        tasks.push(Task {
+            id,
+            title: text_field("title").unwrap_or_else(|| format!("Task {id}")),
+            prompt,
+            recurring: value.get("recurring").and_then(serde_json::Value::as_bool) == Some(true),
+            metric: text_field("metric"),
+            unit: text_field("unit").unwrap_or_default(),
+            lower_is_better: text_field("direction").as_deref() != Some("higher"),
+            target: value.get("target").and_then(serde_json::Value::as_f64),
+        });
     }
     tasks.sort_by_key(|task| task.id);
-    Ok(tasks.into_iter().find(|task| !solved.contains(&task.id)))
+    Ok(tasks)
+}
+
+/// The latest landed value of a recurring task's metric.
+pub(crate) fn landed_metric(store: &PostgresStore, task: &Task) -> Result<Option<f64>, String> {
+    let Some(name) = &task.metric else {
+        return Ok(None);
+    };
+    let attempts = store
+        .rsi_attempts_of(task.id, 200)
+        .map_err(describe_error)?;
+    Ok(attempts
+        .iter()
+        .filter(|attempt| attempt.accepted)
+        .find_map(|attempt| {
+            parse_metrics(&attempt.gate_log)
+                .into_iter()
+                .find(|metric| &metric.name == name)?
+                .candidate
+        }))
+}
+
+/// Lowest-numbered open task: a one-shot task without an accepted patch, or
+/// a recurring task whose landed metric has not reached its target.
+fn next_open_task(
+    store: &PostgresStore,
+    directory: &Path,
+    solved: &[u32],
+) -> Result<Option<Task>, String> {
+    for task in load_backlog(directory)? {
+        if !task.recurring {
+            if !solved.contains(&task.id) {
+                return Ok(Some(task));
+            }
+            continue;
+        }
+        match landed_metric(store, &task)? {
+            Some(value) if task.meets(value) => {
+                println!("evolve: objective {} met: {value} {}", task.id, task.unit);
+            }
+            _ => return Ok(Some(task)),
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GateFailure, run_bounded};
+    use super::{GateFailure, parse_metrics, run_bounded};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -683,6 +898,17 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg(script);
         command
+    }
+
+    #[test]
+    fn metric_lines_are_read_from_a_prefixed_gate_log() {
+        let log = "| == baseline\n| METRIC ingest_total_ns baseline=1544 candidate=1550\n\
+                   | == candidate\n| METRIC ingest_total_ns baseline=1540 candidate=1400\n\
+                   {\"verdict\":\"accepted\"}";
+        let metrics = parse_metrics(log);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].baseline, Some(1540.0));
+        assert_eq!(metrics[0].candidate, Some(1400.0));
     }
 
     #[test]

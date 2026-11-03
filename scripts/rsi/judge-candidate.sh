@@ -10,7 +10,17 @@
 # The scenario comes from the controller's checkout, not from the trees, so a
 # candidate cannot weaken the test that judges it.
 #
-# Prints one JSON line.
+# Before the verdict it prints the scenario output, each line prefixed with
+# `| `, so the gate log records what the scenario measured.
+#
+# Also enforced (docs/rsi.md §4):
+# - the candidate may not touch `rsi/` or `scripts/rsi/`: the loop's tasks,
+#   scenarios and gate belong to the controller;
+# - every other scenario in the controller's directory must still pass on the
+#   candidate, except ratchet scenarios (a line `# rsi: ratchet`), which
+#   compare against the baseline and so fail on any tree that did not improve.
+#
+# Prints one JSON line, last.
 #
 # ponytail: the gate runs on the host. Move it into a container without the
 # `spawn` binary when a candidate is treated as untrusted.
@@ -56,13 +66,29 @@ try() {
         >"$work/build.log" 2>&1; then
         return 2
     fi
-    (cd "$tree" && SPAWN_BIN="$tree/target/debug/spawn" sh "$scenario") \
-        >"$work/run.log" 2>&1
+    run_scenario "$tree" "$scenario"
+}
+
+# Run one scenario in a built tree, echoing its output prefixed with `| `.
+run_scenario() {
+    status=0
+    (cd "$1" && SPAWN_BIN="$1/target/debug/spawn" SPAWN_BASELINE_TREE="$work/baseline" \
+        sh "$2") >"$work/run.log" 2>&1 || status=$?
+    sed 's/^/| /' "$work/run.log" | tail -n 60
+    return "$status"
 }
 
 extract "$baseline" "$work/baseline"
 extract "$candidate" "$work/candidate"
 
+touched=$(git --git-dir="$repo" diff --name-only "$baseline" "$candidate" -- rsi scripts/rsi)
+if [ -n "$touched" ]; then
+    echo "| candidate touches controller files: $(echo "$touched" | tr '\n' ' ')"
+    echo '{"verdict":"rejected","reason":"candidate touches rsi/ or scripts/rsi/"}'
+    exit 0
+fi
+
+echo "| == baseline: $(basename "$scenario") must fail"
 red=0
 try "$work/baseline" || red=$?
 if [ "$red" -eq 2 ]; then
@@ -74,14 +100,25 @@ if [ "$red" -eq 0 ]; then
     exit 0
 fi
 
+echo "| == candidate: $(basename "$scenario") must pass"
 green=0
 try "$work/candidate" || green=$?
 if [ "$green" -eq 2 ]; then
     echo '{"verdict":"rejected","reason":"candidate does not build"}'
     exit 0
 fi
-if [ "$green" -eq 0 ]; then
-    echo '{"verdict":"accepted"}'
-else
+if [ "$green" -ne 0 ]; then
     echo '{"verdict":"rejected","reason":"scenario fails on the candidate"}'
+    exit 0
 fi
+
+for other in "$(dirname "$scenario")"/*.sh; do
+    [ "$other" = "$scenario" ] && continue
+    grep -q '^# rsi: ratchet' "$other" && continue
+    echo "| == regression: $(basename "$other") must still pass"
+    if ! run_scenario "$work/candidate" "$other"; then
+        echo "{\"verdict\":\"rejected\",\"reason\":\"regression: $(basename "$other") fails on the candidate\"}"
+        exit 0
+    fi
+done
+echo '{"verdict":"accepted"}'
