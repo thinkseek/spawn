@@ -197,9 +197,10 @@ pub fn workspace_store(tag: &str, workspaces: &dyn WorkspaceStore) {
 /// Terminal rules: a name is unique, and a stopped terminal is gone.
 pub fn terminal(tag: &str, terminals: &dyn TerminalHost) {
     let terminal = TerminalName::new(format!("spawn-test-{tag}")).expect("valid terminal");
+    let workspace = WorkspaceId::new("1:/workspaces/1").expect("valid workspace");
     let launch = Launch {
         terminal: terminal.clone(),
-        workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
+        workspace: workspace.clone(),
         program: "true".to_string(),
         arguments: Vec::new(),
         environment: Vec::new(),
@@ -209,14 +210,24 @@ pub fn terminal(tag: &str, terminals: &dyn TerminalHost) {
         terminals.start(&launch).is_err(),
         "a terminal name is unique"
     );
-    assert!(terminals.is_alive(&terminal).expect("query succeeds"));
+    assert!(
+        terminals
+            .is_alive(&terminal, &workspace)
+            .expect("query succeeds")
+    );
     let tail = terminals
-        .capture_tail(&terminal, 10)
+        .capture_tail(&terminal, &workspace, 10)
         .expect("capture succeeds");
     assert!(tail.lines().count() <= 10);
-    terminals.terminate(&terminal).expect("terminate succeeds");
-    assert!(!terminals.is_alive(&terminal).expect("query succeeds"));
     terminals
-        .terminate(&terminal)
+        .terminate(&terminal, &workspace)
+        .expect("terminate succeeds");
+    assert!(
+        !terminals
+            .is_alive(&terminal, &workspace)
+            .expect("query succeeds")
+    );
+    terminals
+        .terminate(&terminal, &workspace)
         .expect("terminating a missing terminal is harmless");
 }

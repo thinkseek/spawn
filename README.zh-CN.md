@@ -1,0 +1,118 @@
+# Spawn
+
+[English](./README.md) · 简体中文
+
+Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
+
+- 调用方向 PostgreSQL 中的队列提交命令（start、input、resume、stop）。
+- `spawn tick` 领取命令，fork 一个 LayerFS 分支，mount 工作区，在 tmux 会话中启动引擎。
+- Claude Code hooks、Codex JSON 输出与终端屏尾转为日志中的类型化事件。
+- Observer 判定每个会话的状态（可输入、运行中、阻塞、失败），并把结论作为事件写回。
+
+日志是唯一的状态。每次 `spawn tick` 是新进程，从日志重建视图，进程崩溃不丢状态。
+
+## 依赖
+
+| 工具 | 版本 | 用途 |
+| --- | --- | --- |
+| Rust | 1.95 及以上 | 编译 |
+| PostgreSQL | 16 及以上 | 事件日志、命令队列、视图 |
+| tmux | 3.x | 终端 |
+| LayerFS CLI | `PATH` 中的 `layerfs` | 分支与工作区 |
+| Claude Code 和/或 Codex CLI | 当前版本 | 引擎 |
+
+## 安装
+
+```bash
+cargo install --path crates/spawn-cli
+```
+
+二进制名为 `spawn`。
+
+## 快速开始
+
+安装 schema：
+
+```bash
+export SPAWN_DATABASE_URL=postgres://spawn@localhost/spawn
+spawn init-db
+```
+
+提交 start 命令：
+
+```bash
+spawn submit --agent agent_demo --session session_demo --key demo-1 --action '{"type":"start","engine":"claude","prompt":"say hello"}'
+```
+
+运行一轮 Bridge 与 Observer：
+
+```bash
+spawn tick --project shop
+```
+
+打印每个会话的最新判定：
+
+```bash
+spawn status
+```
+
+用 cron、systemd timer 或 shell 循环定时运行 `spawn tick`。Spawn 没有常驻进程。
+
+## 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `init-db` | 安装或更新 SQL schema，可重复执行 |
+| `submit` | 向队列写一条命令。参数：`--agent`、`--session`、`--key`、`--action`、`--principal`（默认 `spawn`） |
+| `tick` | 领取并执行排队命令，推进活跃执行，记录判定。参数：`--project`、`--judge-url` |
+| `status` | 打印每个会话的最新判定 |
+| `hook` | 从标准输入读取一条 Claude Code hook 载荷。由 Spawn 配置，无需手动调用 |
+| `run` | 在终端内运行引擎并记录退出。由 Spawn 配置，无需手动调用 |
+
+`--action` 的取值：
+
+| `type` | 字段 |
+| --- | --- |
+| `start` | `engine`（`claude` 或 `codex`）、`prompt`（Codex 必须非空）、可选 `parent_session_id` |
+| `input` | `text`；仅 Claude |
+| `resume` | 可选 `prompt`；Codex 必填 |
+| `stop` | 无 |
+
+## 配置
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `SPAWN_DATABASE_URL` | 必填 | PostgreSQL 连接串 |
+| `SPAWN_PROJECT` | 无 | LayerFS 项目，未传 `--project` 时使用 |
+| `SPAWN_WORKER` | `spawn-worker` | 领取命令时记录的 worker 名 |
+| `SPAWN_LAYERFS_PROGRAM` | `layerfs` | LayerFS CLI 路径 |
+| `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 路径 |
+| `SPAWN_TMUX_SOCKET` | 默认 socket | tmux `-L` socket 名 |
+| `SPAWN_TMUX_IN_WORKSPACE` | 未设置 | 设置后 tmux 经 `layerfs workspace exec` 运行 |
+| `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
+| `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI 路径 |
+| `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
+| `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时用本地启发式判定 |
+| `SPAWN_TRACE` | 未设置 | 设置后在标准错误输出每次端口调用的耗时 |
+
+## 开发
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据库，缺失时测试失败而非跳过。`scripts/e2e-smoke.sh` 用真实 PostgreSQL 与 tmux 跑端到端流程。`scripts/remote-gate.sh` 在远端主机上运行全部检查。
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/architecture.md](./docs/architecture.md) | 架构总览 |
+| [docs/design.md](./docs/design.md) | 技术方案、事件协议、端口契约、已知限制 |
+| [docs/view-architecture.md](./docs/view-architecture.md) | 读视图设计 |
+
+## 许可证
+
+Apache-2.0

@@ -359,7 +359,12 @@ impl TerminalHost for MemoryStore {
         Ok(())
     }
 
-    fn submit_text(&self, terminal: &TerminalName, text: &str) -> Result<(), TerminalError> {
+    fn submit_text(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError> {
         let mut state = self.lock();
         if !state.terminals.contains(terminal) {
             return Err(TerminalError(format!("terminal {terminal} is gone")));
@@ -370,11 +375,20 @@ impl TerminalHost for MemoryStore {
         Ok(())
     }
 
-    fn is_alive(&self, terminal: &TerminalName) -> Result<bool, TerminalError> {
+    fn is_alive(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<bool, TerminalError> {
         Ok(self.lock().terminals.contains(terminal))
     }
 
-    fn capture_tail(&self, terminal: &TerminalName, lines: usize) -> Result<String, TerminalError> {
+    fn capture_tail(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+        lines: usize,
+    ) -> Result<String, TerminalError> {
         let state = self.lock();
         if !state.terminals.contains(terminal) {
             return Err(TerminalError(format!("terminal {terminal} is gone")));
@@ -385,7 +399,11 @@ impl TerminalHost for MemoryStore {
         Ok(all[start..].join("\n"))
     }
 
-    fn terminate(&self, terminal: &TerminalName) -> Result<(), TerminalError> {
+    fn terminate(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
         let mut state = self.lock();
         state.terminals.remove(terminal);
         state.panes.remove(terminal);

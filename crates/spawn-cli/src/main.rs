@@ -5,9 +5,10 @@
 //! - `init-db` installs the SQL schema.
 //! - `submit` writes one command to the queue.
 //! - `tick` runs one Bridge and Observer pass.
-//! - `status` prints the last observation per session.
+//! - `status` prints the latest observation per session.
 //! - `hook` ingests one Claude Code hook payload from standard input.
-//! - `run` starts the engine inside the terminal and forwards its exit code.
+//! - `run` starts the engine inside the terminal, records its exit, and
+//!   forwards its exit code.
 //!
 //! Configuration is environment first, so a terminal started by the Bridge
 //! carries everything its hook and runner need.
@@ -19,7 +20,7 @@ use std::sync::Arc;
 
 use spawn_core::bridge::{Bridge, BridgeConfig};
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::{GlobalPosition, NewEvent, Source};
+use spawn_core::event::{EndCause, EventKind, GlobalPosition, NewEvent, Source};
 use spawn_core::id::{AgentId, ExecutionId, IdempotencyKey, Principal, SessionId};
 use spawn_core::ingest::{claude_hook, codex_line};
 use spawn_core::observe::{HeuristicJudge, Observer, StateJudge};
@@ -173,6 +174,11 @@ fn cmd_tick(flags: &Flags) -> Result<i32, String> {
     );
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.codex_program = env_or("SPAWN_CODEX_PROGRAM", "codex");
+    // The hook and the runner inside the terminal write to the same log.
+    config.environment.push((
+        "SPAWN_DATABASE_URL".to_string(),
+        required_env("SPAWN_DATABASE_URL")?,
+    ));
 
     let mut log: Arc<dyn EventLog> = store.clone();
     let mut queue: Arc<dyn CommandQueue> = store.clone();
@@ -215,24 +221,33 @@ fn cmd_tick(flags: &Flags) -> Result<i32, String> {
     Ok(0)
 }
 
-fn cmd_status(flags: &Flags) -> Result<i32, String> {
+fn cmd_status(_flags: &Flags) -> Result<i32, String> {
+    const PAGE: usize = 1000;
+    // ponytail: scans the whole log; read the `agent_state` view once the
+    // log outgrows one pass. The cap bounds the scan at 10 million events.
+    const MAX_PAGES: usize = 10_000;
     let store = open_store()?;
-    let limit = flags
-        .get("limit")
-        .and_then(|text| text.parse::<usize>().ok())
-        .unwrap_or(1000);
-    let events = store
-        .read_global(GlobalPosition(0), limit)
-        .map_err(|error| error.to_string())?;
     let mut last: HashMap<String, String> = HashMap::new();
-    for record in &events {
-        if record.event.kind.name() == "observation.recorded" {
-            let kind =
-                serde_json::to_string(&record.event.kind).unwrap_or_else(|_| "{}".to_string());
-            last.insert(record.event.session_id.to_string(), kind);
+    let mut cursor = GlobalPosition(0);
+    for _ in 0..MAX_PAGES {
+        let events = store
+            .read_global(cursor, PAGE)
+            .map_err(|error| error.to_string())?;
+        for record in &events {
+            if record.event.kind.name() == "observation.recorded" {
+                let kind =
+                    serde_json::to_string(&record.event.kind).unwrap_or_else(|_| "{}".to_string());
+                last.insert(record.event.session_id.to_string(), kind);
+            }
+        }
+        match events.last() {
+            Some(record) if events.len() == PAGE => cursor = record.position,
+            _ => break,
         }
     }
-    for (session, line) in last {
+    let mut lines: Vec<_> = last.into_iter().collect();
+    lines.sort();
+    for (session, line) in lines {
         println!("{session}\t{line}");
     }
     Ok(0)
@@ -254,13 +269,8 @@ fn cmd_hook() -> Result<i32, String> {
         .map(|text| ExecutionId::new(text).map_err(|error| error.to_string()))
         .transpose()?;
 
-    let engine = env_or("SPAWN_ENGINE", "claude");
-    let normalized = if engine == "codex" {
-        codex_line(&payload)
-    } else {
-        claude_hook(&payload)
-    };
-    let normalized = match normalized {
+    // Only Claude Code has hooks; Codex events come through `spawn run`.
+    let normalized = match claude_hook(&payload) {
         Ok(Some(normalized)) => normalized,
         Ok(None) => return Ok(0),
         Err(error) => {
@@ -270,16 +280,11 @@ fn cmd_hook() -> Result<i32, String> {
             return Ok(0);
         }
     };
-    let source = if engine == "codex" {
-        Source::Codex
-    } else {
-        Source::Claude
-    };
     if let Err(error) = store.append(NewEvent {
         agent_id: agent,
         session_id: session,
         execution_id: execution,
-        source,
+        source: Source::Claude,
         source_event_id: normalized.source_event_id,
         kind: normalized.kind,
     }) {
@@ -297,48 +302,81 @@ fn cmd_run(rest: &[String]) -> Result<i32, String> {
     let (program, arguments) = words
         .split_first()
         .ok_or_else(|| "run needs a program after --".to_string())?;
-
-    if env_or("SPAWN_ENGINE", "claude") != "codex" {
-        let status = Command::new(program)
-            .args(arguments)
-            .status()
-            .map_err(|error| format!("start {program}: {error}"))?;
-        return Ok(status.code().unwrap_or(1));
+    let codex = env_or("SPAWN_ENGINE", "claude") == "codex";
+    let mut command = Command::new(program);
+    command.args(arguments);
+    if codex {
+        command.stdout(Stdio::piped());
     }
-
-    // Codex prints one JSON object per line. Read it, record what matters,
-    // and echo every line so the pane still shows the engine output.
-    let mut child = Command::new(program)
-        .args(arguments)
-        .stdout(Stdio::piped())
+    let mut child = command
         .spawn()
         .map_err(|error| format!("start {program}: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "no stdout from the engine".to_string())?;
-    let store = open_store()?;
-    let agent = AgentId::new(required_env("SPAWN_AGENT_ID")?).map_err(|error| error.to_string())?;
-    let session =
-        SessionId::new(required_env("SPAWN_SESSION_ID")?).map_err(|error| error.to_string())?;
-    let execution = env_value("SPAWN_EXECUTION_ID")
-        .map(|text| ExecutionId::new(text).map_err(|error| error.to_string()))
-        .transpose()?;
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        println!("{line}");
-        let _ = std::io::stdout().flush();
-        if let Ok(Some(normalized)) = codex_line(&line) {
-            let _ = store.append(NewEvent {
-                agent_id: agent.clone(),
-                session_id: session.clone(),
-                execution_id: execution.clone(),
-                source: Source::Codex,
-                source_event_id: normalized.source_event_id,
-                kind: normalized.kind,
-            });
+    // The runner must not fail the engine: without a store it only runs it.
+    let target = open_store().ok().zip(run_target().ok());
+
+    if let Some(stdout) = child.stdout.take() {
+        // Codex prints one JSON object per line. Record what matters and
+        // echo every line so the pane still shows the engine output.
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+            if let (Some((store, target)), Ok(Some(normalized))) = (&target, codex_line(&line)) {
+                let _ = store.append(target.event(
+                    Source::Codex,
+                    normalized.source_event_id,
+                    normalized.kind,
+                ));
+            }
         }
     }
     let status = child.wait().map_err(|error| error.to_string())?;
-    Ok(status.code().unwrap_or(1))
+    let code = status.code();
+    if let Some((store, target)) = &target
+        && let Some(execution) = &target.execution
+    {
+        // The Bridge sees this on its next tick and does the cleanup; the
+        // engine source keeps it apart from the Bridge's own end event.
+        let source = if codex { Source::Codex } else { Source::Claude };
+        let _ = store.append(target.event(
+            source,
+            Some(format!("{execution}:exited")),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Exited,
+                exit_code: code,
+            },
+        ));
+    }
+    Ok(code.unwrap_or(1))
+}
+
+/// Session the runner reports for, read from the terminal environment.
+struct RunTarget {
+    agent: AgentId,
+    session: SessionId,
+    execution: Option<ExecutionId>,
+}
+
+impl RunTarget {
+    fn event(&self, source: Source, key: Option<String>, kind: EventKind) -> NewEvent {
+        NewEvent {
+            agent_id: self.agent.clone(),
+            session_id: self.session.clone(),
+            execution_id: self.execution.clone(),
+            source,
+            source_event_id: key,
+            kind,
+        }
+    }
+}
+
+fn run_target() -> Result<RunTarget, String> {
+    Ok(RunTarget {
+        agent: AgentId::new(required_env("SPAWN_AGENT_ID")?).map_err(|error| error.to_string())?,
+        session: SessionId::new(required_env("SPAWN_SESSION_ID")?)
+            .map_err(|error| error.to_string())?,
+        execution: env_value("SPAWN_EXECUTION_ID")
+            .map(|text| ExecutionId::new(text).map_err(|error| error.to_string()))
+            .transpose()?,
+    })
 }

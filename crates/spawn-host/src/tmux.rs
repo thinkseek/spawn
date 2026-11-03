@@ -10,11 +10,11 @@
 //!   terminal.
 //! - in workspace: tmux runs inside the sandbox, so every tmux call is
 //!   wrapped by the LayerFS `workspace exec` prefix of the terminal's
-//!   workspace. The prefix needs the workspace, so `start` records it.
+//!   workspace. Every port call names the workspace, so the host keeps no
+//!   state and works the same in a new process.
 
-use std::collections::HashMap;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{Launch, TerminalError, TerminalHost};
@@ -33,7 +33,6 @@ pub struct TmuxHost {
     program: String,
     socket: Option<String>,
     builder: Option<Arc<PrefixBuilder>>,
-    workspaces: Mutex<HashMap<String, WorkspaceId>>,
 }
 
 /// One finished tmux call.
@@ -50,7 +49,6 @@ impl TmuxHost {
             program: program.to_string(),
             socket: None,
             builder: None,
-            workspaces: Mutex::new(HashMap::new()),
         }
     }
 
@@ -64,30 +62,13 @@ impl TmuxHost {
             program: program.to_string(),
             socket,
             builder: Some(builder),
-            workspaces: Mutex::new(HashMap::new()),
         }
     }
 
-    fn record(&self, terminal: &TerminalName, workspace: &WorkspaceId) {
-        let mut map = self
-            .workspaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(terminal.as_str().to_string(), workspace.clone());
-    }
-
-    fn prefix(&self, terminal: &TerminalName) -> Result<Vec<String>, TerminalError> {
-        let Some(builder) = self.builder.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let map = self
-            .workspaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let workspace = map
-            .get(terminal.as_str())
-            .ok_or_else(|| TerminalError(format!("workspace of {terminal} is not known")))?;
-        Ok(builder(workspace))
+    fn prefix(&self, workspace: &WorkspaceId) -> Vec<String> {
+        self.builder
+            .as_ref()
+            .map_or_else(Vec::new, |builder| builder(workspace))
     }
 
     fn words(&self, arguments: &[String]) -> Vec<String> {
@@ -132,17 +113,17 @@ impl TmuxHost {
     /// Pane target with exact-name matching.
     ///
     /// `send-keys` and `capture-pane` take a pane target, and tmux reads a
-    /// bare `=name` there as a pane specification, so the window and pane
-    /// suffix must be explicit.
+    /// bare `=name` there as a pane specification. `=name:` names the
+    /// active pane of the current window and does not depend on
+    /// `pane-base-index`.
     fn pane(terminal: &TerminalName) -> String {
-        format!("={}:.0", terminal.as_str())
+        format!("={}:", terminal.as_str())
     }
 }
 
 impl TerminalHost for TmuxHost {
     fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
-        self.record(&launch.terminal, &launch.workspace);
-        let prefix = self.prefix(&launch.terminal)?;
+        let prefix = self.prefix(&launch.workspace);
 
         let mut arguments = vec![
             "new-session".to_string(),
@@ -166,13 +147,6 @@ impl TerminalHost for TmuxHost {
         if run.code == Some(0) {
             return Ok(());
         }
-        {
-            let mut map = self
-                .workspaces
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.remove(launch.terminal.as_str());
-        }
         let stderr = run.stderr.trim();
         if stderr.contains("duplicate session") {
             return Err(TerminalError(format!("{} already exists", launch.terminal)));
@@ -183,8 +157,13 @@ impl TerminalHost for TmuxHost {
         )))
     }
 
-    fn submit_text(&self, terminal: &TerminalName, text: &str) -> Result<(), TerminalError> {
-        let prefix = self.prefix(terminal)?;
+    fn submit_text(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError> {
+        let prefix = self.prefix(workspace);
         let target = Self::pane(terminal);
         for line in text.lines() {
             let literal = vec![
@@ -219,8 +198,12 @@ impl TerminalHost for TmuxHost {
         Ok(())
     }
 
-    fn is_alive(&self, terminal: &TerminalName) -> Result<bool, TerminalError> {
-        let prefix = self.prefix(terminal)?;
+    fn is_alive(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<bool, TerminalError> {
+        let prefix = self.prefix(workspace);
         let run = self.run(
             &prefix,
             &[
@@ -239,8 +222,13 @@ impl TerminalHost for TmuxHost {
         }
     }
 
-    fn capture_tail(&self, terminal: &TerminalName, lines: usize) -> Result<String, TerminalError> {
-        let prefix = self.prefix(terminal)?;
+    fn capture_tail(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        lines: usize,
+    ) -> Result<String, TerminalError> {
+        let prefix = self.prefix(workspace);
         let run = self.run(
             &prefix,
             &[
@@ -261,8 +249,12 @@ impl TerminalHost for TmuxHost {
         )))
     }
 
-    fn terminate(&self, terminal: &TerminalName) -> Result<(), TerminalError> {
-        let prefix = self.prefix(terminal)?;
+    fn terminate(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        let prefix = self.prefix(workspace);
         let run = self.run(
             &prefix,
             &[
@@ -271,12 +263,6 @@ impl TerminalHost for TmuxHost {
                 Self::target(terminal),
             ],
         )?;
-        let mut map = self
-            .workspaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.remove(terminal.as_str());
-        drop(map);
         if run.code == Some(0) {
             return Ok(());
         }

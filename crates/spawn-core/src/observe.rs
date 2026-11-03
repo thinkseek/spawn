@@ -155,6 +155,20 @@ impl Snapshot {
     /// Apply one event.
     fn apply(&mut self, record: &EventRecord) {
         self.evidence_seq = record.session_seq;
+        // A hook event is newer than any screen reading and means the engine
+        // moved on, so an older screen state or permission prompt is stale.
+        if matches!(
+            record.event.kind,
+            EventKind::ToolStarted { .. }
+                | EventKind::ToolCompleted { .. }
+                | EventKind::ToolFailed { .. }
+                | EventKind::TurnStopped { .. }
+                | EventKind::TurnFailed { .. }
+                | EventKind::MessageReceived
+        ) {
+            self.screen = None;
+            self.permission_pending = false;
+        }
         match &record.event.kind {
             EventKind::ExecutionStarted { engine, .. } => {
                 self.engine = Some(*engine);
@@ -162,6 +176,7 @@ impl Snapshot {
                 self.last_end = None;
                 self.open_tools.clear();
                 self.permission_pending = false;
+                self.screen = None;
                 self.turn = None;
             }
             EventKind::ExecutionEnded { cause, .. } => {
@@ -301,9 +316,6 @@ impl Observer {
                 return Ok(());
             }
             for record in &batch {
-                if record.event.source == Source::Observer {
-                    continue;
-                }
                 let tracked = self
                     .sessions
                     .entry(record.event.session_id.clone())
@@ -314,7 +326,15 @@ impl Observer {
                         judged_seq: SessionSeq(0),
                         retry: false,
                     });
-                tracked.snapshot.apply(record);
+                // The Observer's own output restores what it last wrote, so a
+                // new process does not write the same observation again.
+                if let EventKind::ObservationRecorded { observation } = &record.event.kind {
+                    tracked.last = Some((observation.state, observation.reason));
+                    tracked.judged_seq = observation.based_on_seq;
+                    tracked.retry = observation.reason == Some(WaitReason::JudgeUnavailable);
+                } else if record.event.source != Source::Observer {
+                    tracked.snapshot.apply(record);
+                }
             }
             if let Some(last) = batch.last() {
                 self.cursor = last.position;

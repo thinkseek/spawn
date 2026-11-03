@@ -3,6 +3,10 @@
 //! The Bridge owns four jobs: start and resume engines, record events, commit
 //! workspace state, and map native identifiers to Spawn sessions. It does not
 //! run the agent loop and does not judge state.
+//!
+//! The Bridge is the only writer of a Bridge-sourced `execution.ended`, and
+//! it writes that event only after the final checkpoint, the terminal kill
+//! and the unmount. A refold of the log therefore never repeats cleanup.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +17,8 @@ use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, Outcome};
 use crate::event::{
-    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, GlobalPosition, NewEvent, Source,
+    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, EventRecord, GlobalPosition,
+    NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use crate::port::{
@@ -41,9 +46,8 @@ pub struct BridgeConfig {
     pub claude_program: String,
     /// Codex executable.
     pub codex_program: String,
-    /// argv prefix that puts a terminal command inside the workspace.
-    pub wrapper: Vec<String>,
-    /// Extra environment for the engine process.
+    /// Extra environment for the engine process, for example the database
+    /// URL that the hook and the runner need.
     pub environment: Vec<(String, String)>,
     /// Worker name recorded in the lease.
     pub worker: String,
@@ -64,7 +68,6 @@ impl BridgeConfig {
             spawn_program: "spawn".to_string(),
             claude_program: "claude".to_string(),
             codex_program: "codex".to_string(),
-            wrapper: Vec::new(),
             environment: Vec::new(),
             worker: worker.to_string(),
             lease_ttl: Duration::from_mins(2),
@@ -82,7 +85,13 @@ struct Active {
     terminal: TerminalName,
     workspace: WorkspaceId,
     engine: Engine,
+    /// A tool or turn finished after the last commit.
+    // ponytail: an `Unchanged` commit writes no event, so after a refold an
+    // idle session repeats one no-op commit per tick; record attempts if
+    // LayerFS calls get expensive.
     checkpoint: Option<CheckpointReason>,
+    /// The runner reported the engine exit; cleanup is still due.
+    reported_end: Option<(EndCause, Option<i32>)>,
 }
 
 /// What the Bridge knows about one session.
@@ -91,7 +100,6 @@ struct SessionView {
     agent_id: AgentId,
     native: Option<(Engine, String)>,
     active: Option<Active>,
-    ended: Option<EndCause>,
 }
 
 /// Result of one tick.
@@ -163,6 +171,7 @@ impl Bridge {
             self.catch_up()?;
         }
         self.act(&mut report)?;
+        self.catch_up()?;
         Ok(report)
     }
 
@@ -185,7 +194,7 @@ impl Bridge {
         }
     }
 
-    fn fold(&mut self, record: &crate::event::EventRecord) {
+    fn fold(&mut self, record: &EventRecord) {
         let event = &record.event;
         let view = self
             .sessions
@@ -194,8 +203,11 @@ impl Bridge {
                 agent_id: event.agent_id.clone(),
                 native: None,
                 active: None,
-                ended: None,
             });
+        let current = view
+            .active
+            .as_ref()
+            .is_some_and(|active| event.execution_id.as_ref() == Some(&active.execution_id));
         match &event.kind {
             EventKind::ExecutionStarted {
                 engine,
@@ -210,14 +222,16 @@ impl Bridge {
                         workspace: workspace.clone(),
                         engine: *engine,
                         checkpoint: None,
+                        reported_end: None,
                     });
-                    view.ended = None;
                 }
             }
-            EventKind::ExecutionEnded { cause, .. } => {
-                view.ended = Some(*cause);
+            EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
+                view.active = None;
+            }
+            EventKind::ExecutionEnded { cause, exit_code } if current => {
                 if let Some(active) = view.active.as_mut() {
-                    active.checkpoint = Some(CheckpointReason::ExecutionEnded);
+                    active.reported_end = Some((*cause, *exit_code));
                 }
             }
             EventKind::NativeSessionStarted {
@@ -227,104 +241,137 @@ impl Bridge {
             } => {
                 view.native = Some((*engine, native_session_id.clone()));
             }
+            EventKind::ArtifactCommitted { .. } => {
+                if let Some(active) = view.active.as_mut() {
+                    active.checkpoint = None;
+                }
+            }
             other => {
                 if let Some(reason) = other.checkpoint_reason()
                     && let Some(active) = view.active.as_mut()
                 {
-                    let escalates = active
-                        .checkpoint
-                        .is_none_or(|held| held != CheckpointReason::ExecutionEnded);
-                    if escalates {
-                        active.checkpoint = Some(reason);
-                    }
+                    active.checkpoint = Some(reason);
                 }
             }
         }
     }
 
     fn act(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
-        let running: Vec<SessionId> = self
+        let running: Vec<(SessionId, AgentId, Active)> = self
             .sessions
             .iter()
-            .filter(|(_, view)| view.active.is_some())
-            .map(|(session, _)| session.clone())
+            .filter_map(|(session, view)| {
+                let active = view.active.clone()?;
+                Some((session.clone(), view.agent_id.clone(), active))
+            })
             .collect();
-        for session in running {
-            let Some(mut view) = self.sessions.remove(&session) else {
-                continue;
-            };
-            let result = self.advance(&session, &mut view, report);
-            self.sessions.insert(session, view);
-            result?;
+        for (session, agent_id, active) in running {
+            let ended = self.advance(&agent_id, &session, &active, report)?;
+            if let Some(view) = self.sessions.get_mut(&session) {
+                if ended {
+                    view.active = None;
+                } else if let Some(held) = view.active.as_mut() {
+                    held.checkpoint = None;
+                }
+            }
         }
         Ok(())
     }
 
+    /// Commit a pending checkpoint, or end an execution whose process is
+    /// gone. Returns whether the execution ended.
     fn advance(
-        &mut self,
+        &self,
+        agent_id: &AgentId,
         session: &SessionId,
-        view: &mut SessionView,
+        active: &Active,
         report: &mut TickReport,
-    ) -> Result<(), StoreError> {
-        let Some(active) = view.active.clone() else {
-            return Ok(());
+    ) -> Result<bool, StoreError> {
+        let end = match active.reported_end {
+            Some(end) => Some(end),
+            None => match self.terminals.is_alive(&active.terminal, &active.workspace) {
+                Ok(true) => None,
+                Ok(false) => Some((EndCause::Lost, None)),
+                Err(error) => {
+                    report
+                        .warnings
+                        .push(format!("is_alive {}: {error}", active.terminal));
+                    None
+                }
+            },
         };
-        if view.ended.is_none()
-            && let Ok(false) = self.terminals.is_alive(&active.terminal)
+        if let Some((cause, exit_code)) = end {
+            return self.end(agent_id, session, active, cause, exit_code, report);
+        }
+        if let Some(reason) = active.checkpoint {
+            self.checkpoint(agent_id, session, active, reason, report)?;
+        }
+        Ok(false)
+    }
+
+    /// Final checkpoint, kill, unmount, then `execution.ended`. Returns
+    /// false when the terminal could not be killed; the execution then stays
+    /// active and the next tick tries again.
+    fn end(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        cause: EndCause,
+        exit_code: Option<i32>,
+        report: &mut TickReport,
+    ) -> Result<bool, StoreError> {
+        self.checkpoint(
+            agent_id,
+            session,
+            active,
+            CheckpointReason::ExecutionEnded,
+            report,
+        )?;
+        if let Err(error) = self
+            .terminals
+            .terminate(&active.terminal, &active.workspace)
         {
-            self.append(
-                &view.agent_id,
-                session,
-                Some(&active.execution_id),
-                Source::Bridge,
-                Some(format!("{}:ended", active.execution_id)),
-                EventKind::ExecutionEnded {
-                    cause: EndCause::Lost,
-                    exit_code: None,
-                },
-            )?;
-            view.ended = Some(EndCause::Lost);
+            report
+                .warnings
+                .push(format!("terminate {}: {error}", active.terminal));
+            return Ok(false);
         }
-        let reason = active.checkpoint.or(if view.ended.is_some() {
-            Some(CheckpointReason::ExecutionEnded)
-        } else {
-            None
-        });
-        if let Some(reason) = reason {
-            self.checkpoint(session, view, &active, reason, report)?;
+        if let Err(error) = self.workspaces.unmount(&active.workspace) {
+            report
+                .warnings
+                .push(format!("unmount {}: {error}", active.workspace));
         }
-        if view.ended.is_some() {
-            if let Err(error) = self.workspaces.unmount(&active.workspace) {
-                report
-                    .warnings
-                    .push(format!("unmount {}: {error}", active.workspace));
-            }
-            view.active = None;
-            view.ended = None;
-        }
-        Ok(())
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:ended", active.execution_id)),
+            EventKind::ExecutionEnded { cause, exit_code },
+        )?;
+        Ok(true)
     }
 
     fn checkpoint(
-        &mut self,
+        &self,
+        agent_id: &AgentId,
         session: &SessionId,
-        view: &mut SessionView,
         active: &Active,
         reason: CheckpointReason,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
         let message = format!("spawn checkpoint {}", active.execution_id);
-        let outcome = self.workspaces.commit(&active.workspace, &message);
-        match outcome {
+        match self.workspaces.commit(&active.workspace, &message) {
             Ok(Commit::Unchanged) => {}
             Ok(Commit::Created(commit)) => {
                 let artifact = ArtifactRef {
                     project: self.workspaces.project().to_string(),
-                    branch: BranchName::for_agent(&view.agent_id),
+                    branch: BranchName::for_agent(agent_id),
                     commit,
                 };
                 self.append(
-                    &view.agent_id,
+                    agent_id,
                     session,
                     Some(&active.execution_id),
                     Source::Layerfs,
@@ -340,9 +387,6 @@ impl Bridge {
             Err(WorkspaceError::Unavailable(text)) => {
                 report.warnings.push(format!("commit unavailable: {text}"));
             }
-        }
-        if let Some(held) = view.active.as_mut() {
-            held.checkpoint = None;
         }
         Ok(())
     }
@@ -383,6 +427,10 @@ impl Bridge {
         }
     }
 
+    fn running(&self, session: &SessionId) -> Option<Active> {
+        self.sessions.get(session)?.active.clone()
+    }
+
     fn start(
         &mut self,
         claimed: &Claimed,
@@ -401,6 +449,8 @@ impl Bridge {
         if let Err(error) = self.workspaces.ensure_branch(&branch) {
             return Ok(Outcome::Failed(format!("ensure branch {branch}: {error}")));
         }
+        // ponytail: a crash between mount and `execution.started` leaks one
+        // mount; a startup sweep of unrecorded mounts fixes it if it shows up.
         let workspace = match self.workspaces.mount(&branch) {
             Ok(workspace) => workspace,
             Err(error) => return Ok(Outcome::Failed(format!("mount {branch}: {error}"))),
@@ -418,25 +468,32 @@ impl Bridge {
             )?;
         }
         let execution = ExecutionId::for_command(claimed.command_id);
-        let terminal = TerminalName::for_execution(&execution);
+        let active = Active {
+            terminal: TerminalName::for_execution(&execution),
+            execution_id: execution,
+            workspace,
+            engine,
+            checkpoint: None,
+            reported_end: None,
+        };
+        // The event goes first: a crash after it leaves a recorded execution
+        // whose missing terminal the next tick ends as lost.
         self.append(
             &claimed.agent_id,
             &claimed.session_id,
-            Some(&execution),
+            Some(&active.execution_id),
             Source::Bridge,
-            Some(format!("{execution}:started")),
+            Some(format!("{}:started", active.execution_id)),
             EventKind::ExecutionStarted {
                 engine,
-                terminal: terminal.clone(),
-                workspace: workspace.clone(),
+                terminal: active.terminal.clone(),
+                workspace: active.workspace.clone(),
                 command_id: claimed.command_id,
             },
         )?;
         let launch = self.launch(
             claimed,
-            &execution,
-            &terminal,
-            &workspace,
+            &active,
             &Run {
                 engine,
                 native,
@@ -444,40 +501,33 @@ impl Bridge {
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
-            self.append(
+            let mut report = TickReport::default();
+            self.end(
                 &claimed.agent_id,
                 &claimed.session_id,
-                Some(&execution),
-                Source::Bridge,
-                Some(format!("{execution}:ended")),
-                EventKind::ExecutionEnded {
-                    cause: EndCause::Lost,
-                    exit_code: None,
-                },
+                &active,
+                EndCause::Lost,
+                None,
+                &mut report,
             )?;
-            return Ok(Outcome::Failed(format!("start terminal: {error}")));
+            report
+                .warnings
+                .insert(0, format!("start terminal: {error}"));
+            return Ok(Outcome::Failed(report.warnings.join("; ")));
         }
         if engine == Engine::Claude && !prompt.is_empty() {
-            return self.type_prompt(claimed, &execution, &terminal, prompt);
+            return self.type_prompt(claimed, &active, prompt);
         }
         Ok(Outcome::Succeeded)
     }
 
-    fn launch(
-        &self,
-        claimed: &Claimed,
-        execution: &ExecutionId,
-        terminal: &TerminalName,
-        workspace: &WorkspaceId,
-        run: &Run<'_>,
-    ) -> Launch {
+    fn launch(&self, claimed: &Claimed, active: &Active, run: &Run<'_>) -> Launch {
         let Run {
             engine,
             native,
             prompt,
         } = *run;
         let mut arguments = vec!["run".to_string(), "--".to_string()];
-        arguments.extend(self.config.wrapper.iter().cloned());
         arguments.push(match engine {
             Engine::Claude => self.config.claude_program.clone(),
             Engine::Codex => self.config.codex_program.clone(),
@@ -492,17 +542,14 @@ impl Bridge {
             "SPAWN_SESSION_ID".to_string(),
             claimed.session_id.to_string(),
         ));
-        environment.push(("SPAWN_EXECUTION_ID".to_string(), execution.to_string()));
         environment.push((
-            "SPAWN_ENGINE".to_string(),
-            match engine {
-                Engine::Claude => "claude".to_string(),
-                Engine::Codex => "codex".to_string(),
-            },
+            "SPAWN_EXECUTION_ID".to_string(),
+            active.execution_id.to_string(),
         ));
+        environment.push(("SPAWN_ENGINE".to_string(), engine.as_str().to_string()));
         Launch {
-            terminal: terminal.clone(),
-            workspace: workspace.clone(),
+            terminal: active.terminal.clone(),
+            workspace: active.workspace.clone(),
             program: self.config.spawn_program.clone(),
             arguments,
             environment,
@@ -512,8 +559,7 @@ impl Bridge {
     fn type_prompt(
         &mut self,
         claimed: &Claimed,
-        execution: &ExecutionId,
-        terminal: &TerminalName,
+        active: &Active,
         prompt: &str,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
@@ -521,7 +567,10 @@ impl Bridge {
             if attempt > 0 {
                 sleep(self.config.ready_interval);
             }
-            let Ok(pane) = self.terminals.capture_tail(terminal, TAIL_LINES) else {
+            let Ok(pane) =
+                self.terminals
+                    .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+            else {
                 return Ok(Outcome::Failed("terminal disappeared".to_string()));
             };
             let reading = read_claude_screen(&pane);
@@ -532,15 +581,18 @@ impl Bridge {
             self.append(
                 &claimed.agent_id,
                 &claimed.session_id,
-                Some(execution),
+                Some(&active.execution_id),
                 Source::Bridge,
-                Some(format!("{execution}:screen:ready")),
+                Some(format!("{}:screen:ready", active.execution_id)),
                 EventKind::ScreenObserved {
                     state: reading.state,
                     evidence: reading.evidence,
                 },
             )?;
-            return match self.terminals.submit_text(terminal, prompt) {
+            return match self
+                .terminals
+                .submit_text(&active.terminal, &active.workspace, prompt)
+            {
                 Ok(()) => Ok(Outcome::Succeeded),
                 Err(error) => Ok(Outcome::Failed(format!("submit prompt: {error}"))),
             };
@@ -551,25 +603,28 @@ impl Bridge {
     }
 
     fn input(&mut self, claimed: &Claimed, text: &str) -> Result<Outcome, StoreError> {
-        let Some((execution, terminal, engine)) = self.running(&claimed.session_id) else {
+        let Some(active) = self.running(&claimed.session_id) else {
             return Ok(Outcome::Failed(format!(
                 "{} runs no execution",
                 claimed.session_id
             )));
         };
-        if engine != Engine::Claude {
+        if active.engine != Engine::Claude {
             return Ok(Outcome::Failed(
                 "only a Claude execution accepts typed input".to_string(),
             ));
         }
-        let Ok(pane) = self.terminals.capture_tail(&terminal, TAIL_LINES) else {
+        let Ok(pane) = self
+            .terminals
+            .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+        else {
             return Ok(Outcome::Failed("terminal disappeared".to_string()));
         };
         let reading = read_claude_screen(&pane);
         self.append(
             &claimed.agent_id,
             &claimed.session_id,
-            Some(&execution),
+            Some(&active.execution_id),
             Source::Bridge,
             None,
             EventKind::ScreenObserved {
@@ -583,61 +638,34 @@ impl Bridge {
                 reading.state
             )));
         }
-        match self.terminals.submit_text(&terminal, text) {
+        match self
+            .terminals
+            .submit_text(&active.terminal, &active.workspace, text)
+        {
             Ok(()) => Ok(Outcome::Succeeded),
             Err(error) => Ok(Outcome::Failed(format!("submit text: {error}"))),
         }
     }
 
-    fn running(&self, session: &SessionId) -> Option<(ExecutionId, TerminalName, Engine)> {
-        let view = self.sessions.get(session)?;
-        view.active.as_ref().map(|active| {
-            (
-                active.execution_id.clone(),
-                active.terminal.clone(),
-                active.engine,
-            )
-        })
-    }
-
     fn stop(&mut self, claimed: &Claimed) -> Result<Outcome, StoreError> {
-        let Some((execution, terminal, _)) = self.running(&claimed.session_id) else {
+        let Some(active) = self.running(&claimed.session_id) else {
             return Ok(Outcome::Succeeded);
         };
-        let Some(mut view) = self.sessions.remove(&claimed.session_id) else {
-            return Ok(Outcome::Failed("session vanished".to_string()));
-        };
-        let active = view.active.clone();
-        let result = if let Some(active) = &active {
-            let mut report = TickReport::default();
-            self.checkpoint(
-                &claimed.session_id,
-                &mut view,
-                active,
-                CheckpointReason::ExecutionEnded,
-                &mut report,
-            )
-        } else {
-            Ok(())
-        };
-        self.sessions.insert(claimed.session_id.clone(), view);
-        result?;
-        if let Err(error) = self.terminals.terminate(&terminal) {
-            return Ok(Outcome::Failed(format!("terminate: {error}")));
-        }
-        self.append(
+        let mut report = TickReport::default();
+        let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
-            Some(&execution),
-            Source::Bridge,
-            Some(format!("{execution}:ended")),
-            EventKind::ExecutionEnded {
-                cause: EndCause::Stopped,
-                exit_code: None,
-            },
+            &active,
+            EndCause::Stopped,
+            None,
+            &mut report,
         )?;
         self.catch_up()?;
-        Ok(Outcome::Succeeded)
+        if ended {
+            Ok(Outcome::Succeeded)
+        } else {
+            Ok(Outcome::Failed(report.warnings.join("; ")))
+        }
     }
 
     fn resume(&mut self, claimed: &Claimed, prompt: Option<&str>) -> Result<Outcome, StoreError> {

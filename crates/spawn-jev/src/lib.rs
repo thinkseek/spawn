@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -207,7 +207,12 @@ fn is_chunked(head: &str) -> bool {
 fn post_json(url: &str, body: &str, timeout: Duration) -> Result<String, String> {
     let (host, port, path) = split_url(url)?;
     let address = format!("{host}:{port}");
-    let stream = TcpStream::connect(address.as_str())
+    let socket = address
+        .to_socket_addrs()
+        .map_err(|error| format!("resolve {address}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("resolve {address}: no address"))?;
+    let stream = TcpStream::connect_timeout(&socket, timeout)
         .map_err(|error| format!("connect {address}: {error}"))?;
     stream
         .set_read_timeout(Some(timeout))

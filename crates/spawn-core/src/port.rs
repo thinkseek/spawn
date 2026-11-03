@@ -151,15 +151,36 @@ pub trait TerminalHost: Send + Sync {
     /// Start a detached terminal that runs the launch.
     fn start(&self, launch: &Launch) -> Result<(), TerminalError>;
 
+    // Every call after `start` names the workspace again, so a host that
+    // runs inside the workspace needs no memory between processes.
+
     /// Type `text` literally, then press Enter.
-    fn submit_text(&self, terminal: &TerminalName, text: &str) -> Result<(), TerminalError>;
+    fn submit_text(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError>;
 
     /// Whether the terminal still exists.
-    fn is_alive(&self, terminal: &TerminalName) -> Result<bool, TerminalError>;
+    fn is_alive(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<bool, TerminalError>;
 
     /// Last `lines` lines of the terminal screen, newest last.
-    fn capture_tail(&self, terminal: &TerminalName, lines: usize) -> Result<String, TerminalError>;
+    fn capture_tail(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        lines: usize,
+    ) -> Result<String, TerminalError>;
 
     /// Kill the terminal and its process. A missing terminal is not an error.
-    fn terminate(&self, terminal: &TerminalName) -> Result<(), TerminalError>;
+    fn terminate(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError>;
 }
