@@ -32,6 +32,7 @@ use spawn_jev::{JevConfig, JevJudge};
 use spawn_postgres::PostgresStore;
 
 mod context;
+mod dispatch;
 mod evolve;
 mod serve;
 mod supervise;
@@ -88,7 +89,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         return Err(
-            "usage: spawn <init-db|submit|tick|loop|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>"
+            "usage: spawn <init-db|submit|tick|loop|dispatch|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>"
                 .to_string(),
         );
     };
@@ -102,6 +103,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "evolve" => evolve::evolve(&Flags::parse(&rest)?)
             .map(|code| if code == evolve::IDLE { 0 } else { code }),
         "rsi-loop" => cmd_rsi_loop(&Flags::parse(&rest)?),
+        "dispatch" => cmd_dispatch(&rest),
         "status" => cmd_status(&Flags::parse(&rest)?),
         "fleet" => cmd_fleet(),
         "tail" => cmd_tail(&Flags::parse(&rest)?),
@@ -314,6 +316,10 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
             .unwrap_or(2000),
     );
     let (mut bridge, mut observer) = runtime(flags)?;
+    let supervised = env_value("SPAWN_SUPERVISOR").is_some();
+    let dispatching = env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0");
+    let spawn = env_or("SPAWN_PROGRAM", "spawn");
+    let mut dispatch_store: Option<PostgresStore> = None;
     let mut failures: u32 = 0;
     loop {
         match bridge.tick() {
@@ -331,7 +337,25 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
         if let Err(error) = observer.tick() {
             eprintln!("spawn loop: observer: {error}");
         }
-        if env_value("SPAWN_SUPERVISOR").is_some() {
+        if dispatching {
+            if dispatch_store.is_none() {
+                dispatch_store = open_store()
+                    .map_err(|error| eprintln!("spawn loop: dispatch: {error}"))
+                    .ok();
+            }
+            if let Some(store) = &dispatch_store {
+                match dispatch::step(store, supervised, &spawn) {
+                    Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
+                    Err(error) => {
+                        // A broken connection is reopened on the next step.
+                        dispatch_store = None;
+                        failures = failures.saturating_add(1);
+                        eprintln!("spawn loop: dispatch: {error}");
+                    }
+                }
+            }
+        }
+        if supervised {
             match supervise::keep_alive() {
                 Ok(Some(line)) => println!("{line}"),
                 Ok(None) => {}
@@ -346,6 +370,36 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
         let pause = interval.saturating_mul(failures.clamp(1, 30));
         std::thread::sleep(pause);
     }
+}
+
+/// One dispatcher step; `--dry-run` prints the plan and submits nothing.
+fn cmd_dispatch(rest: &[String]) -> Result<i32, String> {
+    let dry = rest.iter().any(|word| word == "--dry-run");
+    let store = open_store()?;
+    let supervised = env_value("SPAWN_SUPERVISOR").is_some();
+    let spawn = env_or("SPAWN_PROGRAM", "spawn");
+    if dry {
+        let plan = dispatch::plan(&store, supervised, &spawn)?;
+        for order in &plan.orders {
+            println!(
+                "order {} -> {}: {}",
+                order.key,
+                order.session_id,
+                serde_json::to_string(&order.action).unwrap_or_default()
+            );
+        }
+        for item in &plan.pending {
+            println!("pending {} {:?}: {}", item.session_id, item.why, item.line);
+        }
+        if plan.orders.is_empty() && plan.pending.is_empty() {
+            println!("dispatch: nothing to do");
+        }
+        return Ok(0);
+    }
+    for line in dispatch::step(&store, supervised, &spawn)? {
+        println!("{line}");
+    }
+    Ok(0)
 }
 
 /// Run the RSI controller until it halts.
