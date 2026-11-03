@@ -110,20 +110,42 @@ impl<T: TerminalHost + ?Sized> TerminalHost for Timed<T> {
         time("tmux.start", || self.0.start(launch))
     }
 
-    fn submit_text(&self, terminal: &TerminalName, text: &str) -> Result<(), TerminalError> {
-        time("tmux.submit_text", || self.0.submit_text(terminal, text))
+    fn submit_text(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError> {
+        time("tmux.submit_text", || {
+            self.0.submit_text(terminal, workspace, text)
+        })
     }
 
-    fn is_alive(&self, terminal: &TerminalName) -> Result<bool, TerminalError> {
-        time("tmux.is_alive", || self.0.is_alive(terminal))
+    fn is_alive(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<bool, TerminalError> {
+        time("tmux.is_alive", || self.0.is_alive(terminal, workspace))
     }
 
-    fn capture_tail(&self, terminal: &TerminalName, lines: usize) -> Result<String, TerminalError> {
-        time("tmux.capture_tail", || self.0.capture_tail(terminal, lines))
+    fn capture_tail(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        lines: usize,
+    ) -> Result<String, TerminalError> {
+        time("tmux.capture_tail", || {
+            self.0.capture_tail(terminal, workspace, lines)
+        })
     }
 
-    fn terminate(&self, terminal: &TerminalName) -> Result<(), TerminalError> {
-        time("tmux.terminate", || self.0.terminate(terminal))
+    fn terminate(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        time("tmux.terminate", || self.0.terminate(terminal, workspace))
     }
 }
 

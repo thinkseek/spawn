@@ -119,7 +119,7 @@ terminal=$("$tmux" -L "$socket" list-sessions -F '#{session_name}' | head -1)
 # The engine echoes the typed prompt asynchronously; poll the tail.
 found=0
 for _ in $(seq 1 40); do
-  "$tmux" -L "$socket" capture-pane -p -t "=$terminal:.0" -S -80 >"$work/pane.txt"
+  "$tmux" -L "$socket" capture-pane -p -t "=$terminal:" -S -80 >"$work/pane.txt"
   if grep -q 'echo: say hello' "$work/pane.txt"; then
     found=1
     echo "spawn-trace e2e.submit_to_echo $(( $(now_us) - t_submit ))" >>"$trace"
@@ -133,7 +133,7 @@ if [ "$found" = 0 ]; then
   fail "the prompt did not reach the pane"
 fi
 
-step status "$bin" status --limit 100 >"$work/status.txt"
+step status "$bin" status >"$work/status.txt"
 grep -q "$session" "$work/status.txt" ||
   fail "no observation for $session"
 echo "e2e: ok ($terminal)"

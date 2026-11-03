@@ -258,15 +258,23 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     })
     .expect("start succeeds");
 
-    assert!(host.is_alive(&name).expect("is_alive succeeds"));
-    host.submit_text(&name, "hello from spawn")
+    assert!(
+        host.is_alive(&name, &workspace())
+            .expect("is_alive succeeds")
+    );
+    host.submit_text(&name, &workspace(), "hello from spawn")
         .expect("submit succeeds");
-    let pane = host.capture_tail(&name, 20).expect("capture succeeds");
+    let pane = host
+        .capture_tail(&name, &workspace(), 20)
+        .expect("capture succeeds");
     assert!(pane.contains("hello from spawn"), "pane: {pane}");
 
-    host.terminate(&name).expect("terminate succeeds");
+    host.terminate(&name, &workspace())
+        .expect("terminate succeeds");
     assert!(
-        !host.is_alive(&name).expect("is_alive after terminate"),
+        !host
+            .is_alive(&name, &workspace())
+            .expect("is_alive after terminate"),
         "the session is gone"
     );
 }
@@ -294,7 +302,7 @@ fn tmux_rejects_a_duplicate_terminal() {
         })
         .expect_err("a duplicate start fails");
     assert!(error.0.contains("already exists"), "{error:?}");
-    host.terminate(&name).expect("clean up");
+    host.terminate(&name, &workspace()).expect("clean up");
 }
 
 #[test]
@@ -313,12 +321,14 @@ fn tmux_matches_the_session_name_exactly() {
         })
         .expect("start succeeds");
     }
-    host.terminate(&first).expect("terminate the short name");
+    host.terminate(&first, &workspace())
+        .expect("terminate the short name");
     assert!(
-        host.is_alive(&second).expect("is_alive succeeds"),
+        host.is_alive(&second, &workspace())
+            .expect("is_alive succeeds"),
         "terminating spawn-a must not kill spawn-ab"
     );
-    host.terminate(&second).expect("clean up");
+    host.terminate(&second, &workspace()).expect("clean up");
 }
 
 #[test]
@@ -348,7 +358,7 @@ fn tmux_calls_go_through_the_workspace_prefix() {
         let prefix = cli.exec_prefix(&workspace());
         std::sync::Arc::new(move |_: &WorkspaceId| prefix.clone())
     };
-    let host = TmuxHost::in_workspaces(&inner, builder, None);
+    let host = TmuxHost::in_workspaces(&inner, builder.clone(), None);
     let name = terminal("prefix");
     host.start(&Launch {
         terminal: name.clone(),
@@ -358,7 +368,16 @@ fn tmux_calls_go_through_the_workspace_prefix() {
         environment: Vec::new(),
     })
     .expect("start through the prefix succeeds");
-    host.terminate(&name).expect("terminate through the prefix");
+    // A second host stands for the next `spawn tick` process.
+    let later = TmuxHost::in_workspaces(&inner, builder, None);
+    assert!(
+        later
+            .is_alive(&name, &workspace())
+            .expect("is_alive in a new host")
+    );
+    later
+        .terminate(&name, &workspace())
+        .expect("terminate through the prefix");
     let log = fs::read_to_string(&calls).expect("read the call log");
     assert!(
         log.contains("layerfs --project shop workspace exec 9:/workspaces/9 --stream --"),

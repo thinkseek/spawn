@@ -208,6 +208,93 @@ fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
         .expect("submit succeeds")
 }
 
+/// The memory host ignores the workspace argument.
+fn any_workspace() -> spawn_core::id::WorkspaceId {
+    spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid workspace")
+}
+
+/// One `spawn tick` process: a new Bridge that refolds the log first.
+fn tick_fresh(store: &Arc<MemoryStore>) -> spawn_core::bridge::TickReport {
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    );
+    bridge.recover().expect("recover succeeds");
+    bridge.tick().expect("tick succeeds")
+}
+
+fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
+    let principal = Principal::new("tester").expect("valid principal");
+    store
+        .submit(
+            &principal,
+            &Submission {
+                agent_id: agent(),
+                session_id: session(),
+                idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+                action,
+            },
+        )
+        .expect("submit succeeds");
+}
+
+fn ended(store: &MemoryStore) -> Vec<EndCause> {
+    events(store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ExecutionEnded { cause, .. } => Some(cause),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn bridge_lifecycle_survives_a_refold_per_tick() {
+    let store = store();
+    for command in 1..=3 {
+        let execution = ExecutionId::for_command(CommandId(command));
+        store.set_pane(&TerminalName::for_execution(&execution), READY);
+    }
+    submit_start(&store, "first");
+    tick_fresh(&store);
+    submit(&store, "key_stop", CommandAction::Stop);
+    let report = tick_fresh(&store);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+
+    // After a stop the session is free again; a refold must not keep it busy.
+    submit(
+        &store,
+        "key_again",
+        CommandAction::Start {
+            engine: Engine::Claude,
+            prompt: "second".to_string(),
+            parent_session_id: None,
+        },
+    );
+    tick_fresh(&store);
+    let finished: Vec<bool> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::CommandFinished { succeeded, .. } => Some(succeeded),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, vec![true, true, true], "{:?}", names(&store));
+
+    // The process dies: the next tick ends the execution once, as lost.
+    let second = TerminalName::for_execution(&ExecutionId::for_command(CommandId(3)));
+    store
+        .terminate(&second, &any_workspace())
+        .expect("kill succeeds");
+    tick_fresh(&store);
+    tick_fresh(&store);
+    assert_eq!(ended(&store), vec![EndCause::Stopped, EndCause::Lost]);
+}
+
 fn events(store: &MemoryStore) -> Vec<NewEvent> {
     store
         .read_global(spawn_core::event::GlobalPosition(0), 500)
@@ -256,7 +343,9 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
             "command.finished",
         ]
     );
-    let pane = store.capture_tail(&terminal, 40).expect("pane exists");
+    let pane = store
+        .capture_tail(&terminal, &any_workspace(), 40)
+        .expect("pane exists");
     assert!(
         pane.contains("list the files"),
         "prompt reached the pane: {pane}"
@@ -343,7 +432,9 @@ fn bridge_checkpoints_and_unmounts_on_stop() {
         names(&store)
     );
     assert!(
-        !store.is_alive(&terminal).expect("query succeeds"),
+        !store
+            .is_alive(&terminal, &any_workspace())
+            .expect("query succeeds"),
         "terminal is gone"
     );
 }
@@ -415,7 +506,11 @@ fn bridge_resumes_the_stored_native_session() {
     assert_eq!(accepted, CommandId(1));
     assert_eq!(started.execution_id, Some(execution_again.clone()));
     let pane = store
-        .capture_tail(&TerminalName::for_execution(&execution), 40)
+        .capture_tail(
+            &TerminalName::for_execution(&execution),
+            &any_workspace(),
+            40,
+        )
         .expect("the resumed pane exists");
     assert!(pane.contains("继续"), "the resume prompt reached the pane");
 }
@@ -471,6 +566,13 @@ fn observer_writes_only_on_change() {
         observer.tick().expect("tick succeeds"),
         0,
         "no change, no write"
+    );
+    let mut next = Observer::new(store.clone(), Arc::new(HeuristicJudge));
+    next.recover().expect("recover succeeds");
+    assert_eq!(
+        next.tick().expect("tick succeeds"),
+        0,
+        "a new process restores the last observation"
     );
 
     store

@@ -42,7 +42,7 @@ spawn-core
 
 | 规则 | 实现 |
 | --- | --- |
-| 前缀与字符集 | `label!` 宏统一校验，`[A-Za-z0-9_-]` |
+| 前缀与字符集 | `label!` 宏统一校验：1–256 字节、无控制字符；带前缀的 ID 在前缀后只允许 `[A-Za-z0-9_-]+` |
 | 工作区形态 | `check_workspace`：必须含 `:`，冒号前非空，路径以 `/` 开头 |
 | 无前缀类型 | 两参形式转调三参形式，传入 `|_raw| Ok(())` |
 | 失败处理 | 返回错误，不 panic |
@@ -92,7 +92,7 @@ spawn-core
 | | `claim(worker, ttl)` | 领取最老且无活跃租约的会话首条命令 |
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
 | `WorkspaceStore` | `ensure_branch`、`mount`、`commit`、`unmount` | LayerFS 的四个动作；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
-| `TerminalHost` | `start`、`submit_text`、`is_alive`、`capture_tail`、`terminate` | 终端生命周期与屏尾读取 |
+| `TerminalHost` | `start`、`submit_text`、`is_alive`、`capture_tail`、`terminate` | 终端生命周期与屏尾读取；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 
 错误类型：
 
@@ -110,9 +110,9 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 | 命令 | 行为 |
 | --- | --- |
-| `Start{engine,prompt,parent_session_id}` | 检查会话是否已有执行 → 开分支 → mount → 启动终端 → 写 `execution.started` → Claude 走屏尾等待投递 |
+| `Start{engine,prompt,parent_session_id}` | 检查会话是否已有执行 → 开分支 → mount → 写 `execution.started` → 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
 | `Input{text}` | 屏尾非 Ready 直接拒绝，Ready 才 `send-keys` |
-| `Stop` | 先做一次 checkpoint，再终止终端 |
+| `Stop` | 走结束流程，原因记为 `Stopped` |
 | `Resume{prompt}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
 
 一次启动的参数由 `claude_arguments` 与 `codex_arguments` 生成：
@@ -128,7 +128,19 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
 
-恢复：折叠会话事件得到最新原生会话 id 与最近 commit，重新 mount，优先 `--resume`。原生会话丢失时新开执行，逻辑 Session 不变。
+结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。
+
+结束的三个来源：
+
+| 来源 | 触发 | `cause` |
+| --- | --- | --- |
+| `Stop` 命令 | 用户 | `Stopped` |
+| `spawn run` | 引擎退出，runner 写引擎来源的 `execution.ended`，键 `<exec>:exited` | `Exited`，带退出码 |
+| tick 发现终端不在 | 进程崩溃或终端被外部杀掉 | `Lost` |
+
+引擎来源的结束事件只是报告；Bridge 下一次 tick 读到后执行结束流程并写自己的结束事件。折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行。
+
+恢复：每次 `spawn tick` 是新进程，从位置 0 折叠全部事件得到活跃执行、原生会话 id 与待提交的 checkpoint。`Resume` 复用最新原生会话 id，新开 Execution 与 mount，优先 `--resume`；逻辑 Session 不变。
 
 ## 6. 屏尾判定
 
@@ -166,7 +178,9 @@ Observer 每次 tick：
 1. 从游标读取增量，折叠成会话快照。
 2. 调 `StateJudge`。
 3. 状态或原因变化才追加 `observation.recorded`，`based_on_seq` 记录依据。
-4. 跳过 `source = Observer` 的事件，避免自递归。
+4. `source = Observer` 的事件不进入快照；`observation.recorded` 只恢复上一次结论与 `based_on_seq`，新进程不重复写同一结论。
+
+快照规则：hook 事件（工具、消息、回合）比屏尾读数新，到达时清空 `screen` 与 `permission_pending`。
 
 判定实现：
 
@@ -219,6 +233,8 @@ Observer 每次 tick：
 | `spawn_claim(worker, ttl_ms)` | `out_id`、`out_attempt`、`out_agent`、`out_session`、`out_action` | `for update skip locked`，单会话串行，过期租约 attempt+1 |
 | `spawn_finish(command, attempt, succeeded, error)` | `done`、`already`、`stale`、`missing` | 旧 attempt 结束被拒 |
 
+权限：视图对 public 可读；`spawn_events`、`spawn_commands`、`spawn_grants` 撤销 public 全部权限；四个写函数撤销 public 执行权。`spawn_gateway_insert` 固定 `search_path = <schema>, pg_temp`，调用方无法用临时表替换 `spawn_grants`。
+
 视图：`agent_state`（每会话最新 observation）、`agent_timeline`、`agent_tasks`、`agent_executions`、`agent_artifacts`、`agent_relations`、`agent_commands`。视图取代早期物化视图与 CDC 方案。
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
@@ -231,7 +247,7 @@ tmux：
 | --- | --- |
 | `new-session -d -s <name> -x 200 -y 50 [-e K=V] -- prog …` | 每次执行一个会话 |
 | `has-session`、`kill-session` | 会话 target：`=<name>` |
-| `send-keys`、`capture-pane` | pane target：`=<name>:.0`，裸 `=` 会被当作 pane 规格而报错 |
+| `send-keys`、`capture-pane` | pane target：`=<name>:`，即当前窗口的活跃 pane；裸 `=<name>` 会被当作 pane 规格而报错，`:.0` 在 `pane-base-index 1` 下失效 |
 | 重复会话 | stderr 为 `duplicate session: …`，适配层归一为 `already exists` |
 
 LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
@@ -260,18 +276,21 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | 工具链 | edition 2024，`rust-version` 1.95 |
 | 调试信息 | dev `debug="line-tables-only"`、`split-debuginfo="packed"`；release `lto="thin"`、`codegen-units=1` |
 | 编译缓存 | 远端门禁 `RUSTC_WRAPPER=kache`，`CARGO_INCREMENTAL=0` |
+| 登录开销 | dev profile 对 `sha2`、`hmac`、`postgres-protocol` 开 `opt-level = 3`，SCRAM 登录从约 50 ms 降到约 6 ms |
 | 目标目录 | 远端固定 `CARGO_TARGET_DIR`，kache 复用，避免多轮 rsync 占盘 |
 
 ## 12. 测试策略
 
 只测公开 API：断言全部位于各 crate 的 `tests/api.rs`，库内不写 `#[cfg(test)]`。
 
-| crate | 断言数 | 覆盖 |
-| --- | --- | --- |
-| `spawn-core` | 12 | ID 校验、事件往返、去重、双序号、租约过期、屏尾七态、Bridge 事件序与恢复 |
-| `spawn-host` | 16 | LayerFS 三种退出码与全部 JSON 形态、tmux 精确名匹配、前缀注入、真实 tmux 生命周期 |
-| `spawn-jev` | 9 | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
-| `spawn-postgres` | 10 | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图、授权拒绝、共享一致性套件 |
+| crate | 覆盖 |
+| --- | --- |
+| `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
+| `spawn-host` | LayerFS 三种退出码与全部 JSON 形态、tmux 精确名匹配、前缀注入与跨进程调用、真实 tmux 生命周期 |
+| `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
+| `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图、授权拒绝、共享一致性套件 |
+
+共享一致性套件 |
 
 共享一致性套件在 `spawn-core::contract`：`event_log`、`command_queue`、`workspace_store`、`terminal` 四个函数，任一实现都必须通过。
 
@@ -284,18 +303,24 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | 格式 | `cargo fmt --all -- --check` |
 | 静态检查 | `cargo clippy --workspace --all-targets -- -D warnings` |
 | 测试 | `cargo test --workspace --no-fail-fast` |
-| 端到端 | `scripts/e2e-smoke.sh`：真 PG、真 tmux、假 LayerFS、假 Claude 屏，断言 `--ax-screen-reader`、前缀调用、提示落到屏、observation 入库 |
+| 端到端 | `scripts/e2e-smoke.sh`：真 PG、真 tmux、假 LayerFS、假 Claude 屏，断言 `--ax-screen-reader`、前缀调用、提示落到屏、observation 入库；按阶段打印 calls、total、max 与 submit 到回显的延迟 |
 
 缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 
 ## 13. 已知限制
 
-| 项 | 现状 |
-| --- | --- |
-| 视图读取 | Rust 侧无读视图 API，视图供 SQL 客户端使用；`spawn status` 读原始事件拼接 |
-| 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 |
-| 视图覆盖 | `agent_executions`、`agent_artifacts`、`agent_relations`、`agent_commands` 与 `spawn_finish` 四态暂无断言 |
-| 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 |
-| Bridge 借用 | 同会话 `remove`→`insert` 的借用规避免逻辑仅由两条 bridge 断言覆盖 |
-| LayerFS | `unmount` 会顺带 `sandbox close`；复用已有沙箱时可能误关 |
-| tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 |
+| 项 | 现状 | 升级路径 |
+| --- | --- | --- |
+| 无常驻进程 | 每次 `spawn tick` 连接 PG、从位置 0 折叠全部事件；耗时随事件数线性增长 | 常驻 worker 持有游标，或按会话快照 |
+| 租约续期 | Bridge 不续租；单条命令超过 `lease_ttl`（2 分钟）会被别的 worker 重取 | tick 内续租，或缩短单命令时长 |
+| 重试上限 | `spawn_claim` 无最大 attempt，坏命令会被反复领取 | 加 `max_attempts`，超限直接 `finish(failed)` |
+| schema 版本 | `migrate` 每次整体执行 `schema.sql`，无版本表 | 编号迁移文件与版本表 |
+| 子进程超时 | `layerfs`、`tmux` 调用没有超时 | `wait_timeout` 或独立线程计时 |
+| 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 由 hooks 的 `turn.failed` 取代 |
+| 视图读取 | Rust 侧无读视图 API，`spawn status` 扫描原始事件 | 见 [view-architecture.md](./view-architecture.md) |
+| 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 | 接入 `LISTEN/NOTIFY` |
+| 写入串行 | `spawn_append` 用一把全局 advisory lock | 按会话分锁 |
+| 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 | 用真实服务做契约测试 |
+| LayerFS | `unmount` 会顺带 `sandbox close`；复用已有沙箱时可能误关 | 分开 unmount 与 close |
+| tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 | `paste-buffer` |
+| mount 泄漏 | mount 与 `execution.started` 之间崩溃会遗留一个 mount | 启动时清扫未记录的 mount |

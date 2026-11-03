@@ -347,9 +347,11 @@ select
 from spawn_events e
 where e.event_name = 'session.linked';
 
--- Read access is public; writes stay with the owner. The gateway trigger
--- runs as the owner and checks `session_user` against `spawn_grants`.
-grant select on spawn_events, agent_state, agent_timeline, agent_tasks,
+-- Views are public; the raw tables and writes stay with the owner. The
+-- gateway trigger runs as the owner and checks `session_user` against
+-- `spawn_grants`.
+revoke all on spawn_events, spawn_commands, spawn_grants from public;
+grant select on agent_state, agent_timeline, agent_tasks,
     agent_executions, agent_artifacts, agent_relations
     to public;
 grant insert on agent_commands to public;
@@ -358,3 +360,15 @@ revoke execute on function spawn_append(text, text, text, text, text, jsonb) fro
 revoke execute on function spawn_submit(text, text, text, text, jsonb) from public;
 revoke execute on function spawn_claim(text, bigint) from public;
 revoke execute on function spawn_finish(bigint, integer, boolean, text) from public;
+
+-- A security definer function must not resolve names through the caller's
+-- search_path, or a caller's temporary table could stand in for
+-- `spawn_grants`. Pin the schema the migration runs in, temp schema last.
+do $$
+begin
+    execute format(
+        'alter function spawn_gateway_insert() set search_path = %I, pg_temp',
+        current_schema()
+    );
+end
+$$;
