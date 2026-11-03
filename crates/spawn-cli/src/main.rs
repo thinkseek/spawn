@@ -10,6 +10,7 @@
 //! - `hook` ingests one Claude Code hook payload from standard input.
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
+//! - `version` prints `spawn <crate version>`.
 //!
 //! Configuration is environment first, so a terminal started by the Bridge
 //! carries everything its hook and runner need.
@@ -85,7 +86,8 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         return Err(
-            "usage: spawn <init-db|submit|tick|loop|evolve|serve|status|hook|run>".to_string(),
+            "usage: spawn <init-db|submit|tick|loop|evolve|serve|status|hook|run|version>"
+                .to_string(),
         );
     };
     let rest: Vec<String> = arguments.collect();
@@ -99,6 +101,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "status" => cmd_status(&Flags::parse(&rest)?),
         "hook" => cmd_hook(),
         "run" => cmd_run(&rest),
+        "version" => cmd_version(&rest),
         other => Err(format!("unknown command {other}")),
     }
 }
@@ -118,6 +121,14 @@ fn required_env(name: &str) -> Result<String, String> {
 pub(crate) fn open_store() -> Result<PostgresStore, String> {
     let url = required_env("SPAWN_DATABASE_URL")?;
     trace::time("pg.connect", || PostgresStore::connect(&url)).map_err(|error| error.to_string())
+}
+
+fn cmd_version(rest: &[String]) -> Result<i32, String> {
+    if let Some(word) = rest.first() {
+        return Err(format!("unexpected argument {word}"));
+    }
+    println!("spawn {}", env!("CARGO_PKG_VERSION"));
+    Ok(0)
 }
 
 fn cmd_init_db(_flags: &Flags) -> Result<i32, String> {
