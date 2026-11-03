@@ -221,13 +221,13 @@ fn an_expired_lease_is_taken_again_with_a_new_attempt() {
 #[test]
 fn views_answer_from_the_event_log() {
     let (store, schema) = store("views");
-    let observation = Observation {
-        state: SemanticState::Working,
-        reason: None,
-        based_on_seq: SessionSeq(1),
-        confidence: Confidence::new(0.75).expect("valid confidence"),
-        judge: "heuristic".to_string(),
-    };
+    let observation = Observation::basic(
+        SemanticState::Working,
+        None,
+        SessionSeq(1),
+        Confidence::new(0.75).expect("valid confidence"),
+        "heuristic",
+    );
     store
         .append(message(EventKind::ObservationRecorded { observation }))
         .expect("append succeeds");
@@ -740,13 +740,13 @@ fn migrating_twice_changes_nothing() {
 
 fn observed(seq: u64) -> NewEvent {
     message(EventKind::ObservationRecorded {
-        observation: Observation {
-            state: SemanticState::Working,
-            reason: None,
-            based_on_seq: SessionSeq(seq),
-            confidence: Confidence::new(0.5).expect("valid confidence"),
-            judge: "heuristic".to_string(),
-        },
+        observation: Observation::basic(
+            SemanticState::Working,
+            None,
+            SessionSeq(seq),
+            Confidence::new(0.5).expect("valid confidence"),
+            "heuristic",
+        ),
     })
 }
 

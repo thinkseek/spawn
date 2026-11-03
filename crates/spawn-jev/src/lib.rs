@@ -1,8 +1,9 @@
 //! Jev System One judge.
 //!
 //! The endpoint takes one `state` value and a map of typed questions, and
-//! answers every question with a label or a probability. Spawn asks one
-//! `choice` question per session, named `semantic_state`.
+//! answers every question with a label or a probability. The Observer calls
+//! it only for cases its rules mark ambiguous, and asks three questions in one
+//! request: `semantic_state` (choice), `needs_human` and `stuck` (yes/no).
 //!
 //! The request and answer shapes were read from the running service, not
 //! guessed: `{"state": …, "questions": {"<name>": {"type": "choice",
@@ -21,14 +22,30 @@ use serde::Deserialize;
 use spawn_core::observation::{Confidence, SemanticState};
 use spawn_core::observe::{JudgeError, JudgeInput, Judgement, StateJudge};
 
-/// Question name used in every request.
+/// Question name of the state choice.
 pub const QUESTION: &str = "semantic_state";
 
-/// Instruction shown to the model.
+/// Question name of the yes/no "a human must step in".
+pub const NEEDS_HUMAN: &str = "needs_human";
+
+/// Question name of the yes/no "the agent makes no progress".
+pub const STUCK: &str = "stuck";
+
+/// Instruction shown to the model for the state choice.
 const INSTRUCTIONS: &str = "What is the semantic state of this coding agent session? \
-Use the evidence in state: an open tool or a running pane means progress, \
-a permission prompt means a human must answer, and a stopped turn means the \
-agent waits for the next prompt.";
+Deterministic rules could not decide it; `ambiguity` says why. Read \
+`screen_tail`, the agent's terminal as a person would see it, and `task`, \
+what the agent was asked to do. An agent that ended its turn with a question \
+or a request for a decision is BLOCKED, not WAITING. An agent whose task is \
+done and that says so is COMPLETED.";
+
+/// Instruction for `needs_human`.
+const NEEDS_HUMAN_INSTRUCTIONS: &str = "Does this agent need a human to answer, decide, \
+approve or fix something before it can continue its task?";
+
+/// Instruction for `stuck`.
+const STUCK_INSTRUCTIONS: &str = "Is this agent stuck: repeating the same failing \
+action, looping, or making no progress toward its task?";
 
 /// Which state means what. Order is the wire order.
 fn description(state: SemanticState) -> &'static str {
@@ -73,9 +90,11 @@ pub fn build_request_for(input: &JudgeInput, model: &str) -> String {
     }
     criteria.push('}');
     let instructions = serde_json::to_string(INSTRUCTIONS).unwrap_or_default();
+    let needs_human = serde_json::to_string(NEEDS_HUMAN_INSTRUCTIONS).unwrap_or_default();
+    let stuck = serde_json::to_string(STUCK_INSTRUCTIONS).unwrap_or_default();
     let model = serde_json::to_string(model).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "{{\"model\":{model},\"state\":{state},\"questions\":{{\"{QUESTION}\":{{\"type\":\"choice\",\"instructions\":{instructions},\"criteria\":{criteria}}}}}}}"
+        "{{\"model\":{model},\"state\":{state},\"questions\":{{\"{QUESTION}\":{{\"type\":\"choice\",\"instructions\":{instructions},\"criteria\":{criteria}}},\"{NEEDS_HUMAN}\":{{\"type\":\"noul\",\"instructions\":{needs_human}}},\"{STUCK}\":{{\"type\":\"noul\",\"instructions\":{stuck}}}}}}}"
     )
 }
 
@@ -92,6 +111,9 @@ struct Answer {
     confidence: Option<f64>,
     #[serde(default)]
     probabilities: BTreeMap<String, f64>,
+    /// Probability of "yes" for a `noul` question.
+    #[serde(default)]
+    noul: Option<f64>,
 }
 
 /// Parse one answer body.
@@ -116,7 +138,29 @@ pub fn parse_reply(body: &str) -> Result<Judgement, JudgeError> {
     let confidence = answer.confidence.map_or(Confidence::ZERO, |value| {
         Confidence::new(value).unwrap_or(Confidence::ZERO)
     });
-    Ok(Judgement { state, confidence })
+    let distribution = (!answer.probabilities.is_empty()).then(|| {
+        SemanticState::ALL.map(|candidate| {
+            answer
+                .probabilities
+                .get(candidate.key())
+                .copied()
+                .unwrap_or(0.0)
+        })
+    });
+    let yes = |name: &str| {
+        reply
+            .answers
+            .get(name)
+            .and_then(|answer| answer.noul)
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+    };
+    Ok(Judgement {
+        state,
+        confidence,
+        probabilities: distribution,
+        needs_human: yes(NEEDS_HUMAN),
+        stuck: yes(STUCK),
+    })
 }
 
 /// Settings of the decision service.

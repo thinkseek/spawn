@@ -1,5 +1,7 @@
 //! Semantic judgements produced by the Observer.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -60,6 +62,52 @@ pub enum WaitReason {
     JudgeUnavailable,
 }
 
+/// Why the rules could not decide a state from the facts alone.
+///
+/// Only an ambiguous case reaches the model judge. Each kind limits the
+/// states the judge may choose: the facts already rule the others out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ambiguity {
+    /// The turn stopped at an idle prompt: finished, asking a human, or
+    /// waiting for the next prompt.
+    TurnStoppedIdle,
+    /// The execution runs with no open tool and no event for a while:
+    /// thinking, waiting, or hung.
+    QuietLive,
+    /// The latest turn failed or the engine printed an error: recovering or
+    /// stuck.
+    EngineError,
+    /// The engine exited on its own: done, or failed.
+    ExitedOnItsOwn,
+    /// The terminal disappeared without a recorded exit.
+    Lost,
+}
+
+impl Ambiguity {
+    /// States the facts still allow.
+    pub fn allowed(self) -> &'static [SemanticState] {
+        match self {
+            Self::TurnStoppedIdle => &[
+                SemanticState::Waiting,
+                SemanticState::Blocked,
+                SemanticState::Completed,
+            ],
+            Self::QuietLive | Self::EngineError => &[
+                SemanticState::Working,
+                SemanticState::Waiting,
+                SemanticState::Blocked,
+            ],
+            Self::ExitedOnItsOwn => &[SemanticState::Completed, SemanticState::Blocked],
+            Self::Lost => &[
+                SemanticState::Unknown,
+                SemanticState::Blocked,
+                SemanticState::Completed,
+            ],
+        }
+    }
+}
+
 /// A probability outside `[0, 1]` or not finite.
 #[derive(Debug, Clone, Copy, PartialEq, Error)]
 #[error("confidence {0} is outside [0, 1]")]
@@ -114,6 +162,58 @@ pub struct Observation {
     pub based_on_seq: SessionSeq,
     /// Judge confidence.
     pub confidence: Confidence,
-    /// Judge implementation name.
+    /// Who decided: `rules`, or the model judge's name (`jev`, `heuristic`).
     pub judge: String,
+    /// Why the rules could not decide. `None` when the rules decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguity: Option<Ambiguity>,
+    /// The rules' best guess for an ambiguous case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_state: Option<SemanticState>,
+    /// The model judge's distribution over states, before the facts narrowed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probabilities: Option<BTreeMap<String, f64>>,
+    /// Probability that a human must answer or decide before work continues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_human: Option<f64>,
+    /// Probability that the agent loops or makes no progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck: Option<f64>,
+    /// Model judge round trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// The observation layer's flag that a person or a higher tier should
+    /// look. Acting on it is the control layer's decision, not this one's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attention: bool,
+    /// The input the model judge saw, for audit and replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
+}
+
+impl Observation {
+    /// An observation with only the original fields set.
+    pub fn basic(
+        state: SemanticState,
+        reason: Option<WaitReason>,
+        based_on_seq: SessionSeq,
+        confidence: Confidence,
+        judge: &str,
+    ) -> Self {
+        Self {
+            state,
+            reason,
+            based_on_seq,
+            confidence,
+            judge: judge.to_string(),
+            ambiguity: None,
+            rules_state: None,
+            probabilities: None,
+            needs_human: None,
+            stuck: None,
+            latency_ms: None,
+            attention: false,
+            evidence: None,
+        }
+    }
 }
