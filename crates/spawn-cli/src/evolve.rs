@@ -85,12 +85,39 @@ pub(crate) struct Metric {
     pub(crate) candidate: Option<f64>,
 }
 
-/// Every metric line in a gate log. The gate prefixes scenario output with
-/// `| `; both forms are read. The last line per name wins, which is the
-/// candidate run.
+/// The candidate's metric from a gate log.
+///
+/// Scenario output is written by candidate code, so a `METRIC` line in it
+/// proves nothing: a regression scenario could print a better number after the
+/// real one. The gate puts the candidate run's metric into its verdict, and
+/// that is what counts. Logs from before that change are read from the first
+/// candidate section only, which ends before any regression output.
 pub(crate) fn parse_metrics(log: &str) -> Vec<Metric> {
+    let verdict = log
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+    if let Some(verdict) = verdict {
+        return verdict
+            .get("metric")
+            .and_then(serde_json::Value::as_str)
+            .map(metric_lines)
+            .unwrap_or_default();
+    }
+    let section = log
+        .lines()
+        .skip_while(|line| !line.starts_with("| == candidate"))
+        .skip(1)
+        .take_while(|line| !line.starts_with("| =="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    metric_lines(&section)
+}
+
+fn metric_lines(text: &str) -> Vec<Metric> {
     let mut metrics: Vec<Metric> = Vec::new();
-    for line in log.lines() {
+    for line in text.lines() {
         let line = line.trim_start_matches('|').trim();
         let Some(rest) = line.strip_prefix("METRIC ") else {
             continue;
@@ -180,8 +207,29 @@ pub fn evolve(flags: &Flags) -> Result<i32, String> {
         return Ok(2);
     }
 
+    // A halt holds until a person clears it: a restarted controller must not
+    // start one more iteration first.
+    let halted = check_halt(&store)?;
+    if halted != 0 {
+        return Ok(halted);
+    }
+
     match store.rsi_open_iteration().map_err(describe_error)? {
-        None => start_iteration(&store, &root, &state, &backlog),
+        None => {
+            // Between iterations the git baseline and the stored one agree.
+            // If they do not, something outside the controller moved one.
+            let main = workspaces
+                .commit_id_of("refs/heads/main")
+                .map_err(|error| error.to_string())?;
+            if main != state.baseline {
+                println!(
+                    "evolve: HALT: main is {main} but the recorded baseline is {}",
+                    state.baseline
+                );
+                return Ok(2);
+            }
+            start_iteration(&store, &root, &state, &backlog)
+        }
         Some(iteration) => {
             advance_iteration(
                 &store,
@@ -379,10 +427,12 @@ fn advance_iteration(
     iteration: &spawn_postgres::RsiIteration,
 ) -> Result<(), String> {
     // An iteration that runs past its budget is aborted before the next
-    // transition. Without this, one hung agent stops the loop forever.
-    if let Some(budget) = store
-        .rsi_iteration_budget(iteration.iteration)
-        .map_err(describe_error)?
+    // transition. Without this, one hung agent stops the loop forever. An
+    // accepted one is only landing, and `main` may already have moved.
+    if iteration.phase != "Accepted"
+        && let Some(budget) = store
+            .rsi_iteration_budget(iteration.iteration)
+            .map_err(describe_error)?
     {
         if let Some(elapsed) = budget.elapsed_ms {
             let millis = u64::try_from(elapsed).unwrap_or(0);
@@ -413,6 +463,25 @@ fn advance_iteration(
                 iteration,
                 candidate,
                 iteration.patch.as_deref().unwrap_or(""),
+            )
+        }
+        "Accepted" => {
+            // The gate accepted and the controller stopped before landing.
+            // Landing again is idempotent; the gate is not run twice.
+            let (Some(candidate), Some(log)) = (
+                iteration.candidate.as_deref(),
+                iteration.verdict_log.as_deref(),
+            ) else {
+                return abort_iteration(store, iteration, "Accepted iteration lost its verdict");
+            };
+            land(
+                store,
+                workspaces,
+                state,
+                iteration,
+                candidate,
+                iteration.patch.as_deref().unwrap_or(""),
+                log,
             )
         }
         _ => Ok(()),
@@ -545,6 +614,34 @@ fn settle_gating(
     if !verdict.accepted {
         return reject_iteration(store, iteration, patch, &verdict.reason);
     }
+    // The verdict is stored before git moves, so a crash after the git step
+    // finishes the landing on the next call instead of judging again.
+    store
+        .rsi_accept(iteration.iteration, &verdict.output)
+        .map_err(describe_error)?;
+    land(
+        store,
+        workspaces,
+        state,
+        iteration,
+        candidate,
+        patch,
+        &verdict.output,
+    )
+}
+
+/// Move `main`, then the stored baseline, the phase and the attempt in one
+/// transaction. Both steps are idempotent, so a crash between them is
+/// finished by the next call.
+fn land(
+    store: &PostgresStore,
+    workspaces: &GitWorkspace,
+    state: &spawn_postgres::RsiState,
+    iteration: &spawn_postgres::RsiIteration,
+    candidate: &str,
+    patch: &str,
+    log: &str,
+) -> Result<(), String> {
     let advanced = workspaces
         .advance_base(&state.baseline, candidate)
         .map_err(|error| error.to_string())?;
@@ -556,10 +653,26 @@ fn settle_gating(
             "baseline moved during the iteration",
         );
     }
-    store
-        .rsi_advance_baseline(iteration.iteration, &state.baseline, candidate)
+    let landed = store
+        .rsi_land(
+            iteration.iteration,
+            iteration.task_id,
+            &state.baseline,
+            candidate,
+            if patch.is_empty() {
+                iteration.patch.as_deref().unwrap_or("")
+            } else {
+                patch
+            },
+            log,
+        )
         .map_err(describe_error)?;
-    record_attempt(store, iteration, patch, &verdict.output, true)?;
+    if !landed {
+        return Err(format!(
+            "main is {candidate} but the stored baseline moved off {}",
+            state.baseline
+        ));
+    }
     println!(
         "evolve: iteration {} landed {candidate}",
         iteration.iteration
@@ -689,12 +802,23 @@ fn judge_candidate(
         .arg(baseline)
         .arg(candidate)
         .arg(&scenario);
-    let output = run_bounded(command, GATE_WALL_CLOCK)?;
-    let line = output
+    let (stdout, stderr) = run_bounded(command, GATE_WALL_CLOCK)?;
+    // The verdict is the gate's last line on stdout, nothing else: scenario
+    // output reaches stdout only through the gate's `| ` prefix, and stderr
+    // is open to whatever the candidate's processes print.
+    let line = stdout
         .lines()
         .rev()
-        .find(|line| line.trim_start().starts_with('{'))
+        .find(|line| !line.trim().is_empty())
+        .filter(|line| line.starts_with('{'))
         .ok_or_else(|| GateFailure::Failed("gate produced no verdict".to_string()))?;
+    // The record keeps stderr, marked `! ` so no line of it can pass for a
+    // verdict or a section header, and the verdict stays last.
+    let mut output = stdout[..stdout.rfind(line).unwrap_or(stdout.len())].to_string();
+    for text in stderr.lines() {
+        let _ = writeln!(output, "! {text}");
+    }
+    let _ = writeln!(output, "{line}");
     let verdict: serde_json::Value = serde_json::from_str(line)
         .map_err(|error| GateFailure::Failed(format!("gate verdict: {error}")))?;
     Ok(GateVerdict {
@@ -708,39 +832,72 @@ fn judge_candidate(
     })
 }
 
-/// Run a command with a wall clock, returning its combined output.
+/// Run a command with a wall clock, returning its stdout and stderr.
 ///
 /// The child writes to files, not to pipes: a pipe that fills up would block
-/// the child while this loop waits for it to exit.
-fn run_bounded(mut command: Command, limit: Duration) -> Result<String, GateFailure> {
+/// the child while this loop waits for it to exit. The files live in a new
+/// private directory per run. The child leads its own process group, and the
+/// whole group is killed when the gate ends or times out, so nothing the
+/// candidate started outlives the verdict.
+///
+/// ponytail: same-uid code can still reach the files through /proc; the real
+/// boundary is running the gate in a container.
+fn run_bounded(mut command: Command, limit: Duration) -> Result<(String, String), GateFailure> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::process::CommandExt as _;
+
     let failed = |error: std::io::Error| GateFailure::Failed(error.to_string());
-    let directory = std::env::temp_dir().join(format!("spawn-gate-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).map_err(failed)?;
-    let out_path = directory.join("stdout");
-    let err_path = directory.join("stderr");
-    let stdout = std::fs::File::create(&out_path).map_err(failed)?;
-    let stderr = std::fs::File::create(&err_path).map_err(failed)?;
-    let mut child = command
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let directory =
+        std::env::temp_dir().join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
         .map_err(failed)?;
-    let deadline = Instant::now() + limit;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GateFailure::Timeout);
+    let result = (|| {
+        let out_path = directory.join("stdout");
+        let err_path = directory.join("stderr");
+        let stdout = std::fs::File::create(&out_path).map_err(failed)?;
+        let stderr = std::fs::File::create(&err_path).map_err(failed)?;
+        let mut child = command
+            .stdout(stdout)
+            .stderr(stderr)
+            .process_group(0)
+            .spawn()
+            .map_err(failed)?;
+        let group = child.id();
+        let kill_group = || {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{group}")])
+                .stderr(std::process::Stdio::null())
+                .status();
+        };
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    kill_group();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(GateFailure::Timeout);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Err(error) => {
+                    kill_group();
+                    return Err(failed(error));
+                }
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-            Err(error) => return Err(failed(error)),
         }
-    }
-    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-    Ok(format!("{stdout}{stderr}"))
+        kill_group();
+        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+        Ok((stdout, stderr))
+    })();
+    let _ = std::fs::remove_dir_all(&directory);
+    result
 }
 
 /// Scenario files in the controller's checkout.
@@ -901,13 +1058,36 @@ mod tests {
     }
 
     #[test]
-    fn metric_lines_are_read_from_a_prefixed_gate_log() {
-        let log = "| == baseline\n| METRIC ingest_total_ns baseline=1544 candidate=1550\n\
-                   | == candidate\n| METRIC ingest_total_ns baseline=1540 candidate=1400\n\
-                   {\"verdict\":\"accepted\"}";
+    fn the_metric_comes_from_the_verdict() {
+        let log = "| == candidate: 002.sh must pass\n\
+                   | METRIC ingest_total_ns baseline=1540 candidate=1400\n\
+                   | == regression: 001.sh must still pass\n\
+                   | METRIC ingest_total_ns baseline=1540 candidate=1\n\
+                   {\"verdict\":\"accepted\",\"metric\":\"METRIC ingest_total_ns baseline=1540 candidate=1400\"}";
         let metrics = parse_metrics(log);
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].baseline, Some(1540.0));
+        assert_eq!(metrics[0].candidate, Some(1400.0));
+    }
+
+    #[test]
+    fn a_verdict_without_a_metric_has_none() {
+        let log = "| == candidate: 002.sh must pass\n\
+                   | METRIC ingest_total_ns baseline=1540 candidate=1\n\
+                   {\"verdict\":\"accepted\"}";
+        assert!(parse_metrics(log).is_empty());
+    }
+
+    #[test]
+    fn an_old_log_is_read_from_the_candidate_section_only() {
+        let log = "| == baseline: 002.sh must fail\n\
+                   | METRIC ingest_total_ns baseline=1544 candidate=1550\n\
+                   | == candidate: 002.sh must pass\n\
+                   | METRIC ingest_total_ns baseline=1540 candidate=1400\n\
+                   | == regression: 001.sh must still pass\n\
+                   | METRIC ingest_total_ns baseline=1540 candidate=1\n";
+        let metrics = parse_metrics(log);
+        assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].candidate, Some(1400.0));
     }
 
@@ -921,7 +1101,24 @@ mod tests {
 
     #[test]
     fn a_command_inside_its_deadline_returns_its_output() {
-        let output = run_bounded(shell("echo accepted"), Duration::from_secs(10)).expect("output");
-        assert!(output.contains("accepted"));
+        let (stdout, stderr) = run_bounded(
+            shell("echo accepted; echo forged >&2"),
+            Duration::from_secs(10),
+        )
+        .expect("output");
+        assert!(stdout.contains("accepted"));
+        assert!(!stdout.contains("forged"), "stderr stays out of stdout");
+        assert!(stderr.contains("forged"));
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_group() {
+        let marker = std::env::temp_dir().join(format!("spawn-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("(sleep 2; touch {}) & sleep 30", marker.display());
+        let killed = run_bounded(shell(&script), Duration::from_millis(300));
+        assert!(matches!(killed, Err(GateFailure::Timeout)));
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists(), "the background child died with the gate");
     }
 }

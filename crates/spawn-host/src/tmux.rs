@@ -20,6 +20,14 @@ use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{Launch, TerminalError, TerminalHost};
 use spawn_core::shell::shell_join;
 
+/// Variables kept out of the tmux server's environment.
+const SCRUBBED: [&str; 4] = [
+    "SPAWN_DATABASE_URL",
+    "SPAWN_TEST_DATABASE_URL",
+    "PGPASSWORD",
+    "TYPESAFE_API_KEY",
+];
+
 /// Builds the argv prefix that runs one command inside a workspace.
 pub type PrefixBuilder = dyn Fn(&WorkspaceId) -> Vec<String> + Send + Sync;
 
@@ -95,6 +103,13 @@ impl TmuxHost {
                 command
             }
         };
+        // The first command starts the tmux server, whose global environment
+        // every pane can read with `tmux show-environment -g`. The
+        // controller's own database login must not end up there; panes get
+        // their restricted login through `-e` instead.
+        for secret in SCRUBBED {
+            command.env_remove(secret);
+        }
         let output = command
             .output()
             .map_err(|error| TerminalError(format!("run {}: {error}", self.program)))?;

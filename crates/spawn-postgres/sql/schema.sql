@@ -126,7 +126,8 @@ declare
     v_seq bigint;
     v_id  bigint;
     v_at  bigint;
-    v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded';
+    -- Only the Observer's judgement is the projected state.
+    v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded' and p_source = 'observer';
 begin
     perform pg_advisory_xact_lock(1399957335);
 
@@ -721,6 +722,11 @@ create index if not exists rsi_iterations_phase on rsi_iterations (phase);
 -- iteration. `updated_at_ms` moves on every phase change, so it cannot.
 -- `scenario_count` is the floor the next round must not fall below.
 alter table rsi_iterations add column if not exists started_at_ms bigint not null default 0;
+
+-- The accepted gate output, stored before `main` moves, so a controller that
+-- stops between the git step and the database step lands without judging
+-- again.
+alter table rsi_iterations add column if not exists verdict_log text;
 alter table rsi_state add column if not exists scenario_count integer not null default 0;
 
 -- Aborts in a row toward the infrastructure halt. A candidate is never judged
@@ -788,6 +794,20 @@ insert into spawn_grants (principal, agent_id, scope) values
     ('spawn_supervisor', '*', 'read'),
     ('spawn_supervisor', 'agent_worker_*', 'all')
 on conflict (principal, agent_id) do nothing;
+
+-- `spawn serve` connects with this login. It reads every table and writes
+-- nothing, so the dashboard on the LAN cannot change the log, the queue or
+-- the RSI state even if it is tricked into running a query.
+do $$
+begin
+    if not exists (select 1 from pg_roles where rolname = 'spawn_reader') then
+        create role spawn_reader login password 'spawn_reader';
+    end if;
+    execute format('grant connect on database %I to spawn_reader', current_database());
+    execute format('grant usage on schema %I to spawn_reader', current_schema());
+    execute format('grant select on all tables in schema %I to spawn_reader', current_schema());
+end
+$$;
 
 -- `spawn_append` is now SECURITY DEFINER, so it must not resolve names
 -- through the caller's `search_path`.

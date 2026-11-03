@@ -189,6 +189,10 @@ pub struct Observation {
     /// The input the model judge saw, for audit and replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<serde_json::Value>,
+    /// Stable digest of that input. A restarted Observer does not ask the
+    /// model again about evidence it already judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 impl Observation {
@@ -214,6 +218,7 @@ impl Observation {
             latency_ms: None,
             attention: false,
             evidence: None,
+            fingerprint: None,
         }
     }
 }

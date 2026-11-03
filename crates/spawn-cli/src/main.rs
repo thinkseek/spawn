@@ -88,7 +88,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         return Err(
-            "usage: spawn <init-db|submit|tick|loop|evolve|serve|status|fleet|tail|hook|run|version>"
+            "usage: spawn <init-db|submit|tick|loop|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>"
                 .to_string(),
         );
     };
@@ -100,6 +100,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "loop" => cmd_loop(&Flags::parse(&rest)?),
         "serve" => serve::serve(&Flags::parse(&rest)?),
         "evolve" => evolve::evolve(&Flags::parse(&rest)?),
+        "rsi-loop" => cmd_rsi_loop(&Flags::parse(&rest)?),
         "status" => cmd_status(&Flags::parse(&rest)?),
         "fleet" => cmd_fleet(),
         "tail" => cmd_tail(&Flags::parse(&rest)?),
@@ -339,21 +340,38 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
                 }
             }
         }
-        match evolve::evolve(flags) {
-            Ok(2) => {
-                eprintln!("spawn loop: RSI halted after repeated rejections");
-                return Ok(2);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                failures = failures.saturating_add(1);
-                eprintln!("spawn loop: evolve: {error}");
-            }
-        }
         // ponytail: fixed backoff, cap at 30 intervals. A per-error-kind
         // schedule only matters once a failure class is slow to clear.
         let pause = interval.saturating_mul(failures.clamp(1, 30));
         std::thread::sleep(pause);
+    }
+}
+
+/// Run the RSI controller until it halts.
+///
+/// RSI is one workload of the fleet, not the fleet: it runs in its own
+/// process, so a 20-minute gate does not stall the Bridge, and its halt (exit
+/// 2, a decision for a human) stops only the RSI loop, never the supervisor.
+fn cmd_rsi_loop(flags: &Flags) -> Result<i32, String> {
+    let interval = std::time::Duration::from_millis(
+        env_value("SPAWN_LOOP_INTERVAL_MS")
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(2000),
+    );
+    let mut failures: u32 = 0;
+    loop {
+        match evolve::evolve(flags) {
+            Ok(2) => {
+                eprintln!("spawn rsi-loop: RSI halted; a person must clear it");
+                return Ok(2);
+            }
+            Ok(_) => failures = 0,
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                eprintln!("spawn rsi-loop: evolve: {error}");
+            }
+        }
+        std::thread::sleep(interval.saturating_mul(failures.clamp(1, 30)));
     }
 }
 

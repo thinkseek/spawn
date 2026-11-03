@@ -57,7 +57,7 @@ Print the latest observation for each session:
 spawn status
 ```
 
-Run `spawn tick` on a schedule (cron, systemd timer or a shell loop). Spawn has no daemon.
+Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `spawn loop` running: it ticks the Bridge and the Observer and keeps the supervisor alive. The RSI controller runs separately as `spawn rsi-loop` (see docs/rsi.md).
 
 ## Commands
 
