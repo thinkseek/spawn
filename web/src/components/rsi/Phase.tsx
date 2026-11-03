@@ -1,25 +1,95 @@
 import { useEffect, useState } from "react";
 
-const PHASE: Record<string, { dot: string; text: string }> = {
-  Starting: { dot: "bg-info animate-spawn-pulse", text: "text-info" },
-  Working: { dot: "bg-success animate-spawn-pulse", text: "text-success" },
-  Gating: { dot: "bg-warning animate-spawn-pulse", text: "text-warning" },
-  Landed: { dot: "bg-success", text: "text-success" },
-  Rejected: { dot: "bg-destructive", text: "text-destructive" },
-  Aborted: { dot: "bg-muted-foreground", text: "text-muted-foreground" },
+import { cx } from "../ui";
+
+export interface PhaseStyle {
+  /** Badge colors: tinted fill, text, inset ring. */
+  badge: string;
+  dot: string;
+  /** Solid fill for bars and steppers. */
+  bar: string;
+  text: string;
+  pulse: boolean;
+}
+
+const INFO: Omit<PhaseStyle, "pulse"> = {
+  badge: "bg-info/12 text-info ring-info/25",
+  dot: "bg-info",
+  bar: "bg-info",
+  text: "text-info",
 };
 
-const FALLBACK = { dot: "bg-faint-foreground", text: "text-faint-foreground" };
+const PHASE: Record<string, PhaseStyle> = {
+  Starting: { ...INFO, pulse: true },
+  Working: { ...INFO, pulse: true },
+  Gating: {
+    badge: "bg-warning/12 text-warning ring-warning/25",
+    dot: "bg-warning",
+    bar: "bg-warning",
+    text: "text-warning",
+    pulse: true,
+  },
+  Landed: {
+    badge: "bg-success/12 text-success ring-success/25",
+    dot: "bg-success",
+    bar: "bg-success",
+    text: "text-success",
+    pulse: false,
+  },
+  Rejected: {
+    badge: "bg-destructive/12 text-destructive ring-destructive/25",
+    dot: "bg-destructive",
+    bar: "bg-destructive",
+    text: "text-destructive",
+    pulse: false,
+  },
+  Aborted: {
+    badge: "bg-muted text-muted-foreground ring-surface-border",
+    dot: "bg-muted-foreground",
+    bar: "bg-muted-foreground",
+    text: "text-muted-foreground",
+    pulse: false,
+  },
+};
 
-export function PhaseBadge({ phase }: { phase: string }) {
-  const style = PHASE[phase] ?? FALLBACK;
+const FALLBACK: PhaseStyle = {
+  badge: "bg-muted text-faint-foreground ring-surface-border",
+  dot: "bg-faint-foreground",
+  bar: "bg-faint-foreground",
+  text: "text-faint-foreground",
+  pulse: false,
+};
+
+export function phaseStyle(phase: string): PhaseStyle {
+  return PHASE[phase] ?? FALLBACK;
+}
+
+export function PhaseBadge({
+  phase,
+  size = "sm",
+}: {
+  phase: string;
+  size?: "sm" | "md";
+}) {
+  const style = phaseStyle(phase);
   return (
     <span
-      className={`inline-flex shrink-0 items-center gap-1.5 rounded-sm border border-surface-border bg-surface px-1.5 py-0.5 text-micro font-medium ${style.text}`}
+      className={cx(
+        "inline-flex shrink-0 items-center rounded-md font-medium ring-1 ring-inset",
+        size === "md"
+          ? "h-7 gap-2 px-2.5 text-label"
+          : "h-5 gap-1.5 px-1.5 text-caption",
+        style.badge,
+      )}
     >
       <span
         aria-hidden="true"
-        className={`inline-block size-1.5 shrink-0 rounded-full ${style.dot}`}
+        className={cx(
+          "inline-block shrink-0 rounded-full",
+          size === "md" ? "size-2" : "size-1.5",
+          style.dot,
+          style.pulse && "animate-spawn-pulse",
+        )}
       />
       {phase}
     </span>
@@ -41,8 +111,13 @@ export function formatMetric(value: number | null, unit: string): string {
   if (value === null || !Number.isFinite(value)) return "—";
   const magnitude = Math.abs(value);
   const digits = magnitude >= 100 ? 0 : magnitude >= 10 ? 1 : 2;
-  const shown = value.toLocaleString(undefined, {
+  const shown = value.toLocaleString("en-US", {
     maximumFractionDigits: digits,
   });
   return unit ? `${shown} ${unit}` : shown;
+}
+
+/** Number part of a metric, without the unit. */
+export function formatNumber(value: number | null): string {
+  return formatMetric(value, "");
 }

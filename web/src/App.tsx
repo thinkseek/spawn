@@ -1,13 +1,14 @@
-import { WifiOff } from "lucide-react";
+import { PanelRight } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { fetchOverview, fetchSession, usePoll } from "./api";
 import type { SessionDetail } from "./api";
-import { DetailsRail } from "./components/DetailsRail";
-import { Sidebar } from "./components/Sidebar";
+import { DetailsRail, RailContent } from "./components/DetailsRail";
+import { MobileNav, Sidebar } from "./components/Sidebar";
 import { StateBadge } from "./components/StateDot";
 import { Timeline } from "./components/Timeline";
 import { RsiView } from "./components/rsi/RsiView";
+import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
 import { relativeTime } from "./format";
 import { RSI_SESSION } from "./rsi";
 
@@ -20,6 +21,7 @@ function viewFromHash(): View {
 export default function App() {
   const overview = usePoll("overview", fetchOverview);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [railOpen, setRailOpen] = useState(false);
   // The RSI view is the landing page; the hash keeps the view across reloads.
   const [view, setView] = useState<View>(viewFromHash);
 
@@ -67,15 +69,26 @@ export default function App() {
   const state = detail?.state ?? summary?.state ?? "unknown";
   const freshness = detail?.freshness ?? null;
   const error = overview.error ?? session.error;
+  const agentId = detail?.agent_id || summary?.agent_id || null;
   const sessionId = detail?.session_id ?? selectedId;
+  const rsi = overview.data?.rsi ?? null;
+  const observation = summary?.observation ?? null;
 
   return (
-    <div className="flex h-dvh w-full overflow-hidden bg-app-shell text-foreground">
+    <div className="flex h-dvh w-full flex-col overflow-hidden bg-app-shell text-label text-foreground md:flex-row">
+      <MobileNav
+        view={view}
+        onShowRsi={() => setView("rsi")}
+        onShowSessions={() => setView("sessions")}
+      />
       <Sidebar
         sessions={overview.data?.sessions ?? []}
         selectedId={view === "sessions" ? selectedId : null}
         view={view}
+        rsi={rsi}
+        error={overview.error}
         onShowRsi={() => setView("rsi")}
+        onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
           setSelectedId(id);
           setView("sessions");
@@ -90,34 +103,59 @@ export default function App() {
           }}
         />
       ) : (
-        <>
+        <div className="flex min-h-0 min-w-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col bg-page-canvas">
-            <header className="sticky top-0 z-10 shrink-0 border-b border-surface-border bg-page-canvas px-5 py-3">
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                <h1 className="min-w-0 truncate font-mono text-title-sm font-medium text-foreground">
-                  {sessionId ?? "No session selected"}
-                </h1>
-                <StateBadge state={state} />
-                <div className="ml-auto flex items-center gap-3">
-                  <span className="text-caption text-muted-foreground">
-                    {freshness ? `${freshness.event_count} events` : "0 events"}
-                    <span className="mx-1.5 text-faint-foreground">·</span>
-                    {freshness
-                      ? `last event ${relativeTime(freshness.last_event_at_ms)}`
-                      : "no events yet"}
-                  </span>
-                  {error && (
-                    <span
-                      title={error}
-                      className="inline-flex items-center gap-1 rounded-sm border border-destructive/30 bg-destructive/10 px-1.5 py-0.5 text-micro font-medium text-destructive"
-                    >
-                      <WifiOff size={11} />
-                      disconnected
+            <PageHeader
+              title={
+                <>
+                  <h1 className="min-w-0 truncate text-body font-semibold text-foreground">
+                    {agentId ?? sessionId ?? "No session selected"}
+                  </h1>
+                  {sessionId && agentId && (
+                    <span className="hidden truncate rounded bg-muted px-1.5 py-px font-mono text-micro text-muted-foreground sm:inline">
+                      {sessionId}
                     </span>
                   )}
-                </div>
+                  {sessionId && <StateBadge state={state} />}
+                </>
+              }
+            >
+              <span className="tnum hidden text-caption text-muted-foreground lg:inline">
+                {freshness ? `${freshness.event_count} events` : "0 events"}
+                <span className="mx-1.5 text-faint-foreground">·</span>
+                {freshness
+                  ? `last ${relativeTime(freshness.last_event_at_ms)}`
+                  : "no events yet"}
+              </span>
+              <LiveStatus error={error} label="" />
+              <Button
+                onClick={() => setRailOpen(true)}
+                className="lg:hidden"
+                title="Session details"
+              >
+                <PanelRight size={13} />
+                Details
+              </Button>
+            </PageHeader>
+
+            {(overview.data?.sessions.length ?? 0) > 1 && (
+              <div className="flex shrink-0 gap-1.5 overflow-x-auto border-b border-surface-border px-3 py-2 md:hidden">
+                {overview.data?.sessions.map((entry) => (
+                  <button
+                    key={entry.session_id}
+                    type="button"
+                    onClick={() => setSelectedId(entry.session_id)}
+                    className={`shrink-0 rounded-md px-2.5 py-1 text-caption ${
+                      entry.session_id === selectedId
+                        ? "bg-surface-selected text-foreground"
+                        : "text-muted-foreground"
+                    }`}
+                  >
+                    {entry.agent_id || entry.session_id}
+                  </button>
+                ))}
               </div>
-            </header>
+            )}
 
             {!selectedId ? (
               <Placeholder text="Waiting for a session." />
@@ -134,8 +172,32 @@ export default function App() {
             )}
           </main>
 
-          <DetailsRail rsi={overview.data?.rsi ?? null} detail={detail} />
-        </>
+          <DetailsRail
+            className="hidden lg:flex"
+            rsi={rsi}
+            detail={detail}
+            observation={observation}
+          />
+          {railOpen && (
+            <Drawer
+              width="max-w-sm"
+              onClose={() => setRailOpen(false)}
+              header={
+                <h2 className="text-title-sm font-semibold text-foreground">
+                  Session details
+                </h2>
+              }
+            >
+              <div className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-app-shell p-3">
+                <RailContent
+                  rsi={rsi}
+                  detail={detail}
+                  observation={observation}
+                />
+              </div>
+            </Drawer>
+          )}
+        </div>
       )}
     </div>
   );
