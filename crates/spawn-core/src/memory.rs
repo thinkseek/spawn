@@ -375,6 +375,23 @@ impl TerminalHost for MemoryStore {
         Ok(())
     }
 
+    fn send_keys(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+        keys: &[&str],
+    ) -> Result<(), TerminalError> {
+        let mut state = self.lock();
+        if !state.terminals.contains(terminal) {
+            return Err(TerminalError(format!("terminal {terminal} is gone")));
+        }
+        let pane = state.panes.entry(terminal.clone()).or_default();
+        for key in keys {
+            pane.push_str(if *key == "Enter" { "\n" } else { key });
+        }
+        Ok(())
+    }
+
     fn is_alive(
         &self,
         terminal: &TerminalName,

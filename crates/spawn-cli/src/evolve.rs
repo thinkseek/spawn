@@ -171,8 +171,8 @@ fn start_iteration(
 /// Channel into the loop's one long-lived session.
 ///
 /// A live execution takes typed input. A dead one resumes its native session,
-/// so the agent keeps the memory it accumulated. Only the first task starts a
-/// new session.
+/// so the agent keeps the memory it accumulated. A new session starts only for
+/// the first task, or when no execution ever bound a native session.
 fn next_action(store: &PostgresStore, prompt: String) -> Result<CommandAction, String> {
     let session = spawn_core::id::SessionId::new(spawn_postgres::RSI_SESSION)
         .map_err(|error| error.to_string())?;
@@ -186,6 +186,16 @@ fn next_action(store: &PostgresStore, prompt: String) -> Result<CommandAction, S
     };
     if latest.ended_at.is_none() {
         return Ok(CommandAction::Input { text: prompt });
+    }
+    // An execution that died before the engine reported its session leaves
+    // nothing to resume. Resuming would abort every later iteration the same
+    // way until the loop halts.
+    if !store.rsi_has_native_session().map_err(describe_error)? {
+        return Ok(CommandAction::Start {
+            engine: Engine::Claude,
+            prompt,
+            parent_session_id: None,
+        });
     }
     Ok(CommandAction::Resume {
         prompt: Some(prompt),

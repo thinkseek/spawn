@@ -121,6 +121,17 @@ impl<T: TerminalHost + ?Sized> TerminalHost for Timed<T> {
         })
     }
 
+    fn send_keys(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        keys: &[&str],
+    ) -> Result<(), TerminalError> {
+        time("tmux.send_keys", || {
+            self.0.send_keys(terminal, workspace, keys)
+        })
+    }
+
     fn is_alive(
         &self,
         terminal: &TerminalName,
