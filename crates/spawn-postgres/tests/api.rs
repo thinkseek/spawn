@@ -13,8 +13,14 @@ use std::time::Duration;
 use postgres::{Client, NoTls};
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
-use spawn_core::event::{Engine, EventKind, GlobalPosition, NewEvent, SessionSeq, Source};
-use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
+use spawn_core::event::{
+    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, GlobalPosition, NewEvent,
+    SessionSeq, Source,
+};
+use spawn_core::id::{
+    AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
+    TerminalName, WorkspaceId,
+};
 use spawn_core::observation::{Confidence, Observation, SemanticState};
 use spawn_core::port::{CommandQueue, EventLog};
 use spawn_postgres::PostgresStore;
@@ -252,6 +258,145 @@ fn views_answer_from_the_event_log() {
         .expect("agent_timeline answers");
     let names: Vec<String> = timeline.iter().map(|row| row.get(0)).collect();
     assert_eq!(names, vec!["observation.recorded", "turn.stopped"]);
+}
+
+fn lifecycle(execution: &ExecutionId, source: Source, key: &str, kind: EventKind) -> NewEvent {
+    NewEvent {
+        agent_id: agent(),
+        session_id: session(),
+        execution_id: Some(execution.clone()),
+        source,
+        source_event_id: Some(key.to_string()),
+        kind,
+    }
+}
+
+#[test]
+fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
+    let (store, schema) = store("executions");
+    let execution = ExecutionId::new("exec_1").expect("valid execution");
+    let ended = |cause| EventKind::ExecutionEnded {
+        cause,
+        exit_code: Some(0),
+    };
+    let row = |label: &str| {
+        let row = admin(&schema)
+            .query_one(
+                "select engine, ended_at_ms, cause, exit_reported from agent_executions",
+                &[],
+            )
+            .expect("one execution row");
+        let engine: Option<String> = row.get(0);
+        assert_eq!(engine.as_deref(), Some("claude"), "{label}");
+        let ended_at: Option<i64> = row.get(1);
+        let cause: Option<String> = row.get(2);
+        let reported: bool = row.get(3);
+        (ended_at.is_some(), cause, reported)
+    };
+
+    store
+        .append(lifecycle(
+            &execution,
+            Source::Bridge,
+            "exec_1:started",
+            EventKind::ExecutionStarted {
+                engine: Engine::Claude,
+                terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
+                workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
+                command_id: CommandId(1),
+            },
+        ))
+        .expect("append succeeds");
+    assert_eq!(row("started"), (false, None, false));
+
+    store
+        .append(lifecycle(
+            &execution,
+            Source::Claude,
+            "exec_1:exited",
+            ended(EndCause::Exited),
+        ))
+        .expect("append succeeds");
+    assert_eq!(
+        row("reported"),
+        (false, None, true),
+        "a runner report alone does not end the execution"
+    );
+
+    store
+        .append(lifecycle(
+            &execution,
+            Source::Bridge,
+            "exec_1:ended",
+            ended(EndCause::Exited),
+        ))
+        .expect("append succeeds");
+    assert_eq!(row("ended"), (true, Some("exited".to_string()), true));
+}
+
+#[test]
+fn artifact_and_relation_views_read_their_events() {
+    let (store, schema) = store("artifacts");
+    store
+        .append(message(EventKind::ArtifactCommitted {
+            reason: CheckpointReason::TurnStopped,
+            artifact: ArtifactRef {
+                project: "shop".to_string(),
+                branch: BranchName::new("b1").expect("valid branch"),
+                commit: CommitId::new("c1").expect("valid commit"),
+            },
+        }))
+        .expect("append succeeds");
+    store
+        .append(message(EventKind::SessionLinked {
+            parent_session_id: SessionId::new("session_parent").expect("valid session"),
+        }))
+        .expect("append succeeds");
+
+    let artifact = admin(&schema)
+        .query_one(
+            "select project, branch, commit_id, reason from agent_artifacts",
+            &[],
+        )
+        .expect("one artifact row");
+    let columns: Vec<Option<String>> = (0..4).map(|index| artifact.get(index)).collect();
+    let expected = ["shop", "b1", "c1", "turn_stopped"].map(|text| Some(text.to_string()));
+    assert_eq!(columns, expected);
+
+    let parent: Option<String> = admin(&schema)
+        .query_one("select parent_session_id from agent_relations", &[])
+        .expect("one relation row")
+        .get(0);
+    assert_eq!(parent.as_deref(), Some("session_parent"));
+}
+
+#[test]
+fn finish_reports_missing_stale_done_and_already() {
+    let (store, schema) = store("finish");
+    let principal = Principal::new("tester").expect("valid principal");
+    let id = store
+        .submit(&principal, &start(session(), "key_finish"))
+        .expect("submit succeeds");
+    let claimed = store
+        .claim("worker", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("one command is ready");
+    let command = i64::try_from(id.0).expect("small id");
+    let attempt = i32::try_from(claimed.attempt).expect("small attempt");
+    let mut client = admin(&schema);
+    let mut finish = |command: i64, attempt: i32| -> String {
+        client
+            .query_one(
+                "select spawn_finish($1, $2, true, null)",
+                &[&command, &attempt],
+            )
+            .expect("spawn_finish answers")
+            .get(0)
+    };
+    assert_eq!(finish(command + 1000, attempt), "missing");
+    assert_eq!(finish(command, attempt + 1), "stale");
+    assert_eq!(finish(command, attempt), "done");
+    assert_eq!(finish(command, attempt), "already");
 }
 
 #[test]

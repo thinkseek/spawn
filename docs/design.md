@@ -235,7 +235,7 @@ Observer 每次 tick：
 
 权限：视图对 public 可读；`spawn_events`、`spawn_commands`、`spawn_grants` 撤销 public 全部权限；四个写函数撤销 public 执行权。`spawn_gateway_insert` 固定 `search_path = <schema>, pg_temp`，调用方无法用临时表替换 `spawn_grants`。
 
-视图：`agent_state`（每会话最新 observation）、`agent_timeline`、`agent_tasks`、`agent_executions`、`agent_artifacts`、`agent_relations`、`agent_commands`。视图取代早期物化视图与 CDC 方案。
+视图：`agent_state`（每会话最新 observation）、`agent_timeline`、`agent_tasks`、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记 runner 已报告退出）、`agent_artifacts`、`agent_relations`、`agent_commands`。视图取代早期物化视图与 CDC 方案。
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
 
@@ -288,7 +288,7 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
 | `spawn-host` | LayerFS 三种退出码与全部 JSON 形态、tmux 精确名匹配、前缀注入与跨进程调用、真实 tmux 生命周期 |
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
-| `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图、授权拒绝、共享一致性套件 |
+| `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图（含执行结束口径、产物、关系）、`spawn_finish` 四态、授权拒绝、共享一致性套件 |
 
 共享一致性套件 |
 
