@@ -1,11 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 export type SessionState =
-  | "working"
-  | "waiting"
-  | "blocked"
-  | "completed"
-  | "unknown";
+  "working" | "waiting" | "blocked" | "completed" | "unknown";
 
 export interface Observation {
   state: string;
@@ -198,9 +194,7 @@ export function normalizeOverview(value: unknown): Overview {
           // The stated contract carries `state`; the current server derives it
           // from the observation. Accept both.
           state: state(session.state ?? observation?.state),
-          session_seq: number(
-            session.session_seq ?? observation?.based_on_seq,
-          ),
+          session_seq: number(session.session_seq ?? observation?.based_on_seq),
           recorded_at_ms: number(session.recorded_at_ms),
           observation,
         },
@@ -272,7 +266,8 @@ export function normalizeSession(value: unknown): SessionDetail {
       })
       .sort(
         (left, right) =>
-          left.session_seq - right.session_seq || left.event_id - right.event_id,
+          left.session_seq - right.session_seq ||
+          left.event_id - right.event_id,
       ),
   };
 }
@@ -314,13 +309,19 @@ export function usePoll<T>(
   const [error, setError] = useState<string | null>(null);
   const loadRef = useRef(load);
   loadRef.current = load;
+  const keyRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
     let controller: AbortController | null = null;
-    setData(null);
-    setError(null);
+    // A new key is a different resource: drop the old one. A new interval
+    // for the same key keeps what is on screen.
+    if (keyRef.current !== key) {
+      keyRef.current = key;
+      setData(null);
+      setError(null);
+    }
 
     const tick = async () => {
       if (inFlight) return;
