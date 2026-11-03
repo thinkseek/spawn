@@ -1,0 +1,16 @@
+//! Spawn domain: types, ports, event normalization, Agent Bridge and
+//! Observer logic. This crate performs no IO.
+
+pub mod bridge;
+pub mod command;
+pub mod contract;
+pub mod event;
+pub mod id;
+pub mod ingest;
+pub mod memory;
+pub mod observation;
+pub mod observe;
+pub mod port;
+pub mod screen;
+pub mod shell;
+pub mod time;

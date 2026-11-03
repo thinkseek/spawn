@@ -1,130 +1,330 @@
-//! Spawn command-line entry point.
+//! The `spawn` binary: assembles stores, host adapters and the Bridge.
 //!
-//! The binary only wires library ports. Business rules live in the library
-//! crates and are covered there through public API tests.
+//! Subcommands:
+//!
+//! - `init-db` installs the SQL schema.
+//! - `submit` writes one command to the queue.
+//! - `tick` runs one Bridge and Observer pass.
+//! - `status` prints the last observation per session.
+//! - `hook` ingests one Claude Code hook payload from standard input.
+//! - `run` starts the engine inside the terminal and forwards its exit code.
+//!
+//! Configuration is environment first, so a terminal started by the Bridge
+//! carries everything its hook and runner need.
 
-// Pedantic doc-bookkeeping lints: public items carry purposeful docs, but
-// mandatory Errors/Panics sections and identifier backticks add noise.
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::doc_markdown
-)]
-#![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
 
-use spawn_engine::{ClaudeHookInput, normalize_claude_hook};
-use spawn_judge_jev::{JevConfig, JevJudge};
-use spawn_observer::{HeuristicJudge, Observer};
-use spawn_projector::{InMemoryViewStore, Projector};
-use spawn_store::EventLog;
-use spawn_store_postgres::PostgresStore;
-use spawn_types::clock::SystemClock;
-use spawn_types::event::{EventSource, NewEvent};
-use spawn_types::identifiers::{AgentId, ExecutionId, SessionId};
-
-mod config;
-
-use config::EnvConfig;
+use spawn_core::bridge::{Bridge, BridgeConfig};
+use spawn_core::command::{CommandAction, Submission};
+use spawn_core::event::{GlobalPosition, NewEvent, Source};
+use spawn_core::id::{AgentId, ExecutionId, IdempotencyKey, Principal, SessionId};
+use spawn_core::ingest::{claude_hook, codex_line};
+use spawn_core::observe::{HeuristicJudge, Observer, StateJudge};
+use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
+use spawn_host::{LayerFsCli, TmuxHost};
+use spawn_jev::{JevConfig, JevJudge};
+use spawn_postgres::PostgresStore;
 
 fn main() {
-    let result = run();
-    if let Err(error) = result {
-        eprintln!("spawn: {error}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> Result<(), String> {
-    let command = std::env::args().nth(1).unwrap_or_default();
-    match command.as_str() {
-        "migrate" => cmd_migrate(),
-        "hook" => cmd_hook(),
-        "observe" => cmd_observe(),
-        "project" => cmd_project(),
-        other => Err(format!(
-            "unknown subcommand '{other}'; expected migrate|hook|observe|project"
-        )),
-    }
-}
-
-fn connect(config: &EnvConfig) -> Result<PostgresStore, String> {
-    PostgresStore::connect(&config.database_url, Arc::new(SystemClock))
-        .map_err(|error| error.to_string())
-}
-
-fn cmd_migrate() -> Result<(), String> {
-    let config = EnvConfig::from_env()?;
-    let _store = connect(&config)?;
-    println!("migrations applied");
-    Ok(())
-}
-
-fn cmd_hook() -> Result<(), String> {
-    let config = EnvConfig::from_env()?;
-    let mut body = String::new();
-    std::io::stdin()
-        .read_to_string(&mut body)
-        .map_err(|error| error.to_string())?;
-    let input: ClaudeHookInput =
-        serde_json::from_str(&body).map_err(|error| format!("invalid hook payload: {error}"))?;
-    let normalized = normalize_claude_hook(&input).map_err(|error| error.to_string())?;
-    let store = connect(&config)?;
-    let outcome = store
-        .append(NewEvent {
-            agent_id: AgentId::from_prefixed(config.require("SPAWN_AGENT_ID")?)
-                .map_err(|error| error.to_string())?,
-            session_id: SessionId::from_prefixed(config.require("SPAWN_SESSION_ID")?)
-                .map_err(|error| error.to_string())?,
-            execution_id: Some(
-                ExecutionId::from_prefixed(config.require("SPAWN_EXECUTION_ID")?)
-                    .map_err(|error| error.to_string())?,
-            ),
-            source: EventSource::ClaudeHooks,
-            source_event_id: normalized.source_event_id,
-            kind: normalized.kind,
-            artifact: None,
-            occurred_at: None,
-        })
-        .map_err(|error| error.to_string())?;
-    println!(
-        "{}",
-        serde_json::to_string(outcome.record()).map_err(|e| e.to_string())?
-    );
-    Ok(())
-}
-
-fn cmd_observe() -> Result<(), String> {
-    let config = EnvConfig::from_env()?;
-    let store = Arc::new(connect(&config)?);
-    let judge: Arc<dyn spawn_observer::StateJudge> = match std::env::var("SPAWN_DECISION_URL") {
-        Ok(url) if !url.is_empty() => Arc::new(JevJudge::new(JevConfig::new(url))),
-        _ => Arc::new(HeuristicJudge::new()),
-    };
-    // Observation heartbeat timeout: 60 seconds by design, not a minute-named value.
-    #[allow(clippy::duration_suboptimal_units)]
-    let mut observer = Observer::new(store, judge, Arc::new(SystemClock), Duration::from_secs(60));
-    loop {
-        let emitted = observer.tick().map_err(|error| error.to_string())?;
-        if !emitted.is_empty() {
-            println!("recorded {} observation(s)", emitted.len());
+    let code = match dispatch() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("spawn: {error}");
+            1
         }
-        std::thread::sleep(Duration::from_secs(1));
+    };
+    std::process::exit(code);
+}
+
+/// Parsed arguments.
+#[derive(Debug, Default)]
+struct Flags {
+    values: HashMap<String, String>,
+}
+
+impl Flags {
+    fn parse(arguments: &[String]) -> Result<Self, String> {
+        let mut flags = Self::default();
+        let mut rest = arguments.iter();
+        while let Some(word) = rest.next() {
+            let Some(name) = word.strip_prefix("--") else {
+                return Err(format!("unexpected argument {word}"));
+            };
+            let Some(next) = rest.next() else {
+                return Err(format!("--{name} needs a value"));
+            };
+            if next.starts_with("--") {
+                return Err(format!("--{name} needs a value, found {next}"));
+            }
+            flags.values.insert(name.to_string(), next.clone());
+        }
+        Ok(flags)
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.values.get(name).cloned()
+    }
+
+    fn required(&self, name: &str) -> Result<String, String> {
+        self.get(name)
+            .ok_or_else(|| format!("--{name} is required"))
     }
 }
 
-fn cmd_project() -> Result<(), String> {
-    let config = EnvConfig::from_env()?;
-    let store = Arc::new(connect(&config)?);
-    let views = Arc::new(InMemoryViewStore::new());
-    let projector = Projector::new(store, views.clone(), spawn_types::event::GlobalPosition(0));
-    loop {
-        let cursor = projector
-            .process_available()
-            .map_err(|error| error.to_string())?;
-        println!("projector at global position {}", cursor.0);
-        std::thread::sleep(Duration::from_secs(1));
+fn dispatch() -> Result<i32, String> {
+    let mut arguments = std::env::args().skip(1);
+    let Some(command) = arguments.next() else {
+        return Err("usage: spawn <init-db|submit|tick|status|hook|run>".to_string());
+    };
+    let rest: Vec<String> = arguments.collect();
+    match command.as_str() {
+        "init-db" => cmd_init_db(&Flags::parse(&rest)?),
+        "submit" => cmd_submit(&Flags::parse(&rest)?),
+        "tick" => cmd_tick(&Flags::parse(&rest)?),
+        "status" => cmd_status(&Flags::parse(&rest)?),
+        "hook" => cmd_hook(),
+        "run" => cmd_run(&rest),
+        other => Err(format!("unknown command {other}")),
     }
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn env_or(name: &str, fallback: &str) -> String {
+    env_value(name).unwrap_or_else(|| fallback.to_string())
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    env_value(name).ok_or_else(|| format!("{name} is not set"))
+}
+
+fn open_store() -> Result<PostgresStore, String> {
+    let url = required_env("SPAWN_DATABASE_URL")?;
+    PostgresStore::connect(&url).map_err(|error| error.to_string())
+}
+
+fn cmd_init_db(_flags: &Flags) -> Result<i32, String> {
+    let store = open_store()?;
+    store.migrate().map_err(|error| error.to_string())?;
+    println!("spawn: schema installed");
+    Ok(0)
+}
+
+fn cmd_submit(flags: &Flags) -> Result<i32, String> {
+    let store = open_store()?;
+    let principal = Principal::new(
+        flags
+            .get("principal")
+            .unwrap_or_else(|| "spawn".to_string()),
+    )
+    .map_err(|error| error.to_string())?;
+    let agent = AgentId::new(flags.required("agent")?).map_err(|error| error.to_string())?;
+    let session = SessionId::new(flags.required("session")?).map_err(|error| error.to_string())?;
+    let key = IdempotencyKey::new(flags.required("key")?).map_err(|error| error.to_string())?;
+    let action: CommandAction = serde_json::from_str(&flags.required("action")?)
+        .map_err(|error| format!("--action is not a command action: {error}"))?;
+    let submission = Submission {
+        agent_id: agent,
+        session_id: session,
+        idempotency_key: key,
+        action,
+    };
+    let id = store
+        .submit(&principal, &submission)
+        .map_err(|error| error.to_string())?;
+    println!("command={}", id.0);
+    Ok(0)
+}
+
+fn cmd_tick(flags: &Flags) -> Result<i32, String> {
+    let store = Arc::new(open_store()?);
+    let project = flags
+        .get("project")
+        .or_else(|| env_value("SPAWN_PROJECT"))
+        .ok_or_else(|| "--project or SPAWN_PROJECT is required".to_string())?;
+    let layerfs = env_or("SPAWN_LAYERFS_PROGRAM", "layerfs");
+    let tmux = env_or("SPAWN_TMUX_PROGRAM", "tmux");
+    let socket = env_value("SPAWN_TMUX_SOCKET");
+
+    let workspaces: Arc<dyn WorkspaceStore> = Arc::new(LayerFsCli::new(&layerfs, &project));
+    let terminals: Arc<dyn TerminalHost> = if env_value("SPAWN_TMUX_IN_WORKSPACE").is_some() {
+        let prefix = LayerFsCli::new(&layerfs, &project);
+        Arc::new(TmuxHost::in_workspaces(
+            &tmux,
+            Arc::new(move |workspace| prefix.exec_prefix(workspace)),
+            socket.clone(),
+        ))
+    } else {
+        Arc::new(TmuxHost::local(&tmux))
+    };
+
+    let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
+    config.spawn_program = env_or(
+        "SPAWN_PROGRAM",
+        &std::env::current_exe()
+            .map_or_else(|_| "spawn".to_string(), |path| path.display().to_string()),
+    );
+    config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
+    config.codex_program = env_or("SPAWN_CODEX_PROGRAM", "codex");
+
+    let log: Arc<dyn EventLog> = store.clone();
+    let queue: Arc<dyn CommandQueue> = store.clone();
+    let mut bridge = Bridge::new(Arc::clone(&log), queue, workspaces, terminals, config);
+    bridge.recover().map_err(|error| error.to_string())?;
+    let report = bridge.tick().map_err(|error| error.to_string())?;
+    for warning in &report.warnings {
+        eprintln!("spawn tick warning: {warning}");
+    }
+
+    let judge: Arc<dyn StateJudge> = match flags
+        .get("judge-url")
+        .or_else(|| env_value("SPAWN_JUDGE_URL"))
+    {
+        Some(url) => Arc::new(JevJudge::new(JevConfig::new(&url))),
+        None => Arc::new(HeuristicJudge),
+    };
+    let mut observer = Observer::new(log, judge);
+    observer.recover().map_err(|error| error.to_string())?;
+    let observations = observer.tick().map_err(|error| error.to_string())?;
+
+    println!(
+        "commands={} observations={} sessions={}",
+        report.commands,
+        observations,
+        bridge.session_count()
+    );
+    Ok(0)
+}
+
+fn cmd_status(flags: &Flags) -> Result<i32, String> {
+    let store = open_store()?;
+    let limit = flags
+        .get("limit")
+        .and_then(|text| text.parse::<usize>().ok())
+        .unwrap_or(1000);
+    let events = store
+        .read_global(GlobalPosition(0), limit)
+        .map_err(|error| error.to_string())?;
+    let mut last: HashMap<String, String> = HashMap::new();
+    for record in &events {
+        if record.event.kind.name() == "observation.recorded" {
+            let kind =
+                serde_json::to_string(&record.event.kind).unwrap_or_else(|_| "{}".to_string());
+            last.insert(record.event.session_id.to_string(), kind);
+        }
+    }
+    for (session, line) in last {
+        println!("{session}\t{line}");
+    }
+    Ok(0)
+}
+
+fn cmd_hook() -> Result<i32, String> {
+    let mut payload = String::new();
+    std::io::stdin()
+        .read_to_string(&mut payload)
+        .map_err(|error| format!("read hook payload: {error}"))?;
+    if payload.trim().is_empty() {
+        return Ok(0);
+    }
+    let store = open_store()?;
+    let agent = AgentId::new(required_env("SPAWN_AGENT_ID")?).map_err(|error| error.to_string())?;
+    let session =
+        SessionId::new(required_env("SPAWN_SESSION_ID")?).map_err(|error| error.to_string())?;
+    let execution = env_value("SPAWN_EXECUTION_ID")
+        .map(|text| ExecutionId::new(text).map_err(|error| error.to_string()))
+        .transpose()?;
+
+    let engine = env_or("SPAWN_ENGINE", "claude");
+    let normalized = if engine == "codex" {
+        codex_line(&payload)
+    } else {
+        claude_hook(&payload)
+    };
+    let normalized = match normalized {
+        Ok(Some(normalized)) => normalized,
+        Ok(None) => return Ok(0),
+        Err(error) => {
+            // A hook must never block the engine. The engine shows this line,
+            // so a lost event is visible instead of silent.
+            eprintln!("spawn hook: {error}");
+            return Ok(0);
+        }
+    };
+    let source = if engine == "codex" {
+        Source::Codex
+    } else {
+        Source::Claude
+    };
+    if let Err(error) = store.append(NewEvent {
+        agent_id: agent,
+        session_id: session,
+        execution_id: execution,
+        source,
+        source_event_id: normalized.source_event_id,
+        kind: normalized.kind,
+    }) {
+        eprintln!("spawn hook: {error}");
+    }
+    Ok(0)
+}
+
+fn cmd_run(rest: &[String]) -> Result<i32, String> {
+    let words: &[String] = match rest.split_first() {
+        Some((first, tail)) if first == "--" => tail,
+        Some(_) => rest,
+        None => return Err("run needs a program after --".to_string()),
+    };
+    let (program, arguments) = words
+        .split_first()
+        .ok_or_else(|| "run needs a program after --".to_string())?;
+
+    if env_or("SPAWN_ENGINE", "claude") != "codex" {
+        let status = Command::new(program)
+            .args(arguments)
+            .status()
+            .map_err(|error| format!("start {program}: {error}"))?;
+        return Ok(status.code().unwrap_or(1));
+    }
+
+    // Codex prints one JSON object per line. Read it, record what matters,
+    // and echo every line so the pane still shows the engine output.
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start {program}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "no stdout from the engine".to_string())?;
+    let store = open_store()?;
+    let agent = AgentId::new(required_env("SPAWN_AGENT_ID")?).map_err(|error| error.to_string())?;
+    let session =
+        SessionId::new(required_env("SPAWN_SESSION_ID")?).map_err(|error| error.to_string())?;
+    let execution = env_value("SPAWN_EXECUTION_ID")
+        .map(|text| ExecutionId::new(text).map_err(|error| error.to_string()))
+        .transpose()?;
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+        if let Ok(Some(normalized)) = codex_line(&line) {
+            let _ = store.append(NewEvent {
+                agent_id: agent.clone(),
+                session_id: session.clone(),
+                execution_id: execution.clone(),
+                source: Source::Codex,
+                source_event_id: normalized.source_event_id,
+                kind: normalized.kind,
+            });
+        }
+    }
+    let status = child.wait().map_err(|error| error.to_string())?;
+    Ok(status.code().unwrap_or(1))
 }

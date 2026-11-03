@@ -1,0 +1,546 @@
+//! Public API tests for spawn-core.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use spawn_core::bridge::{Bridge, BridgeConfig, claude_arguments};
+use spawn_core::command::{CommandAction, Outcome, Submission};
+use spawn_core::contract;
+use spawn_core::event::{EndCause, Engine, EventKind, NewEvent, SessionSeq, Source};
+use spawn_core::id::{
+    AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
+};
+use spawn_core::ingest::{claude_hook, codex_line};
+use spawn_core::memory::MemoryStore;
+use spawn_core::observation::SemanticState;
+use spawn_core::observe::{HeuristicJudge, Observer};
+use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
+use spawn_core::screen::{ScreenState, read_claude_screen};
+use spawn_core::time::{ManualClock, Timestamp};
+
+/// A ready pane: input box empty, status line below it.
+const READY: &str = "❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+/// A running turn: spinner above an input box that is still empty.
+const BUSY: &str = "✽ Effecting… (27m 12s · ↓ 92.3k tokens)\n❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+/// A finished turn from a real pane.
+const FINISHED: &str = "✻ Sautéed for 6s · done 11:27 PM · 5 shells still running\n❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+/// A failed hook printed by the engine at the tail.
+const HOOK_ERROR: &str = "⎿ UserPromptSubmit hook error\nFailed with non-blocking status code: /bin/sh: /Users/bytedance/.botmux/bin/botmux: No such file or directory\n❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+/// A permission dialog above the input box.
+const PERMISSION: &str = "Do you want to allow this tool call?\n❯ 1. Yes\n  2. No";
+
+fn store() -> Arc<MemoryStore> {
+    let clock: Arc<ManualClock> = Arc::new(ManualClock::new(Timestamp(1_000)));
+    Arc::new(MemoryStore::new("shop", clock))
+}
+
+fn agent() -> AgentId {
+    AgentId::new("agent_one").expect("valid agent")
+}
+
+fn session() -> SessionId {
+    SessionId::new("session_one").expect("valid session")
+}
+
+#[test]
+fn ids_reject_empty_and_long_labels() {
+    assert!(AgentId::new("").is_err());
+    assert!(AgentId::new("x".repeat(257)).is_err());
+    assert!(AgentId::new("agent_one").is_ok());
+    assert!(TerminalName::new("spawn-exec_1").is_ok());
+    let workspace = spawn_core::id::WorkspaceId::new("1:/workspaces/3").expect("valid workspace");
+    assert_eq!(workspace.sandbox(), "1");
+    assert_eq!(workspace.path(), "/workspaces/3");
+    assert!(spawn_core::id::WorkspaceId::new("1:workspaces/3").is_err());
+}
+
+#[test]
+fn events_round_trip_through_json() {
+    let kinds = [
+        EventKind::MessageReceived,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "tool_1".to_string(),
+        },
+        EventKind::CommandAccepted {
+            command_id: CommandId(7),
+        },
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+        },
+    ];
+    for kind in kinds {
+        let value = serde_json::to_value(&kind).expect("serialize");
+        assert!(value.get("name").is_some(), "kind carries a name tag");
+        let back: EventKind = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back, kind);
+        assert_eq!(back.name(), kind.name());
+    }
+    assert_eq!(Source::parse("claude"), Some(Source::Claude));
+    assert_eq!(Source::Gateway.as_str(), "gateway");
+    assert!(Source::parse("nope").is_none());
+    assert_eq!(Engine::parse("codex"), Some(Engine::Codex));
+}
+
+#[test]
+fn screen_reads_the_tail_not_the_history() {
+    assert_eq!(read_claude_screen(READY).state, ScreenState::Ready);
+    assert_eq!(read_claude_screen(BUSY).state, ScreenState::Busy);
+    assert_eq!(read_claude_screen(FINISHED).state, ScreenState::Ready);
+    assert_eq!(read_claude_screen(HOOK_ERROR).state, ScreenState::Error);
+    assert_eq!(
+        read_claude_screen(PERMISSION).state,
+        ScreenState::Permission
+    );
+    assert_eq!(read_claude_screen("❯ hello").state, ScreenState::Drafted);
+    assert_eq!(read_claude_screen("").state, ScreenState::Unknown);
+    assert_eq!(
+        read_claude_screen("no prompt here").state,
+        ScreenState::Unknown
+    );
+
+    // An empty input box does not mean that input is safe: a running turn
+    // also shows an empty box.
+    assert!(!read_claude_screen(BUSY).state.accepts_input());
+    assert!(read_claude_screen(READY).state.accepts_input());
+
+    // A stale spinner outside the tail window must not decide the state.
+    let mut history = String::from("✽ Effecting… (27m 12s)\n");
+    for line in 0..60 {
+        history.push_str("old output line ");
+        history.push_str(&line.to_string());
+        history.push('\n');
+    }
+    history.push_str(READY);
+    assert_eq!(read_claude_screen(&history).state, ScreenState::Ready);
+
+    // A tall pane pads the bottom with blank rows. The prompt sits near the
+    // top of that padding, so the window must ignore it.
+    let mut padded = String::from("Welcome to Claude Code\n\n");
+    padded.push_str(READY);
+    for _ in 0..60 {
+        padded.push('\n');
+    }
+    assert_eq!(read_claude_screen(&padded).state, ScreenState::Ready);
+
+    // ANSI escapes and control sequences are stripped before matching.
+    let ansi = "\u{1b}[2K\u{1b}[1m✽ Effecting…\u{1b}[0m\n\u{1b}[2K❯ \n  model line";
+    assert_eq!(read_claude_screen(ansi).state, ScreenState::Busy);
+    let ansi_ready = "\u{1b}[2K❯ \u{1b}[0m\n  model line";
+    assert_eq!(read_claude_screen(ansi_ready).state, ScreenState::Ready);
+}
+
+#[test]
+fn claude_arguments_carry_the_flag_and_absolute_hooks() {
+    let arguments = claude_arguments("/opt/spawn", Some("native-1"));
+    assert_eq!(arguments[0], "--ax-screen-reader");
+    assert_eq!(arguments[1], "--settings");
+    let settings = &arguments[2];
+    assert!(settings.contains("/opt/spawn"), "hook command is absolute");
+    assert!(settings.contains("UserPromptSubmit"));
+    assert_eq!(arguments[3], "--resume");
+    assert_eq!(arguments[4], "native-1");
+    assert!(!claude_arguments("/opt/spawn", None).contains(&"--resume".to_string()));
+}
+
+#[test]
+fn ingestion_ignores_unknown_engine_events() {
+    let payload = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"t1"}"#;
+    let normalized = claude_hook(payload)
+        .expect("valid payload")
+        .expect("known hook");
+    assert_eq!(normalized.source_event_id.as_deref(), Some("t1:started"));
+    assert_eq!(
+        normalized.kind,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "t1".to_string(),
+        }
+    );
+    assert!(
+        claude_hook(r#"{"hook_event_name":"PreCompact"}"#)
+            .expect("valid payload")
+            .is_none()
+    );
+    assert!(claude_hook("not json").is_err());
+
+    let line = r#"{"type":"item.started","item":{"id":"i1","type":"command_execution"}}"#;
+    assert!(codex_line(line).expect("valid line").is_some());
+    assert!(
+        codex_line(r#"{"type":"item.started","item":{"id":"i2","type":"message"}}"#)
+            .expect("valid line")
+            .is_none()
+    );
+    assert!(codex_line("  ").expect("blank line").is_none());
+}
+
+#[test]
+fn memory_backend_passes_the_contract() {
+    let store = store();
+    let concrete: &MemoryStore = store.as_ref();
+    contract::event_log("mem_evt", concrete);
+    contract::command_queue("mem_cmd", concrete, concrete);
+    contract::workspace_store("mem_ws", concrete);
+    contract::terminal("mem_tty", concrete);
+}
+
+fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
+    let principal = Principal::new("tester").expect("valid principal");
+    store
+        .submit(
+            &principal,
+            &Submission {
+                agent_id: agent(),
+                session_id: session(),
+                idempotency_key: IdempotencyKey::new("key_start").expect("valid key"),
+                action: CommandAction::Start {
+                    engine: Engine::Claude,
+                    prompt: prompt.to_string(),
+                    parent_session_id: None,
+                },
+            },
+        )
+        .expect("submit succeeds")
+}
+
+fn events(store: &MemoryStore) -> Vec<NewEvent> {
+    store
+        .read_global(spawn_core::event::GlobalPosition(0), 500)
+        .expect("read succeeds")
+        .into_iter()
+        .map(|record| record.event)
+        .collect()
+}
+
+fn names(store: &MemoryStore) -> Vec<&'static str> {
+    events(store)
+        .iter()
+        .map(|event| event.kind.name())
+        .collect()
+}
+
+#[test]
+fn bridge_starts_an_execution_and_types_the_prompt() {
+    let store = store();
+    let log: Arc<dyn EventLog> = store.clone();
+    let queue: Arc<dyn CommandQueue> = store.clone();
+    let workspaces: Arc<dyn WorkspaceStore> = store.clone();
+    let terminals: Arc<dyn TerminalHost> = store.clone();
+    let mut bridge = Bridge::new(
+        log,
+        queue,
+        workspaces,
+        terminals,
+        BridgeConfig::new("tester"),
+    );
+    let execution = ExecutionId::for_command(CommandId(1));
+    let terminal = TerminalName::for_execution(&execution);
+    store.set_pane(&terminal, READY);
+
+    submit_start(&store, "list the files");
+    let report = bridge.tick().expect("tick succeeds");
+    assert_eq!(report.commands, 1);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    assert_eq!(
+        names(&store),
+        vec![
+            "command.accepted",
+            "execution.started",
+            "screen.observed",
+            "command.finished",
+        ]
+    );
+    let pane = store.capture_tail(&terminal, 40).expect("pane exists");
+    assert!(
+        pane.contains("list the files"),
+        "prompt reached the pane: {pane}"
+    );
+    assert_eq!(bridge.session_count(), 1);
+}
+
+#[test]
+fn bridge_refuses_input_while_a_turn_runs() {
+    let store = store();
+    let log: Arc<dyn EventLog> = store.clone();
+    let queue: Arc<dyn CommandQueue> = store.clone();
+    let workspaces: Arc<dyn WorkspaceStore> = store.clone();
+    let terminals: Arc<dyn TerminalHost> = store.clone();
+    let mut bridge = Bridge::new(
+        log,
+        queue,
+        workspaces,
+        terminals,
+        BridgeConfig::new("tester"),
+    );
+
+    let execution = ExecutionId::for_command(CommandId(1));
+    let terminal = TerminalName::for_execution(&execution);
+    store.set_pane(&terminal, BUSY);
+
+    submit_start(&store, "first");
+    bridge.tick().expect("tick succeeds");
+    let last = events(&store).pop().expect("an event");
+    assert_eq!(last.kind.name(), "command.finished");
+    match last.kind {
+        EventKind::CommandFinished { succeeded, .. } => assert!(!succeeded),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn bridge_checkpoints_and_unmounts_on_stop() {
+    let store = store();
+    let log: Arc<dyn EventLog> = store.clone();
+    let queue: Arc<dyn CommandQueue> = store.clone();
+    let workspaces: Arc<dyn WorkspaceStore> = store.clone();
+    let terminals: Arc<dyn TerminalHost> = store.clone();
+    let mut bridge = Bridge::new(
+        log,
+        queue,
+        workspaces,
+        terminals,
+        BridgeConfig::new("tester"),
+    );
+
+    let execution = ExecutionId::for_command(CommandId(1));
+    let terminal = TerminalName::for_execution(&execution);
+    store.set_pane(&terminal, READY);
+    submit_start(&store, "change the readme");
+    bridge.tick().expect("tick succeeds");
+
+    let workspace = events(&store)
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ExecutionStarted { workspace, .. } => Some(workspace.clone()),
+            _ => None,
+        })
+        .expect("execution started");
+    store.mark_dirty(&workspace);
+
+    let principal = Principal::new("tester").expect("valid principal");
+    store
+        .submit(
+            &principal,
+            &Submission {
+                agent_id: agent(),
+                session_id: session(),
+                idempotency_key: IdempotencyKey::new("key_stop").expect("valid key"),
+                action: CommandAction::Stop,
+            },
+        )
+        .expect("submit succeeds");
+    bridge.tick().expect("tick succeeds");
+
+    assert!(
+        names(&store).contains(&"artifact.committed"),
+        "stop commits the workspace: {:?}",
+        names(&store)
+    );
+    assert!(
+        !store.is_alive(&terminal).expect("query succeeds"),
+        "terminal is gone"
+    );
+}
+
+#[test]
+fn bridge_resumes_the_stored_native_session() {
+    let store = store();
+    let log: Arc<dyn EventLog> = store.clone();
+    let queue: Arc<dyn CommandQueue> = store.clone();
+    let workspaces: Arc<dyn WorkspaceStore> = store.clone();
+    let terminals: Arc<dyn TerminalHost> = store.clone();
+    let mut bridge = Bridge::new(
+        log,
+        queue,
+        workspaces,
+        terminals,
+        BridgeConfig::new("tester"),
+    );
+
+    // A hook already recorded the native session.
+    store
+        .append(NewEvent {
+            agent_id: agent(),
+            session_id: session(),
+            execution_id: None,
+            source: Source::Claude,
+            source_event_id: None,
+            kind: EventKind::NativeSessionStarted {
+                engine: Engine::Claude,
+                native_session_id: "native-7".to_string(),
+                transcript_path: None,
+            },
+        })
+        .expect("append succeeds");
+
+    // A fresh store accepts this submission as command 1, so the execution
+    // and its terminal are known before the tick runs.
+    let execution = ExecutionId::for_command(CommandId(1));
+    store.set_pane(&TerminalName::for_execution(&execution), READY);
+    let execution_again = execution.clone();
+
+    let principal = Principal::new("tester").expect("valid principal");
+    store
+        .submit(
+            &principal,
+            &Submission {
+                agent_id: agent(),
+                session_id: session(),
+                idempotency_key: IdempotencyKey::new("key_resume").expect("valid key"),
+                action: CommandAction::Resume {
+                    prompt: Some("继续".to_string()),
+                },
+            },
+        )
+        .expect("submit succeeds");
+    bridge.tick().expect("tick succeeds");
+
+    let accepted = events(&store)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::CommandAccepted { command_id } => Some(command_id),
+            _ => None,
+        })
+        .expect("the command was accepted");
+    let started = events(&store)
+        .into_iter()
+        .find(|event| event.kind.name() == "execution.started")
+        .expect("resume started an execution");
+    assert_eq!(accepted, CommandId(1));
+    assert_eq!(started.execution_id, Some(execution_again.clone()));
+    let pane = store
+        .capture_tail(&TerminalName::for_execution(&execution), 40)
+        .expect("the resumed pane exists");
+    assert!(pane.contains("继续"), "the resume prompt reached the pane");
+}
+
+#[test]
+fn observer_writes_only_on_change() {
+    let store = store();
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log, Arc::new(HeuristicJudge));
+
+    store
+        .append(NewEvent {
+            agent_id: agent(),
+            session_id: session(),
+            execution_id: Some(ExecutionId::for_command(CommandId(1))),
+            source: Source::Bridge,
+            source_event_id: None,
+            kind: EventKind::ExecutionStarted {
+                engine: Engine::Claude,
+                terminal: TerminalName::new("spawn-exec_1").expect("valid"),
+                workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                command_id: CommandId(1),
+            },
+        })
+        .expect("append succeeds");
+    store
+        .append(NewEvent {
+            agent_id: agent(),
+            session_id: session(),
+            execution_id: None,
+            source: Source::Claude,
+            source_event_id: Some("t1:started".to_string()),
+            kind: EventKind::ToolStarted {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "t1".to_string(),
+            },
+        })
+        .expect("append succeeds");
+
+    assert_eq!(observer.tick().expect("tick succeeds"), 1);
+    let recorded = events(&store)
+        .into_iter()
+        .find(|event| event.kind.name() == "observation.recorded")
+        .expect("an observation exists");
+    match recorded.kind {
+        EventKind::ObservationRecorded { observation } => {
+            assert_eq!(observation.state, SemanticState::Working);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    assert_eq!(
+        observer.tick().expect("tick succeeds"),
+        0,
+        "no change, no write"
+    );
+
+    store
+        .append(NewEvent {
+            agent_id: agent(),
+            session_id: session(),
+            execution_id: None,
+            source: Source::Claude,
+            source_event_id: None,
+            kind: EventKind::TurnStopped {
+                input_tokens: None,
+                output_tokens: None,
+            },
+        })
+        .expect("append succeeds");
+    assert_eq!(observer.tick().expect("tick succeeds"), 1);
+    let last = events(&store).pop().expect("an event");
+    match last.kind {
+        EventKind::ObservationRecorded { observation } => {
+            assert_eq!(observation.state, SemanticState::Waiting);
+            assert!(observation.based_on_seq >= SessionSeq(1));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn lease_ttl_expires_and_takes_the_command_again() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = MemoryStore::new("shop", clock.clone());
+    let principal = Principal::new("tester").expect("valid principal");
+    let submission = Submission {
+        agent_id: agent(),
+        session_id: session(),
+        idempotency_key: IdempotencyKey::new("key_1").expect("valid key"),
+        action: CommandAction::Start {
+            engine: Engine::Claude,
+            prompt: "x".to_string(),
+            parent_session_id: None,
+        },
+    };
+    let id = store
+        .submit(&principal, &submission)
+        .expect("submit succeeds");
+
+    let first = store
+        .claim("w1", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("ready");
+    assert_eq!(first.command_id, id);
+    assert_eq!(first.attempt, 1);
+    assert!(
+        store
+            .claim("w2", Duration::from_mins(1))
+            .expect("claim succeeds")
+            .is_none(),
+        "a live lease blocks a second worker"
+    );
+
+    clock.advance(Duration::from_secs(61));
+    let second = store
+        .claim("w2", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("the expired lease is taken again");
+    assert_eq!(second.attempt, 2);
+    assert!(
+        store.finish(&first, &Outcome::Succeeded).is_err(),
+        "the old attempt must not finish the command"
+    );
+    store
+        .finish(&second, &Outcome::Succeeded)
+        .expect("the current attempt finishes");
+}
