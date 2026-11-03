@@ -199,10 +199,12 @@ fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     );
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.codex_program = env_or("SPAWN_CODEX_PROGRAM", "codex");
-    // The hook and the runner inside the terminal write to the same log.
+    // The hook and the runner inside the terminal write to the same log, but
+    // the agent reads their environment. The pane therefore carries the
+    // restricted login, which can only append engine events.
     config.environment.push((
         "SPAWN_DATABASE_URL".to_string(),
-        required_env("SPAWN_DATABASE_URL")?,
+        spawn_postgres::terminal_url(&required_env("SPAWN_DATABASE_URL")?),
     ));
 
     let mut log: Arc<dyn EventLog> = store.clone();

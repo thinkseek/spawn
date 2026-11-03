@@ -94,6 +94,21 @@ impl PostgresStore {
     }
 }
 
+/// URL a terminal uses: the controller's URL with the restricted login.
+///
+/// The agent runs inside the terminal and reads its environment. Handing it
+/// the controller URL would let a candidate write `rsi_state` and advance its
+/// own baseline past the gate, so the pane gets the login that can only
+/// append engine events.
+#[must_use]
+pub fn terminal_url(controller: &str) -> String {
+    let Some((scheme, rest)) = controller.split_once("://") else {
+        return controller.to_string();
+    };
+    let host = rest.split_once('@').map_or(rest, |(_, tail)| tail);
+    format!("{scheme}://spawn_terminal:spawn_terminal@{host}")
+}
+
 fn record_from_row(row: &Row) -> Result<EventRecord, StoreError> {
     let kind_value: serde_json::Value = row.get("kind");
     let kind: EventKind = serde_json::from_value(kind_value)
