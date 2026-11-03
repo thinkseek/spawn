@@ -1,236 +1,301 @@
 # Spawn 技术方案与接口契约
 
-结论：Spawn 不实现 Agent 推理框架，只用 Rust 实现三类连接器——Agent Bridge、事件存储适配、SQL Projector/Gateway，并通过 trait 端口隔离 tmux、LayerFS CLI、PostgreSQL、决策模型四类外部进程。本文定义 ADT、trait 边界、不变量和验收口径。代码按本文实现；与 README 冲突时以 README 的模块职责为准。
+结论：Spawn 用 5 个 crate 连接现成组件。`spawn-core` 不碰 IO，只定义类型、端口与编排逻辑；实现层分别是 PostgreSQL、HTTP 判定、tmux 与 LayerFS 子进程；`spawn-cli` 做装配。全部代码同步阻塞。本文给出 crate 边界、ADT、端口契约、SQL 对象与验收口径，代码按本文实现。
 
-## 1. 范围与模块边界
+## 1. 模块边界
 
-五块能力对应十三个 crate。Compute 与 Observer 只依赖存储端口，互相不直接调用。
+| crate | 职责 | 不允许 |
+| --- | --- | --- |
+| `spawn-core` | ADT、端口、事件归一、Bridge、Observer、内存实现、一致性套件 | 文件、网络、进程 IO；依赖驱动 |
+| `spawn-postgres` | `EventLog` 与 `CommandQueue` 实现、`schema.sql` | 编排逻辑、投影规则 |
+| `spawn-jev` | 判定 HTTP 客户端 | 持有会话状态 |
+| `spawn-host` | tmux 与 `layerfs` CLI 适配 | 解释事件内容 |
+| `spawn-cli` | 子命令与配置装配 | 业务规则 |
 
-| 层 | crate | 职责 | 不允许做的事 |
-| --- | --- | --- | --- |
-| 领域 | `spawn-types` | 全部 ADT、校验、ID 生成、时钟端口 | 不出现 IO、不依赖运行时 |
-| 进程 | `spawn-process` | 子进程执行端口与系统实现 | 不含业务语义 |
-| 存储 | `spawn-store` | EventLog/CommandQueue 端口与内存实现 | 不解析引擎原生事件 |
-| 存储 | `spawn-store-postgres` | PostgreSQL 端口实现与迁移 | 不包含投影规则 |
-| 计算 | `spawn-engine` | Claude Hooks 与 Codex JSONL 归一化、启动参数 | 不直接写库、不起进程 |
-| 计算 | `spawn-layerfs` | ArtifactStore 端口与 layerfs CLI 适配 | 不依赖 tmux、不写事件 |
-| 计算 | `spawn-terminal` | TerminalHost 端口与 tmux 实现 | 不解释事件内容 |
-| 计算 | `spawn-bridge` | Session 映射、Checkpoint、恢复、命令消费编排 | 不实现推理循环 |
-| 观测 | `spawn-observer` | 1Hz 调度、快照折叠、状态判定端口、防递归 | 不直接调用具体模型 HTTP |
-| 观测 | `spawn-judge-jev` | System One `/v1/systemone` 客户端 | 不持有 Session 状态 |
-| 呈现 | `spawn-projector` | 事件到六个视图的纯折叠与游标 | 不接受消费者命令 |
-| 呈现 | `spawn-gateway` | 授权校验、幂等命令提交、状态订阅 | 不直接执行 Agent 操作 |
-| 装配 | `spawn-cli` | 子命令与配置装配 | 不放业务规则 |
-
-依赖方向固定为单向。`spawn-types` 是叶子。端口 trait 与实现分 crate，重依赖（PostgreSQL 驱动、HTTP/TLS）只出现在适配 crate，核心 crate 编译不等待它们。
+依赖单向：
 
 ```text
-spawn-types
-  ├─ spawn-process
-  ├─ spawn-store ── spawn-store-postgres
-  ├─ spawn-engine
-  ├─ spawn-layerfs
-  ├─ spawn-terminal
-  ├─ spawn-bridge ── engine, layerfs, terminal, store, process
-  ├─ spawn-observer ── spawn-judge-jev
-  ├─ spawn-projector
-  └─ spawn-gateway
-spawn-cli 只做装配，依赖全部端口与适配器
+spawn-core
+  ├─ spawn-postgres
+  ├─ spawn-jev
+  └─ spawn-host
+        ↑ 只有 spawn-cli 依赖全部实现层
 ```
 
-## 2. 统一身份与 ID 规则
+`spawn-core` 的 13 个模块：`bridge`、`command`、`contract`、`event`、`id`、`ingest`、`memory`、`observation`、`observe`、`port`、`screen`、`shell`、`time`。
 
-逻辑 Session 独立于任何原生 ID。映射不靠独立表维护，而由事件流重建：Bridge 每绑定一个原生对象就追加一条绑定事件，恢复时折叠事件得到当前映射。
+## 2. 身份与 ID
 
-| ADT | 文本形态 | 生成方 | 说明 |
-| --- | --- | --- | --- |
-| `AgentId` | `agent_<22>` | Bridge | 长期逻辑身份 |
-| `SessionId` | `session_<22>` | Bridge | 连续逻辑历史，跨引擎/终端存活 |
-| `ExecutionId` | `exec_<22>` | Bridge | 一次计算，绑定一个终端与工作区 |
-| `EventId` | `evt_<22>` | EventLog 写入侧 | 全局不可变事实标识 |
-| `CommandId` | `cmd_<22>` | Gateway | 消费者命令 |
-| `CommitId`/`BranchName`/`MountId`/`TerminalName` | 外部原文字符串 | LayerFS/tmux | 包装为 newtype，不假设格式 |
+事件流是映射的唯一来源。Bridge 每绑定一个原生对象就追加一条事件，恢复时折叠得到当前映射。
 
-`<22>` 由毫秒时间戳、进程标识、进程内原子计数器拼接后 base32 编码得到。`IdGenerator` 是 trait，测试注入固定生成器。所有 newtype 校验非空、长度上限 256 字节、不含控制字符；校验失败返回 `ValidationError`，不 panic。
-
-双序号口径：
-
-| 序号 | 作用域 | 分配者 | 用途 |
-| --- | --- | --- | --- |
-| `SessionSeq` | 单 Session 内单调，从 1 开始 | EventLog 写入事务 | 会话内因果与 Observer 游标 |
-| `GlobalPosition` | 全库单调 | EventLog 写入事务 | Projector/CDC 全量扫描，不依赖多系统时钟 |
-
-## 3. 事件协议（核心 ADT）
-
-### 3.1 信封
-
-`NewEvent` 由生产方构造，`EventRecord` 由 EventLog 在成功写入时返回。外部来源事件带 `source_event_id`，写入侧用 `(session_id, source, source_event_id)` 唯一约束去重；Bridge 重放同一 Hooks 输入不产生第二条事实。
-
-| 字段 | 类型 | 约束 |
+| ADT | 前缀 | 说明 |
 | --- | --- | --- |
-| `event_id` | `EventId` | 写入侧分配 |
-| `agent_id`/`session_id`/`execution_id` | newtype | execution 允许空，表示 Session 级事件 |
-| `session_seq`/`global_position` | `u64` | 写入侧分配 |
-| `source` | `EventSource` | `ClaudeHooks`/`CodexStream`/`LayerFs`/`Bridge`/`Observer`/`Gateway`/`Runtime` |
-| `source_event_id` | `Option<String>` | 外部去重键 |
-| `kind` | `EventKind` | 见 3.2 |
-| `artifact` | `Option<ArtifactRef>` | 文件类事件必填 |
-| `occurred_at` | `Timestamp` | 毫秒 UTC；写入侧用注入 Clock 补全 |
+| `AgentId` | `agent_` | 长期逻辑身份 |
+| `SessionId` | `session_` | 连续历史，跨引擎与终端存活 |
+| `ExecutionId` | `exec_` | 一次计算，绑定一个终端与工作区 |
+| `TerminalName` | `spawn-` | tmux 会话名，由 `ExecutionId` 派生 |
+| `CommandId` | 数字 | 命令序号，PG 自增 |
+| `Principal`、`IdempotencyKey`、`BranchName`、`CommitId` | 无 | 外部原文包装 |
+| `WorkspaceId` | 无 | 必须形如 `<sandbox>:/<path>` |
 
-### 3.2 EventKind 与外部事件映射
+校验规则：
 
-事件名使用点分层级，序列化后与 README 的统一事件名一致。Claude 与 Codex 的原生事件只在 `spawn-engine` 内映射，其余 crate 只认识统一事件。
-
-| 统一 kind | Claude Hooks | Codex `exec --json` | 载荷要点 |
-| --- | --- | --- | --- |
-| `session.native_started` | `SessionStart` | `thread.started` | engine、native_session_id、transcript_path |
-| `message.received` | `UserPromptSubmit` | turn 前用户输入 | prompt 摘要/引用 |
-| `tool.started` | `PreToolUse` | `item.started` | tool_name、tool_use_id/item.id、参数引用 |
-| `tool.completed` | `PostToolUse` | `item.completed` 成功 | 工具调用关联 id、duration_ms |
-| `tool.failed` | `PostToolUseFailure` | `item.completed` 失败/`error` | 错误分类与原文 |
-| `turn.stopped` | `Stop` | `turn.completed` | usage 计数 |
-| `turn.failed` | `StopFailure` | `turn.failed` | 失败类型 |
-| `session.native_ended` | `SessionEnd` | 线程结束/进程退出 | end_reason |
-| `execution.started`/`execution.exited`/`execution.lost` | Bridge/Runtime 产生 | 同左 | 退出码或丢失原因 |
-| `artifact.committed` | Bridge 在 Checkpoint 后产生 | 同左 | ArtifactRef、CheckpointReason |
-| `command.accepted`/`command.claimed`/`command.finished` | Gateway/Queue 产生 | 同左 | 命令与租约 |
-| `observation.recorded` | Observer 产生 | 同左 | Observation |
-| `relation.linked` | Bridge 产生 | 同左 | parent_agent/parent_session |
-
-`Stop` 只表示模型本轮停止，不等价任务完成，语义完成只由 Observation 的 `COMPLETED` 表达。
-
-### 3.3 文件与事件的顺序和对账
-
-Checkpoint 顺序固定：先在 LayerFS 持久化 Commit 成功，再追加 `artifact.committed`，其 `source_event_id` 直接使用 CommitId。事件写入失败时重试插入；唯一约束保证同一 Commit 只记一次。LayerFS 返回 `NoChanges` 时不产生 Commit、不产生事件。未确认 Commit 持久化前，事件载荷不得声称已持久化。
-
-## 4. 存储端口
-
-### 4.1 EventLog
-
-```text
-append(NewEvent) -> AppendOutcome { Recorded(EventRecord) | Deduplicated(EventRecord) }
-read_session(session, since_seq, limit) -> Vec<EventRecord>
-read_global(since_position, limit) -> Vec<EventRecord>
-session_cursor() -> Vec<SessionCursor>
-```
-
-契约：`append` 是串行化的；内存实现用互斥锁，PostgreSQL 实现用单事务内更新会话序号表并插入事件，唯一索引兜底去重。读接口只返回已提交数据。
-
-### 4.2 CommandQueue 与租约
-
-| 方法 | 语义 |
+| 规则 | 实现 |
 | --- | --- |
-| `submit(CommandRecord)` | 幂等键唯一；重复提交返回既有命令 |
-| `claim(worker, now, ttl)` | 同一 Session 同时最多一条命令被领取；`SKIP LOCKED` 跳过他人租约 |
-| `renew(token, now, ttl)` | 租约持有者才能续租，fencing token 不匹配报错 |
-| `finish(token, outcome, now)` | 终态不可逆；过期租约可被其他 Worker 重新领取 |
+| 前缀与字符集 | `label!` 宏统一校验，`[A-Za-z0-9_-]` |
+| 工作区形态 | `check_workspace`：必须含 `:`，冒号前非空，路径以 `/` 开头 |
+| 无前缀类型 | 两参形式转调三参形式，传入 `|_raw| Ok(())` |
+| 失败处理 | 返回错误，不 panic |
 
-`LeaseToken` 含命令 id 与单调 attempt 序号，作为 fencing token。Worker 重启后只认当前 attempt，旧 attempt 的外部写回被拒绝，避免重复执行外部操作。
+时间统一 `bigint` 毫秒。`Timestamp(i64)` 提供 `plus` 与 `since`；`Clock` 是 trait，`SystemClock` 与 `ManualClock` 实现，测试注入固定时钟。
 
-## 5. Agent Bridge 行为
+## 3. 事件协议
 
-Bridge 只做四件事：启动恢复、事件采集、文件提交、身份映射。它持有三个端口引用：`EventLog`、`ArtifactStore`、`TerminalHost`。
+信封 `NewEvent { agent_id, session_id, execution_id, source, source_event_id, kind }`，写入返回 `EventRecord { position, session_seq, recorded_at, event }` 与 `Appended { record, inserted }`。
 
-| 操作 | 行为序列 |
-| --- | --- |
-| open_session | 确保 Branch 存在（已存在视为成功）→ 追加 Session 打开与分支绑定 |
-| start_execution | 创建/复用 Sandbox → mount 工作区 → 按 Engine 构造启动参数 → tmux 启动 → 追加 execution.started 与终端绑定 |
-| ingest_native | engine crate 归一化 → 追加统一事件；工具结束事件触发 Checkpoint 评估 |
-| checkpoint | 工作区有改动才 commit → 成功后追加 artifact.committed；NoChanges 为空操作 |
-| finish_turn | turn.stopped 后做最终 Checkpoint |
-| recover | 折叠事件取最新 Commit 与原生 session id → 重新 mount → 优先原生 resume，失败则新开原生会话并加载上下文 → 创建新 Execution，逻辑 Session 不变 |
+`Source`：Claude、Codex、Bridge、Layerfs、Observer、Gateway。
 
-Checkpoint 触发规则：文件类工具成功结束、一轮结束、长任务定时巡检发现脏工作区。Bridge 不解析模型决策，不注入推理提示。
-
-## 6. ArtifactStore 与外部进程端口
-
-LayerFS 只发布 JavaScript SDK 与 `layerfs` 命令，因此 Rust 侧以子进程边界接入，不引入 Node 依赖。成功时 stdout 输出裸 JSON 对象；结构化拒绝走退出码 125 并携带 `{code,message,detail}`。适配层把协议错误映射为 `ArtifactError::Refused{code,message,detail}`，进程级错误映射为 `ArtifactError::Unavailable`。无更改提交的拒绝码为 `NoCommit`，适配层映射为 `CommitOutcome::NoChanges`；合并冲突拒绝码为 `Conflict`，冲突路径取自 `detail.conflicts`。
-
-| 端口方法 | 对应 layerfs 调用 | 关键结果判定 |
+| 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |
-| `ensure_branch` | `branch fork` | `Forked` 或 `NameTaken` 均为成功 |
-| `create_sandbox` | `sandbox create` | 返回 sandbox 编号 |
-| `mount` | `workspace mount` | `{sandbox,path,image}` → MountId |
-| `commit` | `workspace commit` | `Committed` 取 commit.id；`NoChanges` 为空 |
-| `unmount` | `workspace unmount` | 支持 discard |
-| `list_commits` | `branch list_commits` | 分页 items/hasMore |
-| `merge` | `branch merge` | `Merged` 或结构化 `Conflict` |
+| `session.native_started` | hook、Codex | engine、native_session_id、transcript_path |
+| `session.native_ended` | hook、Codex | reason |
+| `session.linked` | Bridge | parent_session_id |
+| `message.received` | hook | 无 |
+| `notification.received` | hook | notification_type |
+| `tool.started` | hook、Codex | tool_name、tool_use_id |
+| `tool.completed` | hook、Codex | tool_use_id、duration_ms |
+| `tool.failed` | hook、Codex | tool_use_id、error |
+| `turn.stopped` | hook、Codex | input_tokens、output_tokens |
+| `turn.failed` | hook、Codex | error |
+| `execution.started` | Bridge | engine、terminal、workspace、command_id |
+| `execution.ended` | Bridge | cause、exit_code |
+| `artifact.committed` | Bridge | reason、artifact |
+| `command.accepted` | Gateway 事务 | command_id |
+| `command.finished` | Worker | command_id、succeeded、error |
+| `screen.observed` | Bridge | state、evidence |
+| `observation.recorded` | Observer | observation |
 
-`spawn-process` 定义 `CommandLine` 与 `ProcessRunner`，测试用脚本假机替换可执行文件，验证参数顺序、stdout JSON 解析与退出码映射，不依赖真实 LayerFS。
+`turn.stopped` 只表示模型本轮停止，不等于任务完成。任务完成只由 `SemanticState::Completed` 表达。
 
-TerminalHost 端口方法：`start(LaunchSpec)`、`send_keys`、`capture_pane`、`is_alive`、`terminate`。tmux 实现只通过 `tmux` 命令操作；在 Sandbox 内运行时由 `LaunchSpec.prefix` 注入容器 exec 前缀，端口本身不感知容器。
+去重：`(session_id, source, source_event_id)` 唯一。Bridge 重放同一 hook 载荷返回既有记录，`inserted = false`。
 
-## 7. Observer 与状态判定
+## 4. 端口契约
 
-执行事实与语义状态分离。进程退出、工具完成、心跳丢失是事实事件；WORKING/WAITING/BLOCKED/COMPLETED/UNKNOWN 是判定结果。
+`spawn-core::port` 定义四个 trait 与错误类型。
 
-| ADT | 取值 |
+| trait | 方法 | 语义 |
+| --- | --- | --- |
+| `EventLog` | `append` | 追加一条事件，去重返回既有记录 |
+| | `read_session(session, after, limit)` | `session_seq > after` 的会话事件 |
+| | `read_global(after, limit)` | `position > after` 的全部事件，位置可见性单调 |
+| `CommandQueue` | `submit(principal, submission)` | 幂等提交，同时写 `command.accepted` |
+| | `claim(worker, ttl)` | 领取最老且无活跃租约的会话首条命令 |
+| | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
+| `WorkspaceStore` | `ensure_branch`、`mount`、`commit`、`unmount` | LayerFS 的四个动作；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
+| `TerminalHost` | `start`、`submit_text`、`is_alive`、`capture_tail`、`terminate` | 终端生命周期与屏尾读取 |
+
+错误类型：
+
+| 类型 | 取值 |
 | --- | --- |
-| `SemanticState` | `Working`/`Waiting`/`Blocked`/`Completed`/`Unknown` |
-| `WaitReason` | `AwaitingUserPermission`/`AwaitingUserInput`/`IdleTurnStop`/`JudgeUnavailable`/`ObservationExpired`/`Other(String)` |
-| `Confidence` | `f64`，构造校验闭区间 `[0,1]` |
+| `StoreError` | `LeaseLost{command,attempt}`、`Rejected`、`Corrupt`、`Backend` |
+| `WorkspaceError` | `Refused{code,message}`、`Unavailable` |
+| `TerminalError` | 单字段消息 |
+
+并发规则：`append` 串行化；PG 实现用 `pg_advisory_xact_lock` 保证同库写入顺序，并用唯一索引兜底。
+
+## 5. Agent Bridge
+
+Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提交工作区。
+
+| 命令 | 行为 |
+| --- | --- |
+| `Start{engine,prompt,parent_session_id}` | 检查会话是否已有执行 → 开分支 → mount → 启动终端 → 写 `execution.started` → Claude 走屏尾等待投递 |
+| `Input{text}` | 屏尾非 Ready 直接拒绝，Ready 才 `send-keys` |
+| `Stop` | 先做一次 checkpoint，再终止终端 |
+| `Resume{prompt}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
+
+一次启动的参数由 `claude_arguments` 与 `codex_arguments` 生成：
+
+| 引擎 | 参数 |
+| --- | --- |
+| Claude | `--ax-screen-reader --settings <内联 JSON> [--resume <id>]` |
+| Codex | `exec --json [resume <id>] -- <prompt>` |
+
+`--settings` 注入七类 hook：`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop`、`SessionEnd`、`Notification`，命令统一是 `<spawn 绝对路径> hook`。钩子通过环境变量 `SPAWN_AGENT_ID`、`SPAWN_SESSION_ID`、`SPAWN_EXECUTION_ID`、`SPAWN_ENGINE` 定位会话。
+
+启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
+
+checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
+
+恢复：折叠会话事件得到最新原生会话 id 与最近 commit，重新 mount，优先 `--resume`。原生会话丢失时新开执行，逻辑 Session 不变。
+
+## 6. 屏尾判定
+
+Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。hooks 给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。
+
+| 常量 | 值 | 含义 |
+| --- | --- | --- |
+| `TAIL_LINES` | 40 | 判定窗口行数 |
+| `BODY_WINDOW` | 14 | 提示符上方正文窗口 |
+| `PROMPT` | `❯` | 输入提示符 |
+| spinner 集合 | `✻ ✽ ✳ ✢ ✶ ✷ ✸ ✹` | 运行中的旋转符 |
+| `FINISHED` | `· done` | 本轮结束标记 |
+
+`ScreenState`：`Ready`、`Drafted`、`Busy`、`Permission`、`Error`、`Unknown`。只有 `Ready` 允许输入。
+
+解析顺序：
+
+1. 去掉 ANSI 转义。
+2. 丢弃尾部空白行，再取最后 40 行。空屏底部留白不得挤掉真实文本。
+3. 取窗口内最低的 `❯` 行作为提示符行。
+4. 提示符行带选项编号判 `Permission`；提示符后为空判 `Ready`，有文本判 `Drafted`。
+5. 正文窗口内自下而上匹配权限行、运行中行、`esc to interrupt`、报错行。
+6. 都不匹配判 `Unknown`。
+
+严格尾匹配的含义：窗口外的旧 spinner、旧报错、旧提示符不参与判定。判定结果与决定它的原始行一起写入 `screen.observed`。
+
+## 7. Observer 与判定
+
+`Observation { state, reason, based_on_seq, confidence, judge }`。`SemanticState` 取值 `Working`、`Waiting`、`Blocked`、`Completed`、`Unknown`，序列化为 `SCREAMING_SNAKE_CASE`，`ALL` 数组即声明顺序。
+
+`JudgeInput` 字段：`agent_id`、`session_id`、`engine`、`execution_active`、`last_end`、`open_tools`、`last_tool`、`permission_pending`、`screen`、`turn`、`last_error`、`evidence_seq`。
 
 Observer 每次 tick：
 
-1. 读取每个活跃 Session 自上次游标后的增量，折叠出 `SessionSnapshot`（开放工具、最后活动时间、最后事实）。
-2. 增量为空也重新评估时间条件（心跳超时），但默认不重复写相同结论。
-3. 调 `StateJudge` 端口；判定错误或超时只产生 `Unknown + JudgeUnavailable`，不标记 Agent 死亡。
-4. 状态或原因变化、或首次判定时追加 `observation.recorded`，`based_on_seq` 记录判定依据。
-5. 读取增量时跳过 `source=Observer` 事件，Observation 不递归触发新 Observation。
+1. 从游标读取增量，折叠成会话快照。
+2. 调 `StateJudge`。
+3. 状态或原因变化才追加 `observation.recorded`，`based_on_seq` 记录依据。
+4. 跳过 `source = Observer` 的事件，避免自递归。
 
-判定端口两个实现：`HeuristicJudge`（纯规则，离线可用，也是测试基线）和 `JevJudge`（HTTP）。JevJudge 一次请求提交 choice/score/noul 三类问题，choice 枚举固定为五个 SemanticState，noul 用于判断是否阻塞，score 用于置信校准；端点、模型名、超时、可选 Bearer token 全部配置注入。System One 契约与 v100 自部署 StartLux 服务共用同一套请求响应结构。choice 的 `criteria` 必须序列化为 JSON 对象 `{选项键: 描述}`，选项键即五个状态枚举名；服务端把数组元素整体当作选项名，二元组数组会被字符串化成错误键，因此客户端用保序 map 编码，不能发 `[键, 描述]` 数组。响应 `answers.semantic_state.choice` 回传裸枚举键，客户端据此映射 `SemanticState`。
+判定实现：
 
-## 8. Projector 与 Gateway
-
-Projector 维护 GlobalPosition 游标，按批读取事件并纯折叠成六类视图行：`agent_state`、`agent_timeline`、`agent_tasks`、`agent_artifacts`、`agent_executions`、`agent_relations`。折叠函数无 IO、可重入：重启后从上一提交游标继续，幂等 upsert 不产生重复行。文件视图的 Commit 元数据只经 ArtifactStore 后端读取能力获取，不读取 LayerFS 私有 SQLite。
-
-Gateway 是唯一命令写入口：
-
-| 步骤 | 规则 |
+| 实现 | 用途 |
 | --- | --- |
-| 校验 | Principal 授权 + CommandAction 字段校验 + 载荷上限 |
-| 幂等 | 同一 Principal 的 IdempotencyKey 命中则返回原命令 |
-| 写入 | 校验通过才写命令表并追加 command.accepted |
-| 订阅 | 只读视图 + 版本号变化通知；订阅本身不产生事件 |
+| `HeuristicJudge` | 纯规则，离线可用，测试基线。`name()` 返回 `heuristic` |
+| `JevJudge` | HTTP，见第 8 节。`name()` 返回 `jev` |
 
-查询面同时暴露两条等价路径：Rust `ViewStore` 方法，以及 PostgreSQL 内只读 SQL 视图。Gateway 不实现 SQL 解析器，不接受任意 DDL/DML。
+判定错误只产生 `Unknown + JudgeUnavailable`，不标记 Agent 死亡。
 
-## 9. 编译耗时与磁盘策略
+## 8. Jev HTTP 契约
+
+请求 `POST <base>/v1/systemone`，请求体：
+
+```json
+{"state": <任意 JSON>, "questions": {"semantic_state": {"type": "choice", "instructions": "...", "criteria": {"WORKING": "...", ...}}}}
+```
+
+`criteria` 必须编码为保序对象，键是 `SemanticState::ALL` 的枚举名。服务端把数组元素整体当选项名，二元组数组会被字符串化成错误键。
+
+响应读取 `answers.semantic_state`：`choice` 缺失时回退概率最大项，此时 `confidence` 记为 `Confidence::ZERO`。
+
+| 情况 | 处理 |
+| --- | --- |
+| 空 `answers` | `JudgeError::Unavailable` |
+| 非 2xx 且带 body | 错误信息同时含状态码与 body |
+| 连接失败 | `Unavailable` |
+| `Transfer-Encoding: chunked` | 分块解码 |
+| base 尾部有斜杠 | 规范化后再拼接 |
+
+客户端由标准库 socket 手写 HTTP/1.1，不引入 HTTP 库。
+
+## 9. PostgreSQL schema
+
+表：
+
+| 表 | 关键列 |
+| --- | --- |
+| `spawn_events` | `id`、`agent_id`、`session_id`、`execution_id`、`source`、`source_event_id`、`kind`、`session_seq`、`recorded_at_ms`、生成列 `event_name` |
+| `spawn_commands` | `principal`、`idempotency_key`、`state`、`lease_until_ms`、`lease_attempt` |
+| `spawn_grants` | 授权 principal |
+
+函数：
+
+| 函数 | 返回 | 说明 |
+| --- | --- | --- |
+| `spawn_now_ms()` | `bigint` | 单一时间源 |
+| `spawn_append(...)` | `out_id`、`out_seq`、`out_at`、`out_inserted` | 事务内取序号并插入，`pg_advisory_xact_lock(1399957335)` 串行化 |
+| `spawn_submit(...)` | `out_id` | 幂等插入并写 `command.accepted` |
+| `spawn_claim(worker, ttl_ms)` | `out_id`、`out_attempt`、`out_agent`、`out_session`、`out_action` | `for update skip locked`，单会话串行，过期租约 attempt+1 |
+| `spawn_finish(command, attempt, succeeded, error)` | `done`、`already`、`stale`、`missing` | 旧 attempt 结束被拒 |
+
+视图：`agent_state`（每会话最新 observation）、`agent_timeline`、`agent_tasks`、`agent_executions`、`agent_artifacts`、`agent_relations`、`agent_commands`。视图取代早期物化视图与 CDC 方案。
+
+`agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
+
+## 10. tmux 与 LayerFS 契约
+
+tmux：
+
+| 调用 | 要点 |
+| --- | --- |
+| `new-session -d -s <name> -x 200 -y 50 [-e K=V] -- prog …` | 每次执行一个会话 |
+| `has-session`、`kill-session` | 会话 target：`=<name>` |
+| `send-keys`、`capture-pane` | pane target：`=<name>:.0`，裸 `=` 会被当作 pane 规格而报错 |
+| 重复会话 | stderr 为 `duplicate session: …`，适配层归一为 `already exists` |
+
+LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 成功，stdout 是裸 JSON |
+| 2 | 用法错误，未执行任何操作 |
+| 125 | 拒绝或失败，stderr 是 `{code,message,detail}` |
+
+| 调用 | 响应 | 映射 |
+| --- | --- | --- |
+| `sandbox create` | `{"sandbox":"9"}` | 沙箱编号 |
+| `workspace mount <sb> <branch>` | `{"ws":"9:/workspaces/9"}` | `WorkspaceId` |
+| `workspace commit … -m <msg>` | `{"commit":{"id":"c_9"}}` 或 `{"upToDate":true}` | `Created` 或 `Unchanged` |
+| 无变更 | `NoCommit` 拒绝码 | `Unchanged` |
+
+`exec_prefix` 为 `layerfs --project <p> workspace exec <ws> --stream --`，共 8 段；tmux 命令整体作为一段传入前缀程序。
+
+## 11. 编译与磁盘策略
 
 | 手段 | 配置 |
 | --- | --- |
-| 叶子拆分 | 纯 ADT crate 零重依赖；postgres/HTTP 隔离在独立 crate |
-| 依赖最小化 | 无 CLI 参数框架、无 async 运行时扩散、无时间/UUID 额外库；HTTP 仅 jev crate 使用 ureq+rustls |
-| 工具链 | `rust-toolchain.toml` 固定 1.95.0，digest 已预装，避免远程下载 |
-| 调试信息 | dev/test `debug = "line-tables-only"`，split debuginfo，链接更快体积更小 |
-| 编译缓存 | 远端门禁 `RUSTC_WRAPPER=kache`，关闭 incremental（wrapper 缓存不兼容 incremental 产物） |
-| 目标目录 | 远端固定 `CARGO_TARGET_DIR=/data00/home/chenkailun.c/spawn-target`，kache hardlink 复用，多轮 rsync 不重复占盘 |
-| 测试二进制 | 每 crate 单 tests 入口模块，减少重复链接 |
+| 依赖最小化 | 无 async 运行时、无 chrono/uuid/rand、无 HTTP 客户端库 |
+| 驱动隔离 | `postgres` 只在 `spawn-postgres`，HTTP 只在 `spawn-jev` |
+| 工具链 | edition 2024，`rust-version` 1.95 |
+| 调试信息 | dev `debug="line-tables-only"`、`split-debuginfo="packed"`；release `lto="thin"`、`codegen-units=1` |
+| 编译缓存 | 远端门禁 `RUSTC_WRAPPER=kache`，`CARGO_INCREMENTAL=0` |
+| 目标目录 | 远端固定 `CARGO_TARGET_DIR`，kache 复用，避免多轮 rsync 占盘 |
 
-## 10. 测试策略
+## 12. 测试策略
 
-只测公开 API：每个 crate 的断言全部位于 `tests/` 集成测试，库内不写 `#[cfg(test)]` 私有单测。测试只经公开 trait/函数/ADT 构造行为。
+只测公开 API：断言全部位于各 crate 的 `tests/api.rs`，库内不写 `#[cfg(test)]`。
 
-| crate | 公开行为覆盖 |
+| crate | 断言数 | 覆盖 |
+| --- | --- | --- |
+| `spawn-core` | 12 | ID 校验、事件往返、去重、双序号、租约过期、屏尾七态、Bridge 事件序与恢复 |
+| `spawn-host` | 16 | LayerFS 三种退出码与全部 JSON 形态、tmux 精确名匹配、前缀注入、真实 tmux 生命周期 |
+| `spawn-jev` | 9 | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
+| `spawn-postgres` | 10 | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图、授权拒绝、共享一致性套件 |
+
+共享一致性套件在 `spawn-core::contract`：`event_log`、`command_queue`、`workspace_store`、`terminal` 四个函数，任一实现都必须通过。
+
+门禁在 digest 执行：
+
+| 步骤 | 命令 |
 | --- | --- |
-| spawn-types | ID 校验、序列化往返、置信度/序号边界 |
-| spawn-store | 去重、双序号、租约领取/过期/fencing、重启语义 |
-| spawn-engine | 两类原生样例到统一事件的完整映射与未知事件拒绝 |
-| spawn-layerfs | 假 layerfs 可执行文件验证参数、JSON、退出码 125 映射 |
-| spawn-terminal | digest 真机 tmux 会话生命周期 |
-| spawn-bridge | 内存端口端到端：Checkpoint 顺序、NoChanges、恢复映射、重试对账 |
-| spawn-observer | 1Hz tick、状态变化才写入、防递归、超时 Unknown、游标恢复 |
-| spawn-judge-jev | 本地 HTTP 假机验证请求结构与三类响应解析、错误降级 |
-| spawn-projector | 六视图折叠、断点续跑幂等 |
-| spawn-gateway | 授权拒绝、幂等返回、命令生命周期 |
-| spawn-store-postgres | docker PostgreSQL：迁移、唯一去重、SKIP LOCKED 并发领取 |
+| 工具链 | `cargo --version`、`kache --version` |
+| 数据库 | 临时容器 `postgres:16-alpine`，注入 `SPAWN_TEST_DATABASE_URL` |
+| 格式 | `cargo fmt --all -- --check` |
+| 静态检查 | `cargo clippy --workspace --all-targets -- -D warnings` |
+| 测试 | `cargo test --workspace --no-fail-fast` |
+| 端到端 | `scripts/e2e-smoke.sh`：真 PG、真 tmux、假 LayerFS、假 Claude 屏，断言 `--ax-screen-reader`、前缀调用、提示落到屏、observation 入库 |
 
-PostgreSQL 测试由门禁脚本启动 `postgres:16-alpine` 并注入 `SPAWN_TEST_DATABASE_URL`；未注入环境时测试显式失败并打印指引，不允许静默 skip。门禁在 digest 执行，网络经代理，crate 下载走已配置的 rsproxy 镜像。
+缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 
-## 11. 待验证项
+## 13. 已知限制
 
-| 项 | 处置 |
+| 项 | 现状 |
 | --- | --- |
-| v100 StartLux 9B 在 V100(SM70) 上的引擎路线 | 已落地：llama.cpp SM70 构建 + Q8_0 GGUF（9.53GB），前端 `startlux_decide` 暴露 `/v1/systemone` 于 8090，`SPAWN_DECISION_URL` 填根地址；验收通过、中位延迟约 0.29s |
-| LayerFS 真实 Sandbox 与 FUSE 可用性 | 本期用协议假机保证适配逻辑；真机联调在 M1 阶段接入 |
-| Materialize SUBSCRIBE | V1 用 PG 视图 + 版本通知满足订阅语义，Materialize 作为后续 CDC 对接项 |
+| 视图读取 | Rust 侧无读视图 API，视图供 SQL 客户端使用；`spawn status` 读原始事件拼接 |
+| 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 |
+| 视图覆盖 | `agent_executions`、`agent_artifacts`、`agent_relations`、`agent_commands` 与 `spawn_finish` 四态暂无断言 |
+| 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 |
+| Bridge 借用 | 同会话 `remove`→`insert` 的借用规避免逻辑仅由两条 bridge 断言覆盖 |
+| LayerFS | `unmount` 会顺带 `sandbox close`；复用已有沙箱时可能误关 |
+| tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 |

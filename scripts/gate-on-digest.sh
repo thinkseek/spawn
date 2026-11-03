@@ -64,6 +64,11 @@ cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee "$LOG_DIR/clipp
 echo "== test =="
 cargo test --workspace --no-fail-fast 2>&1 | tee "$LOG_DIR/test.log"
 
+echo "== e2e =="
+SPAWN_PSQL="docker exec $PG_CONTAINER psql -U postgres -d spawn -c" \
+  SPAWN_DATABASE_URL="$SPAWN_TEST_DATABASE_URL" \
+  bash "$REPO_DIR/scripts/e2e-smoke.sh" 2>&1 | tee "$LOG_DIR/e2e.log"
+
 echo "== kache stats =="
 "$RUSTC_WRAPPER" stats 2>&1 | tee "$LOG_DIR/kache.log" || true
 echo "gate ok"
