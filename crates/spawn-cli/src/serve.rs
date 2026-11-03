@@ -20,6 +20,14 @@ use spawn_postgres::{RSI_AGENT, RSI_SESSION, RsiIterationRow};
 use crate::evolve::{Task, landed_metric, load_backlog, parse_metrics};
 use crate::{Flags, env_or, env_value};
 
+/// Prefix of an error that answers 400.
+const BAD_REQUEST: &str = "bad request: ";
+
+/// A session id from a URL, or a 400.
+fn session_id(id: &str) -> Result<SessionId, String> {
+    SessionId::new(id).map_err(|error| format!("{BAD_REQUEST}{error}"))
+}
+
 /// Halt threshold of the controller, mirrored for display.
 const HALT_AFTER: u32 = 3;
 
@@ -96,6 +104,8 @@ fn handle(request: Request, web: &Path) -> Result<(), String> {
     };
     let (status, body) = match answer {
         Ok(body) => (200, body),
+        // A malformed identifier is the caller's mistake, not the server's.
+        Err(error) if error.starts_with(BAD_REQUEST) => (400, json!({ "error": error })),
         Err(error) => (500, json!({ "error": error })),
     };
     request
@@ -305,7 +315,7 @@ fn rsi_overview() -> Result<Value, String> {
 fn rsi_iteration(number: &str) -> Result<Value, String> {
     let number: u32 = number
         .parse()
-        .map_err(|_| format!("bad iteration {number}"))?;
+        .map_err(|_| format!("{BAD_REQUEST}bad iteration {number}"))?;
     let store = open_store()?;
     let Some((row, prompt)) = store.rsi_iteration(number).map_err(err)? else {
         return Err(format!("iteration {number} does not exist"));
@@ -338,8 +348,8 @@ fn fleet() -> Result<Value, String> {
 fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
     let (id, what) = rest
         .split_once('/')
-        .ok_or_else(|| format!("unknown fleet path {rest}"))?;
-    let session = SessionId::new(id).map_err(err)?;
+        .ok_or_else(|| format!("{BAD_REQUEST}unknown fleet path {rest}"))?;
+    let session = session_id(id)?;
     let limit = parameter(query, "limit")
         .and_then(|text| text.parse::<u32>().ok())
         .unwrap_or(50)
@@ -348,7 +358,7 @@ fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
     match what {
         "judgements" => store.judgements_json(session.as_str(), limit).map_err(err),
         "commands" => store.commands_json(session.as_str(), limit).map_err(err),
-        other => Err(format!("unknown fleet view {other}")),
+        other => Err(format!("{BAD_REQUEST}unknown fleet view {other}")),
     }
 }
 
@@ -356,7 +366,7 @@ fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
 /// not storage. Capturing a pane changes nothing, so the API stays read-only.
 fn pane(id: &str) -> Result<Value, String> {
     let store = open_store()?;
-    let session = SessionId::new(id).map_err(err)?;
+    let session = session_id(id)?;
     let latest = store.executions(&session).map_err(err)?.into_iter().next();
     let Some(execution) = latest else {
         return Ok(
@@ -413,7 +423,7 @@ fn pane(id: &str) -> Result<Value, String> {
 }
 
 fn session(id: &str, query: &str) -> Result<Value, String> {
-    let session = SessionId::new(id).map_err(|error| error.to_string())?;
+    let session = session_id(id)?;
     let after = parameter(query, "after")
         .and_then(|text| text.parse::<u64>().ok())
         .unwrap_or(0);

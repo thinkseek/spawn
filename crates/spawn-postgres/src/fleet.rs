@@ -37,11 +37,27 @@ from (
               select max(k.recorded_at_ms) from agent_judgements k
                where k.session_id = s.session_id and k.state is distinct from s.state), 0)
     ) as state_since_ms,
+    case when coalesce((p.observation ->> 'attention')::boolean, false) then
+      (select min(j.recorded_at_ms) from agent_judgements j
+        where j.session_id = s.session_id
+          and j.recorded_at_ms > coalesce((
+                select max(k.recorded_at_ms) from agent_judgements k
+                 where k.session_id = s.session_id
+                   and not coalesce((k.observation ->> 'attention')::boolean, false)), 0))
+    end as attention_since_ms,
+    -- The assignment: the latest text a person or the supervisor gave, not
+    -- a dispatcher digest or a liveness restart.
+    (select left(coalesce(c.action ->> 'prompt', c.action ->> 'text'), 600)
+       from spawn_commands c
+      where c.session_id = s.session_id
+        and c.principal not in ('spawn-dispatch', 'spawn-liveness')
+        and coalesce(c.action ->> 'prompt', c.action ->> 'text') is not null
+      order by c.id desc limit 1) as task,
     (select left(coalesce(c.action ->> 'prompt', c.action ->> 'text'), 600)
        from spawn_commands c
       where c.session_id = s.session_id
         and coalesce(c.action ->> 'prompt', c.action ->> 'text') is not null
-      order by c.id desc limit 1) as task,
+      order by c.id desc limit 1) as last_input,
     jsonb_build_object(
       'current_tool', (select o.tool_name from agent_open_tools o
                         where o.session_id = s.session_id
@@ -160,7 +176,67 @@ from (
   where s.agent_id like 'agent\_worker\_%' or s.session_id = 'session_supervisor'
 ) w";
 
+/// Every model judgement since a time, with the evidence it saw and what
+/// happened next: the next command into the session, the first tool call the
+/// agent made on its own before that command, and the end of the execution.
+const CORPUS: &str = r"
+select coalesce(jsonb_agg(row_to_json(r) order by r.event_id), '[]'::jsonb)
+from (
+  select
+    o.id as event_id,
+    o.session_id,
+    o.agent_id,
+    o.recorded_at_ms,
+    o.kind -> 'detail' -> 'observation' as observation,
+    nc.principal as next_principal,
+    nc.action as next_action,
+    nc.created_at_ms as next_command_at_ms,
+    nc.in_flight as next_in_flight,
+    (select min(e.recorded_at_ms) from spawn_events e
+      where e.session_id = o.session_id and e.session_seq > ev.seq
+        and e.event_name = 'tool.started'
+        and not coalesce(nc.in_flight, false)
+        and e.recorded_at_ms < coalesce(nc.created_at_ms, 9223372036854775807)) as agent_moved_at_ms,
+    (select min(e.recorded_at_ms) from spawn_events e
+      where e.session_id = o.session_id and e.session_seq > ev.seq
+        and e.event_name = 'execution.ended' and e.source = 'bridge') as ended_at_ms
+  from spawn_events o
+  -- What happened next is measured from the evidence the judgement covered,
+  -- not from when it was written: a prompt typed in between is part of what
+  -- happened next.
+  cross join lateral (
+    select (o.kind -> 'detail' -> 'observation' ->> 'based_on_seq')::bigint as seq,
+           coalesce((select e.recorded_at_ms from spawn_events e
+                      where e.session_id = o.session_id
+                        and e.session_seq = (o.kind -> 'detail' -> 'observation' ->> 'based_on_seq')::bigint),
+                    o.recorded_at_ms) as at_ms
+  ) ev
+  left join lateral (
+    -- A command already in flight at the evidence (a start whose prompt is
+    -- typed after the ready screen) counts: its input lands afterwards.
+    select c.principal, c.action ->> 'type' as action, c.created_at_ms,
+           c.created_at_ms <= ev.at_ms as in_flight
+      from spawn_commands c
+     where c.session_id = o.session_id
+       and coalesce(c.finished_at_ms, 9223372036854775807) >= ev.at_ms
+     order by c.id limit 1
+  ) nc on true
+  where o.event_name = 'observation.recorded' and o.source = 'observer'
+    and o.kind -> 'detail' -> 'observation' ? 'evidence'
+    and o.kind -> 'detail' -> 'observation' ->> 'judge' <> 'rules'
+    and o.recorded_at_ms > $1
+) r";
+
 impl PostgresStore {
+    /// Model judgements since `since_ms` with their outcomes, as JSON rows.
+    pub fn corpus_rows(&self, since_ms: i64) -> Result<Value, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_one(CORPUS, &[&since_ms])
+            .map_err(|error| backend(&error))?;
+        Ok(row.get(0))
+    }
+
     /// Facts for the dispatcher, as JSON rows.
     pub fn dispatch_facts(&self) -> Result<Value, StoreError> {
         let mut client = self.lock();

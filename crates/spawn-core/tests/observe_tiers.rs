@@ -567,3 +567,103 @@ fn a_restarted_observer_corrects_a_stale_row() {
     let mut again = Observer::new(log, judge).with_clock(fixture.clock.clone());
     assert_eq!(again.tick().expect("tick"), 0);
 }
+
+/// The supervisor's context: never ends, and its screen asks a person.
+struct Supervisor;
+
+impl ObservationContext for Supervisor {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        Some("you: deploy it\nclaude: The build is green.\nclaude: HUMAN: which region?\n$ ".to_string())
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn perpetual(&self, _session: &SessionId) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_perpetual_session_is_never_completed_and_its_question_pages() {
+    // Live: Jev put the idle supervisor at COMPLETED 0.71.
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Completed,
+        confidence: confidence(0.71),
+        probabilities: Some([0.0, 0.27, 0.02, 0.71, 0.0]),
+        needs_human: Some(0.2),
+        stuck: Some(0.05),
+    }));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log, judge)
+        .with_clock(clock)
+        .with_context(Arc::new(Supervisor));
+    started(&store);
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Waiting, "COMPLETED folds into WAITING");
+    assert!(last.confidence.value() > 0.95, "0.98 of the allowed mass");
+    assert_eq!(
+        last.probabilities.and_then(|p| p.get("COMPLETED").copied()),
+        Some(0.71),
+        "the raw answer is kept"
+    );
+    assert_eq!(last.human_question.as_deref(), Some("which region?"));
+    assert!(last.attention);
+    assert_eq!(last.attention_reason.as_deref(), Some("human_question"));
+}
+
+#[test]
+fn attention_says_why() {
+    let judge = Scripted::new(Err("connection refused".to_string()));
+    let mut fixture = fixture(judge);
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.attention_reason.as_deref(), Some("judge_unavailable"));
+
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = self::fixture(judge);
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.attention_reason.as_deref(), Some("blocked"));
+}
+
+#[test]
+fn input_typed_into_a_ready_pane_is_work_not_an_idle_prompt() {
+    // Live: the ready screen, then the typed prompt's command.finished, with
+    // the engine's message.received hook still in flight. Jev was asked about
+    // an idle prompt that had just received its input.
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ScreenObserved {
+            state: ScreenState::Ready,
+            evidence: ">".to_string(),
+        },
+    );
+    append(
+        &fixture.store,
+        Source::Gateway,
+        EventKind::CommandFinished {
+            command_id: CommandId(1),
+            succeeded: true,
+            error: None,
+        },
+    );
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 0);
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert_eq!(last.judge, "rules");
+}

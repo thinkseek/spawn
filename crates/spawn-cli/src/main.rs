@@ -32,6 +32,7 @@ use spawn_jev::{JevConfig, JevJudge};
 use spawn_postgres::PostgresStore;
 
 mod context;
+mod corpus;
 mod dispatch;
 mod evolve;
 mod serve;
@@ -89,7 +90,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         return Err(
-            "usage: spawn <init-db|submit|tick|loop|dispatch|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>"
+            "usage: spawn <init-db|submit|tick|loop|dispatch|corpus|judge|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>"
                 .to_string(),
         );
     };
@@ -104,6 +105,8 @@ pub(crate) fn dispatch() -> Result<i32, String> {
             .map(|code| if code == evolve::IDLE { 0 } else { code }),
         "rsi-loop" => cmd_rsi_loop(&Flags::parse(&rest)?),
         "dispatch" => cmd_dispatch(&rest),
+        "corpus" => cmd_corpus(&rest),
+        "judge" => cmd_judge(&Flags::parse(&rest)?),
         "status" => cmd_status(&Flags::parse(&rest)?),
         "fleet" => cmd_fleet(),
         "tail" => cmd_tail(&Flags::parse(&rest)?),
@@ -370,6 +373,38 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
         let pause = interval.saturating_mul(failures.clamp(1, 30));
         std::thread::sleep(pause);
     }
+}
+
+/// `spawn corpus export [--since-hours N]`: model judgements with their
+/// outcomes, one JSON line each, on stdout.
+fn cmd_corpus(rest: &[String]) -> Result<i32, String> {
+    let Some(("export", rest)) = rest.split_first().map(|(word, rest)| (word.as_str(), rest)) else {
+        return Err("usage: spawn corpus export [--since-hours N]".to_string());
+    };
+    let flags = Flags::parse(rest)?;
+    let hours: i64 = flags
+        .get("since-hours")
+        .map_or(Ok(24 * 365), |text| text.parse().map_err(|_| format!("bad --since-hours {text}")))?;
+    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+    let store = open_store()?;
+    let mut out = std::io::stdout().lock();
+    for record in corpus::export(&store, now.saturating_sub(hours.saturating_mul(3_600_000)))? {
+        let line = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+        writeln!(out, "{line}").map_err(|error| error.to_string())?;
+    }
+    Ok(0)
+}
+
+/// `spawn judge --replay <corpus.jsonl>`: which tier the current rules leave
+/// each recorded episode to, and how well they agree.
+fn cmd_judge(flags: &Flags) -> Result<i32, String> {
+    let path = flags.required("replay")?;
+    let records = corpus::read(&path)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&corpus::replay(&records)).unwrap_or_default()
+    );
+    Ok(0)
 }
 
 /// One dispatcher step; `--dry-run` prints the plan and submits nothing.

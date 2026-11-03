@@ -42,4 +42,8 @@ impl ObservationContext for HostContext {
     fn task(&self, session: &SessionId) -> Option<String> {
         self.store.latest_task(session).ok()?
     }
+
+    fn perpetual(&self, session: &SessionId) -> bool {
+        session.as_str() == crate::supervise::SUPERVISOR_SESSION
+    }
 }
