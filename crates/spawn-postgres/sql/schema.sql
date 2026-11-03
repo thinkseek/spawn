@@ -33,6 +33,78 @@ create unique index if not exists spawn_events_source_key
 create index if not exists spawn_events_session_name
     on spawn_events (session_id, event_name, id);
 
+-- Projection: one row per session, written by `spawn_append` in the same
+-- transaction as the event, so `agent_state`, `agent_status` and
+-- `agent_freshness` read one row instead of folding the log. The log stays
+-- the only truth: a row is the fold of its session's events, and any row
+-- out of step with the log is folded again.
+create table if not exists spawn_session_state (
+    session_id           text   primary key,
+    agent_id             text   not null,
+    last_session_seq     bigint not null,
+    last_event_id        bigint not null,
+    last_event_at_ms     bigint not null,
+    event_count          bigint not null,
+    observation          jsonb,
+    observation_seq      bigint,
+    observation_event_id bigint,
+    observation_at_ms    bigint
+);
+
+-- The session belongs to the agent of its first event, so a command another
+-- agent submits into the session cannot move it out of its owner's grants.
+create or replace function spawn_session_fold(p_session text) returns void
+language sql as $$
+    insert into spawn_session_state
+    select f.session_id, a.agent_id, f.last_session_seq, f.last_event_id,
+           f.last_event_at_ms, f.event_count,
+           o.observation, o.session_seq, o.id, o.recorded_at_ms
+    from (
+        select e.session_id,
+               max(e.session_seq) as last_session_seq, max(e.id) as last_event_id,
+               max(e.recorded_at_ms) as last_event_at_ms, count(*) as event_count
+        from spawn_events e
+        where e.session_id = p_session
+        group by e.session_id
+    ) f
+    cross join lateral (
+        select e.agent_id from spawn_events e
+        where e.session_id = f.session_id
+        order by e.session_seq limit 1
+    ) a
+    left join lateral (
+        select e.kind -> 'detail' -> 'observation' as observation,
+               e.session_seq, e.id, e.recorded_at_ms
+        from spawn_events e
+        where e.session_id = f.session_id and e.event_name = 'observation.recorded'
+        order by e.session_seq desc
+        limit 1
+    ) o on true
+    on conflict (session_id) do update set
+        agent_id             = excluded.agent_id,
+        last_session_seq     = excluded.last_session_seq,
+        last_event_id        = excluded.last_event_id,
+        last_event_at_ms     = excluded.last_event_at_ms,
+        event_count          = excluded.event_count,
+        observation          = excluded.observation,
+        observation_seq      = excluded.observation_seq,
+        observation_event_id = excluded.observation_event_id,
+        observation_at_ms    = excluded.observation_at_ms;
+$$;
+
+-- Fold the sessions the projection is missing or behind on: a database from
+-- before the projection, or events an older `spawn_append` wrote while this
+-- migration ran. The append lock waits for those calls to commit; the
+-- migration holds it until its own commit, after which the new body runs.
+-- ponytail: this groups the whole log on every migration; keep a migration
+-- version and run it once when init-db on a large log gets slow.
+select pg_advisory_xact_lock(1399957335);
+select spawn_session_fold(f.session_id)
+from (select e.session_id, max(e.session_seq) as last_seq
+      from spawn_events e group by e.session_id) f
+left join spawn_session_state p on p.session_id = f.session_id
+where p.last_session_seq is distinct from f.last_seq;
+
 create or replace function spawn_append(
     p_agent      text,
     p_session    text,
@@ -50,6 +122,7 @@ declare
     v_seq bigint;
     v_id  bigint;
     v_at  bigint;
+    v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded';
 begin
     perform pg_advisory_xact_lock(1399957335);
 
@@ -80,6 +153,22 @@ begin
     values
         (p_agent, p_session, p_execution, p_source, p_source_key, p_kind, v_seq, v_at)
     returning spawn_events.id into v_id;
+
+    -- Guard: step the row only when it holds exactly the previous event.
+    -- Any other row (missing, behind, ahead) is folded again from the log.
+    update spawn_session_state p set
+        last_session_seq     = v_seq,
+        last_event_id        = v_id,
+        last_event_at_ms     = greatest(p.last_event_at_ms, v_at),
+        event_count          = p.event_count + 1,
+        observation          = case when v_obs then p_kind -> 'detail' -> 'observation' else p.observation end,
+        observation_seq      = case when v_obs then v_seq else p.observation_seq end,
+        observation_event_id = case when v_obs then v_id else p.observation_event_id end,
+        observation_at_ms    = case when v_obs then v_at else p.observation_at_ms end
+    where p.session_id = p_session and p.last_session_seq = v_seq - 1;
+    if not found then
+        perform spawn_session_fold(p_session);
+    end if;
 
     perform pg_notify('spawn_events', v_id::text);
 
@@ -259,21 +348,20 @@ create trigger spawn_gateway_insert
     for each row execute function spawn_gateway_insert();
 
 create or replace view agent_state as
-select distinct on (e.session_id)
-    e.session_id,
-    e.agent_id,
-    e.kind -> 'detail' -> 'observation' ->> 'state'      as state,
-    e.kind -> 'detail' -> 'observation' ->> 'reason'     as reason,
-    (e.kind -> 'detail' -> 'observation' ->> 'confidence')::float8 as confidence,
-    (e.kind -> 'detail' -> 'observation' ->> 'based_on_seq')::bigint as based_on_seq,
-    e.kind -> 'detail' -> 'observation' ->> 'judge'      as judge,
-    e.session_seq,
-    e.recorded_at_ms,
-    e.id as event_id,
-    e.kind -> 'detail' -> 'observation' as observation
-from spawn_events e
-where e.event_name = 'observation.recorded'
-order by e.session_id, e.session_seq desc;
+select
+    p.session_id,
+    p.agent_id,
+    p.observation ->> 'state'      as state,
+    p.observation ->> 'reason'     as reason,
+    (p.observation ->> 'confidence')::float8 as confidence,
+    (p.observation ->> 'based_on_seq')::bigint as based_on_seq,
+    p.observation ->> 'judge'      as judge,
+    p.observation_seq as session_seq,
+    p.observation_at_ms as recorded_at_ms,
+    p.observation_event_id as event_id,
+    p.observation
+from spawn_session_state p
+where p.observation is not null;
 
 create or replace view agent_timeline as
 select
@@ -317,7 +405,8 @@ select
     c.succeeded,
     c.error,
     c.created_at_ms,
-    c.finished_at_ms
+    c.finished_at_ms,
+    coalesce(c.action ->> 'prompt', c.action ->> 'text') as prompt
 from spawn_commands c;
 
 create or replace view agent_executions as
@@ -448,30 +537,48 @@ where s.event_name = 'tool.started'
 -- Position of the log per session. This is not judgement lag; see
 -- docs/view-architecture.md section 4.1.
 create or replace view agent_freshness as
-select
-    e.session_id,
-    min(e.agent_id) as agent_id,
-    max(e.session_seq) as last_session_seq,
-    max(e.id) as last_event_id,
-    max(e.recorded_at_ms) as last_event_at_ms,
-    count(*) as event_count
-from spawn_events e
-group by e.session_id;
+select p.session_id, p.agent_id, p.last_session_seq, p.last_event_id,
+       p.last_event_at_ms, p.event_count
+from spawn_session_state p;
 
--- Views are public; the raw tables and writes stay with the owner. The
--- gateway trigger runs as the owner and checks `session_user` against
--- `spawn_grants`.
-revoke all on spawn_events, spawn_commands, spawn_grants from public;
--- ponytail: the views stay public next to the grant-filtered
--- `spawn_read_*` functions below, so current SQL readers keep working.
--- For multi-tenant use, revoke select on these views from public.
-grant select on agent_state, agent_timeline, agent_judgements, agent_tasks,
+-- One row per session: the latest judgement and the latest execution.
+create or replace view agent_status as
+select
+    p.session_id,
+    p.agent_id,
+    p.observation ->> 'state'  as state,
+    p.observation ->> 'reason' as reason,
+    p.observation_seq,
+    p.last_session_seq,
+    p.last_event_at_ms,
+    x.execution_id,
+    x.engine,
+    x.started_at_ms,
+    x.ended_at_ms,
+    x.exit_reported,
+    x.execution_id is not null and x.ended_at_ms is null as live
+from spawn_session_state p
+left join lateral (
+    select a.execution_id, a.engine, a.started_at_ms, a.ended_at_ms, a.exit_reported
+    from agent_executions a
+    where a.session_id = p.session_id
+    order by a.started_at_ms desc, a.execution_id desc
+    limit 1
+) x on true;
+
+-- The raw tables, the projection and the views stay with the owner. Readers
+-- go through the grant-filtered `spawn_read_*` functions below; the gateway
+-- trigger runs as the owner and checks `session_user` against `spawn_grants`.
+-- The revoke on the views also removes the public select of older schemas.
+revoke all on spawn_events, spawn_commands, spawn_grants, spawn_session_state from public;
+revoke select on agent_state, agent_status, agent_timeline, agent_judgements, agent_tasks,
     agent_task_events, agent_executions, agent_artifacts, agent_relations,
     agent_lineage, agent_open_tools, agent_freshness
-    to public;
+    from public;
 grant insert on agent_commands to public;
 
 revoke execute on function spawn_append(text, text, text, text, text, jsonb) from public;
+revoke execute on function spawn_session_fold(text) from public;
 revoke execute on function spawn_submit(text, text, text, text, jsonb) from public;
 revoke execute on function spawn_claim(text, bigint) from public;
 revoke execute on function spawn_finish(bigint, integer, boolean, text) from public;
@@ -498,7 +605,7 @@ declare
         'exists (select 1 from spawn_grants g where g.principal = session_user::text'
         ' and g.agent_id in (r.agent_id, ''*''))';
 begin
-    foreach v_view in array array['state', 'tasks', 'relations', 'freshness'] loop
+    foreach v_view in array array['state', 'status', 'tasks', 'relations', 'freshness'] loop
         execute format(
             'create or replace function spawn_read_%1$s() returns setof agent_%1$s'
             ' language sql stable security definer set search_path = %2$I, pg_temp'

@@ -233,9 +233,11 @@ Observer 每次 tick：
 | `spawn_claim(worker, ttl_ms)` | `out_id`、`out_attempt`、`out_agent`、`out_session`、`out_action` | `for update skip locked`，单会话串行，过期租约 attempt+1 |
 | `spawn_finish(command, attempt, succeeded, error)` | `done`、`already`、`stale`、`missing` | 旧 attempt 结束被拒 |
 
-权限：视图对 public 可读（单租户）；另有 `security definer` 读函数 `spawn_read_<视图>()`（state、tasks、relations、freshness）与 `spawn_read_<视图>(session_id)`（其余），按 `spawn_grants` 过滤 `session_user`，固定 `search_path`；多租户部署收回视图的 public select 即可；`spawn_events`、`spawn_commands`、`spawn_grants` 撤销 public 全部权限；四个写函数撤销 public 执行权。`spawn_gateway_insert` 固定 `search_path = <schema>, pg_temp`，调用方无法用临时表替换 `spawn_grants`。
+权限：视图只归 owner，public 只有 `agent_commands` 的 insert；其他角色读 `security definer` 函数 `spawn_read_<视图>()`（state、status、tasks、relations、freshness）与 `spawn_read_<视图>(session_id)`（其余），按 `spawn_grants` 过滤 `session_user`，固定 `search_path`；`spawn_events`、`spawn_commands`、`spawn_grants`、`spawn_session_state` 撤销 public 全部权限；四个写函数撤销 public 执行权。`spawn_gateway_insert` 固定 `search_path = <schema>, pg_temp`，调用方无法用临时表替换 `spawn_grants`。
 
-视图：`agent_state`（每会话最新 observation，带 `event_id`）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记 runner 已报告退出，带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。视图取代早期物化视图与 CDC 方案。
+投影：`spawn_session_state` 每会话一行（最后序号、最后 id、事件数、最新 observation），由 `spawn_append` 在同一事务内更新，`session_seq` 守卫：行恰好落后一个事件时步进，否则从日志重折；迁移持 append 锁重折不一致的会话。会话归属取首个事件的 agent。
+
+视图：`agent_state`（读投影，每会话最新 observation，带 `event_id`）、`agent_status`（判定加最近一次执行，`live` 标记未结束）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`（带 `prompt`）、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记 runner 已报告退出，带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。视图取代早期物化视图与 CDC 方案。
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
 
@@ -288,7 +290,7 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
 | `spawn-host` | LayerFS 三种退出码与全部 JSON 形态、tmux 精确名匹配、前缀注入与跨进程调用、真实 tmux 生命周期 |
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
-| `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、有授权写入与读函数过滤、共享一致性套件 |
+| `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（列集快照、投影等于日志折叠、状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、非 owner 直查视图被拒、有授权写入与读函数过滤、共享一致性套件 |
 
 共享一致性套件 |
 
@@ -317,7 +319,7 @@ LayerFS：一次调用对应一次 `@layerfs/agent` 调用。
 | schema 版本 | `migrate` 每次整体执行 `schema.sql`，无版本表 | 编号迁移文件与版本表 |
 | 子进程超时 | `layerfs`、`tmux` 调用没有超时 | `wait_timeout` 或独立线程计时 |
 | 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 由 hooks 的 `turn.failed` 取代 |
-| 视图读取 | 读时折叠，无投影表；视图仍对 public 可读 | 单会话事件过万再上投影表；多租户收回 public，见 [view-architecture.md](./view-architecture.md) |
+| 视图读取 | 状态与新鲜度读投影表，其余视图读时折叠；迁移每次按会话聚合全量日志 | 日志很大时加迁移版本号，只跑一次，见 [view-architecture.md](./view-architecture.md) |
 | 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 | 接入 `LISTEN/NOTIFY` |
 | 写入串行 | `spawn_append` 用一把全局 advisory lock | 按会话分锁 |
 | 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 | 用真实服务做契约测试 |

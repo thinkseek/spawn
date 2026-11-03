@@ -737,3 +737,208 @@ fn migrating_twice_changes_nothing() {
     let (store, _schema) = store("migrate");
     store.migrate().expect("a second migration succeeds");
 }
+
+fn observed(seq: u64) -> NewEvent {
+    message(EventKind::ObservationRecorded {
+        observation: Observation {
+            state: SemanticState::Working,
+            reason: None,
+            based_on_seq: SessionSeq(seq),
+            confidence: Confidence::new(0.5).expect("valid confidence"),
+            judge: "heuristic".to_string(),
+        },
+    })
+}
+
+/// The projection row as text, next to the same row folded from the log.
+const PROJECTION_VS_FOLD: &str = "
+    select p::text, (
+        select row(f.session_id, (select agent_id from spawn_events
+                                  where session_id = p.session_id order by session_seq limit 1),
+                   f.last_session_seq, f.last_event_id,
+                   f.last_event_at_ms, f.event_count, o.observation, o.session_seq,
+                   o.id, o.recorded_at_ms)::text
+        from (select session_id, max(session_seq) as last_session_seq, max(id) as last_event_id,
+                     max(recorded_at_ms) as last_event_at_ms, count(*) as event_count
+              from spawn_events where session_id = p.session_id group by session_id) f
+        left join lateral (
+            select kind -> 'detail' -> 'observation' as observation, session_seq, id, recorded_at_ms
+            from spawn_events
+            where session_id = f.session_id and event_name = 'observation.recorded'
+            order by session_seq desc limit 1) o on true)
+    from spawn_session_state p order by p.session_id";
+
+fn projection_matches_fold(client: &mut Client) {
+    let rows = client.query(PROJECTION_VS_FOLD, &[]).expect("compare");
+    assert!(!rows.is_empty(), "the projection has rows");
+    for row in rows {
+        let projected: String = row.get(0);
+        let folded: String = row.get(1);
+        assert_eq!(
+            projected, folded,
+            "the projection equals the fold of the log"
+        );
+    }
+}
+
+#[test]
+fn the_projection_follows_the_log_and_rebuilds_from_it() {
+    let (store, schema) = store("projection");
+    let mut client = admin(&schema);
+    store.append(observed(1)).expect("append succeeds");
+    store
+        .append(message(EventKind::MessageReceived))
+        .expect("append succeeds");
+    store.append(observed(2)).expect("append succeeds");
+    store
+        .append(message(EventKind::MessageReceived))
+        .expect("append succeeds");
+    projection_matches_fold(&mut client);
+    let (seq, based): (i64, i64) = {
+        let row = client
+            .query_one("select session_seq, based_on_seq from agent_state", &[])
+            .expect("agent_state answers");
+        (row.get(0), row.get(1))
+    };
+    assert_eq!((seq, based), (3, 2), "the latest observation wins");
+
+    // The guard: a row out of step with the log is folded again.
+    client
+        .execute(
+            "update spawn_session_state set last_session_seq = 100, event_count = 0",
+            &[],
+        )
+        .expect("move ahead");
+    store
+        .append(message(EventKind::MessageReceived))
+        .expect("append succeeds");
+    projection_matches_fold(&mut client);
+
+    // Another agent's event does not move the session out of its owner.
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_0").expect("valid agent"),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    let owner: String = client
+        .query_one("select agent_id from spawn_session_state", &[])
+        .expect("projection row")
+        .get(0);
+    assert_eq!(
+        owner, "agent_one",
+        "the first event's agent owns the session"
+    );
+
+    client
+        .execute("delete from spawn_session_state", &[])
+        .expect("drop the projection rows");
+    store.migrate().expect("migration backfills");
+    projection_matches_fold(&mut client);
+}
+
+#[test]
+fn status_joins_the_judgement_and_the_latest_execution() {
+    let (store, schema) = store("status");
+    let execution = ExecutionId::new("exec_status").expect("valid execution");
+    store.append(observed(1)).expect("append succeeds");
+    store
+        .append(lifecycle(
+            &execution,
+            Source::Bridge,
+            "exec_status:started",
+            EventKind::ExecutionStarted {
+                engine: Engine::Claude,
+                terminal: TerminalName::new("spawn-exec_status").expect("valid terminal"),
+                workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
+                command_id: CommandId(1),
+            },
+        ))
+        .expect("append succeeds");
+    let row = admin(&schema)
+        .query_one(
+            "select state, execution_id, live, last_session_seq from agent_status",
+            &[],
+        )
+        .expect("agent_status answers");
+    assert_eq!(row.get::<_, Option<String>>(0).as_deref(), Some("WORKING"));
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("exec_status")
+    );
+    assert!(row.get::<_, bool>(2), "a started execution is live");
+    assert_eq!(row.get::<_, i64>(3), 2);
+}
+
+#[test]
+fn views_are_closed_to_other_roles() {
+    let (_store, schema) = store("revoke");
+    let mut client = admin(&schema);
+    let role = format!("spawn_reader_{}", std::process::id());
+    client
+        .batch_execute(&format!(
+            "drop role if exists {role}; create role {role}; \
+             grant usage on schema {schema} to {role}; set role {role}"
+        ))
+        .expect("become a plain role");
+    for view in [
+        "agent_state",
+        "agent_status",
+        "agent_timeline",
+        "agent_tasks",
+    ] {
+        let error = client
+            .query(&format!("select * from {view}"), &[])
+            .expect_err("a plain role cannot read a view");
+        assert_eq!(
+            error.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{view}"
+        );
+    }
+    let rows = client
+        .query("select * from spawn_read_status()", &[])
+        .expect("the read function answers");
+    assert!(rows.is_empty(), "no grant reads nothing");
+    client
+        .batch_execute(&format!(
+            "reset role; drop owned by {role}; drop role {role}"
+        ))
+        .expect("clean up the role");
+}
+
+/// Column names and types of every read view. A change here breaks SQL
+/// readers; update the snapshot on purpose.
+#[test]
+fn view_columns_match_the_snapshot() {
+    let (_store, schema) = store("columns");
+    let rows = admin(&schema)
+        .query(
+            "select table_name, string_agg(column_name || ' ' || data_type, ', ' order by ordinal_position)
+               from information_schema.columns
+              where table_schema = $1 and table_name like 'agent\\_%'
+              group by table_name order by table_name",
+            &[&schema],
+        )
+        .expect("information_schema answers");
+    let actual: Vec<String> = rows
+        .iter()
+        .map(|row| format!("{}: {}", row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect();
+    let expected = [
+        "agent_artifacts: session_id text, agent_id text, execution_id text, project text, branch text, commit_id text, reason text, session_seq bigint, recorded_at_ms bigint",
+        "agent_commands: id bigint, agent_id text, session_id text, idempotency_key text, action jsonb, created_at_ms bigint",
+        "agent_executions: session_id text, agent_id text, execution_id text, engine text, terminal text, workspace text, started_at_ms bigint, cause text, exit_code integer, ended_at_ms bigint, exit_reported boolean, duration_ms bigint, command_id bigint",
+        "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
+        "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
+        "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",
+        "agent_open_tools: session_id text, agent_id text, execution_id text, tool_use_id text, tool_name text, session_seq bigint, started_at_ms bigint",
+        "agent_relations: session_id text, agent_id text, parent_session_id text, recorded_at_ms bigint",
+        "agent_state: session_id text, agent_id text, state text, reason text, confidence double precision, based_on_seq bigint, judge text, session_seq bigint, recorded_at_ms bigint, event_id bigint, observation jsonb",
+        "agent_status: session_id text, agent_id text, state text, reason text, observation_seq bigint, last_session_seq bigint, last_event_at_ms bigint, execution_id text, engine text, started_at_ms bigint, ended_at_ms bigint, exit_reported boolean, live boolean",
+        "agent_task_events: command_id bigint, session_id text, agent_id text, session_seq bigint, event_id bigint, execution_id text, event_name text, recorded_at_ms bigint",
+        "agent_tasks: command_id bigint, agent_id text, session_id text, action text, state text, lease_worker text, lease_attempt integer, succeeded boolean, error text, created_at_ms bigint, finished_at_ms bigint, prompt text",
+        "agent_timeline: session_id text, session_seq bigint, id bigint, agent_id text, execution_id text, source text, event_name text, detail jsonb, recorded_at_ms bigint",
+    ];
+    assert_eq!(actual, expected);
+}
