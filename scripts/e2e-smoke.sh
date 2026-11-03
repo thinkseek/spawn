@@ -80,19 +80,34 @@ export SPAWN_TMUX_PROGRAM=$tmux
 export SPAWN_TMUX_SOCKET=$socket
 export SPAWN_TMUX_IN_WORKSPACE=1
 export SPAWN_WORKER=worker-e2e
+export SPAWN_TRACE=1
+trace=$work/trace.log
 
-"$bin" init-db >/dev/null
+# Wall time of one step in milliseconds, appended to the trace as e2e.<name>.
+now_us() { echo "${EPOCHREALTIME/./}"; }
+step() {
+  name=$1; shift
+  t0=$(now_us)
+  if ! "$@" 2>>"$trace"; then
+    grep -v '^spawn-trace' "$trace" >&2 || true
+    fail "step $name failed"
+  fi
+  echo "spawn-trace e2e.$name $(( $(now_us) - t0 ))" >>"$trace"
+}
+
+step init_db "$bin" init-db >/dev/null
 # A fresh database works too; reset only when psql is reachable.
 if [ -n "$psql" ]; then
   $psql "delete from spawn_commands; delete from spawn_events;" >/dev/null
 fi
 
-command=$("$bin" submit --principal spawn --agent "$agent" --session "$session" \
+command=$(step submit "$bin" submit --principal spawn --agent "$agent" --session "$session" \
   --key "$key" \
   --action '{"type":"start","engine":"claude","prompt":"say hello"}')
 echo "e2e: $command"
 
-"$bin" tick --project shop
+t_submit=$(now_us)
+step tick "$bin" tick --project shop
 
 grep -q -- '--ax-screen-reader' "$work/argv.log" ||
   fail "Claude did not run with --ax-screen-reader"
@@ -105,7 +120,11 @@ terminal=$("$tmux" -L "$socket" list-sessions -F '#{session_name}' | head -1)
 found=0
 for _ in $(seq 1 40); do
   "$tmux" -L "$socket" capture-pane -p -t "=$terminal:.0" -S -80 >"$work/pane.txt"
-  if grep -q 'echo: say hello' "$work/pane.txt"; then found=1; break; fi
+  if grep -q 'echo: say hello' "$work/pane.txt"; then
+    found=1
+    echo "spawn-trace e2e.submit_to_echo $(( $(now_us) - t_submit ))" >>"$trace"
+    break
+  fi
   sleep 0.25
 done
 if [ "$found" = 0 ]; then
@@ -114,6 +133,18 @@ if [ "$found" = 0 ]; then
   fail "the prompt did not reach the pane"
 fi
 
-"$bin" status --limit 100 | grep -q "$session" ||
+step status "$bin" status --limit 100 >"$work/status.txt"
+grep -q "$session" "$work/status.txt" ||
   fail "no observation for $session"
 echo "e2e: ok ($terminal)"
+
+grep -v '^spawn-trace' "$trace" >&2 || true
+
+# Per-stage timing: calls, total and max in milliseconds.
+echo "e2e: timing (stage calls total_ms max_ms)"
+awk '$1 == "spawn-trace" {
+  n[$2]++; t[$2] += $3; if ($3 > m[$2]) m[$2] = $3
+} END {
+  for (k in n) printf "  %-22s %4d %9.2f %9.2f\n", k, n[k], t[k] / 1000, m[k] / 1000
+}' "$trace" | sort
+if [ -n "${SPAWN_TRACE_OUT:-}" ]; then cp "$trace" "$SPAWN_TRACE_OUT"; fi

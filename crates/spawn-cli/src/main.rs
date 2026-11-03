@@ -28,6 +28,9 @@ use spawn_host::{LayerFsCli, TmuxHost};
 use spawn_jev::{JevConfig, JevJudge};
 use spawn_postgres::PostgresStore;
 
+mod trace;
+use trace::Timed;
+
 fn main() {
     let code = match dispatch() {
         Ok(code) => code,
@@ -105,7 +108,7 @@ fn required_env(name: &str) -> Result<String, String> {
 
 fn open_store() -> Result<PostgresStore, String> {
     let url = required_env("SPAWN_DATABASE_URL")?;
-    PostgresStore::connect(&url).map_err(|error| error.to_string())
+    trace::time("pg.connect", || PostgresStore::connect(&url)).map_err(|error| error.to_string())
 }
 
 fn cmd_init_db(_flags: &Flags) -> Result<i32, String> {
@@ -134,8 +137,7 @@ fn cmd_submit(flags: &Flags) -> Result<i32, String> {
         idempotency_key: key,
         action,
     };
-    let id = store
-        .submit(&principal, &submission)
+    let id = trace::time("queue.submit", || store.submit(&principal, &submission))
         .map_err(|error| error.to_string())?;
     println!("command={}", id.0);
     Ok(0)
@@ -172,25 +174,37 @@ fn cmd_tick(flags: &Flags) -> Result<i32, String> {
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.codex_program = env_or("SPAWN_CODEX_PROGRAM", "codex");
 
-    let log: Arc<dyn EventLog> = store.clone();
-    let queue: Arc<dyn CommandQueue> = store.clone();
+    let mut log: Arc<dyn EventLog> = store.clone();
+    let mut queue: Arc<dyn CommandQueue> = store.clone();
+    let (mut workspaces, mut terminals) = (workspaces, terminals);
+    let tracing = trace::enabled();
+    if tracing {
+        log = Arc::new(Timed(log));
+        queue = Arc::new(Timed(queue));
+        workspaces = Arc::new(Timed(workspaces));
+        terminals = Arc::new(Timed(terminals));
+    }
     let mut bridge = Bridge::new(Arc::clone(&log), queue, workspaces, terminals, config);
-    bridge.recover().map_err(|error| error.to_string())?;
-    let report = bridge.tick().map_err(|error| error.to_string())?;
+    trace::time("bridge.recover", || bridge.recover()).map_err(|error| error.to_string())?;
+    let report = trace::time("bridge.tick", || bridge.tick()).map_err(|error| error.to_string())?;
     for warning in &report.warnings {
         eprintln!("spawn tick warning: {warning}");
     }
 
-    let judge: Arc<dyn StateJudge> = match flags
+    let mut judge: Arc<dyn StateJudge> = match flags
         .get("judge-url")
         .or_else(|| env_value("SPAWN_JUDGE_URL"))
     {
         Some(url) => Arc::new(JevJudge::new(JevConfig::new(&url))),
         None => Arc::new(HeuristicJudge),
     };
+    if tracing {
+        judge = Arc::new(Timed(judge));
+    }
     let mut observer = Observer::new(log, judge);
-    observer.recover().map_err(|error| error.to_string())?;
-    let observations = observer.tick().map_err(|error| error.to_string())?;
+    trace::time("observer.recover", || observer.recover()).map_err(|error| error.to_string())?;
+    let observations =
+        trace::time("observer.tick", || observer.tick()).map_err(|error| error.to_string())?;
 
     println!(
         "commands={} observations={} sessions={}",
