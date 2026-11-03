@@ -21,6 +21,8 @@ export interface RsiObjective {
   metric: string;
   unit: string;
   direction: Direction;
+  /** Value the objective aims for; `null` when the task names none. */
+  target: number | null;
 }
 
 export interface RsiIteration {
@@ -153,6 +155,7 @@ function normalizeObjective(value: unknown): RsiObjective | null {
     metric: text(raw.metric),
     unit: text(raw.unit),
     direction: raw.direction === "higher" ? "higher" : "lower",
+    target: optionalNumber(raw.target),
   };
 }
 

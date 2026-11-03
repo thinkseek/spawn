@@ -90,20 +90,21 @@ pub(crate) struct Metric {
 /// Scenario output is written by candidate code, so a `METRIC` line in it
 /// proves nothing: a regression scenario could print a better number after the
 /// real one. The gate puts the candidate run's metric into its verdict, and
-/// that is what counts. Logs from before that change are read from the first
-/// candidate section only, which ends before any regression output.
+/// that is what counts. Without one (logs from before that change, or a run
+/// that printed none) only the first candidate section is read: it ends
+/// before any regression output, and the scenario prints its own line last.
 pub(crate) fn parse_metrics(log: &str) -> Vec<Metric> {
     let verdict = log
         .lines()
         .rev()
         .find(|line| line.trim_start().starts_with('{'))
         .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok());
-    if let Some(verdict) = verdict {
-        return verdict
-            .get("metric")
-            .and_then(serde_json::Value::as_str)
-            .map(metric_lines)
-            .unwrap_or_default();
+    if let Some(metric) = verdict
+        .as_ref()
+        .and_then(|verdict| verdict.get("metric"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return metric_lines(metric);
     }
     let section = log
         .lines()
@@ -1071,11 +1072,18 @@ mod tests {
     }
 
     #[test]
-    fn a_verdict_without_a_metric_has_none() {
-        let log = "| == candidate: 002.sh must pass\n\
-                   | METRIC ingest_total_ns baseline=1540 candidate=1\n\
+    fn an_old_verdict_falls_back_to_the_candidate_section() {
+        // Iteration 6's real log: the verdict line carries no metric.
+        let log = "| == baseline: 002.sh must fail\n\
+                   | METRIC ingest_total_ns baseline=1578 candidate=1586\n\
+                   | == candidate: 002.sh must pass\n\
+                   | METRIC ingest_total_ns baseline=1573 candidate=1021\n\
+                   | == regression: 001.sh must still pass\n\
+                   | METRIC ingest_total_ns baseline=1573 candidate=1\n\
                    {\"verdict\":\"accepted\"}";
-        assert!(parse_metrics(log).is_empty());
+        let metrics = parse_metrics(log);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].candidate, Some(1021.0));
     }
 
     #[test]
