@@ -232,10 +232,13 @@ fn views_answer_from_the_event_log() {
         .append(message(EventKind::ObservationRecorded { observation }))
         .expect("append succeeds");
     store
-        .append(message(EventKind::TurnStopped {
-            input_tokens: Some(10),
-            output_tokens: Some(20),
-        }))
+        .append(NewEvent {
+            source: Source::Claude,
+            ..message(EventKind::TurnStopped {
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+            })
+        })
         .expect("append succeeds");
 
     let row = admin(&schema)
@@ -253,11 +256,67 @@ fn views_answer_from_the_event_log() {
     let based_on: Option<i64> = row.get(3);
     assert_eq!(based_on, Some(1));
 
-    let timeline = admin(&schema)
-        .query("select event_name from agent_timeline order by id", &[])
+    let event_id: i64 = row_event_id(&schema);
+    let state = store
+        .state(&session())
+        .expect("state reads")
+        .expect("one state");
+    assert_eq!(state.event_id, GlobalPosition(event_id.unsigned_abs()));
+    assert_eq!(state.observation.state, SemanticState::Working);
+    assert_eq!(store.states().expect("states read"), vec![state]);
+
+    let timeline = store
+        .timeline(&session(), SessionSeq(0), 10)
+        .expect("timeline reads");
+    let names: Vec<&str> = timeline.iter().map(|e| e.event_name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["turn.stopped"],
+        "the timeline has no judgements"
+    );
+    assert!(
+        store
+            .timeline(&session(), SessionSeq(2), 10)
+            .expect("timeline reads")
+            .is_empty(),
+        "the cursor is exclusive"
+    );
+    let judgements = admin(&schema)
+        .query(
+            "select event_name from agent_timeline where source = 'observer'",
+            &[],
+        )
         .expect("agent_timeline answers");
-    let names: Vec<String> = timeline.iter().map(|row| row.get(0)).collect();
-    assert_eq!(names, vec!["observation.recorded", "turn.stopped"]);
+    assert!(judgements.is_empty());
+    let judged: i64 = admin(&schema)
+        .query_one("select count(*) from agent_judgements", &[])
+        .expect("agent_judgements answers")
+        .get(0);
+    assert_eq!(judged, 1, "the judgement view holds the observation");
+
+    let fresh = store
+        .freshness(&session())
+        .expect("freshness reads")
+        .expect("one row");
+    assert_eq!(fresh.last_session_seq, SessionSeq(2));
+    assert_eq!(fresh.event_count, 2);
+    assert!(
+        store
+            .freshness(&SessionId::new("session_none").expect("valid session"))
+            .expect("freshness reads")
+            .is_none(),
+        "a session without events has no row"
+    );
+}
+
+fn row_event_id(schema: &str) -> i64 {
+    admin(schema)
+        .query_one(
+            "select id from spawn_events where event_name = 'observation.recorded'",
+            &[],
+        )
+        .expect("observation event")
+        .get(0)
 }
 
 fn lifecycle(execution: &ExecutionId, source: Source, key: &str, kind: EventKind) -> NewEvent {
@@ -332,6 +391,166 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
         ))
         .expect("append succeeds");
     assert_eq!(row("ended"), (true, Some("exited".to_string()), true));
+
+    let executions = store.executions(&session()).expect("executions read");
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].command_id, Some(CommandId(1)));
+    let duration = executions[0]
+        .duration_ms
+        .expect("an ended execution has a duration");
+    assert!(duration >= 0);
+}
+
+fn tool_event(execution: &ExecutionId, key: &str, kind: EventKind) -> NewEvent {
+    lifecycle(execution, Source::Claude, key, kind)
+}
+
+#[test]
+fn open_tools_are_started_minus_finished_in_live_executions() {
+    let (store, _schema) = store("open_tools");
+    let execution = ExecutionId::new("exec_1").expect("valid execution");
+    let started = |id: &str| EventKind::ToolStarted {
+        tool_name: "Bash".to_string(),
+        tool_use_id: id.to_string(),
+    };
+    store
+        .append(tool_event(&execution, "a:start", started("a")))
+        .expect("append succeeds");
+    store
+        .append(tool_event(&execution, "b:start", started("b")))
+        .expect("append succeeds");
+    store
+        .append(tool_event(
+            &execution,
+            "a:done",
+            EventKind::ToolCompleted {
+                tool_use_id: "a".to_string(),
+                duration_ms: Some(5),
+            },
+        ))
+        .expect("append succeeds");
+    let open = store.open_tools(&session()).expect("open tools read");
+    let ids: Vec<&str> = open.iter().map(|tool| tool.tool_use_id.as_str()).collect();
+    assert_eq!(ids, vec!["b"]);
+
+    store
+        .append(lifecycle(
+            &execution,
+            Source::Bridge,
+            "exec_1:ended",
+            EventKind::ExecutionEnded {
+                cause: EndCause::Exited,
+                exit_code: Some(0),
+            },
+        ))
+        .expect("append succeeds");
+    assert!(
+        store
+            .open_tools(&session())
+            .expect("open tools read")
+            .is_empty(),
+        "an ended execution has no open tools"
+    );
+}
+
+#[test]
+fn lineage_follows_links_to_every_ancestor() {
+    let (store, schema) = store("lineage");
+    for (child, parent) in [("session_b", "session_a"), ("session_c", "session_b")] {
+        store
+            .append(NewEvent {
+                session_id: SessionId::new(child).expect("valid session"),
+                ..message(EventKind::SessionLinked {
+                    parent_session_id: SessionId::new(parent).expect("valid session"),
+                })
+            })
+            .expect("append succeeds");
+    }
+    let rows = admin(&schema)
+        .query(
+            "select ancestor_session_id, depth from agent_lineage \
+             where session_id = 'session_c' order by depth",
+            &[],
+        )
+        .expect("agent_lineage answers");
+    let chain: Vec<(String, i32)> = rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+    assert_eq!(
+        chain,
+        vec![("session_b".to_string(), 1), ("session_a".to_string(), 2)]
+    );
+}
+
+#[test]
+fn a_task_lists_its_command_and_execution_events() {
+    let (store, schema) = store("task_events");
+    let principal = Principal::new("tester").expect("valid principal");
+    let command = store
+        .submit(&principal, &start(session(), "key_1"))
+        .expect("submit succeeds");
+    let claimed = store
+        .claim("worker", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("one command");
+    let execution = ExecutionId::new("exec_1").expect("valid execution");
+    store
+        .append(lifecycle(
+            &execution,
+            Source::Bridge,
+            "exec_1:started",
+            EventKind::ExecutionStarted {
+                engine: Engine::Claude,
+                terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
+                workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
+                command_id: command,
+            },
+        ))
+        .expect("append succeeds");
+    store
+        .append(tool_event(&execution, "turn", EventKind::MessageReceived))
+        .expect("append succeeds");
+    store
+        .append(message(EventKind::TurnStopped {
+            input_tokens: None,
+            output_tokens: None,
+        }))
+        .expect("an event outside the execution");
+    store
+        .finish(&claimed, &Outcome::Succeeded)
+        .expect("finish succeeds");
+
+    let id = i64::try_from(command.0).expect("small id");
+    let names: Vec<String> = admin(&schema)
+        .query(
+            "select event_name from agent_task_events where command_id = $1 order by session_seq",
+            &[&id],
+        )
+        .expect("agent_task_events answers")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "command.accepted",
+            "execution.started",
+            "message.received",
+            "command.finished"
+        ]
+    );
+    let task = admin(&schema)
+        .query_one(
+            "select action, state, succeeded, lease_attempt from agent_tasks where command_id = $1",
+            &[&id],
+        )
+        .expect("agent_tasks answers");
+    let action: Option<String> = task.get(0);
+    let state: String = task.get(1);
+    let succeeded: Option<bool> = task.get(2);
+    let attempt: i32 = task.get(3);
+    assert_eq!(
+        (action.as_deref(), state.as_str(), succeeded, attempt),
+        (Some("start"), "finished", Some(true), 1)
+    );
 }
 
 #[test]
@@ -426,6 +645,68 @@ fn the_gateway_view_rejects_a_principal_without_a_grant() {
             .is_ok(),
         "the sanctioned path still works"
     );
+}
+
+#[test]
+fn a_granted_principal_inserts_and_reads_only_its_agents() {
+    let (store, schema) = store("granted");
+    let mut client = admin(&schema);
+    store
+        .append(message(EventKind::MessageReceived))
+        .expect("append succeeds");
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_two").expect("valid agent"),
+            session_id: SessionId::new("session_two").expect("valid session"),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    let readable = |client: &mut Client| -> Vec<String> {
+        client
+            .query(
+                "select session_id from spawn_read_freshness() order by session_id",
+                &[],
+            )
+            .expect("spawn_read_freshness answers")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    assert!(readable(&mut client).is_empty(), "no grant reads nothing");
+
+    client
+        .execute(
+            "insert into spawn_grants (principal, agent_id) values (session_user, 'agent_one')",
+            &[],
+        )
+        .expect("grant");
+    assert_eq!(readable(&mut client), vec!["session_one"]);
+    let timeline: i64 = client
+        .query_one(
+            "select count(*) from spawn_read_timeline('session_two')",
+            &[],
+        )
+        .expect("spawn_read_timeline answers")
+        .get(0);
+    assert_eq!(timeline, 0, "an ungranted agent's session reads empty");
+
+    let row = client
+        .query_one(
+            "insert into agent_commands (agent_id, session_id, idempotency_key, action) \
+             values ('agent_one', 'session_one', 'key_1', '{\"type\":\"stop\"}'::jsonb) \
+             returning id",
+            &[],
+        )
+        .expect("a granted insert is accepted");
+    let id: i64 = row.get(0);
+    let action: Option<String> = client
+        .query_one(
+            "select action from agent_tasks where command_id = $1",
+            &[&id],
+        )
+        .expect("the command is queued")
+        .get(0);
+    assert_eq!(action.as_deref(), Some("stop"));
 }
 
 #[test]

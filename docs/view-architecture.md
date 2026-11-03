@@ -1,6 +1,6 @@
 # Spawn 视图层（读模型）设计
 
-结论：视图分成 L0 到 L4 五层，每层写明粒度、主键、排序键与新鲜度；读权限从公开视图收成授权函数；Rust 侧由 `PostgresStore` 直接提供读方法，不加端口。现有 7 个视图是平铺的，缺契约、缺滞后标识，读路径不按 agent 授权。
+结论：视图分成 L0 到 L4 五层，每层写明粒度、主键、排序键与新鲜度；读权限有按 agent 过滤的授权函数；Rust 侧由 `PostgresStore` 直接提供读方法，不加端口。第 1 到 4 步已完成，第 5 步（投影表）未到门槛。
 
 适用范围：`spawn-postgres` 的 SQL 视图、`spawn-core` 的读端口、`spawn-cli` 的查询子命令。写入路径与事件协议不在本文范围，见 [design.md](./design.md)。
 
@@ -19,9 +19,9 @@
 | 事件与 SQL 口径 | [design.md 第 9 节](./design.md) | 表、函数、视图的现有描述 |
 | 架构总览 | [architecture.md 第 3、6 节](./architecture.md) | 运行链路与接口表 |
 
-## 2. 现状
+## 2. 起点（第 1 步之前）
 
-7 个视图，全部由读时折叠生成，没有物化。
+7 个视图，全部由读时折叠生成，没有物化。下表是改动前的问题，第 1 到 4 步已处理，`agent_tasks` 的 prompt 与 `agent_artifacts` 的主键仍按原样。
 
 | 视图 | 定义 | 问题 |
 | --- | --- | --- |
@@ -94,7 +94,9 @@ Observer 只在结论变化时写 `observation.recorded`。因此 `agent_state.b
 | 方案 | 做法 | 取舍 |
 | --- | --- | --- |
 | A 单租户（现状） | 视图公开；原始表与 `agent_commands` 的 select 已收回 | 无需改动；库用户能读全部会话 |
-| B 多租户 | 视图收回 public，暴露 `spawn_read_*(principal)` 函数，内部按 `spawn_grants` 过滤 | 权限一致；客户端不能直查视图，必须走函数 |
+| B 多租户 | 视图收回 public，客户端走 `spawn_read_*` 函数，内部按 `spawn_grants` 过滤 `session_user` | 权限一致；客户端不能直查视图，必须走函数 |
+
+函数门面已上线，与公开视图并行：`spawn_read_state()`、`spawn_read_tasks()`、`spawn_read_relations()`、`spawn_read_freshness()` 跨会话；`spawn_read_timeline`、`judgements`、`executions`、`artifacts`、`task_events`、`lineage`、`open_tools` 取 `session_id` 参数。切到 B 只需 `revoke select on agent_* from public`。
 
 多租户时选 B。写入路径已经在 [触发器:234](../crates/spawn-postgres/sql/schema.sql#L234) 校验 `spawn_grants`，读取路径不校验。单租户部署保持 A。读函数与触发器一样是 `security definer`，必须同样固定 `search_path`。
 
@@ -134,16 +136,16 @@ Observer 只在结论变化时写 `observation.recorded`。因此 `agent_state.b
 | 计划检查 | 万级事件上 `explain` `agent_state`。现有索引是 `(session_id, event_name, id)`，跨会话查询用不上前缀；按需加部分索引 `on (session_id, session_seq desc) where event_name = 'observation.recorded'` | 门禁一次性检查 |
 | 全量门禁 | `bash scripts/remote-gate.sh` | 每轮必跑 |
 
-现有覆盖：`agent_state`、`agent_timeline`、`agent_executions` 结束口径、`agent_artifacts`、`agent_relations`、`spawn_finish` 四态、`agent_commands` 无授权被拒。缺口：`agent_tasks` 与 `agent_commands` 有授权写入。
+现有覆盖：全部视图与六个读方法、`spawn_finish` 四态、`agent_commands` 无授权被拒与有授权写入、读函数无授权为空与按 agent 过滤。缺口：列集快照、万级事件 `explain`。
 
 ## 9. 演进顺序
 
 | 步 | 内容 | 完成条件 |
 | --- | --- | --- |
 | 1（已完成） | 修 `agent_executions` 结束口径，补现有视图断言 | runner 先报告退出、Bridge 后结束的序列有断言 |
-| 2 | `PostgresStore` 读方法，加 `agent_open_tools`、`agent_freshness`、`agent_state.event_id` | 新视图有断言，`status` 切到 `states()` |
-| 3 | 加 `agent_lineage`、`agent_task_events`，补 `duration_ms` | 深链、命令关联各有断言 |
-| 4 | 收权限，上 `security definer` 读函数 | 授权用例通过，外部消费方已迁移 |
+| 2（已完成） | `PostgresStore` 读方法，加 `agent_open_tools`、`agent_freshness`、`agent_state.event_id` | 新视图有断言，`status` 切到 `states()` |
+| 3（已完成） | 加 `agent_lineage`、`agent_judgements`、拆时间线、`agent_task_events`，补 `duration_ms` | 深链、命令关联各有断言 |
+| 4（函数已上线） | 上 `security definer` 读函数；收回视图 public 待外部消费方迁移 | 授权用例通过 |
 | 5 | 单会话事件过万后再上投影表 | `spawn_append` 内更新 `spawn_session_state`，带 `session_seq` 守卫 |
 
 第 5 步之前不物化。当前读代价是 O(会话事件数)，量级够用；提前物化会带来写放大与第二份真值。
