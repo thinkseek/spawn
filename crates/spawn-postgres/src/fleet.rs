@@ -120,18 +120,66 @@ select jsonb_build_object(
                                    / (ms / 3600000.0) end from live_ms)
 )";
 
+/// What the dispatcher decides from: every worker session and the
+/// supervisor, with the latest judgement, the episode (latest command not
+/// sent by the dispatcher), whether a command is in flight, and what the
+/// dispatcher already sent there in the last day.
+const DISPATCH_FACTS: &str = r"
+select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
+from (
+  select
+    s.session_id,
+    s.agent_id,
+    s.live,
+    s.execution_id,
+    (select x.cause from agent_executions x where x.session_id = s.session_id
+      order by x.started_at_ms desc, x.execution_id desc limit 1) as end_cause,
+    p.observation,
+    p.observation_event_id,
+    p.observation_at_ms,
+    (select max(c.id) from spawn_commands c
+      where c.session_id = s.session_id and c.principal <> 'spawn-dispatch') as episode,
+    exists (select 1 from spawn_commands c
+             where c.session_id = s.session_id and c.state <> 'finished') as open_command,
+    (select coalesce(jsonb_agg(jsonb_build_object(
+              'key', c.idempotency_key,
+              'text', c.action ->> 'text',
+              'created_at_ms', c.created_at_ms,
+              'finished_at_ms', c.finished_at_ms,
+              'succeeded', c.succeeded) order by c.id), '[]'::jsonb)
+       from spawn_commands c
+      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.created_at_ms > spawn_now_ms() - 86400000) as dispatched
+  from agent_status s
+  join spawn_session_state p using (session_id)
+  where s.agent_id like 'agent\_worker\_%' or s.session_id = 'session_supervisor'
+) w";
+
 impl PostgresStore {
+    /// Facts for the dispatcher, as JSON rows.
+    pub fn dispatch_facts(&self) -> Result<Value, StoreError> {
+        let mut client = self.lock();
+        let row = client
+            .query_one(DISPATCH_FACTS, &[])
+            .map_err(|error| backend(&error))?;
+        Ok(row.get(0))
+    }
+
     /// Every session with its judgement, task and activity, supervisor first.
     pub fn fleet_board(&self) -> Result<Value, StoreError> {
         let mut client = self.lock();
-        let row = client.query_one(AGENTS, &[]).map_err(|error| backend(&error))?;
+        let row = client
+            .query_one(AGENTS, &[])
+            .map_err(|error| backend(&error))?;
         Ok(row.get(0))
     }
 
     /// Fleet health and the decision ladder over the last hour and day.
     pub fn fleet_health(&self) -> Result<Value, StoreError> {
         let mut client = self.lock();
-        let row = client.query_one(HEALTH, &[]).map_err(|error| backend(&error))?;
+        let row = client
+            .query_one(HEALTH, &[])
+            .map_err(|error| backend(&error))?;
         Ok(row.get(0))
     }
 

@@ -16,6 +16,7 @@ spawn-core.workspace = true
 spawn-postgres.workspace = true
 spawn-host.workspace = true
 spawn-jev.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tiny_http = "0.12.0"
 

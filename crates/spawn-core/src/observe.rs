@@ -380,6 +380,22 @@ pub trait ObservationContext: Send + Sync {
     fn task(&self, session: &SessionId) -> Option<String>;
 }
 
+/// Whether the screen ends with a question for a person: a line that starts
+/// with `HUMAN:` (after an optional `claude:` speaker tag), below the last
+/// line the user typed. An answered question no longer counts.
+pub fn asks_human(screen_tail: &str) -> bool {
+    let lines: Vec<&str> = screen_tail.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with("you:"))
+        .map_or(0, |index| index + 1);
+    lines[start..].iter().any(|line| {
+        let text = line.trim_start();
+        let text = text.strip_prefix("claude:").map_or(text, str::trim_start);
+        text.starts_with("HUMAN:")
+    })
+}
+
 fn tail_chars(text: &str, limit: usize) -> String {
     let count = text.chars().count();
     text.chars().skip(count.saturating_sub(limit)).collect()
@@ -533,6 +549,27 @@ fn key_of(observation: &Observation) -> WrittenKey {
         observation.attention,
         observation.ambiguity.is_some(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asks_human;
+
+    #[test]
+    fn a_question_for_a_person_is_seen_until_answered() {
+        assert!(asks_human(
+            "you: deploy it\nclaude: Done with the build.\nclaude: HUMAN: which region?\n$ "
+        ));
+        assert!(asks_human(
+            "claude: The key is missing.\nHUMAN: please add it\n"
+        ));
+        assert!(!asks_human(
+            "claude: HUMAN: which region?\nyou: eu-west\nclaude: deploying\n"
+        ));
+        assert!(!asks_human(
+            "claude: a human should look at the HUMAN: tag docs\n"
+        ));
+    }
 }
 
 /// Per-session observation state.
@@ -758,6 +795,10 @@ impl Observer {
                     return Ok(0);
                 }
                 let (mut observation, failed) = self.ask_model(&input, ambiguity, guess, seq);
+                if input.screen_tail.as_deref().is_some_and(asks_human) {
+                    observation.asks_human = true;
+                    observation.attention = true;
+                }
                 if failed {
                     (observation, previous_ask, failures.saturating_add(1))
                 } else {
