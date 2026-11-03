@@ -26,6 +26,10 @@ use crate::{Flags, env_or, env_value, open_store};
 /// Rejections in a row that stop the loop.
 const HALT_AFTER: u32 = 3;
 
+/// `evolve` result when the backlog has no open task. The CLI reports it as
+/// success; `spawn rsi-loop` waits longer before looking again.
+pub(crate) const IDLE: i32 = 3;
+
 /// Guard the candidate tree against runaway growth.
 const MAX_PATCH_BYTES: usize = 1 << 20;
 
@@ -275,7 +279,7 @@ fn start_iteration(
     let solved = store.rsi_solved_tasks().map_err(describe_error)?;
     let Some(task) = next_open_task(store, backlog, &solved)? else {
         println!("evolve: backlog has no open task");
-        return Ok(0);
+        return Ok(IDLE);
     };
     let iteration = state.iteration + 1;
     let prompt = task_prompt(store, &task)?;
