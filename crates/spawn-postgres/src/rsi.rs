@@ -41,6 +41,8 @@ pub struct RsiState {
     /// Scenario files the previous round saw. The next round must not fall
     /// below it. Zero means the floor is not set yet.
     pub scenario_count: u32,
+    /// Aborts in a row, toward the infrastructure halt.
+    pub infra_failures: u32,
 }
 
 /// Resource use of one iteration.
@@ -97,6 +99,7 @@ fn state_of(row: &Row) -> RsiState {
         iteration: number(row, "iteration"),
         consecutive_rejected: number(row, "consecutive_rejected"),
         scenario_count: number(row, "scenario_count"),
+        infra_failures: number(row, "infra_failures"),
     }
 }
 
@@ -352,7 +355,8 @@ impl PostgresStore {
         let changed = transaction
             .execute(
                 "update rsi_state
-                    set baseline_commit = $2, consecutive_rejected = 0
+                    set baseline_commit = $2, consecutive_rejected = 0,
+                        infra_failures = 0
                   where id = 1 and baseline_commit = $1",
                 &[&expected, &candidate],
             )
@@ -394,6 +398,18 @@ impl PostgresStore {
                 .execute(
                     "update rsi_state
                         set consecutive_rejected = consecutive_rejected + 1
+                      where id = 1",
+                    &[],
+                )
+                .map_err(|error| backend(&error))?;
+        }
+        // An abort means the candidate was never judged. Counting it as a
+        // rejection would feed a good patch back as a failure.
+        if changed == 1 && phase == "Aborted" {
+            transaction
+                .execute(
+                    "update rsi_state
+                        set infra_failures = infra_failures + 1
                       where id = 1",
                     &[],
                 )
