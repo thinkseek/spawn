@@ -34,6 +34,7 @@ fn input() -> JudgeInput {
         quiet_ms: None,
         task: None,
         screen_tail: None,
+        perpetual: false,
     }
 }
 
