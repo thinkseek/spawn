@@ -9,11 +9,18 @@
 //! (Claude `tool_use_id`). Turn and prompt events have no such id; giving them
 //! a constant key would drop every event after the first.
 
+use std::borrow::Cow;
+use std::fmt;
+use std::marker::PhantomData;
+
 use serde::Deserialize;
+use serde::de::{Deserializer, Visitor};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::event::{Engine, EventKind};
+
+mod scan;
 
 /// Maximum characters kept from engine error text.
 const MAX_ERROR_CHARS: usize = 2000;
@@ -54,17 +61,77 @@ fn required<T>(value: Option<T>, event: &str, field: &'static str) -> Result<T, 
     })
 }
 
+/// A JSON string borrowed from the payload when it has no escapes.
+///
+/// `Cow<str>` alone always allocates when deserialized inside an `Option`;
+/// this wrapper borrows wherever the input allows, so fields that are only
+/// matched or ignored cost no allocation.
+#[derive(Debug)]
+struct Str<'a>(Cow<'a, str>);
+
+impl Str<'_> {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_string(self) -> String {
+        self.0.into_owned()
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Str<'a> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StrVisitor<'a>(PhantomData<Str<'a>>);
+
+        impl<'de: 'a, 'a> Visitor<'de> for StrVisitor<'a> {
+            type Value = Str<'a>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                text: &'de str,
+            ) -> Result<Self::Value, E> {
+                Ok(Str(Cow::Borrowed(text)))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(Str(Cow::Owned(text.to_owned())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(Str(Cow::Owned(text)))
+            }
+        }
+
+        deserializer.deserialize_str(StrVisitor(PhantomData))
+    }
+}
+
+fn owned(value: Option<Str<'_>>) -> Option<String> {
+    value.map(Str::into_string)
+}
+
 #[derive(Debug, Deserialize)]
-struct ClaudeHook {
-    hook_event_name: String,
-    session_id: Option<String>,
-    transcript_path: Option<String>,
-    tool_name: Option<String>,
-    tool_use_id: Option<String>,
+struct ClaudeHook<'a> {
+    #[serde(borrow)]
+    hook_event_name: Str<'a>,
+    #[serde(borrow)]
+    session_id: Option<Str<'a>>,
+    #[serde(borrow)]
+    transcript_path: Option<Str<'a>>,
+    #[serde(borrow)]
+    tool_name: Option<Str<'a>>,
+    #[serde(borrow)]
+    tool_use_id: Option<Str<'a>>,
     duration_ms: Option<u64>,
     error: Option<Value>,
-    notification_type: Option<String>,
-    reason: Option<String>,
+    #[serde(borrow)]
+    notification_type: Option<Str<'a>>,
+    #[serde(borrow)]
+    reason: Option<Str<'a>>,
 }
 
 fn error_text(error: Option<&Value>) -> String {
@@ -77,21 +144,34 @@ fn error_text(error: Option<&Value>) -> String {
 
 /// Map one Claude Code hook payload.
 pub fn claude_hook(payload: &str) -> Result<Option<Normalized>, IngestError> {
-    let hook: ClaudeHook = serde_json::from_str(payload)?;
+    let hook = match scan::claude(payload) {
+        Some(hook) => hook,
+        None => serde_json::from_str(payload)?,
+    };
     let name = hook.hook_event_name.as_str();
-    let tool_key = |suffix: &str| hook.tool_use_id.as_ref().map(|id| format!("{id}:{suffix}"));
+    // The tool key is `<tool_use_id>:<suffix>`; the id is required for every
+    // event that has a key, so it is checked before the key is built.
+    let tool_id = |suffix: &str| -> Result<(String, Option<String>), IngestError> {
+        let id = required(hook.tool_use_id.as_ref(), name, "tool_use_id")?.as_str();
+        // Built by hand: `format!` costs more than the rest of the mapping.
+        let mut key = String::with_capacity(id.len() + 1 + suffix.len());
+        key.push_str(id);
+        key.push(':');
+        key.push_str(suffix);
+        Ok((id.to_owned(), Some(key)))
+    };
     let (kind, source_event_id) = match name {
         "SessionStart" => (
             EventKind::NativeSessionStarted {
                 engine: Engine::Claude,
-                native_session_id: required(hook.session_id.clone(), name, "session_id")?,
-                transcript_path: hook.transcript_path.clone(),
+                native_session_id: required(hook.session_id, name, "session_id")?.into_string(),
+                transcript_path: owned(hook.transcript_path),
             },
             None,
         ),
         "SessionEnd" => (
             EventKind::NativeSessionEnded {
-                reason: hook.reason.clone(),
+                reason: owned(hook.reason),
             },
             None,
         ),
@@ -100,32 +180,43 @@ pub fn claude_hook(payload: &str) -> Result<Option<Normalized>, IngestError> {
             EventKind::NotificationReceived {
                 notification_type: hook
                     .notification_type
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
+                    .map_or_else(|| "unknown".to_string(), Str::into_string),
             },
             None,
         ),
-        "PreToolUse" => (
-            EventKind::ToolStarted {
-                tool_name: required(hook.tool_name.clone(), name, "tool_name")?,
-                tool_use_id: required(hook.tool_use_id.clone(), name, "tool_use_id")?,
-            },
-            tool_key("started"),
-        ),
-        "PostToolUse" => (
-            EventKind::ToolCompleted {
-                tool_use_id: required(hook.tool_use_id.clone(), name, "tool_use_id")?,
-                duration_ms: hook.duration_ms,
-            },
-            tool_key("completed"),
-        ),
-        "PostToolUseFailure" => (
-            EventKind::ToolFailed {
-                tool_use_id: required(hook.tool_use_id.clone(), name, "tool_use_id")?,
-                error: error_text(hook.error.as_ref()),
-            },
-            tool_key("failed"),
-        ),
+        "PreToolUse" => {
+            let tool_name = required(hook.tool_name.as_ref(), name, "tool_name")?
+                .as_str()
+                .to_owned();
+            let (tool_use_id, key) = tool_id("started")?;
+            (
+                EventKind::ToolStarted {
+                    tool_name,
+                    tool_use_id,
+                },
+                key,
+            )
+        }
+        "PostToolUse" => {
+            let (tool_use_id, key) = tool_id("completed")?;
+            (
+                EventKind::ToolCompleted {
+                    tool_use_id,
+                    duration_ms: hook.duration_ms,
+                },
+                key,
+            )
+        }
+        "PostToolUseFailure" => {
+            let (tool_use_id, key) = tool_id("failed")?;
+            (
+                EventKind::ToolFailed {
+                    tool_use_id,
+                    error: error_text(hook.error.as_ref()),
+                },
+                key,
+            )
+        }
         "Stop" => (
             EventKind::TurnStopped {
                 input_tokens: None,
@@ -148,14 +239,17 @@ pub fn claude_hook(payload: &str) -> Result<Option<Normalized>, IngestError> {
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexLine {
-    #[serde(rename = "type")]
-    line_type: String,
-    thread_id: Option<String>,
+struct CodexLine<'a> {
+    #[serde(rename = "type", borrow)]
+    line_type: Str<'a>,
+    #[serde(borrow)]
+    thread_id: Option<Str<'a>>,
     usage: Option<CodexUsage>,
     error: Option<Value>,
-    message: Option<String>,
-    item: Option<CodexItem>,
+    #[serde(borrow)]
+    message: Option<Str<'a>>,
+    #[serde(borrow)]
+    item: Option<CodexItem<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,11 +259,13 @@ struct CodexUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexItem {
-    id: String,
-    #[serde(rename = "type")]
-    item_type: String,
-    status: Option<String>,
+struct CodexItem<'a> {
+    #[serde(borrow)]
+    id: Str<'a>,
+    #[serde(rename = "type", borrow)]
+    item_type: Str<'a>,
+    #[serde(borrow)]
+    status: Option<Str<'a>>,
     error: Option<Value>,
 }
 
@@ -182,7 +278,7 @@ const CODEX_TOOL_ITEMS: [&str; 4] = [
     "web_search",
 ];
 
-fn codex_error(error: Option<&Value>, message: Option<&String>) -> String {
+fn codex_error(error: Option<&Value>, message: Option<&str>) -> String {
     match (error, message) {
         (Some(Value::Object(object)), _) => {
             object.get("message").and_then(Value::as_str).map_or_else(
@@ -196,23 +292,23 @@ fn codex_error(error: Option<&Value>, message: Option<&String>) -> String {
     }
 }
 
-fn codex_item(line_type: &str, item: CodexItem) -> Option<EventKind> {
+fn codex_item(line_type: &str, item: CodexItem<'_>) -> Option<EventKind> {
     if !CODEX_TOOL_ITEMS.contains(&item.item_type.as_str()) {
         return None;
     }
     match line_type {
         "item.started" => Some(EventKind::ToolStarted {
-            tool_name: item.item_type,
-            tool_use_id: item.id,
+            tool_name: item.item_type.into_string(),
+            tool_use_id: item.id.into_string(),
         }),
-        "item.completed" if item.status.as_deref() == Some("failed") => {
+        "item.completed" if item.status.as_ref().map(Str::as_str) == Some("failed") => {
             Some(EventKind::ToolFailed {
-                tool_use_id: item.id,
+                tool_use_id: item.id.into_string(),
                 error: codex_error(item.error.as_ref(), None),
             })
         }
         "item.completed" => Some(EventKind::ToolCompleted {
-            tool_use_id: item.id,
+            tool_use_id: item.id.into_string(),
             duration_ms: None,
         }),
         _ => None,
@@ -224,12 +320,15 @@ pub fn codex_line(line: &str) -> Result<Option<Normalized>, IngestError> {
     if line.trim().is_empty() {
         return Ok(None);
     }
-    let parsed: CodexLine = serde_json::from_str(line)?;
+    let parsed = match scan::codex(line) {
+        Some(parsed) => parsed,
+        None => serde_json::from_str(line)?,
+    };
     let name = parsed.line_type.as_str();
     let kind = match name {
         "thread.started" => Some(EventKind::NativeSessionStarted {
             engine: Engine::Codex,
-            native_session_id: required(parsed.thread_id.clone(), name, "thread_id")?,
+            native_session_id: required(parsed.thread_id, name, "thread_id")?.into_string(),
             transcript_path: None,
         }),
         "turn.started" => Some(EventKind::MessageReceived),
@@ -238,7 +337,10 @@ pub fn codex_line(line: &str) -> Result<Option<Normalized>, IngestError> {
             output_tokens: parsed.usage.as_ref().and_then(|usage| usage.output_tokens),
         }),
         "turn.failed" | "error" => Some(EventKind::TurnFailed {
-            error: codex_error(parsed.error.as_ref(), parsed.message.as_ref()),
+            error: codex_error(
+                parsed.error.as_ref(),
+                parsed.message.as_ref().map(Str::as_str),
+            ),
         }),
         "item.started" | "item.completed" => {
             let item = required(parsed.item, name, "item")?;
