@@ -104,7 +104,7 @@ export function LiveStatus({
         className="inline-flex h-6 items-center gap-1.5 rounded-md bg-destructive/12 px-2 text-caption font-medium text-destructive ring-1 ring-destructive/25 ring-inset"
       >
         <WifiOff size={12} />
-        Disconnected
+        {error.startsWith("HTTP 401") ? "Token needed" : "Disconnected"}
       </span>
     );
   }
