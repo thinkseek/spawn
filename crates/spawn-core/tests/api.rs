@@ -488,6 +488,40 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
 }
 
 #[test]
+fn an_engine_that_exits_between_the_two_reads_is_exited_not_lost() {
+    let store = store();
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    );
+    let execution = ExecutionId::for_command(CommandId(1));
+    let terminal = TerminalName::for_execution(&execution);
+    store.set_pane(&terminal, READY);
+    submit_start(&store, "list the files");
+    bridge.tick().expect("tick succeeds");
+    // The exit file is absent when the Bridge reads it, then the engine
+    // writes it and its pane closes before the liveness check.
+    store.exit_on_next_check(
+        &terminal,
+        &format!("{}/.spawn/exit-{execution}", any_workspace().path()),
+        "0",
+    );
+    bridge.tick().expect("tick");
+    let ended = store
+        .read_global(GlobalPosition(0), 200)
+        .expect("read")
+        .into_iter()
+        .find_map(|record| match record.event.kind {
+            EventKind::ExecutionEnded { cause, exit_code } => Some((cause, exit_code)),
+            _ => None,
+        });
+    assert_eq!(ended, Some((EndCause::Exited, Some(0))));
+}
+
+#[test]
 fn a_prompt_that_cannot_be_typed_ends_the_execution_as_lost() {
     let store = store();
     let mut config = BridgeConfig::new("tester");
