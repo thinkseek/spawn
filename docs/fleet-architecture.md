@@ -43,11 +43,11 @@ Three ideas carry the design:
  │               → observation events (state, who decided, why)          │
  ├──────────────────────────────────────────────────────────────────────┤
  │ 2 Event log   PostgreSQL: spawn_events (truth), spawn_commands        │
- │               (queue), grants, views; rsi_* controller tables         │
+ │               (queue), grants, views; the control stream (§10.1)      │
  ├──────────────────────────────────────────────────────────────────────┤
  │ 1 Runtime     Bridge: start / input / resume / stop                   │
  │               engines (Claude Code, Codex) in tmux + git workspaces   │
- │               hooks, JSON lines, pane tail → typed events             │
+ │               transcripts, JSON lines, screen, exit files → events    │
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,7 +56,7 @@ No layer calls another layer's process directly; they meet in the log.
 
 | Layer | Exists today | Changes |
 | --- | --- | --- |
-| 1 Runtime | Bridge, tmux, git, hooks | none |
+| 1 Runtime | Bridge, tmux, git, transcripts | none |
 | 2 Event log | events, commands, grants, views | observation payload grows (additive); supervisor role |
 | 3 Observation | Observer with one judge per deployment | two tiers: rules first, Jev on ambiguity |
 | 4 Control | RSI controller | supervisor session, notifier |
@@ -64,7 +64,7 @@ No layer calls another layer's process directly; they meet in the log.
 
 ## 2. Observation: rules first, Jev on ambiguity
 
-The Observer folds facts per session (hooks, executions, screen readings) as
+The Observer folds facts per session (transcript events, executions, screen readings) as
 today. Each time a session's facts change, and every 30 s while an execution
 runs, it classifies:
 
@@ -194,7 +194,7 @@ it, on the same ladder.
   principal `human`; it is the event the whole system tries to make rarer.
 - **Authority** comes from grants and DB roles. The dispatcher and the
   supervisor submit as their own principals and only for worker sessions.
-  Neither can write observations, runtime events or `rsi_*`.
+  Neither can write observations or runtime events.
 - **Deterministic controllers** (the RSI `evolve`) own their sessions and
   appear in the fleet as members.
 
@@ -335,13 +335,12 @@ Known edges, each with its rule:
 | The UI's live terminal reads tmux | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
 | The supervisor's native transcript lives on the host (`~/.claude`) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
 | Code lives in git | Artifact storage; every commit is referenced from an event |
-| `rsi_*` tables are mutable rows, not events | Storage, owned by one controller; forced by the closed `EventKind` |
 
 - The event log is the only state; every process is restartable.
 - `EventKind` stays closed; observation fields are additive.
 - Facts > rules > Jev; observation never acts; Jev alone triggers only reversible, bounded actions.
-- Agent panes write through restricted logins: `spawn_terminal` (workers) and `spawn_supervisor` may append only engine events by name (no observations, no controller facts, `execution.ended` only as the runner's own exit). The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing.
-- Known limit: all panes share one uid, one login and one tmux server. An agent can append events for another session, or simply `tmux send-keys` into another pane. The DB roles stop a pane from forging controller facts; they do not isolate agents from each other. Isolation between agents needs container mode (`SPAWN_EXEC_IMAGE`) or one uid per agent. The same holds for the RSI gate, which runs candidate code on the host (see docs/rsi.md §5).
+- Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the runner's copy of Codex output, the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. `spawn_terminal` is retired. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing; it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. The restricted logins' passwords are derived from the owner's (SHA-256 over the owner's password and the role name, `spawn_postgres::role_url`) and set by every migration, so nothing stores them and only a holder of the owner's credentials can form them.
+- Known limit: all panes share one uid and one tmux server. A worker cannot write the log, but it can write the files the Bridge reads for another session (a transcript, an exit file), read the supervisor pane's login from its environment, or simply `tmux send-keys` into another pane. Holding no login stops a worker from forging facts through the database; it does not isolate agents from each other. Isolation between agents needs container mode (`SPAWN_EXEC_IMAGE`) or one uid per agent. The same holds for the RSI gate, which runs candidate code on the host (see docs/rsi.md §5).
 - RSI keeps its black-box gate, host-side commit, baseline compare-and-swap and halt rules.
 
 ## 7. MVP: the minimal closed loop
@@ -411,7 +410,7 @@ Open items:
 3. Dispatcher with rules + Jev playbook; roles and grants per principal.
 4. Supervisor session with `spawn fleet` / `spawn tail`; digests from the dispatcher.
 5. Experience views, `spawn corpus export`, replay commands.
-6. RSI objectives over the corpus (rules coverage first), replacing the ingest-speed demo objective.
+6. RSI objectives over the corpus (rules coverage first). The ingest-speed demo objective is retired: it measured the hook parser, which is gone.
 
 ## 9. Decisions on §3.2 (2026-11-04)
 
@@ -561,6 +560,8 @@ Each step is tested red, then green, gated, and committed.
   - Both old objectives were imported as landed, with objective 2 at
     1021 ns against its 1,100 ns target, so the integrator is idle until the
     backlog gets a new objective.
+  - Objective 2 is since retired with its scenario and bench: it measured
+    the hook parser, which the transcript reader replaced.
   - `spawn-rsi` and `repo.git` are retired; their units and the repository
     were moved to `~/.local/share/spawn-rsi/backups/`.
   - The supervisor's default repository is now the scratch repository.
@@ -575,7 +576,7 @@ Each step is tested red, then green, gated, and committed.
     documented in `crates/spawn-cli/src/serve.rs`.
   - `/api/rsi/task/<id>` replaces `/api/rsi/iteration/<n>`; `/api/rsi/pane`
     shows the mission resident's terminal.
-  - Nothing reads `rsi_*` any more. The tables stay as history.
+  - Nothing reads `rsi_*` any more, and the tables are dropped.
   - The integrator's advisory lock moved into the missions code, with the
     old controller's key, so the two could never run at once.
   - `spawn mission import-rsi` is gone: its one import ran.
