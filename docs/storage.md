@@ -77,7 +77,11 @@ files, a chunk fetch.
   retried with backoff, and what still waits pushed when the store drops (a
   one-shot `spawn tick`). Chunks in R2 (phase 3).
 - **Main into branches automatically**: right after the checkpoint of a turn
-  end, never while a turn runs, when the source's `main` moved (the mirror's
+  end, and on an idle live execution (no turn open, nothing read that asks for
+  a checkpoint, the screen last read ready) at most every 30 s by the Bridge's
+  clock, so an agent already idle when the gate reports a conflict finds the
+  markers within about 30 s; never while a turn runs or a prompt is typed.
+  When the source's `main` moved (the mirror's
   `main` is fetched at most every 30 s for this), it is merged into the
   agent's branch (`merge-tree --attr-source=main`, so the rules come from
   `main`, which only the gate moves; the integrator lands with the same
