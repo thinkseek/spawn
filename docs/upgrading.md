@@ -11,6 +11,7 @@ be replaced while it runs and which need the engine to stop.
 | runner | Bridge `launch` | parent of the engine; writes its exit file | none |
 | Bridge | `spawn tick` or `spawn loop` | one tick or the loop | session map, log cursor, transcript read offsets, last screen reading |
 | Observer | same process as the Bridge | same | log cursor, per-session tracking |
+| dispatcher and liveness rule | `spawn loop` | the loop | none: idempotency keys and digest markers are in the commands they submitted |
 | integrator | `spawn integrate` | the process | none |
 | UI server | `spawn serve` | the process | none |
 
@@ -23,12 +24,15 @@ These hold no state that is not rebuildable.
   pane while the Bridge is down; the next tick reads its transcript from the
   start (event keys make a second read a no-op) and its exit file, if the
   engine ended meanwhile.
+- **Dispatcher and liveness rule.** They decide from the log on every pass;
+  their idempotency keys derive from the facts, so a restarted loop does not
+  submit the same command twice.
 - **Integrator.** Its state is the control stream of the event log (task and
   mission rows are folds of it). It records a verdict before it moves git, so
   a killed integrator resumes from the recorded state.
-- **`spawn hook`.** A no-op. Engines started by a build that still installed
-  hooks call it by absolute path on every event; the replaced binary accepts
-  and ignores the payload, and their events come from the transcript.
+- **`spawn hook`.** A no-op that reads and discards standard input. Spawn
+  configures no hooks; an engine whose settings name it calls it by absolute
+  path, and its events come from the transcript.
 - **UI server.** Read-only. No writes exist in `spawn serve`.
 
 ## Cold: needs the execution to end
@@ -43,13 +47,13 @@ These hold no state that is not rebuildable.
 
 These are not about process lifetime. They break when two versions meet.
 
-1. **`EventKind` is a closed enum.** A new event name written by an upgraded
-   Bridge or Observer, read by an older one, produces `StoreError::Corrupt`.
+1. **`EventKind` is a closed enum.** An event name written by one version of the
+   Bridge or Observer and read by a version without it produces `StoreError::Corrupt`.
    The next tick exits 1. Every process that reads the log must therefore
    carry the same enum.
 2. **The schema.** `migrate()` runs `create or replace` on every connect. An
-   additive column or view is safe for an older reader. A removed or renamed
-   column is not. The resident loop holds one connection, so a new schema takes
+   additive column or view is safe for a reader built before it. A removed or renamed
+   column is not. `spawn loop` holds one connection, so a migrated schema takes
    effect on its next connection, not on the running one.
 3. **The SQL functions.** `spawn_append`, `spawn_submit`, `spawn_claim` and
    `spawn_finish` keep the ordering guarantees. A running transaction sees one
@@ -59,12 +63,11 @@ These are not about process lifetime. They break when two versions meet.
    with. It writes the exit code to `SPAWN_EXIT_FILE` (`.spawn/exit-<execution>`
    in the workspace) and, for Codex, a copy of the output to
    `SPAWN_ENGINE_OUTPUT`; the Bridge reads both, so their paths and format
-   must stay the same across versions. An engine started before the transcript
-   reader has no exit file (its runner wrote through the retired
-   `spawn_terminal` login); the Bridge ends it as `Lost` once its pane is gone.
+   must stay the same across versions. An execution with no exit file is
+   ended as `Lost` once its pane is gone.
 5. **The Claude transcript.** Its format is the engine's. `claude_line` skips
-   lines it does not know, so a new engine release adds no failure, but a
-   renamed field silently drops the events it carried.
+   lines it does not know, so an engine release that adds line types causes
+   no failure, but a renamed field silently drops the events it carried.
 6. **The prompt contract.** Delivery writes the task prompt and the
    `.spawn/report.md` convention. The engine reads them as plain text. A
    change here is hot for the dispatcher and cold for the engine only in that
@@ -76,17 +79,28 @@ These are not about process lifetime. They break when two versions meet.
 - The Observer, its judge and its thresholds.
 - The UI and the documentation.
 
-## What the gate must reject
+## What a candidate must not change
 
 A candidate that changes any of these cannot be judged while the loop runs,
 because the change breaks the reader that judges it:
 
-- `EventKind` variants (adding one is safe only after every writer is
-  upgraded).
+- `EventKind` variants (adding one is safe only once every reader carries
+  it).
 - Destructive changes to `crates/spawn-postgres/sql/schema.sql`.
-- The screen-reader markers, when the installed engine version still prints
-  the old ones. Extending the marker list is safe; replacing it is not.
+- The screen-reader markers the installed engine prints. Extending the
+  marker list is safe; replacing it is not.
 
-`scripts/rsi/gate.sh` (formerly `judge-candidate.sh`) builds both the baseline and the candidate
-into separate trees, so a candidate that fails to build, or that changes a
-coupled boundary, is rejected before the baseline moves.
+`scripts/rsi/gate.sh` builds the base and the candidate in separate trees and
+runs every check on the candidate, so a candidate that fails to build or
+breaks a scenario is rejected before `main` moves. The gate has no check
+aimed at the boundaries above: the e2e and black-box scenarios catch a break
+only where they exercise it.
+
+## Deploying
+
+`deploy/deploy.sh` replaces the binary of the live fleet on this host: a
+backup, a release build, the binary swapped by rename (`spawn.prev` kept),
+then, with `spawn-integrate` stopped, the schema migrated and the missions
+repository's `main` moved forward, and finally `spawn-loop`,
+`spawn-integrate` and `spawn-serve` restarted. Details in
+[deploy/systemd/README.md](../deploy/systemd/README.md#deploying).

@@ -1,7 +1,7 @@
 # PostgreSQL backups to Cloudflare R2
 
-Storage phase 3a ([docs/storage.md](../../docs/storage.md)). Once a day the
-event log (the `spawn` database: `spawn_events`, `spawn_commands`, missions,
+The event log's off-host copy ([docs/storage.md](../../docs/storage.md),
+"Where state lives"). Once a day the event log (the `spawn` database: `spawn_events`, `spawn_commands`, missions,
 tasks, everything in it) is dumped, checked, encrypted on this host and
 uploaded to R2, where **no key on this host can delete or overwrite it**
 before it ages out.
@@ -26,7 +26,7 @@ Retention is entirely R2's: the script never deletes.
 | `postgres/weekly/` | the first good backup of each ISO week (UTC) | 56 days | 60 days | ~9 |
 | `postgres/monthly/` | the first good backup of each month (UTC) | 365 days | 400 days | ~13 |
 | `postgres/suspect/` | dumps that failed the plausibility check | none | 30 days | normally 0 |
-| `postgres/spawn-*` | the first two days' flat layout | none | 15 days | 1, until it expires |
+| `postgres/spawn-*` | the flat layout the first backups used, before the prefixes above | none | 15 days | 0 once expired |
 | `locktest/` | throwaway probes to prove the lock works | 1 day | 2 days | 0-1 |
 
 "First of the week/month" rather than "Sunday's/the 1st's": a host that was
@@ -39,8 +39,8 @@ cf r2 buckets lifecycle update spawn-store --rules @deploy/backup/r2-lifecycle-r
 cf r2 buckets locks get spawn-store; cf r2 buckets lifecycle get spawn-store
 ```
 
-Each `update` replaces the whole rule set. Verified 2026-11-04 with the
-host's S3 key: `DELETE` and an overwriting `PUT` of a locked object return
+Each `update` replaces the whole rule set. Tested with the host's S3 key:
+`DELETE` and an overwriting `PUT` of a locked object return
 `409 ObjectLockedByBucketPolicy`; reading or writing the bucket's lifecycle
 returns `403 AccessDenied`.
 
@@ -119,7 +119,7 @@ removed at start. It prints the row counts of `spawn_events`,
 (read-only transactions) and checks `spawn_events` against the count recorded
 at upload. It refuses if the drill server has the live server's system
 identifier or postmaster start time. Nothing reaches the shared test server.
-Run it after any change here and now and then.
+Run it after any change here, and periodically.
 
 ## Restoring for real
 
@@ -142,16 +142,15 @@ pg_restore --no-owner -d '<url of spawn_restored>' spawn.dump
 ```
 
 (`--user` on the command line shows the key in `ps`; fine for a one-off by
-hand, which is why the scripts do not do it.) The one flat-layout object,
-`postgres/spawn-20261104-130240.dump.gpg` (expires ~2026-11-19), was made by
-pg_dump 18 and needs pg_restore 17+; everything under `daily/`, `weekly/`,
-`monthly/` is a PostgreSQL 16 archive.
+hand, which is why the scripts do not do it.) A flat-layout object
+(`postgres/spawn-*`) was made by pg_dump 18 and needs pg_restore 17+;
+everything under `daily/`, `weekly/`, `monthly/` is a PostgreSQL 16 archive.
 
 ## Cost
 
 Inside R2's free tier (10 GB-month storage, 1M Class A and 10M Class B
 operations a month, no egress fees; lifecycle rules and bucket locks are
-free). A backup is about 0.27 MB today and ~37 objects are held (15 daily, 9
-weekly, 13 monthly): about 10 MB. A run is 1-3 PUTs (Class A); no list, no
+free). The store holds ~37 objects (15 daily, 9 weekly, 13 monthly): about
+10 MB at 0.27 MB per dump. A run is 1-3 PUTs (Class A); no list, no
 delete. A drill is 1 ListObjectsV2 (Class A) and 1 GET (Class B). About 35
 Class A operations a month. At 100 MB per dump the store would hold ~3.7 GB.

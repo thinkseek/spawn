@@ -1,6 +1,6 @@
 # Spawn 架构总览
 
-[English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md)
+[English README](../README.md) · [中文 README](../README.zh-CN.md) · [技术方案与接口契约](./design.md) · [视图层设计](./view-architecture.md) · [舰队架构](./fleet-architecture.md) · [存储](./storage.md) · [RSI](./rsi.md) · [升级](./upgrading.md)
 
 结论：Spawn 用 5 个 Rust crate 连接现成组件，不实现 Agent 推理框架。Claude Code 提供计算，git 提供工作区，PostgreSQL 保存事件并对外提供 SQL 视图，Jev 判定语义状态，`spawn` 二进制只做装配。全部代码同步阻塞，不使用 async。
 
@@ -11,7 +11,7 @@
 | 计算 | Claude Code、Codex CLI | 启动进程、投递提示、读取 transcript、屏幕与退出文件 |
 | 工作区 | git | 裸仓库加每分支一份工作树，`git archive` 导出、`commit-tree` 收口 |
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
-| 语义状态 | 判定模型 `/v1/systemone` 或内置规则 | 发一次 HTTP 请求，写一条 observation |
+| 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时用内置启发式判定） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
 | 终端 | tmux | 建会话、输入文本、抓取屏尾 |
 
@@ -21,10 +21,10 @@ Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎�
 
 | crate | 职责 | 依赖 |
 | --- | --- | --- |
-| `spawn-core` | 类型、端口、事件归一、Bridge、Observer、内存实现、一致性套件。零 IO | serde、serde_json、thiserror |
-| `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`schema.sql` | spawn-core、postgres |
+| `spawn-core` | 类型、端口、事件归一、Bridge、Observer；内存实现与一致性套件在 `testing` feature 后。零 IO | serde、serde_json、thiserror |
+| `spawn-postgres` | EventLog + CommandQueue 的 PG 实现、`schema.sql`、读方法 | spawn-core、postgres、sha2 |
 | `spawn-jev` | 判定 HTTP 客户端，端口在 core，实现在此 | spawn-core、serde_json |
-| `spawn-host` | tmux 与 git 工作区适配 | spawn-core |
+| `spawn-host` | tmux、git 工作区与块存储适配 | spawn-core、libc、blake3、zstd |
 | `spawn-cli` | 二进制 `spawn`，装配上述实现 | 全部 |
 
 ```mermaid
@@ -108,7 +108,7 @@ Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信
 | `agent_tasks`、`agent_executions`、`agent_artifacts`、`agent_relations` | 任务、执行、产物、父子关系 |
 | `agent_commands` | 命令视图；`insert` 经 `spawn_gateway_insert` 校验 `spawn_grants` 后入队 |
 
-视图取代早期方案的物化视图和 CDC。当前订阅方式是读取 `spawn_events` 增量；`LISTEN/NOTIFY` 尚未接入。
+视图不用物化视图和 CDC。订阅方式是读取 `spawn_events` 增量，没有 `LISTEN/NOTIFY`。
 
 ## 7. 用法
 
@@ -130,19 +130,20 @@ spawn status
 | `submit` | 写一条命令，幂等键重复则返回原命令 |
 | `tick` | 跑一轮 Bridge 与 Observer |
 | `status` | 扫描全部事件，打印每会话最新一条 observation |
-| `hook` | 读取并丢弃标准输入；仅为旧版本以 hook 启动的引擎保留 |
+| `hook` | 读取并丢弃标准输入。Spawn 不配置 hook；它只为设置里写了它的引擎存在 |
 | `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
 | `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
 | `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
 | `serve` | 常驻：只读看板与 HTTP 查询 |
 | `dispatch` | 跑一轮派发：把消息、任务、新闻送给对应会话 |
-| `mission` / `charter` / `task` / `resident` | 任务域控制流：开/关/恢复任务、章程、任务分派、常驻 worker |
+| `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
 | `judge` / `fleet` / `tail` / `corpus` | 判定、舰队概览、事件尾随、导出判定语料 |
+| `version` | 打印 `spawn <版本>` |
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | 必填 | PG 连接串 |
-| `SPAWN_GIT_REPO` | 必填 | 存放基线 commit 的裸仓库 |
+| `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
 | `SPAWN_CODEX_PROGRAM` | `codex` | Codex 可执行文件 |
@@ -163,7 +164,7 @@ scripts/rsi/gate.sh "$PWD/.git" HEAD HEAD "$PWD/rsi/scenarios"   # 唯一门禁�
 scripts/rsi/test-gate.sh                                          # 门禁自身的测试
 ```
 
-检查项都是 `rsi/scenarios/check-*.sh` 场景，见 fleet-architecture.md §10.2。
+检查项都是 `rsi/scenarios/check-*.sh` 场景，见 [fleet-architecture.md](./fleet-architecture.md) §10.2。
 
 ## 9. 依赖约束
 
