@@ -362,11 +362,14 @@ pub(crate) fn task_prompt(task: &TaskRow) -> String {
     )
 }
 
-/// What a live worker gets typed for a task: a new task, or a revision.
+/// What a live worker gets typed for a task: a new task, or a revision. A
+/// revision opens with a header no one can read as the answer to a question
+/// the worker left open (it may be typed at a BLOCKED worker's prompt).
 fn typed(task: &TaskRow) -> String {
     if task.is_revision() {
         format!(
-            "Task #{} was sent back by the supervisor: {}\nFix it, then rewrite `{REPORT}`.",
+            "{}\nTask #{} was sent back by the supervisor: {}\nFix it, then rewrite `{REPORT}`.",
+            revision_header(task.id),
             task.id,
             task.review_note.as_deref().unwrap_or("see the review")
         )
@@ -380,6 +383,13 @@ fn typed(task: &TaskRow) -> String {
             report_contract()
         )
     }
+}
+
+/// The first line of every typed revision.
+fn revision_header(task: i64) -> String {
+    format!(
+        "[Review of your report on task #{task} — this is not an answer to any question you asked]"
+    )
 }
 
 /// The prompt that resumes a session for a task; a revision also carries
@@ -719,6 +729,14 @@ mod tests {
             panic!("typed");
         };
         assert!(text.contains("tests fail"));
+        // Typed into a prompt that may hold an open question: it says first
+        // that it is no answer.
+        assert!(
+            text.starts_with(
+                "[Review of your report on task #4 — this is not an answer to any question you asked]\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
