@@ -1,0 +1,9 @@
+[
+  {"id": "Default Multipart Abort Rule", "enabled": true, "conditions": {}, "abortMultipartUploadsTransition": {"condition": {"type": "Age", "maxAge": 604800}}},
+  {"id": "postgres-daily-expire-15d", "enabled": true, "conditions": {"prefix": "postgres/daily/"}, "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 1296000}}},
+  {"id": "postgres-weekly-expire-60d", "enabled": true, "conditions": {"prefix": "postgres/weekly/"}, "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 5184000}}},
+  {"id": "postgres-monthly-expire-400d", "enabled": true, "conditions": {"prefix": "postgres/monthly/"}, "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 34560000}}},
+  {"id": "postgres-suspect-expire-30d", "enabled": true, "conditions": {"prefix": "postgres/suspect/"}, "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 2592000}}},
+  {"id": "postgres-legacy-flat-expire-15d", "enabled": true, "conditions": {"prefix": "postgres/spawn-"}, "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 1296000}}},
+  {"id": "locktest-expire-2d", "enabled": true, "conditions": {"prefix": "locktest/"}, "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 172800}}}
+]
