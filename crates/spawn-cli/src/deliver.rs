@@ -11,7 +11,9 @@
 //! - a report (`.spawn/report.md`) is collected once its worker is idle, and
 //!   moved aside so the next task starts clean;
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
-//!   so is a retired resident.
+//!   so is a retired resident. In a mission with a gate, acceptance is not
+//!   the end: the worker's workspace is the candidate, so it stays (and its
+//!   next task waits) until the work lands or the gate sends it back.
 //!
 //! Missions, reports, approvals and human messages to workers become digest
 //! items for the supervisor ([`news`]). Like the dispatcher, delivery keeps
@@ -65,12 +67,22 @@ pub(crate) struct TaskRow {
     pub(crate) charter: Option<String>,
     #[serde(default)]
     pub(crate) resident: Option<String>,
+    /// The mission has a gate: its accepted work still has to land.
+    #[serde(default)]
+    pub(crate) gated: bool,
 }
 
 impl TaskRow {
     /// Sent back by the supervisor, waiting to be delivered again.
     fn is_revision(&self) -> bool {
         self.state == TaskState::Revise
+    }
+
+    /// Nothing more happens to this task: closed, or accepted without a
+    /// gate to pass.
+    fn is_finished(&self) -> bool {
+        matches!(self.state, TaskState::Cancelled | TaskState::Landed)
+            || (self.state == TaskState::Accepted && !self.gated)
     }
 
     /// A command to this task's session that delivers or retires it.
@@ -129,11 +141,22 @@ impl Work {
             .collect()
     }
 
-    /// Sessions whose open task (delivered, under review, or sent back)
-    /// keeps the next one waiting: a revision continues in the same context,
-    /// and no other task is mixed in before the supervisor closes it.
+    /// Sessions whose open task (delivered, under review, waiting for the
+    /// gate, or landing) keeps the next one waiting: a revision continues in
+    /// the same context, and no other task is mixed in before it closes.
     pub(crate) fn blocked(&self) -> BTreeSet<&str> {
-        self.sessions_in(&[TaskState::Delivered, TaskState::Reported])
+        let mut blocked = self.sessions_in(&[
+            TaskState::Delivered,
+            TaskState::Reported,
+            TaskState::Landing,
+        ]);
+        blocked.extend(
+            self.tasks
+                .iter()
+                .filter(|task| task.state == TaskState::Accepted && task.gated)
+                .map(|task| task.session_id.as_str()),
+        );
+        blocked
     }
 
     /// Sessions with a task being worked on right now.
@@ -230,8 +253,9 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
                 }
             }
             // A finished ephemeral worker is stopped.
-            TaskState::Accepted | TaskState::Cancelled
-                if task.kind == "ephemeral" && found.is_some_and(Facts::live_and_free) =>
+            _ if task.is_finished()
+                && task.kind == "ephemeral"
+                && found.is_some_and(Facts::live_and_free) =>
             {
                 let key = format!("retire-task-{}", task.id);
                 orders.push(task.order(key, CommandAction::Stop));
@@ -239,7 +263,9 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
             TaskState::Accepted
             | TaskState::Cancelled
             | TaskState::Delivered
-            | TaskState::Reported => {}
+            | TaskState::Reported
+            | TaskState::Landing
+            | TaskState::Landed => {}
         }
     }
     for (agent, session) in &work.retired {
@@ -341,6 +367,7 @@ mod tests {
             mission_text: "Make ingest robust".to_string(),
             charter: Some("Owns spawn-core".to_string()),
             resident: Some("core".to_string()),
+            gated: false,
         }
     }
 
@@ -464,6 +491,30 @@ mod tests {
         assert_eq!(plan[0].action, CommandAction::Stop);
         let resident = task(5, TaskState::Accepted, "resident");
         assert!(orders(&work(vec![resident]), &[worker(true, true)]).is_empty());
+    }
+
+    #[test]
+    fn gated_work_keeps_its_worker_until_it_lands() {
+        let mut accepted = task(4, TaskState::Accepted, "ephemeral");
+        accepted.gated = true;
+        let next = task(6, TaskState::Assigned, "ephemeral");
+        let plan = orders(
+            &work(vec![accepted.clone(), next.clone()]),
+            &[worker(true, true)],
+        );
+        assert!(
+            plan.is_empty(),
+            "no stop, and no next task, before landing: {plan:?}"
+        );
+
+        let mut landing = accepted.clone();
+        landing.state = TaskState::Landing;
+        assert!(orders(&work(vec![landing, next.clone()]), &[worker(true, true)]).is_empty());
+
+        let mut landed = accepted;
+        landed.state = TaskState::Landed;
+        let plan = orders(&work(vec![landed]), &[worker(true, true)]);
+        assert_eq!(plan[0].action, CommandAction::Stop);
     }
 
     #[test]

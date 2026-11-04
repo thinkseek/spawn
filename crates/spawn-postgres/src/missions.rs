@@ -36,6 +36,47 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// Give a mission a gate (or take it away) and say how its tasks are
+    /// accepted: `review` or `gate`. A human's decision: owner only.
+    pub fn mission_configure(
+        &self,
+        mission: i64,
+        gate: Option<&str>,
+        accept: &str,
+        budget: Option<&Value>,
+    ) -> Result<(), StoreError> {
+        self.execute(
+            missions::MISSION_CONFIGURE,
+            &[&mission, &gate, &accept, &budget],
+        )?;
+        Ok(())
+    }
+
+    /// Clear a halted mission. A human's decision: owner only.
+    pub fn mission_resume(&self, mission: i64) -> Result<(), StoreError> {
+        self.execute(missions::MISSION_RESUME, &[&mission])?;
+        Ok(())
+    }
+
+    /// Record a gate verdict, a landing, an abort or a halt (owner only).
+    pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(missions::INTEGRATOR_RECORD, &[record])?
+            .get(0))
+    }
+
+    /// Open missions with a gate and the tasks the integrator may act on.
+    pub fn gated_missions(&self) -> Result<Value, StoreError> {
+        self.query_json(missions::GATED, &[])
+    }
+
+    /// Tool calls `session` started after `since_ms`: a task's budget.
+    pub fn tool_calls_since(&self, session: &str, since_ms: i64) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(missions::TOOL_CALLS_SINCE, &[&session, &since_ms])?
+            .get(0))
+    }
+
     /// Assign a task; returns its id.
     pub fn task_assign(
         &self,
@@ -142,11 +183,12 @@ mod tests {
     use spawn_core::mission::TaskState;
 
     /// The values allowed by the check constraint on `mission_tasks.state`,
-    /// read from the schema text.
+    /// read from the schema text: the constraint as the migration re-adds
+    /// it, which is what every database ends up with.
     fn constrained_task_states() -> Vec<String> {
         let table = crate::SCHEMA
-            .split_once("create table if not exists mission_tasks (")
-            .expect("the schema creates mission_tasks")
+            .split_once("add constraint mission_tasks_state_check")
+            .expect("the schema re-adds the state constraint")
             .1;
         let list = table
             .split_once("check (state in (")

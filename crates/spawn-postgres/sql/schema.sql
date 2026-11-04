@@ -850,7 +850,7 @@ create table if not exists mission_tasks (
     brief         text   not null,
     state         text   not null default 'assigned'
                   check (state in ('assigned', 'delivered', 'reported', 'revise',
-                                   'accepted', 'cancelled')),
+                                   'accepted', 'cancelled', 'landing', 'landed')),
     revisions     integer not null default 0,
     review_note   text,
     command_id    bigint,
@@ -861,6 +861,37 @@ create table if not exists mission_tasks (
 );
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
+
+-- Landing (§10.3). A mission with a gate (a scenarios directory in the
+-- controller's checkout) lands its tasks' work on its source: after the
+-- supervisor's review (`accept` = review) or on the gate alone (`gate`).
+-- `baseline` is where the last landing left the source's main; `halted`
+-- holds the reason a halt rule fired, until a human resumes the mission.
+alter table mission_missions add column if not exists gate text;
+alter table mission_missions add column if not exists accept text not null default 'review';
+alter table mission_missions add column if not exists budget jsonb;
+alter table mission_missions add column if not exists baseline text;
+alter table mission_missions add column if not exists halted text;
+alter table mission_missions add column if not exists scenario_floor integer not null default 0;
+alter table mission_missions add column if not exists gate_rejections integer not null default 0;
+alter table mission_missions add column if not exists gate_aborts integer not null default 0;
+alter table mission_missions drop constraint if exists mission_missions_accept_check;
+alter table mission_missions add constraint mission_missions_accept_check
+    check (accept in ('review', 'gate'));
+
+-- A task's landing: the commit the gate judged and its base, the gate's
+-- log, and, for an objective task, the backlog objective and its scenario.
+alter table mission_tasks add column if not exists base text;
+alter table mission_tasks add column if not exists candidate text;
+alter table mission_tasks add column if not exists gate_log text;
+alter table mission_tasks add column if not exists metric text;
+alter table mission_tasks add column if not exists objective integer;
+alter table mission_tasks add column if not exists scenario text;
+alter table mission_tasks add column if not exists delivered_at_ms bigint;
+alter table mission_tasks drop constraint if exists mission_tasks_state_check;
+alter table mission_tasks add constraint mission_tasks_state_check
+    check (state in ('assigned', 'delivered', 'reported', 'revise',
+                     'accepted', 'cancelled', 'landing', 'landed'));
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login.
@@ -884,6 +915,9 @@ declare
     v_type text := p_record ->> 'type';
     v_id bigint := (p_record ->> 'id')::bigint;
     v_accepted boolean;
+    v_verdict text;
+    v_mission bigint;
+    v_accept text;
 begin
     case v_type
     when 'mission.added' then
@@ -899,16 +933,72 @@ begin
          where mission_id = v_id and state in ('assigned', 'revise');
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
-                                   created_by, created_at_ms, updated_at_ms)
+                                   created_by, objective, scenario, created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
-                p_record ->> 'created_by', p_at, p_at);
+                p_record ->> 'created_by', (p_record ->> 'objective')::integer,
+                p_record ->> 'scenario', p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
+    when 'mission.configured' then
+        update mission_missions set gate = p_record ->> 'gate', accept = p_record ->> 'accept',
+                                    budget = p_record -> 'budget', updated_at_ms = p_at
+         where id = v_id;
+    when 'mission.halted' then
+        update mission_missions set halted = p_record ->> 'reason', updated_at_ms = p_at
+         where id = v_id;
+    when 'mission.resumed' then
+        -- The next gate records the source's main as the new baseline.
+        update mission_missions set halted = null, baseline = null, gate_rejections = 0,
+                                    gate_aborts = 0, updated_at_ms = p_at
+         where id = v_id;
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
+                                 delivered_at_ms = p_at, updated_at_ms = p_at
+         where id = v_id;
+    when 'task.gated' then
+        v_verdict := p_record ->> 'verdict';
+        select k.mission_id, m.accept into v_mission, v_accept
+          from mission_tasks k join mission_missions m on m.id = k.mission_id
+         where k.id = v_id;
+        update mission_tasks
+           set state = case v_verdict
+                         when 'accepted' then 'landing'
+                         when 'rejected' then 'revise'
+                         when 'conflict' then 'revise'
+                         when 'stale' then case when v_accept = 'gate' then 'reported' else 'accepted' end
+                         else state end,
+               base = coalesce(p_record ->> 'base', base),
+               candidate = case when v_verdict = 'accepted' then p_record ->> 'candidate'
+                                when v_verdict = 'aborted' then candidate end,
+               gate_log = coalesce(p_record ->> 'log', gate_log),
+               metric = case when v_verdict = 'accepted' then p_record ->> 'metric' else metric end,
+               review_note = case when v_verdict in ('rejected', 'conflict') then p_record ->> 'note'
+                                  else review_note end,
+               revisions = revisions + case when v_verdict in ('rejected', 'conflict') then 1 else 0 end,
+               updated_at_ms = p_at
+         where id = v_id;
+        update mission_missions
+           set baseline = coalesce(baseline, p_record ->> 'base'),
+               gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
+                                                when 'accepted' then 0 else gate_rejections end,
+               gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
+                                            when 'stale' then gate_aborts
+                                            else 0 end,
+               scenario_floor = greatest(scenario_floor, coalesce((p_record ->> 'scenarios')::integer, 0)),
+               updated_at_ms = p_at
+         where id = v_mission;
+    when 'task.landed' then
+        update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+         where id = (select mission_id from mission_tasks where id = v_id);
+    when 'task.aborted' then
+        -- Over budget: the work is dropped, and it counts toward the abort halt.
+        update mission_tasks set state = 'cancelled', review_note = p_record ->> 'reason',
                                  updated_at_ms = p_at
          where id = v_id;
+        update mission_missions set gate_aborts = gate_aborts + 1, updated_at_ms = p_at
+         where id = (select mission_id from mission_tasks where id = v_id);
     when 'task.reported' then
         update mission_tasks set state = 'reported', report = p_record ->> 'report',
                                  updated_at_ms = p_at
@@ -944,8 +1034,11 @@ begin
         -- A row from before the control stream, as it was.
         case p_record ->> 'table'
         when 'mission_missions' then
+            -- Columns added after the import take their defaults.
             insert into mission_missions
-            select * from jsonb_populate_record(null::mission_missions, p_record -> 'row');
+            select * from jsonb_populate_record(null::mission_missions,
+                jsonb_build_object('accept', 'review', 'scenario_floor', 0,
+                                   'gate_rejections', 0, 'gate_aborts', 0) || (p_record -> 'row'));
         when 'mission_residents' then
             insert into mission_residents
             select * from jsonb_populate_record(null::mission_residents, p_record -> 'row');
@@ -1131,7 +1224,8 @@ begin
     if spawn_mission_caller() is null then
         raise exception '% may not cancel tasks', session_user using errcode = '42501';
     end if;
-    if not exists (select 1 from mission_tasks where id = p_task and state not in ('accepted', 'cancelled')) then
+    if not exists (select 1 from mission_tasks where id = p_task
+                     and state not in ('accepted', 'cancelled', 'landing', 'landed')) then
         raise exception 'task % is already closed', p_task;
     end if;
     perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
@@ -1184,6 +1278,57 @@ begin
     perform spawn_control_record(jsonb_build_object('type', 'resident.retired', 'name', p_name));
 end $$;
 
+-- Landing settings and halts are a human's (§10.3): the owner's login only.
+create or replace function spawn_mission_configure(p_mission bigint, p_gate text, p_accept text, p_budget jsonb)
+returns void language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only a human sets a mission''s gate' using errcode = '42501';
+    end if;
+    if p_gate is not null and left(p_gate, 1) <> '/' then
+        raise exception 'a gate is an absolute path, not %', p_gate;
+    end if;
+    if coalesce(p_accept, 'review') not in ('review', 'gate') then
+        raise exception 'a mission accepts by review or gate, not %', p_accept;
+    end if;
+    if not exists (select 1 from mission_missions where id = p_mission and state in ('open', 'active')) then
+        raise exception 'mission % is not open', p_mission;
+    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'mission.configured', 'id', p_mission, 'gate', p_gate,
+        'accept', coalesce(p_accept, 'review'), 'budget', p_budget));
+end $$;
+
+create or replace function spawn_mission_resume(p_mission bigint)
+returns void language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only a human resumes a halted mission' using errcode = '42501';
+    end if;
+    if not exists (select 1 from mission_missions where id = p_mission and halted is not null) then
+        raise exception 'mission % is not halted', p_mission;
+    end if;
+    perform spawn_control_record(jsonb_build_object('type', 'mission.resumed', 'id', p_mission));
+end $$;
+
+-- The integrator's records (`spawn integrate`, owner only): gate verdicts,
+-- landings, aborts over budget, and halts.
+create or replace function spawn_integrator_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record landings', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted') then
+        raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    if p_record ->> 'type' = 'task.gated'
+       and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'aborted', 'stale') then
+        raise exception 'unknown gate verdict %', p_record ->> 'verdict';
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
 -- A database from before the control stream has rows and no records. Each
 -- row becomes one `legacy.imported` record, once.
 do $$
@@ -1229,12 +1374,15 @@ begin
         'spawn_resident_approve(text)', 'spawn_resident_retire(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
-        'spawn_control_refold()'] loop
+        'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb)',
+        'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
         if v_function not in ('spawn_resident_approve(text)', 'spawn_task_delivered(bigint, bigint)',
                               'spawn_task_reported(bigint, text)', 'spawn_control_apply(jsonb, bigint)',
-                              'spawn_control_record(jsonb)', 'spawn_control_refold()') then
+                              'spawn_control_record(jsonb)', 'spawn_control_refold()',
+                              'spawn_mission_configure(bigint, text, text, jsonb)',
+                              'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)') then
             execute format('grant execute on function %s to spawn_supervisor', v_function);
         end if;
     end loop;

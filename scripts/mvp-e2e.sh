@@ -93,7 +93,8 @@ mkdir -p "$work/ws"
 #   E2E:WORK   one tool call, then "DONE", then stop
 #   E2E:STALL  stop partway ("STALLED"); a later "continue" finishes it
 #   E2E:ASK    stop with a HUMAN: question
-#   E2E:REPORT write .spawn/report.md, then stop
+#   E2E:REPORT write .spawn/report.md, then stop; with E2E:WRITE=<file>,
+#              write that file into the workspace first
 # Other lines are read silently; one second of quiet ends the turn.
 cat >"$work/claude" <<'ENGINE'
 #!/usr/bin/env bash
@@ -139,6 +140,9 @@ while :; do
       hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
       tool
       mkdir -p .spawn
+      case "$line" in
+      *E2E:WRITE=*) written=${line#*E2E:WRITE=}; printf 'written\n' >"${written%% *}" ;;
+      esac
       printf '## Outcome\ndone: %s\n## What changed\nfiles: %s\n## Open issues\nnone\n' "$line" "$(ls | tr '\n' ' ')" >.spawn/report.md
       printf 'DONE: reported\n'
       stop; pending=0 ;;
@@ -376,6 +380,67 @@ board | jq -e --argjson id "$t4" '.missions[].tasks[] | select(.id == $id) | .re
   fail "a new worker started from a stale copy of its mission's source"
 sup task accept --id "$t4" >/dev/null
 pass "a new worker starts from the source as it is now, not as it was first mirrored"
+
+# --- landing: one gate, one landing path (docs/fleet-architecture.md §10.3) ---
+gated=$work/gated.git
+git init -q --bare --initial-branch=main "$gated"
+git -C "$seed" push -q "$gated" main:main
+gate=$work/gate
+mkdir -p "$gate"
+printf '#!/bin/sh\n# Check: no file named BAD.\n[ ! -e BAD ]\n' >"$gate/check-no-bad.sh"
+gm=$("$bin" mission add --text "E2E gated mission" --source "$gated" --gate "$gate" | jq -r .mission)
+if sup mission configure --id "$gm" --gate "$gate" --accept gate >/dev/null 2>&1; then
+  fail "the supervisor set a mission's gate"
+fi
+integrate() { SPAWN_GATE=$root/scripts/rsi/gate.sh "$bin" integrate --once --root "$work/ws" >>"$work/integrate.log" 2>&1; }
+on_main() { git --git-dir="$gated" cat-file -e "main:$1" 2>/dev/null; }
+# Two workers start from the same main, so the second lands as a merge.
+t5=$(sup task assign --mission "$gm" --kind ephemeral --worker lander --brief "E2E:REPORT E2E:WRITE=FIRST_MARKER.txt" | jq -r .task)
+t6=$(sup task assign --mission "$gm" --kind ephemeral --worker second --brief "E2E:REPORT E2E:WRITE=SECOND_MARKER.txt" | jq -r .task)
+wait_for 60 "the first gated report" state_is "$t5" reported
+wait_for 60 "the second gated report" state_is "$t6" reported
+sup task accept --id "$t5" >/dev/null
+sup task accept --id "$t6" >/dev/null
+[ "$(task_state "$t5")" = accepted ] || fail "accepted gated work closed before landing"
+integrate
+state_is "$t5" landed || fail "accepted work did not land: $(task_state "$t5"); $(tail -n 5 "$work/integrate.log")"
+on_main FIRST_MARKER.txt || fail "the landing is not on the source's main"
+integrate
+state_is "$t6" landed || fail "the second task did not land: $(task_state "$t6"); $(tail -n 5 "$work/integrate.log")"
+on_main SECOND_MARKER.txt && on_main FIRST_MARKER.txt || fail "the merge lost a landing"
+[ "$(git --git-dir="$gated" rev-list --parents -n 1 main | wc -w)" -eq 3 ] || fail "the second landing is not a merge"
+lander=$(board | jq -r --argjson id "$t5" '.missions[].tasks[] | select(.id == $id) | .session_id')
+gone_lander() { ! live "$lander"; }
+wait_for 60 "the landed worker to be stopped" gone_lander
+pass "accepted work passed the gate and landed on its source, the second as a merge"
+
+t7=$(sup task assign --mission "$gm" --kind ephemeral --worker breaker --brief "E2E:REPORT E2E:WRITE=BAD" | jq -r .task)
+wait_for 60 "the breaking report" state_is "$t7" reported
+sup task accept --id "$t7" >/dev/null
+integrate
+state_is "$t7" revise || fail "rejected work was not sent back: $(task_state "$t7")"
+board | jq -e --argjson id "$t7" '.missions[].tasks[] | select(.id == $id) | .review_note | test("check-no-bad")' >/dev/null ||
+  fail "the note does not carry the gate's output"
+! on_main BAD || fail "rejected work landed"
+"$bin" task cancel --id "$t7" >/dev/null
+pass "work the gate rejects goes back to its worker with the gate's output"
+
+# Someone pushes to the source outside the gate: the mission halts.
+outside=$work/outside
+git clone -q "$gated" "$outside"
+printf 'x\n' >"$outside/OUTSIDE.txt"
+git -C "$outside" add -A
+git -C "$outside" -c user.name=e2e -c user.email=e2e@localhost commit -qm outside
+git -C "$outside" push -q origin HEAD:main
+integrate
+board | jq -e --argjson id "$gm" '.missions[] | select(.id == $id) | .halted | test("last landing")' >/dev/null ||
+  fail "an outside push did not halt the mission"
+if sup mission resume --id "$gm" >/dev/null 2>&1; then
+  fail "the supervisor resumed a halted mission"
+fi
+"$bin" mission resume --id "$gm" >/dev/null
+board | jq -e --argjson id "$gm" '.missions[] | select(.id == $id) | .halted == null' >/dev/null || fail "resume did not clear the halt"
+pass "a push outside the gate halts the mission until a human resumes it"
 
 "$bin" submit --principal human --agent agent_resident_core --session session_resident_core \
   --key "human-$(date +%s%N)" --action '{"type":"input","text":"hello from a human"}' >/dev/null
