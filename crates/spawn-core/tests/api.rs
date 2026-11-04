@@ -3,14 +3,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use spawn_core::bridge::{Bridge, BridgeConfig, claude_arguments};
+use spawn_core::bridge::{Bridge, BridgeConfig, claude_arguments, claude_session_id};
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
-use spawn_core::event::{EndCause, Engine, EventKind, NewEvent, SessionSeq, Source};
+use spawn_core::event::{
+    EndCause, Engine, EventKind, GlobalPosition, NewEvent, SessionSeq, Source,
+};
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
 };
-use spawn_core::ingest::{claude_hook, codex_line};
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::SemanticState;
 use spawn_core::observe::{HeuristicJudge, Observer};
@@ -177,51 +178,28 @@ fn screen_reads_the_tail_not_the_history() {
 }
 
 #[test]
-fn claude_arguments_carry_the_flag_and_absolute_hooks() {
-    let arguments = claude_arguments("/opt/spawn", Some("native-1"));
+fn claude_arguments_name_the_session_and_install_no_hooks() {
+    let arguments = claude_arguments(Some("native-1"), true);
     assert_eq!(arguments[0], "--ax-screen-reader");
     assert_eq!(arguments[1], "--allow-dangerously-skip-permissions");
     assert_eq!(arguments[2], "--settings");
     let settings = &arguments[3];
-    assert!(settings.contains("/opt/spawn"), "hook command is absolute");
-    assert!(settings.contains("UserPromptSubmit"));
+    assert!(
+        !settings.contains("hooks"),
+        "events come from the transcript"
+    );
     // `--settings` replaces the user settings file, so the engine must not
     // stop on a permission dialog the Bridge cannot answer.
     assert!(settings.contains("skipDangerousModePermissionPrompt"));
-    assert_eq!(arguments[4], "--resume");
-    assert_eq!(arguments[5], "native-1");
-    assert!(!claude_arguments("/opt/spawn", None).contains(&"--resume".to_string()));
-}
-
-#[test]
-fn ingestion_ignores_unknown_engine_events() {
-    let payload = r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"t1"}"#;
-    let normalized = claude_hook(payload)
-        .expect("valid payload")
-        .expect("known hook");
-    assert_eq!(normalized.source_event_id.as_deref(), Some("t1:started"));
     assert_eq!(
-        normalized.kind,
-        EventKind::ToolStarted {
-            tool_name: "Bash".to_string(),
-            tool_use_id: "t1".to_string(),
-        }
+        arguments[4..],
+        ["--resume".to_string(), "native-1".to_string()]
     );
-    assert!(
-        claude_hook(r#"{"hook_event_name":"PreCompact"}"#)
-            .expect("valid payload")
-            .is_none()
+    let fresh = claude_arguments(Some("native-2"), false);
+    assert_eq!(
+        fresh[4..],
+        ["--session-id".to_string(), "native-2".to_string()]
     );
-    assert!(claude_hook("not json").is_err());
-
-    let line = r#"{"type":"item.started","item":{"id":"i1","type":"command_execution"}}"#;
-    assert!(codex_line(line).expect("valid line").is_some());
-    assert!(
-        codex_line(r#"{"type":"item.started","item":{"id":"i2","type":"message"}}"#)
-            .expect("valid line")
-            .is_none()
-    );
-    assert!(codex_line("  ").expect("blank line").is_none());
 }
 
 #[test]
@@ -384,6 +362,7 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
         vec![
             "command.accepted",
             "execution.started",
+            "session.native_started",
             "screen.observed",
             "command.finished",
         ]
@@ -396,6 +375,114 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
         "prompt reached the pane: {pane}"
     );
     assert_eq!(bridge.session_count(), 1);
+}
+
+#[test]
+fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
+    let store = store();
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    );
+    let execution = ExecutionId::for_command(CommandId(1));
+    let terminal = TerminalName::for_execution(&execution);
+    store.set_pane(&terminal, READY);
+    submit_start(&store, "list the files");
+    bridge.tick().expect("tick succeeds");
+
+    // The Bridge named the session, so it knows the transcript.
+    let (native, path) = store
+        .read_global(GlobalPosition(0), 100)
+        .expect("read")
+        .into_iter()
+        .find_map(|record| match record.event.kind {
+            EventKind::NativeSessionStarted {
+                native_session_id,
+                transcript_path,
+                ..
+            } => Some((native_session_id, transcript_path.expect("a path"))),
+            _ => None,
+        })
+        .expect("the start records the native session");
+    assert_eq!(native, claude_session_id(&execution));
+    let at = r#""timestamp":"2099-01-01T00:00:00.000Z""#;
+    store.append_file(
+        &path,
+        &format!(
+            "{{\"type\":\"assistant\",\"uuid\":\"a1\",{at},\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"Bash\"}}]}}}}\n\
+             {{\"type\":\"user\",\"uuid\":\"u1\",{at},\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_9\"}}]}}}}\n\
+             {{\"type\":\"system\",\"subtype\":\"turn_dur"
+        ),
+    );
+    bridge.tick().expect("tick");
+    bridge.tick().expect("a second read appends nothing twice");
+    let engine_events = |store: &MemoryStore| -> Vec<&'static str> {
+        store
+            .read_global(GlobalPosition(0), 200)
+            .expect("read")
+            .into_iter()
+            .filter(|record| record.event.source == Source::Claude)
+            .map(|record| record.event.kind.name())
+            .collect()
+    };
+    assert_eq!(
+        engine_events(&store),
+        vec!["tool.started", "tool.completed"]
+    );
+    // The half-written line is read once it is whole.
+    store.append_file(&path, &format!("ation\",\"uuid\":\"s1\",{at}}}\n"));
+    bridge.tick().expect("tick");
+    assert_eq!(
+        engine_events(&store),
+        vec!["tool.started", "tool.completed", "turn.stopped"]
+    );
+
+    // A screen state is recorded once two readings agree.
+    store.set_pane(
+        &terminal,
+        "✽ Effecting… (esc to interrupt)\n❯ \n  model line",
+    );
+    let busy = |store: &MemoryStore| {
+        store
+            .read_global(GlobalPosition(0), 200)
+            .expect("read")
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.event.kind,
+                    EventKind::ScreenObserved {
+                        state: ScreenState::Busy,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    bridge.tick().expect("tick");
+    assert_eq!(busy(&store), 0, "one reading is not a fact yet");
+    bridge.tick().expect("tick");
+    assert_eq!(busy(&store), 1);
+    bridge.tick().expect("tick");
+    assert_eq!(busy(&store), 1, "an unchanged screen is not recorded again");
+
+    // The runner's exit file ends the execution with its status.
+    store.append_file(
+        &format!("{}/.spawn/exit-{execution}", any_workspace().path()),
+        "3",
+    );
+    bridge.tick().expect("tick");
+    let ended = store
+        .read_global(GlobalPosition(0), 200)
+        .expect("read")
+        .into_iter()
+        .find_map(|record| match record.event.kind {
+            EventKind::ExecutionEnded { cause, exit_code } => Some((cause, exit_code)),
+            _ => None,
+        });
+    assert_eq!(ended, Some((EndCause::Exited, Some(3))));
 }
 
 #[test]

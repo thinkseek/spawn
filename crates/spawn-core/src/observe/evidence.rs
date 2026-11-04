@@ -68,13 +68,20 @@ pub fn human_question(screen_tail: &str) -> Option<String> {
 }
 
 /// Stable digest of what the model is shown (FNV-1a over its JSON), so a
-/// stored fingerprint still matches after a restart or a rebuild.
+/// stored fingerprint still matches after a restart or a rebuild. Digits on
+/// the screen are left out: a ticking timer or token count is not a new
+/// situation, and must not ask the model again.
 pub(super) fn fingerprint_of(input: &JudgeInput) -> String {
+    let screen = input.screen_tail.as_deref().map(|tail| {
+        tail.chars()
+            .filter(|c| !c.is_ascii_digit())
+            .collect::<String>()
+    });
     let shown = serde_json::json!([
         input.ambiguity,
         input.evidence_seq.0,
         input.exit_code,
-        input.screen_tail,
+        screen,
         input.task,
         input.perpetual,
     ]);
@@ -103,6 +110,19 @@ mod tests {
 
     fn asks_human(screen: &str) -> bool {
         human_question(screen).is_some()
+    }
+
+    #[test]
+    fn a_ticking_timer_is_not_a_new_situation() {
+        let mut input = crate::observe::JudgeInput {
+            screen_tail: Some("✽ Working… (12s · 1.2k tokens)".to_string()),
+            ..crate::observe::JudgeInput::default()
+        };
+        let first = super::fingerprint_of(&input);
+        input.screen_tail = Some("✽ Working… (47s · 3.9k tokens)".to_string());
+        assert_eq!(super::fingerprint_of(&input), first);
+        input.screen_tail = Some("HUMAN: which region?".to_string());
+        assert_ne!(super::fingerprint_of(&input), first);
     }
 
     #[test]

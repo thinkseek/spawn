@@ -7,13 +7,14 @@
 //! - `tick` runs one Bridge and Observer pass.
 //! - `integrate` lands gated missions' work and assigns objectives (RSI).
 //! - `status` prints the latest observation per session.
-//! - `hook` ingests one Claude Code hook payload from standard input.
+//! - `hook` accepts and ignores a hook payload from an engine started by an
+//!   older build; the Bridge reads engines' transcripts instead.
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
 //! - `version` prints `spawn <crate version>`.
 //!
 //! Configuration is environment first, so a terminal started by the Bridge
-//! carries everything its hook and runner need.
+//! carries everything its runner needs.
 //!
 //! This file only parses the command word and hands off: command bodies live
 //! in [`commands`], environment and store access in [`config`], and the
@@ -33,7 +34,6 @@ mod runtime;
 mod serve;
 mod sources;
 mod supervise;
-mod trace;
 
 // Re-exported at the crate root, where the command modules import them.
 pub(crate) use config::{Flags, env_or, env_value, open_store};
@@ -87,7 +87,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "status" => inspect::status(&Flags::parse(&rest)?),
         "fleet" => inspect::fleet(),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
-        "hook" => engine::hook(),
+        "hook" => Ok(engine::hook()),
         "run" => engine::run(&rest),
         "version" => {
             if let Some(word) = rest.first() {

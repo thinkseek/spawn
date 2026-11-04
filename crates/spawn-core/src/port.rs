@@ -188,6 +188,17 @@ pub trait TerminalHost: Send + Sync {
         lines: usize,
     ) -> Result<String, TerminalError>;
 
+    /// The bytes of the file at `path`, as the terminal's process sees it,
+    /// from byte `offset` to the end; `None` when there is no such file.
+    /// How the Bridge follows what an engine writes (its transcript, the
+    /// runner's exit status) without the engine reporting anything itself.
+    fn read_from(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        offset: u64,
+    ) -> Result<Option<Vec<u8>>, TerminalError>;
+
     /// Kill the terminal and its process. A missing terminal is not an error.
     fn terminate(
         &self,

@@ -1028,3 +1028,37 @@ fn a_delivered_task_starts_a_new_episode_and_a_nudge_does_not() {
     let delivered = submit("spawn-dispatch", "deliver-4-0");
     assert_eq!(episode().0, Some(delivered), "a new task is a new episode");
 }
+
+#[test]
+fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
+    let (_store, schema) = store("logins");
+    for role in ["spawn_supervisor", "spawn_reader"] {
+        let fixed = format!(
+            "postgres://{role}:{role}@{}",
+            common::url().rsplit_once('@').expect("a host").1
+        );
+        assert!(
+            postgres::Client::connect(&fixed, postgres::NoTls).is_err(),
+            "{role}'s old fixed password is refused"
+        );
+        let mut client = postgres::Client::connect(
+            &spawn_postgres::role_url(&common::url(), role),
+            postgres::NoTls,
+        )
+        .expect("the derived password logs in");
+        client
+            .batch_execute(&format!("set search_path to {schema}"))
+            .expect("schema");
+        let error = client
+            .query(
+                "select * from spawn_append('agent_x', 'session_x', null, 'claude', null, \
+                 '{\"name\":\"tool.started\",\"detail\":{\"tool_name\":\"Bash\",\"tool_use_id\":\"t\"}}'::jsonb)",
+                &[],
+            )
+            .expect_err("a restricted login writes no events");
+        assert_eq!(
+            error.code().map(|code| code.code().to_string()).as_deref(),
+            Some("42501")
+        );
+    }
+}

@@ -8,7 +8,7 @@ use crate::config::{
     env_value, loop_interval, open_store, spawn_program, supervised, workspace_root,
 };
 use crate::runtime::runtime;
-use crate::{dispatch, supervise, trace};
+use crate::{dispatch, supervise};
 
 /// Most intervals a failing loop waits before its next pass.
 const MAX_BACKOFF_INTERVALS: u32 = 30;
@@ -22,12 +22,11 @@ fn backoff(interval: std::time::Duration, failures: u32) -> std::time::Duration 
 /// `spawn tick`: one Bridge and Observer pass.
 pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     let (mut bridge, mut observer) = runtime(flags)?;
-    let report = trace::time("bridge.tick", || bridge.tick()).map_err(|error| error.to_string())?;
+    let report = bridge.tick().map_err(|error| error.to_string())?;
     for warning in &report.warnings {
         eprintln!("spawn tick warning: {warning}");
     }
-    let observations =
-        trace::time("observer.tick", || observer.tick()).map_err(|error| error.to_string())?;
+    let observations = observer.tick().map_err(|error| error.to_string())?;
     println!(
         "commands={} observations={} sessions={}",
         report.commands,
