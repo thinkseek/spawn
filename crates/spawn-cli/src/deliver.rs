@@ -502,8 +502,10 @@ fn written_since(path: &Path, since_ms: Option<i64>) -> bool {
     since_ms.is_none_or(|since| modified_ms >= since)
 }
 
-/// Collect the reports of delivered tasks whose worker is idle. Returns log
-/// lines. The file is moved to `.spawn/reports/task-<id>.md`.
+/// Collect the reports of delivered tasks whose worker's turn stopped at an
+/// idle prompt, judged waiting, completed or blocked alike: the report
+/// contract asks for one when the task is done or the worker cannot go on.
+/// Returns log lines. The file is moved to `.spawn/reports/task-<id>.md`.
 pub(crate) fn collect_reports(
     store: &PostgresStore,
     work: &Work,
@@ -519,7 +521,7 @@ pub(crate) fn collect_reports(
         let idle = rows
             .iter()
             .find(|facts| facts.session_id == task.session_id)
-            .is_some_and(Facts::idle_at_prompt);
+            .is_some_and(Facts::turn_stopped_idle);
         if !idle {
             continue;
         }
