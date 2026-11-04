@@ -5,25 +5,37 @@ import { LiveBadge, TerminalPanel } from "../Terminal";
 import { useNow } from "./Phase";
 
 /**
- * Tail of the RSI agent's tmux pane. Mounted only while the RSI view is
- * visible, so the 1 s poll stops with it.
+ * Tail of the objective mission's resident's tmux pane. Mounted only while
+ * the RSI view is visible, so the 1 s poll stops with it.
  */
-export function AgentPane({ className }: { className?: string }) {
-  const pane = usePoll("rsi-pane", fetchPane, 1_000);
+export function AgentPane({
+  mission,
+  resident,
+  className,
+}: {
+  mission: number | null;
+  resident: string | null;
+  className?: string;
+}) {
+  const pane = usePoll(
+    `rsi-pane-${mission ?? "none"}`,
+    (signal) => fetchPane(mission, signal),
+    1_000,
+  );
   useNow(1_000);
   const data = pane.data;
 
   return (
     <TerminalPanel
       className={className}
-      title="Agent terminal"
+      title={resident ? `Resident ${resident}` : "Resident terminal"}
       tag={data?.terminal}
       text={data?.text ?? ""}
       placeholder={
         pane.error
           ? `Could not read the pane: ${pane.error}`
           : data
-            ? "No agent terminal is running."
+            ? "The resident's terminal is not running."
             : "Connecting…"
       }
       status={
