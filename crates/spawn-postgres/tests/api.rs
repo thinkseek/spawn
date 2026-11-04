@@ -1062,3 +1062,33 @@ fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
         );
     }
 }
+
+/// The same server spelled another way: a socket directory moved to the
+/// `host` parameter, or 127.0.0.1 as `localhost`.
+fn respelled(url: &str) -> String {
+    let (head, tail) = url.rsplit_once('@').expect("a host");
+    let (host, path) = tail.split_once('/').expect("a database");
+    if host.starts_with("%2F") || host.starts_with("%2f") {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        format!("{head}@/{path}{separator}host={host}")
+    } else {
+        format!("{head}@{}/{path}", host.replace("127.0.0.1", "localhost"))
+    }
+}
+
+#[test]
+fn a_cluster_is_known_by_its_identity_not_its_spelling() {
+    let url = common::url();
+    let identity = spawn_postgres::cluster_identity(&url).expect("identity");
+    assert!(!identity.is_empty());
+    let other = respelled(&url);
+    assert_ne!(other, url);
+    assert_eq!(
+        spawn_postgres::cluster_identity(&other).expect("identity through another spelling"),
+        identity
+    );
+    assert!(
+        spawn_postgres::cluster_identity("postgres://nobody:x@%2Fnonexistent%2Fdir/db").is_err(),
+        "an unreachable server has no identity"
+    );
+}
