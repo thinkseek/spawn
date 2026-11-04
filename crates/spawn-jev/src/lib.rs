@@ -261,8 +261,9 @@ fn is_chunked(head: &str) -> bool {
 
 /// Minimal HTTP/1.1 POST over a plain socket.
 ///
-/// The decision service runs inside the cluster and speaks plain HTTP. A
-/// full client would add a TLS stack to the build for no gain.
+/// The client talks to the loopback relay (`scripts/jev-relay.py`), which
+/// adds the API key and the TLS hop to the hosted service, so plain HTTP is
+/// enough here. A full client would add a TLS stack to the build for no gain.
 fn post_json(url: &str, body: &str, timeout: Duration) -> Result<String, String> {
     let (host, port, path) = split_url(url)?;
     let address = format!("{host}:{port}");
