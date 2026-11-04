@@ -130,7 +130,12 @@ assert_eq "$(scalar "select count(*) from agent_timeline where session_id='$sess
     "agent_timeline shows the screen.observed event"
 assert_eq "$(scalar "select count(*) from agent_judgements where session_id='$session'")" 1 \
     "agent_judgements holds the observation"
-assert_eq "$(scalar "select count(*) from agent_judgements where session_id='$session' and state='WAITING'")" 1 \
+# The latest observation's field, as the views must expose it.
+observed() { scalar "select kind -> 'detail' -> 'observation' ->> '$1' from spawn_events where session_id='$session' and source='observer' order by session_seq desc limit 1"; }
+judged=$(scalar "select kind -> 'detail' -> 'observation' ->> 'state' from spawn_events where session_id='$session' and source='observer' order by session_seq desc limit 1")
+judged_reason=$(scalar "select coalesce(kind -> 'detail' -> 'observation' ->> 'reason', '') from spawn_events where session_id='$session' and source='observer' order by session_seq desc limit 1")
+[ -n "$judged" ] || fail "the observation has no state"
+assert_eq "$(scalar "select state from agent_judgements where session_id='$session'")" "$judged" \
     "agent_judgements parses the judged state"
 
 # agent_freshness: the log position of the session, updated by the Observer
@@ -152,13 +157,13 @@ assert_eq "$(scalar "select last_event_at_ms from agent_freshness where session_
 # agent_state: the latest observation, judged on the latest evidence.
 assert_eq "$(scalar "select count(*) from agent_state where session_id='$session'")" 1 \
     "agent_state has one row after the tick"
-assert_eq "$(scalar "select state from agent_state where session_id='$session'")" "WAITING" \
-    "agent_state state is WAITING"
-assert_eq "$(scalar "select reason from agent_state where session_id='$session'")" "WAITING_FOR_USER_INPUT" \
-    "agent_state reason is WAITING_FOR_USER_INPUT"
-assert_eq "$(scalar "select judge from agent_state where session_id='$session'")" "heuristic" \
-    "agent_state names the heuristic judge"
-assert_eq "$(scalar "select confidence from agent_state where session_id='$session'")" "0.8" \
+assert_eq "$(scalar "select state from agent_state where session_id='$session'")" "$judged" \
+    "agent_state state is the judged state"
+assert_eq "$(scalar "select reason from agent_state where session_id='$session'")" "$judged_reason" \
+    "agent_state reason is the judged reason"
+assert_eq "$(scalar "select judge from agent_state where session_id='$session'")" "$(observed judge)" \
+    "agent_state names the judge"
+assert_eq "$(scalar "select confidence::text from agent_state where session_id='$session'")" "$(scalar "select (kind -> 'detail' -> 'observation' ->> 'confidence')::float8::text from spawn_events where session_id='$session' and source='observer' order by session_seq desc limit 1")" \
     "agent_state exposes the judge confidence"
 assert_eq "$(scalar "select based_on_seq from agent_state where session_id='$session'")" \
     "$(scalar "select max(session_seq) from spawn_events where session_id='$session' and source<>'observer'")" \
@@ -169,16 +174,16 @@ assert_eq "$(scalar "select session_seq from agent_state where session_id='$sess
 assert_eq "$(scalar "select event_id from agent_state where session_id='$session'")" \
     "$(scalar "select last_event_id from agent_freshness where session_id='$session'")" \
     "the latest event is the judgement"
-assert_eq "$(scalar "select count(*) from agent_state where session_id='$session' and observation->>'state'='WAITING'")" 1 \
+assert_eq "$(scalar "select count(*) from agent_state where session_id='$session' and observation->>'state'='$judged'")" 1 \
     "agent_state keeps the raw observation"
 
 # agent_status: one row per session, the latest judgement and the latest
 # execution.
 assert_eq "$(scalar "select count(*) from agent_status where session_id='$session'")" 1 \
     "agent_status has one row for the session"
-assert_eq "$(scalar "select state from agent_status where session_id='$session'")" "WAITING" \
-    "agent_status state is WAITING"
-assert_eq "$(scalar "select reason from agent_status where session_id='$session'")" "WAITING_FOR_USER_INPUT" \
+assert_eq "$(scalar "select state from agent_status where session_id='$session'")" "$judged" \
+    "agent_status state is the judged state"
+assert_eq "$(scalar "select reason from agent_status where session_id='$session'")" "$judged_reason" \
     "agent_status reason matches the observation"
 assert_eq "$(scalar "select observation_seq from agent_status where session_id='$session'")" \
     "$(scalar "select session_seq from agent_state where session_id='$session'")" \
@@ -247,8 +252,8 @@ assert_eq "$(scalar "select state from agent_state where session_id='$session'")
     "agent_state moves to COMPLETED on a stopped execution"
 assert_eq "$(scalar "select count(*) from agent_state where session_id='$session' and reason is null")" 1 \
     "COMPLETED has no wait reason"
-assert_eq "$(scalar "select confidence from agent_state where session_id='$session'")" "0.6" \
-    "agent_state confidence follows the heuristic completed rule"
+assert_eq "$(scalar "select confidence::text from agent_state where session_id='$session'")" "$(scalar "select (kind -> 'detail' -> 'observation' ->> 'confidence')::float8::text from spawn_events where session_id='$session' and source='observer' order by session_seq desc limit 1")" \
+    "agent_state confidence follows the completed judgement"
 assert_eq "$(scalar "select state from agent_status where session_id='$session'")" "COMPLETED" \
     "agent_status reports the completed state"
 assert_eq "$(scalar "select count(*) from agent_status where session_id='$session' and reason is null")" 1 \

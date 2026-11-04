@@ -86,7 +86,7 @@ FAKE
     SPAWN_WORKER=worker-bb
     SPAWN_RSI_BACKLOG=$root/rsi/backlog
     SPAWN_RSI_SCENARIOS=$root/rsi/scenarios
-    SPAWN_RSI_JUDGE=$root/scripts/rsi/judge-candidate.sh
+    SPAWN_RSI_JUDGE=$root/scripts/rsi/gate.sh
     WORK=$work
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
         SPAWN_CLAUDE_PROGRAM SPAWN_CODEX_PROGRAM SPAWN_TMUX_SOCKET SPAWN_WORKER \

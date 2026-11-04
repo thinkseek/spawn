@@ -90,8 +90,15 @@ Actions for `--action`:
 Missions: `spawn mission add --text ... [--source <repo>]` (a human), then the supervisor plans
 and routes tasks (`spawn task assign`), workers report in `.spawn/report.md`, the supervisor
 accepts or sends back. Worker branches live in the mission's mirror under
-`$SPAWN_WORKSPACE_ROOT/.sources/`; a human merges one only after
-`scripts/merge-gate.sh <mirror> <branch>` passes.
+`$SPAWN_WORKSPACE_ROOT/.sources/`.
+
+One gate judges every landing, RSI or fleet:
+`scripts/rsi/gate.sh <bare repo> <base> <candidate> $PWD/rsi/scenarios [<task scenario>]`.
+It refuses changes to the paths in `rsi/scenarios/protected` and to build-time code, builds
+each tree with `rsi/scenarios/build`, wants the task scenario red on the base and green on the
+candidate, and runs every other non-ratchet scenario on the candidate: clippy, the tests, the
+e2e, the black-box CLI scenarios and the web build are scenarios (`rsi/scenarios/check-*.sh`).
+Its own tests: `scripts/rsi/test-gate.sh`.
 
 End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s):
 `SPAWN_DATABASE_URL=postgres://.../spawn_test scripts/mvp-e2e.sh`.

@@ -181,7 +181,7 @@ pub fn evolve(flags: &Flags) -> Result<i32, String> {
     let root = PathBuf::from(root);
     let backlog = absolute(&env_or("SPAWN_RSI_BACKLOG", "rsi/backlog"))?;
     let scenarios = absolute(&env_or("SPAWN_RSI_SCENARIOS", "rsi/scenarios"))?;
-    let gate = absolute(&env_or("SPAWN_RSI_JUDGE", "scripts/rsi/judge-candidate.sh"))?;
+    let gate = absolute(&env_or("SPAWN_RSI_JUDGE", "scripts/rsi/gate.sh"))?;
 
     // The lock belongs to the connection, so a crash never blocks the next
     // controller.
@@ -806,6 +806,7 @@ fn judge_candidate(
         .arg(workspaces.project())
         .arg(baseline)
         .arg(candidate)
+        .arg(scenarios)
         .arg(&scenario);
     let (stdout, stderr) = run_bounded(command, GATE_WALL_CLOCK)?;
     // The verdict is the gate's last line on stdout, nothing else: scenario
