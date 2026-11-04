@@ -2,7 +2,7 @@ import { Eye, GitBranch, Terminal, Wrench } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { Observation, RsiSummary, SessionDetail } from "../api";
-import { formatBytes, formatDuration, relativeTime } from "../format";
+import { formatDuration, relativeTime } from "../format";
 import { Card, CardHeader, cx } from "./ui";
 
 interface DetailsRailProps {
