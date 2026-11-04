@@ -1042,7 +1042,7 @@ fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
             "{role}'s old fixed password is refused"
         );
         let mut client = postgres::Client::connect(
-            &spawn_postgres::role_url(&common::url(), role),
+            &spawn_postgres::role_url(&common::url(), role).expect("a password in the test URL"),
             postgres::NoTls,
         )
         .expect("the derived password logs in");

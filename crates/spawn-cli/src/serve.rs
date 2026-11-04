@@ -127,8 +127,10 @@ fn same_secret(given: &[u8], expected: &[u8]) -> bool {
 fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
     let controller = env_value("SPAWN_DATABASE_URL")
         .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
-    let url = env_value("SPAWN_SERVE_DATABASE_URL")
-        .unwrap_or_else(|| spawn_postgres::role_url(&controller, "spawn_reader"));
+    let url = match env_value("SPAWN_SERVE_DATABASE_URL") {
+        Some(url) => url,
+        None => spawn_postgres::role_url(&controller, "spawn_reader")?,
+    };
     spawn_postgres::PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 

@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use spawn_core::id::{TerminalName, WorkspaceId};
-use spawn_core::port::{Launch, TerminalError, TerminalHost};
+use spawn_core::port::{Launch, READ_LIMIT, TerminalError, TerminalHost};
 use spawn_core::shell::shell_join;
 
 /// Variables kept out of the tmux server's environment.
@@ -358,16 +358,26 @@ impl TerminalHost for TmuxHost {
         }
         // Inside the workspace's container: `tail -c +N` prints from byte N
         // (1-based); a missing file exits 3 so it is told apart from failure.
+        // Anything but a regular file exits 4; the whole read is bounded in
+        // time (host-side `timeout`) and size (`head -c`).
         let script = format!(
-            "test -f {path} || exit 3; tail -c +{} {path}",
+            "test -e {path} || test -L {path} || exit 3; \
+             test -f {path} && ! test -L {path} || exit 4; \
+             tail -c +{} {path} | head -c {READ_LIMIT}",
             offset.saturating_add(1),
             path = spawn_core::shell::shell_quote(path)
         );
         let words = vec!["sh".to_string(), "-c".to_string(), script];
-        let run = run_words(&prefix, &words)?;
+        let bounded: Vec<String> = ["timeout", "10"]
+            .into_iter()
+            .map(String::from)
+            .chain(prefix)
+            .collect();
+        let run = run_words(&bounded, &words)?;
         match run.code {
             Some(0) => Ok(Some(run.stdout_bytes)),
             Some(3) => Ok(None),
+            Some(4) => Err(TerminalError(format!("{path} is not a regular file"))),
             other => Err(TerminalError(format!(
                 "read {path} returned {other:?}: {}",
                 run.stderr.trim()
@@ -387,17 +397,88 @@ fn gone(stderr: &str) -> bool {
         || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
 }
 
-/// Bytes of a local file from `offset`; `None` when it does not exist.
+/// At most [`READ_LIMIT`] bytes of a local file from `offset`; `None` when
+/// it does not exist. The agent controls the path: a symlink is not followed
+/// and a FIFO does not block the open (`O_NOFOLLOW | O_NONBLOCK`), and
+/// anything but a regular file is refused before a byte is read.
 fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = match std::fs::File::open(path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path);
+    let file = match opened {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(TerminalError(format!("open {path}: {error}"))),
     };
+    let regular = file
+        .metadata()
+        .map_err(|error| TerminalError(format!("stat {path}: {error}")))?
+        .is_file();
+    if !regular {
+        return Err(TerminalError(format!("{path} is not a regular file")));
+    }
     let mut bytes = Vec::new();
+    let mut file = file;
     file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_to_end(&mut bytes))
+        .and_then(|_| (&mut file).take(READ_LIMIT as u64).read_to_end(&mut bytes))
         .map_err(|error| TerminalError(format!("read {path}: {error}")))?;
     Ok(Some(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{READ_LIMIT, read_local};
+    use std::time::{Duration, Instant};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("spawn-read-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_agent_planted_fifo_or_symlink_is_refused_without_blocking() {
+        let dir = scratch("special");
+        let fifo = dir.join("exit-fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let started = Instant::now();
+        assert!(read_local(fifo.to_str().unwrap(), 0).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the open blocked"
+        );
+
+        let link = dir.join("exit-link");
+        std::os::unix::fs::symlink("/etc/hostname", &link).unwrap();
+        assert!(read_local(link.to_str().unwrap(), 0).is_err());
+
+        assert!(
+            read_local(dir.join("absent").to_str().unwrap(), 0)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_returns_at_most_the_limit_from_the_offset() {
+        let dir = scratch("limit");
+        let file = dir.join("big");
+        std::fs::write(&file, vec![b'x'; READ_LIMIT + 10]).unwrap();
+        let path = file.to_str().unwrap();
+        assert_eq!(read_local(path, 0).unwrap().unwrap().len(), READ_LIMIT);
+        assert_eq!(
+            read_local(path, READ_LIMIT as u64).unwrap().unwrap().len(),
+            10
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

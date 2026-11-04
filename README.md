@@ -35,7 +35,9 @@ The binary is `spawn`.
 Install the schema:
 
 ```bash
-export SPAWN_DATABASE_URL=postgres://spawn@localhost/spawn
+# The password is required: the restricted logins (supervisor, dashboard)
+# derive theirs from it; without one they cannot log in.
+export SPAWN_DATABASE_URL=postgres://spawn:PASSWORD@localhost/spawn
 spawn init-db
 ```
 
