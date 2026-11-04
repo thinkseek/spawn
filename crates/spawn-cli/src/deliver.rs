@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use spawn_core::command::CommandAction;
 use spawn_core::event::Engine;
+use spawn_core::mission::TaskState;
 use spawn_postgres::PostgresStore;
 
 use crate::dispatch::{Facts, Order};
@@ -53,7 +54,7 @@ pub(crate) struct TaskRow {
     pub(crate) agent_id: String,
     pub(crate) session_id: String,
     pub(crate) brief: String,
-    pub(crate) state: String,
+    pub(crate) state: TaskState,
     #[serde(default)]
     pub(crate) revisions: i32,
     #[serde(default)]
@@ -69,7 +70,7 @@ pub(crate) struct TaskRow {
 impl TaskRow {
     /// Sent back by the supervisor, waiting to be delivered again.
     fn is_revision(&self) -> bool {
-        self.state == "revise"
+        self.state == TaskState::Revise
     }
 
     /// A command to this task's session that delivers or retires it.
@@ -120,10 +121,10 @@ impl Work {
     }
 
     /// Sessions whose tasks are in one of `states`.
-    fn sessions_in(&self, states: &[&str]) -> BTreeSet<&str> {
+    fn sessions_in(&self, states: &[TaskState]) -> BTreeSet<&str> {
         self.tasks
             .iter()
-            .filter(|task| states.contains(&task.state.as_str()))
+            .filter(|task| states.contains(&task.state))
             .map(|task| task.session_id.as_str())
             .collect()
     }
@@ -132,12 +133,12 @@ impl Work {
     /// keeps the next one waiting: a revision continues in the same context,
     /// and no other task is mixed in before the supervisor closes it.
     pub(crate) fn blocked(&self) -> BTreeSet<&str> {
-        self.sessions_in(&["delivered", "reported"])
+        self.sessions_in(&[TaskState::Delivered, TaskState::Reported])
     }
 
     /// Sessions with a task being worked on right now.
     pub(crate) fn in_flight(&self) -> BTreeSet<&str> {
-        self.sessions_in(&["delivered"])
+        self.sessions_in(&[TaskState::Delivered])
     }
 
     /// Sessions the mission layer manages (they have recent tasks, or are
@@ -160,7 +161,7 @@ struct Turns<'a> {
 
 impl<'a> Turns<'a> {
     fn new(work: &'a Work) -> Self {
-        let revisions = work.sessions_in(&["revise"]);
+        let revisions = work.sessions_in(&[TaskState::Revise]);
         Self {
             taken: revisions.clone(),
             revisions,
@@ -221,21 +222,24 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
     for task in &work.tasks {
         let session = task.session_id.as_str();
         let found = facts.get(session).copied();
-        match task.state.as_str() {
-            "assigned" | "revise" => {
+        match task.state {
+            TaskState::Assigned | TaskState::Revise => {
                 let turn = turns.take(task);
                 if turn && !blocked.contains(session) {
                     orders.extend(delivery(task, found));
                 }
             }
             // A finished ephemeral worker is stopped.
-            "accepted" | "cancelled"
+            TaskState::Accepted | TaskState::Cancelled
                 if task.kind == "ephemeral" && found.is_some_and(Facts::live_and_free) =>
             {
                 let key = format!("retire-task-{}", task.id);
                 orders.push(task.order(key, CommandAction::Stop));
             }
-            _ => {}
+            TaskState::Accepted
+            | TaskState::Cancelled
+            | TaskState::Delivered
+            | TaskState::Reported => {}
         }
     }
     for (agent, session) in &work.retired {
@@ -281,7 +285,7 @@ pub(crate) fn collect_reports(
     root: &Path,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    for task in work.tasks.iter().filter(|task| task.state == "delivered") {
+    for task in work.tasks.iter().filter(|task| task.state == TaskState::Delivered) {
         let idle = rows
             .iter()
             .find(|facts| facts.session_id == task.session_id)
@@ -316,9 +320,10 @@ mod tests {
     use serde_json::json;
     use spawn_core::command::CommandAction;
     use spawn_core::event::SessionSeq;
+    use spawn_core::mission::TaskState;
     use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
 
-    fn task(id: i64, state: &str, kind: &str) -> TaskRow {
+    fn task(id: i64, state: TaskState, kind: &str) -> TaskRow {
         TaskRow {
             id,
             mission_id: 1,
@@ -326,7 +331,7 @@ mod tests {
             agent_id: "agent_resident_core".to_string(),
             session_id: "session_resident_core".to_string(),
             brief: format!("brief {id}"),
-            state: state.to_string(),
+            state,
             revisions: 0,
             review_note: Some("tests fail".to_string()),
             mission_text: "Make ingest robust".to_string(),
@@ -376,7 +381,7 @@ mod tests {
 
     #[test]
     fn a_new_worker_is_started_with_charter_brief_and_report_contract() {
-        let plan = orders(&work(vec![task(4, "assigned", "resident")]), &[]);
+        let plan = orders(&work(vec![task(4, TaskState::Assigned, "resident")]), &[]);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].task, Some(4));
         let CommandAction::Start { prompt, .. } = &plan[0].action else {
@@ -390,7 +395,7 @@ mod tests {
     #[test]
     fn a_resident_that_ran_before_is_resumed_not_restarted() {
         let plan = orders(
-            &work(vec![task(4, "assigned", "resident")]),
+            &work(vec![task(4, TaskState::Assigned, "resident")]),
             &[worker(false, false)],
         );
         assert!(matches!(plan[0].action, CommandAction::Resume { .. }));
@@ -398,7 +403,7 @@ mod tests {
 
     #[test]
     fn a_live_worker_gets_the_task_only_when_idle() {
-        let tasks = vec![task(4, "assigned", "resident")];
+        let tasks = vec![task(4, TaskState::Assigned, "resident")];
         assert!(orders(&work(tasks.clone()), &[worker(true, false)]).is_empty());
         let plan = orders(&work(tasks), &[worker(true, true)]);
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
@@ -407,13 +412,13 @@ mod tests {
     #[test]
     fn one_task_in_flight_per_worker() {
         let tasks = vec![
-            task(3, "delivered", "resident"),
-            task(4, "assigned", "resident"),
+            task(3, TaskState::Delivered, "resident"),
+            task(4, TaskState::Assigned, "resident"),
         ];
         assert!(orders(&work(tasks), &[worker(true, true)]).is_empty());
         let queued = vec![
-            task(4, "assigned", "resident"),
-            task(5, "assigned", "resident"),
+            task(4, TaskState::Assigned, "resident"),
+            task(5, TaskState::Assigned, "resident"),
         ];
         let plan = orders(&work(queued), &[worker(true, true)]);
         assert_eq!(plan.len(), 1, "oldest first, one at a time");
@@ -423,13 +428,13 @@ mod tests {
     #[test]
     fn the_next_task_waits_for_the_review() {
         let tasks = vec![
-            task(3, "reported", "resident"),
-            task(4, "assigned", "resident"),
+            task(3, TaskState::Reported, "resident"),
+            task(4, TaskState::Assigned, "resident"),
         ];
         assert!(orders(&work(tasks), &[worker(true, true)]).is_empty());
-        let mut revise = task(3, "revise", "resident");
+        let mut revise = task(3, TaskState::Revise, "resident");
         revise.revisions = 1;
-        let tasks = vec![revise, task(4, "assigned", "resident")];
+        let tasks = vec![revise, task(4, TaskState::Assigned, "resident")];
         let plan = orders(&work(tasks), &[worker(true, true)]);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].task, Some(3), "the revision goes first");
@@ -437,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_task_sent_back_carries_the_note() {
-        let mut revise = task(4, "revise", "resident");
+        let mut revise = task(4, TaskState::Revise, "resident");
         revise.revisions = 1;
         let plan = orders(&work(vec![revise]), &[worker(true, true)]);
         assert_eq!(plan[0].key, "deliver-4-1");
@@ -449,11 +454,11 @@ mod tests {
 
     #[test]
     fn an_accepted_ephemeral_worker_is_stopped() {
-        let mut done = task(4, "accepted", "ephemeral");
+        let mut done = task(4, TaskState::Accepted, "ephemeral");
         done.resident = None;
         let plan = orders(&work(vec![done]), &[worker(true, true)]);
         assert_eq!(plan[0].action, CommandAction::Stop);
-        let resident = task(5, "accepted", "resident");
+        let resident = task(5, TaskState::Accepted, "resident");
         assert!(orders(&work(vec![resident]), &[worker(true, true)]).is_empty());
     }
 
@@ -480,7 +485,7 @@ mod tests {
 
     #[test]
     fn an_ephemeral_prompt_has_no_charter() {
-        let mut one = task(9, "assigned", "ephemeral");
+        let mut one = task(9, TaskState::Assigned, "ephemeral");
         one.resident = None;
         one.charter = None;
         assert!(task_prompt(&one).contains("started for one task"));
