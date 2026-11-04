@@ -220,15 +220,32 @@ pub enum ChunkError {
     Unavailable(String),
 }
 
+/// One object a chunk store holds, as a collection sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    /// Its name: the hash of its bytes.
+    pub name: String,
+    /// Time since it was written or last used (a `put` of the same content,
+    /// a [`ChunkStore::touch`]).
+    pub age: Duration,
+    /// Bytes it takes in the store.
+    pub bytes: u64,
+}
+
 /// Content-addressed object store for large files (docs/storage.md).
 ///
 /// An object is named by the hash of its bytes, written once and never
 /// changed. Every read is verified: bytes that do not hash to the name are an
 /// error, never an answer. A local directory first, any S3-compatible bucket
 /// later, behind this one port.
+///
+/// Objects are collected (`spawn chunks gc`) when no reachable commit names
+/// them and they are older than a grace period, so every use restarts an
+/// object's age: chunks are written before the commit that names them.
 pub trait ChunkStore: Send + Sync + std::fmt::Debug {
     /// Store `bytes` unless a sound object of the same content exists; its
-    /// name. A corrupt object of that content is replaced.
+    /// name. A corrupt object of that content is replaced; a sound one is
+    /// made young again.
     fn put(&self, bytes: &[u8]) -> Result<String, ChunkError>;
 
     /// The bytes of the object `name`, verified against the name.
@@ -236,6 +253,19 @@ pub trait ChunkStore: Send + Sync + std::fmt::Debug {
 
     /// Whether an object `name` is stored (not verified).
     fn contains(&self, name: &str) -> Result<bool, ChunkError>;
+
+    /// Make the object `name` young again, as a `put` of its content would;
+    /// false when the store does not hold it.
+    fn touch(&self, name: &str) -> Result<bool, ChunkError>;
+
+    /// Every object the store holds, with its age and size.
+    fn list(&self) -> Result<Vec<StoredObject>, ChunkError>;
+
+    /// Remove the object `name` only if it is still at least `older_than`
+    /// old, read again just before it goes: the bytes freed, or `None` when
+    /// it was kept (made young meanwhile, or already gone).
+    fn remove_if_older(&self, name: &str, older_than: Duration)
+    -> Result<Option<u64>, ChunkError>;
 }
 
 /// Terminal failure.
