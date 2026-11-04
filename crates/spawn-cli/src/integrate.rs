@@ -411,10 +411,14 @@ impl Integrator {
         {
             branch
         } else {
-            // Main moved since the worker started: land the merge of both.
+            // Main moved since the worker started: land the merge of both,
+            // by main's merge rules (a bare repository reads no in-tree
+            // .gitattributes otherwise), as the Bridge merges main into
+            // idle branches.
             let Ok(tree) = git(&[
                 "--git-dir",
                 &mirror_path,
+                &format!("--attr-source={main}"),
                 "merge-tree",
                 "--write-tree",
                 main,
