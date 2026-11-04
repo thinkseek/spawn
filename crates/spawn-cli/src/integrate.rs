@@ -11,12 +11,29 @@
 //!    stopped;
 //! 3. a task whose gate passed is landed (again, after a crash);
 //! 4. otherwise the next ready task is judged: accepted by the supervisor
-//!    (`accept` = review) or just reported (`gate`). Its workspace is
-//!    committed, merged with the source's main when main moved, and judged
-//!    by `scripts/rsi/gate.sh` with the mission's scenarios. A pass records
+//!    (`accept` = review) or just reported (`gate`). The candidate is what
+//!    the agent published: the source's `refs/heads/spawn/<agent>` (pushed
+//!    by the Bridge's pusher, [`crate::push`]), fetched into this mirror's
+//!    own `refs/spawn-integrate/<agent>`. The integrator never commits a
+//!    mounted workspace and never moves the agent's `refs/heads/<agent>`,
+//!    so it works the same on a host that never ran the agent, and a file
+//!    written after the last checkpoint never lands. The candidate is
+//!    merged with the source's main when main moved, and judged by
+//!    `scripts/rsi/gate.sh` with the mission's scenarios. A pass records
 //!    the verdict before git moves, then moves the source's main with a
 //!    compare-and-swap push and records the landing. A rejection sends the
 //!    task back to its worker with the gate's output as the note;
+//!
+//!    **Stale pushes do not land.** The pushed head must be the commit of
+//!    the agent's latest `artifact.committed` event (its last checkpoint or
+//!    merge of main) or a descendant of it. A push that lags (behind,
+//!    diverged, missing that commit, or no `spawn/<agent>` at all while the
+//!    agent has a checkpoint) is waited for briefly ([`PUSH_WAIT`], the
+//!    pusher coalesces pushes), then gated `stale`: the gate does not run,
+//!    the task goes back to `reported` (`accepted` under review), no
+//!    rejection is counted, nothing reaches the worker, and a later pass
+//!    judges again. An agent with neither a checkpoint nor a pushed branch
+//!    has no branch to land;
 //! 5. an objective mission with no open task gets its next objective
 //!    ([`objectives`]).
 //!
@@ -36,7 +53,7 @@ use spawn_core::port::{CommandQueue, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
-use crate::config::{chunk_store, loop_interval, workspace_root};
+use crate::config::{loop_interval, workspace_root};
 use crate::gate::{self, GateFailure};
 use crate::{Flags, env_or, open_store};
 use crate::{objectives, sources};
@@ -53,6 +70,14 @@ const MAX_PATCH_BYTES: usize = 1 << 20;
 
 /// Characters of gate output quoted back to the worker.
 const NOTE_LOG_CHARS: usize = 4000;
+
+/// How long a pass waits for a pushed branch that lags the agent's latest
+/// checkpoint before it gates the task `stale`: the pusher pushes a branch at
+/// most once per [`crate::push::INTERVAL`].
+const PUSH_WAIT: Duration = Duration::from_secs(12);
+
+/// Pause between two looks at a lagging pushed branch.
+const PUSH_POLL: Duration = Duration::from_millis(500);
 
 /// Who the integrator's commands come from.
 const PRINCIPAL: &str = "spawn-integrate";
@@ -173,6 +198,55 @@ fn tail(text: &str, limit: usize) -> &str {
         start += 1;
     }
     &text[start..]
+}
+
+/// Whether a pushed branch may be judged, against the agent's latest
+/// checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Freshness {
+    /// The pushed head is the checkpoint, a descendant of it, or there is
+    /// no checkpoint to compare with: judge this commit.
+    Fresh(String),
+    /// The push lags the checkpoint: wait for the pusher.
+    Stale(String),
+    /// Neither a checkpoint nor a pushed branch: nothing to land.
+    Nothing,
+}
+
+/// The stale rule. `contains(ancestor, commit)` says whether `ancestor` is
+/// reachable from `commit` in the integrator's mirror; a commit the mirror
+/// lacks is contained by nothing.
+pub(crate) fn freshness(
+    checkpoint: Option<&str>,
+    pushed: Option<&str>,
+    contains: impl Fn(&str, &str) -> bool,
+) -> Freshness {
+    match (checkpoint, pushed) {
+        (None, None) => Freshness::Nothing,
+        (None, Some(pushed)) => Freshness::Fresh(pushed.to_string()),
+        (Some(checkpoint), None) => Freshness::Stale(format!(
+            "the source has no spawn/<agent> yet, and the latest checkpoint is {checkpoint}"
+        )),
+        (Some(checkpoint), Some(pushed)) => {
+            if pushed == checkpoint || contains(checkpoint, pushed) {
+                Freshness::Fresh(pushed.to_string())
+            } else if contains(pushed, checkpoint) {
+                Freshness::Stale(format!(
+                    "the pushed branch ({pushed}) is behind the latest checkpoint ({checkpoint})"
+                ))
+            } else {
+                Freshness::Stale(format!(
+                    "the pushed branch ({pushed}) does not contain the latest checkpoint                      ({checkpoint})"
+                ))
+            }
+        }
+    }
+}
+
+/// The mirror's own copy of an agent's pushed branch: never
+/// `refs/heads/<agent>`, which on the Bridge's host is the Bridge's.
+fn integrator_ref(agent: &str) -> String {
+    format!("refs/spawn-integrate/{agent}")
 }
 
 fn git(arguments: &[&str]) -> Result<String, String> {
@@ -357,6 +431,45 @@ impl Integrator {
         Ok(aborted)
     }
 
+    /// The agent's pushed branch, fetched into the mirror, checked against
+    /// its latest checkpoint. A lagging push is fetched again for up to
+    /// [`PUSH_WAIT`] before it counts as stale.
+    fn pushed_candidate(
+        store: &PostgresStore,
+        mirror: &Path,
+        source: &str,
+        agent: &str,
+    ) -> Result<Freshness, String> {
+        let checkpoint = store
+            .latest_checkpoint(agent)
+            .map_err(|error| error.to_string())?;
+        let mirror_path = mirror.to_string_lossy().to_string();
+        let contains = |ancestor: &str, commit: &str| {
+            git(&[
+                "--git-dir",
+                &mirror_path,
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                commit,
+            ])
+            .is_ok()
+        };
+        let deadline = std::time::Instant::now() + PUSH_WAIT;
+        loop {
+            let pushed =
+                sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
+                    .map_err(|error| error.to_string())?;
+            let verdict = freshness(checkpoint.as_deref(), pushed.as_deref(), contains);
+            if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
+                return Ok(verdict);
+            }
+            std::thread::sleep(PUSH_POLL);
+        }
+    }
+
+    /// Judge one task. True when what it recorded may move another mission's
+    /// view; a stale push moves nothing.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn judge(
         &self,
@@ -367,16 +480,10 @@ impl Integrator {
         scenarios: &Path,
         count: u32,
         task: &Task,
-    ) -> Result<(), String> {
-        let repo = GitWorkspace::new(mirror, &self.root)
-            .with_chunks(chunk_store(&self.root.to_string_lossy()));
-        let directory = self.root.join(&task.agent_id);
-        if directory.exists() {
-            let workspace = WorkspaceId::new(format!("{}:{}", task.agent_id, directory.display()))
-                .map_err(|error| error.to_string())?;
-            repo.commit(&workspace, &format!("spawn integrate: task {}", task.id))
-                .map_err(|error| error.to_string())?;
-        }
+    ) -> Result<bool, String> {
+        // Read only: the integrator never commits a workspace, so the store
+        // needs no chunk store of its own.
+        let repo = GitWorkspace::new(mirror, &self.root);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
                                           "base": main, "scenarios": count});
@@ -397,8 +504,21 @@ impl Integrator {
         };
 
         let mirror_path = mirror.to_string_lossy().to_string();
-        let Ok(branch) = repo.commit_id_of(&format!("refs/heads/{}", task.agent_id)) else {
-            return rejected("the worker has no branch to land", "");
+        let branch = match Self::pushed_candidate(store, mirror, source, &task.agent_id)? {
+            Freshness::Fresh(branch) => branch,
+            Freshness::Nothing => {
+                return rejected("the worker has no branch to land", "").map(|()| true);
+            }
+            Freshness::Stale(reason) => {
+                // Not a verdict on the work: the pusher has not caught up.
+                record(
+                    store,
+                    &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                            "reason": reason}),
+                )?;
+                println!("integrate: task {} stale: {reason}", task.id);
+                return Ok(false);
+            }
         };
         // A merge of main whose markers are not resolved is not judged: the
         // markers could land, and a file rewritten instead of resolved would
