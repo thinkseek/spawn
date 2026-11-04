@@ -93,6 +93,7 @@ files, a chunk fetch.
 | State | Where | Rebuildable? |
 | --- | --- | --- |
 | Event log | PostgreSQL, one container on this host, bound to 127.0.0.1 | It *is* the source |
+| Event log backups | daily encrypted `pg_dump` in R2 bucket `spawn-store` (`postgres/`), 14 daily + 8 weekly; newest also in `~/.local/share/spawn-rsi/backups/` ([deploy/backup](../deploy/backup/README.md)) | They are the copy; the key is kept off-host |
 | What an engine did | read by the Bridge from transcript and pane into the log | Yes: in the log |
 | Full transcript text | `~/.claude/projects/...` on the compute host | **No**: phase 3 |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
