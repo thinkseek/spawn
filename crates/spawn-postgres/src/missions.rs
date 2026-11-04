@@ -195,9 +195,9 @@ impl PostgresStore {
     }
 
     /// One task with its brief, report and every gate verdict with its log;
-    /// `Value::Null` when there is no such task.
-    pub fn objective_task(&self, task: i64) -> Result<Value, StoreError> {
-        self.query_json(missions::OBJECTIVE_TASK, &[&task])
+    /// `None` when there is no such task.
+    pub fn objective_task(&self, task: i64) -> Result<Option<Value>, StoreError> {
+        Ok(self.query_one(missions::OBJECTIVE_TASK, &[&task])?.get(0))
     }
 
     /// Tasks the dispatcher has to deliver, watch or wind down.
