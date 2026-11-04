@@ -6,8 +6,9 @@
 capture "$SPAWN_BIN" init-db
 assert_eq "$status" 0 "init-db exit"
 
-# A port derived from the scenario pid keeps parallel scenarios apart.
-port=$((20000 + ($$ % 20000)))
+# A random port keeps parallel scenarios apart (not the pid: in the gate's
+# PID namespace it is the same every run).
+port=$((20000 + $(od -An -N2 -tu2 /dev/urandom) % 20000))
 web=$WORK/web
 mkdir -p "$web"
 printf '<!doctype html><title>spawn</title>\n' >"$web/index.html"

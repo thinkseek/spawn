@@ -33,9 +33,13 @@ fi
 base_url=${SPAWN_DATABASE_URL:?SPAWN_DATABASE_URL is required}
 tmux=${SPAWN_TMUX_PROGRAM:-tmux}
 work=$(mktemp -d)
-socket="spawn-mvp-$$"
-schema="mvp_e2e_$$"
-port=$((20000 + $$ % 20000))
+# Names unique per run. Not from $$ alone: the gate runs this in a new PID
+# namespace, where $$ is the same small number every time, and a schema
+# left by an earlier run would be reused.
+run="$$_${RANDOM}${RANDOM}"
+socket="spawn-mvp-$run"
+schema="mvp_e2e_$run"
+port=$((20000 + RANDOM % 20000))
 loop_pid=""
 jev_pid=""
 
