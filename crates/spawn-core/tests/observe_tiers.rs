@@ -184,6 +184,42 @@ fn rules_decide_settled_facts_without_a_model_call() {
 }
 
 #[test]
+fn a_stalled_end_asks_for_attention_until_the_execution_ends() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ExecutionEndStalled {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+            failures: 20,
+            error: "commit unavailable: chunk store: No space left on device".to_string(),
+        },
+    );
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Blocked);
+    assert_eq!(last.judge, "rules");
+    assert!(last.attention);
+    assert_eq!(last.attention_reason.as_deref(), Some("end_stalled"));
+    assert_eq!(judge.calls(), 0, "a fact, not a question for the model");
+
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Exited,
+            exit_code: Some(0),
+        },
+    );
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_ne!(last.attention_reason.as_deref(), Some("end_stalled"));
+}
+
+#[test]
 fn an_idle_prompt_goes_to_the_model_with_screen_and_task() {
     let judge = Scripted::new(Ok(blocked_answer()));
     let mut fixture = fixture(judge.clone());

@@ -8,10 +8,12 @@
 //! an in-place edit changes only the chunks it touches, and identical chunks
 //! are stored once.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use spawn_core::port::{ChunkError, ChunkStore};
@@ -141,6 +143,9 @@ pub fn is_name(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct LocalChunkStore {
     directory: PathBuf,
+    /// Objects this process found sound: each is read back once, not on
+    /// every `put` of the same content.
+    verified: Arc<Mutex<HashSet<String>>>,
 }
 
 impl LocalChunkStore {
@@ -148,6 +153,7 @@ impl LocalChunkStore {
     pub fn new(directory: impl AsRef<Path>) -> Self {
         Self {
             directory: directory.as_ref().to_path_buf(),
+            verified: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -168,17 +174,75 @@ fn unavailable(what: &str, path: &Path, error: &std::io::Error) -> ChunkError {
 /// Distinguishes temporary files of concurrent writers in one process.
 static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
+impl LocalChunkStore {
+    /// Whether the object at `path` decompresses to bytes named `name`.
+    fn verifies(path: &Path, name: &str) -> bool {
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
+            return false;
+        };
+        let mut hasher = blake3::Hasher::new();
+        let copied = std::io::copy(&mut decoder.take(MAX_OBJECT + 1), &mut hasher);
+        copied.is_ok_and(|length| length <= MAX_OBJECT)
+            && hasher.finalize().to_hex().as_str() == name
+    }
+
+    /// Whether the object `name` exists and was found sound, by this process
+    /// or now.
+    fn sound(&self, name: &str, path: &Path) -> bool {
+        let known = self
+            .verified
+            .lock()
+            .is_ok_and(|verified| verified.contains(name));
+        if known && path.is_file() {
+            return true;
+        }
+        if !Self::verifies(path, name) {
+            return false;
+        }
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.insert(name.to_string());
+        }
+        true
+    }
+}
+
+/// Fsync a directory, so the entries just made in it survive a crash.
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
 impl ChunkStore for LocalChunkStore {
+    /// Store `bytes`. An object already there is verified first: a sound one
+    /// is never rewritten, a corrupt one (a torn write, a disk error, a copy
+    /// that died) is replaced atomically by a rename over it, which repairs
+    /// every manifest that names it. File and directories are fsynced.
     fn put(&self, bytes: &[u8]) -> Result<String, ChunkError> {
         let name = hash_of(bytes);
         let path = self.path_of(&name);
-        if path.exists() {
+        let exists = std::fs::symlink_metadata(&path).is_ok();
+        if exists && self.sound(&name, &path) {
             return Ok(name);
         }
         let parent = path
             .parent()
             .ok_or_else(|| ChunkError::Unavailable(format!("{} has no parent", path.display())))?;
-        std::fs::create_dir_all(parent).map_err(|error| unavailable("create", parent, &error))?;
+        if !parent.is_dir() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| unavailable("create", parent, &error))?;
+            // The fan-out directory's own entry, and the root's, if new.
+            sync_directory(&self.directory)
+                .map_err(|error| unavailable("sync", &self.directory, &error))?;
+            if let Some(above) = self
+                .directory
+                .parent()
+                .filter(|above| !above.as_os_str().is_empty())
+            {
+                let _ = sync_directory(above);
+            }
+        }
         let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL)
             .map_err(|error| ChunkError::Unavailable(format!("compress {name}: {error}")))?;
         let temporary = parent.join(format!(
@@ -195,17 +259,28 @@ impl ChunkStore for LocalChunkStore {
             let _ = std::fs::remove_file(&temporary);
             return Err(unavailable("write", &temporary, &error));
         }
-        // A hard link never replaces an existing object; a writer that lost
-        // the race wrote the same bytes, so its copy is simply dropped.
-        let linked = match std::fs::hard_link(&temporary, &path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(_) if path.exists() => Ok(()),
-            // A file system without hard links: rename is still atomic.
-            Err(_) => std::fs::rename(&temporary, &path),
+        let published = if exists {
+            // A corrupt object: the rename replaces it in one step. A writer
+            // racing this one renames the same bytes.
+            std::fs::rename(&temporary, &path)
+        } else {
+            // A hard link never replaces an existing object; a writer that
+            // lost the race wrote the same bytes, so its copy is dropped.
+            let linked = match std::fs::hard_link(&temporary, &path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(_) if path.exists() => Ok(()),
+                // A file system without hard links: rename is still atomic.
+                Err(_) => std::fs::rename(&temporary, &path),
+            };
+            let _ = std::fs::remove_file(&temporary);
+            linked
         };
-        let _ = std::fs::remove_file(&temporary);
-        linked.map_err(|error| unavailable("publish", &path, &error))?;
+        if published.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        published.map_err(|error| unavailable("publish", &path, &error))?;
+        sync_directory(parent).map_err(|error| unavailable("sync", parent, &error))?;
         Ok(name)
     }
 
@@ -379,43 +454,123 @@ pub fn store_file(store: &dyn ChunkStore, path: &Path) -> Result<(Vec<String>, u
     Ok((chunks, size))
 }
 
-/// Write `file` under `directory` from `store`, atomically: every chunk is
-/// verified and the size checked into a temporary file beside the target,
-/// which is renamed into place only when all of it is right. On any error
-/// the target is left untouched.
+/// A directory held open, reached without following any symlink, and the
+/// path that names its entries: through the open descriptor
+/// (`/proc/self/fd/<n>/<entry>`) where /proc shows it, so a component
+/// swapped for a symlink after it was opened is never followed.
+struct Held {
+    file: File,
+    path: PathBuf,
+}
+
+impl Held {
+    /// Open the directory `path` itself, refusing a symlink or anything that
+    /// is not a directory.
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        Ok(Self { file, path })
+    }
+
+    /// The path of `name` inside this directory.
+    fn entry(&self, name: &std::ffi::OsStr) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        let through = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+        if through.is_dir() {
+            through.join(name)
+        } else {
+            self.path.join(name)
+        }
+    }
+
+    /// The child directory `name`, made when missing. A symlink, a file or
+    /// anything else that is not a directory is refused.
+    fn child(&self, name: &std::ffi::OsStr) -> Result<Self, String> {
+        let entry = self.entry(name);
+        let shown = self.path.join(name);
+        let refused = |error: std::io::Error| {
+            format!(
+                "{}: not a directory of the workspace (a symlink or a file is in the way): {error}",
+                shown.display()
+            )
+        };
+        match std::fs::symlink_metadata(&entry) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // mkdir never follows a symlink in its last component.
+                match std::fs::create_dir(&entry) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(format!("create {}: {error}", shown.display())),
+                }
+            }
+            Err(error) => return Err(format!("stat {}: {error}", shown.display())),
+        }
+        let held = Self::open(entry).map_err(refused)?;
+        Ok(Self {
+            path: shown,
+            ..held
+        })
+    }
+}
+
+/// Write `file` under `directory` from `store`, atomically and inside the
+/// workspace only: every chunk is verified and the size checked into a
+/// temporary file beside the target, which is renamed into place only when
+/// all of it is right. On any error the target is left untouched.
+///
+/// The parent directories are walked one component at a time, each opened
+/// with `O_NOFOLLOW` and made with `mkdir` when missing, so a symlink (or a
+/// file) where the manifest has a directory fails the write instead of
+/// leading it out of the workspace. The temporary file is created
+/// exclusively and without following a symlink, and renamed inside the
+/// directory that was verified.
 pub fn materialize(
     store: &dyn ChunkStore,
     directory: &Path,
     file: &LargeFile,
 ) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
     if !is_safe_path(&file.path) {
         return Err(format!("unsafe path {}", file.path));
     }
-    let target = directory.join(&file.path);
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("{} has no parent", target.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("create {}: {error}", parent.display()))?;
-    let name = target
+    let relative = Path::new(&file.path);
+    let name = relative
         .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let temporary = parent.join(format!(
-        ".{name}.spawn-{}-{}",
+        .ok_or_else(|| format!("{} has no file name", file.path))?;
+    let mut parent = Held::open(directory.to_path_buf())
+        .map_err(|error| format!("open {}: {error}", directory.display()))?;
+    if let Some(parents) = relative.parent() {
+        for component in parents.components() {
+            parent = parent.child(component.as_os_str())?;
+        }
+    }
+    let temporary_name = format!(
+        ".{}.spawn-{}-{}",
+        name.to_string_lossy(),
         std::process::id(),
         TEMPORARY.fetch_add(1, Ordering::Relaxed)
-    ));
+    );
+    let temporary = parent.entry(std::ffi::OsStr::new(&temporary_name));
+    let shown = parent.path.join(&temporary_name);
+    let target = parent.entry(name);
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temporary)
+        .map_err(|error| format!("create {}: {error}", shown.display()))?;
     let written = (|| -> Result<(), String> {
-        let mut output = File::create(&temporary)
-            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
         let mut size = 0u64;
         for chunk in &file.chunks {
             let bytes = store.get(chunk).map_err(|error| error.to_string())?;
             size += bytes.len() as u64;
             output
                 .write_all(&bytes)
-                .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+                .map_err(|error| format!("write {}: {error}", shown.display()))?;
         }
         if size != file.size {
             return Err(format!(
@@ -423,12 +578,16 @@ pub fn materialize(
                 file.path, file.size
             ));
         }
+        set_mode(&output, file.mode)
+            .map_err(|error| format!("chmod {}: {error}", shown.display()))?;
         output
             .sync_all()
-            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
-        set_mode(&temporary, file.mode)?;
+            .map_err(|error| format!("sync {}: {error}", shown.display()))?;
+        // rename replaces a symlink at the target, never what it points to.
         std::fs::rename(&temporary, &target)
-            .map_err(|error| format!("rename to {}: {error}", target.display()))
+            .map_err(|error| format!("rename to {}: {error}", parent.path.join(name).display()))?;
+        let _ = parent.file.sync_all();
+        Ok(())
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -436,12 +595,13 @@ pub fn materialize(
     written
 }
 
-fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+fn set_mode(file: &File, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let permissions =
-        std::fs::Permissions::from_mode(if mode == 0o100_755 { 0o755 } else { 0o644 });
-    std::fs::set_permissions(path, permissions)
-        .map_err(|error| format!("chmod {}: {error}", path.display()))
+    file.set_permissions(std::fs::Permissions::from_mode(if mode == 0o100_755 {
+        0o755
+    } else {
+        0o644
+    }))
 }
 
 /// git mode of a file from its permissions.
@@ -580,6 +740,7 @@ mod tests {
             chunks: vec![name.clone()],
         };
         let workspace = directory.join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
         materialize(&store, &workspace, &file).expect("materialize");
         assert_eq!(
             std::fs::read(workspace.join("data/big.bin")).expect("read"),
@@ -602,6 +763,103 @@ mod tests {
         );
         let leftovers: Vec<_> = walk(&workspace.join("data"));
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_put_repairs_a_corrupt_object_and_never_rewrites_a_sound_one() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = scratch("repair");
+        let bytes = noise(6, 150_000);
+        let name = LocalChunkStore::new(&directory).put(&bytes).expect("put");
+        let object = directory.join(&name[..2]).join(&name);
+        let inode = std::fs::metadata(&object).expect("object").ino();
+
+        // Sound: a later process (a fresh store) verifies it and keeps it.
+        let store = LocalChunkStore::new(&directory);
+        assert_eq!(store.put(&bytes).expect("put sound"), name);
+        assert_eq!(std::fs::metadata(&object).expect("object").ino(), inode);
+
+        // Truncated, as a torn copy leaves it: the next put replaces it.
+        let stored = std::fs::read(&object).expect("read object");
+        std::fs::write(&object, &stored[..stored.len() / 2]).expect("truncate");
+        let store = LocalChunkStore::new(&directory);
+        assert!(matches!(store.get(&name), Err(ChunkError::Corrupt(_))));
+        assert_eq!(store.put(&bytes).expect("put repairs"), name);
+        assert_eq!(store.get(&name).expect("repaired"), bytes);
+        assert_ne!(
+            std::fs::metadata(&object).expect("object").ino(),
+            inode,
+            "replaced by a rename, not written in place"
+        );
+        assert_eq!(walk(&directory).len(), 1, "no temporary file left");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn materialize_never_writes_through_a_symlink_or_past_a_file() {
+        let directory = scratch("nofollow");
+        let store = LocalChunkStore::new(directory.join("store"));
+        let bytes = noise(7, 100_000);
+        let name = store.put(&bytes).expect("put");
+        let workspace = directory.join("ws");
+        let outside = directory.join("outside");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("model.bin"), b"owner's file").expect("victim");
+        let file = |path: &str| LargeFile {
+            path: path.to_string(),
+            mode: 0o100_644,
+            size: bytes.len() as u64,
+            chunks: vec![name.clone()],
+        };
+
+        // A symlinked directory, first or deeper in the path.
+        std::os::unix::fs::symlink(&outside, workspace.join("assets")).expect("symlink");
+        let refused = materialize(&store, &workspace, &file("assets/model.bin"))
+            .expect_err("a symlinked parent is refused");
+        assert!(
+            refused.contains("not a directory of the workspace"),
+            "{refused}"
+        );
+        std::fs::create_dir_all(workspace.join("deep")).expect("deep");
+        std::os::unix::fs::symlink("../../outside", workspace.join("deep/link")).expect("symlink");
+        assert!(materialize(&store, &workspace, &file("deep/link/model.bin")).is_err());
+        assert_eq!(
+            std::fs::read(outside.join("model.bin")).expect("victim"),
+            b"owner's file"
+        );
+        assert_eq!(walk(&outside).len(), 1, "nothing written outside");
+
+        // A file where a directory should be.
+        std::fs::write(workspace.join("plain"), b"x").expect("file");
+        assert!(materialize(&store, &workspace, &file("plain/model.bin")).is_err());
+
+        // A symlink at the target itself is replaced, not written through.
+        std::os::unix::fs::symlink(outside.join("model.bin"), workspace.join("top.bin"))
+            .expect("symlink");
+        materialize(&store, &workspace, &file("top.bin")).expect("materialize");
+        assert_eq!(
+            std::fs::read(workspace.join("top.bin")).expect("read"),
+            bytes
+        );
+        assert!(
+            !std::fs::symlink_metadata(workspace.join("top.bin"))
+                .expect("stat")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(outside.join("model.bin")).expect("victim"),
+            b"owner's file"
+        );
+
+        // Missing directories are made, inside the workspace.
+        materialize(&store, &workspace, &file("new/dir/model.bin")).expect("materialize");
+        assert_eq!(
+            std::fs::read(workspace.join("new/dir/model.bin")).expect("read"),
+            bytes
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 

@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use spawn_core::id::{BranchName, WorkspaceId};
-use spawn_core::port::{BaseMerge, Branch, Commit, WorkspaceStore};
-use spawn_host::{GitWorkspace, has_conflict_block};
+use spawn_core::port::{BaseMerge, Branch, ChunkStore, Commit, WorkspaceStore};
+use spawn_host::chunks::{LargeFile, Manifest};
+use spawn_host::git::DEFAULT_CHUNK_DIRECTORY;
+use spawn_host::{GitWorkspace, LocalChunkStore, has_conflict_block};
 
 /// Output of git in `directory`, which must succeed.
 fn git(directory: &Path, arguments: &[&str]) -> String {
@@ -258,7 +260,10 @@ fn a_content_conflict_writes_markers_and_the_resolution_becomes_the_merge() {
     assert_eq!(read(&directory, "new.txt"), "theirs\n");
     assert_eq!(fixture.head("agent_a"), head, "the branch did not move");
     let waiting = fs::read_to_string(pending(&directory, "agent_a")).expect("a pending merge");
-    assert!(waiting.starts_with(&main), "{waiting:?}");
+    assert!(
+        waiting.starts_with(&format!("pending-merge\0{main}\0{head}\0")),
+        "{waiting:?}"
+    );
     // Asked again, nothing is written twice.
     assert_eq!(
         fixture.store.merge_base(&workspace).expect("again"),
@@ -441,12 +446,27 @@ fn the_merge_rules_come_from_mains_gitattributes() {
     ));
 }
 
-#[test]
-fn a_merge_keeps_the_branchs_large_file_manifest() {
-    let fixture = Fixture::new("trailer", &[("README.md", "base\n")]);
-    let (_, workspace, _) = fixture.mount("agent_a");
-    let head = fixture.work(&workspace, &[("work.txt", "mine\n")]);
-    // A checkpoint that names a large-file manifest.
+/// Put a manifest of one large file at `path` (a few bytes of content) in
+/// the store's chunk directory, and make the branch head name it, as a
+/// checkpoint with a large file does. Returns the manifest's name.
+fn name_large_file(fixture: &Fixture, workspace: &WorkspaceId, branch: &str, path: &str) -> String {
+    let chunks = LocalChunkStore::new(
+        Path::new(workspace.path())
+            .parent()
+            .expect("the workspace root")
+            .join(DEFAULT_CHUNK_DIRECTORY),
+    );
+    let chunk = chunks.put(b"model").expect("put a chunk");
+    let manifest = Manifest {
+        files: vec![LargeFile {
+            path: path.to_string(),
+            mode: 0o100_644,
+            size: 5,
+            chunks: vec![chunk],
+        }],
+    };
+    let name = chunks.put(&manifest.to_bytes()).expect("put the manifest");
+    let head = fixture.head(branch);
     let tree = git(
         &fixture.checkout,
         &["rev-parse", &format!("{head}^{{tree}}")],
@@ -459,13 +479,22 @@ fn a_merge_keeps_the_branchs_large_file_manifest() {
             "-p",
             &head,
             "-m",
-            "spawn checkpoint\n\nSpawn-Large: abc123",
+            &format!("spawn checkpoint\n\nSpawn-Large: {name}"),
         ],
     );
     git(
         &fixture.checkout,
-        &["update-ref", "refs/heads/agent_a", &named, &head],
+        &["update-ref", &format!("refs/heads/{branch}"), &named, &head],
     );
+    name
+}
+
+#[test]
+fn a_merge_keeps_the_branchs_large_file_manifest() {
+    let fixture = Fixture::new("trailer", &[("README.md", "base\n")]);
+    let (_, workspace, _) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    let name = name_large_file(&fixture, &workspace, "agent_a", "data/model.bin");
     fixture.land(&[("new.txt", "theirs\n")]);
     let BaseMerge::Merged { commit, .. } = fixture.store.merge_base(&workspace).expect("merge")
     else {
@@ -475,7 +504,78 @@ fn a_merge_keeps_the_branchs_large_file_manifest() {
         &fixture.checkout,
         &["log", "-1", "--format=%B", commit.as_str()],
     );
-    assert!(message.contains("Spawn-Large: abc123"), "{message}");
+    assert!(
+        message.contains(&format!("Spawn-Large: {name}")),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_main_symlink_where_a_large_file_lives_is_refused_at_merge_and_at_mount() {
+    let fixture = Fixture::new("large-symlink", &[("README.md", "base\n")]);
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    name_large_file(&fixture, &workspace, "agent_a", "assets/model.bin");
+    let named = fixture.head("agent_a");
+    // Main gains `assets -> <outside>`, where the branch's large file goes.
+    let outside = directory
+        .parent()
+        .and_then(Path::parent)
+        .expect("the fixture directory")
+        .join("outside");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("model.bin"), "owner's file\n").expect("a file outside");
+    std::os::unix::fs::symlink(&outside, fixture.checkout.join("assets")).expect("symlink");
+    let main = fixture.land(&[]);
+
+    // The idle merge is clean in git, but the merged tree has no room for
+    // the large file: refused, nothing moves.
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec!["assets/model.bin".to_string()],
+            marked: false,
+        }
+    );
+    assert_eq!(fixture.head("agent_a"), named, "the branch did not move");
+
+    // A head that pairs the symlink with the manifest anyway (the merge an
+    // earlier build made, or a commit a same-uid agent wrote): the mount
+    // fails and writes nothing outside.
+    let merged_tree = git(
+        &fixture.checkout,
+        &["merge-tree", "--write-tree", &main, &named],
+    );
+    let message = git(&fixture.checkout, &["log", "-1", "--format=%B", &named]);
+    let forced = git(
+        &fixture.checkout,
+        &[
+            "commit-tree",
+            merged_tree.lines().next().expect("a tree"),
+            "-p",
+            &named,
+            "-p",
+            &main,
+            "-m",
+            &message,
+        ],
+    );
+    git(
+        &fixture.checkout,
+        &["update-ref", "refs/heads/agent_a", &forced, &named],
+    );
+    fixture.store.unmount(&workspace).expect("unmount");
+    let refused = fixture.store.mount(&branch).expect_err("the mount fails");
+    assert!(
+        refused.to_string().contains("assets/model.bin"),
+        "{refused}"
+    );
+    assert_eq!(read(&outside, "model.bin"), "owner's file\n");
+    assert_eq!(
+        fs::read_dir(&outside).expect("outside").count(),
+        1,
+        "nothing written outside"
+    );
 }
 
 #[test]
@@ -545,6 +645,60 @@ fn a_pending_merge_lives_only_in_its_directory() {
     assert!(!pending(&directory, "agent_a").exists(), "mount clears it");
     let after = fixture.work(&workspace, &[("work.txt", "more\n")]);
     assert_eq!(parents(&fixture, &after), vec![head]);
+}
+
+#[test]
+fn a_pending_merge_whose_markers_were_committed_survives_the_unmount() {
+    let fixture = Fixture::new("pending-committed", &[("README.md", "base\n")]);
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    let head = fixture.work(&workspace, &[("README.md", "mine\n")]);
+    let main = fixture.land(&[("README.md", "theirs\n"), ("new.txt", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    // A checkpoint with the markers in, then the execution ends.
+    let Commit::Created(unresolved) = fixture.store.commit(&workspace, "wip").expect("commit")
+    else {
+        panic!("the merge changed the workspace");
+    };
+    assert_eq!(parents(&fixture, unresolved.as_str()), vec![head]);
+    let marked = read(&directory, "README.md");
+    fixture.store.unmount(&workspace).expect("unmount");
+    assert!(
+        pending(&directory, "agent_a").exists(),
+        "the branch carries the markers: main is still owed a parent"
+    );
+
+    // The next execution sees the same markers, not a merge of them.
+    let workspace = fixture.store.mount(&branch).expect("mount");
+    assert!(pending(&directory, "agent_a").exists());
+    assert_eq!(read(&directory, "README.md"), marked);
+    assert_eq!(read(&directory, "new.txt"), "theirs\n");
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec!["README.md".to_string()],
+            marked: true,
+        }
+    );
+    assert_eq!(read(&directory, "README.md"), marked, "no doubled markers");
+
+    // The resolution is the merge with main, and main is now contained.
+    let resolved = fixture.work(&workspace, &[("README.md", "mine and theirs\n")]);
+    assert_eq!(
+        parents(&fixture, &resolved),
+        vec![unresolved.as_str().to_string(), main.clone()]
+    );
+    assert!(!pending(&directory, "agent_a").exists());
+    git(
+        &fixture.checkout,
+        &["merge-base", "--is-ancestor", &main, &resolved],
+    );
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("current"),
+        BaseMerge::Current
+    );
 }
 
 #[test]

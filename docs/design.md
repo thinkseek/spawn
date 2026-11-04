@@ -61,6 +61,8 @@ spawn-core
 | `session.native_ended` | 无；保留它以读取日志里已有的行 | reason |
 | `session.linked` | Bridge | parent_session_id |
 | `message.received` | 会话记录（transcript） | 无 |
+| `notice.typed` | Bridge（键入的提示以合并通知开头时） | through（通知覆盖到的最后一个合并事件的位置） |
+| `notice.received` | 会话记录（以合并通知固定开头的提示行） | 无 |
 | `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |
 | `tool.started` | 会话记录、Codex | tool_name、tool_use_id |
 | `tool.completed` | 会话记录、Codex | tool_use_id、duration_ms |
@@ -69,6 +71,7 @@ spawn-core
 | `turn.failed` | 会话记录（API 错误行）、Codex | error |
 | `execution.started` | Bridge | engine、terminal、workspace、command_id；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code |
+| `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
 | `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
 | `merge.conflicted` | Bridge | files、marked |
 | `command.accepted` | Gateway 事务 | command_id |
@@ -94,7 +97,7 @@ spawn-core
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进空闲工作区的分支：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
-| `ChunkStore` | `put`、`get`、`contains` | 按内容寻址的大文件对象存储：对象以其字节的哈希命名，写一次、不改，读时校验（见 [storage.md](./storage.md)） |
+| `ChunkStore` | `put`、`get`、`contains` | 按内容寻址的大文件对象存储：对象以其字节的哈希命名，写一次、不改，读时校验；`put` 遇到已有对象先校验，损坏的原子替换（修复，不是修改）（见 [storage.md](./storage.md)） |
 | `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`capture_tail`、`read_from`、`terminate` | 终端生命周期、屏尾读取与读取引擎写的文件；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 
 错误类型：
@@ -115,7 +118,8 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 | --- | --- |
 | `Start{engine,prompt,parent_session_id,from}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ mount → 写 `execution.started`（新分支带 fork）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
 | `Input{text}` | 屏尾非 Ready 直接拒绝，Ready 才 `send-keys` |
-| `Stop` | 走结束流程，原因记为 `Stopped` |
+| `Stop` | 走结束流程，原因记为 `Stopped`；最后一次 checkpoint 失败时工作区不卸载 |
+| `Discard` | 同 `Stop`，但最后一次 checkpoint 失败也卸载工作区，未提交的内容丢失；只由人或 supervisor 在 `execution.end_stalled` 之后发出 |
 | `Resume{prompt}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
 
 一次启动的参数由 `claude_arguments` 与 `codex_arguments` 生成：
@@ -131,15 +135,15 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
 
-合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。此外，空闲的活执行（没有进行中的回合、本 tick 没读到要求 checkpoint 的事件、屏幕最后读到 Ready）按 Bridge 自己的时钟每 30 秒（`IDLE_MERGE_MS`）至多调用一次 `merge_base`；Bridge 投递提示（`Start` 的首个提示、`Input`）时立即打开回合。`Merged` 写 `artifact.committed`（reason `base_merged`，带合并改动的 `files`，折叠时不清掉仍待做的 checkpoint）；冲突按状态记一次 `merge.conflicted{files,marked}`，同一冲突或失败的警告只报一次，状态变了才再报。每个会话有一份由这两种事件折叠出、遇 `message.received` 清空的提示：Bridge 下一次为该会话键入 `Input` 或 `Resume` 提示时把它放在最前（「Spawn merged main into your workspace since your last turn: <files>. Re-read them before editing.」；冲突时说明这些文件带冲突标记、编辑标记区域、不要凭记忆重写），从不主动键入，送出即清空。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后大声告警并照常卸载；`Conflicted` 与失败只进 tick 报告的警告（区分「目录里已有冲突标记」与「标记表达不了，未合并」），冲突由落地告诉 agent。
+合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。此外，空闲的活执行（没有进行中的回合、本 tick 没读到要求 checkpoint 的事件、屏幕最后读到 Ready）按 Bridge 自己的时钟每 30 秒（`IDLE_MERGE_MS`）至多调用一次 `merge_base`；Bridge 投递提示（`Start` 的首个提示、`Input`）时立即打开回合。`Merged` 写 `artifact.committed`（reason `base_merged`，带合并改动的 `files`，折叠时不清掉仍待做的 checkpoint）；冲突按状态记一次 `merge.conflicted{files,marked}`，同一冲突或失败的警告只报一次，状态变了才再报。每个会话有一份由这两种事件折叠出的提示，每个文件记着最后提到它的合并事件的位置：Bridge 下一次为该会话键入 `Input` 或 `Resume` 提示时把它放在最前（「Spawn merged main into your workspace since your last turn: <files>. Re-read them before editing.」；冲突时说明这些文件带冲突标记、编辑标记区域、不要凭记忆重写），从不主动键入。键入成功后写 `notice.typed{through}`；只有这条提示到达引擎时才清空：会话记录里以通知固定开头的提示行产生 `notice.received`（Codex 的提示是启动参数，恢复执行的第一条提示即是它），只清掉 `through` 及之前的文件。别人键入的回合、引擎自己继续的回合、重启都不清空；已键入未到达的通知随下一条提示再键入。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载；`Conflicted` 与失败只进 tick 报告的警告（区分「目录里已有冲突标记」与「标记表达不了，未合并」），冲突由落地告诉 agent。
 
-结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。
+结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
 
 结束的三个来源：
 
 | 来源 | 触发 | `cause` |
 | --- | --- | --- |
-| `Stop` 命令 | 用户 | `Stopped` |
+| `Stop`、`Discard` 命令 | 用户、supervisor | `Stopped`（已在结束中的执行保留原来的原因） |
 | `spawn run` | 引擎退出，runner 把退出码写进 `SPAWN_EXIT_FILE`，Bridge 下一个 tick 读到后走结束流程 | `Exited`，带退出码 |
 | tick 发现终端不在 | 进程崩溃或终端被外部杀掉 | `Lost` |
 
@@ -176,7 +180,7 @@ Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来
 
 `Observation { state, reason, based_on_seq, confidence, judge }`。`SemanticState` 取值 `Working`、`Waiting`、`Blocked`、`Completed`、`Unknown`，序列化为 `SCREAMING_SNAKE_CASE`，`ALL` 数组即声明顺序。
 
-`JudgeInput` 字段：`agent_id`、`session_id`、`engine`、`execution_active`、`last_end`、`open_tools`、`last_tool`、`permission_pending`、`screen`、`turn`、`last_error`、`evidence_seq`。
+`JudgeInput` 字段：`agent_id`、`session_id`、`engine`、`execution_active`、`stalled_end`、`last_end`、`open_tools`、`last_tool`、`permission_pending`、`screen`、`turn`、`last_error`、`evidence_seq`。`stalled_end` 来自当前执行的 `execution.end_stalled`（到 `execution.ended` 为止）：规则直接判 BLOCKED，attention 原因 `end_stalled`，不问判定器。
 
 Observer 每次 tick：
 

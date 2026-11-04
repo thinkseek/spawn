@@ -21,6 +21,7 @@ fn input() -> JudgeInput {
         session_id: "session_one".to_string(),
         engine: Some(spawn_core::event::Engine::Claude),
         execution_active: true,
+        stalled_end: None,
         last_end: None,
         exit_code: None,
         open_tools: 1,

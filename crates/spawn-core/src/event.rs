@@ -166,6 +166,20 @@ pub enum EventKind {
     /// A prompt reached the engine.
     #[serde(rename = "message.received")]
     MessageReceived,
+    /// The Bridge typed a prompt that opens with the merge notice
+    /// ([`crate::ingest::MERGE_NOTICE_OPENING`]): what merges of main changed
+    /// in the agent's workspace, up to and including the event at `through`.
+    /// The notice stays due until that prompt reaches the engine.
+    #[serde(rename = "notice.typed")]
+    NoticeTyped {
+        /// The last merge event the typed notice told of.
+        through: GlobalPosition,
+    },
+    /// A prompt that opens with the merge notice reached the engine: the
+    /// notice the Bridge typed last is delivered. Read from the engine's
+    /// transcript, never inferred from any prompt.
+    #[serde(rename = "notice.received")]
+    NoticeReceived,
     /// The engine asked for attention, for example a permission prompt.
     #[serde(rename = "notification.received")]
     NotificationReceived {
@@ -232,6 +246,22 @@ pub enum EventKind {
         cause: EndCause,
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
+    },
+    /// The final checkpoint of an ending execution kept failing: the
+    /// terminal is down, the workspace stays mounted with everything it
+    /// holds, and the Bridge retries the checkpoint at a slow interval until
+    /// it commits or a `discard` command gives the work up. Written once per
+    /// execution; it asks for attention until `execution.ended`.
+    #[serde(rename = "execution.end_stalled")]
+    ExecutionEndStalled {
+        /// How the execution was ending.
+        cause: EndCause,
+        /// Process exit code when the OS reported one.
+        exit_code: Option<i32>,
+        /// Final checkpoints that failed so far.
+        failures: u32,
+        /// The last failure.
+        error: String,
     },
     /// The workspace store persisted a checkpoint.
     #[serde(rename = "artifact.committed")]
@@ -303,6 +333,8 @@ impl EventKind {
             Self::NativeSessionEnded { .. } => "session.native_ended",
             Self::SessionLinked { .. } => "session.linked",
             Self::MessageReceived => "message.received",
+            Self::NoticeTyped { .. } => "notice.typed",
+            Self::NoticeReceived => "notice.received",
             Self::NotificationReceived { .. } => "notification.received",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolCompleted { .. } => "tool.completed",
@@ -311,6 +343,7 @@ impl EventKind {
             Self::TurnFailed { .. } => "turn.failed",
             Self::ExecutionStarted { .. } => "execution.started",
             Self::ExecutionEnded { .. } => "execution.ended",
+            Self::ExecutionEndStalled { .. } => "execution.end_stalled",
             Self::ArtifactCommitted { .. } => "artifact.committed",
             Self::MergeConflicted { .. } => "merge.conflicted",
             Self::CommandAccepted { .. } => "command.accepted",

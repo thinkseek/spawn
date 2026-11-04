@@ -191,8 +191,9 @@ pub struct Observation {
     pub evidence: Option<serde_json::Value>,
     /// Why `attention` is set, in one word: `permission`, `blocked`,
     /// `unknown`, `needs_human`, `stuck`, `risky`, `disagreement`,
-    /// `low_confidence`, `judge_unavailable`, `failing_exit`, or
-    /// `human_question`.
+    /// `low_confidence`, `judge_unavailable`, `failing_exit`,
+    /// `human_question`, or `end_stalled` (a final checkpoint that keeps
+    /// failing over a workspace that stays mounted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_reason: Option<String>,
     /// The question for a person the agent's screen ends with (a line that
