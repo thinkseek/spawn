@@ -18,6 +18,12 @@ mkdir -p "$HOME/.config/spawn" "$HOME/.ssh" "$HOME/.local/share/spawn-rsi"
 echo owner-secret >"$HOME/.config/spawn/secret"
 echo owner-key >"$HOME/.ssh/id_test"
 echo owner-session >"$HOME/.claude.json"
+# Files no deny-list named: the allow-list hides them too.
+printf '[credential]\n\thelper = owner-helper\n' >"$HOME/.gitconfig"
+echo owner-oauth >"$HOME/.claude.json.backup"
+echo 'export TOKEN=owner' >"$HOME/.bash_history"
+mkdir -p "$HOME/.hermes"
+echo owner-hermes >"$HOME/.hermes/key"
 echo SPAWN_DATABASE_URL=owner >"$HOME/.local/share/spawn-rsi/spawn.env"
 
 repo=$work/repo.git
@@ -205,6 +211,53 @@ EOF
 sandboxed=$(commit sandbox)
 expect "candidate code is confined" "$(judge "$sandboxed")" 'exit=0 {"verdict":"accepted"}'
 [ ! -e "$work/escaped" ] || { echo "FAIL the sandbox wrote $work/escaped"; exit 1; }
+
+# 3b. $HOME is an allow-list: a file nobody thought to mask is not there.
+branch home
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+fail=0
+for f in .gitconfig .claude.json.backup .bash_history .hermes/key; do
+    if cat "$HOME/$f" 2>/dev/null | grep -q owner; then echo "read ~/$f"; fail=1; fi
+done
+exit $fail
+EOF
+home=$(commit home)
+expect "a \$HOME file outside the allow-list is not readable" "$(judge "$home")" 'exit=0 {"verdict":"accepted"}'
+
+# 3c. No network but loopback: a host listener and the live database port
+# are unreachable; the sandbox's own loopback works.
+listener=$work/listener.port
+python3 -c '
+import socket, sys, time
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+print(s.getsockname()[1], flush=True)
+time.sleep(600)' >"$listener" &
+listener_pid=$!
+trap 'kill "$listener_pid" 2>/dev/null; rm -rf "$work" "$marker"' EXIT
+while [ ! -s "$listener" ]; do sleep 0.1; done
+host_port=$(cat "$listener")
+# The probe's control: the host listener answers from outside the sandbox.
+python3 -c "import socket; socket.create_connection(('127.0.0.1', $host_port), 2)"
+branch network
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<EOF
+#!/bin/sh
+fail=0
+for port in $host_port 15433; do
+    if python3 -c "import socket; socket.create_connection(('127.0.0.1', \$port), 2)" 2>/dev/null; then
+        echo "reached 127.0.0.1:\$port"; fail=1
+    fi
+done
+python3 -c '
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+socket.create_connection(s.getsockname(), 2)' || { echo "no loopback"; fail=1; }
+exit \$fail
+EOF
+network=$(commit network)
+expect "the host's listeners (and 127.0.0.1:15433) are unreachable" "$(judge "$network")" 'exit=0 {"verdict":"accepted"}'
 
 # 4. A build script by another name: `build = ` in any Cargo.toml, however
 # spelled. `[build-dependencies]` and `build-override` are not build keys.
