@@ -87,6 +87,12 @@ Actions for `--action`:
 | `resume` | optional `prompt`; Codex requires it |
 | `stop` | none |
 
+Missions: `spawn mission add --text ... [--source <repo>]` (a human), then the supervisor plans
+and routes tasks (`spawn task assign`), workers report in `.spawn/report.md`, the supervisor
+accepts or sends back. Worker branches live in the mission's mirror under
+`$SPAWN_WORKSPACE_ROOT/.sources/`; a human merges one only after
+`scripts/merge-gate.sh <mirror> <branch>` passes.
+
 End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s):
 `SPAWN_DATABASE_URL=postgres://.../spawn_test scripts/mvp-e2e.sh`.
 
