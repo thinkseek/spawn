@@ -214,6 +214,48 @@ fn a_large_file_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
 }
 
 #[test]
+fn a_large_file_named_like_a_pattern_drops_nothing_else() {
+    let _exclusive = exclusive();
+    let (repo, root) = repository("pattern");
+    let store = GitWorkspace::new(&repo, &root);
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 1;
+    fs::write(directory.join("a.txt"), "a\n").expect("write");
+    fs::write(directory.join("b.txt"), "b\n").expect("write");
+    for name in ["*", "*.txt", ":"] {
+        fs::write(directory.join(name), vec![1u8; size]).expect("write a large file");
+    }
+    assert!(matches!(
+        store.commit(&workspace, "work").expect("commit succeeds"),
+        Commit::Created(_)
+    ));
+    let listed = Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args(["ls-tree", "-r", "--name-only", &branch().to_string()])
+        .output()
+        .expect("list the branch");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    for kept in ["a.txt", "b.txt", "README.md"] {
+        assert!(
+            listed.lines().any(|line| line == kept),
+            "{kept} kept: {listed}"
+        );
+    }
+    for large in ["*", "*.txt", ":"] {
+        assert!(
+            !listed.lines().any(|line| line == large),
+            "{large} out: {listed}"
+        );
+    }
+    store.unmount(&workspace).expect("unmount succeeds");
+}
+
+#[test]
 fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
     let (repo, root) = repository("identity");
