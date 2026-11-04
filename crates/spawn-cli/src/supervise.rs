@@ -5,12 +5,14 @@
 //! liveness rule that keeps it: a control-layer rule over facts read from
 //! storage, with no model involved. Each loop step it decides one of:
 //!
-//! - nothing: a command is in flight, the engine is live, or a human stopped it;
+//! - nothing: a command is in flight, the engine is live, someone stopped it,
+//!   or a failed revival is backing off;
 //! - resume: the engine ended and a native session exists to resume;
 //! - start with a handoff: nothing to resume, or resuming failed three times.
 //!   The new native session gets the charter plus a summary rebuilt from the
 //!   log, because the log, not the context window, is its durable memory.
 //!
+//! Approved residents are kept by the same rule ([`keep_residents`]).
 //! Idempotency keys derive from the facts, so a restarted loop never submits
 //! the same revival twice.
 
@@ -22,13 +24,17 @@ use spawn_core::port::CommandQueue;
 use spawn_postgres::{LivenessFacts, PostgresStore};
 
 use crate::config::spawn_program;
-use crate::{env_or, open_store};
+use crate::deliver::{REPORT, Work, resident_role, task_prompt};
+use crate::env_or;
 
 /// Agent of the supervisor.
 pub(crate) const SUPERVISOR_AGENT: &str = "agent_supervisor";
 
 /// Session of the supervisor, for the life of the system.
 pub(crate) const SUPERVISOR_SESSION: &str = "session_supervisor";
+
+/// Principal (and database login) of the supervisor.
+pub(crate) const SUPERVISOR_PRINCIPAL: &str = "spawn_supervisor";
 
 /// Principal the liveness rule submits as.
 const REVIVER: &str = "spawn-liveness";
@@ -44,31 +50,17 @@ const BACKOFF_MS: i64 = 10_000;
 pub(crate) enum Revive {
     /// Leave the session alone.
     Nothing,
-    /// A revival failed recently; wait out the backoff.
-    Wait,
     /// Resume the recorded native session.
     Resume,
     /// Start a new native session; `handoff` adds the summary from the log.
     Start { handoff: bool },
 }
 
-/// The liveness rule for the supervisor, which only a person may stop.
+/// The liveness rule, as a pure function of the facts. A stop command ends
+/// the session: only a person, the supervisor (for a resident) or delivery
+/// (for a retired resident) sends one. Any other end is an outage to repair.
 pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
-    decide_for(facts, now_ms, &["human"])
-}
-
-/// The liveness rule, as a pure function of the facts. A stop by one of
-/// `respected` ends the session; any other end is an outage to repair.
-pub(crate) fn decide_for(facts: &LivenessFacts, now_ms: i64, respected: &[&str]) -> Revive {
-    if facts.open_command || facts.live {
-        return Revive::Nothing;
-    }
-    if facts.last_kind.as_deref() == Some("stop")
-        && facts
-            .last_principal
-            .as_deref()
-            .is_some_and(|principal| respected.contains(&principal))
-    {
+    if facts.open_command || facts.live || facts.last_kind.as_deref() == Some("stop") {
         return Revive::Nothing;
     }
     if facts.failures > 0 {
@@ -78,7 +70,7 @@ pub(crate) fn decide_for(facts: &LivenessFacts, now_ms: i64, respected: &[&str])
             .last_failure_ms
             .is_some_and(|failed| now_ms.saturating_sub(failed) < pause)
         {
-            return Revive::Wait;
+            return Revive::Nothing;
         }
     }
     if facts.execution_id.is_none() && facts.failures == 0 {
@@ -165,7 +157,7 @@ fn handoff(store: &PostgresStore) -> String {
         |error| format!("(fleet unavailable: {error})"),
         |value| serde_json::to_string_pretty(&value).unwrap_or_default(),
     );
-    let mine = store.commands_by("spawn_supervisor", 15).map_or_else(
+    let mine = store.commands_by(SUPERVISOR_PRINCIPAL, 15).map_or_else(
         |error| format!("(history unavailable: {error})"),
         |value| serde_json::to_string_pretty(&value).unwrap_or_default(),
     );
@@ -180,148 +172,130 @@ Your last commands, newest first:\n{mine}\n\nStart with `mission list` and `flee
     )
 }
 
-/// Advance the liveness rule by one step. Returns a line for the loop's log
-/// when it acted.
-pub(crate) fn keep_alive() -> Result<Option<String>, String> {
-    let store = open_store()?;
-    let session = SessionId::new(SUPERVISOR_SESSION).map_err(|error| error.to_string())?;
-    let facts = store
-        .liveness_facts(&session, REVIVER)
-        .map_err(|error| error.to_string())?;
-    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
-    let decision = decide(&facts, now);
-    let spawn = spawn_program();
-    let mission = env_or("SPAWN_MISSION_FILE", "mission.md");
-    let execution = facts
-        .execution_id
-        .clone()
-        .unwrap_or_else(|| "none".to_string());
-    let (action, key) = match decision {
-        Revive::Nothing | Revive::Wait => return Ok(None),
-        Revive::Resume => (
-            CommandAction::Resume {
-                prompt: Some(format!(
-                    "Spawn restarted your engine (the previous execution {execution} ended: {}). \
-Run `{spawn} fleet` and continue supervising per your charter.",
-                    facts.cause.as_deref().unwrap_or("unknown")
-                )),
-            },
-            format!("supervisor-resume-{execution}-{}", facts.failures),
-        ),
-        Revive::Start {
-            handoff: with_handoff,
-        } => {
-            let mut prompt = charter(&spawn, &mission);
-            if with_handoff {
-                prompt.push_str(&handoff(&store));
-            }
-            (
-                CommandAction::Start {
-                    engine: Engine::Claude,
-                    prompt,
-                    parent_session_id: None,
-                },
-                format!(
-                    "supervisor-start-{execution}-{}-{}",
-                    facts.failures,
-                    if with_handoff { "handoff" } else { "first" }
-                ),
-            )
-        }
-    };
-    let submission = Submission {
-        agent_id: AgentId::new(SUPERVISOR_AGENT).map_err(|error| error.to_string())?,
-        session_id: session,
-        idempotency_key: IdempotencyKey::new(key.clone()).map_err(|error| error.to_string())?,
-        action,
-    };
-    let principal = Principal::new(REVIVER).map_err(|error| error.to_string())?;
-    store
-        .submit(&principal, &submission)
-        .map_err(|error| error.to_string())?;
-    Ok(Some(format!("supervise: {decision:?} ({key})")))
-}
-
-/// Keep one approved resident alive: resumed after an outage, a stop by a
-/// human or the supervisor respected. `prompt` is its charter with its
-/// current task, given when a new native session must start.
-pub(crate) fn keep_resident(
+/// One liveness step for one session: decide, and submit the revival.
+/// `resume` words the resume prompt from the facts; `start` builds the
+/// prompt of a new native session, given whether it is a handoff. Returns a
+/// line for the loop's log when it acted.
+fn revive(
     store: &PostgresStore,
     agent: &str,
     session: &str,
-    prompt: &str,
+    resume: impl FnOnce(&LivenessFacts) -> String,
+    start: impl FnOnce(bool) -> String,
 ) -> Result<Option<String>, String> {
-    let session_id = SessionId::new(session).map_err(|error| error.to_string())?;
+    let error = |error: &dyn std::fmt::Display| error.to_string();
+    let session_id = SessionId::new(session).map_err(|e| error(&e))?;
     let facts = store
         .liveness_facts(&session_id, REVIVER)
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| error(&e))?;
     let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
-    let decision = decide_for(&facts, now, &["human", "spawn_supervisor"]);
-    let execution = facts
-        .execution_id
-        .clone()
-        .unwrap_or_else(|| "none".to_string());
+    let decision = decide(&facts, now);
+    let execution = facts.execution_id.as_deref().unwrap_or("none");
     let (action, key) = match decision {
-        Revive::Nothing | Revive::Wait => return Ok(None),
+        Revive::Nothing => return Ok(None),
         Revive::Resume => (
             CommandAction::Resume {
-                prompt: Some(format!(
-                    "Spawn restarted your engine (execution {execution} ended: {}). Continue \
-your current task; when it is finished, write `.spawn/report.md`.",
-                    facts.cause.as_deref().unwrap_or("unknown")
-                )),
+                prompt: Some(resume(&facts)),
             },
-            format!("resident-resume-{execution}-{}", facts.failures),
+            format!("{session}-resume-{execution}-{}", facts.failures),
         ),
-        Revive::Start { .. } => (
+        Revive::Start { handoff } => (
             CommandAction::Start {
                 engine: Engine::Claude,
-                prompt: format!(
-                    "{prompt}\n\nYour previous native session could not be resumed, so this is \
-a new one; anything you learned before is in your workspace and its reports."
-                ),
+                prompt: start(handoff),
                 parent_session_id: None,
             },
-            format!("resident-start-{execution}-{}", facts.failures),
+            format!(
+                "{session}-start-{execution}-{}-{}",
+                facts.failures,
+                if handoff { "handoff" } else { "first" }
+            ),
         ),
     };
     let submission = Submission {
-        agent_id: AgentId::new(agent).map_err(|error| error.to_string())?,
+        agent_id: AgentId::new(agent).map_err(|e| error(&e))?,
         session_id,
-        idempotency_key: IdempotencyKey::new(key.clone()).map_err(|error| error.to_string())?,
+        idempotency_key: IdempotencyKey::new(key.clone()).map_err(|e| error(&e))?,
         action,
     };
-    let principal = Principal::new(REVIVER).map_err(|error| error.to_string())?;
+    let principal = Principal::new(REVIVER).map_err(|e| error(&e))?;
     store
         .submit(&principal, &submission)
-        .map_err(|error| error.to_string())?;
+        .map_err(|e| error(&e))?;
     Ok(Some(format!("liveness: {session} {decision:?} ({key})")))
 }
 
-/// One liveness step for every resident worth keeping.
+/// Keep the supervisor alive.
+pub(crate) fn keep_alive(store: &PostgresStore) -> Result<Option<String>, String> {
+    let spawn = spawn_program();
+    let mission = env_or("SPAWN_MISSION_FILE", "mission.md");
+    revive(
+        store,
+        SUPERVISOR_AGENT,
+        SUPERVISOR_SESSION,
+        |facts| {
+            format!(
+                "Spawn restarted your engine (the previous execution {} ended: {}). Run `{spawn} \
+fleet` and continue supervising per your charter.",
+                facts.execution_id.as_deref().unwrap_or("none"),
+                facts.cause.as_deref().unwrap_or("unknown")
+            )
+        },
+        |with_handoff| {
+            let mut prompt = charter(&spawn, &mission);
+            if with_handoff {
+                prompt.push_str(&handoff(store));
+            }
+            prompt
+        },
+    )
+}
+
+/// Keep every approved resident alive: resumed after an outage, given its
+/// charter (and its current task) when a new native session must start.
 pub(crate) fn keep_residents(store: &PostgresStore) -> Result<Vec<String>, String> {
-    let work = crate::deliver::Work::load(store)?;
     let mut lines = Vec::new();
     for (agent, session, charter) in store
         .residents_to_keep()
         .map_err(|error| error.to_string())?
     {
-        let prompt = work
-            .tasks
-            .iter()
-            .find(|task| task.session_id == session && task.state == TaskState::Delivered)
-            .map_or_else(
-                || format!("You are a long-lived resident worker of Spawn. Your charter:\n{charter}\n\nWait for your next task."),
-                crate::deliver::task_prompt,
+        let start = |_handoff: bool| {
+            let task = Work::load(store).ok().and_then(|work| {
+                work.tasks
+                    .into_iter()
+                    .find(|task| task.session_id == session && task.state == TaskState::Delivered)
+            });
+            let prompt = task.map_or_else(
+                || {
+                    let name = session.trim_start_matches("session_resident_");
+                    format!(
+                        "{}\n\nWait for your next task.",
+                        resident_role(name, &charter)
+                    )
+                },
+                |task| task_prompt(&task),
             );
-        lines.extend(keep_resident(store, &agent, &session, &prompt)?);
+            format!(
+                "{prompt}\n\nYour previous native session could not be resumed, so this is a new \
+one; anything you learned before is in your workspace and its reports."
+            )
+        };
+        let resume = |facts: &LivenessFacts| {
+            format!(
+                "Spawn restarted your engine (execution {} ended: {}). Continue your current \
+task; when it is finished, write `{REPORT}`.",
+                facts.execution_id.as_deref().unwrap_or("none"),
+                facts.cause.as_deref().unwrap_or("unknown")
+            )
+        };
+        lines.extend(revive(store, &agent, &session, resume, start)?);
     }
     Ok(lines)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Revive, decide, decide_for};
+    use super::{Revive, decide};
     use spawn_postgres::LivenessFacts;
 
     fn facts() -> LivenessFacts {
@@ -330,7 +304,6 @@ mod tests {
             execution_id: Some("exec_3".to_string()),
             live: false,
             cause: Some("lost".to_string()),
-            last_principal: Some("spawn-liveness".to_string()),
             last_kind: Some("resume".to_string()),
             native_bound: true,
             failures: 0,
@@ -368,19 +341,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_human_stop_is_respected() {
-        let human = LivenessFacts {
+    fn a_stopped_session_stays_down() {
+        let stopped = LivenessFacts {
             last_kind: Some("stop".to_string()),
-            last_principal: Some("human".to_string()),
             cause: Some("stopped".to_string()),
             ..facts()
         };
-        assert_eq!(decide(&human, 0), Revive::Nothing);
-        let automatic = LivenessFacts {
-            last_principal: Some("spawn".to_string()),
-            ..human
-        };
-        assert_eq!(decide(&automatic, 0), Revive::Resume);
+        assert_eq!(decide(&stopped, 0), Revive::Nothing);
     }
 
     #[test]
@@ -390,7 +357,7 @@ mod tests {
             last_failure_ms: Some(1_000),
             ..facts()
         };
-        assert_eq!(decide(&failed, 1_500), Revive::Wait);
+        assert_eq!(decide(&failed, 1_500), Revive::Nothing);
         assert_eq!(decide(&failed, 1_000 + 20_000), Revive::Resume);
         let exhausted = LivenessFacts {
             failures: 3,
@@ -400,25 +367,6 @@ mod tests {
         assert_eq!(
             decide(&exhausted, 10_000_000),
             Revive::Start { handoff: true }
-        );
-    }
-
-    #[test]
-    fn a_resident_stopped_by_the_supervisor_stays_down() {
-        let stopped = LivenessFacts {
-            last_kind: Some("stop".to_string()),
-            last_principal: Some("spawn_supervisor".to_string()),
-            cause: Some("stopped".to_string()),
-            ..facts()
-        };
-        assert_eq!(
-            decide_for(&stopped, 0, &["human", "spawn_supervisor"]),
-            Revive::Nothing
-        );
-        assert_eq!(
-            decide(&stopped, 0),
-            Revive::Resume,
-            "the supervisor itself is kept"
         );
     }
 

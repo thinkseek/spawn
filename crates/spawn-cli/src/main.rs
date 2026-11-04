@@ -25,7 +25,6 @@ mod context;
 mod corpus;
 mod deliver;
 mod dispatch;
-mod flags;
 mod gate;
 mod integrate;
 mod missions;
@@ -37,10 +36,9 @@ mod supervise;
 mod trace;
 
 // Re-exported at the crate root, where the command modules import them.
-pub(crate) use config::{env_or, env_value, open_store};
-pub(crate) use flags::Flags;
+pub(crate) use config::{Flags, env_or, env_value, open_store};
 
-use commands::{admin, engine, inspect, judging, loops, queue};
+use commands::{engine, inspect, loops, queue};
 
 const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|corpus|judge|serve|status|fleet|tail|hook|run|version>";
 
@@ -66,14 +64,18 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     };
     let rest: Vec<String> = arguments.collect();
     match command.as_str() {
-        "init-db" => admin::init_db(&Flags::parse(&rest)?),
+        "init-db" => {
+            open_store()?.migrate().map_err(|error| error.to_string())?;
+            println!("spawn: schema installed");
+            Ok(0)
+        }
         "submit" => queue::submit(&Flags::parse(&rest)?),
         "tick" => loops::tick(&Flags::parse(&rest)?),
         "loop" => loops::resident_loop(&Flags::parse(&rest)?),
         "serve" => serve::serve(&Flags::parse(&rest)?),
         "dispatch" => queue::dispatch_once(&rest),
         "integrate" => integrate::integrate(&rest),
-        "corpus" => judging::corpus(&rest),
+        "corpus" => corpus::command(&rest),
         "mission" => missions::mission(&rest),
         "charter" => {
             println!("{}", supervise::current_charter());
@@ -81,13 +83,19 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         }
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),
-        "judge" => judging::judge(&Flags::parse(&rest)?),
+        "judge" => corpus::judge(&Flags::parse(&rest)?),
         "status" => inspect::status(&Flags::parse(&rest)?),
         "fleet" => inspect::fleet(),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
         "hook" => engine::hook(),
         "run" => engine::run(&rest),
-        "version" => admin::version(&rest),
+        "version" => {
+            if let Some(word) = rest.first() {
+                return Err(format!("unexpected argument {word}"));
+            }
+            println!("spawn {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
         other => Err(format!("unknown command {other}")),
     }
 }

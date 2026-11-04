@@ -63,13 +63,19 @@ pub(crate) fn git(arguments: &[&str]) -> Result<String, WorkspaceError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Directory name of a source's mirror: readable, and unique by a hash.
-fn mirror_name(source: &str) -> String {
+/// FNV-1a: a stable short hash for names and keys.
+pub(crate) fn fnv(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in source.bytes() {
+    for byte in text.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
+    hash
+}
+
+/// Directory name of a source's mirror: readable, and unique by a hash.
+fn mirror_name(source: &str) -> String {
+    let hash = fnv(source);
     let tail: String = source
         .trim_end_matches('/')
         .trim_end_matches(".git")
@@ -102,11 +108,6 @@ impl MissionWorkspaces {
         }
     }
 
-    /// Bare repository for a source, cloned on first use.
-    fn mirror(&self, source: Option<&str>) -> Result<PathBuf, WorkspaceError> {
-        ensure_mirror(&self.root, source)
-    }
-
     /// The store for one agent's workspace.
     fn route(&self, agent: &str) -> Result<Routed, WorkspaceError> {
         let source = self
@@ -127,7 +128,7 @@ impl MissionWorkspaces {
         if let Some(routed) = mirrors.get(&key) {
             return Ok(routed.clone());
         }
-        let repo = self.mirror(source.as_deref())?;
+        let repo = ensure_mirror(&self.root, source.as_deref())?;
         let routed = Routed {
             store: Arc::new((self.factory)(&repo)),
             mirror: source.map(|source| (repo, source)),

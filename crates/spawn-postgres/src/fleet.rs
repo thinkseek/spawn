@@ -136,8 +136,8 @@ select jsonb_build_object(
 )";
 
 /// What the dispatcher decides from: every worker session and the
-/// supervisor, with the latest judgement, the episode (latest command not
-/// sent by the dispatcher), whether a command is in flight, and what the
+/// supervisor, with the latest judgement, the episode (latest command from
+/// someone other than the dispatcher, or a task it delivered), whether a command is in flight, and what the
 /// dispatcher already sent there in the last day.
 pub(crate) const DISPATCH_FACTS: &str = r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
@@ -154,11 +154,8 @@ from (
     p.observation_at_ms,
     (select max(e.session_seq) from spawn_events e
       where e.session_id = s.session_id and e.source <> 'observer') as evidence_seq,
-    (select max(c.id) from spawn_commands c
-      where c.session_id = s.session_id and c.principal <> 'spawn-dispatch') as episode,
-    (select c.action ->> 'type' from spawn_commands c
-      where c.session_id = s.session_id and c.principal <> 'spawn-dispatch'
-      order by c.id desc limit 1) as episode_action,
+    ep.id as episode,
+    ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c
              where c.session_id = s.session_id and c.state <> 'finished') as open_command,
     (select coalesce(jsonb_agg(jsonb_build_object(
@@ -172,6 +169,10 @@ from (
         and c.created_at_ms > spawn_now_ms() - 86400000) as dispatched
   from agent_status s
   join spawn_session_state p using (session_id)
+  left join lateral (select c.id, c.action from spawn_commands c
+     where c.session_id = s.session_id
+       and (c.principal <> 'spawn-dispatch' or c.idempotency_key like 'deliver-%')
+     order by c.id desc limit 1) ep on true
   where s.agent_id like 'agent\_worker\_%' or s.agent_id like 'agent\_resident\_%'
      or s.session_id = 'session_supervisor'
 ) w";

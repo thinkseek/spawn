@@ -4,7 +4,7 @@
 use spawn_core::command::CommandAction;
 use spawn_core::observation::{Ambiguity, Observation, SemanticState, WaitReason};
 
-use super::facts::{Escalation, Facts, Order, Why};
+use super::{Escalation, Facts, Order, Why};
 
 /// Nudges per worker per hour, across episodes.
 pub(super) const NUDGES_PER_HOUR: usize = 3;
@@ -23,17 +23,11 @@ const NUDGE_KEY_PREFIX: &str = "dispatch-nudge-";
 
 const HOUR_MS: i64 = 3_600_000;
 
-/// At most one order and at most one escalation for a worker.
-pub(super) type Decision = (Option<Order>, Option<Escalation>);
-
-const NOTHING: Decision = (None, None);
-
-fn act(order: Order) -> Decision {
-    (Some(order), None)
-}
-
-fn escalate(escalation: Escalation) -> Decision {
-    (None, Some(escalation))
+/// What the ladder decides for one worker.
+pub(super) enum Decision {
+    Nothing,
+    Act(Order),
+    Escalate(Escalation),
 }
 
 fn percent(value: Option<f64>) -> String {
@@ -82,7 +76,7 @@ fn resume_lost(facts: &Facts) -> Decision {
     let execution = facts.execution_id.as_deref().unwrap_or("none");
     let key = format!("dispatch-resume-{execution}");
     match facts.sent(&key) {
-        None => act(Order::to(
+        None => Decision::Act(Order::to(
             facts,
             key,
             CommandAction::Resume {
@@ -93,13 +87,13 @@ fn resume_lost(facts: &Facts) -> Decision {
                 ),
             },
         )),
-        Some(resume) if resume.succeeded == Some(false) => escalate(Escalation::about(
+        Some(resume) if resume.succeeded == Some(false) => Decision::Escalate(Escalation::about(
             facts,
             format!("resume-{execution}"),
             Why::ResumeFailed,
             "engine was lost and the automatic resume failed".to_string(),
         )),
-        Some(_) => NOTHING,
+        Some(_) => Decision::Nothing,
     }
 }
 
@@ -123,14 +117,14 @@ fn nudge(facts: &Facts, observation: &Observation, now_ms: i64) -> Decision {
     let judged_at = facts.observation_at_ms.unwrap_or(0);
     let key = format!("{NUDGE_KEY_PREFIX}{}-{episode}", facts.session_id);
     match facts.sent(&key) {
-        None if nudges_this_hour(facts, now_ms) < NUDGES_PER_HOUR => act(Order::to(
+        None if nudges_this_hour(facts, now_ms) < NUDGES_PER_HOUR => Decision::Act(Order::to(
             facts,
             key,
             CommandAction::Input {
                 text: "continue".to_string(),
             },
         )),
-        None => escalate(Escalation::about(
+        None => Decision::Escalate(Escalation::about(
             facts,
             format!("nudges-{episode}"),
             Why::NudgeFailed,
@@ -141,30 +135,34 @@ fn nudge(facts: &Facts, observation: &Observation, now_ms: i64) -> Decision {
         )),
         // Judged idle again after the nudge landed: it did not help.
         Some(sent) if sent.finished_at_ms.is_some_and(|done| judged_at > done) => {
-            escalate(Escalation::about(
+            Decision::Escalate(Escalation::about(
                 facts,
                 format!("nudge-{episode}"),
                 Why::NudgeFailed,
                 format!("stopped again after `continue` ({})", describe(observation)),
             ))
         }
-        Some(_) => NOTHING,
+        Some(_) => Decision::Nothing,
     }
 }
 
-/// The policy for one worker: at most one order and at most one escalation.
+/// The policy for one worker: one order, one escalation, or nothing.
 pub(super) fn decide_worker(facts: &Facts, now_ms: i64) -> Decision {
     // Something is in flight; its outcome is the next fact.
     if facts.open_command {
-        return NOTHING;
+        return Decision::Nothing;
     }
-    // 1. Rules over facts.
-    if !facts.live && facts.end_cause.as_deref() == Some("lost") {
+    // 1. Rules over facts. Residents are revived by the liveness rule
+    // (crate::supervise), so only ephemeral workers are resumed here.
+    if !facts.live
+        && facts.end_cause.as_deref() == Some("lost")
+        && facts.agent_id.starts_with("agent_worker_")
+    {
         return resume_lost(facts);
     }
     // Act only on a current judgement; a stale one waits for the next.
     let Some(observation) = facts.current_observation() else {
-        return NOTHING;
+        return Decision::Nothing;
     };
     // 2. The one reversible action a Jev judgement may trigger.
     if facts.live && nudgeable(observation) {
@@ -176,7 +174,7 @@ pub(super) fn decide_worker(facts: &Facts, now_ms: i64) -> Decision {
             || format!("seq-{}", observation.based_on_seq.0),
             |id| id.to_string(),
         );
-        return escalate(Escalation::about(
+        return Decision::Escalate(Escalation::about(
             facts,
             id,
             Why::Attention,
@@ -192,7 +190,7 @@ pub(super) fn decide_worker(facts: &Facts, now_ms: i64) -> Decision {
         } else {
             (Why::Idle, "stopped at its prompt")
         };
-        return escalate(Escalation::about(
+        return Decision::Escalate(Escalation::about(
             facts,
             format!("idle-{episode}"),
             why,
@@ -205,12 +203,12 @@ pub(super) fn decide_worker(facts: &Facts, now_ms: i64) -> Decision {
         && observation.state == SemanticState::Completed
         && facts.episode_action.as_deref() != Some("stop")
     {
-        return escalate(Escalation::about(
+        return Decision::Escalate(Escalation::about(
             facts,
             format!("done-{episode}"),
             Why::Completed,
             format!("execution ended, task finished ({})", describe(observation)),
         ));
     }
-    NOTHING
+    Decision::Nothing
 }

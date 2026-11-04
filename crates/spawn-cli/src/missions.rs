@@ -59,14 +59,7 @@ fn directory(flags: &Flags, name: &str) -> Result<Option<String>, String> {
     let Some(text) = flags.get(name) else {
         return Ok(None);
     };
-    let path = std::path::PathBuf::from(&text);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .map_err(|error| format!("current directory: {error}"))?
-            .join(path)
-    };
+    let path = std::path::absolute(&text).map_err(|error| format!("--{name}: {error}"))?;
     if !path.is_dir() {
         return Err(format!("--{name} {} is not a directory", path.display()));
     }

@@ -150,7 +150,7 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
             .ok_or_else(|| format!("{} has no id", path.display()))?;
         let prompt =
             text_field("prompt").ok_or_else(|| format!("{} has no prompt", path.display()))?;
-        tasks.push(Task {
+        let task = Task {
             id,
             title: text_field("title").unwrap_or_else(|| format!("Task {id}")),
             prompt,
@@ -159,7 +159,15 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
             unit: text_field("unit").unwrap_or_default(),
             lower_is_better: text_field("direction").as_deref() != Some("higher"),
             target: value.get("target").and_then(serde_json::Value::as_f64),
-        });
+        };
+        // Without both, a recurring objective could never be met.
+        if task.recurring && (task.metric.is_none() || task.target.is_none()) {
+            return Err(format!(
+                "{} is recurring but has no metric and target",
+                path.display()
+            ));
+        }
+        tasks.push(task);
     }
     tasks.sort_by_key(|task| task.id);
     Ok(tasks)
@@ -306,7 +314,7 @@ pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Op
 
 #[cfg(test)]
 mod tests {
-    use super::{Landing, Task, next_open, parse_metrics};
+    use super::{Landing, Task, load_backlog, next_open, parse_metrics};
 
     fn objective(id: u32, recurring: bool) -> Task {
         Task {
@@ -401,5 +409,19 @@ mod tests {
         let metrics = parse_metrics(log);
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].candidate, Some(1400.0));
+    }
+
+    #[test]
+    fn a_recurring_objective_needs_a_metric_and_a_target() {
+        let dir = std::env::temp_dir().join(format!("spawn-backlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write = |body: &str| std::fs::write(dir.join("001.json"), body).expect("write");
+        write(
+            r#"{"id": 1, "prompt": "go faster", "recurring": true, "metric": "ns", "target": 900}"#,
+        );
+        assert_eq!(load_backlog(&dir).expect("valid").len(), 1);
+        write(r#"{"id": 1, "prompt": "go faster", "recurring": true, "metric": "ns"}"#);
+        assert!(load_backlog(&dir).is_err(), "never met");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
