@@ -31,12 +31,20 @@
 # candidate could otherwise sabotage the base's run: 0 = solved, 1 (twice,
 # from two runs that agree) = unsolved, anything else aborts the gate (exit
 # 4, no verdict: the integrator records an abort, never a skip). Results are
-# cached per (base commit, sha256 of the scenario, of the build hook, of
-# this file) in ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-base, written outside
-# the sandbox and hidden from it; the base moves only on landings, so most
-# runs build and run nothing on the base. Helpers a scenario sources from
-# the controller (scripts/blackbox) are not in the key. The base is built
-# only on a cache miss.
+# cached per (base commit, sha256 of the scenario, of the build hook, of the
+# controller's scripts/blackbox helpers, of this file) in
+# ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-base, written outside the sandbox
+# and hidden from it (a tmpfs over it, and the gate refuses to run when the
+# directory lies under anything the sandbox binds back); the base moves only
+# on landings, so most runs build and run nothing on the base. The base is
+# built only on a cache miss.
+#
+# The cache's limit is the same-uid limit: candidate code in the sandbox
+# can neither see nor write it, but any process outside the sandbox that
+# runs as this uid can (on a host without containers, every agent). One that
+# writes "unsolved" for an objective under the current key lets a candidate
+# that breaks that objective land. Closing that needs the gate under a uid
+# agents do not have.
 #
 # Scenarios run inside the tree with SPAWN_BIN (the tree's `spawn`, when the
 # build made one) and SPAWN_BASELINE_TREE set. Their output is printed with a
@@ -136,16 +144,27 @@ json_string() {
         awk 'NR > 1 { printf "%s", "\\n" } { printf "%s", $0 }'
 }
 
-# verdict <accepted|rejected> [reason]
+# verdict <accepted|rejected> [reason]: the verdict names the commits it
+# judged, resolved, so a reader can check what it is about (deploy.sh does).
 verdict() {
     json="{\"verdict\":\"$1\""
     [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
     [ -n "$metric" ] && json="$json,\"metric\":\"$(json_string "$metric")\""
-    json="$json}"
+    json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
     fi
     echo "$json"
+}
+
+# What the verdict is about: both commits, resolved once.
+base_commit=$(git --git-dir="$repo" rev-parse --verify --quiet "$baseline^{commit}") || {
+    echo "gate: no commit $baseline in $repo" >&2
+    exit 3
+}
+candidate_commit=$(git --git-dir="$repo" rev-parse --verify --quiet "$candidate^{commit}") || {
+    echo "gate: no commit $candidate in $repo" >&2
+    exit 3
 }
 
 # The controller resolves these paths against its own checkout. A relative
@@ -175,6 +194,7 @@ rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
 base_cache=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-base
 mkdir -p "$base_cache"
 chmod 700 "$base_cache"
+base_cache=$(cd "$base_cache" && pwd -P)
 # The controller's checkout, as the checks locate it (two levels above the
 # scenarios directory).
 controller=$(cd "$scenarios/../.." && pwd)
@@ -232,6 +252,24 @@ for path in "$controller/scripts" "$controller/web/node_modules"; do
     under_home "$path" && bind_home "$path"
 done
 
+# The base cache must stay hidden: the sandbox puts a tmpfs over it, and a
+# bind of a directory above it, made after that tmpfs, would show it again.
+# Those binds: the scenarios, the task scenario, the allow-listed $HOME
+# paths and the test database's socket directory (below). The tree under
+# test and the base tree are fresh directories under $work.
+cache_exposed() {
+    for exposed in "$@"; do
+        [ -n "$exposed" ] && [ -e "$exposed" ] || continue
+        exposed=$(cd "$(dirname "$exposed")" && pwd -P)/$(basename "$exposed")
+        case "$base_cache/" in "$exposed"/*)
+            echo "gate: the base cache $base_cache lies under $exposed, which the sandbox shows" >&2
+            return 0
+            ;;
+        esac
+    done
+    return 1
+}
+
 # The test database, reached over its Unix socket: the sandbox has no
 # network but its own loopback. A URL whose host is a percent-encoded path
 # (postgres://user:pw@%2Fpath%2Fto%2Fdir/db) names the socket directory.
@@ -252,6 +290,16 @@ case "${SPAWN_TEST_DATABASE_URL-}" in
     esac
     ;;
 esac
+
+old_ifs=$IFS
+IFS='
+'
+# shellcheck disable=SC2086 # one path per line
+if cache_exposed "$scenarios" "$scenario" "$db_socket" $home_binds; then
+    IFS=$old_ifs
+    exit 3
+fi
+IFS=$old_ifs
 
 # sandbox <tree> <command...>: run a command inside the tree, in bwrap.
 sandbox() {
@@ -478,10 +526,18 @@ fi
 # unsolved result needs two runs that agree. Results are cached per (base
 # commit, scenario, build hook, gate) in $base_cache, which the sandbox
 # cannot see, so a base that did not move costs nothing.
-base_commit=$(git --git-dir="$repo" rev-parse "$baseline^{commit}")
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 gate_sha=$(sha "$0")
 build_sha=$([ -f "$scenarios/build" ] && sha "$scenarios/build" || echo none)
+# What scenarios source from the controller: a changed helper is a changed
+# scenario.
+if [ -d "$controller/scripts/blackbox" ]; then
+    helpers_sha=$(cd "$controller/scripts/blackbox" && find . -type f | LC_ALL=C sort |
+        while IFS= read -r helper; do printf '%s %s\n' "$(sha "$helper")" "$helper"; done |
+        sha256sum | cut -d' ' -f1)
+else
+    helpers_sha=none
+fi
 : >"$work/base-results"
 for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     [ -f "$objective" ] || continue
@@ -492,8 +548,8 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     grep -qxF "$objective" "$work/base-results.seen" 2>/dev/null && continue
     printf '%s\n' "$objective" >>"$work/base-results.seen"
     objective_name=$(basename "$objective")
-    key=$(printf '%s %s %s %s\n' "$base_commit" "$(sha "$objective")" "$build_sha" "$gate_sha" |
-        sha256sum | cut -d' ' -f1)
+    key=$(printf '%s %s %s %s %s\n' "$base_commit" "$(sha "$objective")" "$build_sha" \
+        "$helpers_sha" "$gate_sha" | sha256sum | cut -d' ' -f1)
     if [ -f "$base_cache/$key" ]; then
         result=$(cat "$base_cache/$key")
         echo "| == base: $objective_name: $result (cached)"

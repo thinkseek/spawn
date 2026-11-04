@@ -18,8 +18,11 @@ work=$(mktemp -d)
 marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
 trap 'rm -rf "$work" "$marker"' EXIT
 
-# The owner's home, with secrets the candidate must not read.
+# The owner's home, with secrets the candidate must not read. The gate's base
+# cache goes under it too, never into the real one.
 export HOME="$work/home"
+export XDG_CACHE_HOME="$HOME/.cache"
+cache=$XDG_CACHE_HOME/spawn/gate-base
 mkdir -p "$HOME/.config/spawn" "$HOME/.ssh" "$HOME/.local/share/spawn-rsi"
 echo owner-secret >"$HOME/.config/spawn/secret"
 echo owner-key >"$HOME/.ssh/id_test"
@@ -106,7 +109,8 @@ branch() {
 }
 # judge <candidate> [<scenario>] [<scenarios-dir>]: run the gate as the
 # integrator does, with SPAWN_GATE_VERDICT in a directory of its own, and
-# print `exit=<status> <verdict file>`. The gate's output is in gate.out.
+# print `exit=<status> <verdict file>`, without the commits the verdict names
+# (checked once, below). The gate's output is in gate.out.
 integrator=$work/integrator
 judge() {
     rm -rf "$integrator"
@@ -115,7 +119,10 @@ judge() {
     status=0
     SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" "$repo" "$base" "$1" "${3:-$scenarios}" ${2:+"$2"} \
         >"$work/gate.out" 2>&1 || status=$?
-    echo "exit=$status $(cat "$integrator/verdict" 2>/dev/null || true)"
+    echo "exit=$status $(without_commits 2>/dev/null <"$integrator/verdict" || true)"
+}
+without_commits() {
+    sed -E 's/,"base":"[0-9a-f]+","candidate":"[0-9a-f]+"\}$/}/'
 }
 expect() {
     case "$2" in
@@ -141,7 +148,14 @@ branch good
 printf 'two\n' >"$seed/value"
 good=$(commit good)
 expect "red then green lands" "$(judge "$good" "$scenarios/007.sh")" 'exit=0 {"verdict":"accepted"}'
-expect "the verdict file and stdout agree" "$(tail -n 1 "$work/gate.out")" '{"verdict":"accepted"}'
+expect "the verdict file and stdout agree" "$(tail -n 1 "$work/gate.out" | without_commits)" '{"verdict":"accepted"}'
+expect "the verdict names the commits it judged, resolved" "$(cat "$integrator/verdict")" \
+    "\"base\":\"$base\",\"candidate\":\"$good\"}"
+expect "a ref is resolved to its commit" \
+    "$(SPAWN_GATE_VERDICT=$work/by-ref sh "$gate" "$repo" "$base" refs/heads/good "$scenarios" >/dev/null 2>&1; cat "$work/by-ref")" \
+    "\"candidate\":\"$good\"}"
+expect "a candidate that names no commit is no verdict" \
+    "exit=$(sh "$gate" "$repo" "$base" no-such-ref "$scenarios" >/dev/null 2>&1 || echo $?)" 'exit=3'
 expect "no task scenario: regression only" "$(judge "$good")" 'exit=0 {"verdict":"accepted"}'
 
 expect "a task scenario already green on the base" "$(judge "$good" "$scenarios/check-built.sh")" 'already passes'
@@ -525,6 +539,50 @@ refuse "no base build on a cache hit" "$(cat "$work/gate.out")" '== base: build'
 printf '# a comment changes the scenario\n' >>"$objectives/011.sh"
 expect "a changed scenario is judged again" "$(judge "$good" "" "$objectives")" 'exit=0 {"verdict":"accepted"}'
 refuse "not from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+
+# Candidate code can neither see nor write the base cache: it tries to turn
+# every entry into "unsolved" and to plant one.
+cached_before=$(cd "$cache" && for entry in *; do printf '%s=%s\n' "$entry" "$(cat "$entry")"; done)
+[ -n "$cached_before" ] || { echo "FAIL no base cache entries to protect"; exit 1; }
+branch poison
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<EOF
+#!/bin/sh
+for entry in "$cache"/*; do echo unsolved >"\$entry" 2>/dev/null; done
+mkdir -p "$cache" 2>/dev/null
+echo unsolved >"$cache/planted" 2>/dev/null
+exit 0
+EOF
+poison=$(commit poison)
+expect "a candidate that writes at the base cache still gets its verdict" \
+    "$(judge "$poison" "" "$objectives")" 'exit=0 {"verdict":"accepted"}'
+expect "the base cache is unchanged" \
+    "$(cd "$cache" && for entry in *; do printf '%s=%s\n' "$entry" "$(cat "$entry")"; done)" "$cached_before"
+[ ! -e "$cache/planted" ] || { echo "FAIL the sandbox planted a base cache entry"; exit 1; }
+echo "ok   nothing planted in the base cache"
+
+# A helper the scenarios source from the controller is in the key: the
+# controller is two levels above the scenarios directory.
+controller=$work/controller
+mkdir -p "$controller/rsi" "$controller/scripts/blackbox"
+cp -r "$objectives" "$controller/rsi/scenarios"
+printf '# helper\n' >"$controller/scripts/blackbox/lib.sh"
+judge "$good" "" "$controller/rsi/scenarios" >/dev/null
+expect "with the controller's helpers, a second run is cached" \
+    "$(judge "$good" "" "$controller/rsi/scenarios")" 'exit=0 {"verdict":"accepted"}'
+expect "from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+printf '# changed\n' >>"$controller/scripts/blackbox/lib.sh"
+expect "a changed helper is judged again" "$(judge "$good" "" "$controller/rsi/scenarios")" \
+    'exit=0 {"verdict":"accepted"}'
+refuse "not from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+
+# A base cache the sandbox would show again (under a directory it binds) is
+# refused before anything runs.
+exposed=$work/exposed
+cp -r "$objectives" "$exposed"
+expect "a base cache under the scenarios directory is refused" \
+    "$(export XDG_CACHE_HOME="$exposed/cache"; judge "$good" "" "$exposed")" 'exit=3 '
+expect "and says why" "$(cat "$work/gate.out")" 'which the sandbox shows'
 
 # A harness error on the base aborts the gate: no verdict, never a skip.
 server break >/dev/null
