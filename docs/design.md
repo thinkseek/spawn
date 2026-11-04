@@ -67,9 +67,9 @@ spawn-core
 | `tool.failed` | 会话记录、Codex | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断）、Codex | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行）、Codex | error |
-| `execution.started` | Bridge | engine、terminal、workspace、command_id |
+| `execution.started` | Bridge | engine、terminal、workspace、command_id；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code |
-| `artifact.committed` | Bridge | reason、artifact |
+| `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact |
 | `command.accepted` | Gateway 事务 | command_id |
 | `command.finished` | Worker | command_id、succeeded、error |
 | `screen.observed` | Bridge | state、evidence |
@@ -90,7 +90,8 @@ spawn-core
 | `CommandQueue` | `submit(principal, submission)` | 幂等提交，同时写 `command.accepted` |
 | | `claim(worker, ttl)` | 领取最老且无活跃租约的会话首条命令 |
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
-| `WorkspaceStore` | `ensure_branch`、`mount`、`commit`、`unmount` | 工作区的四个动作；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
+| `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
+| | `merge_base(workspace)` | 把基线（源的 `main`）合进空闲工作区的分支：`Current`、`Merged{commit,files}` 或 `Conflicted{files}`；冲突或目录与分支不符时什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
 | `TerminalHost` | `start`、`submit_text`、`is_alive`、`capture_tail`、`terminate` | 终端生命周期与屏尾读取；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 
 错误类型：
@@ -109,7 +110,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 | 命令 | 行为 |
 | --- | --- |
-| `Start{engine,prompt,parent_session_id}` | 检查会话是否已有执行 → 开分支 → mount → 写 `execution.started` → 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
+| `Start{engine,prompt,parent_session_id,from}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ mount → 写 `execution.started`（新分支带 fork）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
 | `Input{text}` | 屏尾非 Ready 直接拒绝，Ready 才 `send-keys` |
 | `Stop` | 走结束流程，原因记为 `Stopped` |
 | `Resume{prompt}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
@@ -126,6 +127,8 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
 checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
+
+合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。`Merged` 写 `artifact.committed`（reason `base_merged`）；`Conflicted` 与失败只进 tick 报告的警告，冲突由落地告诉 agent。
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。
 
@@ -257,10 +260,13 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 
 | 方法 | 命令 |
 | --- | --- |
-| `ensure_branch` | 无 `refs/heads/main` 时用 `mktree` + `commit-tree` 建根提交；再 `git branch <b> main` |
+| `ensure_branch` | 无 `refs/heads/main` 时用 `mktree` + `commit-tree` 建根提交；分支已存在返回 `Existing`；否则把 `from`（`refs/heads/<agent>` 或完整 commit id，`rev-parse --verify <x>^{commit}`）或 `main` 解析成 commit，`update-ref refs/heads/<b> <commit> ""`（只建不改） |
 | `mount` | `git archive refs/heads/<b> \| tar -x -C <dir>`；配置了镜像时再 `docker run -d -v <dir>:<dir> -w <dir>` |
 | `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A` → `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref` |
 | `unmount` | `docker rm -f`，再删工作树目录 |
+| `merge_base` | `main` 是分支头的祖先则 `Current`；否则 `git --attr-source=<main> merge-tree --write-tree --name-only -z <main> <head>`（合并规则取自 `main` 的 `.gitattributes`，只有 gate 能动它；裸仓库不加 `--attr-source` 不读树内属性）。退出码 1 为 `Conflicted`，什么都不改；干净时先动目录：临时索引 `read-tree <head 树>`、`update-index -q --refresh`、`read-tree -m -u <head 树> <合并树>`（目录里要改的文件与分支不符、或未跟踪文件挡路时拒绝，返回错误、什么都不改），再 `commit-tree -p <head> -p <main>`（保留 head 的 `Spawn-Large` trailer）和带旧值的 `update-ref`。顺序不能反：先动 ref 会让下一次 checkpoint 把旧文件提交回去，抹掉 `main` 的改动 |
+
+任务源（`spawn-cli` 的 `MissionWorkspaces`）在 git 存储外再包一层：每个任务源一个主机本地镜像 `<root>/.sources/<name>.git`。新分支前强制刷新镜像的 `main`，`merge_base` 前最多每 30 秒刷新一次。每次 checkpoint 产生新提交、合并或建分支后，分支被标记待推：后台线程把 `refs/heads/<agent>` 推到源的 `refs/heads/spawn/<agent>`，每个分支最多每 5 秒一次（推的是当时的分支头，中间丢的推送无所谓），从不强推（被拒说明有另一个写者：警告，不覆盖），失败按指数退避重试，存储被丢弃时（`spawn tick` 退出）同步推完。启动时镜像没有该分支则先从源取 `spawn/<agent>`，有就从它建（在另一台主机上续跑）；镜像里的分支落后于源上的则快进，分叉则警告并保留本地的。
 
 容器把工作树挂到**同一绝对路径**，所以两侧路径一致，不需要任何翻译。
 
