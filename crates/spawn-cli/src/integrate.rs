@@ -456,9 +456,8 @@ impl Integrator {
         };
         let deadline = std::time::Instant::now() + PUSH_WAIT;
         loop {
-            let pushed =
-                sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
-                    .map_err(|error| error.to_string())?;
+            let pushed = sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
+                .map_err(|error| error.to_string())?;
             let verdict = freshness(checkpoint.as_deref(), pushed.as_deref(), contains);
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
                 return Ok(verdict);
@@ -817,9 +816,75 @@ fn stop(store: &PostgresStore, task: &Task) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mission, aborted, halt_reason, markers_note, over_budget};
+    use super::{Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget};
     use crate::gate::GateFailure;
     use serde_json::json;
+
+    /// History c1 <- c2 <- c3, and d2 forked from c1: `contains(a, b)` when
+    /// `a` is reachable from `b`.
+    fn history(ancestor: &str, commit: &str) -> bool {
+        let parents = |commit: &str| match commit {
+            "c2" | "d2" => Some("c1"),
+            "c3" => Some("c2"),
+            _ => None,
+        };
+        let mut at = Some(commit);
+        while let Some(current) = at {
+            if current == ancestor {
+                return true;
+            }
+            at = parents(current);
+        }
+        false
+    }
+
+    #[test]
+    fn a_push_at_the_checkpoint_or_past_it_is_judged() {
+        assert_eq!(
+            freshness(Some("c2"), Some("c2"), history),
+            Freshness::Fresh("c2".to_string()),
+            "equal"
+        );
+        assert_eq!(
+            freshness(Some("c2"), Some("c3"), history),
+            Freshness::Fresh("c3".to_string()),
+            "descendant"
+        );
+        assert_eq!(
+            freshness(None, Some("c1"), history),
+            Freshness::Fresh("c1".to_string()),
+            "no checkpoint to compare with"
+        );
+    }
+
+    #[test]
+    fn a_push_that_lags_the_checkpoint_is_stale() {
+        let behind = freshness(Some("c2"), Some("c1"), history);
+        assert!(
+            matches!(&behind, Freshness::Stale(reason) if reason.contains("behind")),
+            "{behind:?}"
+        );
+        let diverged = freshness(Some("c2"), Some("d2"), history);
+        assert!(
+            matches!(&diverged, Freshness::Stale(reason) if reason.contains("does not contain")),
+            "{diverged:?}"
+        );
+        let unknown = freshness(Some("elsewhere"), Some("c3"), history);
+        assert!(
+            matches!(unknown, Freshness::Stale(_)),
+            "a checkpoint the mirror lacks"
+        );
+        let absent = freshness(Some("c2"), None, history);
+        assert!(
+            matches!(&absent, Freshness::Stale(reason) if reason.contains("no spawn/<agent>")),
+            "{absent:?}"
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_and_no_pushed_branch_is_nothing_to_land() {
+        assert_eq!(freshness(None, None, history), Freshness::Nothing);
+    }
 
     #[test]
     fn unresolved_markers_send_work_back_before_the_gate() {
