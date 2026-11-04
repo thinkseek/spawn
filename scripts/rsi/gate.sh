@@ -35,7 +35,7 @@
 # path, the base tree is read-only, and the user's runtime directory, the
 # docker socket and the host's TMPDIR are hidden. $HOME is an empty tmpfs
 # with an allow-list bound back read-only (see `home_binds` below): the
-# Rust toolchain, the install roots of node/npm/bun when they live there,
+# Rust toolchain, the install root of node/npm/npx when it lives there,
 # and the controller's `scripts` and `web/node_modules` (the controller is
 # the directory two levels above the scenarios). The network namespace is
 # new: loopback only, so no host service (the live database, serve, the Jev
@@ -158,7 +158,7 @@ controller=$(cd "$scenarios/../.." && pwd)
 # where PATH found it), and the controller's `scripts` and
 # `web/node_modules`, which the checks use. Nothing else of $HOME is
 # visible: not ~/.gitconfig, not ~/.claude.json.backup, not shell history.
-home_tools="node npm npx bun"
+home_tools="node npm npx"
 home_binds=""
 home_links=""
 under_home() {
