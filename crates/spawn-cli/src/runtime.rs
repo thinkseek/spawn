@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use spawn_core::bridge::{Bridge, BridgeConfig};
+use spawn_core::bridge::{Bridge, BridgeConfig, ModelRelay};
 use spawn_core::observe::{HeuristicJudge, Observer, StateJudge};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_host::GitWorkspace;
@@ -79,6 +79,7 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.codex_program = env_or("SPAWN_CODEX_PROGRAM", "codex");
     config.claude_projects = claude_projects();
+    config.model_relay = model_relay();
     // A worker's pane gets no database login: the Bridge reads what the
     // engine does from its files and screen. The supervisor's pane gets its
     // own login: it reads the fleet and commands workers through the
@@ -100,6 +101,23 @@ fn bridge_config() -> Result<BridgeConfig, String> {
         Err(_) => {}
     }
     Ok(config)
+}
+
+/// The model relay (`scripts/model-relay.py`) Claude Code engines reach
+/// their models through: `SPAWN_MODEL_RELAY` (`http://127.0.0.1:8791` on a
+/// host that runs `spawn-model-relay`; unset or `off` for none), with the
+/// cheap profile's main model `SPAWN_CHEAP_MODEL` and every profile's small
+/// model `SPAWN_SMALL_MODEL`. Names only: the relay holds the keys.
+///
+/// Opt-in, so a host or test without a relay never probes one, and a
+/// configured relay that is down is a warning worth reading.
+fn model_relay() -> Option<ModelRelay> {
+    let url = env_value("SPAWN_MODEL_RELAY").filter(|url| url != "off")?;
+    Some(ModelRelay {
+        url: url.trim_end_matches('/').to_string(),
+        cheap_model: env_or("SPAWN_CHEAP_MODEL", "deepseek-v4-pro"),
+        small_model: env_or("SPAWN_SMALL_MODEL", "deepseek-flash"),
+    })
 }
 
 /// Claude Code's transcript directory as the engine sees it:

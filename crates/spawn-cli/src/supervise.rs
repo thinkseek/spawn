@@ -108,6 +108,9 @@ charter;
 for that task only.
    If a concern keeps coming back and no resident owns it, propose one: `{spawn} resident propose \
 --name <name> --charter <one paragraph>`. A human must approve it before you can use it.
+   Add `--model cheap` to run a task entirely on a cheaper model (DeepSeek) when it is simple and \
+fully specified: docs, mechanical edits, adding tests for behaviour the brief states. Keep the \
+default for design, concurrency, security, debugging, and anything a gate judges as hard.
 3. Review: each worker ends with a report; you get it in a digest. Accept (`{spawn} task accept \
 --id N`) or send it back with what to fix (`{spawn} task reject --id N --note ...`). Read the \
 worker's transcript (`{spawn} tail --session <session>`) only when the report is not enough.
@@ -123,7 +126,7 @@ a row, or its source moved outside the gate) waits for a human: tell them with H
 
 Tools (run them with Bash; they go through your restricted login):
 - `{spawn} mission list` — missions with their tasks, states and reports; the resident roster.
-- `{spawn} task assign --mission N --kind ephemeral|resident --worker <label|name> --brief <text>`
+- `{spawn} task assign --mission N --kind ephemeral|resident --worker <label|name> --brief <text> [--model cheap]`
 - `{spawn} task accept|reject|cancel --id N`
 - `{spawn} resident propose --name <name> --charter <text>`, `{spawn} resident retire --name <name>`
 - `{spawn} fleet` — every agent's state (rules or Jev), attention, needs_human, stuck.
@@ -201,8 +204,11 @@ fn revive(
     let (action, key) = match decision {
         Revive::Nothing => return Ok(None),
         Revive::Resume => (
+            // No profile named: a revived session keeps the one it last
+            // started with, so a resident keeps its models.
             CommandAction::Resume {
                 prompt: Some(resume(&facts)),
+                model: None,
             },
             format!("{session}-resume-{execution}-{}", facts.failures),
         ),
@@ -212,6 +218,7 @@ fn revive(
                 prompt: start(handoff),
                 parent_session_id: None,
                 from: None,
+                model: None,
             },
             format!(
                 "{session}-start-{execution}-{}-{}",
@@ -303,8 +310,16 @@ task; when it is finished, write `{REPORT}`.",
 
 #[cfg(test)]
 mod tests {
-    use super::{Revive, decide};
+    use super::{Revive, charter, decide};
     use spawn_postgres::LivenessFacts;
+
+    #[test]
+    fn the_charter_says_when_a_task_runs_cheap() {
+        let text = charter("spawn", "mission.md");
+        assert!(text.contains("--model cheap"));
+        assert!(text.contains("simple and fully specified"));
+        assert!(text.contains("security"));
+    }
 
     fn facts() -> LivenessFacts {
         LivenessFacts {

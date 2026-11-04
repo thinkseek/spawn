@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::command::{Claimed, CommandAction, Outcome};
 use crate::event::{
     ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, EventRecord, Fork, GlobalPosition,
-    NewEvent, Source,
+    ModelProfile, NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use crate::ingest::{MERGE_NOTICE_OPENING, claude_line, codex_line};
@@ -59,6 +59,8 @@ struct Run<'a> {
     /// `native` names an earlier session to resume, not a new one.
     resume: bool,
     prompt: &'a str,
+    /// Claude Code's inline settings ([`claude_settings`]).
+    settings: &'a str,
 }
 
 /// What one start asks for. Grouped so that [`Bridge::start`] keeps a
@@ -71,6 +73,41 @@ struct Begin<'a> {
     native: Option<&'a str>,
     /// Where a new branch starts (`start {from}`).
     from: Option<&'a str>,
+    /// Models the engine runs on; unset keeps the session's last profile.
+    model: Option<ModelProfile>,
+}
+
+/// The loopback relay engines reach their models through
+/// (`scripts/model-relay.py`), and the models each profile names. The relay
+/// routes `deepseek-*` models to DeepSeek with its own key and everything
+/// else to Claude Code's gateway with the engine's own credentials, so
+/// Spawn holds neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRelay {
+    /// Base URL of the relay, `http://127.0.0.1:<port>`.
+    pub url: String,
+    /// The cheap profile's main model, also in its sonnet and opus slots.
+    pub cheap_model: String,
+    /// The small, fast model (the haiku slot) of every profile.
+    pub small_model: String,
+}
+
+impl ModelRelay {
+    /// Whether the relay accepts connections now. Checked at every start,
+    /// so a relay that comes back is used again without a restart.
+    pub fn reachable(&self) -> bool {
+        let address = self
+            .url
+            .split_once("://")
+            .map_or(self.url.as_str(), |(_, rest)| rest);
+        let address = address.split('/').next().unwrap_or_default();
+        let Ok(mut addresses) = std::net::ToSocketAddrs::to_socket_addrs(address) else {
+            return false;
+        };
+        addresses.any(|address| {
+            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()
+        })
+    }
 }
 
 /// Bridge settings.
@@ -104,6 +141,8 @@ pub struct BridgeConfig {
     /// A busy screen is recorded again this often while it stays busy, so
     /// the Observer keeps a current fact for a long turn.
     pub screen_refresh: Duration,
+    /// The model relay, when Claude Code engines go through one.
+    pub model_relay: Option<ModelRelay>,
 }
 
 impl BridgeConfig {
@@ -122,6 +161,7 @@ impl BridgeConfig {
             ready_interval: Duration::from_millis(250),
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
+            model_relay: None,
         }
     }
 }
@@ -194,6 +234,9 @@ struct Follow {
 struct SessionView {
     agent_id: AgentId,
     native: Option<(Engine, String)>,
+    /// The profile the session's last execution started with: what a start
+    /// or resume that names none runs on.
+    model: ModelProfile,
     active: Option<Active>,
     /// What merges of main changed under the agent and it has not been
     /// told: told with the next prompt the Bridge types.
@@ -445,6 +488,7 @@ impl Bridge {
             .or_insert_with(|| SessionView {
                 agent_id: event.agent_id.clone(),
                 native: None,
+                model: ModelProfile::Default,
                 active: None,
                 notice: Notice::default(),
             });
@@ -458,8 +502,10 @@ impl Bridge {
                 engine,
                 terminal,
                 workspace,
+                model,
                 ..
             } => {
+                view.model = *model;
                 if let Some(execution_id) = event.execution_id.clone() {
                     view.active = Some(Active {
                         execution_id,
@@ -1097,6 +1143,7 @@ impl Bridge {
                 prompt,
                 parent_session_id,
                 from,
+                model,
             } => self.start(
                 claimed,
                 &Begin {
@@ -1105,13 +1152,16 @@ impl Bridge {
                     parent: parent_session_id.as_ref(),
                     native: None,
                     from: from.as_deref(),
+                    model,
                 },
                 report,
             ),
             CommandAction::Input { text } => self.input(claimed, &text),
             CommandAction::Stop => self.stop(claimed, false, report),
             CommandAction::Discard => self.stop(claimed, true, report),
-            CommandAction::Resume { prompt } => self.resume(claimed, prompt.as_deref(), report),
+            CommandAction::Resume { prompt, model } => {
+                self.resume(claimed, prompt.as_deref(), model, report)
+            }
         }
     }
 
@@ -1131,6 +1181,7 @@ impl Bridge {
             parent,
             native,
             from,
+            model,
         } = *begin;
         if self.running(&claimed.session_id).is_some() {
             return Ok(Outcome::Failed(format!(
@@ -1138,6 +1189,15 @@ impl Bridge {
                 claimed.session_id
             )));
         }
+        let model = model.unwrap_or_else(|| {
+            self.sessions
+                .get(&claimed.session_id)
+                .map_or(ModelProfile::Default, |view| view.model)
+        });
+        let settings = match self.engine_settings(claimed, engine, model, report) {
+            Ok(settings) => settings,
+            Err(why) => return Ok(Outcome::Failed(why)),
+        };
         let branch = BranchName::for_agent(&claimed.agent_id);
         let fork = match self.ensure_branch(claimed, &branch, from, report) {
             Ok(fork) => fork,
@@ -1187,6 +1247,7 @@ impl Bridge {
                 workspace: active.workspace.clone(),
                 command_id: claimed.command_id,
                 fork,
+                model,
             },
         )?;
         let fresh = self.name_session(claimed, engine, native, &active)?;
@@ -1198,6 +1259,7 @@ impl Bridge {
                 native: fresh.as_deref().or(native),
                 resume: native.is_some(),
                 prompt,
+                settings: &settings,
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
@@ -1216,6 +1278,49 @@ impl Bridge {
             return Ok(outcome);
         }
         Ok(Outcome::Succeeded)
+    }
+
+    /// Claude Code's inline settings for an engine on `model`, or why it
+    /// cannot start. The default profile falls back on Claude Code's own
+    /// settings (the gateway, its own small model) when the relay is down;
+    /// the cheap profile has no fallback, and fails where its sender sees
+    /// it.
+    fn engine_settings(
+        &self,
+        claimed: &Claimed,
+        engine: Engine,
+        model: ModelProfile,
+        report: &mut TickReport,
+    ) -> Result<String, String> {
+        if engine != Engine::Claude {
+            return match model {
+                ModelProfile::Default => Ok(String::new()),
+                ModelProfile::Cheap => Err("the cheap profile runs Claude Code only".to_string()),
+            };
+        }
+        let relay = self.config.model_relay.as_ref();
+        let reachable = relay.filter(|relay| relay.reachable());
+        match (model, relay, reachable) {
+            (_, _, Some(relay)) => Ok(claude_settings(Some(relay), model)),
+            (ModelProfile::Default, Some(relay), None) => {
+                report.warnings.push(format!(
+                    "{}: model relay {} unreachable; the default profile runs on Claude Code's \
+                     own settings",
+                    claimed.session_id, relay.url
+                ));
+                Ok(claude_settings(None, model))
+            }
+            (ModelProfile::Default, None, None) => Ok(claude_settings(None, model)),
+            (ModelProfile::Cheap, Some(relay), None) => Err(format!(
+                "the cheap profile needs the model relay, and {} is unreachable",
+                relay.url
+            )),
+            (ModelProfile::Cheap, None, None) => Err(
+                "the cheap profile needs the model relay, and none is configured \
+                 (SPAWN_MODEL_RELAY)"
+                    .to_string(),
+            ),
+        }
     }
 
     /// End a start that failed as lost; the failure names `why` first.
@@ -1306,6 +1411,7 @@ impl Bridge {
             native,
             resume,
             prompt,
+            settings,
         } = *run;
         let mut arguments = vec!["run".to_string(), "--".to_string()];
         arguments.push(match engine {
@@ -1313,7 +1419,7 @@ impl Bridge {
             Engine::Codex => self.config.codex_program.clone(),
         });
         arguments.extend(match engine {
-            Engine::Claude => claude_arguments(native, resume),
+            Engine::Claude => claude_arguments(native, resume, settings),
             Engine::Codex => codex_arguments(native.filter(|_| resume), prompt),
         });
         let mut environment = self.config.environment.clone();
@@ -1533,6 +1639,7 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         prompt: Option<&str>,
+        model: Option<ModelProfile>,
         report: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
         if self.running(&claimed.session_id).is_some() {
@@ -1567,6 +1674,7 @@ impl Bridge {
                 parent: None,
                 native: Some(native.as_str()),
                 from: None,
+                model,
             },
             report,
         )?;
@@ -1629,32 +1737,63 @@ fn opens_turn(kind: &EventKind) -> Option<bool> {
     }
 }
 
-/// Settings passed to Claude Code.
+/// Settings passed to Claude Code for an engine on `profile`, through
+/// `relay` when there is one.
 ///
-/// `--settings` takes inline JSON, and that JSON replaces the user's settings
-/// file for the session. The permission keys must therefore be repeated here:
-/// without them the engine stops on a startup dialog and never reads the
-/// prompt the Bridge types into the pane. No hooks: the Bridge reads what
-/// the engine does from its transcript and its screen.
-pub fn claude_settings() -> String {
-    json!({
+/// `--settings` takes inline JSON, which Claude Code merges over the user's
+/// settings files: a key set here wins, and `env` merges name by name
+/// (checked with Claude Code 2.1.318: an inline `env` naming only the base
+/// URL and the haiku slot kept the user's main model and auth token). So
+/// the gateway's token reaches the engine from the user's own settings, as
+/// it would without Spawn, and Spawn never holds it.
+///
+/// The permission keys are repeated so the engine never depends on the
+/// user's file for them: without them it stops on a startup dialog and
+/// never reads the prompt the Bridge types into the pane. No hooks: the
+/// Bridge reads what the engine does from its transcript and its screen.
+///
+/// With a relay, the engine calls it instead of the gateway, and the haiku
+/// slot (Claude Code's small model for background work) is the relay's
+/// small model; the cheap profile also puts its main model in the main,
+/// sonnet and opus slots. Without a relay nothing about models is set: the
+/// cheap profile needs one, and the Bridge refuses to start it without.
+pub fn claude_settings(relay: Option<&ModelRelay>, profile: ModelProfile) -> String {
+    let mut settings = json!({
         "permissions": { "defaultMode": "bypassPermissions" },
         "skipDangerousModePermissionPrompt": true,
-    })
-    .to_string()
+    });
+    if let Some(relay) = relay {
+        let mut env = serde_json::Map::new();
+        env.insert("ANTHROPIC_BASE_URL".to_string(), json!(relay.url));
+        if profile == ModelProfile::Cheap {
+            for slot in [
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            ] {
+                env.insert(slot.to_string(), json!(relay.cheap_model));
+            }
+        }
+        env.insert(
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+            json!(relay.small_model),
+        );
+        settings["env"] = serde_json::Value::Object(env);
+    }
+    settings.to_string()
 }
 
 /// Claude arguments for the session `native`: a new one with that id, or
-/// the earlier one resumed. The prompt is typed into the pane, never
-/// passed here.
-pub fn claude_arguments(native: Option<&str>, resume: bool) -> Vec<String> {
+/// the earlier one resumed, with `settings` from [`claude_settings`]. The
+/// prompt is typed into the pane, never passed here.
+pub fn claude_arguments(native: Option<&str>, resume: bool, settings: &str) -> Vec<String> {
     // The engine runs in a container with no credentials of its own, so the
     // permission prompts have nowhere to go. The sandbox is the boundary.
     let mut arguments = vec![
         "--ax-screen-reader".to_string(),
         "--allow-dangerously-skip-permissions".to_string(),
         "--settings".to_string(),
-        claude_settings(),
+        settings.to_string(),
     ];
     if let Some(native) = native {
         arguments.push(if resume { "--resume" } else { "--session-id" }.to_string());

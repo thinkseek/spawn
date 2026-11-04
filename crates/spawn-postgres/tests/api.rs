@@ -14,8 +14,8 @@ use postgres::Client;
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
-    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, GlobalPosition, NewEvent,
-    SessionSeq, Source,
+    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, GlobalPosition, ModelProfile,
+    NewEvent, SessionSeq, Source,
 };
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
@@ -56,6 +56,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
             prompt: "hello".to_string(),
             parent_session_id: None,
             from: None,
+            model: None,
         },
     }
 }
@@ -347,6 +348,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: CommandId(1),
                 fork: None,
+                model: ModelProfile::Default,
             },
         ))
         .expect("append succeeds");
@@ -487,6 +489,7 @@ fn a_task_lists_its_command_and_execution_events() {
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: command,
                 fork: None,
+                model: ModelProfile::Default,
             },
         ))
         .expect("append succeeds");
@@ -839,6 +842,7 @@ fn status_joins_the_judgement_and_the_latest_execution() {
                 workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
                 command_id: CommandId(1),
                 fork: None,
+                model: ModelProfile::Default,
             },
         ))
         .expect("append succeeds");
@@ -1032,6 +1036,50 @@ fn a_delivered_task_starts_a_new_episode_and_a_nudge_does_not() {
     assert_eq!(episode(), (Some(human), Some("input".to_string())));
     let delivered = submit("spawn-dispatch", "deliver-4-0");
     assert_eq!(episode().0, Some(delivered), "a new task is a new episode");
+}
+
+#[test]
+fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
+    let (store, _schema) = store("facts_model");
+    let worker = AgentId::new("agent_worker_docs_1").expect("valid agent");
+    let session = SessionId::new("session_worker_docs_1").expect("valid session");
+    let model = || {
+        let facts = store.dispatch_facts().expect("facts");
+        facts.as_array().expect("rows")[0]["model"]
+            .as_str()
+            .map(str::to_string)
+    };
+    store
+        .append(NewEvent {
+            agent_id: worker.clone(),
+            session_id: session.clone(),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    assert_eq!(model().as_deref(), Some("default"), "never ran");
+    for (number, profile) in [(1, ModelProfile::Default), (2, ModelProfile::Cheap)] {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        store
+            .append(NewEvent {
+                agent_id: worker.clone(),
+                session_id: session.clone(),
+                ..lifecycle(
+                    &execution,
+                    Source::Bridge,
+                    &format!("exec_{number}:started"),
+                    EventKind::ExecutionStarted {
+                        engine: Engine::Claude,
+                        terminal: TerminalName::for_execution(&execution),
+                        workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                        command_id: CommandId(number),
+                        fork: None,
+                        model: profile,
+                    },
+                )
+            })
+            .expect("append succeeds");
+        assert_eq!(model().as_deref(), Some(profile.as_str()));
+    }
 }
 
 #[test]

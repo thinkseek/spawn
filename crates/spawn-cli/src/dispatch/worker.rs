@@ -85,6 +85,8 @@ fn resume_lost(facts: &Facts) -> Decision {
                      and continue your task."
                         .to_string(),
                 ),
+                // The session's own profile: a lost cheap worker stays cheap.
+                model: None,
             },
         )),
         Some(resume) if resume.succeeded == Some(false) => Decision::Escalate(Escalation::about(

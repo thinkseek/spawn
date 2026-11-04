@@ -463,6 +463,9 @@ function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
             {task.kind}
           </Pill>
         )}
+        {task.model === "cheap" && (
+          <Pill className="bg-muted text-muted-foreground">cheap model</Pill>
+        )}
         <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
         <span className="tnum ml-auto text-micro text-faint-foreground">
           {task.created_by && <>by {task.created_by} · </>}
