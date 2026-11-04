@@ -30,8 +30,14 @@ pub enum CommandAction {
         /// Text to submit.
         text: String,
     },
-    /// Stop the running execution after a final checkpoint.
+    /// Stop the running execution after a final checkpoint. While the
+    /// checkpoint fails the workspace stays mounted and the stop is retried.
     Stop,
+    /// Stop the running execution, and unmount its workspace even when the
+    /// final checkpoint fails: what it did not commit is lost. Only a person
+    /// or the supervisor sends it, after `execution.end_stalled`, having
+    /// decided the work can go.
+    Discard,
     /// Start a new execution that resumes the latest native session.
     Resume {
         /// Prompt for the resumed session. Codex requires one.

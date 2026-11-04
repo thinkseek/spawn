@@ -133,6 +133,30 @@ fn prompt(id: &str) -> String {
     format!(r#"{{"type":"user","uuid":"p-{id}",{AT},"message":{{"content":"next"}}}}"#)
 }
 
+/// The transcript line of a prompt whose text is `text`, as the engine
+/// records what was typed into it.
+fn prompt_of(id: &str, text: &str) -> String {
+    let content = serde_json::to_string(text).expect("a JSON string");
+    format!(r#"{{"type":"user","uuid":"p-{id}",{AT},"message":{{"content":{content}}}}}"#)
+}
+
+/// What the pane of the first execution shows after its last ready line:
+/// the text typed since the pane was last reset.
+fn typed_last(store: &MemoryStore) -> String {
+    let pane = pane(store, 1);
+    pane.rsplit("tok/s").next().unwrap_or_default().to_string()
+}
+
+/// The last prompt typed into the first execution that opened with the
+/// merge notice.
+fn typed_notice(store: &MemoryStore) -> String {
+    let pane = pane(store, 1);
+    let at = pane
+        .rfind(spawn_core::ingest::MERGE_NOTICE_OPENING)
+        .expect("a typed notice");
+    pane[at..].trim_end().to_string()
+}
+
 fn quiet(report: &TickReport) {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
@@ -477,8 +501,12 @@ fn what_a_merge_changed_is_recorded_and_told_with_the_next_prompt_only() {
     let told = typed.find(MERGED_NOTICE).expect("the notice was typed");
     assert!(typed[told..].contains("\n\nnext"), "{typed}");
 
-    // Told once: the next prompt goes alone, after a restart too.
-    transcript(&store, &[prompt("2"), turn_end("2")]);
+    // Told once that prompt reached the engine: the next prompt goes alone,
+    // after a restart too.
+    transcript(
+        &store,
+        &[prompt_of("2", &typed_notice(&store)), turn_end("2")],
+    );
     bridge.tick().expect("read the turn");
     bridge.tick().expect("checkpoint");
     let mut bridge = self::bridge(&store);
@@ -513,6 +541,109 @@ fn what_a_merge_changed_is_recorded_and_told_with_the_next_prompt_only() {
             && typed.contains("do not rewrite the files from memory")
             && typed.contains("fix it"),
         "{typed}"
+    );
+}
+
+#[test]
+fn only_the_bridges_own_notice_reaching_the_engine_clears_it() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("e".repeat(40)).expect("valid commit"),
+        files: vec!["src/a.rs".to_string()],
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint and merge");
+    store.set_base_merge(BaseMerge::Current);
+
+    // A turn the Bridge did not type (a person at the pane, the engine
+    // going on by itself) tells the agent nothing.
+    transcript(&store, &[prompt("2"), turn_end("2")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    input(&store, "key_input_1", "next");
+    bridge.tick().expect("type");
+    assert!(
+        typed_last(&store).contains(MERGED_NOTICE),
+        "{}",
+        pane(&store, 1)
+    );
+
+    // Typed, but not in the transcript yet: a restart still owes it, and
+    // the next prompt carries it again.
+    let typed = typed_notice(&store);
+    let mut bridge = self::bridge(&store);
+    bridge.recover().expect("recover");
+    reset_pane(&store, 1);
+    input(&store, "key_input_2", "more");
+    bridge.tick().expect("type");
+    assert!(
+        typed_last(&store).contains(MERGED_NOTICE),
+        "{}",
+        pane(&store, 1)
+    );
+
+    // The typed prompt reaches the engine: told, also for a restarted
+    // Bridge.
+    transcript(&store, &[prompt_of("3", &typed), turn_end("3")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    assert!(
+        events(&store)
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::NoticeReceived))
+    );
+    let mut bridge = self::bridge(&store);
+    bridge.recover().expect("recover");
+    reset_pane(&store, 1);
+    input(&store, "key_input_3", "again");
+    bridge.tick().expect("type");
+    let last = typed_last(&store);
+    assert!(
+        last.contains("again") && !last.contains("Spawn merged"),
+        "{last}"
+    );
+}
+
+#[test]
+fn a_merge_after_the_notice_was_typed_is_told_next_time() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("e".repeat(40)).expect("valid commit"),
+        files: vec!["src/a.rs".to_string()],
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint and merge");
+    input(&store, "key_input_1", "next");
+    bridge.tick().expect("type");
+    let typed = typed_notice(&store);
+
+    // Another merge lands before the typed prompt shows in the transcript.
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("f".repeat(40)).expect("valid commit"),
+        files: vec!["src/b.rs".to_string()],
+    });
+    transcript(&store, &[turn_end("x")]);
+    bridge.tick().expect("read the turn end");
+    bridge.tick().expect("checkpoint and merge");
+    store.set_base_merge(BaseMerge::Current);
+    transcript(&store, &[prompt_of("2", &typed), turn_end("2")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    reset_pane(&store, 1);
+    input(&store, "key_input_2", "again");
+    bridge.tick().expect("type");
+    let last = typed_last(&store);
+    assert!(
+        last.contains("since your last turn: src/b.rs.") && !last.contains("src/a.rs"),
+        "{last}"
     );
 }
 
@@ -591,38 +722,141 @@ fn a_failed_final_checkpoint_keeps_the_workspace_and_is_tried_again() {
     assert_eq!(unmounts(&store), 1);
 }
 
-#[test]
-fn a_final_checkpoint_that_keeps_failing_unmounts_loudly_after_twenty_ticks() {
-    let store = store();
-    let mut bridge = bridge(&store);
-    start(&store, None);
+fn commits(store: &MemoryStore) -> usize {
+    store
+        .workspace_calls()
+        .iter()
+        .filter(|call| *call == "commit")
+        .count()
+}
+
+fn stalls(store: &MemoryStore) -> Vec<(EndCause, u32)> {
+    events(store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ExecutionEndStalled {
+                cause, failures, ..
+            } => Some((cause, failures)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A Bridge on `clock` whose stop's final checkpoint has failed twenty
+/// times: the end is stalled.
+fn stalled(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Bridge {
+    let mut bridge = bridge(store).with_clock(clock.clone());
+    start(store, None);
     bridge.tick().expect("start");
     store.fail_commits(true);
-    submit(&store, "key_stop", CommandAction::Stop);
+    submit(store, "key_stop", CommandAction::Stop);
     // The stop tries once, and the same tick's pass over executions again.
     bridge.tick().expect("stop: attempts 1 and 2");
-    let attempts = |store: &MemoryStore| {
-        store
-            .workspace_calls()
-            .iter()
-            .filter(|call| *call == "commit")
-            .count()
-    };
-    assert_eq!(attempts(&store), 2);
-    while attempts(&store) < 19 {
+    assert_eq!(commits(store), 2);
+    while commits(store) < 19 {
         bridge.tick().expect("attempt");
-        assert!(ended(&store).is_empty());
+        assert!(stalls(store).is_empty());
     }
     let report = bridge.tick().expect("attempt 20");
-    assert_eq!(attempts(&store), 20);
+    assert_eq!(commits(store), 20);
+    assert!(
+        report.warnings.iter().any(
+            |warning| warning.contains("FINAL CHECKPOINT FAILED 20 TIMES")
+                && warning.contains("STAYS MOUNTED")
+        ),
+        "{:?}",
+        report.warnings
+    );
+    bridge
+}
+
+#[test]
+fn a_final_checkpoint_that_keeps_failing_stalls_the_end_and_never_unmounts() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, READY);
+    let mut bridge = stalled(&store, &clock);
+    assert_eq!(
+        stalls(&store),
+        vec![(EndCause::Stopped, 20)],
+        "recorded once"
+    );
+    assert_eq!(unmounts(&store), 0, "the workspace stays");
+    assert!(ended(&store).is_empty());
+    let workspace = spawn_core::id::WorkspaceId::new("1:/w").expect("valid");
+    assert!(
+        !store.is_alive(&terminal, &workspace).expect("alive?"),
+        "the terminal is down"
+    );
+
+    // Slow from now on: nothing within 30 s, one attempt after, no second
+    // loud warning.
+    let wait = |seconds: u64| clock.advance(std::time::Duration::from_secs(seconds));
+    wait(29);
+    quiet(&bridge.tick().expect("waits"));
+    assert_eq!(commits(&store), 20);
+    wait(1);
+    let report = bridge.tick().expect("attempt 21");
+    assert_eq!(commits(&store), 21);
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("FINAL CHECKPOINT FAILED")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(unmounts(&store), 0);
+
+    // A restarted Bridge keeps the end stalled, and slow.
+    let mut bridge = self::bridge(&store).with_clock(clock.clone());
+    bridge.recover().expect("recover");
+    bridge.tick().expect("attempt 22");
+    assert_eq!(commits(&store), 22);
+    bridge.tick().expect("waits");
+    assert_eq!(commits(&store), 22);
+    assert_eq!(stalls(&store).len(), 1);
+    assert_eq!(unmounts(&store), 0);
+
+    // A plain stop does not give the work up either.
+    submit(&store, "key_stop_again", CommandAction::Stop);
+    bridge.tick().expect("stop again");
+    assert_eq!(unmounts(&store), 0);
+
+    // The cause is fixed: the next attempt ends it, as it was ending.
+    store.fail_commits(false);
+    wait(30);
+    bridge.tick().expect("the checkpoint commits");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1);
+}
+
+#[test]
+fn a_discard_unmounts_a_stalled_end() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, READY);
+    let mut bridge = stalled(&store, &clock);
+    submit(&store, "key_discard", CommandAction::Discard);
+    let report = bridge.tick().expect("discard");
     assert!(
         report
             .warnings
             .iter()
-            .any(|warning| warning.contains("FINAL CHECKPOINT FAILED 20 TIMES")),
+            .any(|warning| warning.contains("discarded")),
         "{:?}",
         report.warnings
     );
     assert_eq!(ended(&store), vec![EndCause::Stopped]);
     assert_eq!(unmounts(&store), 1);
+    let finished: Vec<bool> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::CommandFinished { succeeded, .. } => Some(succeeded),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished.last(), Some(&true), "the discard succeeded");
 }

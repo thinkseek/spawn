@@ -8,7 +8,7 @@
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -21,7 +21,7 @@ use crate::event::{
     NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
-use crate::ingest::{claude_line, codex_line};
+use crate::ingest::{MERGE_NOTICE_OPENING, claude_line, codex_line};
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
     TerminalHost, WorkspaceError, WorkspaceStore,
@@ -39,9 +39,16 @@ const CLOCK_SLACK_MS: i64 = 60_000;
 /// without waiting for a turn.
 pub const IDLE_MERGE_MS: i64 = 30_000;
 
-/// Ticks an execution's end waits for its final checkpoint to succeed before
-/// the workspace is unmounted anyway (and what it did not commit is lost).
+/// Final checkpoints an ending execution tries on consecutive ticks before
+/// its end counts as stalled: the terminal is killed, the workspace stays
+/// mounted, `execution.end_stalled` asks for attention, and the checkpoint is
+/// retried every [`END_RETRY_MS`]. A workspace is unmounted only after its
+/// final checkpoint commits, or on a `discard` command.
 pub const END_ATTEMPTS: u32 = 20;
+
+/// How often a stalled end retries its final checkpoint, by the Bridge's
+/// clock.
+pub const END_RETRY_MS: i64 = 30_000;
 
 /// Engine choice and prompt of one launch.
 ///
@@ -173,9 +180,13 @@ struct Follow {
     /// This tick read an event that asks for a checkpoint, not folded yet:
     /// the workspace may hold work not on its branch.
     checkpoint_read: bool,
-    /// Ends whose final checkpoint failed; the workspace stays mounted
-    /// until one succeeds or [`END_ATTEMPTS`] have failed.
+    /// Final checkpoints of this execution's end that failed. The
+    /// workspace stays mounted until one succeeds (or a `discard`); from
+    /// [`END_ATTEMPTS`] on the end is stalled.
     end_failures: u32,
+    /// When the end's final checkpoint was last tried, by the Bridge's
+    /// clock: a stalled end retries every [`END_RETRY_MS`].
+    end_tried_at: Option<i64>,
 }
 
 /// What the Bridge knows about one session.
@@ -184,48 +195,139 @@ struct SessionView {
     agent_id: AgentId,
     native: Option<(Engine, String)>,
     active: Option<Active>,
-    /// What merges of main changed under the agent since the last prompt it
-    /// received: told with the next prompt the Bridge types.
+    /// What merges of main changed under the agent and it has not been
+    /// told: told with the next prompt the Bridge types.
     notice: Notice,
 }
 
 /// Files merges of main changed in an agent's workspace that the agent has
-/// not been told of yet. Folded from the log: a merge adds its files, a
-/// prompt reaching the engine clears them (the Bridge put the notice in it).
+/// not been told of yet, each with the position of the last merge event that
+/// named it. Folded from the log: a merge adds its files; `notice.typed`
+/// records which of them a prompt the Bridge typed carried; the
+/// `notice.received` read from the engine's transcript (for Codex, whose
+/// prompt is its argument, the execution's first prompt) clears those. No
+/// other prompt clears anything: a turn someone else typed told the agent
+/// nothing.
 #[derive(Debug, Clone, Default)]
 struct Notice {
-    merged: std::collections::BTreeSet<String>,
-    conflicted: std::collections::BTreeSet<String>,
+    merged: BTreeMap<String, GlobalPosition>,
+    conflicted: BTreeMap<String, GlobalPosition>,
+    /// The notice typed last and not received yet.
+    typed: Option<Typed>,
+}
+
+/// A notice the Bridge typed.
+#[derive(Debug, Clone)]
+struct Typed {
+    /// What it told of: merge events up to this position.
+    through: GlobalPosition,
+    /// The execution it was typed into.
+    execution: Option<ExecutionId>,
+    /// Typed as a Codex prompt (an argument): the execution's first prompt
+    /// is that prompt.
+    codex: bool,
 }
 
 impl Notice {
-    /// The text that goes before the next prompt, if anything is to be told.
-    fn text(&self) -> Option<String> {
-        let list = |files: &std::collections::BTreeSet<String>| {
-            files.iter().cloned().collect::<Vec<_>>().join(", ")
+    /// The text that goes before the next prompt, if anything is to be
+    /// told, and the position of the last merge event it tells of.
+    fn text(&self) -> Option<(String, GlobalPosition)> {
+        let list = |files: &[&String]| {
+            files
+                .iter()
+                .map(|file| file.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let merged: std::collections::BTreeSet<String> =
-            self.merged.difference(&self.conflicted).cloned().collect();
-        match (merged.is_empty(), self.conflicted.is_empty()) {
-            (true, true) => None,
-            (false, true) => Some(format!(
-                "Spawn merged main into your workspace since your last turn: {}. Re-read them \
-                 before editing.",
+        let merged: Vec<&String> = self
+            .merged
+            .keys()
+            .filter(|file| !self.conflicted.contains_key(*file))
+            .collect();
+        let conflicted: Vec<&String> = self.conflicted.keys().collect();
+        let through = self
+            .merged
+            .values()
+            .chain(self.conflicted.values())
+            .max()
+            .copied()?;
+        let text = match (merged.is_empty(), conflicted.is_empty()) {
+            (true, true) => return None,
+            (false, true) => format!(
+                "{MERGE_NOTICE_OPENING}: {}. Re-read them before editing.",
                 list(&merged)
-            )),
-            (true, false) => Some(format!(
-                "Spawn merged main into your workspace since your last turn; these files carry \
+            ),
+            (true, false) => format!(
+                "{MERGE_NOTICE_OPENING}; these files carry conflict markers: {}. Resolve them \
+                 by editing the marked regions; do not rewrite the files from memory.",
+                list(&conflicted)
+            ),
+            (false, false) => format!(
+                "{MERGE_NOTICE_OPENING}: {}. Re-read them before editing. These files carry \
                  conflict markers: {}. Resolve them by editing the marked regions; do not \
                  rewrite the files from memory.",
-                list(&self.conflicted)
-            )),
-            (false, false) => Some(format!(
-                "Spawn merged main into your workspace since your last turn: {}. Re-read them \
-                 before editing. These files carry conflict markers: {}. Resolve them by \
-                 editing the marked regions; do not rewrite the files from memory.",
                 list(&merged),
-                list(&self.conflicted)
-            )),
+                list(&conflicted)
+            ),
+        };
+        Some((text, through))
+    }
+
+    /// Fold one event of the session: merges add files, the Bridge's
+    /// `notice.typed` records what a prompt carried, its receipt clears it.
+    /// `active` is the session's running execution.
+    fn fold(&mut self, record: &EventRecord, active: Option<&Active>) {
+        let event = &record.event;
+        match &event.kind {
+            EventKind::ArtifactCommitted {
+                reason: CheckpointReason::BaseMerged,
+                files,
+                ..
+            } => {
+                for file in files {
+                    self.merged.insert(file.clone(), record.position);
+                }
+            }
+            EventKind::MergeConflicted {
+                files,
+                marked: true,
+            } => {
+                for file in files {
+                    self.conflicted.insert(file.clone(), record.position);
+                }
+            }
+            EventKind::NoticeTyped { through } if event.source == Source::Bridge => {
+                let codex = active.is_some_and(|active| {
+                    active.engine == Engine::Codex
+                        && event.execution_id.as_ref() == Some(&active.execution_id)
+                });
+                self.typed = Some(Typed {
+                    through: *through,
+                    execution: event.execution_id.clone(),
+                    codex,
+                });
+            }
+            EventKind::NoticeReceived => self.received(),
+            // A Codex execution's first prompt is the argument it started
+            // with, which carried the notice.
+            EventKind::MessageReceived
+                if self.typed.as_ref().is_some_and(|typed| {
+                    typed.codex
+                        && typed.execution.is_some()
+                        && typed.execution == event.execution_id
+                }) =>
+            {
+                self.received();
+            }
+            _ => {}
+        }
+    }
+
+    /// The typed notice reached the engine: what it told of is told.
+    fn received(&mut self) {
+        if let Some(typed) = self.typed.take() {
+            self.merged.retain(|_, at| *at > typed.through);
+            self.conflicted.retain(|_, at| *at > typed.through);
         }
     }
 }
@@ -346,19 +448,7 @@ impl Bridge {
                 active: None,
                 notice: Notice::default(),
             });
-        match &event.kind {
-            EventKind::ArtifactCommitted {
-                reason: CheckpointReason::BaseMerged,
-                files,
-                ..
-            } => view.notice.merged.extend(files.iter().cloned()),
-            EventKind::MergeConflicted {
-                files,
-                marked: true,
-            } => view.notice.conflicted.extend(files.iter().cloned()),
-            EventKind::MessageReceived => view.notice = Notice::default(),
-            _ => {}
-        }
+        view.notice.fold(record, view.active.as_ref());
         let current = view
             .active
             .as_ref()
@@ -399,6 +489,15 @@ impl Bridge {
             EventKind::ExecutionEnded { cause, exit_code } if current => {
                 if let Some(active) = view.active.as_mut() {
                     active.reported_end = Some((*cause, *exit_code));
+                }
+            }
+            // A stalled end stays due after a restart, slow from the start.
+            EventKind::ExecutionEndStalled {
+                cause, exit_code, ..
+            } if current => {
+                if let Some(active) = view.active.as_mut() {
+                    active.reported_end = Some((*cause, *exit_code));
+                    active.follow.end_failures = active.follow.end_failures.max(END_ATTEMPTS);
                 }
             }
             EventKind::NativeSessionStarted {
@@ -498,7 +597,7 @@ impl Bridge {
         if let Some((cause, exit_code)) = end {
             // What the engine wrote last comes before its end.
             self.follow_output(agent_id, session, native, active, report)?;
-            return self.end(agent_id, session, active, cause, exit_code, report);
+            return self.end(agent_id, session, active, cause, exit_code, false, report);
         }
         if let Some(reason) = active.checkpoint {
             let committed = self.checkpoint(agent_id, session, active, reason, report)?;
@@ -790,8 +889,16 @@ impl Bridge {
     /// Final checkpoint, kill, unmount, then `execution.ended`. Returns
     /// false when the final checkpoint failed or the terminal could not be
     /// killed; the execution then stays active, its workspace mounted, and
-    /// the next tick tries the same end again. After [`END_ATTEMPTS`] failed
-    /// checkpoints the workspace is unmounted anyway, loudly.
+    /// the next tick tries the same end again.
+    ///
+    /// A failed final checkpoint never leads to an unmount: its workspace
+    /// holds the only copy of what the execution did not commit. After
+    /// [`END_ATTEMPTS`] failures the end is stalled: the terminal is killed,
+    /// `execution.end_stalled` is recorded and warned once, and the
+    /// checkpoint is retried every [`END_RETRY_MS`] until it commits. Only
+    /// `discard` (a person's or the supervisor's decision) unmounts a
+    /// workspace whose final checkpoint failed.
+    #[allow(clippy::too_many_arguments)]
     fn end(
         &self,
         agent_id: &AgentId,
@@ -799,9 +906,22 @@ impl Bridge {
         active: &mut Active,
         cause: EndCause,
         exit_code: Option<i32>,
+        discard: bool,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         active.reported_end = Some((cause, exit_code));
+        let now = self.clock.now().0;
+        let stalled = active.follow.end_failures >= END_ATTEMPTS;
+        if stalled
+            && !discard
+            && active
+                .follow
+                .end_tried_at
+                .is_some_and(|at| now.saturating_sub(at) < END_RETRY_MS)
+        {
+            return Ok(false);
+        }
+        active.follow.end_tried_at = Some(now);
         let committed = self.checkpoint(
             agent_id,
             session,
@@ -809,21 +929,25 @@ impl Bridge {
             CheckpointReason::ExecutionEnded,
             report,
         )?;
-        if !committed {
-            active.follow.end_failures += 1;
-            if active.follow.end_failures < END_ATTEMPTS {
-                report.warnings.push(format!(
-                    "{session}: final checkpoint failed ({} of {END_ATTEMPTS}); the workspace \
-                     stays mounted and the end is tried again",
-                    active.follow.end_failures
-                ));
-                return Ok(false);
-            }
+        if !committed && discard {
             report.warnings.push(format!(
-                "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; unmounting {} anyway: \
-                 what it did not commit is lost",
+                "{session}: final checkpoint failed; discarded: unmounting {} with what it \
+                 did not commit",
                 active.workspace
             ));
+        } else if !committed {
+            let error = report.warnings.last().cloned().unwrap_or_default();
+            active.follow.end_failures = active.follow.end_failures.saturating_add(1);
+            let failures = active.follow.end_failures;
+            if failures < END_ATTEMPTS {
+                report.warnings.push(format!(
+                    "{session}: final checkpoint failed ({failures} of {END_ATTEMPTS}); the \
+                     workspace stays mounted and the end is tried again"
+                ));
+            } else if failures == END_ATTEMPTS {
+                self.stall(agent_id, session, active, error, report)?;
+            }
+            return Ok(false);
         }
         if let Err(error) = self
             .terminals
@@ -848,6 +972,48 @@ impl Bridge {
             EventKind::ExecutionEnded { cause, exit_code },
         )?;
         Ok(true)
+    }
+
+    /// The end's final checkpoint failed [`END_ATTEMPTS`] times: kill the
+    /// terminal (the engine's work is all in the workspace, which stays),
+    /// record `execution.end_stalled` and warn, once.
+    fn stall(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        error: String,
+        report: &mut TickReport,
+    ) -> Result<(), StoreError> {
+        if let Err(error) = self
+            .terminals
+            .terminate(&active.terminal, &active.workspace)
+        {
+            report
+                .warnings
+                .push(format!("terminate {}: {error}", active.terminal));
+        }
+        report.warnings.push(format!(
+            "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; the terminal is down, \
+             {} STAYS MOUNTED with everything it holds and the checkpoint is retried every \
+             {} s. Fix the cause ({error}); a discard command gives the uncommitted work up",
+            active.workspace,
+            END_RETRY_MS / 1000
+        ));
+        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Lost, None));
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:end_stalled", active.execution_id)),
+            EventKind::ExecutionEndStalled {
+                cause,
+                exit_code,
+                failures: END_ATTEMPTS,
+                error,
+            },
+        )
     }
 
     /// Commit the workspace and record a new commit. Returns whether the
@@ -943,7 +1109,8 @@ impl Bridge {
                 report,
             ),
             CommandAction::Input { text } => self.input(claimed, &text),
-            CommandAction::Stop => self.stop(claimed),
+            CommandAction::Stop => self.stop(claimed, false, report),
+            CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt } => self.resume(claimed, prompt.as_deref(), report),
         }
     }
@@ -1059,12 +1226,14 @@ impl Bridge {
         why: String,
     ) -> Result<Outcome, StoreError> {
         let mut report = TickReport::default();
+        // Nothing ran in it yet: an unmount loses nothing.
         self.end(
             &claimed.agent_id,
             &claimed.session_id,
             &mut active.clone(),
             EndCause::Lost,
             None,
+            true,
             &mut report,
         )?;
         report.warnings.insert(0, why);
@@ -1283,7 +1452,7 @@ impl Bridge {
                 reading.state
             )));
         }
-        let typed = self.with_notice(&claimed.session_id, text);
+        let (typed, through) = self.with_notice(&claimed.session_id, text);
         match self
             .terminals
             .submit_text(&active.terminal, &active.workspace, &typed)
@@ -1291,7 +1460,7 @@ impl Bridge {
             Ok(()) => {
                 // A turn starts now, before its transcript says so.
                 self.open_turn(&claimed.session_id);
-                self.notice_delivered(&claimed.session_id);
+                self.notice_typed(claimed, &active, through)?;
                 Ok(Outcome::Succeeded)
             }
             Err(error) => Ok(Outcome::Failed(format!("submit text: {error}"))),
@@ -1310,21 +1479,33 @@ impl Bridge {
         }
     }
 
-    fn stop(&mut self, claimed: &Claimed) -> Result<Outcome, StoreError> {
+    /// `Stop`, or with `discard` the `Discard` that unmounts even when the
+    /// final checkpoint fails.
+    fn stop(
+        &mut self,
+        claimed: &Claimed,
+        discard: bool,
+        tick: &mut TickReport,
+    ) -> Result<Outcome, StoreError> {
         let Some(mut active) = self.running(&claimed.session_id) else {
             return Ok(Outcome::Succeeded);
         };
         let mut report = TickReport::default();
+        // A stop of an end already under way keeps its cause.
+        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Stopped, None));
         let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
             &mut active,
-            EndCause::Stopped,
-            None,
+            cause,
+            exit_code,
+            discard,
             &mut report,
         )?;
         self.catch_up()?;
         if ended {
+            // A discard that lost work says so in the tick's report too.
+            tick.warnings.append(&mut report.warnings);
             return Ok(Outcome::Succeeded);
         }
         // The stop stays due: each tick tries the same end again.
@@ -1335,6 +1516,15 @@ impl Bridge {
         {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
+            held.follow.end_tried_at = active.follow.end_tried_at;
+        }
+        if report.warnings.is_empty() {
+            report.warnings.push(format!(
+                "{}: the end is stalled and its final checkpoint retried every {} s; a \
+                 discard command gives the uncommitted work up",
+                claimed.session_id,
+                END_RETRY_MS / 1000
+            ));
         }
         Ok(Outcome::Failed(report.warnings.join("; ")))
     }
@@ -1364,8 +1554,8 @@ impl Bridge {
         }
         // What merges changed goes with the prompt; nothing is typed
         // unprompted.
-        let prompt = if prompt.is_empty() {
-            String::new()
+        let (prompt, through) = if prompt.is_empty() {
+            (String::new(), None)
         } else {
             self.with_notice(&claimed.session_id, prompt)
         };
@@ -1380,30 +1570,52 @@ impl Bridge {
             },
             report,
         )?;
-        if outcome == Outcome::Succeeded && !prompt.is_empty() {
-            self.notice_delivered(&claimed.session_id);
+        // The execution the prompt went to, folded (a Codex start does not
+        // fold it itself).
+        self.catch_up()?;
+        if outcome == Outcome::Succeeded
+            && let Some(active) = self.running(&claimed.session_id)
+        {
+            self.notice_typed(claimed, &active, through)?;
         }
         Ok(outcome)
     }
 
-    /// `prompt`, after what merges of main changed under the agent since
-    /// its last prompt, if anything did.
-    fn with_notice(&self, session: &SessionId, prompt: &str) -> String {
+    /// `prompt`, after what merges of main changed under the agent and it
+    /// was not told yet, if anything did; and the position of the last merge
+    /// event the notice tells of.
+    fn with_notice(&self, session: &SessionId, prompt: &str) -> (String, Option<GlobalPosition>) {
         match self
             .sessions
             .get(session)
             .and_then(|view| view.notice.text())
         {
-            Some(notice) => format!("{notice}\n\n{prompt}"),
-            None => prompt.to_string(),
+            Some((notice, through)) => (format!("{notice}\n\n{prompt}"), Some(through)),
+            None => (prompt.to_string(), None),
         }
     }
 
-    /// The notice went out with a typed prompt (which the command records).
-    fn notice_delivered(&mut self, session: &SessionId) {
-        if let Some(view) = self.sessions.get_mut(session) {
-            view.notice = Notice::default();
-        }
+    /// A prompt with the notice through `through` went to the engine:
+    /// record it, so the notice clears when that prompt reaches the engine
+    /// (`notice.received`), and only then.
+    fn notice_typed(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        through: Option<GlobalPosition>,
+    ) -> Result<(), StoreError> {
+        let Some(through) = through else {
+            return Ok(());
+        };
+        self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("cmd_{}:notice", claimed.command_id.0)),
+            EventKind::NoticeTyped { through },
+        )?;
+        self.catch_up()
     }
 }
 

@@ -56,11 +56,13 @@ pub(crate) enum Revive {
     Start { handoff: bool },
 }
 
-/// The liveness rule, as a pure function of the facts. A stop command ends
-/// the session: only a person, the supervisor (for a resident) or delivery
-/// (for a retired resident) sends one. Any other end is an outage to repair.
+/// The liveness rule, as a pure function of the facts. A stop (or discard)
+/// command ends the session: only a person, the supervisor (for a resident)
+/// or delivery (for a retired resident) sends one. Any other end is an
+/// outage to repair.
 pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
-    if facts.open_command || facts.live || facts.last_kind.as_deref() == Some("stop") {
+    let stopped = matches!(facts.last_kind.as_deref(), Some("stop" | "discard"));
+    if facts.open_command || facts.live || stopped {
         return Revive::Nothing;
     }
     if facts.failures > 0 {
@@ -127,7 +129,11 @@ Tools (run them with Bash; they go through your restricted login):
 - `{spawn} fleet` — every agent's state (rules or Jev), attention, needs_human, stuck.
 - `{spawn} tail --session <id>` — one agent's judgement, recent events, judgements and commands.
 - `{spawn} submit --agent <agent> --session <session> --key <unique> --action '{{\"type\":\"stop\"}}'` \
-— stop a worker if you must (input to workers goes through tasks).
+— stop a worker if you must (input to workers goes through tasks). An agent whose `fleet` \
+attention says `end_stalled` has ended but its final checkpoint keeps failing: its workspace \
+stays mounted and holds work that is on no branch. Fix the cause if you can (a full disk, the \
+chunk store); `{{\"type\":\"discard\"}}` unmounts it and loses that work, so send it only \
+when the work may go.
 
 Boundaries:
 - Spawn's dispatcher delivers tasks one at a time per worker, nudges, resumes and sends you \
@@ -350,6 +356,11 @@ mod tests {
             ..facts()
         };
         assert_eq!(decide(&stopped, 0), Revive::Nothing);
+        let discarded = LivenessFacts {
+            last_kind: Some("discard".to_string()),
+            ..stopped
+        };
+        assert_eq!(decide(&discarded, 0), Revive::Nothing);
     }
 
     #[test]

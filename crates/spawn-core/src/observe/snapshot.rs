@@ -16,6 +16,9 @@ pub(super) struct Snapshot {
     /// The newest execution started.
     execution: Option<ExecutionId>,
     pub(super) execution_active: bool,
+    /// The current execution's end, whose final checkpoint keeps failing:
+    /// its workspace stays mounted until someone acts.
+    stalled_end: Option<EndCause>,
     last_end: Option<EndCause>,
     open_tools: HashSet<String>,
     last_tool: Option<String>,
@@ -53,6 +56,7 @@ impl Snapshot {
                 self.engine = Some(*engine);
                 self.execution.clone_from(&record.event.execution_id);
                 self.execution_active = true;
+                self.stalled_end = None;
                 self.last_end = None;
                 self.exit_code = None;
                 self.open_tools.clear();
@@ -68,11 +72,21 @@ impl Snapshot {
                     && record.event.execution_id != self.execution => {}
             EventKind::ExecutionEnded { cause, exit_code } => {
                 self.execution_active = false;
+                self.stalled_end = None;
                 self.last_end = Some(*cause);
                 self.exit_code = *exit_code;
                 self.open_tools.clear();
                 // The pane is gone with the execution; nothing on it is a
                 // current fact any more.
+                self.screen = None;
+                self.permission_pending = false;
+            }
+            EventKind::ExecutionEndStalled { cause, .. }
+                if record.event.execution_id.is_none()
+                    || record.event.execution_id == self.execution =>
+            {
+                self.stalled_end = Some(*cause);
+                // The Bridge killed the terminal: nothing on it is current.
                 self.screen = None;
                 self.permission_pending = false;
             }
@@ -152,6 +166,7 @@ impl Snapshot {
             session_id: session_id.to_string(),
             engine: self.engine,
             execution_active: self.execution_active,
+            stalled_end: self.stalled_end,
             last_end: self.last_end,
             exit_code: self.exit_code,
             open_tools: self.open_tools.len(),
