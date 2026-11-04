@@ -253,30 +253,37 @@ impl Integrator {
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
         for mission in &missions {
-            if let Err(error) = self.mission(&store, mission) {
-                eprintln!("integrate: mission {}: {error}", mission.id);
+            match self.mission(&store, mission) {
+                // Whatever one mission did may move another's view (a shared
+                // source's main): the next pass reads everything again.
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
             }
         }
         Ok(())
     }
 
-    fn mission(&self, store: &PostgresStore, mission: &Mission) -> Result<(), String> {
+    /// One mission's step. True when it recorded anything.
+    fn mission(&self, store: &PostgresStore, mission: &Mission) -> Result<bool, String> {
         if mission.halted.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         let scenarios = PathBuf::from(&mission.gate);
         let count = gate::count_scenarios(&scenarios)?;
         if let Some(reason) = halt_reason(mission, count) {
-            return halt(store, mission, &reason);
+            return halt(store, mission, &reason).map(|()| true);
         }
-        Self::enforce_budget(store, mission)?;
+        if Self::enforce_budget(store, mission)? {
+            return Ok(true);
+        }
         let Some(source) = mission.source.as_deref() else {
-            return Ok(());
+            return Ok(false);
         };
         let mirror =
             sources::ensure_mirror(&self.root, Some(source)).map_err(|error| error.to_string())?;
         if let Some(task) = mission.landing() {
-            return land(store, &mirror, source, task);
+            return land(store, &mirror, source, task).map(|()| true);
         }
         sources::refresh(&mirror, source);
         let main = git(&[
@@ -292,20 +299,23 @@ impl Integrator {
                 store,
                 mission,
                 &format!("the source's main is {main}, but the last landing left {baseline}"),
-            );
+            )
+            .map(|()| true);
         }
         let Some(task) = mission.ready() else {
             // An objective mission with nothing open gets its next task.
-            objectives::assign_next(store, mission)?;
-            return Ok(());
+            return Ok(objectives::assign_next(store, mission)?.is_some());
         };
         self.judge(store, &mirror, source, &main, &scenarios, count, task)
+            .map(|()| true)
     }
 
-    fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<(), String> {
+    /// Abort delivered tasks over budget. True when it aborted one.
+    fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<bool, String> {
         let Some(budget) = &mission.budget else {
-            return Ok(());
+            return Ok(false);
         };
+        let mut aborted = false;
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         for task in &mission.tasks {
             let (TaskState::Delivered, Some(at)) = (task.state, task.delivered_at_ms) else {
@@ -321,9 +331,10 @@ impl Integrator {
                 )?;
                 stop(store, task);
                 println!("integrate: task {} aborted: {reason}", task.id);
+                aborted = true;
             }
         }
-        Ok(())
+        Ok(aborted)
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
