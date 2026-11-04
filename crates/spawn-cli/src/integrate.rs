@@ -428,7 +428,12 @@ impl Integrator {
                     "conflict",
                     json!({"note": format!(
                         "Your work conflicts with the source's current main ({main}). \
-                         Bring the conflicting files in line with it and report again.")}),
+                         Main is merged into your workspace when a turn of yours ends, so \
+                         the conflicting files carry conflict markers there (<<<<<<< / \
+                         ======= / >>>>>>>; if none show yet, they will once this turn \
+                         ends). Resolve them, keeping both sides' intent and removing every \
+                         marker, then report again: the checkpoint after the last marker \
+                         is gone records the merge.")}),
                 );
             };
             let tree = tree.lines().next().unwrap_or_default().to_string();
