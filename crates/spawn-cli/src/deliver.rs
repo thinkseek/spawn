@@ -239,19 +239,40 @@ impl<'a> Turns<'a> {
     }
 }
 
+/// Whether the last task typed into `facts`' session is closed. A question
+/// the worker asked at the end of it (judged BLOCKED) is then settled by
+/// the close, and new work may be typed in.
+fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
+    facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key.starts_with("deliver-"))
+        .max_by_key(|sent| sent.created_at_ms)
+        .and_then(|sent| sent.key.split('-').nth(1)?.parse::<i64>().ok())
+        // Open tasks are always among the rows; a closed resident task is not.
+        .is_some_and(|id| {
+            !work
+                .tasks
+                .iter()
+                .any(|task| task.id == id && !task.is_finished())
+        })
+}
+
 /// How a waiting task reaches its worker, given the worker's facts.
-fn delivery(task: &TaskRow, found: Option<&Facts>) -> Option<Order> {
+/// `settled`: the worker's last task is closed (see [`last_delivery_closed`]).
+fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Order> {
     let key = task.delivery_key();
     match found {
         Some(facts) if facts.open_command => None,
         // A revision answers the worker's own report, which may have asked
         // a question (judged BLOCKED): a stopped turn is enough. New work
-        // waits for a worker that is not blocked.
+        // waits for a worker that is not blocked, unless what it asked about
+        // is a task that has closed since.
         Some(facts) if facts.live => {
             let ready = if task.is_revision() {
                 facts.turn_stopped_idle()
             } else {
-                facts.idle_at_prompt()
+                facts.idle_at_prompt() || (settled && facts.turn_stopped_idle())
             };
             ready.then(|| task.order(key, CommandAction::Input { text: typed(task) }))
         }
@@ -290,7 +311,8 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
             TaskState::Assigned | TaskState::Revise => {
                 let turn = turns.take(task);
                 if turn && !blocked.contains(session) {
-                    orders.extend(delivery(task, found));
+                    let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
+                    orders.extend(delivery(task, found, settled));
                 }
             }
             // A finished ephemeral worker is stopped.
@@ -655,6 +677,49 @@ mod tests {
         assert!(
             new.is_empty(),
             "new work waits for a worker that is not blocked"
+        );
+    }
+
+    #[test]
+    fn new_work_reaches_a_worker_blocked_on_a_task_that_has_closed() {
+        let mut blocked = worker(true, true);
+        if let Some(observation) = blocked.observation.as_mut() {
+            observation.state = SemanticState::Blocked;
+        }
+        blocked.dispatched.push(Sent {
+            key: "deliver-7-1".to_string(),
+            text: None,
+            created_at_ms: 5,
+            finished_at_ms: Some(6),
+            succeeded: Some(true),
+        });
+        let waiting = |closed: TaskState| {
+            orders(
+                &work(vec![
+                    task(7, closed, "resident"),
+                    task(8, TaskState::Assigned, "resident"),
+                ]),
+                &[blocked.clone()],
+            )
+        };
+        let plan = waiting(TaskState::Landed);
+        assert_eq!(plan.len(), 1, "its question was about task 7, which landed");
+        assert_eq!(plan[0].task, Some(8));
+        assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+        assert!(
+            waiting(TaskState::Revise)
+                .iter()
+                .all(|order| order.task != Some(8)),
+            "task 7 is still open: no new work"
+        );
+        let gone = orders(
+            &work(vec![task(8, TaskState::Assigned, "resident")]),
+            &[blocked.clone()],
+        );
+        assert_eq!(
+            gone.len(),
+            1,
+            "a landed resident task is not among the rows"
         );
     }
 
