@@ -57,7 +57,14 @@ fn backend(error: &postgres::Error) -> StoreError {
 /// PostgreSQL store.
 pub struct PostgresStore {
     client: Mutex<Client>,
+    /// The password in the URL this store connected with: the owner's, when
+    /// it migrates, and the key the logins' passwords are derived from.
+    password: String,
 }
+
+/// The schema's restricted logins. Their passwords are derived from the
+/// owner's ([`role_url`]) and set on every migration.
+const LOGINS: [&str; 2] = ["spawn_supervisor", "spawn_reader"];
 
 impl PostgresStore {
     /// Connect to the database in the URL.
@@ -65,6 +72,7 @@ impl PostgresStore {
         let client = Client::connect(url, NoTls).map_err(|error| backend(&error))?;
         Ok(Self {
             client: Mutex::new(client),
+            password: url_password(url).to_string(),
         })
     }
 
@@ -100,34 +108,60 @@ impl PostgresStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Install or refresh the schema. Idempotent.
+    /// Install or refresh the schema, and set the logins' passwords.
+    /// Idempotent: every process of one install derives the same ones.
     pub fn migrate(&self) -> Result<(), StoreError> {
-        self.lock()
+        let mut client = self.lock();
+        client
             .batch_execute(SCHEMA)
-            .map_err(|error| backend(&error))
+            .map_err(|error| backend(&error))?;
+        for role in LOGINS {
+            // Hex only, so the literal needs no quoting beyond the quotes.
+            let password = role_password(&self.password, role);
+            client
+                .batch_execute(&format!(
+                    "alter role {role} with login password '{password}'"
+                ))
+                .map_err(|error| backend(&error))?;
+        }
+        Ok(())
     }
 }
 
-/// URL a terminal uses: the controller's URL with the restricted login.
-///
-/// The agent runs inside the terminal and reads its environment. Handing it
-/// the controller URL would let a candidate write the mission tables and
-/// move its own baseline past the gate, so the pane gets the login that can only
-/// append engine events.
-#[must_use]
-pub fn terminal_url(controller: &str) -> String {
-    role_url(controller, "spawn_terminal")
+/// The password part of a `scheme://user:password@host/...` URL, or "".
+fn url_password(url: &str) -> &str {
+    url.split_once("://")
+        .and_then(|(_, rest)| rest.rsplit_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .map_or("", |(_, password)| password)
 }
 
-/// The controller URL with its credentials replaced by one of the schema's
-/// fixed-password roles (`spawn_terminal`, `spawn_supervisor`). The boundary
-/// is the role's privileges, not the password.
-pub fn role_url(controller: &str, role: &str) -> String {
-    let Some((scheme, rest)) = controller.split_once("://") else {
-        return controller.to_string();
+/// The password of one restricted login: SHA-256 over the owner's password
+/// and the role name. Only a holder of the owner's credentials can form it,
+/// and nothing has to be stored to agree on it.
+fn role_password(owner_password: &str, role: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("spawn-login-v1\0{owner_password}\0{role}").as_bytes());
+    digest.iter().fold(String::new(), |mut hex, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+/// The owner's URL with its credentials replaced by one of the schema's
+/// restricted logins (`spawn_supervisor`, `spawn_reader`). The boundary is
+/// the login's privileges; its password keeps anyone who lacks the owner's
+/// credentials from using it, which matters once the database is reachable
+/// from elsewhere.
+#[must_use]
+pub fn role_url(owner: &str, role: &str) -> String {
+    let Some((scheme, rest)) = owner.split_once("://") else {
+        return owner.to_string();
     };
-    let host = rest.split_once('@').map_or(rest, |(_, tail)| tail);
-    format!("{scheme}://{role}:{role}@{host}")
+    let host = rest.rsplit_once('@').map_or(rest, |(_, tail)| tail);
+    let password = role_password(url_password(owner), role);
+    format!("{scheme}://{role}:{password}@{host}")
 }
 
 /// Statement parameters, as the driver takes them.

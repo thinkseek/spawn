@@ -48,6 +48,7 @@ struct Run {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+    stdout_bytes: Vec<u8>,
 }
 
 impl TmuxHost {
@@ -90,34 +91,7 @@ impl TmuxHost {
     }
 
     fn run(&self, prefix: &[String], arguments: &[String]) -> Result<Run, TerminalError> {
-        let words = self.words(arguments);
-        let mut command = match prefix.split_first() {
-            None => {
-                let mut command = Command::new(&words[0]);
-                command.args(&words[1..]);
-                command
-            }
-            Some((program, rest)) => {
-                let mut command = Command::new(program);
-                command.args(rest).arg(shell_join(&words));
-                command
-            }
-        };
-        // The first command starts the tmux server, whose global environment
-        // every pane can read with `tmux show-environment -g`. The
-        // controller's own database login must not end up there; panes get
-        // their restricted login through `-e` instead.
-        for secret in SCRUBBED {
-            command.env_remove(secret);
-        }
-        let output = command
-            .output()
-            .map_err(|error| TerminalError(format!("run {}: {error}", self.program)))?;
-        Ok(Run {
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })
+        run_words(prefix, &self.words(arguments))
     }
 
     /// Session target with exact-name matching.
@@ -134,6 +108,37 @@ impl TmuxHost {
     fn pane(terminal: &TerminalName) -> String {
         format!("={}:", terminal.as_str())
     }
+}
+
+/// Run `words`, inside the workspace when `prefix` is not empty.
+fn run_words(prefix: &[String], words: &[String]) -> Result<Run, TerminalError> {
+    let mut command = match prefix.split_first() {
+        None => {
+            let mut command = Command::new(&words[0]);
+            command.args(&words[1..]);
+            command
+        }
+        Some((program, rest)) => {
+            let mut command = Command::new(program);
+            command.args(rest).arg(shell_join(words));
+            command
+        }
+    };
+    // The first command starts the tmux server, whose global environment
+    // every pane can read with `tmux show-environment -g`. The
+    // controller's own database login must not end up there.
+    for secret in SCRUBBED {
+        command.env_remove(secret);
+    }
+    let output = command
+        .output()
+        .map_err(|error| TerminalError(format!("run {}: {error}", words[0])))?;
+    Ok(Run {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout_bytes: output.stdout,
+    })
 }
 
 impl TerminalHost for TmuxHost {
@@ -276,7 +281,10 @@ impl TerminalHost for TmuxHost {
         )?;
         match run.code {
             Some(0) => Ok(true),
-            Some(1) => Ok(false),
+            Some(1) if gone(&run.stderr) => Ok(false),
+            // Anything else (a socket we may not open, a failing container
+            // runtime) says nothing about the terminal: ending its execution
+            // on it would unmount a workspace an agent may still be using.
             other => Err(TerminalError(format!(
                 "has-session returned {other:?}: {}",
                 run.stderr.trim()
@@ -328,14 +336,66 @@ impl TerminalHost for TmuxHost {
         if run.code == Some(0) {
             return Ok(());
         }
-        let stderr = run.stderr.trim();
         // A terminal that is already gone is the desired end state.
-        if stderr.contains("can't find session")
-            || stderr.contains("no server running")
-            || stderr.contains("error connecting")
-        {
+        if gone(&run.stderr) {
             return Ok(());
         }
-        Err(TerminalError(format!("kill-session failed: {stderr}")))
+        Err(TerminalError(format!(
+            "kill-session failed: {}",
+            run.stderr.trim()
+        )))
     }
+
+    fn read_from(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        offset: u64,
+    ) -> Result<Option<Vec<u8>>, TerminalError> {
+        let prefix = self.prefix(workspace);
+        if prefix.is_empty() {
+            return read_local(path, offset);
+        }
+        // Inside the workspace's container: `tail -c +N` prints from byte N
+        // (1-based); a missing file exits 3 so it is told apart from failure.
+        let script = format!(
+            "test -f {path} || exit 3; tail -c +{} {path}",
+            offset.saturating_add(1),
+            path = spawn_core::shell::shell_quote(path)
+        );
+        let words = vec!["sh".to_string(), "-c".to_string(), script];
+        let run = run_words(&prefix, &words)?;
+        match run.code {
+            Some(0) => Ok(Some(run.stdout_bytes)),
+            Some(3) => Ok(None),
+            other => Err(TerminalError(format!(
+                "read {path} returned {other:?}: {}",
+                run.stderr.trim()
+            ))),
+        }
+    }
+}
+
+/// Whether tmux's error says the terminal does not exist: no such session,
+/// no server on the socket, or no socket at all. A socket that may not be
+/// opened is not among them.
+fn gone(stderr: &str) -> bool {
+    stderr.contains("can't find session")
+        || stderr.contains("no server running")
+        || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
+}
+
+/// Bytes of a local file from `offset`; `None` when it does not exist.
+fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(TerminalError(format!("open {path}: {error}"))),
+    };
+    let mut bytes = Vec::new();
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_to_end(&mut bytes))
+        .map_err(|error| TerminalError(format!("read {path}: {error}")))?;
+    Ok(Some(bytes))
 }

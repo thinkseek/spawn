@@ -193,12 +193,12 @@ begin
     return query select v_id, v_seq, v_at, true;
 end $$;
 
--- The entry point for every caller. The agent's terminal (`spawn_terminal`)
--- and the supervisor's (`spawn_supervisor`) own nothing and reach only this
--- function. They may write engine output, never the controller's own facts:
--- a forged `observation.recorded` would let an agent report a state it is not
--- in, and a forged `command.accepted` would confuse the queue's views.
--- `session_user` survives SECURITY DEFINER, so it names the real caller.
+-- The entry point for every caller of the owner's login. No restricted login
+-- writes events: engines report nothing themselves (the Bridge reads their
+-- transcripts, screens and exit files), so a pane holds no login that could
+-- forge a fact. The restricted logins are refused here as well as by the
+-- grants. `session_user` survives SECURITY DEFINER, so it names the real
+-- caller.
 create or replace function spawn_append(
     p_agent      text,
     p_session    text,
@@ -213,26 +213,8 @@ create or replace function spawn_append(
     out_inserted boolean
 ) language plpgsql security definer as $$
 begin
-    if session_user in ('spawn_terminal', 'spawn_supervisor') then
-        if p_source is distinct from 'claude' and p_source is distinct from 'codex' then
-            raise exception '% may not write source %', session_user, p_source
-                using errcode = '42501';
-        end if;
-        -- Engine output only, by name. The runner in the pane reports its own
-        -- exit (`execution.ended`, cause `exited`); any other end, and every
-        -- controller fact, belongs to the Bridge, the Observer or the gateway.
-        -- An unknown name is refused too: one undecodable row would stop
-        -- every reader of the closed EventKind.
-        if (p_kind ->> 'name') is null or (p_kind ->> 'name') not in (
-                'session.native_started', 'session.native_ended', 'message.received',
-                'notification.received', 'tool.started', 'tool.completed', 'tool.failed',
-                'turn.stopped', 'turn.failed', 'execution.ended')
-            or ((p_kind ->> 'name') = 'execution.ended'
-                and (p_kind -> 'detail' ->> 'cause') is distinct from 'exited')
-        then
-            raise exception '% may not write %', session_user, coalesce(p_kind ->> 'name', 'an unnamed event')
-                using errcode = '42501';
-        end if;
+    if session_user in ('spawn_terminal', 'spawn_supervisor', 'spawn_reader') then
+        raise exception '% may not write events', session_user using errcode = '42501';
     end if;
     return query
         select * from spawn_append_trusted(p_agent, p_session, p_execution, p_source, p_source_key, p_kind);
@@ -723,106 +705,38 @@ drop function if exists spawn_read_task_events(text);
 drop function if exists spawn_read_lineage(text);
 drop function if exists spawn_read_open_tools(text);
 
--- RSI controller state.
---
--- These tables are not events: EventKind is a closed serde enum, and an
--- unknown event name makes the next tick fail with a corrupt row. The
--- controller therefore keeps its own state here and never writes rsi.* to
--- spawn_events.
-create table if not exists rsi_state (
-    id                   integer primary key check (id = 1),
-    baseline_commit      text   not null,
-    iteration            integer not null default 0,
-    consecutive_rejected integer not null default 0
-);
+-- The retired RSI controller's tables; its history is in the control stream.
+drop table if exists rsi_attempts, rsi_iterations, rsi_state;
 
--- One iteration of the loop. `phase` drives the controller.
-create table if not exists rsi_iterations (
-    iteration     integer primary key,
-    task_id       integer not null,
-    phase         text    not null,
-    agent_id      text    not null,
-    session_id    text    not null,
-    command_id    bigint,
-    patch         text,
-    candidate     text,
-    note          text,
-    updated_at_ms bigint  not null
-);
-
-create index if not exists rsi_iterations_phase on rsi_iterations (phase);
-
--- `started_at_ms` bounds the wall clock and the tool-call count of one
--- iteration. `updated_at_ms` moves on every phase change, so it cannot.
--- `scenario_count` is the floor the next round must not fall below.
-alter table rsi_iterations add column if not exists started_at_ms bigint not null default 0;
-
--- The accepted gate output, stored before `main` moves, so a controller that
--- stops between the git step and the database step lands without judging
--- again.
-alter table rsi_iterations add column if not exists verdict_log text;
-alter table rsi_state add column if not exists scenario_count integer not null default 0;
-
--- Aborts in a row toward the infrastructure halt. A candidate is never judged
--- in an aborted iteration, so these cannot count as rejections: a dead agent
--- would otherwise mark a good patch as rejected and feed it back as a failure.
-alter table rsi_state add column if not exists infra_failures integer not null default 0;
-
--- Every attempt at a task, successful or not. The controller feeds the
--- failures back into the next prompt.
-create table if not exists rsi_attempts (
-    task_id       integer not null,
-    attempt       integer not null,
-    iteration     integer not null,
-    diff          text,
-    gate_log      text,
-    classifier    text,
-    accept_ok     boolean,
-    created_at_ms bigint  not null,
-    primary key (task_id, attempt)
-);
-
--- The agent's terminal connects with this login. It owns nothing and can
--- only execute `spawn_append`, so an RSI candidate that reaches the database
--- cannot write `rsi_state`, the projections, or the controller's own events.
--- The password is not a secret from the agent: the boundary is the
--- privileges, not the credential.
--- ponytail: fixed password; rotate it when the database is reachable beyond
--- localhost.
+-- The login engine terminals used to append their own events. Nothing uses
+-- it any more; an existing one may no longer log in or call anything here.
 do $$
 begin
-    if not exists (select 1 from pg_roles where rolname = 'spawn_terminal') then
-        create role spawn_terminal login password 'spawn_terminal';
+    if exists (select 1 from pg_roles where rolname = 'spawn_terminal') then
+        alter role spawn_terminal nologin;
+        execute format('revoke all on schema %I from spawn_terminal', current_schema());
+        revoke execute on function spawn_append(text, text, text, text, text, jsonb) from spawn_terminal;
     end if;
 end
 $$;
 
-do $$
-begin
-    execute format('grant connect on database %I to spawn_terminal', current_database());
-    execute format('grant usage on schema %I to spawn_terminal', current_schema());
-end
-$$;
-
-grant execute on function spawn_append(text, text, text, text, text, jsonb) to spawn_terminal;
-
--- The supervisor's terminal connects with this login. Like `spawn_terminal`
--- it appends only engine output for its hooks. It also reads the whole fleet
--- through the `spawn_read_*` functions and submits commands through the
--- `agent_commands` gateway, which records `spawn_supervisor` as the principal
--- and allows only agents named `agent_worker_*`. It cannot claim or finish
--- commands, write observations or runtime events, or touch `rsi_*`.
+-- The supervisor's terminal connects with this login. It reads the fleet
+-- and submits commands through the `agent_commands` gateway, which records
+-- `spawn_supervisor` as the principal and allows only the agents its grants
+-- name; it decides missions through the checked mission functions. It
+-- writes no events, claims or finishes no commands. Its password is set by
+-- every migration, derived from the owner's (PostgresStore::migrate).
 do $$
 begin
     if not exists (select 1 from pg_roles where rolname = 'spawn_supervisor') then
-        create role spawn_supervisor login password 'spawn_supervisor';
+        create role spawn_supervisor login;
     end if;
     execute format('grant connect on database %I to spawn_supervisor', current_database());
     execute format('grant usage on schema %I to spawn_supervisor', current_schema());
 end
 $$;
 
-grant execute on function spawn_append(text, text, text, text, text, jsonb) to spawn_supervisor;
+revoke execute on function spawn_append(text, text, text, text, text, jsonb) from spawn_supervisor;
 
 insert into spawn_grants (principal, agent_id, scope) values
     ('spawn_supervisor', '*', 'read'),
@@ -1503,12 +1417,12 @@ insert into spawn_grants (principal, agent_id, scope) values
 on conflict (principal, agent_id) do nothing;
 
 -- `spawn serve` connects with this login. It reads every table and writes
--- nothing, so the dashboard on the LAN cannot change the log, the queue or
--- the RSI state even if it is tricked into running a query.
+-- nothing, so the dashboard cannot change the log or the queue even if it is
+-- tricked into running a query. Its password is set like the supervisor's.
 do $$
 begin
     if not exists (select 1 from pg_roles where rolname = 'spawn_reader') then
-        create role spawn_reader login password 'spawn_reader';
+        create role spawn_reader login;
     end if;
     execute format('grant connect on database %I to spawn_reader', current_database());
     execute format('grant usage on schema %I to spawn_reader', current_schema());

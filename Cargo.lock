@@ -596,6 +596,7 @@ dependencies = [
  "postgres",
  "serde",
  "serde_json",
+ "sha2",
  "spawn-core",
 ]
 

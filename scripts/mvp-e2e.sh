@@ -45,8 +45,12 @@ case "$base_url" in
 esac
 
 # Reads go through the supervisor's login: the fleet readers are filtered by
-# grants, and the owner holds none.
-sup_url=$(printf '%s' "$url" | sed -E 's#://[^@]*@#://spawn_supervisor:spawn_supervisor@#')
+# grants, and the owner holds none. Its password is derived from the owner's
+# as spawn-postgres does it (role_password): SHA-256 of
+# "spawn-login-v1\0<owner password>\0<role>", in hex.
+owner_password=$(printf '%s' "$url" | sed -E 's#^[a-z]+://[^:@]*:([^@]*)@.*#\1#')
+sup_password=$(printf 'spawn-login-v1\0%s\0spawn_supervisor' "$owner_password" | sha256sum | cut -d' ' -f1)
+sup_url=$(printf '%s' "$url" | sed -E "s#://[^@]*@#://spawn_supervisor:$sup_password@#")
 
 cleanup() {
   [ -n "$loop_pid" ] && kill "$loop_pid" 2>/dev/null || true
@@ -88,7 +92,8 @@ git -C "$seed" push -q "$repo" main:main
 mkdir -p "$work/ws"
 
 # --- scripted engine ------------------------------------------------------
-# Draws a prompt, reports Claude Code hooks through `spawn hook`, and acts on
+# Draws a prompt, writes a Claude Code session transcript where the real
+# engine does (the Bridge reads it; nothing reports to Spawn), and acts on
 # tokens in typed lines:
 #   E2E:WORK   one tool call, then "DONE", then stop
 #   E2E:STALL  stop partway ("STALLED"); a later "continue" finishes it
@@ -100,44 +105,53 @@ cat >"$work/claude" <<'ENGINE'
 #!/usr/bin/env bash
 log=$E2E_WORK/argv.log
 printf '%s %s\n' "$SPAWN_SESSION_ID" "$*" >>"$log"
-native="native-$SPAWN_EXECUTION_ID"
+native=
 while [ $# -gt 0 ]; do
-  [ "$1" = "--resume" ] && native=$2
+  case "$1" in --resume | --session-id) native=$2 ;; esac
   shift
 done
-hook() { printf '%s' "$1" | "$E2E_SPAWN" hook >/dev/null 2>&1 || true; }
-hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$native\"}"
+dir=$SPAWN_CLAUDE_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+mkdir -p "$dir"
+transcript=$dir/$native.jsonl
+c=0
+line() {
+  c=$((c + 1))
+  printf '{"uuid":"%s-%s","timestamp":"%s","sessionId":"%s",%s}\n' \
+    "$SPAWN_EXECUTION_ID" "$c" "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$native" "$1" >>"$transcript"
+}
+prompt() { line '"type":"user","message":{"role":"user","content":"prompt"}'; }
 n=0
 tool() {
   n=$((n + 1))
-  hook "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"$native\",\"tool_name\":\"Bash\",\"tool_use_id\":\"t$n-$SPAWN_EXECUTION_ID\"}"
+  id=t$n-$SPAWN_EXECUTION_ID
+  line "\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"$id\",\"name\":\"Bash\",\"input\":{}}]}"
   sleep "${1:-0.3}"
-  hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$native\",\"tool_use_id\":\"t$n-$SPAWN_EXECUTION_ID\"}"
+  line "\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$id\",\"content\":\"ok\"}]}"
 }
-stop() { hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$native\"}"; printf '\n❯ '; }
+stop() { line '"type":"system","subtype":"turn_duration","durationMs":1'; printf '\n❯ '; }
 printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
   if IFS= read -r -t 1 line; then
     case "$line" in
     *E2E:WORK*)
-      hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
+      prompt
       printf '\nworking...\n'
       tool "${E2E_TOOL_SECONDS:-0.3}"
       printf 'DONE: work finished\n'
       stop; pending=0 ;;
     *E2E:STALL*)
-      hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
+      prompt
       tool
       printf 'STALLED: halfway through, stopping here\n'
       stop; pending=0 ;;
     continue)
-      hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
+      prompt
       tool
       printf 'DONE: finished after continue\n'
       stop; pending=0 ;;
     *E2E:REPORT*)
-      hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
+      prompt
       tool
       mkdir -p .spawn
       case "$line" in
@@ -147,12 +161,12 @@ while :; do
       printf 'DONE: reported\n'
       stop; pending=0 ;;
     *E2E:ASK*)
-      hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
+      prompt
       printf 'HUMAN: which region should I deploy to?\n'
       stop; pending=0 ;;
     *)
       if [ "$pending" = 0 ]; then
-        hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
+        prompt
       fi
       pending=1 ;;
     esac
@@ -213,7 +227,7 @@ start_jev() {
 }
 
 # --- environment ------------------------------------------------------------
-export E2E_WORK=$work E2E_SPAWN=$bin
+export E2E_WORK=$work E2E_SPAWN=$bin SPAWN_CLAUDE_PROJECTS=$work/claude-projects
 export SPAWN_DATABASE_URL=$url
 export SPAWN_GIT_REPO=$repo SPAWN_WORKSPACE_ROOT=$work/ws
 export SPAWN_CLAUDE_PROGRAM=$work/claude SPAWN_PROGRAM=$bin

@@ -9,8 +9,6 @@ use std::path::PathBuf;
 
 use spawn_postgres::PostgresStore;
 
-use crate::trace;
-
 pub(crate) fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
@@ -25,7 +23,7 @@ pub(crate) fn required_env(name: &str) -> Result<String, String> {
 
 pub(crate) fn open_store() -> Result<PostgresStore, String> {
     let url = required_env("SPAWN_DATABASE_URL")?;
-    trace::time("pg.connect", || PostgresStore::connect(&url)).map_err(|error| error.to_string())
+    PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 
 /// Whether this host runs the supervisor (`SPAWN_SUPERVISOR` is set).
@@ -55,12 +53,14 @@ fn resolve_workspace_root(flag: Option<String>, environment: Option<String>) -> 
     flag.or(environment)
 }
 
-/// Pause between loop passes: `SPAWN_LOOP_INTERVAL_MS`, 2000 by default.
+/// Pause between loop passes: `SPAWN_LOOP_INTERVAL_MS`, 500 by default.
+/// Each pass reads every live engine's transcript and screen, so a short
+/// pause is how quickly the fleet notices anything; the cost is a few reads.
 pub(crate) fn loop_interval() -> std::time::Duration {
     std::time::Duration::from_millis(
         env_value("SPAWN_LOOP_INTERVAL_MS")
             .and_then(|text| text.parse().ok())
-            .unwrap_or(2000),
+            .unwrap_or(500),
     )
 }
 
@@ -142,4 +142,22 @@ impl Flags {
         self.get(name)
             .ok_or_else(|| format!("--{name} is required"))
     }
+}
+
+/// The terminal host the environment describes: tmux on this machine, or
+/// inside each workspace's container when `SPAWN_EXEC_IMAGE` is set.
+pub(crate) fn terminal_host() -> spawn_host::TmuxHost {
+    use spawn_core::id::WorkspaceId;
+    let program = env_or("SPAWN_TMUX_PROGRAM", "tmux");
+    let socket = env_value("SPAWN_TMUX_SOCKET");
+    let prefix: std::sync::Arc<spawn_host::PrefixBuilder> = match env_value("SPAWN_EXEC_IMAGE") {
+        Some(_) => {
+            let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
+            std::sync::Arc::new(move |workspace: &WorkspaceId| {
+                spawn_host::docker_prefix(&docker, workspace.sandbox())
+            })
+        }
+        None => std::sync::Arc::new(|_: &WorkspaceId| Vec::new()),
+    };
+    spawn_host::TmuxHost::in_workspaces(&program, prefix, socket)
 }

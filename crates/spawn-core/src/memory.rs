@@ -60,6 +60,7 @@ struct State {
     commits: u64,
     terminals: HashSet<TerminalName>,
     panes: HashMap<TerminalName, String>,
+    files: HashMap<String, Vec<u8>>,
 }
 
 impl State {
@@ -115,6 +116,16 @@ impl MemoryStore {
     /// Replace the visible pane of a terminal. Test helper.
     pub fn set_pane(&self, terminal: &TerminalName, pane: &str) {
         self.lock().panes.insert(terminal.clone(), pane.to_string());
+    }
+
+    /// Append to a file the terminal host can read, as an engine would.
+    /// Test helper.
+    pub fn append_file(&self, path: &str, bytes: &str) {
+        self.lock()
+            .files
+            .entry(path.to_string())
+            .or_default()
+            .extend_from_slice(bytes.as_bytes());
     }
 
     /// Mark a workspace as holding uncommitted changes. Test helper.
@@ -414,6 +425,21 @@ impl TerminalHost for MemoryStore {
         let all: Vec<&str> = pane.lines().collect();
         let start = all.len().saturating_sub(lines);
         Ok(all[start..].join("\n"))
+    }
+
+    fn read_from(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        offset: u64,
+    ) -> Result<Option<Vec<u8>>, TerminalError> {
+        let state = self.lock();
+        Ok(state.files.get(path).map(|bytes| {
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            bytes[start..].to_vec()
+        }))
     }
 
     fn terminate(

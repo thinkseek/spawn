@@ -6,7 +6,7 @@ use spawn_core::port::CommandQueue;
 
 use crate::Flags;
 use crate::config::{env_value, open_store, spawn_program, supervised, workspace_root};
-use crate::{dispatch, trace};
+use crate::dispatch;
 
 /// `spawn submit`: write one command to the queue.
 pub(crate) fn submit(flags: &Flags) -> Result<i32, String> {
@@ -31,9 +31,9 @@ pub(crate) fn submit(flags: &Flags) -> Result<i32, String> {
     // A restricted login (the supervisor's terminal) submits through the
     // gateway, which takes the principal from the login and checks grants.
     let id = if env_value("SPAWN_GATEWAY").is_some() {
-        trace::time("queue.submit", || store.submit_via_gateway(&submission))
+        store.submit_via_gateway(&submission)
     } else {
-        trace::time("queue.submit", || store.submit(&principal, &submission))
+        store.submit(&principal, &submission)
     }
     .map_err(|error| error.to_string())?;
     println!("command={}", id.0);

@@ -14,7 +14,6 @@ use tiny_http::{Header, Request, Response, Server};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalHost;
-use spawn_host::{TmuxHost, docker_prefix};
 
 use crate::objectives::{Landing, Task, landed_value, load_backlog, metric_lines};
 use crate::{Flags, env_or, env_value};
@@ -508,25 +507,7 @@ fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let terminal = TerminalName::for_execution(&execution.execution_id);
     let root = env_or("SPAWN_WORKSPACE_ROOT", "/tmp");
     let workspace = WorkspaceId::new(format!("{agent}:{root}/{agent}")).map_err(err)?;
-    let program = env_or("SPAWN_TMUX_PROGRAM", "tmux");
-    let socket = env_value("SPAWN_TMUX_SOCKET");
-    let host = match env_value("SPAWN_EXEC_IMAGE") {
-        Some(_) => {
-            let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
-            TmuxHost::in_workspaces(
-                &program,
-                std::sync::Arc::new(move |workspace: &WorkspaceId| {
-                    docker_prefix(&docker, workspace.sandbox())
-                }),
-                socket,
-            )
-        }
-        None => TmuxHost::in_workspaces(
-            &program,
-            std::sync::Arc::new(|_: &WorkspaceId| Vec::new()),
-            socket,
-        ),
-    };
+    let host = crate::config::terminal_host();
     let text = if live {
         host.capture_tail(&terminal, &workspace, PANE_LINES)
             .unwrap_or_default()

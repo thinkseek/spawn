@@ -21,12 +21,17 @@ use crate::event::{
     NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
+use crate::ingest::{claude_line, codex_line};
 use crate::port::{
     CommandQueue, Commit, EventLog, Launch, StoreError, TerminalHost, WorkspaceError,
     WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
-use crate::shell::shell_quote;
+use crate::time::{Clock, SystemClock};
+
+/// Transcript lines this much older than the execution's start are still
+/// read as its own.
+const CLOCK_SLACK_MS: i64 = 60_000;
 
 /// Engine choice and prompt of one launch.
 ///
@@ -34,13 +39,15 @@ use crate::shell::shell_quote;
 struct Run<'a> {
     engine: Engine,
     native: Option<&'a str>,
+    /// `native` names an earlier session to resume, not a new one.
+    resume: bool,
     prompt: &'a str,
 }
 
 /// Bridge settings.
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
-    /// Absolute path of the `spawn` binary, used for hooks and for the runner.
+    /// Absolute path of the `spawn` binary, which runs the engine (`spawn run`).
     pub spawn_program: String,
     /// Claude Code executable.
     pub claude_program: String,
@@ -62,6 +69,12 @@ pub struct BridgeConfig {
     pub ready_attempts: usize,
     /// Delay between ready attempts.
     pub ready_interval: Duration,
+    /// Where Claude Code writes session transcripts (its `projects`
+    /// directory), as the terminal host sees it.
+    pub claude_projects: String,
+    /// A busy screen is recorded again this often while it stays busy, so
+    /// the Observer keeps a current fact for a long turn.
+    pub screen_refresh: Duration,
 }
 
 impl BridgeConfig {
@@ -78,6 +91,8 @@ impl BridgeConfig {
             max_commands_per_tick: 16,
             ready_attempts: 40,
             ready_interval: Duration::from_millis(250),
+            claude_projects: "/root/.claude/projects".to_string(),
+            screen_refresh: Duration::from_secs(30),
         }
     }
 }
@@ -96,6 +111,31 @@ struct Active {
     checkpoint: Option<CheckpointReason>,
     /// The runner reported the engine exit; cleanup is still due.
     reported_end: Option<(EndCause, Option<i32>)>,
+    /// When the execution started: transcript lines before it belong to
+    /// earlier executions of the session.
+    started_ms: i64,
+    /// What the Bridge has read of the engine's files and screen.
+    follow: Follow,
+}
+
+/// The Bridge's own view of a running engine, rebuilt after a restart: read
+/// positions start at zero (event keys make a second read a no-op), and the
+/// last recorded screen is folded from the log.
+#[derive(Debug, Clone, Default)]
+struct Follow {
+    /// Bytes of the transcript (Claude) or output copy (Codex) read so far.
+    offset: u64,
+    /// Codex output lines read so far, which key their events.
+    lines: u64,
+    /// The last screen state recorded, and when.
+    screen: Option<(ScreenState, i64)>,
+    /// A state read once and not recorded yet: a screen is recorded when
+    /// two readings in a row agree, so a frame mid-redraw is not a fact.
+    seen: Option<ScreenState>,
+    /// When this Bridge first followed the execution, by its own clock.
+    first_seen: Option<i64>,
+    /// The engine's file is missing after the start grace; warned once.
+    warned: bool,
 }
 
 /// What the Bridge knows about one session.
@@ -124,6 +164,7 @@ pub struct Bridge {
     config: BridgeConfig,
     cursor: GlobalPosition,
     sessions: HashMap<SessionId, SessionView>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Bridge {
@@ -143,7 +184,15 @@ impl Bridge {
             config,
             cursor: GlobalPosition(0),
             sessions: HashMap::new(),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Use `clock` for screen refreshes instead of the system clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Sessions the Bridge tracks.
@@ -231,7 +280,18 @@ impl Bridge {
                         engine: *engine,
                         checkpoint: None,
                         reported_end: None,
+                        started_ms: record.recorded_at.0,
+                        follow: Follow::default(),
                     });
+                }
+            }
+            // After a restart, the last recorded screen. The Bridge's own
+            // readings keep its own clock, which the refresh is timed by.
+            EventKind::ScreenObserved { state, .. } if current => {
+                if let Some(active) = view.active.as_mut()
+                    && active.follow.screen.map(|(known, _)| known) != Some(*state)
+                {
+                    active.follow.screen = Some((*state, record.recorded_at.0));
                 }
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
@@ -265,40 +325,49 @@ impl Bridge {
     }
 
     fn act(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
-        let running: Vec<(SessionId, AgentId, Active)> = self
+        let running: Vec<(SessionId, AgentId, Option<String>, Active)> = self
             .sessions
             .iter()
             .filter_map(|(session, view)| {
                 let active = view.active.clone()?;
-                Some((session.clone(), view.agent_id.clone(), active))
+                let native = view.native.as_ref().map(|(_, id)| id.clone());
+                Some((session.clone(), view.agent_id.clone(), native, active))
             })
             .collect();
-        for (session, agent_id, active) in running {
-            let ended = self.advance(&agent_id, &session, &active, report)?;
+        for (session, agent_id, native, mut active) in running {
+            let ended =
+                self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
             if let Some(view) = self.sessions.get_mut(&session) {
                 if ended {
                     view.active = None;
                 } else if let Some(held) = view.active.as_mut() {
                     held.checkpoint = None;
+                    held.follow = active.follow;
                 }
             }
         }
         Ok(())
     }
 
-    /// Commit a pending checkpoint, or end an execution whose process is
-    /// gone. Returns whether the execution ended.
+    /// Record what the engine did since the last tick, commit a pending
+    /// checkpoint, or end an execution whose process is gone. Returns
+    /// whether the execution ended.
     fn advance(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
-        active: &Active,
+        native: Option<&str>,
+        active: &mut Active,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
-        let end = match active.reported_end {
+        self.follow_output(agent_id, session, native, active, report)?;
+        let end = match active.reported_end.or_else(|| self.exit_status(active)) {
             Some(end) => Some(end),
             None => match self.terminals.is_alive(&active.terminal, &active.workspace) {
-                Ok(true) => None,
+                Ok(true) => {
+                    self.follow_screen(agent_id, session, active)?;
+                    None
+                }
                 Ok(false) => Some((EndCause::Lost, None)),
                 Err(error) => {
                     report
@@ -309,12 +378,157 @@ impl Bridge {
             },
         };
         if let Some((cause, exit_code)) = end {
+            // What the engine wrote last comes before its end.
+            self.follow_output(agent_id, session, native, active, report)?;
             return self.end(agent_id, session, active, cause, exit_code, report);
         }
         if let Some(reason) = active.checkpoint {
             self.checkpoint(agent_id, session, active, reason, report)?;
         }
         Ok(false)
+    }
+
+    /// The exit status the runner wrote when the engine exited, if it has.
+    fn exit_status(&self, active: &Active) -> Option<(EndCause, Option<i32>)> {
+        let bytes = self
+            .terminals
+            .read_from(&active.workspace, &exit_file(active), 0)
+            .ok()??;
+        let text = String::from_utf8_lossy(&bytes);
+        Some((EndCause::Exited, text.trim().parse().ok()))
+    }
+
+    /// Append the events in what the engine wrote since the last read: the
+    /// Claude transcript, or the runner's copy of the Codex output. Only
+    /// whole lines are read; a line being written waits for the next tick.
+    fn follow_output(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        native: Option<&str>,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) -> Result<(), StoreError> {
+        let path = match active.engine {
+            Engine::Claude => match native {
+                Some(native) => {
+                    transcript_path(&self.config.claude_projects, &active.workspace, native)
+                }
+                None => return Ok(()),
+            },
+            Engine::Codex => codex_output(active),
+        };
+        let bytes = match self
+            .terminals
+            .read_from(&active.workspace, &path, active.follow.offset)
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                let now = self.clock.now().0;
+                let since = *active.follow.first_seen.get_or_insert(now);
+                let grace = now.saturating_sub(since) > 60_000;
+                if grace && !active.follow.warned {
+                    active.follow.warned = true;
+                    report
+                        .warnings
+                        .push(format!("{session}: no engine output at {path}"));
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                report.warnings.push(format!("read {path}: {error}"));
+                return Ok(());
+            }
+        };
+        let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(());
+        };
+        for line in bytes[..end].split(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(line);
+            let events = match active.engine {
+                // A minute of slack for a log clock ahead of this host's:
+                // lines already recorded are dropped by their keys anyway.
+                Engine::Claude => claude_line(&line, active.started_ms - CLOCK_SLACK_MS)
+                    .into_iter()
+                    .map(|event| (event.source_event_id, event.kind))
+                    .collect(),
+                Engine::Codex => {
+                    active.follow.lines += 1;
+                    let key = format!("{}:codex:{}", active.execution_id, active.follow.lines);
+                    codex_line(&line)
+                        .map(|kind| (Some(key), kind))
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                }
+            };
+            let source = match active.engine {
+                Engine::Claude => Source::Claude,
+                Engine::Codex => Source::Codex,
+            };
+            for (key, kind) in events {
+                self.append(
+                    agent_id,
+                    session,
+                    Some(&active.execution_id),
+                    source,
+                    key,
+                    kind,
+                )?;
+            }
+        }
+        active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
+        Ok(())
+    }
+
+    /// Read the pane and record its state when it changes, or again after
+    /// [`BridgeConfig::screen_refresh`] while a turn keeps it busy. Only a
+    /// Claude pane has a layout the Bridge knows.
+    fn follow_screen(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &mut Active,
+    ) -> Result<(), StoreError> {
+        if active.engine != Engine::Claude {
+            return Ok(());
+        }
+        let Ok(pane) = self
+            .terminals
+            .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+        else {
+            return Ok(());
+        };
+        let reading = read_claude_screen(&pane);
+        let confirmed = active.follow.seen == Some(reading.state);
+        active.follow.seen = Some(reading.state);
+        if !confirmed || reading.state == ScreenState::Unknown {
+            return Ok(());
+        }
+        let now = self.clock.now().0;
+        let due = match active.follow.screen {
+            None => true,
+            Some((state, _)) if state != reading.state => true,
+            Some((state, at)) => {
+                state == ScreenState::Busy
+                    && now.saturating_sub(at)
+                        >= i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX)
+            }
+        };
+        if due {
+            active.follow.screen = Some((reading.state, now));
+            self.append(
+                agent_id,
+                session,
+                Some(&active.execution_id),
+                Source::Bridge,
+                None,
+                EventKind::ScreenObserved {
+                    state: reading.state,
+                    evidence: reading.evidence,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Final checkpoint, kill, unmount, then `execution.ended`. Returns
@@ -483,6 +697,8 @@ impl Bridge {
             engine,
             checkpoint: None,
             reported_end: None,
+            started_ms: self.clock.now().0,
+            follow: Follow::default(),
         };
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
@@ -499,12 +715,14 @@ impl Bridge {
                 command_id: claimed.command_id,
             },
         )?;
+        let fresh = self.name_session(claimed, engine, native, &active)?;
         let launch = self.launch(
             claimed,
             &active,
             &Run {
                 engine,
-                native,
+                native: fresh.as_deref().or(native),
+                resume: native.is_some(),
                 prompt,
             },
         );
@@ -545,10 +763,45 @@ impl Bridge {
         Ok(Outcome::Succeeded)
     }
 
+    /// A new Claude session gets its id from the Bridge, recorded before the
+    /// engine starts, so the transcript it will write is known. Returns the
+    /// id, or `None` when the engine names its own session or one is resumed.
+    fn name_session(
+        &mut self,
+        claimed: &Claimed,
+        engine: Engine,
+        native: Option<&str>,
+        active: &Active,
+    ) -> Result<Option<String>, StoreError> {
+        if engine != Engine::Claude || native.is_some() {
+            return Ok(None);
+        }
+        let id = claude_session_id(&active.execution_id);
+        self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:native", active.execution_id)),
+            EventKind::NativeSessionStarted {
+                engine,
+                native_session_id: id.clone(),
+                transcript_path: Some(transcript_path(
+                    &self.config.claude_projects,
+                    &active.workspace,
+                    &id,
+                )),
+            },
+        )?;
+        self.catch_up()?;
+        Ok(Some(id))
+    }
+
     fn launch(&self, claimed: &Claimed, active: &Active, run: &Run<'_>) -> Launch {
         let Run {
             engine,
             native,
+            resume,
             prompt,
         } = *run;
         let mut arguments = vec!["run".to_string(), "--".to_string()];
@@ -557,8 +810,8 @@ impl Bridge {
             Engine::Codex => self.config.codex_program.clone(),
         });
         arguments.extend(match engine {
-            Engine::Claude => claude_arguments(&self.config.spawn_program, native),
-            Engine::Codex => codex_arguments(native, prompt),
+            Engine::Claude => claude_arguments(native, resume),
+            Engine::Codex => codex_arguments(native.filter(|_| resume), prompt),
         });
         let mut environment = self.config.environment.clone();
         for (session, overrides) in &self.config.session_environment {
@@ -580,6 +833,12 @@ impl Bridge {
             active.execution_id.to_string(),
         ));
         environment.push(("SPAWN_ENGINE".to_string(), engine.as_str().to_string()));
+        // The runner writes the exit status, and a copy of Codex output,
+        // where the Bridge reads them: the pane needs no login of its own.
+        environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file(active)));
+        if engine == Engine::Codex {
+            environment.push(("SPAWN_ENGINE_OUTPUT".to_string(), codex_output(active)));
+        }
         Launch {
             terminal: active.terminal.clone(),
             workspace: active.workspace.clone(),
@@ -742,57 +1001,95 @@ impl Bridge {
     }
 }
 
-/// Hook settings passed to Claude Code.
+/// Settings passed to Claude Code.
 ///
 /// `--settings` takes inline JSON, and that JSON replaces the user's settings
 /// file for the session. The permission keys must therefore be repeated here:
 /// without them the engine stops on a startup dialog and never reads the
-/// prompt the Bridge types into the pane.
-///
-/// The hook command is an absolute path, so a `PATH` change inside the sandbox
-/// cannot break event capture.
-pub fn claude_settings(spawn_program: &str) -> String {
-    let command = format!("{} hook", shell_quote(spawn_program));
-    let entry = json!([{ "hooks": [{ "type": "command", "command": command }] }]);
-    let events: [&str; 7] = [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "Notification",
-        "Stop",
-        "SessionEnd",
-    ];
-    let mut hooks = serde_json::Map::new();
-    for event in events {
-        hooks.insert(event.to_string(), entry.clone());
-    }
-    // `--settings` replaces the user settings file for this session, so the
-    // first-run prompts have to be silenced here. A prompt in the pane blocks
-    // the Bridge, which types the task prompt next and never answers it.
+/// prompt the Bridge types into the pane. No hooks: the Bridge reads what
+/// the engine does from its transcript and its screen.
+pub fn claude_settings() -> String {
     json!({
         "permissions": { "defaultMode": "bypassPermissions" },
         "skipDangerousModePermissionPrompt": true,
-        "hooks": hooks,
     })
     .to_string()
 }
 
-/// Claude arguments. The prompt is typed into the pane, never passed here.
-pub fn claude_arguments(spawn_program: &str, native: Option<&str>) -> Vec<String> {
+/// Claude arguments for the session `native`: a new one with that id, or
+/// the earlier one resumed. The prompt is typed into the pane, never
+/// passed here.
+pub fn claude_arguments(native: Option<&str>, resume: bool) -> Vec<String> {
     // The engine runs in a container with no credentials of its own, so the
     // permission prompts have nowhere to go. The sandbox is the boundary.
     let mut arguments = vec![
         "--ax-screen-reader".to_string(),
         "--allow-dangerously-skip-permissions".to_string(),
         "--settings".to_string(),
-        claude_settings(spawn_program),
+        claude_settings(),
     ];
     if let Some(native) = native {
-        arguments.push("--resume".to_string());
+        arguments.push(if resume { "--resume" } else { "--session-id" }.to_string());
         arguments.push(native.to_string());
     }
     arguments
+}
+
+/// The id of the Claude session a new execution starts: a UUID derived from
+/// the execution, so the Bridge knows the transcript before the engine runs.
+pub fn claude_session_id(execution: &ExecutionId) -> String {
+    let hash = |seed: u64| {
+        execution.as_str().bytes().fold(seed, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+    };
+    let (high, low) = (hash(0xcbf2_9ce4_8422_2325), hash(0x8422_2325_cbf2_9ce4));
+    // Version 4 and the RFC 4122 variant, so the engine accepts it.
+    let high = (high & !0xf000) | 0x4000;
+    let low = (low & !(0b11 << 62)) | (0b10 << 62);
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        high >> 32,
+        (high >> 16) & 0xffff,
+        high & 0xffff,
+        low >> 48,
+        low & 0xffff_ffff_ffff
+    )
+}
+
+/// Where Claude Code writes the transcript of `native` for an engine started
+/// in `workspace`: its projects directory, one directory per working
+/// directory with every character but ASCII letters and digits replaced by
+/// `-`, one file per session.
+pub fn transcript_path(projects: &str, workspace: &WorkspaceId, native: &str) -> String {
+    let directory: String = workspace
+        .path()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!(
+        "{}/{directory}/{native}.jsonl",
+        projects.trim_end_matches('/')
+    )
+}
+
+/// Where the runner writes the engine's exit status. `.spawn/` is never
+/// committed.
+fn exit_file(active: &Active) -> String {
+    format!(
+        "{}/.spawn/exit-{}",
+        active.workspace.path(),
+        active.execution_id
+    )
+}
+
+/// Where the runner copies Codex's `exec --json` output.
+fn codex_output(active: &Active) -> String {
+    format!(
+        "{}/.spawn/codex-{}.jsonl",
+        active.workspace.path(),
+        active.execution_id
+    )
 }
 
 /// Codex arguments. `exec --json` prints one JSON object per line.
