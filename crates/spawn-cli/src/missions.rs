@@ -268,3 +268,31 @@ pub(crate) fn resident(rest: &[String]) -> Result<i32, String> {
     print(&json!({ "resident": name, verb: true }));
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use spawn_core::event::ModelProfile;
+
+    use super::model;
+    use crate::Flags;
+
+    fn flags(words: &[&str]) -> Flags {
+        let words: Vec<String> = words.iter().map(ToString::to_string).collect();
+        Flags::parse(&words).expect("valid flags")
+    }
+
+    #[test]
+    fn a_task_runs_on_the_default_profile_unless_model_names_another() {
+        assert_eq!(model(&flags(&[])), Ok(ModelProfile::Default));
+        assert_eq!(
+            model(&flags(&["--model", "cheap"])),
+            Ok(ModelProfile::Cheap)
+        );
+        assert_eq!(
+            model(&flags(&["--model", "default"])),
+            Ok(ModelProfile::Default)
+        );
+        let refused = model(&flags(&["--model", "opus"])).expect_err("not a profile");
+        assert!(refused.contains("default or cheap"), "{refused}");
+    }
+}
