@@ -57,16 +57,16 @@ spawn-core
 
 | 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |
-| `session.native_started` | hook、Codex | engine、native_session_id、transcript_path |
-| `session.native_ended` | hook、Codex | reason |
+| `session.native_started` | Bridge（新会话由它命名）、旧版 hook、Codex | engine、native_session_id、transcript_path |
+| `session.native_ended` | 旧版 hook、Codex | reason |
 | `session.linked` | Bridge | parent_session_id |
-| `message.received` | hook | 无 |
-| `notification.received` | hook | notification_type |
-| `tool.started` | hook、Codex | tool_name、tool_use_id |
-| `tool.completed` | hook、Codex | tool_use_id、duration_ms |
-| `tool.failed` | hook、Codex | tool_use_id、error |
-| `turn.stopped` | hook、Codex | input_tokens、output_tokens |
-| `turn.failed` | hook、Codex | error |
+| `message.received` | 会话记录（transcript） | 无 |
+| `notification.received` | 旧版 hook（不再产生） | notification_type |
+| `tool.started` | 会话记录、Codex | tool_name、tool_use_id |
+| `tool.completed` | 会话记录、Codex | tool_use_id、duration_ms |
+| `tool.failed` | 会话记录、Codex | tool_use_id、error |
+| `turn.stopped` | 会话记录（`turn_duration`、中断）、Codex | input_tokens、output_tokens |
+| `turn.failed` | 会话记录（API 错误行）、Codex | error |
 | `execution.started` | Bridge | engine、terminal、workspace、command_id |
 | `execution.ended` | Bridge | cause、exit_code |
 | `artifact.committed` | Bridge | reason、artifact |
@@ -77,7 +77,7 @@ spawn-core
 
 `turn.stopped` 只表示模型本轮停止，不等于任务完成。任务完成只由 `SemanticState::Completed` 表达。
 
-去重：`(session_id, source, source_event_id)` 唯一。Bridge 重放同一 hook 载荷返回既有记录，`inserted = false`。
+去重：`(session_id, source, source_event_id)` 唯一。Bridge 重读同一会话记录行返回既有记录，`inserted = false`。
 
 ## 4. 端口契约
 
@@ -86,7 +86,6 @@ spawn-core
 | trait | 方法 | 语义 |
 | --- | --- | --- |
 | `EventLog` | `append` | 追加一条事件，去重返回既有记录 |
-| | `read_session(session, after, limit)` | `session_seq > after` 的会话事件 |
 | | `read_global(after, limit)` | `position > after` 的全部事件，位置可见性单调 |
 | `CommandQueue` | `submit(principal, submission)` | 幂等提交，同时写 `command.accepted` |
 | | `claim(worker, ttl)` | 领取最老且无活跃租约的会话首条命令 |
@@ -122,7 +121,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 | Claude | `--ax-screen-reader --settings <内联 JSON> [--resume <id>]` |
 | Codex | `exec --json [resume <id>] -- <prompt>` |
 
-`--settings` 注入七类 hook：`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop`、`SessionEnd`、`Notification`，命令统一是 `<spawn 绝对路径> hook`。钩子通过环境变量 `SPAWN_AGENT_ID`、`SPAWN_SESSION_ID`、`SPAWN_EXECUTION_ID`、`SPAWN_ENGINE` 定位会话。
+不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`，Codex 输出另存到 `SPAWN_ENGINE_OUTPUT`；终端里没有数据库登录。
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
@@ -144,7 +143,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 ## 6. 屏尾判定
 
-Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。hooks 给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。
+Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。会话记录给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。Bridge 每个 tick 读屏，两次读数一致才记录，忙碌状态每 30 秒重记一次。
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
@@ -180,7 +179,7 @@ Observer 每次 tick：
 3. 状态或原因变化才追加 `observation.recorded`，`based_on_seq` 记录依据。
 4. `source = Observer` 的事件不进入快照；`observation.recorded` 只恢复上一次结论与 `based_on_seq`，新进程不重复写同一结论。
 
-快照规则：hook 事件（工具、消息、回合）比屏尾读数新，到达时清空 `screen` 与 `permission_pending`。
+快照规则：引擎事件（工具、消息、回合）比屏尾读数新，到达时清空 `screen` 与 `permission_pending`。
 
 判定实现：
 
@@ -315,7 +314,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 重试上限 | `spawn_claim` 无最大 attempt，坏命令会被反复领取 | 加 `max_attempts`，超限直接 `finish(failed)` |
 | schema 版本 | `migrate` 每次整体执行 `schema.sql`，无版本表 | 编号迁移文件与版本表 |
 | 子进程超时 | `git`、`docker`、`tmux` 调用没有超时 | `wait_timeout` 或独立线程计时 |
-| 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 由 hooks 的 `turn.failed` 取代 |
+| 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 由会话记录的 `turn.failed` 取代 |
 | 视图读取 | 状态与新鲜度读投影表，其余视图读时折叠；迁移每次按会话聚合全量日志 | 日志很大时加迁移版本号，只跑一次，见 [view-architecture.md](./view-architecture.md) |
 | 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 | 接入 `LISTEN/NOTIFY` |
 | 写入串行 | `spawn_append` 用一把全局 advisory lock | 按会话分锁 |
