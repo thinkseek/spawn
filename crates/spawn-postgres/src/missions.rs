@@ -136,3 +136,37 @@ impl PostgresStore {
         Ok(changed == 1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use spawn_core::mission::TaskState;
+
+    /// The values allowed by the check constraint on `mission_tasks.state`,
+    /// read from the schema text.
+    fn constrained_task_states() -> Vec<String> {
+        let table = crate::SCHEMA
+            .split_once("create table if not exists mission_tasks (")
+            .expect("the schema creates mission_tasks")
+            .1;
+        let list = table
+            .split_once("check (state in (")
+            .expect("mission_tasks.state has a check constraint")
+            .1
+            .split_once(')')
+            .expect("the constraint list is closed")
+            .0;
+        list.split(',')
+            .map(|value| value.trim().trim_matches('\'').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn task_states_match_the_schema_check_constraint() {
+        let schema = constrained_task_states();
+        let rust: Vec<&str> = TaskState::ALL.iter().map(|state| state.as_str()).collect();
+        assert_eq!(schema, rust);
+        for value in &schema {
+            assert!(value.parse::<TaskState>().is_ok(), "{value} parses");
+        }
+    }
+}

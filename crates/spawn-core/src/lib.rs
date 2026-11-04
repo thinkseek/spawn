@@ -8,6 +8,7 @@ pub mod event;
 pub mod id;
 pub mod ingest;
 pub mod memory;
+pub mod mission;
 pub mod observation;
 pub mod observe;
 pub mod port;
