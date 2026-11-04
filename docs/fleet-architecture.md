@@ -273,7 +273,8 @@ input of a mission.
 
 **Commands.** `spawn mission add --text ... [--source <repo>]` (a human),
 `spawn task assign --mission N --kind resident|ephemeral --worker <name>
---brief <text>` (the supervisor; checked like the gateway), `spawn task
+--brief <text> [--model default|cheap]` (the supervisor; checked like the
+gateway; the model profile is §3.3), `spawn task
 accept` /
 `reject`, `spawn resident propose` / `approve` / `retire`, `spawn mission
 close`. Every one is a checked SQL function that appends to the control
@@ -282,7 +283,7 @@ stream (§10.1).
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
-kind, assignee, state and report.
+kind, assignee, model profile, state and report.
 
 **Mission sources.** A mission names its source: any git repository (a path
 or a URL), mirrored into `$SPAWN_WORKSPACE_ROOT/.sources/`, or none (an empty
@@ -291,6 +292,56 @@ scratch repository). Each worker's workspace is a branch of that mirror.
 
 **Limits.** None fixed. The supervisor decides fleet size; humans stop what
 overreaches, and the UI shows the live workers.
+
+### 3.3 Engine models
+
+A Claude Code engine reaches its models through the **model relay**
+(`scripts/model-relay.py`, unit `spawn-model-relay`, `127.0.0.1:8791`). The
+relay routes each call by the `model` in its body: `deepseek-*` goes to
+DeepSeek's Anthropic-compatible endpoint with `x-api-key:
+$DEEPSEEK_API_KEY` in place of the engine's credentials; anything else goes
+unchanged to the gateway of Claude Code's own settings, with the engine's own
+auth header. The DeepSeek key lives only in the relay's process (from
+`~/.hermes/.env`); the gateway token only in `~/.claude/settings.json`.
+Spawn's environment, the engine's environment, the event log and the panes
+hold neither.
+
+Every task runs on one of two **profiles**:
+
+| Profile | Main model (and sonnet, opus slots) | Small model (haiku slot: titles, summaries, background work) | For |
+| --- | --- | --- | --- |
+| `default` | Claude Code's own (`claude-opus-5-5` on the gateway) | `deepseek-flash` | everything not listed below |
+| `cheap` | `deepseek-v4-pro` (`SPAWN_CHEAP_MODEL`) | `deepseek-flash` (`SPAWN_SMALL_MODEL`) | simple, well-specified work: docs, mechanical edits, tests for stated behaviour |
+
+Design, concurrency, security, debugging and anything a gate judges as hard
+stay on `default`; the supervisor's charter says so.
+
+How the profile travels:
+
+- `spawn task assign --model cheap` records it in `task.assigned` and
+  `mission_tasks.model` (default `default`).
+- Delivery puts it on the `Start` or `Resume` it sends. A `Start` or
+  `Resume` that names no profile (liveness revivals, the dispatcher's resume
+  of a lost engine, a human's `spawn submit`) keeps the profile the session's
+  last execution started with, which `execution.started` records: a resumed
+  cheap worker stays cheap, and a revived resident keeps its models.
+- A running engine keeps the models it started with. A task for a live
+  worker on another profile stops it at the moment typing would be safe
+  (`switch-model-<task>-<revision>`); the next pass resumes it, context
+  kept, on the task's profile.
+- The Bridge passes the relay and the slots in the inline `--settings`
+  `env` (`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`,
+  `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`). Claude Code merges inline
+  settings over the user's files, `env` name by name (checked with 2.1.318),
+  so the gateway token still comes from the user's own settings.
+
+**When the relay is down.** The Bridge connects to the relay before every
+Claude start. Unreachable: a `default` engine starts on Claude Code's own
+settings (the gateway, its own small model) and the tick reports a warning;
+a `cheap` start fails, and the failed delivery reaches the supervisor's
+digest. An engine already running when the relay dies sees API errors until
+systemd restarts it (`Restart=always`). `SPAWN_MODEL_RELAY=off` turns the
+relay off for every engine.
 
 ## 4. Experience
 
@@ -347,6 +398,7 @@ Known edges, each with its rule:
 - `EventKind` stays closed; observation fields are additive.
 - Facts > rules > Jev; observation never acts; Jev alone triggers only reversible, bounded actions.
 - Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the runner's copy of Codex output, the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing; it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. The restricted logins' passwords are derived from the owner's (SHA-256 over the owner's password and the role name, `spawn_postgres::role_url`) and set by every migration, so nothing stores them and only a holder of the owner's credentials can form them. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration leaves the logins as they are (created `nologin`; enabled only by a migration that has the owner's password), never with a password derived from the empty string.
+- No model key in Spawn: the DeepSeek key stays in the model relay's process, the gateway token in Claude Code's own settings (§3.3).
 - Every landing goes through the black-box gate, a host-side commit, a compare-and-swap move of the baseline, and the halt rules (§10).
 
 ## 7. The closed loop
