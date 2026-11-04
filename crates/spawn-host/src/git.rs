@@ -278,9 +278,10 @@ impl GitWorkspace {
 
     /// The index of one branch, outside every work tree, kept between
     /// checkpoints: its stat cache makes `add -A` hash only the files that
-    /// changed, not the whole tree on every tool call. Only the Bridge
-    /// commits, one per store root; an index that fails is removed, and the
-    /// next checkpoint rebuilds it.
+    /// changed, not the whole tree on every tool call. A commit holds
+    /// `<index>.spawn-lock` for its whole sequence, since the Bridge and the
+    /// integrator both commit (git itself owns `<index>.lock`). An index
+    /// that fails is removed, and the next checkpoint rebuilds it.
     fn index(&self, branch: &str) -> PathBuf {
         self.root.join(".index").join(branch)
     }
@@ -304,12 +305,52 @@ impl GitWorkspace {
             .collect();
         add.extend(excluded.iter().map(String::as_str));
         self.output_in(directory, index, &add)?;
+        self.unstage(directory, index, &large)?;
+        self.report_large(branch, &large);
+        let tree = self.output_in(directory, index, &["write-tree"])?;
+        // A file that grew past the limit between the size check and `add`
+        // was hashed anyway; keep it off the branch all the same.
+        let grown = self.large_blobs(&tree)?;
+        if grown.is_empty() {
+            return Ok(tree);
+        }
+        self.unstage(directory, index, &grown)?;
+        self.report_large(branch, &grown);
+        self.output_in(directory, index, &["write-tree"])
+    }
+
+    /// Take build output and `paths` out of the index. Paths go to git as
+    /// literals: a file named `*` or `:/` must not match others.
+    fn unstage(
+        &self,
+        directory: &Path,
+        index: &Path,
+        paths: &[(String, u64)],
+    ) -> Result<(), WorkspaceError> {
+        let literal: Vec<String> = paths
+            .iter()
+            .map(|(path, _)| format!(":(literal){path}"))
+            .collect();
         let mut remove = vec!["rm", "-r", "--cached", "--ignore-unmatch", "--"];
         remove.extend(BUILD_OUTPUT);
-        remove.extend(large.iter().map(|(path, _)| path.as_str()));
-        self.output_in(directory, index, &remove)?;
-        self.report_large(branch, &large);
-        self.output_in(directory, index, &["write-tree"])
+        remove.extend(literal.iter().map(String::as_str));
+        self.output_in(directory, index, &remove).map(|_| ())
+    }
+
+    /// Blobs of `tree` larger than [`LARGE_FILE_BYTES`], with their sizes.
+    fn large_blobs(&self, tree: &str) -> Result<Vec<(String, u64)>, WorkspaceError> {
+        let listed = self.git_output(&["ls-tree", "-r", "-l", "-z", tree])?;
+        Ok(listed
+            .split('\0')
+            .filter_map(|entry| {
+                // `<mode> blob <id> <size>\t<path>`
+                let (meta, path) = entry.split_once('\t')?;
+                let mut fields = meta.split_whitespace();
+                let kind = fields.nth(1)?;
+                let size: u64 = fields.nth(1)?.parse().ok()?;
+                (kind == "blob" && size > LARGE_FILE_BYTES).then(|| (path.to_string(), size))
+            })
+            .collect())
     }
 
     /// Files git would commit that are larger than [`LARGE_FILE_BYTES`], with
@@ -474,6 +515,15 @@ impl WorkspaceStore for GitWorkspace {
                 WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
             })?;
         }
+        // The Bridge and the integrator both commit workspaces under one
+        // root: the branch's index is theirs one at a time.
+        let lock_path = index.with_extension("spawn-lock");
+        let lock = std::fs::File::create(&lock_path).map_err(|error| {
+            WorkspaceError::Unavailable(format!("create {}: {error}", lock_path.display()))
+        })?;
+        lock.lock().map_err(|error| {
+            WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
+        })?;
         let tree = self.tree_of(&branch, &directory, &index);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
