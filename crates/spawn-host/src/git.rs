@@ -23,6 +23,12 @@ const BASE: &str = "main";
 /// Paths that never enter a commit.
 const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
 
+/// Files larger than this stay out of git (docs/storage.md): git stores
+/// every version of a file whole, so one rewritten 200 MiB binary costs
+/// seconds per checkpoint on the Bridge's loop and its full size again in
+/// the repository each time.
+pub const LARGE_FILE_BYTES: u64 = 8 << 20;
+
 /// Docker settings for a workspace that hosts the engine.
 #[derive(Debug, Clone)]
 pub struct Container {
@@ -73,6 +79,9 @@ pub struct GitWorkspace {
     root: PathBuf,
     git: String,
     container: Option<Container>,
+    /// Large files already reported, by branch, path and size: one warning
+    /// per version, not one per checkpoint.
+    reported: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl GitWorkspace {
@@ -83,6 +92,7 @@ impl GitWorkspace {
             root: root.as_ref().to_path_buf(),
             git: "git".to_string(),
             container: None,
+            reported: std::sync::Arc::default(),
         }
     }
 
@@ -265,30 +275,91 @@ impl GitWorkspace {
         Ok(false)
     }
 
-    /// Temporary index of one branch and one process, outside every work tree.
-    ///
-    /// The process id keeps two commits of one branch from sharing an index.
-    /// It lives under the configured root rather than the system temporary
-    /// directory, so two stores on one machine never share an index.
-    ///
-    /// ponytail: a killed process leaks one index file under the root; add
-    /// cleanup if the directory grows.
+    /// The index of one branch, outside every work tree, kept between
+    /// checkpoints: its stat cache makes `add -A` hash only the files that
+    /// changed, not the whole tree on every tool call. Only the Bridge
+    /// commits, one per store root; an index that fails is removed, and the
+    /// next checkpoint rebuilds it.
     fn index(&self, branch: &str) -> PathBuf {
-        self.root
-            .join(".index")
-            .join(format!("{branch}-{}", std::process::id()))
+        self.root.join(".index").join(branch)
     }
 
     /// Tree of the work tree in `directory`, built against `index`.
     ///
-    /// Build output leaves the index after `add -A`, so a `.gitignore` inside
-    /// the tree cannot re-include it.
-    fn tree_of(&self, directory: &Path, index: &Path) -> Result<String, WorkspaceError> {
-        self.output_in(directory, index, &["add", "-A"])?;
+    /// Build output and files over [`LARGE_FILE_BYTES`] leave the index after
+    /// `add -A`, so a `.gitignore` inside the tree cannot re-include them; a
+    /// large file is excluded before it is hashed.
+    fn tree_of(
+        &self,
+        branch: &str,
+        directory: &Path,
+        index: &Path,
+    ) -> Result<String, WorkspaceError> {
+        let large = self.large_files(directory, index)?;
+        let mut add = vec!["add", "-A", "--", "."];
+        let excluded: Vec<String> = large
+            .iter()
+            .map(|(path, _)| format!(":(exclude,literal){path}"))
+            .collect();
+        add.extend(excluded.iter().map(String::as_str));
+        self.output_in(directory, index, &add)?;
         let mut remove = vec!["rm", "-r", "--cached", "--ignore-unmatch", "--"];
         remove.extend(BUILD_OUTPUT);
+        remove.extend(large.iter().map(|(path, _)| path.as_str()));
         self.output_in(directory, index, &remove)?;
+        self.report_large(branch, &large);
         self.output_in(directory, index, &["write-tree"])
+    }
+
+    /// Files git would commit that are larger than [`LARGE_FILE_BYTES`], with
+    /// their sizes: tracked or untracked, ignore rules applied.
+    fn large_files(
+        &self,
+        directory: &Path,
+        index: &Path,
+    ) -> Result<Vec<(String, u64)>, WorkspaceError> {
+        let listed = self.output_in(
+            directory,
+            index,
+            &[
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+        )?;
+        let mut large: Vec<(String, u64)> = listed
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .filter_map(|path| {
+                let size = std::fs::symlink_metadata(directory.join(path))
+                    .ok()
+                    .filter(std::fs::Metadata::is_file)?
+                    .len();
+                (size > LARGE_FILE_BYTES).then(|| (path.to_string(), size))
+            })
+            .collect();
+        large.sort();
+        large.dedup();
+        Ok(large)
+    }
+
+    /// Say once per version that a large file stays out of the checkpoint:
+    /// it lives in the workspace until unmount and is not on the branch.
+    fn report_large(&self, branch: &str, large: &[(String, u64)]) {
+        let mut reported = self
+            .reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (path, size) in large {
+            if reported.insert(format!("{branch}\0{path}\0{size}")) {
+                eprintln!(
+                    "git: {branch}: {path} ({size} bytes) is over {LARGE_FILE_BYTES} \
+                     bytes and stays out of the checkpoint (docs/storage.md)"
+                );
+            }
+        }
     }
 }
 
@@ -385,8 +456,10 @@ impl WorkspaceStore for GitWorkspace {
                 WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
             })?;
         }
-        let tree = self.tree_of(&directory, &index);
-        let _ = std::fs::remove_file(&index);
+        let tree = self.tree_of(&branch, &directory, &index);
+        if tree.is_err() {
+            let _ = std::fs::remove_file(&index);
+        }
         let tree = tree?;
 
         let reference = format!("refs/heads/{branch}");

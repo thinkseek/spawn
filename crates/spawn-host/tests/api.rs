@@ -174,6 +174,38 @@ fn a_changed_workspace_advances_the_branch() {
 }
 
 #[test]
+fn a_large_file_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
+    let _exclusive = exclusive();
+    let (repo, root) = repository("large");
+    let store = GitWorkspace::new(&repo, &root);
+    store.ensure_branch(&branch()).expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 1;
+    fs::write(directory.join("model.bin"), vec![7u8; size]).expect("write a large file");
+    fs::write(directory.join("code.rs"), "fn main() {}\n").expect("write a small file");
+    assert!(matches!(
+        store.commit(&workspace, "work").expect("commit succeeds"),
+        Commit::Created(_)
+    ));
+    let listed = Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args(["ls-tree", "-r", "--name-only", &branch().to_string()])
+        .output()
+        .expect("list the branch");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.lines().any(|line| line == "code.rs"), "{listed}");
+    assert!(!listed.lines().any(|line| line == "model.bin"), "{listed}");
+    // The kept index sees an unchanged tree as unchanged, large file and all.
+    assert_eq!(
+        store.commit(&workspace, "again").expect("commit succeeds"),
+        Commit::Unchanged
+    );
+    store.unmount(&workspace).expect("unmount succeeds");
+}
+
+#[test]
 fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
     let (repo, root) = repository("identity");
