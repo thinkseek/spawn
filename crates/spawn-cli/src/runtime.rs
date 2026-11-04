@@ -10,9 +10,7 @@ use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_host::{GitWorkspace, TmuxHost, docker_prefix};
 use spawn_jev::{JevConfig, JevJudge};
 
-use crate::config::{
-    env_or, env_value, open_store, required_env, spawn_program, workspace_root,
-};
+use crate::config::{env_or, env_value, open_store, required_env, spawn_program, workspace_root};
 use crate::flags::Flags;
 use crate::trace::{self, Timed};
 use crate::{context, sources, supervise};
