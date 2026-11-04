@@ -8,9 +8,31 @@ use spawn_core::event::{EndCause, EventKind, NewEvent, Source};
 use spawn_core::ingest::{claude_hook, codex_line};
 use spawn_core::port::EventLog;
 
-use crate::config::{TerminalTarget, env_or, open_store};
+use spawn_core::id::{AgentId, ExecutionId, SessionId};
+
+use crate::config::{env_or, env_value, open_store, required_env};
+
+/// The session a hook or runner inside a terminal reports for, read from the
+/// environment the Bridge gave that terminal.
+struct TerminalTarget {
+    agent: AgentId,
+    session: SessionId,
+    execution: Option<ExecutionId>,
+}
 
 impl TerminalTarget {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            agent: AgentId::new(required_env("SPAWN_AGENT_ID")?)
+                .map_err(|error| error.to_string())?,
+            session: SessionId::new(required_env("SPAWN_SESSION_ID")?)
+                .map_err(|error| error.to_string())?,
+            execution: env_value("SPAWN_EXECUTION_ID")
+                .map(|text| ExecutionId::new(text).map_err(|error| error.to_string()))
+                .transpose()?,
+        })
+    }
+
     fn event(&self, source: Source, key: Option<String>, kind: EventKind) -> NewEvent {
         NewEvent {
             agent_id: self.agent.clone(),

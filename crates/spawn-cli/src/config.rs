@@ -3,7 +3,6 @@
 //! Configuration is environment first, so a terminal started by the Bridge
 //! carries everything its hook and runner need.
 
-use spawn_core::id::{AgentId, ExecutionId, SessionId};
 use spawn_postgres::PostgresStore;
 
 use crate::flags::Flags;
@@ -50,26 +49,4 @@ pub(crate) fn loop_interval() -> std::time::Duration {
             .and_then(|text| text.parse().ok())
             .unwrap_or(2000),
     )
-}
-
-/// The session a hook or runner inside a terminal reports for, read from the
-/// environment the Bridge gave that terminal.
-pub(crate) struct TerminalTarget {
-    pub(crate) agent: AgentId,
-    pub(crate) session: SessionId,
-    pub(crate) execution: Option<ExecutionId>,
-}
-
-impl TerminalTarget {
-    pub(crate) fn from_env() -> Result<Self, String> {
-        Ok(Self {
-            agent: AgentId::new(required_env("SPAWN_AGENT_ID")?)
-                .map_err(|error| error.to_string())?,
-            session: SessionId::new(required_env("SPAWN_SESSION_ID")?)
-                .map_err(|error| error.to_string())?,
-            execution: env_value("SPAWN_EXECUTION_ID")
-                .map(|text| ExecutionId::new(text).map_err(|error| error.to_string()))
-                .transpose()?,
-        })
-    }
 }
