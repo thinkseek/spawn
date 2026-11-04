@@ -53,12 +53,13 @@ pub(crate) enum GateFailure {
 }
 
 /// The gate's environment, read through `lookup`: the [`GATE_ENV`]
-/// variables that are set. A SPAWN_TEST_DATABASE_URL on the same cluster
-/// as SPAWN_DATABASE_URL (same host and port, or same socket directory) is
-/// withheld, whatever database it names: the test login is a superuser, and
-/// a superuser on the owner's cluster reaches the owner's database. (Not an
-/// error: mvp-e2e runs an integrator whose own database is the test
-/// database.)
+/// variables that are set. A SPAWN_TEST_DATABASE_URL whose text names the
+/// owner's cluster (same host and port, or same socket directory) is
+/// withheld here, whatever database it names: the test login is a
+/// superuser, and a superuser on the owner's cluster reaches the owner's
+/// database. Text is only the cheap first pass; [`withhold_owners_cluster`]
+/// decides by the servers' identity. (Not an error: mvp-e2e runs an
+/// integrator whose own database is the test database.)
 pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     let owner = lookup("SPAWN_DATABASE_URL");
     GATE_ENV
@@ -75,6 +76,54 @@ pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, 
                     .is_none_or(|owner| cluster_of(owner) != cluster_of(value))
         })
         .collect()
+}
+
+/// The decisive pass over [`gate_env`]'s result: SPAWN_TEST_DATABASE_URL
+/// stays only when the owner's server and the test server both answer with
+/// their identity (`identity`, `spawn_postgres::cluster_identity` in the
+/// integrator) and the two differ. One server spelled two ways (its socket,
+/// a hostname, 127.0.0.2, a LAN address) has one identity. Fails closed: no
+/// owner URL, or a connection or query that fails, withholds the test URL
+/// too. Returns the environment and, when the URL was withheld, why.
+pub(crate) fn withhold_owners_cluster(
+    env: &[(String, String)],
+    owner: Option<&str>,
+    identity: impl Fn(&str) -> Result<String, String>,
+) -> (Vec<(String, String)>, Option<String>) {
+    let Some((_, test)) = env
+        .iter()
+        .find(|(name, _)| name == "SPAWN_TEST_DATABASE_URL")
+    else {
+        return (env.to_vec(), None);
+    };
+    let reason = match owner {
+        None => Some(
+            "SPAWN_DATABASE_URL is unset, so the test server cannot be told apart from the owner's"
+                .to_string(),
+        ),
+        Some(owner) => match (identity(owner), identity(test)) {
+            (Ok(owner), Ok(test)) if owner != test => None,
+            (Ok(_), Ok(_)) => {
+                Some("SPAWN_TEST_DATABASE_URL reaches the owner's server".to_string())
+            }
+            (Err(error), _) => Some(format!(
+                "the owner's server has no readable identity: {error}"
+            )),
+            (_, Err(error)) => Some(format!("the test server has no readable identity: {error}")),
+        },
+    };
+    match reason {
+        None => (env.to_vec(), None),
+        Some(reason) => (
+            env.iter()
+                .filter(|(name, _)| name != "SPAWN_TEST_DATABASE_URL")
+                .cloned()
+                .collect(),
+            Some(format!(
+                "{reason}; the gate does not get SPAWN_TEST_DATABASE_URL"
+            )),
+        ),
+    }
 }
 
 /// The cluster a postgres URL names: its host, with a percent-encoded
@@ -307,7 +356,9 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GateFailure, PrivateDirectory, gate_env, judge, run_bounded};
+    use super::{
+        GateFailure, PrivateDirectory, gate_env, judge, run_bounded, withhold_owners_cluster,
+    };
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -581,5 +632,79 @@ mod tests {
             owner,
             "postgres://postgres:pw@%2Fhome%2Fu%2Fother/spawn_test"
         ));
+    }
+
+    fn with_test_url(test: &str) -> Vec<(String, String)> {
+        vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("SPAWN_TEST_DATABASE_URL".to_string(), test.to_string()),
+        ]
+    }
+
+    /// Identities by URL, as two servers would answer: the live server
+    /// under four spellings, the test server, and one that is down.
+    fn servers(url: &str) -> Result<String, String> {
+        match url {
+            "postgres://o:pw@127.0.0.1:15433/spawn"
+            | "postgres://t:pw@%2Fvar%2Frun%2Flive/spawn_test"
+            | "postgres://t:pw@127.0.0.2:15433/spawn_test"
+            | "postgres://t:pw@myhost:15433/spawn_test" => Ok("7703".to_string()),
+            "postgres://t:pw@%2Fhome%2Fu%2Ftest-sock/spawn_test" => Ok("7704".to_string()),
+            _ => Err("connection refused".to_string()),
+        }
+    }
+
+    fn kept(owner: Option<&str>, test: &str) -> (bool, Option<String>) {
+        let (env, warning) = withhold_owners_cluster(&with_test_url(test), owner, servers);
+        assert!(env.iter().any(|(name, _)| name == "PATH"), "the rest stays");
+        (
+            env.iter()
+                .any(|(name, _)| name == "SPAWN_TEST_DATABASE_URL"),
+            warning,
+        )
+    }
+
+    #[test]
+    fn the_test_url_stays_only_for_another_server() {
+        let owner = Some("postgres://o:pw@127.0.0.1:15433/spawn");
+        assert_eq!(
+            kept(owner, "postgres://t:pw@%2Fhome%2Fu%2Ftest-sock/spawn_test"),
+            (true, None)
+        );
+        // The live server over its socket, 127.0.0.2, a hostname: one
+        // identity, so withheld, though the text names another cluster.
+        for spelling in [
+            "postgres://t:pw@%2Fvar%2Frun%2Flive/spawn_test",
+            "postgres://t:pw@127.0.0.2:15433/spawn_test",
+            "postgres://t:pw@myhost:15433/spawn_test",
+        ] {
+            let (passed, warning) = kept(owner, spelling);
+            assert!(!passed, "{spelling} reaches the owner's server");
+            assert!(warning.is_some_and(|w| w.contains("owner's server")));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_identity_withholds_the_test_url() {
+        let owner = Some("postgres://o:pw@127.0.0.1:15433/spawn");
+        let (passed, warning) = kept(owner, "postgres://t:pw@%2Fdown/spawn_test");
+        assert!(!passed);
+        assert!(warning.is_some_and(|w| w.contains("test server")));
+        let (passed, warning) = kept(
+            Some("postgres://o:pw@%2Fdown/spawn"),
+            "postgres://t:pw@%2Fhome%2Fu%2Ftest-sock/spawn_test",
+        );
+        assert!(!passed);
+        assert!(warning.is_some_and(|w| w.contains("owner's server")));
+        let (passed, _) = kept(None, "postgres://t:pw@%2Fhome%2Fu%2Ftest-sock/spawn_test");
+        assert!(!passed, "no owner URL to compare with");
+    }
+
+    #[test]
+    fn no_test_url_asks_no_server() {
+        let env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let (kept, warning) = withhold_owners_cluster(&env, None, |_| panic!("no connection"));
+        assert_eq!(kept, env);
+        assert!(warning.is_none());
     }
 }

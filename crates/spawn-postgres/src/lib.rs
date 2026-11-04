@@ -201,6 +201,30 @@ pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
     ))
 }
 
+/// The identity of the server `url` reaches: its `system_identifier`, set
+/// once by initdb. Two URLs that spell one server differently (socket or
+/// TCP, a hostname, 127.0.0.2, a LAN address) give the same identity. One
+/// read, no writes; the connection gives up after 5 seconds.
+///
+/// # Errors
+///
+/// When the URL does not parse, the server is unreachable, or the login may
+/// not read `pg_control_system()`.
+pub fn cluster_identity(url: &str) -> Result<String, StoreError> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|error: postgres::Error| backend(&error))?;
+    config.connect_timeout(std::time::Duration::from_secs(5));
+    let mut client = config.connect(NoTls).map_err(|error| backend(&error))?;
+    let row = client
+        .query_one(
+            "select system_identifier::text from pg_control_system()",
+            &[],
+        )
+        .map_err(|error| backend(&error))?;
+    row.try_get(0).map_err(|error| backend(&error))
+}
+
 /// Statement parameters, as the driver takes them.
 type Params<'a> = [&'a (dyn ToSql + Sync)];
 

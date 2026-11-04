@@ -460,6 +460,16 @@ impl Integrator {
         }
 
         let scenario = task.scenario.as_deref().map(PathBuf::from);
+        // The test server must not be the owner's, by identity, asked now:
+        // a socket mount or a DNS name can change between gate runs.
+        let owner = std::env::var("SPAWN_DATABASE_URL").ok();
+        let (gate_env, warning) =
+            gate::withhold_owners_cluster(&self.gate_env, owner.as_deref(), |url| {
+                spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
+            });
+        if let Some(warning) = warning {
+            eprintln!("integrate: {warning}");
+        }
         match gate::judge(
             &self.gate,
             mirror,
@@ -467,7 +477,7 @@ impl Integrator {
             &candidate,
             scenarios,
             scenario.as_deref(),
-            &self.gate_env,
+            &gate_env,
             GATE_WALL_CLOCK,
         ) {
             Ok(verdict) if verdict.accepted => {
