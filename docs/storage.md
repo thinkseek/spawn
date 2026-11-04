@@ -1,6 +1,6 @@
 # Storage: one place, by kind of object
 
-Status: design (2026-11-04). Phase 0 is in the code; phases 1–3 are the plan.
+Status: design (2026-11-04). Phases 0 and 1 are in the code; phases 2–3 are the plan.
 
 The goal: everything Spawn knows lives in one store that any machine with the
 right credentials can reach, and work in it branches and merges the way
@@ -75,12 +75,20 @@ files, a chunk fetch.
 ## Phases
 
 0. **Done.** The checkpoint index is kept between checkpoints (stat cache),
-   and files over 8 MiB stay out of git commits (a warning names them once;
-   until phase 1 they are not on the branch and are lost at unmount).
-1. **Chunk store; large files kept.** A chunk-store port with a local
-   directory adapter (content-defined chunks, BLAKE3, zstd, verified on read);
-   the large-file manifest and the `Spawn-Large` trailer; mount materializes
-   the large files again.
+   and files over 8 MiB stay out of git commits.
+1. **Done.** **Chunk store; large files kept.** A chunk-store port
+   (`spawn_core::port::ChunkStore`) with a local directory adapter
+   (`spawn_host::chunks`: gear-hash FastCDC chunks of 128 KiB–2 MiB, about
+   512 KiB on average, named by BLAKE3, zstd-compressed, written by temporary
+   file and link so an object is never rewritten, verified on read); the
+   large-file manifest is a chunk-store object and the checkpoint commit names
+   it in a `Spawn-Large` trailer; only large files whose size, mtime or mode
+   changed are chunked again (a stat cache in `<root>/.large/<branch>`); mount
+   materializes the large files again, each atomically, and fails rather than
+   write bytes that do not verify. The store is the directory
+   `SPAWN_CHUNK_STORE` names, else `<root>/.chunks`. A branch head that names
+   a manifest lands as a commit of the same tree without the trailer, so
+   large files never reach `main`.
 2. **Branches in the store.** Fork from any commit (`start {from}`), resume on
    any host, branches pushed to `spawn/<agent>`, `main` merged into idle
    branches automatically.
@@ -97,7 +105,7 @@ files, a chunk fetch.
 | Full transcript text | `~/.claude/projects/...` on the compute host | **No**: phase 3 |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
 | Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`) | **No**: phase 2 |
-| Large files in workspaces | the workspace directory only | **No**: phase 1 |
+| Large files in workspaces | the chunk store (`SPAWN_CHUNK_STORE`, else `<root>/.chunks`), named by the branch head's `Spawn-Large` trailer | **No**: host-local until R2 (phase 3) |
 | Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host: versioned with the source in phase 2 |
 | Secrets | `spawn.env`, `~/.config/spawn/*`, mode 600 | Deliberately not stored |
 
