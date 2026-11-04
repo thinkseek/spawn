@@ -2,8 +2,15 @@
 //!
 //! The UI never writes. Every endpoint reads an existing view through the
 //! same store methods the CLI uses, so a defect in the UI cannot change
-//! state, and the API needs no authentication beyond binding to a private
-//! address.
+//! state.
+//!
+//! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
+//! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
+//! it refuses to start without `SPAWN_SERVE_TOKEN`. With a token set, every
+//! API request must carry it (`Authorization: Bearer <token>` or
+//! `?token=<token>`). The built UI's static files are served without it:
+//! they are the public build and hold no data, and a browser fetches them
+//! without headers.
 
 use std::path::{Path, PathBuf};
 
@@ -50,18 +57,68 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
             .get("web")
             .unwrap_or_else(|| env_or("SPAWN_WEB_DIR", "web/dist")),
     );
+    let token = access_token(&address, env_value("SPAWN_SERVE_TOKEN"))?;
     let server = Server::http(&address).map_err(|error| format!("listen {address}: {error}"))?;
-    println!("serve: http://{address} web {}", web.display());
+    let guard = if token.is_some() { "token" } else { "none" };
+    println!("serve: http://{address} web {} auth {guard}", web.display());
     for request in server.incoming_requests() {
-        if let Err(error) = handle(request, &web) {
+        if let Err(error) = handle(request, &web, token.as_deref()) {
             eprintln!("serve: {error}");
         }
     }
     Ok(0)
 }
 
+/// The token every API request must carry, if any: whatever
+/// `SPAWN_SERVE_TOKEN` holds. An address that is not loopback needs one.
+fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, String> {
+    if token.is_none() && !is_loopback(address) {
+        return Err(format!(
+            "refusing to serve on {address} without SPAWN_SERVE_TOKEN; \
+             bind 127.0.0.1 or set a token"
+        ));
+    }
+    Ok(token)
+}
+
+/// Whether every address `address` resolves to is a loopback one. An
+/// address that does not resolve counts as public.
+fn is_loopback(address: &str) -> bool {
+    let Ok(resolved) = std::net::ToSocketAddrs::to_socket_addrs(address) else {
+        return false;
+    };
+    let resolved: Vec<std::net::SocketAddr> = resolved.collect();
+    !resolved.is_empty() && resolved.iter().all(|socket| socket.ip().is_loopback())
+}
+
+/// Whether `request` carries `token`, as a bearer header or `?token=`.
+fn authorized(request: &Request, query: &str, token: &str) -> bool {
+    let header = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Authorization"))
+        .and_then(|header| {
+            let (scheme, rest) = header.value.as_str().split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+        });
+    [header, parameter(query, "token")]
+        .into_iter()
+        .flatten()
+        .any(|given| same_secret(given.as_bytes(), token.as_bytes()))
+}
+
+/// Byte equality whose time does not depend on where the inputs differ.
+fn same_secret(given: &[u8], expected: &[u8]) -> bool {
+    given.len() == expected.len()
+        && given
+            .iter()
+            .zip(expected)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
 /// The dashboard's connection: the read-only `spawn_reader` login, never the
-/// controller's. `serve` answers anyone on the LAN.
+/// controller's.
 fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
     let controller = env_value("SPAWN_DATABASE_URL")
         .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
@@ -70,12 +127,22 @@ fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
     spawn_postgres::PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 
-fn handle(request: Request, web: &Path) -> Result<(), String> {
+fn handle(request: Request, web: &Path, token: Option<&str>) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((path, query)) => (path, query),
         None => (url.as_str(), ""),
     };
+    if let Some(token) = token
+        && path.starts_with("/api/")
+        && !authorized(&request, query, token)
+    {
+        let challenge =
+            Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header is valid");
+        return request
+            .respond(json_response(401, &json!({ "error": "unauthorized" })).with_header(challenge))
+            .map_err(|error| error.to_string());
+    }
     let answer = match path {
         "/api/overview" => overview(),
         "/api/rsi" => rsi_overview(),
@@ -668,7 +735,9 @@ fn content_type(path: &str) -> &'static str {
 mod tests {
     use serde_json::json;
 
-    use super::{objective_json, rsi_summary, with_last_gates};
+    use super::{
+        access_token, is_loopback, objective_json, rsi_summary, same_secret, with_last_gates,
+    };
     use crate::objectives::Task;
 
     fn objective(id: u32, recurring: bool) -> Task {
@@ -755,6 +824,30 @@ mod tests {
             "accepted"
         );
         assert!(board["missions"][0]["tasks"][1]["last_gate"].is_null());
+    }
+
+    #[test]
+    fn only_a_loopback_address_serves_without_a_token() {
+        assert!(is_loopback("127.0.0.1:8787"));
+        assert!(is_loopback("[::1]:8787"));
+        assert!(!is_loopback("0.0.0.0:8787"));
+        assert!(!is_loopback("[::]:8787"));
+        assert!(!is_loopback("192.168.1.10:8787"));
+        assert!(!is_loopback("not an address"));
+        assert_eq!(access_token("127.0.0.1:8787", None), Ok(None));
+        assert!(access_token("0.0.0.0:8787", None).is_err());
+        assert_eq!(
+            access_token("0.0.0.0:8787", Some("t".to_string())),
+            Ok(Some("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn secrets_match_only_when_equal() {
+        assert!(same_secret(b"abc", b"abc"));
+        assert!(!same_secret(b"abd", b"abc"));
+        assert!(!same_secret(b"ab", b"abc"));
+        assert!(!same_secret(b"", b"abc"));
     }
 
     #[test]

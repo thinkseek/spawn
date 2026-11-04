@@ -3,6 +3,7 @@
 // so a server that omits one renders an empty value instead of crashing.
 
 import type { SessionState } from "./api";
+import { apiHeaders } from "./api";
 import type { RsiPane } from "./rsi";
 import { normalizePane } from "./rsi";
 
@@ -409,7 +410,7 @@ async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(url, {
     signal,
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers: apiHeaders(),
   });
   if (!response.ok) {
     let detail = "";

@@ -276,11 +276,34 @@ export function normalizeSession(value: unknown): SessionDetail {
   };
 }
 
+const TOKEN_KEY = "spawn.serve.token";
+
+/** The token `spawn serve` wants off loopback (`SPAWN_SERVE_TOKEN`): read
+ * once from the page URL's `?token=`, then kept in sessionStorage so a
+ * reload or a link without it still works. */
+const serveToken: string | null = (() => {
+  try {
+    const fromUrl = new URLSearchParams(window.location.search).get("token");
+    if (fromUrl) sessionStorage.setItem(TOKEN_KEY, fromUrl);
+    return sessionStorage.getItem(TOKEN_KEY);
+  } catch {
+    // Storage disabled: the URL is all there is.
+    return new URLSearchParams(window.location.search).get("token");
+  }
+})();
+
+/** Headers of every API read: JSON, plus the serve token when there is one. */
+export function apiHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (serveToken) headers.Authorization = `Bearer ${serveToken}`;
+  return headers;
+}
+
 async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(url, {
     signal,
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers: apiHeaders(),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();

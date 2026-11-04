@@ -2,6 +2,8 @@
 // server that omits one (or sends null) renders an empty value instead of
 // crashing. Read-only: this module only ever issues GET requests.
 
+import { apiHeaders } from "./api";
+
 export const TASK_STATES = [
   "assigned",
   "delivered",
@@ -273,7 +275,7 @@ export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
   const response = await fetch("/api/missions", {
     signal,
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers: apiHeaders(),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return normalizeMissions(await response.json());
