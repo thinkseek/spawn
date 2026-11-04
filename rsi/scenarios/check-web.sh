@@ -14,4 +14,6 @@ done
 [ -d "$controller/web/node_modules" ] || { echo "no node_modules in $controller/web"; exit 1; }
 rm -rf web/node_modules
 ln -s "$controller/web/node_modules" web/node_modules
-cd web && npm run build
+# The controller's node_modules is read-only in the gate's sandbox: Vite
+# loads its config in memory instead of writing it to node_modules/.vite-temp.
+cd web && npm run build -- --configLoader runner
