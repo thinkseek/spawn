@@ -233,17 +233,16 @@ impl Observer {
         let classified = match rules(&input) {
             RulesVerdict::Certain { state } => Self::certain(state, &input, seq),
             RulesVerdict::Ambiguous { ambiguity, guess } => {
-                match self.ambiguous(tracked, session, input, ambiguity, guess, seq) {
-                    Some(classified) => classified,
-                    None => {
-                        // Nothing new to show the model; keep the last answer.
-                        if let Some(tracked) = self.sessions.get_mut(session) {
-                            tracked.judged_seq = seq;
-                            tracked.judged_at = Some(now);
-                        }
-                        return Ok(0);
+                let asked = self.ambiguous(tracked, session, input, ambiguity, guess, seq);
+                let Some(classified) = asked else {
+                    // Nothing new to show the model; keep the last answer.
+                    if let Some(tracked) = self.sessions.get_mut(session) {
+                        tracked.judged_seq = seq;
+                        tracked.judged_at = Some(now);
                     }
-                }
+                    return Ok(0);
+                };
+                classified
             }
         };
         let Classified {
