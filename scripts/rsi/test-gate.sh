@@ -39,6 +39,23 @@ commit() {
 printf 'one\n' >"$seed/value"
 mkdir -p "$seed/judge"
 printf 'keep\n' >"$seed/judge/rule"
+# A crate with tests and lint configuration, for the ratchets.
+mkdir -p "$seed/crates/lib/src"
+printf '[package]\nname = "lib"\n\n[lints.clippy]\nall = "deny"\n' >"$seed/crates/lib/Cargo.toml"
+cat >"$seed/crates/lib/src/lib.rs" <<'EOF'
+#![deny(missing_docs)]
+//! A library.
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one() {}
+
+    #[tokio::test]
+    async fn two() {}
+}
+EOF
+lib=$seed/crates/lib/src/lib.rs
 base=$(commit base)
 
 # The controller's scenarios: a build hook that writes a "binary", a task
@@ -296,6 +313,59 @@ printf '#!/bin/sh\necho "METRIC speed baseline=10 candidate=1"\n' >"$seed/noise.
 twice=$(commit metric-twice)
 expect "two METRIC lines on stdout: no metric" "$(judge "$twice" "$scenarios/008.sh")" 'exit=0 {"verdict":"accepted"}'
 expect "two METRIC lines are reported" "$(cat "$work/gate.out")" 'two or more METRIC lines'
+
+# 7. The candidate may not weaken its own tests: the count of test
+# attributes minus ignores may not fall. A moved test is not a drop.
+branch tests-dropped
+printf 'two\n' >"$seed/value"
+sed -i '/#\[tokio::test\]/,/async fn two/d' "$lib"
+dropped=$(commit tests-dropped)
+expect "a dropped test is refused" "$(judge "$dropped")" 'drops or ignores tests (2 -> 1)'
+branch tests-ignored
+printf 'two\n' >"$seed/value"
+sed -i 's/^    #\[test\]$/    #[test]\n    #[ignore = "flaky"]/' "$lib"
+ignored=$(commit tests-ignored)
+expect "an ignored test is refused" "$(judge "$ignored")" 'drops or ignores tests (2 -> 1)'
+branch tests-cfg-ignored
+printf 'two\n' >"$seed/value"
+sed -i 's/^    #\[tokio::test\]$/    #[tokio::test] #[cfg_attr(all(), ignore)]/' "$lib"
+cfg_ignored=$(commit tests-cfg-ignored)
+expect "a test ignored through cfg_attr is refused" "$(judge "$cfg_ignored")" 'drops or ignores tests'
+branch tests-moved
+printf 'two\n' >"$seed/value"
+sed -i '/#\[tokio::test\]/,/async fn two/d' "$lib"
+mkdir -p "$seed/crates/lib/tests"
+printf '#[tokio::test]\nasync fn two() {}\n' >"$seed/crates/lib/tests/two.rs"
+moved=$(commit tests-moved)
+expect "a moved test is not a drop" "$(judge "$moved")" 'exit=0 {"verdict":"accepted"}'
+
+# 8. Nor relax its lints: [lints] tables, clippy.toml, crate-level allows,
+# a removed crate-level deny.
+branch lints-table
+printf 'two\n' >"$seed/value"
+sed -i 's/^all = "deny"$/all = "allow"/' "$seed/crates/lib/Cargo.toml"
+table=$(commit lints-table)
+expect "a relaxed [lints] table is refused" "$(judge "$table")" 'lint configuration'
+branch lints-clippy-toml
+printf 'two\n' >"$seed/value"
+printf 'too-many-lines-threshold = 1000\n' >"$seed/clippy.toml"
+clippy_toml=$(commit lints-clippy-toml)
+expect "a new clippy.toml is refused" "$(judge "$clippy_toml")" 'lint configuration'
+branch lints-allow
+printf 'two\n' >"$seed/value"
+sed -i '1i #![allow(\n    clippy::all,\n)]' "$lib"
+allowed=$(commit lints-allow)
+expect "a new crate-level allow (multi-line) is refused" "$(judge "$allowed")" 'relaxes crate-level lints'
+branch lints-deny-removed
+printf 'two\n' >"$seed/value"
+sed -i '/#!\[deny(missing_docs)\]/d' "$lib"
+undenied=$(commit lints-deny-removed)
+expect "a removed crate-level deny is refused" "$(judge "$undenied")" 'relaxes crate-level lints'
+branch lints-deny-added
+printf 'two\n' >"$seed/value"
+sed -i '1i #![forbid(unsafe_code)]' "$lib"
+tightened=$(commit lints-deny-added)
+expect "a new crate-level forbid is fine" "$(judge "$tightened")" 'exit=0 {"verdict":"accepted"}'
 
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
