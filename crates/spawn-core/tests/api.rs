@@ -399,6 +399,29 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
 }
 
 #[test]
+fn a_prompt_that_cannot_be_typed_ends_the_execution_as_lost() {
+    let store = store();
+    let mut config = BridgeConfig::new("tester");
+    config.ready_attempts = 2;
+    config.ready_interval = std::time::Duration::from_millis(1);
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        config,
+    );
+    // The pane never shows a ready input box.
+    submit_start(&store, "list the files");
+    bridge.tick().expect("tick succeeds");
+    let names = names(&store);
+    assert!(
+        names.ends_with(&["execution.ended", "command.finished"]),
+        "an engine without its task must not look alive: {names:?}"
+    );
+}
+
+#[test]
 fn bridge_refuses_input_while_a_turn_runs() {
     let store = store();
     let log: Arc<dyn EventLog> = store.clone();

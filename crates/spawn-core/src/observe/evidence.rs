@@ -49,14 +49,10 @@ pub(super) fn attach_context(
     input.perpetual = context.perpetual(session);
 }
 
-/// Whether the screen ends with a question for a person: a line that starts
-/// with `HUMAN:` (after an optional `claude:` speaker tag), below the last
-/// line the user typed. An answered question no longer counts.
-pub fn asks_human(screen_tail: &str) -> bool {
-    human_question(screen_tail).is_some()
-}
-
-/// The last unanswered `HUMAN:` question on the screen, without the tag.
+/// The last unanswered question for a person on the screen, without the
+/// tag: a line that starts with `HUMAN:` (after an optional `claude:` speaker
+/// tag), below the last line the user typed. An answered question no longer
+/// counts.
 pub fn human_question(screen_tail: &str) -> Option<String> {
     let lines: Vec<&str> = screen_tail.lines().collect();
     let start = lines
@@ -103,7 +99,11 @@ fn head_chars(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::asks_human;
+    use super::human_question;
+
+    fn asks_human(screen: &str) -> bool {
+        human_question(screen).is_some()
+    }
 
     #[test]
     fn a_question_for_a_person_is_seen_until_answered() {

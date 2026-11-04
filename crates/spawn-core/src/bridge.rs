@@ -524,7 +524,23 @@ impl Bridge {
             return Ok(Outcome::Failed(report.warnings.join("; ")));
         }
         if engine == Engine::Claude && !prompt.is_empty() {
-            return self.type_prompt(claimed, &active, prompt);
+            let outcome = self.type_prompt(claimed, &active, prompt)?;
+            if let Outcome::Failed(why) = &outcome {
+                // An engine that never got its prompt must not look alive:
+                // whoever started it would wait on it forever.
+                let mut report = TickReport::default();
+                self.end(
+                    &claimed.agent_id,
+                    &claimed.session_id,
+                    &active,
+                    EndCause::Lost,
+                    None,
+                    &mut report,
+                )?;
+                report.warnings.insert(0, why.clone());
+                return Ok(Outcome::Failed(report.warnings.join("; ")));
+            }
+            return Ok(outcome);
         }
         Ok(Outcome::Succeeded)
     }

@@ -34,8 +34,8 @@ mod observer;
 mod snapshot;
 
 pub use classify::{RulesVerdict, rules};
-pub use evidence::{ObservationContext, asks_human, human_question};
-pub use interpret::{attention_reason, narrow, needs_attention};
+pub use evidence::{ObservationContext, human_question};
+pub use interpret::{attention_reason, narrow};
 pub use judge::{HeuristicJudge, JudgeError, JudgeInput, Judgement, StateJudge, TurnFact};
 pub use observer::Observer;
 

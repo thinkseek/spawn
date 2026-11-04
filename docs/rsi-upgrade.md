@@ -11,7 +11,7 @@ be replaced while it runs and which need the engine to stop.
 | runner | Bridge `launch` | parent of the engine | none |
 | Bridge | `spawn tick` or `spawn loop` | one tick or the loop | session map, log cursor |
 | Observer | same process as the Bridge | same | log cursor, per-session tracking |
-| controller | `spawn evolve` | one step | none |
+| integrator | `spawn integrate` | the process | none |
 | hook | the engine, on every event | milliseconds | none |
 | UI server | `spawn serve` | the process | none |
 
@@ -22,9 +22,9 @@ These hold no state that is not rebuildable.
 - **Bridge and Observer.** `recover()` replays `spawn_events` and rebuilds the
   cursor and the session map. A running execution keeps running in its tmux
   pane while the Bridge is down; the next tick folds the events that piled up.
-- **Controller.** All of its state is in `rsi_state`, `rsi_iterations` and
-  `rsi_attempts`. The advisory lock belongs to the connection, so a killed
-  controller never blocks the next one.
+- **Integrator.** Its state is the control stream of the event log (task and
+  mission rows are folds of it). It records a verdict before it moves git, so
+  a killed integrator resumes from the recorded state.
 - **Hook.** Each hook event starts a new process. The settings passed with
   `--settings` hold an absolute path, so replacing the binary changes the hook
   of an already running engine at its next event.
@@ -54,15 +54,14 @@ These are not about process lifetime. They break when two versions meet.
    `spawn_finish` keep the ordering guarantees. A running transaction sees one
    version of a function, so replacing them mid-transaction is safe; a change
    to their meaning is not.
-4. **The prompt contract.** The controller writes the task prompt and the
-   `.spawn/done` marker convention. The engine reads them as plain text. A
-   change here is hot for the controller and cold for the engine only in that
+4. **The prompt contract.** Delivery writes the task prompt and the
+   `.spawn/report.md` convention. The engine reads them as plain text. A
+   change here is hot for the dispatcher and cold for the engine only in that
    the running turn keeps the old instruction.
 
 ## What the loop may improve by itself
 
-- Controller logic and the gate scripts.
-- Scenarios and backlog entries.
+- Integrator and dispatcher logic.
 - The Observer, its judge and its thresholds.
 - The UI and the documentation.
 
