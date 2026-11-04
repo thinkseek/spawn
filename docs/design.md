@@ -300,12 +300,9 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 
 | 步骤 | 命令 |
 | --- | --- |
-| 工具链 | `cargo --version`、`kache --version` |
-| 数据库 | 临时容器 `postgres:16-alpine`，注入 `SPAWN_TEST_DATABASE_URL` |
-| 格式 | `cargo fmt --all -- --check` |
-| 静态检查 | `cargo clippy --workspace --all-targets -- -D warnings` |
-| 测试 | `cargo test --workspace --no-fail-fast` |
-| 端到端 | `scripts/e2e-smoke.sh`：真 PG、真 git、真 tmux、假 Claude 屏，断言 `--ax-screen-reader`、基线树被导出且不含 `.git`、提示落到屏、observation 入库；按阶段打印 calls、total、max 与 submit 到回显的延迟 |
+| 唯一门禁 | `scripts/rsi/gate.sh <repo> <base> <candidate> rsi/scenarios`：`rsi/scenarios/build` 构建，`check-clippy`、`check-tests`（需 `SPAWN_TEST_DATABASE_URL`）、`check-e2e`、`check-blackbox`、`check-web` 逐个必过 |
+| 端到端 | `scripts/mvp-e2e.sh`：真 PG、真 git、真 tmux、脚本化引擎，覆盖整条决策链、任务、落地与目标任务 |
+| 黑盒 | `scripts/blackbox/run-scenarios.sh`：CLI 契约、工作区导出（不含 `.git`）、提示落屏、视图与授权 |
 
 缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 

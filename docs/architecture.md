@@ -150,11 +150,11 @@ spawn status
 ## 8. 验证
 
 ```bash
-scripts/run-gate-on-remote.sh     # 同步到 digest 并跑门禁
-scripts/e2e-smoke.sh       # 真 PG + 真 git + 真 tmux + 假 Claude 屏
+scripts/rsi/gate.sh "$PWD/.git" HEAD HEAD "$PWD/rsi/scenarios"   # 唯一门禁：构建、clippy、测试、e2e、黑盒、web
+scripts/rsi/test-gate.sh                                          # 门禁自身的测试
 ```
 
-门禁顺序：工具链、临时 PG 容器、`cargo fmt --check`、`cargo clippy -D warnings`、`cargo test --workspace`、端到端冒烟。冒烟脚本按阶段计时，输出 calls、total、max 三列，并单列 `submit` 到屏上回显的延迟。
+检查项都是 `rsi/scenarios/check-*.sh` 场景，见 fleet-architecture.md §10.2。
 
 ## 9. 依赖约束
 
