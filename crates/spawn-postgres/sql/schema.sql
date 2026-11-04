@@ -260,17 +260,17 @@ create index if not exists spawn_commands_open
     on spawn_commands (session_id, id)
     where state <> 'finished';
 
-create table if not exists spawn_grants (
-    principal text not null,
-    agent_id  text not null,
-    primary key (principal, agent_id)
-);
-
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
 -- pattern such as `agent_worker_*`, so the supervisor can command every worker
--- without being able to command the RSI agent or itself.
-alter table spawn_grants add column if not exists scope text not null default 'all';
+-- without being able to command itself.
+create table if not exists spawn_grants (
+    principal text not null,
+    agent_id  text not null,
+    scope     text not null default 'all',
+    primary key (principal, agent_id)
+);
+
 
 create or replace function spawn_grant_matches(p_pattern text, p_agent text)
 returns boolean language sql immutable as $$
@@ -698,15 +698,14 @@ declare
         'exists (select 1 from spawn_grants g where g.principal = session_user::text'
         ' and spawn_grant_matches(g.agent_id, r.agent_id))';
 begin
-    foreach v_view in array array['state', 'status', 'tasks', 'relations', 'freshness'] loop
+    foreach v_view in array array['state', 'status', 'tasks', 'freshness'] loop
         execute format(
             'create or replace function spawn_read_%1$s() returns setof agent_%1$s'
             ' language sql stable security definer set search_path = %2$I, pg_temp'
             ' as $f$ select r.* from agent_%1$s r where %3$s $f$',
             v_view, current_schema(), v_filter);
     end loop;
-    foreach v_view in array array['timeline', 'judgements', 'executions', 'artifacts',
-                                  'task_events', 'lineage', 'open_tools'] loop
+    foreach v_view in array array['timeline', 'judgements'] loop
         execute format(
             'create or replace function spawn_read_%1$s(p_session text) returns setof agent_%1$s'
             ' language sql stable security definer set search_path = %2$I, pg_temp'
@@ -715,6 +714,14 @@ begin
     end loop;
 end
 $$;
+
+-- Readers nothing calls are not kept.
+drop function if exists spawn_read_relations();
+drop function if exists spawn_read_executions(text);
+drop function if exists spawn_read_artifacts(text);
+drop function if exists spawn_read_task_events(text);
+drop function if exists spawn_read_lineage(text);
+drop function if exists spawn_read_open_tools(text);
 
 -- RSI controller state.
 --
@@ -838,7 +845,22 @@ create table if not exists mission_missions (
                   check (state in ('open', 'active', 'done', 'dropped')),
     summary       text,
     created_at_ms bigint not null,
-    updated_at_ms bigint not null
+    updated_at_ms bigint not null,
+    -- Landing (§10.3): a gate (a scenarios directory in the controller's
+    -- checkout) lands the tasks' work on the source, after the supervisor's
+    -- review (`review`) or on the gate alone (`gate`). `baseline` is where
+    -- the last landing left the source's main; `halted` holds the reason a
+    -- halt rule fired, until a human resumes the mission.
+    gate            text,
+    accept          text    not null default 'review' check (accept in ('review', 'gate')),
+    budget          jsonb,
+    baseline        text,
+    halted          text,
+    scenario_floor  integer not null default 0,
+    gate_rejections integer not null default 0,
+    gate_aborts     integer not null default 0,
+    -- An objective mission (§10.4): `{"backlog": <dir>, "resident": <name>}`.
+    objectives      jsonb
 );
 
 create table if not exists mission_residents (
@@ -870,45 +892,20 @@ create table if not exists mission_tasks (
     report        text,
     created_by    text   not null,
     created_at_ms bigint not null,
-    updated_at_ms bigint not null
+    updated_at_ms bigint not null,
+    -- Landing: the commit the gate judged and its base, the gate's log and
+    -- metric, and, for an objective task, the objective and its scenario.
+    base            text,
+    candidate       text,
+    gate_log        text,
+    metric          text,
+    objective       integer,
+    scenario        text,
+    delivered_at_ms bigint
 );
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
 
--- Landing (§10.3). A mission with a gate (a scenarios directory in the
--- controller's checkout) lands its tasks' work on its source: after the
--- supervisor's review (`accept` = review) or on the gate alone (`gate`).
--- `baseline` is where the last landing left the source's main; `halted`
--- holds the reason a halt rule fired, until a human resumes the mission.
-alter table mission_missions add column if not exists gate text;
-alter table mission_missions add column if not exists accept text not null default 'review';
-alter table mission_missions add column if not exists budget jsonb;
-alter table mission_missions add column if not exists baseline text;
-alter table mission_missions add column if not exists halted text;
-alter table mission_missions add column if not exists scenario_floor integer not null default 0;
-alter table mission_missions add column if not exists gate_rejections integer not null default 0;
-alter table mission_missions add column if not exists gate_aborts integer not null default 0;
--- An objective mission (§10.4): `{"backlog": <dir>, "resident": <name>}`.
--- The integrator gives the resident the lowest open backlog objective, one
--- task at a time; the backlog lives in the controller's checkout.
-alter table mission_missions add column if not exists objectives jsonb;
-alter table mission_missions drop constraint if exists mission_missions_accept_check;
-alter table mission_missions add constraint mission_missions_accept_check
-    check (accept in ('review', 'gate'));
-
--- A task's landing: the commit the gate judged and its base, the gate's
--- log, and, for an objective task, the backlog objective and its scenario.
-alter table mission_tasks add column if not exists base text;
-alter table mission_tasks add column if not exists candidate text;
-alter table mission_tasks add column if not exists gate_log text;
-alter table mission_tasks add column if not exists metric text;
-alter table mission_tasks add column if not exists objective integer;
-alter table mission_tasks add column if not exists scenario text;
-alter table mission_tasks add column if not exists delivered_at_ms bigint;
-alter table mission_tasks drop constraint if exists mission_tasks_state_check;
-alter table mission_tasks add constraint mission_tasks_state_check
-    check (state in ('assigned', 'delivered', 'reported', 'revise',
-                     'accepted', 'cancelled', 'landing', 'landed'));
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login.
@@ -1322,7 +1319,6 @@ begin
 end $$;
 
 -- Landing settings and halts are a human's (§10.3): the owner's login only.
-drop function if exists spawn_mission_configure(bigint, text, text, jsonb);
 create or replace function spawn_mission_configure(p_mission bigint, p_gate text, p_accept text,
                                                    p_budget jsonb, p_objectives jsonb)
 returns void language plpgsql security definer as $$
@@ -1382,39 +1378,8 @@ begin
     return v_id;
 end $$;
 
--- A landed attempt of the retired RSI controller, imported once as a landed
--- objective task (owner only), so objective status carries over.
-create or replace function spawn_objective_import(p_mission bigint, p_objective integer,
-                                                  p_metric text, p_note text, p_at bigint)
-returns boolean language plpgsql security definer as $$
-declare
-    v_agent text;
-    v_session text;
-begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
-    if spawn_mission_caller() is distinct from 'owner' then
-        raise exception '% may not import attempts', session_user using errcode = '42501';
-    end if;
-    if exists (select 1 from mission_tasks where mission_id = p_mission and objective = p_objective
-                 and created_by = 'rsi' and created_at_ms = p_at) then
-        return false;
-    end if;
-    select r.agent_id, r.session_id into v_agent, v_session
-      from mission_missions m join mission_residents r on r.name = m.objectives ->> 'resident'
-     where m.id = p_mission;
-    if v_agent is null then
-        raise exception 'mission % has no objectives resident', p_mission;
-    end if;
-    perform spawn_control_record(jsonb_build_object(
-        'type', 'legacy.imported', 'table', 'mission_tasks', 'row', jsonb_build_object(
-            'id', nextval(pg_get_serial_sequence('mission_tasks', 'id')), 'mission_id', p_mission,
-            'kind', 'resident', 'agent_id', v_agent, 'session_id', v_session,
-            'brief', coalesce(p_note, 'RSI attempt'), 'state', 'landed', 'revisions', 0,
-            'created_by', 'rsi', 'created_at_ms', p_at, 'updated_at_ms', p_at,
-            'objective', p_objective, 'metric', p_metric)));
-    return true;
-end $$;
+-- The one-time import of the retired RSI controller's attempts has run.
+drop function if exists spawn_objective_import(bigint, integer, text, text, bigint);
 
 create or replace function spawn_mission_resume(p_mission bigint)
 returns void language plpgsql security definer as $$
@@ -1495,6 +1460,9 @@ end
 $$;
 
 revoke all on mission_missions, mission_residents, mission_tasks from public;
+-- Every mission function: search_path pinned, closed to public. The
+-- supervisor may call the ones it decides with; the rest are the owner's
+-- (humans, the dispatcher, the integrator).
 do $$
 declare
     v_function text;
@@ -1503,24 +1471,21 @@ begin
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text)', 'spawn_task_review(bigint, boolean, text)',
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
-        'spawn_resident_approve(text)', 'spawn_resident_retire(text)',
+        'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
-        'spawn_objective_assign(bigint, integer, text, text)',
-        'spawn_objective_import(bigint, integer, text, text, bigint)'] loop
+        'spawn_objective_assign(bigint, integer, text, text)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
-        if v_function not in ('spawn_resident_approve(text)', 'spawn_task_delivered(bigint, bigint)',
-                              'spawn_task_reported(bigint, text)', 'spawn_control_apply(jsonb, bigint)',
-                              'spawn_control_record(jsonb)', 'spawn_control_refold()',
-                              'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
-                              'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
-                              'spawn_objective_assign(bigint, integer, text, text)',
-                              'spawn_objective_import(bigint, integer, text, text, bigint)') then
-            execute format('grant execute on function %s to spawn_supervisor', v_function);
-        end if;
+    end loop;
+    foreach v_function in array array[
+        'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
+        'spawn_task_assign(bigint, text, text, text)', 'spawn_task_review(bigint, boolean, text)',
+        'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
+        'spawn_resident_retire(text)'] loop
+        execute format('grant execute on function %s to spawn_supervisor', v_function);
     end loop;
 end
 $$;

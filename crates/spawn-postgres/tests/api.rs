@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use postgres::{Client, NoTls};
+use postgres::Client;
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
@@ -23,27 +23,9 @@ use spawn_core::id::{
 };
 use spawn_core::observation::{Confidence, Observation, SemanticState};
 use spawn_core::port::{CommandQueue, EventLog};
-use spawn_postgres::PostgresStore;
 
-fn url() -> String {
-    std::env::var("SPAWN_TEST_DATABASE_URL")
-        .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip")
-}
-
-/// Store in a schema of its own.
-fn store(case: &str) -> (PostgresStore, String) {
-    let schema = format!("spawn_test_{}_{case}", std::process::id());
-    let store = PostgresStore::connect_in_schema(&url(), &schema).expect("connect and migrate");
-    (store, schema)
-}
-
-fn admin(schema: &str) -> Client {
-    let mut client = Client::connect(&url(), NoTls).expect("admin connection");
-    client
-        .batch_execute(&format!("set search_path to {schema}"))
-        .expect("select the schema");
-    client
-}
+mod common;
+use common::{admin, store};
 
 fn agent() -> AgentId {
     AgentId::new("agent_one").expect("valid agent")

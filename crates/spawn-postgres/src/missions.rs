@@ -3,13 +3,158 @@
 //! Every decision goes through the checked SQL functions, so the supervisor's
 //! restricted login and the owner's CLI share one set of rules. The
 //! dispatcher's delivery bookkeeping (delivered, reported) runs as the owner.
-//! The SQL is in [`crate::queries::missions`].
 
 use serde_json::Value;
 use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
-use crate::queries::missions;
+
+/// One task the dispatcher has to look at, with what it needs to deliver it.
+pub(crate) const DELIVERY_TASKS: &str = r"
+select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
+from (
+  select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
+         k.revisions, k.review_note, k.command_id,
+         m.text as mission_text, m.sources as mission_sources,
+         m.gate is not null as gated,
+         r.charter, r.name as resident
+    from mission_tasks k
+    join mission_missions m on m.id = k.mission_id
+    left join mission_residents r on r.agent_id = k.agent_id
+   where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
+      or (k.state = 'accepted' and m.gate is not null)
+      or (k.state in ('accepted', 'cancelled', 'landed') and k.kind = 'ephemeral'
+          and k.updated_at_ms > spawn_now_ms() - 86400000)
+) t";
+
+/// What the supervisor should hear about, beyond worker states: open
+/// missions, reports, residents approved, and human messages to workers.
+pub(crate) const MISSION_NEWS: &str = r"
+select jsonb_build_object(
+  'missions', coalesce((select jsonb_agg(jsonb_build_object(
+                 'id', m.id, 'text', left(m.text, 400), 'origin', m.origin,
+                 'sources', m.sources) order by m.id)
+               from mission_missions m where m.state = 'open'), '[]'::jsonb),
+  'reports', coalesce((select jsonb_agg(jsonb_build_object(
+                 'id', k.id, 'mission_id', k.mission_id, 'kind', k.kind,
+                 'agent_id', k.agent_id, 'session_id', k.session_id,
+                 'report', left(k.report, 600)) order by k.id)
+               from mission_tasks k where k.state = 'reported'), '[]'::jsonb),
+  'approved', coalesce((select jsonb_agg(jsonb_build_object('name', r.name) order by r.name)
+               from mission_residents r
+              where r.state = 'approved'
+                and r.updated_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb),
+  'proposed', coalesce((select jsonb_agg(jsonb_build_object(
+                 'name', r.name, 'charter', left(r.charter, 400)) order by r.name)
+               from mission_residents r where r.state = 'proposed'), '[]'::jsonb),
+  'human', coalesce((select jsonb_agg(jsonb_build_object(
+                 'command_id', c.id, 'session_id', c.session_id,
+                 'text', left(coalesce(c.action ->> 'text', c.action ->> 'prompt', c.action ->> 'type'), 200))
+                 order by c.id)
+               from spawn_commands c
+              where c.principal = 'human'
+                and (c.agent_id like 'agent\_worker\_%' or c.agent_id like 'agent\_resident\_%')
+                and c.created_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb)
+)";
+
+/// The board of missions with their tasks, newest first.
+pub(crate) const MISSION_BOARD: &str = r"
+select jsonb_build_object(
+  'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
+      select m.id, m.text, m.origin, m.sources, m.state, m.summary,
+             m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
+             m.created_at_ms, m.updated_at_ms,
+             coalesce((select jsonb_agg(jsonb_build_object(
+                 'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
+                 'session_id', k.session_id, 'brief', left(k.brief, 600),
+                 'state', k.state, 'revisions', k.revisions,
+                 'review_note', k.review_note, 'report', k.report,
+                 'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
+                 'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
+                 'updated_at_ms', k.updated_at_ms) order by k.id)
+               from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
+        from mission_missions m
+       order by m.id desc limit $1) x), '[]'::jsonb),
+  'residents', coalesce((select jsonb_agg(row_to_json(r) order by r.name) from (
+      select name, agent_id, session_id, charter, state, proposed_by, approved_by,
+             created_at_ms, updated_at_ms from mission_residents) r), '[]'::jsonb)
+)";
+
+// Checked decisions, one SQL function each.
+
+/// An objective mission's landed tasks: `[{objective, metric}]`, newest
+/// first. `$1` mission.
+pub(crate) const OBJECTIVE_LANDINGS: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric', k.metric)
+                          order by k.updated_at_ms desc, k.id desc), '[]'::jsonb)
+  from mission_tasks k
+ where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
+
+/// Gate verdicts on one objective's tasks, newest first, from the control
+/// stream: `[{task, verdict, reason, metric, at_ms}]`. `$1` mission,
+/// `$2` objective, `$3` limit.
+pub(crate) const OBJECTIVE_HISTORY: &str = r"
+select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
+  from (select e.session_seq as seq,
+               jsonb_build_object('task', (r ->> 'id')::bigint, 'verdict', r ->> 'verdict',
+                                  'reason', r ->> 'reason', 'metric', r ->> 'metric',
+                                  'at_ms', e.recorded_at_ms) as h
+          from spawn_events e
+         cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and r ->> 'type' = 'task.gated' and r ->> 'verdict' in ('accepted', 'rejected', 'aborted')
+           and (r ->> 'id')::bigint in (select id from mission_tasks
+                                         where mission_id = $1 and objective = $2)
+         order by e.session_seq desc
+         limit $3) z";
+
+/// Missions with a gate that are still open, with their tasks the
+/// integrator may have to act on.
+pub(crate) const GATED: &str = r"
+select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
+from (
+  select m.id, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
+         m.gate_rejections, m.gate_aborts, m.objectives, m.sources ->> 0 as source,
+         coalesce((select jsonb_agg(jsonb_build_object(
+                     'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
+                     'session_id', k.session_id, 'state', k.state, 'base', k.base,
+                     'candidate', k.candidate, 'scenario', k.scenario,
+                     'objective', k.objective, 'delivered_at_ms', k.delivered_at_ms)
+                     order by k.id)
+                   from mission_tasks k
+                  where k.mission_id = m.id
+                    and k.state in ('assigned', 'delivered', 'reported', 'revise',
+                                    'accepted', 'landing')), '[]'::jsonb) as tasks
+    from mission_missions m
+   where m.gate is not null and m.state in ('open', 'active')
+) x";
+
+/// Tool calls a session started after a moment. `$1` session, `$2` ms.
+pub(crate) const TOOL_CALLS_SINCE: &str = "select count(*) from spawn_events
+                  where session_id = $1 and event_name = 'tool.started' and recorded_at_ms > $2";
+
+// Residents and workspaces.
+
+/// Approved residents that have run before, as (agent, session, charter).
+pub(crate) const RESIDENTS_TO_KEEP: &str = "select r.agent_id, r.session_id, r.charter
+                   from mission_residents r
+                  where r.state = 'approved'
+                    and exists (select 1 from spawn_events e
+                                 where e.session_id = r.session_id
+                                   and e.event_name = 'execution.started')
+                  order by r.name";
+
+/// Retired residents, as (agent, session).
+pub(crate) const RETIRED_RESIDENTS: &str =
+    "select agent_id, session_id from mission_residents where state = 'retired'";
+
+/// First source of the mission behind an agent's first task. `$1` agent.
+pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
+                   from mission_tasks k join mission_missions m on m.id = k.mission_id
+                  where k.agent_id = $1
+                  order by k.id limit 1";
+
+// Delivery bookkeeping, run by the dispatcher as the owner.
 
 /// Checked decisions.
 impl PostgresStore {
@@ -21,7 +166,10 @@ impl PostgresStore {
         sources: &Value,
         origin: &str,
     ) -> Result<i64, StoreError> {
-        let row = self.query_one(missions::MISSION_ADD, &[&text, sources, &origin])?;
+        let row = self.query_one(
+            "select spawn_mission_add($1, $2, $3)",
+            &[&text, sources, &origin],
+        )?;
         Ok(row.get(0))
     }
 
@@ -32,7 +180,10 @@ impl PostgresStore {
         state: &str,
         summary: &str,
     ) -> Result<(), StoreError> {
-        self.execute(missions::MISSION_CLOSE, &[&mission, &state, &summary])?;
+        self.execute(
+            "select spawn_mission_close($1, $2, $3)",
+            &[&mission, &state, &summary],
+        )?;
         Ok(())
     }
 
@@ -47,7 +198,7 @@ impl PostgresStore {
         objectives: Option<&Value>,
     ) -> Result<(), StoreError> {
         self.execute(
-            missions::MISSION_CONFIGURE,
+            "select spawn_mission_configure($1, $2, $3, $4, $5)",
             &[&mission, &gate, &accept, &budget, &objectives],
         )?;
         Ok(())
@@ -63,33 +214,15 @@ impl PostgresStore {
     ) -> Result<i64, StoreError> {
         Ok(self
             .query_one(
-                missions::OBJECTIVE_ASSIGN,
+                "select spawn_objective_assign($1, $2, $3, $4)",
                 &[&mission, &objective, &scenario, &brief],
-            )?
-            .get(0))
-    }
-
-    /// Import one landed attempt of the retired RSI controller; false when
-    /// it was imported before.
-    pub fn objective_import(
-        &self,
-        mission: i64,
-        objective: i32,
-        metric: Option<&str>,
-        note: &str,
-        at_ms: i64,
-    ) -> Result<bool, StoreError> {
-        Ok(self
-            .query_one(
-                missions::OBJECTIVE_IMPORT,
-                &[&mission, &objective, &metric, &note, &at_ms],
             )?
             .get(0))
     }
 
     /// An objective mission's landed tasks, newest first.
     pub fn objective_landings(&self, mission: i64) -> Result<Value, StoreError> {
-        self.query_json(missions::OBJECTIVE_LANDINGS, &[&mission])
+        self.query_json(OBJECTIVE_LANDINGS, &[&mission])
     }
 
     /// Gate verdicts on one objective's tasks, newest first.
@@ -99,31 +232,31 @@ impl PostgresStore {
         objective: i32,
         limit: i64,
     ) -> Result<Value, StoreError> {
-        self.query_json(missions::OBJECTIVE_HISTORY, &[&mission, &objective, &limit])
+        self.query_json(OBJECTIVE_HISTORY, &[&mission, &objective, &limit])
     }
 
     /// Clear a halted mission. A human's decision: owner only.
     pub fn mission_resume(&self, mission: i64) -> Result<(), StoreError> {
-        self.execute(missions::MISSION_RESUME, &[&mission])?;
+        self.execute("select spawn_mission_resume($1)", &[&mission])?;
         Ok(())
     }
 
     /// Record a gate verdict, a landing, an abort or a halt (owner only).
     pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
-            .query_one(missions::INTEGRATOR_RECORD, &[record])?
+            .query_one("select spawn_integrator_record($1)", &[record])?
             .get(0))
     }
 
     /// Open missions with a gate and the tasks the integrator may act on.
     pub fn gated_missions(&self) -> Result<Value, StoreError> {
-        self.query_json(missions::GATED, &[])
+        self.query_json(GATED, &[])
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.
     pub fn tool_calls_since(&self, session: &str, since_ms: i64) -> Result<i64, StoreError> {
         Ok(self
-            .query_one(missions::TOOL_CALLS_SINCE, &[&session, &since_ms])?
+            .query_one(TOOL_CALLS_SINCE, &[&session, &since_ms])?
             .get(0))
     }
 
@@ -135,37 +268,43 @@ impl PostgresStore {
         worker: &str,
         brief: &str,
     ) -> Result<i64, StoreError> {
-        let row = self.query_one(missions::TASK_ASSIGN, &[&mission, &kind, &worker, &brief])?;
+        let row = self.query_one(
+            "select spawn_task_assign($1, $2, $3, $4)",
+            &[&mission, &kind, &worker, &brief],
+        )?;
         Ok(row.get(0))
     }
 
     /// Accept a report, or send the task back with a note.
     pub fn task_review(&self, task: i64, accept: bool, note: &str) -> Result<(), StoreError> {
-        self.execute(missions::TASK_REVIEW, &[&task, &accept, &note])?;
+        self.execute(
+            "select spawn_task_review($1, $2, $3)",
+            &[&task, &accept, &note],
+        )?;
         Ok(())
     }
 
     /// Cancel a task that is not closed yet.
     pub fn task_cancel(&self, task: i64) -> Result<(), StoreError> {
-        self.execute(missions::TASK_CANCEL, &[&task])?;
+        self.execute("select spawn_task_cancel($1)", &[&task])?;
         Ok(())
     }
 
     /// Propose a resident (or revise a pending proposal).
     pub fn resident_propose(&self, name: &str, charter: &str) -> Result<(), StoreError> {
-        self.execute(missions::RESIDENT_PROPOSE, &[&name, &charter])?;
+        self.execute("select spawn_resident_propose($1, $2)", &[&name, &charter])?;
         Ok(())
     }
 
     /// Approve a proposed resident. Only the owner's login (a human) may.
     pub fn resident_approve(&self, name: &str) -> Result<(), StoreError> {
-        self.execute(missions::RESIDENT_APPROVE, &[&name])?;
+        self.execute("select spawn_resident_approve($1)", &[&name])?;
         Ok(())
     }
 
     /// Retire a resident; its queued tasks are cancelled.
     pub fn resident_retire(&self, name: &str) -> Result<(), StoreError> {
-        self.execute(missions::RESIDENT_RETIRE, &[&name])?;
+        self.execute("select spawn_resident_retire($1)", &[&name])?;
         Ok(())
     }
 }
@@ -174,23 +313,23 @@ impl PostgresStore {
 impl PostgresStore {
     /// Missions with their tasks, and the resident roster.
     pub fn mission_board(&self, limit: i64) -> Result<Value, StoreError> {
-        self.query_json(missions::MISSION_BOARD, &[&limit])
+        self.query_json(MISSION_BOARD, &[&limit])
     }
 
     /// Tasks the dispatcher has to deliver, watch or wind down.
     pub fn delivery_rows(&self) -> Result<Value, StoreError> {
-        self.query_json(missions::DELIVERY_TASKS, &[])
+        self.query_json(DELIVERY_TASKS, &[])
     }
 
     /// Missions, reports, approvals and human messages for the digest.
     pub fn mission_news(&self) -> Result<Value, StoreError> {
-        self.query_json(missions::MISSION_NEWS, &[])
+        self.query_json(MISSION_NEWS, &[])
     }
 
     /// Approved residents that have run before: the ones the liveness rule
     /// keeps, as (agent, session, charter).
     pub fn residents_to_keep(&self) -> Result<Vec<(String, String, String)>, StoreError> {
-        let rows = self.query(missions::RESIDENTS_TO_KEEP, &[])?;
+        let rows = self.query(RESIDENTS_TO_KEEP, &[])?;
         Ok(rows
             .iter()
             .map(|row| (row.get(0), row.get(1), row.get(2)))
@@ -199,7 +338,7 @@ impl PostgresStore {
 
     /// Residents that are retired, for winding down their sessions.
     pub fn retired_residents(&self) -> Result<Vec<(String, String)>, StoreError> {
-        let rows = self.query(missions::RETIRED_RESIDENTS, &[])?;
+        let rows = self.query(RETIRED_RESIDENTS, &[])?;
         Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
     }
 
@@ -208,7 +347,7 @@ impl PostgresStore {
     /// workspace), `Some(Some(source))` otherwise. The agent's first task
     /// decides, so a resident's workspace never jumps between sources.
     pub fn agent_source(&self, agent: &str) -> Result<Option<Option<String>>, StoreError> {
-        let rows = self.query(missions::AGENT_SOURCE, &[&agent])?;
+        let rows = self.query(AGENT_SOURCE, &[&agent])?;
         Ok(rows.first().map(|row| row.get::<_, Option<String>>(0)))
     }
 }
@@ -217,13 +356,13 @@ impl PostgresStore {
 impl PostgresStore {
     /// Record that a task's delivery command was submitted.
     pub fn task_delivered(&self, task: i64, command: i64) -> Result<(), StoreError> {
-        self.execute(missions::TASK_DELIVERED, &[&task, &command])?;
+        self.execute("select spawn_task_delivered($1, $2)", &[&task, &command])?;
         Ok(())
     }
 
     /// Store a delivered task's report.
     pub fn task_reported(&self, task: i64, report: &str) -> Result<bool, StoreError> {
-        let row = self.query_one(missions::TASK_REPORTED, &[&task, &report])?;
+        let row = self.query_one("select spawn_task_reported($1, $2)", &[&task, &report])?;
         Ok(row.get(0))
     }
 }
@@ -233,12 +372,11 @@ mod tests {
     use spawn_core::mission::TaskState;
 
     /// The values allowed by the check constraint on `mission_tasks.state`,
-    /// read from the schema text: the constraint as the migration re-adds
-    /// it, which is what every database ends up with.
+    /// read from the schema text.
     fn constrained_task_states() -> Vec<String> {
         let table = crate::SCHEMA
-            .split_once("add constraint mission_tasks_state_check")
-            .expect("the schema re-adds the state constraint")
+            .split_once("create table if not exists mission_tasks (")
+            .expect("the schema creates mission_tasks")
             .1;
         let list = table
             .split_once("check (state in (")

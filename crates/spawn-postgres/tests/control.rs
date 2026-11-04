@@ -5,28 +5,11 @@
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`); every case runs
 //! in a schema of its own.
 
-use postgres::{Client, NoTls};
+use postgres::Client;
 use serde_json::json;
-use spawn_postgres::PostgresStore;
 
-fn url() -> String {
-    std::env::var("SPAWN_TEST_DATABASE_URL")
-        .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip")
-}
-
-fn store(case: &str) -> (PostgresStore, String) {
-    let schema = format!("spawn_test_{}_{case}", std::process::id());
-    let store = PostgresStore::connect_in_schema(&url(), &schema).expect("connect and migrate");
-    (store, schema)
-}
-
-fn admin(schema: &str) -> Client {
-    let mut client = Client::connect(&url(), NoTls).expect("admin connection");
-    client
-        .batch_execute(&format!("set search_path to {schema}"))
-        .expect("select the schema");
-    client
-}
+mod common;
+use common::{admin, store};
 
 /// Every row of the three tables, in a stable order.
 fn tables(client: &mut Client) -> serde_json::Value {
@@ -351,29 +334,6 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
         .expect("propose");
     store.resident_approve("rsi").expect("approve");
 
-    assert!(
-        store
-            .objective_import(
-                mission,
-                2,
-                Some("METRIC x baseline=2 candidate=1"),
-                "old",
-                1000
-            )
-            .expect("import")
-    );
-    assert!(
-        !store
-            .objective_import(
-                mission,
-                2,
-                Some("METRIC x baseline=2 candidate=1"),
-                "old",
-                1000
-            )
-            .expect("import again"),
-        "an attempt is imported once"
-    );
     let task = store
         .objective_assign(
             mission,
@@ -391,10 +351,10 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
         )
         .expect("a verdict");
 
-    let landings = store.objective_landings(mission).expect("landings");
     assert_eq!(
-        landings,
-        json!([{"objective": 2, "metric": "METRIC x baseline=2 candidate=1"}])
+        store.objective_landings(mission).expect("landings"),
+        json!([]),
+        "nothing landed yet"
     );
     let history = store.objective_history(mission, 2, 6).expect("history");
     assert_eq!(history[0]["task"], task);
@@ -403,10 +363,10 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
 
     let mut client = admin(&schema);
     let live = tables(&mut client);
-    assert_eq!(live["tasks"][1]["agent_id"], "agent_resident_rsi");
-    assert_eq!(live["tasks"][1]["created_by"], "spawn-integrate");
+    assert_eq!(live["tasks"][0]["agent_id"], "agent_resident_rsi");
+    assert_eq!(live["tasks"][0]["created_by"], "spawn-integrate");
     assert_eq!(
-        live["tasks"][1]["scenario"],
+        live["tasks"][0]["scenario"],
         "/controller/rsi/scenarios/002.sh"
     );
     refold(&mut client);
