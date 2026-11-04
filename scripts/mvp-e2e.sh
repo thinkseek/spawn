@@ -314,7 +314,15 @@ observation session_worker_c | jq -e '.state == "WAITING" and .judge == "jev"' >
   fail "the stub should have called worker c a harmless WAITING"
 wait_for 60 "a digest about worker c" digest_has session_worker_c
 submit human session_worker_c '{"type":"input","text":"E2E:WORK eu-west"}'
-resolved() { observation session_worker_c | jq -e '(.attention // false) == false'; }
+# Resolved: a judgement after the question's has no attention. Not the
+# latest judgement: the question stays on the screen, so the finished turn
+# raises attention again, and the clear one lasts only while the tool runs
+# (0.3 s, shorter than a poll).
+resolved() {
+  tail_of session_worker_c | jq -e '
+    .judgements | (map(.attention_reason == "human_question") | index(true)) as $asked
+    | $asked != null and (.[$asked + 1:] | any(.attention == false))'
+}
 wait_for 60 "worker c's attention to clear after the human answer" resolved
 pass "a HUMAN: question reached attention and a human command resolved it"
 
