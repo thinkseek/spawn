@@ -228,7 +228,7 @@ HALT 是粘性的：`spawn evolve` 在开新迭代之前先检查，重启不会
 - **不写 `rsi.*` 事件。** 封闭枚举，写进去产品链路就停。
 - **不把白盒测试当判据。** 白盒测形状，RSI 改形状。
 - **不从事件里取 commit id。** 事件可伪造，且无改动时不写。
-- **不做不可重启的 daemon。** `spawn loop`（Bridge、Observer、supervisor 存活规则）和 `spawn rsi-loop`（`evolve`）各是一个进程，状态全在库里或事件日志里，杀掉即重启，不丢工作。拉起交给 systemd（`deploy/systemd/`），单元直接运行 `spawn`，不经包装脚本：`KillMode=process` 只杀主进程，主进程若是脚本，旧的 `spawn loop` 会留下来跟新的并跑。哪些部分能边跑边换、哪些必须停机，见 [rsi-upgrade.md](rsi-upgrade.md)。
+- **不做不可重启的 daemon。** `spawn loop`（Bridge、Observer、supervisor 存活规则）和 `spawn rsi-loop`（`evolve`）各是一个进程，状态全在库里或事件日志里，杀掉即重启，不丢工作。拉起交给 systemd（`deploy/systemd/`），单元直接运行 `spawn`，不经包装脚本：`KillMode=process` 只杀主进程，主进程若是脚本，旧的 `spawn loop` 会留下来跟新的并跑。哪些部分能边跑边换、哪些必须停机，见 [upgrading.md](upgrading.md)。
 - **不做并行种群。** 门禁是 pass/fail，选不出更好的那个。
 - **不让 agent 改 backlog、场景或门禁脚本。**
 - **不用 FUSE。** 内核的 overlay 在这个存储驱动上挂不上，`SYS_ADMIN` 又抵消隔离；`git archive` 已经够用。
