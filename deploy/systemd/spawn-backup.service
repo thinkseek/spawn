@@ -1,0 +1,19 @@
+[Unit]
+Description=Spawn: encrypted pg_dump of the event log to Cloudflare R2 (deploy/backup)
+After=docker.service
+# Retry a failed run (proxy or network down) twice, 15 minutes apart.
+StartLimitIntervalSec=2h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+# The scripts are installed copies (deploy/backup/README.md), like bin/spawn.
+ExecStart=%h/.local/share/spawn-rsi/bin/backup/pg-backup.sh
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=https_proxy=http://127.0.0.1:10801 HTTPS_PROXY=http://127.0.0.1:10801
+Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+Restart=on-failure
+RestartSec=15min
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
