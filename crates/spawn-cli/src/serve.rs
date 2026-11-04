@@ -334,7 +334,10 @@ fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
 /// The RSI line of `/api/overview`: the first open objective mission, its
 /// open task and how many objectives are settled.
 fn rsi_summary(mission: &Value) -> Value {
-    let objectives = mission["objectives"].as_array().cloned().unwrap_or_default();
+    let objectives = mission["objectives"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let count = |status: &str| {
         objectives
             .iter()
@@ -645,5 +648,109 @@ fn content_type(path: &str) -> &'static str {
         Some("json") => "application/json; charset=utf-8",
         Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{objective_json, rsi_summary};
+    use crate::objectives::Task;
+
+    fn objective(id: u32, recurring: bool) -> Task {
+        Task {
+            id,
+            title: format!("objective {id}"),
+            prompt: "do it".to_string(),
+            recurring,
+            metric: recurring.then(|| "ingest_total_ns".to_string()),
+            unit: "ns".to_string(),
+            lower_is_better: true,
+            target: recurring.then_some(1100.0),
+        }
+    }
+
+    fn task(
+        id: i64,
+        objective: u32,
+        state: &str,
+        at: i64,
+        metric: Option<&str>,
+    ) -> serde_json::Value {
+        json!({"id": id, "objective": objective, "state": state, "updated_at_ms": at,
+               "metric": metric, "revisions": 0, "gates": []})
+    }
+
+    #[test]
+    fn objectives_read_their_status_from_landed_tasks() {
+        let tasks = [
+            task(13, 2, "revise", 40, None),
+            task(
+                12,
+                2,
+                "landed",
+                30,
+                Some("METRIC ingest_total_ns baseline=1200 candidate=1021"),
+            ),
+            task(
+                11,
+                2,
+                "landed",
+                20,
+                Some("METRIC ingest_total_ns baseline=1573 candidate=1200"),
+            ),
+            task(10, 1, "landed", 10, None),
+        ];
+        let one_shot = objective_json(&objective(1, false), &tasks);
+        assert_eq!(one_shot["status"], "solved");
+        let recurring = objective_json(&objective(2, true), &tasks);
+        assert_eq!(recurring["status"], "met");
+        assert_eq!(recurring["current"], 1021.0);
+        assert_eq!(recurring["tasks"], json!([13, 12, 11]));
+        let landings = recurring["landings"].as_array().expect("landings");
+        assert_eq!(landings.len(), 2);
+        // Oldest first: the chart reads them in order.
+        assert_eq!(landings[0]["task"], 11);
+        assert_eq!(landings[0]["baseline"], 1573.0);
+        assert_eq!(landings[1]["candidate"], 1021.0);
+        let untouched = objective_json(&objective(3, false), &tasks);
+        assert_eq!(untouched["status"], "open");
+        assert_eq!(untouched["landings"], json!([]));
+    }
+
+    #[test]
+    fn a_recurring_objective_above_its_target_stays_open() {
+        let tasks = [task(
+            11,
+            2,
+            "landed",
+            20,
+            Some("METRIC ingest_total_ns baseline=1573 candidate=1200"),
+        )];
+        let recurring = objective_json(&objective(2, true), &tasks);
+        assert_eq!(recurring["status"], "open");
+        assert_eq!(recurring["current"], 1200.0);
+    }
+
+    #[test]
+    fn the_summary_names_the_open_task() {
+        let mission = json!({
+            "id": 4, "halted": null, "baseline": "abc",
+            "objectives": [{"status": "open"}, {"status": "met"}, {"status": "solved"}],
+            "tasks": [
+                {"id": 13, "state": "revise", "objective": 3, "revisions": 1,
+                 "session_id": "session_resident_rsi", "gates": [{"verdict": "rejected"}]},
+                task(12, 2, "landed", 30, None),
+            ],
+        });
+        let summary = rsi_summary(&mission);
+        assert_eq!(summary["mission"], 4);
+        assert_eq!(summary["open_task"]["id"], 13);
+        assert_eq!(summary["open_task"]["last_verdict"], "rejected");
+        assert_eq!(
+            summary["objectives"],
+            json!({"open": 1, "solved": 1, "met": 1})
+        );
     }
 }
