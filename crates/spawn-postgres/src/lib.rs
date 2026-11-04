@@ -115,19 +115,21 @@ impl PostgresStore {
         client
             .batch_execute(SCHEMA)
             .map_err(|error| backend(&error))?;
-        for role in LOGINS {
-            // No owner password (peer or trust login, PGPASSWORD): a password
-            // derived from "" would be a constant anyone can compute, so the
-            // logins get none and cannot log in with one.
-            let password = if self.password.is_empty() {
-                "null".to_string()
-            } else {
+        // No owner password (peer or trust login, PGPASSWORD): a password
+        // derived from "" would be a constant anyone can compute. Such a
+        // migration leaves the logins as they are: created `nologin`, or as
+        // the last migration with a password set them (so processes with
+        // and without one do not flip them back and forth).
+        if !self.password.is_empty() {
+            for role in LOGINS {
                 // Hex only, so the literal needs no quoting beyond the quotes.
-                format!("'{}'", role_password(&self.password, role))
-            };
-            client
-                .batch_execute(&format!("alter role {role} with login password {password}"))
-                .map_err(|error| backend(&error))?;
+                let password = role_password(&self.password, role);
+                client
+                    .batch_execute(&format!(
+                        "alter role {role} with login password '{password}'"
+                    ))
+                    .map_err(|error| backend(&error))?;
+            }
         }
         Ok(())
     }
