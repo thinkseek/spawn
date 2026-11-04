@@ -94,6 +94,15 @@ rm -rf "$live/web.prev"
 [ ! -d "$live/web" ] || mv "$live/web" "$live/web.prev"
 mv "$live/web.new" "$live/web"
 say "installed $("$live/bin/spawn" version 2>/dev/null || echo "$head") and the UI"
+# The relays run from the live bin directory too; restart one only when its
+# script changed, so a deploy does not drop engines' model calls needlessly.
+for relay in jev-relay model-relay; do
+  if ! cmp -s "scripts/$relay.py" "$live/bin/$relay.py"; then
+    install -m 755 "scripts/$relay.py" "$live/bin/$relay.py"
+    systemctl --user try-restart "spawn-$relay"
+    say "installed $relay.py"
+  fi
+done
 
 restart() { systemctl --user restart spawn-loop spawn-integrate spawn-serve; }
 # From here on, a failure must not leave the integrator stopped.
