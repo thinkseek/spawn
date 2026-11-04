@@ -260,9 +260,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
 /// workspace, or delete it if it cannot be moved, so the next task starts
 /// clean.
 fn put_aside(path: &Path, workspace: &Path, task: i64) {
-    let kept = workspace
-        .join(KEPT_REPORTS)
-        .join(format!("task-{task}.md"));
+    let kept = workspace.join(KEPT_REPORTS).join(format!("task-{task}.md"));
     let moved = kept
         .parent()
         .map(std::fs::create_dir_all)

@@ -61,3 +61,17 @@ pub(super) fn resume_prompt(task: &TaskRow) -> String {
         prompt
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_report_contract_names_the_report_file() {
+        assert_eq!(
+            super::report_contract(),
+            "When the task is finished, or you cannot go on, write `.spawn/report.md` \
+at the root of your workspace with three sections: `## Outcome` (done, blocked or failed, in one \
+line), `## What changed` (files, commits, results) and `## Open issues`. Then stop and wait. Do not \
+start other work. If a person must decide something, say so in the report."
+        );
+    }
+}
