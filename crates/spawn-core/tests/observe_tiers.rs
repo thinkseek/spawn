@@ -674,3 +674,27 @@ fn input_typed_into_a_ready_pane_is_work_not_an_idle_prompt() {
     assert_eq!(last.state, SemanticState::Working);
     assert_eq!(last.judge, "rules");
 }
+
+#[test]
+fn the_control_stream_is_not_an_agent_to_observe() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    fixture
+        .store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_control").expect("valid agent"),
+            session_id: SessionId::new("session_control").expect("valid session"),
+            execution_id: None,
+            source: Source::Control,
+            source_event_id: None,
+            kind: EventKind::ControlRecorded {
+                record: serde_json::json!({"type": "mission.added", "id": 1, "text": "x"}),
+            },
+        })
+        .expect("append succeeds");
+    fixture.clock.advance(Duration::from_mins(10));
+
+    assert_eq!(fixture.observer.tick().expect("tick"), 0);
+    assert!(observations(&fixture.store).is_empty());
+    assert_eq!(judge.calls(), 0);
+}

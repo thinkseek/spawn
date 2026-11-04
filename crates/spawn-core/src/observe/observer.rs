@@ -207,7 +207,11 @@ impl Observer {
             if batch.is_empty() {
                 return Ok(());
             }
-            for record in &batch {
+            // The control stream is not an agent's session.
+            for record in batch
+                .iter()
+                .filter(|record| !record.event.kind.is_control())
+            {
                 self.sessions
                     .entry(record.event.session_id.clone())
                     .or_insert_with(|| Tracked::new(record.event.agent_id.clone()))
