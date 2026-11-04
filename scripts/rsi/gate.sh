@@ -25,6 +25,13 @@
 # candidate's task run printed a `METRIC` line, the verdict carries it as
 # "metric" (the controller reads the metric from the verdict only).
 #
+# Environment: SPAWN_GATE_VERDICT, when set, is a file in a directory the
+# integrator owns; the verdict is written there too, and the integrator
+# believes that file only, and only when the gate exits 0.
+#
+# Exit status: 0 with a verdict; anything else is an infrastructure failure
+# (a git error, a killed gate), which the integrator records as an abort.
+#
 # ponytail: the gate runs on the host. Move it into a container without the
 # `spawn` binary when a candidate is treated as untrusted.
 
@@ -41,12 +48,24 @@ trap 'rm -rf "$work"' EXIT
 
 metric=""
 
+# JSON string body: backslash, quote and tab escaped, newlines as \n, other
+# control characters dropped.
+json_string() {
+    printf '%s' "$1" | tr -d '\000-\010\013-\037' |
+        sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" |
+        awk 'NR > 1 { printf "%s", "\\n" } { printf "%s", $0 }'
+}
+
 # verdict <accepted|rejected> [reason]
 verdict() {
     json="{\"verdict\":\"$1\""
-    [ -n "${2-}" ] && json="$json,\"reason\":\"$2\""
-    [ -n "$metric" ] && json="$json,\"metric\":\"$metric\""
-    echo "$json}"
+    [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
+    [ -n "$metric" ] && json="$json,\"metric\":\"$(json_string "$metric")\""
+    json="$json}"
+    if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
+        printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
+    fi
+    echo "$json"
 }
 
 # The controller resolves these paths against its own checkout. A relative

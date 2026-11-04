@@ -215,7 +215,14 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     // inside the tree it judges.
     let gate = std::path::absolute(env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
         .map_err(|error| format!("SPAWN_GATE: {error}"))?;
-    let integrator = Integrator { root, gate };
+    // The gate gets an allowlist of this environment, never all of it: the
+    // owner's SPAWN_DATABASE_URL must not reach candidate code.
+    let gate_env = gate::gate_env(|name| std::env::var(name).ok())?;
+    let integrator = Integrator {
+        root,
+        gate,
+        gate_env,
+    };
     loop {
         if let Err(error) = integrator.pass() {
             eprintln!("integrate: {error}");
@@ -233,6 +240,8 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
 struct Integrator {
     root: PathBuf,
     gate: PathBuf,
+    /// The gate's whole environment ([`gate::gate_env`]).
+    gate_env: Vec<(String, String)>,
 }
 
 impl Integrator {
@@ -448,6 +457,7 @@ impl Integrator {
             &candidate,
             scenarios,
             scenario.as_deref(),
+            &self.gate_env,
             GATE_WALL_CLOCK,
         ) {
             Ok(verdict) if verdict.accepted => {
@@ -466,16 +476,20 @@ impl Integrator {
                 land(store, mirror, source, &landing)
             }
             Ok(verdict) => rejected(&verdict.reason, &verdict.output),
-            // A gate that never returns, or cannot run, says nothing about
-            // the work: an abort, not a rejection.
-            Err(GateFailure::Timeout) => gated(
-                "aborted",
-                json!({"reason": "the gate exceeded its wall clock"}),
-            ),
-            Err(GateFailure::Failed(error)) => gated(
-                "aborted",
-                json!({"reason": format!("the gate failed: {error}")}),
-            ),
+            Err(failure) => gated("aborted", aborted(&failure)),
+        }
+    }
+}
+
+/// The record of a gate run without a verdict to believe. A gate that never
+/// returns, cannot run, or dies (killed, or exiting non-zero, whatever it
+/// printed) says nothing about the work: an abort, never an acceptance.
+fn aborted(failure: &GateFailure) -> Value {
+    match failure {
+        GateFailure::Timeout => json!({"reason": "the gate exceeded its wall clock"}),
+        GateFailure::Failed(error) => json!({"reason": format!("the gate failed: {error}")}),
+        GateFailure::Aborted { reason, log } => {
+            json!({"reason": format!("the gate failed: {reason}"), "log": log})
         }
     }
 }
@@ -562,8 +576,36 @@ fn stop(store: &PostgresStore, task: &Task) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mission, halt_reason, over_budget};
+    use super::{Mission, aborted, halt_reason, over_budget};
+    use crate::gate::GateFailure;
     use serde_json::json;
+
+    #[test]
+    fn a_gate_without_a_believable_verdict_is_recorded_as_an_abort_with_its_log() {
+        let record = aborted(&GateFailure::Aborted {
+            reason: "the gate ended with signal: 9 (SIGKILL)".to_string(),
+            log: "{\"verdict\":\"accepted\"}\n".to_string(),
+        });
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("SIGKILL"))
+        );
+        assert!(
+            record["log"]
+                .as_str()
+                .is_some_and(|l| l.contains("accepted"))
+        );
+        assert!(
+            record.get("verdict").is_none(),
+            "the caller records it as aborted"
+        );
+        assert!(
+            aborted(&GateFailure::Timeout)["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("wall clock"))
+        );
+    }
 
     fn mission(rejections: u32, aborts: u32, floor: u32) -> Mission {
         serde_json::from_value(json!({
