@@ -111,7 +111,9 @@ struct Known {
 /// Size and modification time of a file, `None` when it is not a regular
 /// file.
 fn stat_of(path: &Path) -> Option<(u64, i128, u32)> {
-    let metadata = std::fs::symlink_metadata(path).ok().filter(std::fs::Metadata::is_file)?;
+    let metadata = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
     let mtime = metadata
         .modified()
         .ok()

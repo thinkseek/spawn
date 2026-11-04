@@ -413,7 +413,14 @@ impl Integrator {
             // Large files are workspace state, never source: a branch head
             // that names a large-file manifest lands as a commit of the same
             // tree without it, so nothing forked from main inherits them.
-            let message = git(&["--git-dir", &mirror_path, "show", "-s", "--format=%B", &branch])?;
+            let message = git(&[
+                "--git-dir",
+                &mirror_path,
+                "show",
+                "-s",
+                "--format=%B",
+                &branch,
+            ])?;
             if spawn_host::chunks::trailer_of(&message).is_some() {
                 let tree = git(&[
                     "--git-dir",

@@ -91,7 +91,10 @@ mod tests {
             resolve_chunk_store(Some("/srv/chunks".into()), "/ws"),
             PathBuf::from("/srv/chunks")
         );
-        assert_eq!(resolve_chunk_store(None, "/ws"), PathBuf::from("/ws/.chunks"));
+        assert_eq!(
+            resolve_chunk_store(None, "/ws"),
+            PathBuf::from("/ws/.chunks")
+        );
     }
 
     #[test]
