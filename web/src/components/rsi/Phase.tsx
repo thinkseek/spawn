@@ -19,37 +19,54 @@ const INFO: Omit<PhaseStyle, "pulse"> = {
   text: "text-info",
 };
 
+const WARNING: Omit<PhaseStyle, "pulse"> = {
+  badge: "bg-warning/12 text-warning ring-warning/25",
+  dot: "bg-warning",
+  bar: "bg-warning",
+  text: "text-warning",
+};
+
+const SUCCESS: PhaseStyle = {
+  badge: "bg-success/12 text-success ring-success/25",
+  dot: "bg-success",
+  bar: "bg-success",
+  text: "text-success",
+  pulse: false,
+};
+
+const DESTRUCTIVE: PhaseStyle = {
+  badge: "bg-destructive/12 text-destructive ring-destructive/25",
+  dot: "bg-destructive",
+  bar: "bg-destructive",
+  text: "text-destructive",
+  pulse: false,
+};
+
+const MUTED: PhaseStyle = {
+  badge: "bg-muted text-muted-foreground ring-surface-border",
+  dot: "bg-muted-foreground",
+  bar: "bg-muted-foreground",
+  text: "text-muted-foreground",
+  pulse: false,
+};
+
+/** Task states (mission_tasks.state) and gate verdicts (task.gated). */
 const PHASE: Record<string, PhaseStyle> = {
-  Starting: { ...INFO, pulse: true },
-  Working: { ...INFO, pulse: true },
-  Gating: {
-    badge: "bg-warning/12 text-warning ring-warning/25",
-    dot: "bg-warning",
-    bar: "bg-warning",
-    text: "text-warning",
-    pulse: true,
-  },
-  Landed: {
-    badge: "bg-success/12 text-success ring-success/25",
-    dot: "bg-success",
-    bar: "bg-success",
-    text: "text-success",
-    pulse: false,
-  },
-  Rejected: {
-    badge: "bg-destructive/12 text-destructive ring-destructive/25",
-    dot: "bg-destructive",
-    bar: "bg-destructive",
-    text: "text-destructive",
-    pulse: false,
-  },
-  Aborted: {
-    badge: "bg-muted text-muted-foreground ring-surface-border",
-    dot: "bg-muted-foreground",
-    bar: "bg-muted-foreground",
-    text: "text-muted-foreground",
-    pulse: false,
-  },
+  // Task states, in the order a gated task walks them.
+  assigned: { ...INFO, pulse: true },
+  delivered: { ...INFO, pulse: true },
+  reported: { ...WARNING, pulse: true },
+  accepted: { ...WARNING, pulse: true },
+  landing: { ...WARNING, pulse: true },
+  revise: { ...WARNING, pulse: false },
+  landed: SUCCESS,
+  cancelled: MUTED,
+  // Gate verdicts. `accepted` above doubles as the verdict; a verdict is
+  // settled, so the list renders it without the pulse.
+  rejected: DESTRUCTIVE,
+  aborted: MUTED,
+  conflict: { ...WARNING, pulse: false },
+  stale: MUTED,
 };
 
 const FALLBACK: PhaseStyle = {
@@ -62,6 +79,30 @@ const FALLBACK: PhaseStyle = {
 
 export function phaseStyle(phase: string): PhaseStyle {
   return PHASE[phase] ?? FALLBACK;
+}
+
+/** Style of a gate verdict: settled, never pulsing. */
+export function verdictStyle(verdict: string): PhaseStyle {
+  if (verdict === "accepted") return SUCCESS;
+  return { ...phaseStyle(verdict), pulse: false };
+}
+
+export function VerdictBadge({ verdict }: { verdict: string }) {
+  const style = verdictStyle(verdict);
+  return (
+    <span
+      className={cx(
+        "inline-flex h-5 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-caption font-medium ring-1 ring-inset",
+        style.badge,
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cx("inline-block size-1.5 shrink-0 rounded-full", style.dot)}
+      />
+      {verdict}
+    </span>
+  );
 }
 
 export function PhaseBadge({
