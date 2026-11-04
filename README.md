@@ -71,7 +71,7 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `rsi-loop` | Runs the RSI controller (`evolve` in a loop); exits 2 on HALT. |
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
-| `dispatch [--dry-run]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. |
+| `dispatch [--dry-run] [--root <dir>]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. `--root` is the workspace root (default `SPAWN_WORKSPACE_ROOT`), as for `loop` and `tick`. |
 | `corpus export [--since-hours N]` | Model judgements with their evidence and outcome labels, one JSON line each. |
 | `judge --replay <file>` | Runs the current rules over a corpus: which tier decides each episode, coverage, agreement. |
 | `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. |
@@ -102,7 +102,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | required | PostgreSQL connection string |
 | `SPAWN_GIT_REPO` | required | Bare repository that holds the base commits |
-| `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch |
+| `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick`, `loop` and `dispatch` |
 | `SPAWN_WORKER` | `spawn-worker` | Worker name on claimed commands |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux path |
 | `SPAWN_TMUX_SOCKET` | default socket | tmux `-L` socket name |
@@ -110,7 +110,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker path |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
 | `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI path |
-| `SPAWN_PROGRAM` | current binary | `spawn` path used inside the terminal |
+| `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it a local heuristic judges |
 | `SPAWN_TRACE` | unset | When set, prints the time of each port call to standard error |
 
