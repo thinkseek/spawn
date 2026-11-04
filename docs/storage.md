@@ -85,10 +85,23 @@ files, a chunk fetch.
   -m -u` against a temporary index, which refuses if a file the merge changes
   differs from the branch), then moves the branch by compare-and-swap to a
   merge commit (parents: the head, `main`), recorded as `artifact.committed`
-  with reason `base_merged`; a conflict changes nothing (a tick-report
-  warning) and the agent hears of it at landing, as today. Large files are not
-  merged: the branch keeps its own (the merge commit carries the head's
-  `Spawn-Large` trailer).
+  with reason `base_merged`. A conflict in files' lines is made resolvable
+  the way `git merge` does it: the merge tree with conflict markers is written
+  into the idle workspace by the same safe procedure (a directory that differs
+  from the branch refuses, changing nothing), the branch stays where it is,
+  and `main` waits as the pending second parent under the store root
+  (`.merge/<agent>`, written atomically). The agent hears of the conflict at
+  landing, as today, and finds the markers in its files. Checkpoints keep
+  single parents while any conflicted file still holds a marker (a line that
+  starts with `<<<<<<< ` or `>>>>>>> `, or is `=======`); the first one
+  without commits with parents (head, pending `main`) and clears it, after
+  which the branch lands clean. No newer `main` is merged on top of
+  unresolved markers. A conflict markers cannot show (modify/delete, renames,
+  binary files) changes nothing; the tick-report warning says so. Large files
+  are not merged: the branch keeps its own (a merge commit carries the head's
+  `Spawn-Large` trailer). The pending parent is host-local: an agent resumed
+  on another host before resolving commits the resolution with one parent,
+  and `main` is merged again there.
 - **Landing**: unchanged and text only. The gate judges the git candidate; the
   integrator commits host-side and moves `main` by compare-and-swap. Large
   files are workspace state, not source, and never land.
