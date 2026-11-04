@@ -57,7 +57,7 @@ spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws
 spawn status
 ```
 
-用 cron、systemd timer 或 shell 循环定时运行 `spawn tick`。Spawn 没有常驻进程。
+生产部署跑常驻进程：`spawn loop`（Bridge、Observer、派发、存活规则，默认 500 ms 一轮）、`spawn integrate`（门禁与落地）、`spawn serve`（只读看板），对应 `deploy/systemd/` 下的 user unit。`spawn tick` 只跑一轮，用于调试和测试。
 
 ## 命令
 

@@ -15,7 +15,7 @@
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
 | 终端 | tmux | 建会话、输入文本、抓取屏尾 |
 
-Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎、调度器、Web 服务。
+Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。`spawn serve` 只提供只读看板和事件查询（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`），不是控制面；所有写入仍只经 Bridge 和 `spawn_submit`。
 
 ## 2. crate 结构
 
@@ -132,7 +132,12 @@ spawn status
 | `status` | 扫描全部事件，打印每会话最新一条 observation |
 | `hook` | 读取并丢弃标准输入；仅为旧版本以 hook 启动的引擎保留 |
 | `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
-| `evolve` | 推进一步递归自改循环：开迭代、收补丁、跑黑盒门禁、前移基线 |
+| `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
+| `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
+| `serve` | 常驻：只读看板与 HTTP 查询 |
+| `dispatch` | 跑一轮派发：把消息、任务、新闻送给对应会话 |
+| `mission` / `charter` / `task` / `resident` | 任务域控制流：开/关/恢复任务、章程、任务分派、常驻 worker |
+| `judge` / `fleet` / `tail` / `corpus` | 判定、舰队概览、事件尾随、导出判定语料 |
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |

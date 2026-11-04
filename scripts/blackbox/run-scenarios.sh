@@ -22,6 +22,10 @@ fi
 : "${SPAWN_PSQL:?SPAWN_PSQL is required}"
 : "${SPAWN_PG_BASE:?SPAWN_PG_BASE is required}"
 
+# Per-run suffix for databases and sockets. Not $$ alone: the gate runs this
+# in a new PID namespace, where $$ is the same small number every time.
+run="$$_${RANDOM}${RANDOM}"
+
 passed=0
 failed=0
 matched=0
@@ -43,7 +47,7 @@ for scenario in "$root"/scripts/blackbox/scenarios/$pattern; do
     [ -f "$scenario" ] || continue
     matched=$((matched + 1))
     slug=$(basename "$scenario" .sh)
-    db="bb_${slug//[^a-zA-Z0-9]/_}_$$"
+    db="bb_${slug//[^a-zA-Z0-9]/_}_$run"
     work=$(mktemp -d)
 
     if ! $SPAWN_PSQL -d postgres -tA -c "create database $db" >/dev/null 2>&1; then
@@ -82,7 +86,7 @@ FAKE
     SPAWN_WORKSPACE_ROOT=$work/ws
     SPAWN_CLAUDE_PROGRAM=$work/claude
     SPAWN_CODEX_PROGRAM=$work/claude
-    SPAWN_TMUX_SOCKET="bb-$slug-$$"
+    SPAWN_TMUX_SOCKET="bb-$slug-$run"
     SPAWN_WORKER=worker-bb
     WORK=$work
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \

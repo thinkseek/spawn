@@ -16,8 +16,9 @@ EOF
 chmod 755 "$WORK/tmux"
 export SPAWN_TMUX_PROGRAM="$WORK/tmux"
 
-# A port derived from the scenario pid keeps parallel scenarios apart.
-port=$((20000 + ($$ % 20000)))
+# A random port keeps parallel scenarios apart (not the pid: in the gate's
+# PID namespace it is the same every run).
+port=$((20000 + $(od -An -N2 -tu2 /dev/urandom) % 20000))
 guarded_port=$((port + 20000))
 web=$WORK/web
 mkdir -p "$web"

@@ -36,7 +36,7 @@ Three ideas carry the design:
  │ 4 Control     Supervisor: one perpetual Claude Code session           │
  │                 reads fleet state, submits commands to workers        │
  │               Notifier: wakes the supervisor on attention changes     │
- │               Deterministic controllers (RSI evolve) as workloads     │
+ │               Integrator: gate + host-side commit + CAS baseline      │
  ├──────────────────────────────────────────────────────────────────────┤
  │ 3 Observation Rules: decide every state the facts settle              │
  │               Jev: decides only what the rules leave ambiguous        │
@@ -195,8 +195,9 @@ it, on the same ladder.
 - **Authority** comes from grants and DB roles. The dispatcher and the
   supervisor submit as their own principals and only for worker sessions.
   Neither can write observations or runtime events.
-- **Deterministic controllers** (the RSI `evolve`) own their sessions and
-  appear in the fleet as members.
+- **The integrator** (`spawn integrate`) is the only deterministic
+  controller: it judges accepted tasks with the mission's gate and lands them
+  host-side. RSI is a mission like any other, not a separate controller.
 
 ### 3.1 The supervisor session never ends
 
