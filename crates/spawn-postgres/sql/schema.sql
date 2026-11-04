@@ -45,6 +45,10 @@ create unique index if not exists spawn_events_source_key
 create index if not exists spawn_events_session_name
     on spawn_events (session_id, event_name, id);
 
+-- An agent's latest checkpoint, read by the integrator before it judges.
+create index if not exists spawn_events_agent_name
+    on spawn_events (agent_id, event_name, id);
+
 -- Projection: one row per session, written by `spawn_append` in the same
 -- transaction as the event, so `agent_state`, `agent_status` and
 -- `agent_freshness` read one row instead of folding the log. The log stays

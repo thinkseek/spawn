@@ -214,6 +214,13 @@ pub(crate) const INTEGRATOR_LOCK_KEY: i64 = 1_399_957_336;
 pub(crate) const TOOL_CALLS_SINCE: &str = "select count(*) from spawn_events
                   where session_id = $1 and event_name = 'tool.started' and recorded_at_ms > $2";
 
+/// The commit of an agent's latest checkpoint (or merge of main): its last
+/// `artifact.committed` event.
+pub(crate) const LATEST_CHECKPOINT: &str = "select kind -> 'detail' -> 'artifact' ->> 'commit'
+                   from spawn_events
+                  where agent_id = $1 and event_name = 'artifact.committed'
+                  order by id desc limit 1";
+
 // Residents and workspaces.
 
 /// Approved residents that have run before, as (agent, session, charter).
@@ -364,6 +371,14 @@ impl PostgresStore {
         Ok(self
             .query_one(TOOL_CALLS_SINCE, &[&session, &since_ms])?
             .get(0))
+    }
+
+    /// The commit of the agent's latest `artifact.committed` event, if it
+    /// has one: what its pushed branch must contain to be landed.
+    pub fn latest_checkpoint(&self, agent: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .query_opt(LATEST_CHECKPOINT, &[&agent])?
+            .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 
     /// Assign a task; returns its id.
