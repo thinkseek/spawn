@@ -57,7 +57,7 @@ pub(crate) const MISSION_BOARD: &str = r"
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
       select m.id, m.text, m.origin, m.sources, m.state, m.summary,
-             m.gate, m.accept, m.budget, m.baseline, m.halted,
+             m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
                  'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
