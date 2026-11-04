@@ -302,7 +302,12 @@ impl Observer {
         );
         observation.attention = state == SemanticState::Blocked;
         if observation.attention {
-            observation.attention_reason = Some("permission".to_string());
+            let reason = if input.stalled_end.is_some() {
+                "end_stalled"
+            } else {
+                "permission"
+            };
+            observation.attention_reason = Some(reason.to_string());
         }
         Classified {
             observation,

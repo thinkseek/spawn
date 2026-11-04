@@ -233,6 +233,22 @@ pub enum EventKind {
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
     },
+    /// The final checkpoint of an ending execution kept failing: the
+    /// terminal is down, the workspace stays mounted with everything it
+    /// holds, and the Bridge retries the checkpoint at a slow interval until
+    /// it commits or a `discard` command gives the work up. Written once per
+    /// execution; it asks for attention until `execution.ended`.
+    #[serde(rename = "execution.end_stalled")]
+    ExecutionEndStalled {
+        /// How the execution was ending.
+        cause: EndCause,
+        /// Process exit code when the OS reported one.
+        exit_code: Option<i32>,
+        /// Final checkpoints that failed so far.
+        failures: u32,
+        /// The last failure.
+        error: String,
+    },
     /// The workspace store persisted a checkpoint.
     #[serde(rename = "artifact.committed")]
     ArtifactCommitted {
@@ -311,6 +327,7 @@ impl EventKind {
             Self::TurnFailed { .. } => "turn.failed",
             Self::ExecutionStarted { .. } => "execution.started",
             Self::ExecutionEnded { .. } => "execution.ended",
+            Self::ExecutionEndStalled { .. } => "execution.end_stalled",
             Self::ArtifactCommitted { .. } => "artifact.committed",
             Self::MergeConflicted { .. } => "merge.conflicted",
             Self::CommandAccepted { .. } => "command.accepted",
