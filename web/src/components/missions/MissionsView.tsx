@@ -64,34 +64,41 @@ export function MissionsView() {
           </p>
         </div>
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
-            <ApprovalQueue residents={data.residents} />
-            <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
-              <div className="flex min-w-0 flex-col gap-3">
-                {data.missions.length === 0 ? (
-                  <Card>
-                    <EmptyState
-                      icon={<Target size={20} />}
-                      title="No missions yet"
-                      hint="Missions appear here once the supervisor records one."
-                    />
-                  </Card>
-                ) : (
-                  data.missions.map((mission, index) => (
-                    <MissionCard
-                      key={mission.id ?? `index-${index}`}
-                      mission={mission}
-                    />
-                  ))
-                )}
-              </div>
-              <ResidentRoster residents={data.residents} />
-            </div>
-          </div>
-        </div>
+        <MissionsBody data={data} />
       )}
     </main>
+  );
+}
+
+/** The page body for one snapshot of /api/missions. */
+export function MissionsBody({ data }: { data: Missions }) {
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
+        <ApprovalQueue residents={data.residents} />
+        <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
+          <div className="flex min-w-0 flex-col gap-3">
+            {data.missions.length === 0 ? (
+              <Card>
+                <EmptyState
+                  icon={<Target size={20} />}
+                  title="No missions yet"
+                  hint="Missions appear here once the supervisor records one."
+                />
+              </Card>
+            ) : (
+              data.missions.map((mission, index) => (
+                <MissionCard
+                  key={mission.id ?? `index-${index}`}
+                  mission={mission}
+                />
+              ))
+            )}
+          </div>
+          <ResidentRoster residents={data.residents} />
+        </div>
+      </div>
+    </div>
   );
 }
 
