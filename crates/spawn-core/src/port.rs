@@ -10,8 +10,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::command::{Claimed, Outcome, Submission};
-use crate::event::{Appended, EventRecord, GlobalPosition, NewEvent, SessionSeq};
-use crate::id::{BranchName, CommandId, CommitId, Principal, SessionId, TerminalName, WorkspaceId};
+use crate::event::{Appended, EventRecord, GlobalPosition, NewEvent};
+use crate::id::{BranchName, CommandId, CommitId, Principal, TerminalName, WorkspaceId};
 
 /// Storage failure.
 #[derive(Debug, Error)]
@@ -40,14 +40,6 @@ pub trait EventLog: Send + Sync {
     /// Append one event. A repeated `(session, source, source_event_id)`
     /// returns the stored record with `inserted = false`.
     fn append(&self, event: NewEvent) -> Result<Appended, StoreError>;
-
-    /// Session events with `session_seq > after`, in order, at most `limit`.
-    fn read_session(
-        &self,
-        session: &SessionId,
-        after: SessionSeq,
-        limit: usize,
-    ) -> Result<Vec<EventRecord>, StoreError>;
 
     /// All events with `position > after`, in order, at most `limit`.
     ///

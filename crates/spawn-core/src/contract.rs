@@ -56,25 +56,6 @@ pub fn event_log(tag: &str, log: &dyn EventLog) {
     assert!(!repeated.inserted);
     assert_eq!(repeated.record.position, kept.record.position);
 
-    let read = log
-        .read_session(&session(tag, 1), SessionSeq(0), 10)
-        .expect("read succeeds");
-    assert_eq!(read.len(), 3);
-    assert!(
-        read.windows(2)
-            .all(|pair| pair[0].session_seq < pair[1].session_seq)
-    );
-
-    let after = log
-        .read_session(&session(tag, 1), SessionSeq(1), 10)
-        .expect("read succeeds");
-    assert_eq!(after.len(), 2);
-
-    let limited = log
-        .read_session(&session(tag, 1), SessionSeq(0), 1)
-        .expect("read succeeds");
-    assert_eq!(limited.len(), 1);
-
     let global = log
         .read_global(GlobalPosition(0), 100)
         .expect("read succeeds");
@@ -83,6 +64,21 @@ pub fn event_log(tag: &str, log: &dyn EventLog) {
             .windows(2)
             .all(|pair| pair[0].position < pair[1].position)
     );
+    let sequences: Vec<SessionSeq> = global
+        .iter()
+        .filter(|record| record.event.session_id == session(tag, 1))
+        .map(|record| record.session_seq)
+        .collect();
+    assert_eq!(
+        sequences,
+        [SessionSeq(1), SessionSeq(2), SessionSeq(3)],
+        "a session's events are dense and in global order"
+    );
+
+    let limited = log
+        .read_global(GlobalPosition(0), 1)
+        .expect("read succeeds");
+    assert_eq!(limited.len(), 1);
     let tail = log
         .read_global(second.record.position, 100)
         .expect("read succeeds");

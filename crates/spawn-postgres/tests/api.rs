@@ -94,7 +94,7 @@ fn session_sequences_are_dense_and_positions_increase() {
         assert_eq!(appended.record.session_seq, SessionSeq(expected));
     }
     let read = store
-        .read_session(&session(), SessionSeq(0), 10)
+        .read_global(GlobalPosition(0), 10)
         .expect("read succeeds");
     assert_eq!(read.len(), 3);
     assert!(
@@ -116,7 +116,7 @@ fn submit_is_idempotent_and_accepts_once() {
         .expect("submit succeeds");
     assert_eq!(first, second, "the same key maps to the same command");
     let read = store
-        .read_session(&session(), SessionSeq(0), 10)
+        .read_global(GlobalPosition(0), 10)
         .expect("read succeeds");
     assert_eq!(
         read.iter()

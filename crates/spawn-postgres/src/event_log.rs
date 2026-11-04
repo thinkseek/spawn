@@ -1,7 +1,6 @@
 //! The event log port over `spawn_events`.
 
-use spawn_core::event::{Appended, EventRecord, GlobalPosition, NewEvent, SessionSeq};
-use spawn_core::id::SessionId;
+use spawn_core::event::{Appended, EventRecord, GlobalPosition, NewEvent};
 use spawn_core::port::{EventLog, StoreError};
 use spawn_core::time::Timestamp;
 
@@ -22,17 +21,6 @@ macro_rules! event_record_columns {
 /// `$5` source event id, `$6` kind.
 pub(crate) const APPEND: &str = "select out_id, out_seq, out_at, out_inserted
                    from spawn_append($1, $2, $3, $4, $5, $6)";
-
-/// One session's events after a sequence. `$1` session, `$2` after, `$3` limit.
-pub(crate) const READ_SESSION: &str = concat!(
-    "select ",
-    event_record_columns!(),
-    "
-                   from spawn_events
-                  where session_id = $1 and session_seq > $2
-                  order by session_seq
-                  limit $3"
-);
 
 /// Events of every session after a global position. `$1` after, `$2` limit.
 pub(crate) const READ_GLOBAL: &str = concat!(
@@ -71,21 +59,6 @@ impl EventLog for PostgresStore {
             },
             inserted: row.get("out_inserted"),
         })
-    }
-
-    fn read_session(
-        &self,
-        session: &SessionId,
-        after: SessionSeq,
-        limit: usize,
-    ) -> Result<Vec<EventRecord>, StoreError> {
-        self.query(
-            READ_SESSION,
-            &[&session.as_str(), &bigint(after.0), &bigint(limit)],
-        )?
-        .iter()
-        .map(event_record)
-        .collect()
     }
 
     fn read_global(

@@ -143,24 +143,6 @@ impl EventLog for MemoryStore {
         Ok(Appended { record, inserted })
     }
 
-    fn read_session(
-        &self,
-        session: &SessionId,
-        after: SessionSeq,
-        limit: usize,
-    ) -> Result<Vec<EventRecord>, StoreError> {
-        let state = self.lock();
-        let mut found: Vec<EventRecord> = state
-            .events
-            .iter()
-            .filter(|record| record.event.session_id == *session && record.session_seq > after)
-            .take(limit)
-            .cloned()
-            .collect();
-        found.sort_by_key(|record| record.session_seq);
-        Ok(found)
-    }
-
     fn read_global(
         &self,
         after: GlobalPosition,
