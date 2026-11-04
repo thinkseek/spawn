@@ -377,11 +377,13 @@ impl TerminalHost for TmuxHost {
 }
 
 /// Whether tmux's error says the terminal does not exist: no such session,
-/// no server on the socket, or no socket at all. A socket that may not be
+/// no server on the socket (or one shutting down), or no socket at all. A socket that may not be
 /// opened is not among them.
 fn gone(stderr: &str) -> bool {
     stderr.contains("can't find session")
         || stderr.contains("no server running")
+        // Asked while the server shuts down after its last session ended.
+        || stderr.contains("server exited unexpectedly")
         || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
 }
 

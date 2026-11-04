@@ -133,6 +133,8 @@ printf 'Welcome to Claude Code\n\n❯ '
 pending=0
 while :; do
   if IFS= read -r -t 1 line; then
+    # Screen-reader mode shows each message typed in as a `you:` line.
+    printf 'you: %s\n' "$line"
     case "$line" in
     *E2E:WORK*)
       prompt
