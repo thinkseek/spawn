@@ -205,6 +205,108 @@ fn a_large_file_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
     store.unmount(&workspace).expect("unmount succeeds");
 }
 
+fn git_out(repo: &PathBuf, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(repo)
+        .args(arguments)
+        .output()
+        .expect("git is installed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Deterministic incompressible bytes (xorshift).
+fn noise(seed: u64, length: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+#[test]
+fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
+    let _exclusive = exclusive();
+    let (repo, root) = repository("kept");
+    let store = GitWorkspace::new(&repo, &root);
+    let reference = format!("refs/heads/{}", branch());
+    store.ensure_branch(&branch()).expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 4096;
+    let original = noise(11, size);
+    fs::create_dir_all(directory.join("data")).expect("create data");
+    fs::write(directory.join("data/model.bin"), &original).expect("write a large file");
+    fs::write(directory.join("notes.txt"), "text\n").expect("write a small file");
+    assert!(matches!(
+        store.commit(&workspace, "work").expect("commit succeeds"),
+        Commit::Created(_)
+    ));
+    let trailer = git_out(
+        &repo,
+        &["log", "-1", "--format=%(trailers:key=Spawn-Large,valueonly)", &reference],
+    );
+    assert_eq!(trailer.len(), 64, "{trailer}");
+    let tree = git_out(&repo, &["rev-parse", &format!("{reference}^{{tree}}")]);
+    store.unmount(&workspace).expect("unmount succeeds");
+    assert!(root.join(spawn_host::DEFAULT_CHUNK_DIRECTORY).is_dir());
+
+    // A fresh mount brings the large file back, byte for byte.
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    assert_eq!(fs::read(directory.join("data/model.bin")).expect("read"), original);
+    assert_eq!(
+        store.commit(&workspace, "again").expect("commit succeeds"),
+        Commit::Unchanged,
+        "a fresh mount is not a change"
+    );
+
+    // A large-file-only edit: same tree, new trailer.
+    let mut edited = original.clone();
+    edited[1000..2000].copy_from_slice(&noise(12, 1000));
+    fs::write(directory.join("data/model.bin"), &edited).expect("edit the large file");
+    assert!(matches!(
+        store.commit(&workspace, "edit").expect("commit succeeds"),
+        Commit::Created(_)
+    ));
+    assert_eq!(
+        git_out(&repo, &["rev-parse", &format!("{reference}^{{tree}}")]),
+        tree
+    );
+    let edited_trailer = git_out(
+        &repo,
+        &["log", "-1", "--format=%(trailers:key=Spawn-Large,valueonly)", &reference],
+    );
+    assert_eq!(edited_trailer.len(), 64);
+    assert_ne!(edited_trailer, trailer);
+    store.unmount(&workspace).expect("unmount succeeds");
+
+    // Every stored object corrupted: the mount fails rather than hand back
+    // wrong bytes.
+    let mut pending = vec![root.join(spawn_host::DEFAULT_CHUNK_DIRECTORY)];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(fs::read_dir(&path).expect("read").flatten().map(|e| e.path()));
+        } else {
+            let mut bytes = fs::read(&path).expect("read object");
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0xff;
+            fs::write(&path, bytes).expect("corrupt object");
+        }
+    }
+    match store.mount(&branch()) {
+        Err(_) => {}
+        Ok(workspace) => {
+            let got = fs::read(PathBuf::from(workspace.path()).join("data/model.bin"));
+            assert!(got.is_err() || got.expect("read") == edited, "wrong bytes");
+        }
+    }
+}
+
 #[test]
 fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
