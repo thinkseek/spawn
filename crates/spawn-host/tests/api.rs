@@ -242,7 +242,9 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
     let (repo, root) = repository("kept");
     let store = GitWorkspace::new(&repo, &root);
     let reference = format!("refs/heads/{}", branch());
-    store.ensure_branch(&branch()).expect("create the branch");
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
     let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 4096;
