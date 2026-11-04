@@ -53,31 +53,26 @@ pub(crate) enum GateFailure {
 }
 
 /// The gate's environment, read through `lookup`: the [`GATE_ENV`]
-/// variables that are set. Refused when the test database is the owner's.
-pub(crate) fn gate_env(
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<Vec<(String, String)>, String> {
-    let env: Vec<(String, String)> = GATE_ENV
+/// variables that are set. A SPAWN_TEST_DATABASE_URL that names the same
+/// database as SPAWN_DATABASE_URL is withheld: candidate tests never get
+/// the owner's database, even by that name. (Not an error: mvp-e2e runs
+/// an integrator whose own database is the test database.)
+pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let owner = lookup("SPAWN_DATABASE_URL");
+    GATE_ENV
         .iter()
         .filter_map(|name| {
             lookup(name)
                 .filter(|value| !value.is_empty())
                 .map(|value| ((*name).to_string(), value))
         })
-        .collect();
-    if let (Some(test), Some(owner)) = (
-        lookup("SPAWN_TEST_DATABASE_URL"),
-        lookup("SPAWN_DATABASE_URL"),
-    ) && !test.is_empty()
-        && database_of(&test) == database_of(&owner)
-    {
-        return Err(
-            "SPAWN_TEST_DATABASE_URL names the owner's database; the gate runs candidate \
-             tests against it"
-                .to_string(),
-        );
-    }
-    Ok(env)
+        .filter(|(name, value)| {
+            name != "SPAWN_TEST_DATABASE_URL"
+                || owner
+                    .as_deref()
+                    .is_none_or(|owner| database_of(owner) != database_of(value))
+        })
+        .collect()
 }
 
 /// `host:port/name` of a postgres URL, without credentials or parameters.
@@ -456,7 +451,7 @@ mod tests {
             "SPAWN_DATABASE_URL" => Some("postgres://o@127.0.0.1:15433/spawn".to_string()),
             _ => None,
         };
-        let env = gate_env(lookup).expect("env");
+        let env = gate_env(lookup);
         let verdict = gate.judge(&env).expect("verdict");
         assert!(verdict.accepted, "{}", verdict.reason);
     }
@@ -472,7 +467,7 @@ mod tests {
             "SPAWN_JUDGE_URL" | "http_proxy" | "SSH_AUTH_SOCK" => Some("secret".into()),
             _ => None,
         };
-        let env = gate_env(lookup).expect("env");
+        let env = gate_env(lookup);
         let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
@@ -487,15 +482,11 @@ mod tests {
             ]
         );
         let unset = |name: &str| (name == "PATH").then(|| "/usr/bin".to_string());
-        assert_eq!(
-            gate_env(unset).expect("env").len(),
-            1,
-            "unset names are left out"
-        );
+        assert_eq!(gate_env(unset).len(), 1, "unset names are left out");
     }
 
     #[test]
-    fn a_test_database_that_is_the_owners_is_refused() {
+    fn a_test_database_that_is_the_owners_is_withheld() {
         let lookup = |name: &str| match name {
             "SPAWN_TEST_DATABASE_URL" => Some("postgres://other:pw@127.0.0.1:15433/spawn".into()),
             "SPAWN_DATABASE_URL" => {
@@ -503,6 +494,10 @@ mod tests {
             }
             _ => None,
         };
-        assert!(gate_env(lookup).is_err());
+        let env = gate_env(lookup);
+        assert!(
+            env.iter()
+                .all(|(name, _)| name != "SPAWN_TEST_DATABASE_URL")
+        );
     }
 }
