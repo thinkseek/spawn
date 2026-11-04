@@ -3,10 +3,12 @@
 
 pub mod bridge;
 pub mod command;
+#[cfg(feature = "testing")]
 pub mod contract;
 pub mod event;
 pub mod id;
 pub mod ingest;
+#[cfg(feature = "testing")]
 pub mod memory;
 pub mod mission;
 pub mod observation;

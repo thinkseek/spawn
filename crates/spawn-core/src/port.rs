@@ -3,7 +3,7 @@
 //! Every port is synchronous: Spawn has no concurrent request path inside one
 //! process, and blocking calls keep the dependency graph free of an async
 //! runtime. Adapters live in `spawn-postgres` and `spawn-host`; in-memory
-//! implementations live in [`crate::memory`].
+//! implementations live in `crate::memory` (feature `testing`).
 
 use std::time::Duration;
 

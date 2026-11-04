@@ -1,7 +1,9 @@
 //! Conformance suite shared by every backend.
 //!
-//! The same checks run against the memory backend and the PostgreSQL
-//! backend, so the two cannot drift. Each check owns its identifiers.
+//! The same checks run against the memory backend and the real adapters
+//! (PostgreSQL for the log and the queue, `spawn-host` for workspaces and
+//! terminals), so the fakes the Bridge tests rely on cannot drift from what
+//! production runs. Each check owns its identifiers.
 
 use std::time::Duration;
 
@@ -202,7 +204,8 @@ pub fn terminal(tag: &str, terminals: &dyn TerminalHost) {
         terminal: terminal.clone(),
         workspace: workspace.clone(),
         cwd: "/".to_string(),
-        program: "true".to_string(),
+        // Runs until terminated, so a real host still sees it alive.
+        program: "/bin/cat".to_string(),
         arguments: Vec::new(),
         environment: Vec::new(),
     };
@@ -216,10 +219,12 @@ pub fn terminal(tag: &str, terminals: &dyn TerminalHost) {
             .is_alive(&terminal, &workspace)
             .expect("query succeeds")
     );
-    let tail = terminals
+    // No line count is asserted: tmux returns up to `lines` lines of
+    // scrollback plus the whole visible screen, the memory fake only the
+    // last `lines` lines.
+    terminals
         .capture_tail(&terminal, &workspace, 10)
         .expect("capture succeeds");
-    assert!(tail.lines().count() <= 10);
     terminals
         .terminate(&terminal, &workspace)
         .expect("terminate succeeds");

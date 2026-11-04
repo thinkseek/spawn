@@ -11,5 +11,8 @@ repository.workspace = true
 spawn-core.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+spawn-core = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true
