@@ -88,14 +88,21 @@ database_made=1
 
 # --- the world: one bare repository, one root, one chunk store -----------
 
+# Exit codes (scripts/rsi/gate.sh): 0 pass, 1 an assertion failed (`fail`),
+# 2 a harness error. Setting up the world is harness: each step says so.
+harness() {
+    echo "003: harness: $*" >&2
+    exit 2
+}
+
 repo=$WORK/repo.git
-git init -q --bare --initial-branch=main "$repo"
-git init -q --initial-branch=main "$WORK/seed"
-printf 'base\n' >"$WORK/seed/README.md"
-git -C "$WORK/seed" add -A
-git -C "$WORK/seed" -c user.name=bb -c user.email=bb@localhost commit -qm base
-git -C "$WORK/seed" push -q "$repo" main:main
-mkdir -p "$WORK/ws"
+git init -q --bare --initial-branch=main "$repo" || harness "git init"
+git init -q --initial-branch=main "$WORK/seed" || harness "git init"
+printf 'base\n' >"$WORK/seed/README.md" || harness "seed"
+git -C "$WORK/seed" add -A || harness "git add"
+git -C "$WORK/seed" -c user.name=bb -c user.email=bb@localhost commit -qm base || harness "git commit"
+git -C "$WORK/seed" push -q "$repo" main:main || harness "git push"
+mkdir -p "$WORK/ws" || harness "mkdir"
 
 MIB=1048576
 # Deterministic and incompressible: an AES-CTR keystream with a fixed key.
@@ -104,15 +111,15 @@ keystream() {
     head -c "$2" /dev/zero |
         openssl enc -aes-256-ctr -nosalt -K "$1" -iv 00000000000000000000000000000000
 }
-keystream "$(printf '%064d' 3)" $((20 * MIB)) >"$WORK/big.v1"
-keystream "$(printf '%064d' 7)" "$MIB" >"$WORK/patch"
-cp "$WORK/big.v1" "$WORK/big.v2"
-dd if="$WORK/patch" of="$WORK/big.v2" bs="$MIB" seek=7 conv=notrunc 2>/dev/null
+keystream "$(printf '%064d' 3)" $((20 * MIB)) >"$WORK/big.v1" || harness "openssl"
+keystream "$(printf '%064d' 7)" "$MIB" >"$WORK/patch" || harness "openssl"
+cp "$WORK/big.v1" "$WORK/big.v2" || harness "cp"
+dd if="$WORK/patch" of="$WORK/big.v2" bs="$MIB" seek=7 conv=notrunc 2>/dev/null || harness "dd"
 [ "$(wc -c <"$WORK/big.v1" | tr -d ' ')" -eq $((20 * MIB)) ] ||
-    fail "harness: openssl did not produce 20 MiB"
+    harness "openssl did not produce 20 MiB"
 sha_v1=$(sha256sum "$WORK/big.v1" | cut -d' ' -f1)
 sha_v2=$(sha256sum "$WORK/big.v2" | cut -d' ' -f1)
-[ "$sha_v1" != "$sha_v2" ] || fail "harness: the edit changed nothing"
+[ "$sha_v1" != "$sha_v2" ] || harness "the edit changed nothing"
 
 # The fake engine: `write-large` writes the large file and a text file,
 # `edit-large` rewrites 1 MiB of the large file in place; both then exit,
@@ -210,7 +217,7 @@ tick_until_ended() {
         sleep 0.25
         n=$((n + 1))
     done
-    fail "execution $1 never ended after $2 ticks; tick warnings: $(tail -n 5 "$WORK/ticks.log" 2>/dev/null)"
+    harness "timeout: execution $1 never ended after $2 ticks; tick warnings: $(tail -n 5 "$WORK/ticks.log" 2>/dev/null)"
 }
 
 command_state() {
@@ -285,7 +292,7 @@ store1=$(store_bytes)
 
 # --- 3. a 1 MiB in-place edit, checkpointed at the engine's exit -------------
 
-wait_for 60 pane_ready || fail "the resumed engine never showed its prompt: $(pane 2>&1)"
+wait_for 60 pane_ready || harness "timeout: the resumed engine never showed its prompt: $(pane 2>&1)"
 submit k_edit '{"type":"input","text":"edit-large"}'
 tick
 assert_eq "$(command_state k_edit)" "finished true " "edit input"
