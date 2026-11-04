@@ -175,4 +175,3 @@ impl PostgresStore {
             .map_err(|error| backend(&error))
     }
 }
-mod dump_tmp;
