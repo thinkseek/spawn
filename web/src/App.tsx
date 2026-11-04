@@ -13,7 +13,6 @@ import { RsiView } from "./components/rsi/RsiView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
-import { RSI_SESSION } from "./rsi";
 
 export type View = "fleet" | "missions" | "rsi" | "sessions";
 
@@ -153,7 +152,7 @@ export default function App() {
       ) : view === "missions" ? (
         <MissionsView />
       ) : view === "rsi" ? (
-        <RsiView onOpenSession={() => openTimeline(RSI_SESSION)} />
+        <RsiView onOpenSession={openTimeline} />
       ) : (
         <div className="flex min-h-0 min-w-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col bg-page-canvas">

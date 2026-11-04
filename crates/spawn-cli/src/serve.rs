@@ -15,9 +15,8 @@ use tiny_http::{Header, Request, Response, Server};
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalHost;
 use spawn_host::{TmuxHost, docker_prefix};
-use spawn_postgres::{RSI_AGENT, RSI_SESSION, RsiIterationRow};
 
-use crate::objectives::{Task, load_backlog, parse_metrics};
+use crate::objectives::{Landing, Task, landed_value, load_backlog, metric_lines};
 use crate::{Flags, env_or, env_value};
 
 /// Prefix of an error that answers 400.
@@ -28,14 +27,9 @@ fn session_id(id: &str) -> Result<SessionId, String> {
     SessionId::new(id).map_err(|error| format!("{BAD_REQUEST}{error}"))
 }
 
-/// Halt threshold of the controller, mirrored for display.
+/// Gate rejections (or aborts) in a row that halt a mission, mirrored from
+/// the integrator for display.
 const HALT_AFTER: u32 = 3;
-
-/// Iterations the RSI page lists.
-const RSI_ITERATIONS: u32 = 50;
-
-/// Attempts the RSI page reads for its table and chart.
-const RSI_ATTEMPTS: u32 = 500;
 
 /// Pane lines the RSI page shows.
 const PANE_LINES: usize = 120;
@@ -86,16 +80,16 @@ fn handle(request: Request, web: &Path) -> Result<(), String> {
     let answer = match path {
         "/api/overview" => overview(),
         "/api/rsi" => rsi_overview(),
-        "/api/rsi/pane" => pane(RSI_SESSION),
+        "/api/rsi/pane" => rsi_pane(query),
         "/api/fleet" => fleet(),
-        "/api/missions" => open_store().and_then(|store| store.mission_board(50).map_err(err)),
+        "/api/missions" => missions(),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 session(id, query)
-            } else if let Some(number) = path.strip_prefix("/api/rsi/iteration/") {
-                rsi_iteration(number)
+            } else if let Some(task) = path.strip_prefix("/api/rsi/task/") {
+                rsi_task(task)
             } else if let Some(id) = path.strip_prefix("/api/pane/") {
-                pane(id)
+                pane(id, None)
             } else if let Some(rest) = path.strip_prefix("/api/fleet/") {
                 fleet_session(rest, query)
             } else {
@@ -138,32 +132,8 @@ fn overview() -> Result<Value, String> {
             })
         })
         .collect();
-    let rsi = store.rsi_state().map_err(|error| error.to_string())?;
-    let open = store
-        .rsi_open_iteration()
-        .map_err(|error| error.to_string())?;
-    let solved = store
-        .rsi_solved_tasks()
-        .map_err(|error| error.to_string())?;
-    Ok(json!({
-        "sessions": sessions,
-        "rsi": {
-            "baseline": rsi.as_ref().map(|state| state.baseline.clone()),
-            "iteration": rsi.as_ref().map(|state| state.iteration),
-            "consecutive_rejected": rsi.as_ref().map(|state| state.consecutive_rejected),
-            "solved_tasks": solved,
-            "open_iteration": open.map(|iteration| json!({
-                "iteration": iteration.iteration,
-                "task_id": iteration.task_id,
-                "phase": iteration.phase,
-                "agent_id": iteration.agent_id,
-                "session_id": iteration.session_id,
-                "candidate": iteration.candidate,
-                "note": iteration.note,
-                "patch_bytes": iteration.patch.as_ref().map_or(0, String::len),
-            })),
-        },
-    }))
+    let rsi = objective_missions(&store)?.first().map(rsi_summary);
+    Ok(json!({ "sessions": sessions, "rsi": rsi }))
 }
 
 fn err(error: impl std::fmt::Display) -> String {
@@ -178,182 +148,310 @@ fn now_ms() -> i64 {
         })
 }
 
-/// The latest landed value of a recurring task's metric, from the retired
-/// RSI controller's attempts: the RSI page shows that frozen history until
-/// it moves to the objective mission (docs/fleet-architecture.md §10.4).
-fn landed_metric(
-    store: &spawn_postgres::PostgresStore,
-    task: &Task,
-) -> Result<Option<f64>, String> {
-    let Some(name) = &task.metric else {
-        return Ok(None);
-    };
-    let attempts = store.rsi_attempts_of(task.id, 200).map_err(err)?;
-    Ok(attempts
-        .iter()
-        .filter(|attempt| attempt.accepted)
-        .find_map(|attempt| {
-            parse_metrics(&attempt.gate_log)
-                .into_iter()
-                .find(|metric| &metric.name == name)?
-                .candidate
-        }))
+/// `/api/missions`: the board, each task with its last gate verdict
+/// (`last_gate`: `{verdict, reason, metric, candidate, at_ms}` or null).
+fn missions() -> Result<Value, String> {
+    let store = open_store()?;
+    let mut board = store.mission_board(50).map_err(err)?;
+    let gates = store.last_gates().map_err(err)?;
+    with_last_gates(&mut board, &gates);
+    Ok(board)
 }
 
-/// The objective the loop pursues: the first recurring task in the
-/// controller's backlog that has not met its target, else the last one.
-fn objective(store: &spawn_postgres::PostgresStore) -> Result<Option<Task>, String> {
-    let backlog = PathBuf::from(env_or("SPAWN_RSI_BACKLOG", "rsi/backlog"));
-    let recurring: Vec<Task> = load_backlog(&backlog)?
-        .into_iter()
-        .filter(|task| task.recurring)
-        .collect();
-    for task in &recurring {
-        let met = match (landed_metric(store, task)?, task.target) {
-            (Some(value), Some(target)) => {
-                if task.lower_is_better {
-                    value <= target
-                } else {
-                    value >= target
-                }
-            }
-            _ => false,
-        };
-        if !met {
-            return Ok(Some(task.clone()));
+/// Put each task's last gate verdict from `gates` (keyed by task id) on the
+/// board.
+fn with_last_gates(board: &mut Value, gates: &Value) {
+    let Some(missions) = board.get_mut("missions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for task in missions
+        .iter_mut()
+        .filter_map(|mission| mission.get_mut("tasks").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let gate = task["id"]
+            .as_i64()
+            .and_then(|id| gates.get(id.to_string()))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Some(fields) = task.as_object_mut() {
+            fields.insert("last_gate".to_string(), gate);
         }
     }
-    Ok(recurring.last().cloned())
 }
 
-fn iteration_json(row: &RsiIterationRow) -> Value {
-    let iteration = &row.iteration;
-    json!({
-        "iteration": iteration.iteration,
-        "task_id": iteration.task_id,
-        "phase": iteration.phase,
-        "started_at_ms": row.started_at_ms,
-        "updated_at_ms": row.updated_at_ms,
-        "note": iteration.note,
-        "candidate": iteration.candidate,
-        "patch_bytes": iteration.patch.as_ref().map_or(0, String::len),
-    })
-}
-
-/// Everything the RSI page shows, in one read.
+/// The RSI page (docs/fleet-architecture.md §10.4): every open objective
+/// mission, read from the mission tables, the control stream and the
+/// mission's backlog. Nothing here reads the retired controller's `rsi_*`
+/// tables, which stay in the database as history.
+///
+/// `GET /api/rsi` answers:
+///
+/// ```text
+/// {
+///   "generated_at_ms": 1793766328633,
+///   "halt_after": 3,                      // rejections (or aborts) in a row that halt
+///   "missions": [{                        // open objective missions, by id
+///     "id": 4, "text": "...", "state": "open", "sources": ["..."],
+///     "gate": "/.../rsi/scenarios", "accept": "gate",
+///     "budget": {"minutes": 45, "tool_calls": 60} | null,
+///     "baseline": "<commit>" | null,      // where the last landing left main
+///     "halted": "<reason>" | null,        // set until a human resumes
+///     "scenario_floor": 7, "gate_rejections": 0, "gate_aborts": 0,
+///     "backlog": "/.../rsi/backlog" | null,
+///     "backlog_error": "<why it could not be read>" | null,
+///     "resident": {"name", "agent_id", "session_id", "state"} | null,
+///     "next_objective": 3 | null,         // what the integrator assigns next
+///     "objectives": [{                    // the backlog, by id
+///       "id": 2, "title": "...", "prompt": "...", "recurring": true,
+///       "metric": "ingest_total_ns" | null, "unit": "ns",
+///       "direction": "lower" | "higher", "target": 1100 | null,
+///       "status": "open" | "solved" | "met",
+///       "current": 1021 | null,           // latest landed metric value
+///       "tasks": [10, 14],                // task ids for this objective
+///       "landings": [{                    // landed tasks, oldest first
+///         "task": 10, "at_ms": 1793724858211,
+///         "metric": "METRIC ingest_total_ns baseline=1573 candidate=1021" | null,
+///         "baseline": 1573 | null, "candidate": 1021 | null
+///       }]
+///     }],
+///     "tasks": [{                         // newest first
+///       "id", "kind", "agent_id", "session_id", "state", "revisions",
+///       "objective", "candidate", "base", "metric", "scenario", "brief",
+///       "review_note", "created_by", "created_at_ms", "delivered_at_ms",
+///       "updated_at_ms",
+///       "gates": [{                       // task.gated records, oldest first
+///         "verdict": "accepted" | "rejected" | "aborted" | "conflict" | "stale",
+///         "reason": "..." | null, "metric": "METRIC ..." | null,
+///         "candidate": "<commit>" | null, "at_ms": 1793724858000
+///       }]
+///     }]
+///   }]
+/// }
+/// ```
+///
+/// `GET /api/rsi/task/<id>` answers one task: the fields above plus the full
+/// `brief`, `report`, `gate_log` (the latest), `mission_id`, and `log` on
+/// every gate verdict. It replaces the retired `/api/rsi/iteration/<n>`.
+///
+/// `GET /api/rsi/pane[?mission=<id>]` answers the live pane of the mission's
+/// resident (the first open objective mission by default), in the shape of
+/// `/api/pane/<session>` plus `session_id`.
 fn rsi_overview() -> Result<Value, String> {
     let store = open_store()?;
-    let state = store.rsi_state().map_err(err)?;
-    let objective = objective(&store)?;
-    let iterations: Vec<Value> = store
-        .rsi_iterations(RSI_ITERATIONS)
-        .map_err(err)?
-        .iter()
-        .map(iteration_json)
-        .collect();
-    let attempts = store.rsi_recent_attempts(RSI_ATTEMPTS).map_err(err)?;
-    let unit = objective
-        .as_ref()
-        .map_or(String::new(), |task| task.unit.clone());
-    let attempt_rows: Vec<Value> = attempts
-        .iter()
-        .map(|attempt| {
-            let metrics: serde_json::Map<String, Value> = parse_metrics(&attempt.gate_log)
-                .into_iter()
-                .map(|metric| {
-                    (
-                        metric.name,
-                        json!({ "baseline": metric.baseline, "candidate": metric.candidate, "unit": unit }),
-                    )
-                })
-                .collect();
-            json!({
-                "task_id": attempt.task_id,
-                "attempt": attempt.attempt,
-                "iteration": attempt.iteration,
-                "accepted": attempt.accepted,
-                "created_at_ms": attempt.created_at_ms,
-                "metrics": metrics,
-            })
-        })
-        .collect();
-    let history: Vec<Value> = attempts
-        .iter()
-        .rev()
-        .flat_map(|attempt| {
-            parse_metrics(&attempt.gate_log)
-                .into_iter()
-                .map(move |metric| {
-                    json!({
-                        "iteration": attempt.iteration,
-                        "created_at_ms": attempt.created_at_ms,
-                        "metric": metric.name,
-                        "baseline": metric.baseline,
-                        "candidate": metric.candidate,
-                        "accepted": attempt.accepted,
-                    })
-                })
-        })
-        .collect();
-    let state_json = state.map(|state| {
-        let halt_reason = if state.consecutive_rejected >= HALT_AFTER {
-            Some(format!(
-                "{} rejections in a row",
-                state.consecutive_rejected
-            ))
-        } else if state.infra_failures >= HALT_AFTER {
-            Some(format!("{} aborts in a row", state.infra_failures))
-        } else {
-            None
-        };
-        json!({
-            "baseline": state.baseline,
-            "iteration": state.iteration,
-            "consecutive_rejected": state.consecutive_rejected,
-            "infra_failures": state.infra_failures,
-            "scenario_count": state.scenario_count,
-            "halted": halt_reason.is_some(),
-            "halt_reason": halt_reason,
-        })
-    });
     Ok(json!({
         "generated_at_ms": now_ms(),
-        "state": state_json,
-        "objective": objective.map(|task| json!({
-            "task_id": task.id,
-            "title": task.title,
-            "prompt": task.prompt,
-            "metric": task.metric,
-            "unit": task.unit,
-            "direction": if task.lower_is_better { "lower" } else { "higher" },
-            "target": task.target,
-        })),
-        "iterations": iterations,
-        "attempts": attempt_rows,
-        "metric_history": history,
+        "halt_after": HALT_AFTER,
+        "missions": objective_missions(&store)?,
     }))
 }
 
-/// One iteration with its patch, gate log and prompt.
-fn rsi_iteration(number: &str) -> Result<Value, String> {
-    let number: u32 = number
-        .parse()
-        .map_err(|_| format!("{BAD_REQUEST}bad iteration {number}"))?;
-    let store = open_store()?;
-    let Some((row, prompt)) = store.rsi_iteration(number).map_err(err)? else {
-        return Err(format!("iteration {number} does not exist"));
+/// Open objective missions with their backlog's objectives filled in.
+fn objective_missions(store: &spawn_postgres::PostgresStore) -> Result<Vec<Value>, String> {
+    let missions = store.objective_missions().map_err(err)?;
+    let Value::Array(missions) = missions else {
+        return Ok(Vec::new());
     };
-    let gate_log = store
-        .rsi_attempts_of(row.iteration.task_id, RSI_ATTEMPTS)
-        .map_err(err)?
-        .into_iter()
-        .find(|attempt| attempt.iteration == number)
-        .map(|attempt| attempt.gate_log)
+    Ok(missions.into_iter().map(with_objectives).collect())
+}
+
+/// One mission row with `backlog`, `backlog_error`, `objectives` and
+/// `next_objective` added.
+fn with_objectives(mut mission: Value) -> Value {
+    let backlog = mission
+        .pointer("/objectives/backlog")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let (objectives, error) = match &backlog {
+        Some(path) => match load_backlog(Path::new(path)) {
+            Ok(objectives) => (objectives, None),
+            Err(error) => (Vec::new(), Some(error)),
+        },
+        None => (Vec::new(), Some("the mission names no backlog".to_string())),
+    };
+    let tasks = mission
+        .get("tasks")
+        .and_then(Value::as_array)
+        .cloned()
         .unwrap_or_default();
-    let mut body = iteration_json(&row);
-    body["patch"] = json!(row.iteration.patch.clone().unwrap_or_default());
-    body["gate_log"] = json!(gate_log);
-    body["prompt"] = json!(prompt);
+    let rows: Vec<Value> = objectives
+        .iter()
+        .map(|objective| objective_json(objective, &tasks))
+        .collect();
+    let next = rows
+        .iter()
+        .find(|row| row["status"] == "open")
+        .map(|row| row["id"].clone());
+    if let Some(fields) = mission.as_object_mut() {
+        fields.insert("backlog".to_string(), json!(backlog));
+        fields.insert("backlog_error".to_string(), json!(error));
+        fields.insert("next_objective".to_string(), next.unwrap_or(Value::Null));
+        fields.insert("objectives".to_string(), Value::Array(rows));
+    }
+    mission
+}
+
+/// One backlog objective with its status and landings, from the mission's
+/// tasks (newest first).
+fn objective_json(objective: &Task, tasks: &[Value]) -> Value {
+    let mine: Vec<&Value> = tasks
+        .iter()
+        .filter(|task| task["objective"].as_u64() == Some(u64::from(objective.id)))
+        .collect();
+    let mut landed: Vec<&Value> = mine
+        .iter()
+        .copied()
+        .filter(|task| task["state"] == "landed")
+        .collect();
+    // Newest first, as `landed_value` reads them.
+    landed.sort_by_key(|task| {
+        std::cmp::Reverse((task["updated_at_ms"].as_i64(), task["id"].as_i64()))
+    });
+    let landings: Vec<Landing> = landed
+        .iter()
+        .map(|task| Landing {
+            objective: objective.id,
+            metric: task["metric"].as_str().map(str::to_string),
+        })
+        .collect();
+    let current = landed_value(objective, &landings);
+    let status = if objective.recurring {
+        if current.is_some_and(|value| objective.meets(value)) {
+            "met"
+        } else {
+            "open"
+        }
+    } else if landed.is_empty() {
+        "open"
+    } else {
+        "solved"
+    };
+    let history: Vec<Value> = landed
+        .iter()
+        .rev()
+        .map(|task| {
+            let line = task["metric"].as_str();
+            let metric = line.and_then(|line| {
+                let mut metrics = metric_lines(line);
+                match &objective.metric {
+                    Some(name) => metrics.into_iter().find(|metric| &metric.name == name),
+                    None => metrics.pop(),
+                }
+            });
+            json!({
+                "task": task["id"],
+                "at_ms": task["updated_at_ms"],
+                "metric": line,
+                "baseline": metric.as_ref().and_then(|metric| metric.baseline),
+                "candidate": metric.as_ref().and_then(|metric| metric.candidate),
+            })
+        })
+        .collect();
+    json!({
+        "id": objective.id,
+        "title": objective.title,
+        "prompt": objective.prompt,
+        "recurring": objective.recurring,
+        "metric": objective.metric,
+        "unit": objective.unit,
+        "direction": if objective.lower_is_better { "lower" } else { "higher" },
+        "target": objective.target,
+        "status": status,
+        "current": current,
+        "tasks": mine.iter().map(|task| task["id"].clone()).collect::<Vec<_>>(),
+        "landings": history,
+    })
+}
+
+/// The RSI line of `/api/overview`: the first open objective mission, its
+/// open task and how many objectives are settled.
+fn rsi_summary(mission: &Value) -> Value {
+    let objectives = mission["objectives"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let count = |status: &str| {
+        objectives
+            .iter()
+            .filter(|objective| objective["status"] == status)
+            .count()
+    };
+    let open_task = mission["tasks"].as_array().and_then(|tasks| {
+        tasks
+            .iter()
+            .find(|task| {
+                !matches!(
+                    task["state"].as_str(),
+                    Some("landed" | "cancelled" | "accepted") | None
+                )
+            })
+            .map(|task| {
+                json!({
+                    "id": task["id"],
+                    "state": task["state"],
+                    "objective": task["objective"],
+                    "revisions": task["revisions"],
+                    "session_id": task["session_id"],
+                    "last_verdict": task["gates"]
+                        .as_array()
+                        .and_then(|gates| gates.last())
+                        .map(|gate| gate["verdict"].clone()),
+                })
+            })
+    });
+    json!({
+        "mission": mission["id"],
+        "halted": mission["halted"],
+        "baseline": mission["baseline"],
+        "resident": mission["resident"],
+        "next_objective": mission["next_objective"],
+        "open_task": open_task,
+        "objectives": {
+            "open": count("open"),
+            "solved": count("solved"),
+            "met": count("met"),
+        },
+    })
+}
+
+/// One objective task, with its full brief, report and every gate verdict
+/// with its log.
+fn rsi_task(task: &str) -> Result<Value, String> {
+    let id: i64 = task
+        .parse()
+        .map_err(|_| format!("{BAD_REQUEST}bad task {task}"))?;
+    let store = open_store()?;
+    store
+        .objective_task(id)
+        .map_err(err)?
+        .ok_or_else(|| format!("task {id} does not exist"))
+}
+
+/// The live pane of an objective mission's resident.
+fn rsi_pane(query: &str) -> Result<Value, String> {
+    let wanted = parameter(query, "mission")
+        .map(|text| {
+            text.parse::<i64>()
+                .map_err(|_| format!("{BAD_REQUEST}bad mission {text}"))
+        })
+        .transpose()?;
+    let store = open_store()?;
+    let missions = store.objective_missions().map_err(err)?;
+    let resident = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|mission| wanted.is_none_or(|id| mission["id"].as_i64() == Some(id)))
+        .and_then(|mission| mission.get("resident"))
+        .filter(|resident| resident.is_object())
+        .cloned();
+    let Some(resident) = resident else {
+        return Ok(json!({ "live": false, "terminal": null, "session_id": null,
+                          "captured_at_ms": now_ms(), "text": "" }));
+    };
+    let session = resident["session_id"].as_str().unwrap_or_default();
+    let mut body = pane(session, resident["agent_id"].as_str())?;
+    body["session_id"] = json!(session);
     Ok(body)
 }
 
@@ -387,7 +485,9 @@ fn fleet_session(rest: &str, query: &str) -> Result<Value, String> {
 
 /// The tail of a session's terminal, read from tmux: a live peek at compute,
 /// not storage. Capturing a pane changes nothing, so the API stays read-only.
-fn pane(id: &str) -> Result<Value, String> {
+/// `owner` names the session's agent when the session has no state yet (a
+/// resident before its first event).
+fn pane(id: &str, owner: Option<&str>) -> Result<Value, String> {
     let store = open_store()?;
     let session = session_id(id)?;
     let latest = store.executions(&session).map_err(err)?.into_iter().next();
@@ -400,7 +500,7 @@ fn pane(id: &str) -> Result<Value, String> {
         .state(&session)
         .map_err(err)?
         .map(|state| state.agent_id.to_string())
-        .or_else(|| (id == RSI_SESSION).then(|| RSI_AGENT.to_string()))
+        .or_else(|| owner.map(str::to_string))
     else {
         return Err(format!("{id} has no owner"));
     };
@@ -580,5 +680,120 @@ fn content_type(path: &str) -> &'static str {
         Some("json") => "application/json; charset=utf-8",
         Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{objective_json, rsi_summary, with_last_gates};
+    use crate::objectives::Task;
+
+    fn objective(id: u32, recurring: bool) -> Task {
+        Task {
+            id,
+            title: format!("objective {id}"),
+            prompt: "do it".to_string(),
+            recurring,
+            metric: recurring.then(|| "ingest_total_ns".to_string()),
+            unit: "ns".to_string(),
+            lower_is_better: true,
+            target: recurring.then_some(1100.0),
+        }
+    }
+
+    fn task(
+        id: i64,
+        objective: u32,
+        state: &str,
+        at: i64,
+        metric: Option<&str>,
+    ) -> serde_json::Value {
+        json!({"id": id, "objective": objective, "state": state, "updated_at_ms": at,
+               "metric": metric, "revisions": 0, "gates": []})
+    }
+
+    #[test]
+    fn objectives_read_their_status_from_landed_tasks() {
+        let tasks = [
+            task(13, 2, "revise", 40, None),
+            task(
+                12,
+                2,
+                "landed",
+                30,
+                Some("METRIC ingest_total_ns baseline=1200 candidate=1021"),
+            ),
+            task(
+                11,
+                2,
+                "landed",
+                20,
+                Some("METRIC ingest_total_ns baseline=1573 candidate=1200"),
+            ),
+            task(10, 1, "landed", 10, None),
+        ];
+        let one_shot = objective_json(&objective(1, false), &tasks);
+        assert_eq!(one_shot["status"], "solved");
+        let recurring = objective_json(&objective(2, true), &tasks);
+        assert_eq!(recurring["status"], "met");
+        assert_eq!(recurring["current"], 1021.0);
+        assert_eq!(recurring["tasks"], json!([13, 12, 11]));
+        let landings = recurring["landings"].as_array().expect("landings");
+        assert_eq!(landings.len(), 2);
+        // Oldest first: the chart reads them in order.
+        assert_eq!(landings[0]["task"], 11);
+        assert_eq!(landings[0]["baseline"], 1573.0);
+        assert_eq!(landings[1]["candidate"], 1021.0);
+        let untouched = objective_json(&objective(3, false), &tasks);
+        assert_eq!(untouched["status"], "open");
+        assert_eq!(untouched["landings"], json!([]));
+    }
+
+    #[test]
+    fn a_recurring_objective_above_its_target_stays_open() {
+        let tasks = [task(
+            11,
+            2,
+            "landed",
+            20,
+            Some("METRIC ingest_total_ns baseline=1573 candidate=1200"),
+        )];
+        let recurring = objective_json(&objective(2, true), &tasks);
+        assert_eq!(recurring["status"], "open");
+        assert_eq!(recurring["current"], 1200.0);
+    }
+
+    #[test]
+    fn the_board_gets_each_tasks_last_gate() {
+        let mut board = json!({"missions": [{"tasks": [{"id": 7}, {"id": 8}]}]});
+        with_last_gates(&mut board, &json!({"7": {"verdict": "accepted"}}));
+        assert_eq!(
+            board["missions"][0]["tasks"][0]["last_gate"]["verdict"],
+            "accepted"
+        );
+        assert!(board["missions"][0]["tasks"][1]["last_gate"].is_null());
+    }
+
+    #[test]
+    fn the_summary_names_the_open_task() {
+        let mission = json!({
+            "id": 4, "halted": null, "baseline": "abc",
+            "objectives": [{"status": "open"}, {"status": "met"}, {"status": "solved"}],
+            "tasks": [
+                {"id": 13, "state": "revise", "objective": 3, "revisions": 1,
+                 "session_id": "session_resident_rsi", "gates": [{"verdict": "rejected"}]},
+                task(12, 2, "landed", 30, None),
+            ],
+        });
+        let summary = rsi_summary(&mission);
+        assert_eq!(summary["mission"], 4);
+        assert_eq!(summary["open_task"]["id"], 13);
+        assert_eq!(summary["open_task"]["last_verdict"], "rejected");
+        assert_eq!(
+            summary["objectives"],
+            json!({"open": 1, "solved": 1, "met": 1})
+        );
     }
 }

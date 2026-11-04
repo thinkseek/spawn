@@ -4,6 +4,7 @@ import {
   Check,
   ChevronRight,
   Hourglass,
+  OctagonAlert,
   RotateCcw,
   Target,
   Terminal,
@@ -20,9 +21,9 @@ import type {
   Resident,
   TaskState,
 } from "../../missions";
-import { PIPELINE, approveCommand, fetchMissions } from "../../missions";
+import { approveCommand, fetchMissions, pipelineOf } from "../../missions";
 import { Fact, SectionLabel } from "../fleet/bits";
-import { useNow } from "../rsi/Phase";
+import { VerdictBadge, useNow } from "../rsi/Phase";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 import { Markdown } from "./Markdown";
 
@@ -322,10 +323,65 @@ function MissionCard({ mission }: { mission: Mission }) {
             <span className="tnum">
               {mission.tasks.length}
               {counts.accepted > 0 && ` · ${counts.accepted} accepted`}
+              {counts.landed > 0 && ` · ${counts.landed} landed`}
               {counts.cancelled > 0 && ` · ${counts.cancelled} cancelled`}
             </span>
           </Fact>
         </div>
+
+        {mission.halted && (
+          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/[0.08] px-3 py-2">
+            <OctagonAlert size={14} className="mt-0.5 shrink-0 text-destructive" />
+            <div className="min-w-0 text-label">
+              <span className="font-medium text-destructive">Halted</span>
+              <span className="text-foreground/85"> — {mission.halted}</span>
+              <div className="text-caption text-muted-foreground">
+                Nothing lands until a human runs{" "}
+                <code className="font-mono">spawn mission resume --id {mission.id ?? "N"}</code>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {mission.gate && (
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4">
+            <Fact label="Gate">
+              <span className="font-mono" title={mission.gate}>
+                {shortPath(mission.gate)}
+              </span>
+            </Fact>
+            <Fact label="Accept">
+              {mission.accept === "gate"
+                ? "gate alone"
+                : mission.accept === "review"
+                  ? "review, then gate"
+                  : (mission.accept ?? "—")}
+            </Fact>
+            <Fact label="Baseline">
+              <span className="font-mono" title={mission.baseline ?? undefined}>
+                {mission.baseline ? mission.baseline.slice(0, 10) : "—"}
+              </span>
+            </Fact>
+            <Fact label="Budget">
+              <span className="tnum">{budgetText(mission.budget)}</span>
+            </Fact>
+            {mission.objectives && (
+              <>
+                <Fact label="Backlog">
+                  <span
+                    className="font-mono"
+                    title={mission.objectives.backlog ?? undefined}
+                  >
+                    {mission.objectives.backlog
+                      ? shortPath(mission.objectives.backlog)
+                      : "—"}
+                  </span>
+                </Fact>
+                <Fact label="Resident">{mission.objectives.resident ?? "—"}</Fact>
+              </>
+            )}
+          </div>
+        )}
 
         {mission.summary && (
           <div className="rounded-md border border-success/20 bg-success/[0.05] px-3 py-2">
@@ -371,7 +427,11 @@ function MissionCard({ mission }: { mission: Mission }) {
         ) : (
           <ul className="divide-y divide-surface-border">
             {mission.tasks.map((task, index) => (
-              <TaskRow key={task.id ?? `index-${index}`} task={task} />
+              <TaskRow
+                key={task.id ?? `index-${index}`}
+                task={task}
+                mission={mission}
+              />
             ))}
           </ul>
         )}
@@ -380,7 +440,7 @@ function MissionCard({ mission }: { mission: Mission }) {
   );
 }
 
-function TaskRow({ task }: { task: MissionTask }) {
+function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
   return (
     <li
       className={cx(
@@ -412,7 +472,55 @@ function TaskRow({ task }: { task: MissionTask }) {
         </span>
       </div>
 
-      <Pipeline task={task} />
+      <Pipeline task={task} steps={pipelineOf(mission)} />
+
+      {(task.objective !== null ||
+        task.candidate ||
+        task.metric ||
+        task.last_gate) && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-caption">
+          {task.objective !== null && (
+            <span className="text-muted-foreground">
+              objective <span className="tnum text-foreground">{task.objective}</span>
+            </span>
+          )}
+          {task.candidate && (
+            <span className="text-muted-foreground">
+              candidate{" "}
+              <span className="font-mono text-foreground" title={task.candidate}>
+                {task.candidate.slice(0, 10)}
+              </span>
+            </span>
+          )}
+          {task.metric && (
+            <span className="min-w-0 truncate font-mono text-info" title={task.metric}>
+              {task.metric}
+            </span>
+          )}
+          {task.last_gate && (
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className="text-muted-foreground">last gate</span>
+              <VerdictBadge verdict={task.last_gate.verdict} />
+              {task.last_gate.reason && (
+                <span
+                  className="min-w-0 max-w-md truncate text-foreground/80"
+                  title={task.last_gate.reason}
+                >
+                  {task.last_gate.reason}
+                </span>
+              )}
+              {task.last_gate.at_ms !== null && (
+                <span
+                  className="tnum text-faint-foreground"
+                  title={absolute(task.last_gate.at_ms)}
+                >
+                  {relativeTime(task.last_gate.at_ms)}
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+      )}
 
       {(task.state === "revise" || task.revisions > 0) && (
         <div className="rounded-md border border-warning/25 bg-warning/[0.06] px-3 py-2">
@@ -456,33 +564,32 @@ function TaskRow({ task }: { task: MissionTask }) {
   );
 }
 
-/** How far along the happy path a task has got (index into PIPELINE). */
-function reached(state: TaskState): number {
-  switch (state) {
-    case "assigned":
-      return 0;
-    case "delivered":
-      return 1;
-    case "reported":
-    case "revise":
-      return 2;
-    case "accepted":
-      return 3;
-    default:
-      return -1;
-  }
+/** How far along its path a task has got (index into `steps`). */
+function reached(state: TaskState, steps: ReadonlyArray<TaskState>): number {
+  const at = steps.indexOf(state);
+  if (at >= 0) return at;
+  // Sent back after a report; or accepted by the gate on a path without a
+  // review step, about to land.
+  if (state === "revise" || state === "accepted") return steps.indexOf("reported");
+  return -1;
 }
 
-function Pipeline({ task }: { task: MissionTask }) {
+function Pipeline({
+  task,
+  steps,
+}: {
+  task: MissionTask;
+  steps: ReadonlyArray<TaskState>;
+}) {
   const cancelled = task.state === "cancelled";
   const revise = task.state === "revise";
-  const at = reached(task.state);
+  const at = reached(task.state, steps);
   return (
     <ol
       aria-label={`Task state: ${task.raw_state ?? "unknown"}`}
       className="flex flex-wrap items-center gap-1"
     >
-      {PIPELINE.map((step, index) => {
+      {steps.map((step, index) => {
         const done = !cancelled && index <= at;
         const current = !cancelled && !revise && index === at;
         return (
@@ -499,7 +606,7 @@ function Pipeline({ task }: { task: MissionTask }) {
                 cancelled
                   ? "text-faint-foreground/60 ring-surface-border line-through"
                   : current
-                    ? step === "accepted"
+                    ? step === "accepted" || step === "landed"
                       ? "bg-success/15 text-success ring-success/30"
                       : "bg-info/15 text-info ring-info/30"
                     : done
@@ -612,10 +719,27 @@ function countStates(tasks: MissionTask[]): Record<TaskState, number> {
     revise: 0,
     accepted: 0,
     cancelled: 0,
+    landing: 0,
+    landed: 0,
     unknown: 0,
   };
   for (const task of tasks) counts[task.state] += 1;
   return counts;
+}
+
+/** The last two components of a path: enough to tell gates apart. */
+function shortPath(path: string): string {
+  const parts = path.split("/").filter(Boolean);
+  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
+}
+
+function budgetText(budget: Mission["budget"]): string {
+  if (!budget) return "—";
+  const parts = [
+    budget.minutes !== null ? `${budget.minutes} min` : null,
+    budget.tool_calls !== null ? `${budget.tool_calls} tool calls` : null,
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? parts.join(" · ") : "—";
 }
 
 function absolute(ms: number | null): string | undefined {

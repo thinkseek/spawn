@@ -143,7 +143,6 @@ spawn status
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_TRACE` | 未设 | 设置后每次端口调用向 stderr 打印一行 `spawn-trace <stage> <us>` |
-| `SPAWN_RSI_BACKLOG` | `rsi/backlog` | `spawn serve` 的 RSI 页面读取的任务定义目录 |
 | `SPAWN_GATE` | `scripts/rsi/gate.sh` | `spawn integrate` 的门禁脚本，输出一行 JSON 判定 |
 
 ## 8. 验证

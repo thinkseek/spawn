@@ -9,7 +9,8 @@ use postgres::Client;
 use serde_json::json;
 
 mod common;
-use common::{admin, store};
+use common::{admin, store, url};
+use spawn_postgres::PostgresStore;
 
 /// Every row of the three tables, in a stable order.
 fn tables(client: &mut Client) -> serde_json::Value {
@@ -361,6 +362,8 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
     assert_eq!(history[0]["verdict"], "rejected");
     assert_eq!(history[0]["reason"], "scenario fails on the candidate");
 
+    the_rsi_page_reads_it(&store, mission, task);
+
     let mut client = admin(&schema);
     let live = tables(&mut client);
     assert_eq!(live["tasks"][0]["agent_id"], "agent_resident_rsi");
@@ -539,4 +542,60 @@ fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
         live,
         "the tables are the fold of the log"
     );
+}
+
+#[test]
+fn one_integrator_holds_the_lock() {
+    let (first, schema) = store("control_integrator_lock");
+    let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
+    assert!(
+        first.integrator_try_lock().expect("lock"),
+        "the first takes it"
+    );
+    assert!(
+        !second.integrator_try_lock().expect("lock"),
+        "the second waits for the first"
+    );
+    drop(first);
+    // The lock dies with its connection; the server notices asynchronously.
+    let mut held = false;
+    for _ in 0..50 {
+        held = second.integrator_try_lock().expect("lock");
+        if held {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(held, "a dead integrator never blocks the next one");
+}
+
+/// The RSI page's reads on the objective mission built above: the mission
+/// with its resident and its tasks' gate verdicts, newest task first; one
+/// task with its logs; and the board's last verdict per task.
+fn the_rsi_page_reads_it(store: &PostgresStore, mission: i64, task: i64) {
+    let page = store.objective_missions().expect("objective missions");
+    assert_eq!(page.as_array().map(Vec::len), Some(1));
+    assert_eq!(page[0]["id"], mission);
+    assert_eq!(page[0]["accept"], "gate");
+    assert_eq!(page[0]["resident"]["session_id"], "session_resident_rsi");
+    assert_eq!(page[0]["tasks"][0]["id"], task);
+    assert_eq!(page[0]["tasks"][0]["gates"][0]["verdict"], "rejected");
+    assert_eq!(
+        page[0]["tasks"][0]["gates"][0]["reason"],
+        "scenario fails on the candidate"
+    );
+    assert!(
+        page[0]["tasks"][0]["gates"][0]["log"].is_null(),
+        "no logs in the overview"
+    );
+    let detail = store
+        .objective_task(task)
+        .expect("one task")
+        .expect("it exists");
+    assert_eq!(detail["mission_id"], mission);
+    assert_eq!(detail["brief"], "brief");
+    assert_eq!(detail["gates"][0]["verdict"], "rejected");
+    assert!(store.objective_task(task + 1000).expect("read").is_none());
+    let gates = store.last_gates().expect("last gates");
+    assert_eq!(gates[task.to_string()]["verdict"], "rejected");
 }

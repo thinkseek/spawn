@@ -9,6 +9,8 @@ export const TASK_STATES = [
   "revise",
   "accepted",
   "cancelled",
+  "landing",
+  "landed",
 ] as const;
 export type TaskState = (typeof TASK_STATES)[number] | "unknown";
 
@@ -19,6 +21,31 @@ export const PIPELINE: ReadonlyArray<TaskState> = [
   "reported",
   "accepted",
 ];
+
+/** The path of a task in a mission with a gate (docs/fleet-architecture.md
+ * §10.3): after the supervisor's review (`accept` = review) or on the gate
+ * alone (`gate`), the integrator lands it. */
+export function pipelineOf(mission: Pick<Mission, "gate" | "accept">): ReadonlyArray<TaskState> {
+  if (!mission.gate) return PIPELINE;
+  return mission.accept === "gate"
+    ? ["assigned", "delivered", "reported", "landing", "landed"]
+    : ["assigned", "delivered", "reported", "accepted", "landing", "landed"];
+}
+
+/** The last `task.gated` record of a task. */
+export interface LastGate {
+  verdict: string;
+  reason: string | null;
+  metric: string | null;
+  candidate: string | null;
+  at_ms: number | null;
+}
+
+/** What a mission's tasks are budgeted, when it has a budget. */
+export interface Budget {
+  minutes: number | null;
+  tool_calls: number | null;
+}
 
 export type ResidentState = "proposed" | "approved" | "retired" | "unknown";
 
@@ -34,6 +61,13 @@ export interface MissionTask {
   revisions: number;
   review_note: string | null;
   report: string | null;
+  /** The commit the integrator built for this task. */
+  candidate: string | null;
+  /** The backlog objective of an objective mission's task. */
+  objective: number | null;
+  /** The gate's metric line of the accepted candidate. */
+  metric: string | null;
+  last_gate: LastGate | null;
   created_by: string | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
@@ -46,6 +80,17 @@ export interface Mission {
   sources: string[];
   state: string | null;
   summary: string | null;
+  /** Scenarios directory of the mission's gate; null without a gate. */
+  gate: string | null;
+  /** `review` (the supervisor accepts, then the gate runs) or `gate`. */
+  accept: string | null;
+  budget: Budget | null;
+  /** Where the last landing left the source's main. */
+  baseline: string | null;
+  /** Why a halt rule fired, until a human resumes the mission. */
+  halted: string | null;
+  /** Objective missions: the backlog and the resident that works it. */
+  objectives: { backlog: string | null; resident: string | null } | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
   tasks: MissionTask[];
@@ -103,6 +148,17 @@ function residentState(value: unknown): ResidentState {
     : "unknown";
 }
 
+function normalizeLastGate(value: unknown): LastGate | null {
+  if (!isObject(value)) return null;
+  return {
+    verdict: optionalText(value.verdict) ?? "unknown",
+    reason: optionalText(value.reason),
+    metric: optionalText(value.metric),
+    candidate: optionalText(value.candidate),
+    at_ms: optionalNumber(value.at_ms),
+  };
+}
+
 function normalizeTask(value: unknown): MissionTask | null {
   if (!isObject(value)) return null;
   return {
@@ -116,6 +172,10 @@ function normalizeTask(value: unknown): MissionTask | null {
     revisions: Math.max(0, optionalNumber(value.revisions) ?? 0),
     review_note: optionalText(value.review_note),
     report: optionalText(value.report),
+    candidate: optionalText(value.candidate),
+    objective: optionalNumber(value.objective),
+    metric: optionalText(value.metric),
+    last_gate: normalizeLastGate(value.last_gate),
     created_by: optionalText(value.created_by),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
@@ -142,6 +202,22 @@ function normalizeMission(value: unknown): Mission | null {
     sources,
     state: optionalText(value.state),
     summary: optionalText(value.summary),
+    gate: optionalText(value.gate),
+    accept: optionalText(value.accept),
+    budget: isObject(value.budget)
+      ? {
+          minutes: optionalNumber(value.budget.minutes),
+          tool_calls: optionalNumber(value.budget.tool_calls),
+        }
+      : null,
+    baseline: optionalText(value.baseline),
+    halted: optionalText(value.halted),
+    objectives: isObject(value.objectives)
+      ? {
+          backlog: optionalText(value.objectives.backlog),
+          resident: optionalText(value.objectives.resident),
+        }
+      : null,
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
     tasks,
