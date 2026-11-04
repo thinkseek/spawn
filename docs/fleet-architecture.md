@@ -221,6 +221,55 @@ Rules for the session itself:
   submitted or an event about it, so a handoff can always be rebuilt.
 - Its uptime, restarts, resumes and handoffs are first-class facts in the UI.
 
+### 3.2 Missions, tasks and workers (proposal, under discussion)
+
+Spawn works for missions, not repositories. A repository is just one possible
+input of a mission.
+
+**Distribution is layered, and every routing decision is the supervisor's.**
+
+| Layer | Who | Does | Never does |
+| --- | --- | --- | --- |
+| Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker; later a UI box | bypass the record: every human input is a stored command with principal `human` |
+| Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a new ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker; resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
+
+**Two kinds of worker.**
+
+| | Resident | Ephemeral |
+| --- | --- | --- |
+| Exists for | a lasting concern tied to the architecture (a domain or role with a charter) | one task |
+| Started | by the supervisor, on demand, then kept | by the supervisor, on demand, per task |
+| Context | accumulates knowledge of its domain; one task at a time; handoff from the log when it grows stale | a fresh, self-contained brief and nothing else |
+| Liveness | resumed after outages like the supervisor; a stop by the supervisor or a human is respected (killable) | resumed once at most; ends when its report is accepted |
+| Workspace | its own, long-lived | its own, per task |
+
+**Context cohesion: the rules that decide routing and protect every context.**
+
+1. One session, one concern. A task goes to a resident only when it falls
+   inside that resident's charter; anything else gets an ephemeral worker.
+2. Serial inside a session. A resident starts its next task only after it has
+   reported the last one; its queue waits in storage, not in its context.
+3. Briefs, not histories. A worker receives a self-contained brief (goal,
+   inputs, done criteria, report format), never the supervisor's conversation.
+4. Reports, not transcripts. Workers end with a short structured report; the
+   supervisor reads reports and judgements, and opens a transcript (`tail`)
+   only when it must. Its own context stays about the mission.
+5. Isolated workspaces. Every worker has its own; combining results is a task
+   the supervisor decides on, not a side effect.
+6. Human input is context too. A human message to a worker is recorded, and
+   the supervisor gets a one-line summary of it.
+
+**Storage.** Missions, tasks and the resident roster are controller tables
+(like `rsi_*`): a mission has its text, origin, sources and state; a task has
+its mission, brief, kind, assignee, state and report. The supervisor writes
+tasks through a checked function, as it submits commands through the gateway.
+
+**Mission sources.** A mission names its inputs (any git repository, files,
+or nothing); each worker's workspace is materialized from them.
+`SPAWN_GIT_REPO` becomes only the default source.
+
 ## 4. Experience and the RSI loop
 
 Nothing new is stored outside the log. Three derived views make it usable:
@@ -360,6 +409,9 @@ One loop, end to end, before anything else:
 
 ## 9. Open questions
 
-1. Where do missions come from: a file the supervisor reads, CLI input, or a UI box?
-2. How much authority does the supervisor get: max fleet size, may it stop or start RSI, which repos?
-3. Which repositories do workers work on first?
+1. Who defines residents: charters written by a human, or proposed and
+   created by the supervisor (with or without human approval)?
+2. How does a worker report: a report file in its workspace, or its final
+   message?
+3. Limits on the supervisor's authority: concurrent workers, residents, cost.
+4. May a human talk to a worker directly, or only through the supervisor?
