@@ -513,8 +513,13 @@ the tree's own:
     the abort halt, not as a rejection.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). For each
   task that is ready, it:
-  1. commits the workspace;
-  2. builds the candidate: the branch itself, or a merge of it with `main`
+  1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into
+     its mirror's `refs/spawn-integrate/<agent>` (it never commits a
+     workspace and never moves `refs/heads/<agent>`). A push that lags the
+     agent's latest checkpoint is gated `stale` after a short wait: no gate
+     run, no rejection, the task stays ready and is judged again later
+     ([storage.md](storage.md), "Landing");
+  2. builds the candidate: the pushed branch itself, or a merge of it with `main`
      when `main` has moved. A conflict sends the task back. A branch with a
      pending merge of `main` or with conflict markers is sent back as
      `conflict` before it is judged.
