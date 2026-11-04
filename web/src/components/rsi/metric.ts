@@ -1,9 +1,9 @@
 import type { Direction, MetricPoint } from "../../rsi";
 
 export interface Ratchet {
-  /** Gated attempts that carry a value, oldest first. */
+  /** Landings that carry a value, oldest first. */
   points: MetricPoint[];
-  /** Baseline before the first gated attempt. */
+  /** Baseline before the first landing. */
   start: number | null;
   /** Best landed value after each point; index 0 is `start`. */
   steps: number[];
