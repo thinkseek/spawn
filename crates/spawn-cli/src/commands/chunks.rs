@@ -70,8 +70,8 @@ mod tests {
 
     #[test]
     fn the_grace_period_is_in_minutes_and_defaults_to_an_hour() {
-        assert_eq!(grace(None), Ok(Duration::from_secs(3600)));
-        assert_eq!(grace(Some("30".to_string())), Ok(Duration::from_secs(1800)));
+        assert_eq!(grace(None), Ok(Duration::from_hours(1)));
+        assert_eq!(grace(Some("30".to_string())), Ok(Duration::from_mins(30)));
         assert_eq!(grace(Some("0".to_string())), Ok(Duration::ZERO));
         assert!(grace(Some("-1".to_string())).is_err());
         assert!(grace(Some("soon".to_string())).is_err());

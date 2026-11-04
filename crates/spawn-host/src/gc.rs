@@ -220,7 +220,7 @@ mod tests {
             .expect("age object");
     }
 
-    const HOUR: Duration = Duration::from_secs(3600);
+    const HOUR: Duration = Duration::from_hours(1);
 
     #[test]
     fn the_live_set_is_every_manifest_a_reachable_commit_names_and_its_chunks() {
@@ -279,14 +279,10 @@ mod tests {
         let store = LocalChunkStore::new(directory.join("store"));
         let young = store.put(b"young").expect("put");
         let old = store.put(b"old").expect("put");
-        age(&store, &young, Duration::from_secs(29 * 60));
-        age(&store, &old, Duration::from_secs(31 * 60));
-        let collected = collect(
-            &store,
-            std::slice::from_ref(&repo),
-            Duration::from_secs(30 * 60),
-        )
-        .expect("collect");
+        age(&store, &young, Duration::from_mins(29));
+        age(&store, &old, Duration::from_mins(31));
+        let collected =
+            collect(&store, std::slice::from_ref(&repo), Duration::from_mins(30)).expect("collect");
         assert_eq!((collected.kept, collected.removed), (1, 1));
         assert!(store.contains(&young).expect("contains"));
         assert!(!store.contains(&old).expect("contains"));
@@ -308,13 +304,13 @@ mod tests {
         age(&store, &name, 2 * HOUR);
         assert_eq!(store.put(b"reused bytes").expect("put again"), name);
         let listed = store.list().expect("list");
-        assert!(listed[0].age < Duration::from_secs(60), "{listed:?}");
+        assert!(listed[0].age < Duration::from_mins(1), "{listed:?}");
         let collected = collect(&store, std::slice::from_ref(&repo), HOUR).expect("collect");
         assert_eq!(collected.removed, 0, "a put refreshed it");
 
         age(&store, &name, 2 * HOUR);
         assert!(store.touch(&name).expect("touch"));
-        assert!(store.list().expect("list")[0].age < Duration::from_secs(60));
+        assert!(store.list().expect("list")[0].age < Duration::from_mins(1));
         assert!(!store.touch(&hash_of(b"never stored")).expect("touch"));
         let _ = std::fs::remove_dir_all(&directory);
     }
