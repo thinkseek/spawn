@@ -729,7 +729,8 @@ $$;
 do $$
 begin
     if not exists (select 1 from pg_roles where rolname = 'spawn_supervisor') then
-        create role spawn_supervisor login;
+        -- No login until a migration with the owner's password sets one.
+        create role spawn_supervisor nologin;
     end if;
     execute format('grant connect on database %I to spawn_supervisor', current_database());
     execute format('grant usage on schema %I to spawn_supervisor', current_schema());
@@ -1424,7 +1425,7 @@ on conflict (principal, agent_id) do nothing;
 do $$
 begin
     if not exists (select 1 from pg_roles where rolname = 'spawn_reader') then
-        create role spawn_reader login;
+        create role spawn_reader nologin;
     end if;
     execute format('grant connect on database %I to spawn_reader', current_database());
     execute format('grant usage on schema %I to spawn_reader', current_schema());

@@ -358,17 +358,19 @@ impl TerminalHost for TmuxHost {
         }
         // Inside the workspace's container: `tail -c +N` prints from byte N
         // (1-based); a missing file exits 3 so it is told apart from failure.
-        // Anything but a regular file exits 4; the whole read is bounded in
-        // time (host-side `timeout`) and size (`head -c`).
+        // Anything but a regular file exits 4. The read opens the file the
+        // way `read_local` does (no symlink, never blocking), so a file
+        // swapped for a FIFO after the check reads as nothing rather than
+        // hanging; it is bounded in size (`count`) and time (`timeout`).
         let script = format!(
             "test -e {path} || test -L {path} || exit 3; \
              test -f {path} && ! test -L {path} || exit 4; \
-             tail -c +{} {path} | head -c {READ_LIMIT}",
-            offset.saturating_add(1),
+             dd if={path} iflag=nofollow,nonblock,skip_bytes,count_bytes \
+             skip={offset} count={READ_LIMIT} bs=1M status=none",
             path = spawn_core::shell::shell_quote(path)
         );
         let words = vec!["sh".to_string(), "-c".to_string(), script];
-        let bounded: Vec<String> = ["timeout", "10"]
+        let bounded: Vec<String> = ["timeout", "5"]
             .into_iter()
             .map(String::from)
             .chain(prefix)
