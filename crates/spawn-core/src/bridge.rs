@@ -39,9 +39,16 @@ const CLOCK_SLACK_MS: i64 = 60_000;
 /// without waiting for a turn.
 pub const IDLE_MERGE_MS: i64 = 30_000;
 
-/// Ticks an execution's end waits for its final checkpoint to succeed before
-/// the workspace is unmounted anyway (and what it did not commit is lost).
+/// Final checkpoints an ending execution tries on consecutive ticks before
+/// its end counts as stalled: the terminal is killed, the workspace stays
+/// mounted, `execution.end_stalled` asks for attention, and the checkpoint is
+/// retried every [`END_RETRY_MS`]. A workspace is unmounted only after its
+/// final checkpoint commits, or on a `discard` command.
 pub const END_ATTEMPTS: u32 = 20;
+
+/// How often a stalled end retries its final checkpoint, by the Bridge's
+/// clock.
+pub const END_RETRY_MS: i64 = 30_000;
 
 /// Engine choice and prompt of one launch.
 ///
@@ -173,9 +180,13 @@ struct Follow {
     /// This tick read an event that asks for a checkpoint, not folded yet:
     /// the workspace may hold work not on its branch.
     checkpoint_read: bool,
-    /// Ends whose final checkpoint failed; the workspace stays mounted
-    /// until one succeeds or [`END_ATTEMPTS`] have failed.
+    /// Final checkpoints of this execution's end that failed. The
+    /// workspace stays mounted until one succeeds (or a `discard`); from
+    /// [`END_ATTEMPTS`] on the end is stalled.
     end_failures: u32,
+    /// When the end's final checkpoint was last tried, by the Bridge's
+    /// clock: a stalled end retries every [`END_RETRY_MS`].
+    end_tried_at: Option<i64>,
 }
 
 /// What the Bridge knows about one session.
@@ -401,6 +412,15 @@ impl Bridge {
                     active.reported_end = Some((*cause, *exit_code));
                 }
             }
+            // A stalled end stays due after a restart, slow from the start.
+            EventKind::ExecutionEndStalled {
+                cause, exit_code, ..
+            } if current => {
+                if let Some(active) = view.active.as_mut() {
+                    active.reported_end = Some((*cause, *exit_code));
+                    active.follow.end_failures = active.follow.end_failures.max(END_ATTEMPTS);
+                }
+            }
             EventKind::NativeSessionStarted {
                 engine,
                 native_session_id,
@@ -498,7 +518,7 @@ impl Bridge {
         if let Some((cause, exit_code)) = end {
             // What the engine wrote last comes before its end.
             self.follow_output(agent_id, session, native, active, report)?;
-            return self.end(agent_id, session, active, cause, exit_code, report);
+            return self.end(agent_id, session, active, cause, exit_code, false, report);
         }
         if let Some(reason) = active.checkpoint {
             let committed = self.checkpoint(agent_id, session, active, reason, report)?;
@@ -790,8 +810,16 @@ impl Bridge {
     /// Final checkpoint, kill, unmount, then `execution.ended`. Returns
     /// false when the final checkpoint failed or the terminal could not be
     /// killed; the execution then stays active, its workspace mounted, and
-    /// the next tick tries the same end again. After [`END_ATTEMPTS`] failed
-    /// checkpoints the workspace is unmounted anyway, loudly.
+    /// the next tick tries the same end again.
+    ///
+    /// A failed final checkpoint never leads to an unmount: its workspace
+    /// holds the only copy of what the execution did not commit. After
+    /// [`END_ATTEMPTS`] failures the end is stalled: the terminal is killed,
+    /// `execution.end_stalled` is recorded and warned once, and the
+    /// checkpoint is retried every [`END_RETRY_MS`] until it commits. Only
+    /// `discard` (a person's or the supervisor's decision) unmounts a
+    /// workspace whose final checkpoint failed.
+    #[allow(clippy::too_many_arguments)]
     fn end(
         &self,
         agent_id: &AgentId,
@@ -799,9 +827,22 @@ impl Bridge {
         active: &mut Active,
         cause: EndCause,
         exit_code: Option<i32>,
+        discard: bool,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         active.reported_end = Some((cause, exit_code));
+        let now = self.clock.now().0;
+        let stalled = active.follow.end_failures >= END_ATTEMPTS;
+        if stalled
+            && !discard
+            && active
+                .follow
+                .end_tried_at
+                .is_some_and(|at| now.saturating_sub(at) < END_RETRY_MS)
+        {
+            return Ok(false);
+        }
+        active.follow.end_tried_at = Some(now);
         let committed = self.checkpoint(
             agent_id,
             session,
@@ -809,21 +850,25 @@ impl Bridge {
             CheckpointReason::ExecutionEnded,
             report,
         )?;
-        if !committed {
-            active.follow.end_failures += 1;
-            if active.follow.end_failures < END_ATTEMPTS {
-                report.warnings.push(format!(
-                    "{session}: final checkpoint failed ({} of {END_ATTEMPTS}); the workspace \
-                     stays mounted and the end is tried again",
-                    active.follow.end_failures
-                ));
-                return Ok(false);
-            }
+        if !committed && discard {
             report.warnings.push(format!(
-                "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; unmounting {} anyway: \
-                 what it did not commit is lost",
+                "{session}: final checkpoint failed; discarded: unmounting {} with what it \
+                 did not commit",
                 active.workspace
             ));
+        } else if !committed {
+            let error = report.warnings.last().cloned().unwrap_or_default();
+            active.follow.end_failures = active.follow.end_failures.saturating_add(1);
+            let failures = active.follow.end_failures;
+            if failures < END_ATTEMPTS {
+                report.warnings.push(format!(
+                    "{session}: final checkpoint failed ({failures} of {END_ATTEMPTS}); the \
+                     workspace stays mounted and the end is tried again"
+                ));
+            } else if failures == END_ATTEMPTS {
+                self.stall(agent_id, session, active, error, report)?;
+            }
+            return Ok(false);
         }
         if let Err(error) = self
             .terminals
@@ -848,6 +893,48 @@ impl Bridge {
             EventKind::ExecutionEnded { cause, exit_code },
         )?;
         Ok(true)
+    }
+
+    /// The end's final checkpoint failed [`END_ATTEMPTS`] times: kill the
+    /// terminal (the engine's work is all in the workspace, which stays),
+    /// record `execution.end_stalled` and warn, once.
+    fn stall(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        error: String,
+        report: &mut TickReport,
+    ) -> Result<(), StoreError> {
+        if let Err(error) = self
+            .terminals
+            .terminate(&active.terminal, &active.workspace)
+        {
+            report
+                .warnings
+                .push(format!("terminate {}: {error}", active.terminal));
+        }
+        report.warnings.push(format!(
+            "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; the terminal is down, \
+             {} STAYS MOUNTED with everything it holds and the checkpoint is retried every \
+             {} s. Fix the cause ({error}); a discard command gives the uncommitted work up",
+            active.workspace,
+            END_RETRY_MS / 1000
+        ));
+        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Lost, None));
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:end_stalled", active.execution_id)),
+            EventKind::ExecutionEndStalled {
+                cause,
+                exit_code,
+                failures: END_ATTEMPTS,
+                error,
+            },
+        )
     }
 
     /// Commit the workspace and record a new commit. Returns whether the
@@ -943,7 +1030,8 @@ impl Bridge {
                 report,
             ),
             CommandAction::Input { text } => self.input(claimed, &text),
-            CommandAction::Stop => self.stop(claimed),
+            CommandAction::Stop => self.stop(claimed, false, report),
+            CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt } => self.resume(claimed, prompt.as_deref(), report),
         }
     }
@@ -1059,12 +1147,14 @@ impl Bridge {
         why: String,
     ) -> Result<Outcome, StoreError> {
         let mut report = TickReport::default();
+        // Nothing ran in it yet: an unmount loses nothing.
         self.end(
             &claimed.agent_id,
             &claimed.session_id,
             &mut active.clone(),
             EndCause::Lost,
             None,
+            true,
             &mut report,
         )?;
         report.warnings.insert(0, why);
@@ -1310,21 +1400,33 @@ impl Bridge {
         }
     }
 
-    fn stop(&mut self, claimed: &Claimed) -> Result<Outcome, StoreError> {
+    /// `Stop`, or with `discard` the `Discard` that unmounts even when the
+    /// final checkpoint fails.
+    fn stop(
+        &mut self,
+        claimed: &Claimed,
+        discard: bool,
+        tick: &mut TickReport,
+    ) -> Result<Outcome, StoreError> {
         let Some(mut active) = self.running(&claimed.session_id) else {
             return Ok(Outcome::Succeeded);
         };
         let mut report = TickReport::default();
+        // A stop of an end already under way keeps its cause.
+        let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Stopped, None));
         let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
             &mut active,
-            EndCause::Stopped,
-            None,
+            cause,
+            exit_code,
+            discard,
             &mut report,
         )?;
         self.catch_up()?;
         if ended {
+            // A discard that lost work says so in the tick's report too.
+            tick.warnings.append(&mut report.warnings);
             return Ok(Outcome::Succeeded);
         }
         // The stop stays due: each tick tries the same end again.
@@ -1335,6 +1437,15 @@ impl Bridge {
         {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
+            held.follow.end_tried_at = active.follow.end_tried_at;
+        }
+        if report.warnings.is_empty() {
+            report.warnings.push(format!(
+                "{}: the end is stalled and its final checkpoint retried every {} s; a \
+                 discard command gives the uncommitted work up",
+                claimed.session_id,
+                END_RETRY_MS / 1000
+            ));
         }
         Ok(Outcome::Failed(report.warnings.join("; ")))
     }

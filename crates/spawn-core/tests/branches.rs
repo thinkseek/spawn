@@ -591,38 +591,141 @@ fn a_failed_final_checkpoint_keeps_the_workspace_and_is_tried_again() {
     assert_eq!(unmounts(&store), 1);
 }
 
-#[test]
-fn a_final_checkpoint_that_keeps_failing_unmounts_loudly_after_twenty_ticks() {
-    let store = store();
-    let mut bridge = bridge(&store);
-    start(&store, None);
+fn commits(store: &MemoryStore) -> usize {
+    store
+        .workspace_calls()
+        .iter()
+        .filter(|call| *call == "commit")
+        .count()
+}
+
+fn stalls(store: &MemoryStore) -> Vec<(EndCause, u32)> {
+    events(store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ExecutionEndStalled {
+                cause, failures, ..
+            } => Some((cause, failures)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A Bridge on `clock` whose stop's final checkpoint has failed twenty
+/// times: the end is stalled.
+fn stalled(store: &Arc<MemoryStore>, clock: &Arc<ManualClock>) -> Bridge {
+    let mut bridge = bridge(store).with_clock(clock.clone());
+    start(store, None);
     bridge.tick().expect("start");
     store.fail_commits(true);
-    submit(&store, "key_stop", CommandAction::Stop);
+    submit(store, "key_stop", CommandAction::Stop);
     // The stop tries once, and the same tick's pass over executions again.
     bridge.tick().expect("stop: attempts 1 and 2");
-    let attempts = |store: &MemoryStore| {
-        store
-            .workspace_calls()
-            .iter()
-            .filter(|call| *call == "commit")
-            .count()
-    };
-    assert_eq!(attempts(&store), 2);
-    while attempts(&store) < 19 {
+    assert_eq!(commits(store), 2);
+    while commits(store) < 19 {
         bridge.tick().expect("attempt");
-        assert!(ended(&store).is_empty());
+        assert!(stalls(store).is_empty());
     }
     let report = bridge.tick().expect("attempt 20");
-    assert_eq!(attempts(&store), 20);
+    assert_eq!(commits(store), 20);
+    assert!(
+        report.warnings.iter().any(
+            |warning| warning.contains("FINAL CHECKPOINT FAILED 20 TIMES")
+                && warning.contains("STAYS MOUNTED")
+        ),
+        "{:?}",
+        report.warnings
+    );
+    bridge
+}
+
+#[test]
+fn a_final_checkpoint_that_keeps_failing_stalls_the_end_and_never_unmounts() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, READY);
+    let mut bridge = stalled(&store, &clock);
+    assert_eq!(
+        stalls(&store),
+        vec![(EndCause::Stopped, 20)],
+        "recorded once"
+    );
+    assert_eq!(unmounts(&store), 0, "the workspace stays");
+    assert!(ended(&store).is_empty());
+    let workspace = spawn_core::id::WorkspaceId::new("1:/w").expect("valid");
+    assert!(
+        !store.is_alive(&terminal, &workspace).expect("alive?"),
+        "the terminal is down"
+    );
+
+    // Slow from now on: nothing within 30 s, one attempt after, no second
+    // loud warning.
+    let wait = |seconds: u64| clock.advance(std::time::Duration::from_secs(seconds));
+    wait(29);
+    quiet(&bridge.tick().expect("waits"));
+    assert_eq!(commits(&store), 20);
+    wait(1);
+    let report = bridge.tick().expect("attempt 21");
+    assert_eq!(commits(&store), 21);
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("FINAL CHECKPOINT FAILED")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(unmounts(&store), 0);
+
+    // A restarted Bridge keeps the end stalled, and slow.
+    let mut bridge = self::bridge(&store).with_clock(clock.clone());
+    bridge.recover().expect("recover");
+    bridge.tick().expect("attempt 22");
+    assert_eq!(commits(&store), 22);
+    bridge.tick().expect("waits");
+    assert_eq!(commits(&store), 22);
+    assert_eq!(stalls(&store).len(), 1);
+    assert_eq!(unmounts(&store), 0);
+
+    // A plain stop does not give the work up either.
+    submit(&store, "key_stop_again", CommandAction::Stop);
+    bridge.tick().expect("stop again");
+    assert_eq!(unmounts(&store), 0);
+
+    // The cause is fixed: the next attempt ends it, as it was ending.
+    store.fail_commits(false);
+    wait(30);
+    bridge.tick().expect("the checkpoint commits");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1);
+}
+
+#[test]
+fn a_discard_unmounts_a_stalled_end() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, READY);
+    let mut bridge = stalled(&store, &clock);
+    submit(&store, "key_discard", CommandAction::Discard);
+    let report = bridge.tick().expect("discard");
     assert!(
         report
             .warnings
             .iter()
-            .any(|warning| warning.contains("FINAL CHECKPOINT FAILED 20 TIMES")),
+            .any(|warning| warning.contains("discarded")),
         "{:?}",
         report.warnings
     );
     assert_eq!(ended(&store), vec![EndCause::Stopped]);
     assert_eq!(unmounts(&store), 1);
+    let finished: Vec<bool> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::CommandFinished { succeeded, .. } => Some(succeeded),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished.last(), Some(&true), "the discard succeeded");
 }

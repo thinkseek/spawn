@@ -31,6 +31,13 @@ pub enum RulesVerdict {
 
 /// The rules tier: decide what the facts settle, mark the rest ambiguous.
 pub fn rules(input: &JudgeInput) -> RulesVerdict {
+    // Work that exists only in a mounted workspace, which nothing can
+    // commit: someone has to look, whatever else the facts say.
+    if input.stalled_end.is_some() {
+        return RulesVerdict::Certain {
+            state: SemanticState::Blocked,
+        };
+    }
     if input.execution_active {
         live_execution(input)
     } else {
