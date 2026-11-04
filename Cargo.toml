@@ -30,6 +30,9 @@ sha2 = "0.11"
 # Already linked through std's dependencies; opens agent-written files with
 # O_NOFOLLOW | O_NONBLOCK.
 libc = "0.2"
+# The chunk store (docs/storage.md): names chunks by hash, compresses them.
+blake3 = "1.8"
+zstd = "0.14"
 
 [profile.dev]
 debug = "line-tables-only"
