@@ -497,7 +497,7 @@ function Pipeline({ task }: { task: MissionTask }) {
                       : "bg-info/15 text-info ring-info/30"
                     : done
                       ? "bg-muted text-foreground ring-surface-border"
-                      : "text-faint-foreground ring-surface-border ring-dashed",
+                      : "text-faint-foreground ring-surface-border",
               )}
             >
               {done && !current && <Check size={11} />}
