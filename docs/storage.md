@@ -201,12 +201,15 @@ files, a chunk fetch.
   write, a disk error, a copy that died) is replaced by a rename over it,
   which repairs every manifest that names it. The object file and its
   fan-out directory are fsynced, and the store root when a fan-out
-  directory is created. Objects are never deleted: there is no garbage
-  collection, so the store only grows.
+  directory is created. A `put` of content the store already holds makes
+  that object young again (its modification time is set to now). Objects
+  are removed only by a collection (below).
 - **Manifest.** The large-file manifest is a chunk-store object, and the
   checkpoint commit names it in a `Spawn-Large` trailer. Only large files
   whose size, mtime or mode changed are chunked again (a stat cache in
-  `<root>/.large/<branch>`).
+  `<root>/.large/<branch>`). A checkpoint that takes chunk names from that
+  cache touches each one (makes it young again) and chunks the file again
+  when the store no longer holds one, so it never names a collected chunk.
 - **Mount.** Mount materializes the large files again, each atomically, and
   fails rather than write bytes that do not verify, or write outside the
   workspace. A manifest whose large file the head's tree has no room for (a
@@ -220,6 +223,33 @@ files, a chunk fetch.
 - **Where.** The store is the directory `SPAWN_CHUNK_STORE` names, else
   `<root>/.chunks`. It is host-local: a branch with large files resumed on a
   host without its chunks fails to mount rather than lose them.
+- **Collection.** `spawn chunks gc [--grace <minutes>] [--root <dir>]
+  [--repo <path>]` removes objects no reachable commit names.
+  - *Roots*: the store is `SPAWN_CHUNK_STORE`, else `<root>/.chunks`, with
+    the root from `--root`, else `SPAWN_WORKSPACE_ROOT`. The repositories
+    are the default repository (`--repo`, else `SPAWN_GIT_REPO`) and every
+    bare repository directly under `<root>/.sources/` (the mission mirrors).
+  - *Live*: every commit reachable from any ref of those repositories, not
+    only branch heads (an older commit of a branch still restores its
+    files). Each `Spawn-Large` trailer names a manifest; the manifest and
+    every chunk it lists are live.
+  - *Grace*: an object (a file named by 64 hex digits under
+    `<store>/<2 hex>/`) goes only when it is not live and older than the
+    grace period (default 60 minutes), its time read again just before it
+    is removed. Chunks are written before the commit that names them, and a
+    `put` or a stat-cache reuse makes an object young again, so a checkpoint
+    in flight keeps what it reuses as long as it commits within the grace
+    period.
+  - *Read errors delete nothing*: everything is decided before anything is
+    deleted. A repository that cannot be read (named by its path), or a
+    manifest a reachable commit names that is missing, unreadable or does
+    not verify (named by its 64-hex name; never treated as unreferenced),
+    stops the collection with a non-zero exit.
+  - It prints one line, `chunks gc: kept N objects, removed M objects, freed
+    B bytes`; a second collection with nothing new removes nothing.
+    Listing (each object with its age and size), touching and the
+    age-checked removal are part of the chunk-store port, so a bucket
+    adapter is collected the same way.
 - **Landing.** A branch head that names a manifest lands as a commit of the
   same tree without the trailer, so large files never reach `main`.
 
