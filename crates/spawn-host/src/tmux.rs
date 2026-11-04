@@ -20,13 +20,19 @@ use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{Launch, READ_LIMIT, TerminalError, TerminalHost};
 use spawn_core::shell::shell_join;
 
-/// Variables kept out of the tmux server's environment.
-const SCRUBBED: [&str; 4] = [
-    "SPAWN_DATABASE_URL",
-    "SPAWN_TEST_DATABASE_URL",
-    "PGPASSWORD",
-    "TYPESAFE_API_KEY",
-];
+/// Variables kept out of the tmux server's environment, besides every
+/// `SPAWN_*` one (see [`scrub`]).
+const SCRUBBED: [&str; 2] = ["PGPASSWORD", "TYPESAFE_API_KEY"];
+
+/// Whether a variable of the controller's stays out of tmux: every `SPAWN_*`
+/// setting (database logins, the serve token, the live fleet's tmux socket,
+/// repository and workspace root) and the secrets in [`SCRUBBED`]. A pane
+/// gets only what its launch passes explicitly; an agent that runs the
+/// black-box or e2e scripts in its pane must not reach the live fleet.
+fn scrub(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with("SPAWN_") || SCRUBBED.contains(&name))
+}
 
 /// Builds the argv prefix that runs one command inside a workspace.
 pub type PrefixBuilder = dyn Fn(&WorkspaceId) -> Vec<String> + Send + Sync;
@@ -125,10 +131,11 @@ fn run_words(prefix: &[String], words: &[String]) -> Result<Run, TerminalError> 
         }
     };
     // The first command starts the tmux server, whose global environment
-    // every pane can read with `tmux show-environment -g`. The
-    // controller's own database login must not end up there.
-    for secret in SCRUBBED {
-        command.env_remove(secret);
+    // every pane inherits and can read with `tmux show-environment -g`.
+    for (name, _) in std::env::vars_os() {
+        if scrub(&name) {
+            command.env_remove(name);
+        }
     }
     let output = command
         .output()
@@ -440,6 +447,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_controllers_settings_stay_out_of_tmux() {
+        use std::ffi::OsStr;
+        for name in [
+            "SPAWN_DATABASE_URL",
+            "SPAWN_SERVE_TOKEN",
+            "SPAWN_TMUX_SOCKET",
+            "PGPASSWORD",
+        ] {
+            assert!(super::scrub(OsStr::new(name)), "{name}");
+        }
+        for name in ["PATH", "HOME", "https_proxy", "LANG"] {
+            assert!(!super::scrub(OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]

@@ -442,10 +442,14 @@ impl Integrator {
                 branch
             }
         } else {
-            // Main moved since the worker started: land the merge of both.
+            // Main moved since the worker started: land the merge of both,
+            // by main's merge rules (a bare repository reads no in-tree
+            // .gitattributes otherwise), as the Bridge merges main into
+            // idle branches.
             let Ok(tree) = git(&[
                 "--git-dir",
                 &mirror_path,
+                &format!("--attr-source={main}"),
                 "merge-tree",
                 "--write-tree",
                 main,
@@ -455,7 +459,12 @@ impl Integrator {
                     "conflict",
                     json!({"note": format!(
                         "Your work conflicts with the source's current main ({main}). \
-                         Bring the conflicting files in line with it and report again.")}),
+                         Main is merged into your workspace when a turn of yours ends and \
+                         while you are idle (within about 30 s), so the conflicting files \
+                         carry conflict markers there (<<<<<<< / ======= / >>>>>>>; if \
+                         none show yet, they will once this turn ends). Resolve them, keeping both sides' intent and removing every \
+                         marker, then report again: the checkpoint after the last marker \
+                         is gone records the merge.")}),
                 );
             };
             let tree = tree.lines().next().unwrap_or_default().to_string();
