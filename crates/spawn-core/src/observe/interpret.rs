@@ -39,21 +39,22 @@ pub fn narrow(
     };
     let weight = |state: SemanticState| weight(probabilities, state);
     let total: f64 = allowed.iter().map(|state| weight(*state)).sum();
-    if total <= 0.0 {
-        return (guess, Confidence::ZERO);
+    // Written as `> 0.0` so a NaN total also falls back to the guess.
+    if total > 0.0 {
+        // On a tie the rules' guess wins: it is the documented fallback.
+        let best = allowed
+            .iter()
+            .copied()
+            .max_by(|left, right| {
+                weight(*left)
+                    .total_cmp(&weight(*right))
+                    .then_with(|| (*left == guess).cmp(&(*right == guess)))
+            })
+            .unwrap_or(guess);
+        let confidence = Confidence::new(weight(best) / total).unwrap_or(Confidence::ZERO);
+        return (best, confidence);
     }
-    // On a tie the rules' guess wins: it is the documented fallback.
-    let best = allowed
-        .iter()
-        .copied()
-        .max_by(|left, right| {
-            weight(*left)
-                .total_cmp(&weight(*right))
-                .then_with(|| (*left == guess).cmp(&(*right == guess)))
-        })
-        .unwrap_or(guess);
-    let confidence = Confidence::new(weight(best) / total).unwrap_or(Confidence::ZERO);
-    (best, confidence)
+    (guess, Confidence::ZERO)
 }
 
 /// Whether an observation should draw a person's or a higher tier's eye.
