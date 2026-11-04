@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use spawn_core::port::{ChunkError, ChunkStore};
+use spawn_core::port::{ChunkError, ChunkStore, StoredObject};
 
 /// Smallest chunk the chunker cuts, except at the end of a file.
 pub const MIN_CHUNK: usize = 128 << 10;
@@ -209,6 +209,21 @@ impl LocalChunkStore {
     }
 }
 
+/// Set the object file's modification time to now: a collection measures an
+/// object's age from it. Owning the file is enough; it is opened read-only.
+fn refresh(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.set_modified(std::time::SystemTime::now())
+}
+
+/// Age of a file from its modification time; a time in the future is age 0.
+fn age_of(metadata: &std::fs::Metadata) -> std::time::Duration {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .unwrap_or_default()
+}
+
 /// Fsync a directory, so the entries just made in it survive a crash.
 fn sync_directory(directory: &Path) -> std::io::Result<()> {
     File::open(directory)?.sync_all()
@@ -224,6 +239,9 @@ impl ChunkStore for LocalChunkStore {
         let path = self.path_of(&name);
         let exists = std::fs::symlink_metadata(&path).is_ok();
         if exists && self.sound(&name, &path) {
+            // In use again: a collection must not take it before the commit
+            // that names it.
+            refresh(&path).map_err(|error| unavailable("refresh", &path, &error))?;
             return Ok(name);
         }
         let parent = path
@@ -311,6 +329,93 @@ impl ChunkStore for LocalChunkStore {
 
     fn contains(&self, name: &str) -> Result<bool, ChunkError> {
         Ok(is_name(name) && self.path_of(name).is_file())
+    }
+
+    fn touch(&self, name: &str) -> Result<bool, ChunkError> {
+        if !is_name(name) {
+            return Ok(false);
+        }
+        let path = self.path_of(name);
+        match refresh(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(unavailable("refresh", &path, &error)),
+        }
+    }
+
+    /// Every file named by 64 hex digits in the fan-out directory of its
+    /// first two; temporary files and anything else are not objects.
+    fn list(&self) -> Result<Vec<StoredObject>, ChunkError> {
+        let fan_outs = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(unavailable("list", &self.directory, &error)),
+        };
+        let mut objects = Vec::new();
+        for fan_out in fan_outs {
+            let fan_out = fan_out.map_err(|error| unavailable("list", &self.directory, &error))?;
+            let prefix = fan_out.file_name().to_string_lossy().to_string();
+            let is_fan_out = prefix.len() == 2
+                && prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            let path = fan_out.path();
+            if !is_fan_out || !path.is_dir() {
+                continue;
+            }
+            let entries = std::fs::read_dir(&path).map_err(|error| unavailable("list", &path, &error))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| unavailable("list", &path, &error))?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !is_name(&name) || !name.starts_with(&prefix) {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) if metadata.is_file() => metadata,
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(unavailable("stat", &entry.path(), &error)),
+                };
+                objects.push(StoredObject {
+                    name,
+                    age: age_of(&metadata),
+                    bytes: metadata.len(),
+                });
+            }
+        }
+        objects.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(objects)
+    }
+
+    fn remove_if_older(
+        &self,
+        name: &str,
+        older_than: std::time::Duration,
+    ) -> Result<Option<u64>, ChunkError> {
+        if !is_name(name) {
+            return Ok(None);
+        }
+        let path = self.path_of(name);
+        // The time is read again here, just before the removal: a put since
+        // the listing made the object young, and it stays.
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unavailable("stat", &path, &error)),
+        };
+        if age_of(&metadata) < older_than {
+            return Ok(None);
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unavailable("remove", &path, &error)),
+        }
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.remove(name);
+        }
+        Ok(Some(metadata.len()))
     }
 }
 
