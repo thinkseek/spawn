@@ -1,0 +1,6 @@
+#!/bin/sh
+# Gate build hook (scripts/rsi/gate.sh): build the tree's `spawn` binary.
+# The target directory is pinned to the tree, so two trees never share one
+# and an inherited CARGO_TARGET_DIR cannot swap the binary under test.
+set -eu
+CARGO_TARGET_DIR="$PWD/target" cargo build -q --bin spawn

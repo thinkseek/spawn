@@ -77,6 +77,6 @@ because the change breaks the reader that judges it:
 - The screen-reader markers, when the installed engine version still prints
   the old ones. Extending the marker list is safe; replacing it is not.
 
-`scripts/rsi/judge-candidate.sh` builds both the baseline and the candidate
+`scripts/rsi/gate.sh` (formerly `judge-candidate.sh`) builds both the baseline and the candidate
 into separate trees, so a candidate that fails to build, or that changes a
 coupled boundary, is rejected before the baseline moves.

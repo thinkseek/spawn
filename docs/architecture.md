@@ -145,7 +145,7 @@ spawn status
 | `SPAWN_TRACE` | 未设 | 设置后每次端口调用向 stderr 打印一行 `spawn-trace <stage> <us>` |
 | `SPAWN_RSI_BACKLOG` | `rsi/backlog` | 任务定义目录，agent 不可写 |
 | `SPAWN_RSI_SCENARIOS` | `rsi/scenarios` | 黑盒场景目录，agent 不可写 |
-| `SPAWN_RSI_JUDGE` | `scripts/rsi/judge-candidate.sh` | 门禁脚本，输出一行 JSON 判定 |
+| `SPAWN_RSI_JUDGE` | `scripts/rsi/gate.sh` | 门禁脚本，输出一行 JSON 判定 |
 
 ## 8. 验证
 

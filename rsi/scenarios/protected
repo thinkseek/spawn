@@ -1,0 +1,7 @@
+# Paths a candidate may not change (scripts/rsi/gate.sh). They judge it:
+# the backlog and scenarios, the gate, and the black-box tests the checks
+# run from the controller's checkout.
+rsi/
+scripts/rsi/
+scripts/blackbox/
+scripts/mvp-e2e.sh

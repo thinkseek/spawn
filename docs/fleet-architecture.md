@@ -402,7 +402,7 @@ Fleet work so far: missions 1 and 2 (four refactor branches and the Missions vie
 
 Open items:
 - A resident keeps one branch across tasks, so merges that land in its mission source after it started never reach it. New ephemeral workers are fine: the mirror is refreshed before each new branch. Two fixes are possible: rebase the resident's branch onto `main` when a task is delivered (conflicts would then need a policy), or give every resident task its own branch.
-- Merging is a human step: `merge-gate.sh` runs per branch, then once on the merged tree. Automating it would mean a host-side integrator holding the same CAS discipline as the RSI landing.
+- Merging was a human step: `merge-gate.sh` (since folded into `scripts/rsi/gate.sh`, §10.2) ran per branch, then once on the merged tree. Automating it would mean a host-side integrator holding the same CAS discipline as the RSI landing.
 
 ## 8. Build order
 

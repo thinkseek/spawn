@@ -18,7 +18,8 @@ me=$(scalar 'select session_user')
 
 # --- No grant at all -------------------------------------------------------
 
-assert_eq "$(scalar 'select count(*) from spawn_grants')" 0 "spawn_grants starts empty"
+# The schema seeds the supervisor's grants only; nobody else holds one.
+assert_eq "$(scalar "select count(*) from spawn_grants where principal <> 'spawn_supervisor'")" 0 "spawn_grants starts with no grant but the supervisor's"
 
 capture $SPAWN_PSQL -d "$SPAWN_DB_NAME" -tA -c \
     "insert into agent_commands (agent_id, session_id, idempotency_key, action) values ('agent_x', 'session_x', 'gw_1', '{\"type\":\"stop\"}'::jsonb)"
@@ -39,7 +40,7 @@ assert_eq "$cli_id" "$(scalar 'select max(id) from spawn_commands')" "submit ret
 assert_eq "$(scalar "select principal from spawn_commands where id = $cli_id")" "spawn" "submit uses the default principal"
 assert_eq "$(scalar "select agent_id from spawn_commands where id = $cli_id")" "agent_cli" "submit queues the requested agent"
 assert_eq "$(scalar "select session_id from spawn_commands where id = $cli_id")" "session_cli" "submit queues the requested session"
-assert_eq "$(scalar 'select count(*) from spawn_grants')" 0 "submit needed no grant row"
+assert_eq "$(scalar "select count(*) from spawn_grants where principal <> 'spawn_supervisor'")" 0 "submit needed no grant row"
 assert_eq "$(scalar "select count(*) from spawn_events where event_name = 'command.accepted'")" 1 "submit records the accepted event"
 
 # --- A grant for one agent only --------------------------------------------
@@ -47,7 +48,7 @@ assert_eq "$(scalar "select count(*) from spawn_events where event_name = 'comma
 capture $SPAWN_PSQL -d "$SPAWN_DB_NAME" -tA -c \
     "insert into spawn_grants (principal, agent_id) values (session_user, 'agent_x')"
 assert_eq "$status" 0 "inserting a grant row succeeds"
-assert_eq "$(scalar 'select count(*) from spawn_grants')" 1 "one grant row exists"
+assert_eq "$(scalar "select count(*) from spawn_grants where principal <> 'spawn_supervisor'")" 1 "one grant row exists"
 assert_eq "$(scalar "select agent_id from spawn_grants where principal = '$me'")" "agent_x" "the grant names agent_x"
 
 # A different agent is still refused.

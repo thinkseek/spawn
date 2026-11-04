@@ -32,7 +32,7 @@ cron 方式仍可用（`*/1 * * * * spawn evolve ...`）：HALT 是粘性的，�
 | --- | --- |
 | `spawn tick` | 不变 |
 | `spawn evolve` | 选任务、开迭代、收补丁、跑门禁、前移基线、停 |
-| `scripts/rsi/judge-candidate.sh` | 在主机上跑场景脚本，输出一行 JSON |
+| `scripts/rsi/gate.sh` | 在主机上跑场景脚本，输出一行 JSON（舰队和 RSI 共用的唯一门禁） |
 | `rsi/backlog/NNN.json` | 任务定义，**agent 不可写** |
 | `rsi/scenarios/NNN.sh` | 黑盒场景，**agent 不可写** |
 
