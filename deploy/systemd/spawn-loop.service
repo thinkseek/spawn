@@ -11,6 +11,8 @@ Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin
 Environment=http_proxy=http://127.0.0.1:10801 https_proxy=http://127.0.0.1:10801 HTTP_PROXY=http://127.0.0.1:10801 HTTPS_PROXY=http://127.0.0.1:10801
 Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 Environment=SPAWN_PROGRAM=%h/.local/share/spawn-rsi/bin/spawn
+# A new binary migrates the schema before anything reads it.
+ExecStartPre=%h/.local/share/spawn-rsi/bin/spawn init-db
 ExecStart=%h/.local/share/spawn-rsi/bin/spawn loop
 # The agents' tmux server lives in this cgroup. Restarting the loop must not
 # kill the agents: the next loop recovers their executions from the event
