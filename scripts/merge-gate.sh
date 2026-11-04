@@ -7,6 +7,8 @@
 # exported (never checked out here), it may not touch the controller's files,
 # and it must pass, on its own tree:
 #   - cargo build and cargo clippy --workspace --all-targets with no warning;
+#   - the web build, when the branch touches web/ (dependency changes are
+#     refused: a new package is reviewed by hand);
 #   - cargo test --workspace, database tests included (SPAWN_TEST_DATABASE_URL);
 #   - scripts/mvp-e2e.sh (the whole decision ladder);
 #   - every non-ratchet RSI scenario in the controller's rsi/scenarios.
@@ -39,6 +41,15 @@ step "build and clippy"
 (cd "$tree" && cargo build --quiet --workspace --all-targets) >"$work/build.log" 2>&1 || { tail -30 "$work/build.log"; fail "build"; }
 (cd "$tree" && cargo clippy --quiet --workspace --all-targets) >"$work/clippy.log" 2>&1 || { tail -30 "$work/clippy.log"; fail "clippy errors"; }
 if grep -qE '^(warning|error)' "$work/clippy.log"; then grep -E '^(warning|error)' -A4 "$work/clippy.log" | head -30; fail "clippy warnings"; fi
+
+if git --git-dir="$repo" diff --name-only "$base" "$branch" -- web | grep -q .; then
+  step "web build"
+  webdeps=$(git --git-dir="$repo" diff --name-only "$base" "$branch" -- web/package.json web/pnpm-lock.yaml)
+  [ -z "$webdeps" ] || fail "changes web dependencies (review by hand): $webdeps"
+  [ -d "$root/web/node_modules" ] || fail "web build needs $root/web/node_modules (install once by hand)"
+  ln -s "$root/web/node_modules" "$tree/web/node_modules"
+  (cd "$tree/web" && npm run build) >"$work/web.log" 2>&1 || { tail -30 "$work/web.log"; fail "web build"; }
+fi
 
 step "tests"
 (cd "$tree" && SPAWN_TEST_DATABASE_URL=$test_url cargo test --quiet --workspace) >"$work/test.log" 2>&1 || { grep -E 'FAILED|panicked' -A5 "$work/test.log" | head -40; fail "tests"; }
