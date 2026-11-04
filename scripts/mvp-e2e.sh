@@ -39,7 +39,6 @@ work=$(mktemp -d)
 run="$$_${RANDOM}${RANDOM}"
 socket="spawn-mvp-$run"
 schema="mvp_e2e_$run"
-port=$((20000 + RANDOM % 20000))
 loop_pid=""
 jev_pid=""
 
@@ -191,7 +190,7 @@ chmod 755 "$work/claude"
 # Answers from what the evidence shows. For a HUMAN: question it answers a
 # confident, harmless WAITING on purpose: the rule must page anyway.
 cat >"$work/jev.py" <<'JEV'
-import json, sys
+import json, os, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def answer(state, conf, needs_human, stuck):
@@ -226,12 +225,20 @@ class Stub(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Stub).serve_forever()
+server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Stub)
+with open(sys.argv[2] + ".tmp", "w") as f:
+    f.write(str(server.server_address[1]))
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+server.serve_forever()
 JEV
 
+# The first start takes a port from the kernel (port 0; a guessed port can
+# collide); a restart after the outage step comes back on the same one.
 start_jev() {
-  python3 -I "$work/jev.py" "$port" &
+  python3 -I "$work/jev.py" "${port:-0}" "$work/jev.port" &
   jev_pid=$!
+  wait_for 10 "the stub Jev's port" test -s "$work/jev.port"
+  port=$(cat "$work/jev.port")
   wait_for 10 "the stub Jev" bash -c "exec 3<>/dev/tcp/127.0.0.1/$port"
 }
 
@@ -242,12 +249,13 @@ export SPAWN_GIT_REPO=$repo SPAWN_WORKSPACE_ROOT=$work/ws
 export SPAWN_CLAUDE_PROGRAM=$work/claude SPAWN_PROGRAM=$bin
 export SPAWN_TMUX_PROGRAM=$tmux SPAWN_TMUX_SOCKET=$socket
 export SPAWN_WORKER=worker-mvp SPAWN_LOOP_INTERVAL_MS=300
-export SPAWN_JUDGE_URL=http://127.0.0.1:$port SPAWN_JUDGE_MODEL=stub
+export SPAWN_JUDGE_MODEL=stub
 export SPAWN_SUPERVISOR=1 SPAWN_MISSION_FILE=$work/mission.md
 : >"$work/mission.md"
 
 "$bin" init-db >/dev/null
 start_jev
+export SPAWN_JUDGE_URL=http://127.0.0.1:$port
 
 start_loop() {
   "$bin" loop --repo "$repo" --root "$work/ws" >>"$work/loop.log" 2>&1 &

@@ -60,7 +60,12 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
     let token = access_token(&address, env_value("SPAWN_SERVE_TOKEN"))?;
     let server = Server::http(&address).map_err(|error| format!("listen {address}: {error}"))?;
     let guard = if token.is_some() { "token" } else { "none" };
-    println!("serve: http://{address} web {} auth {guard}", web.display());
+    // The bound address, not the requested one: with port 0 the kernel picks.
+    println!(
+        "serve: http://{} web {} auth {guard}",
+        server.server_addr(),
+        web.display()
+    );
     for request in server.incoming_requests() {
         if let Err(error) = handle(request, &web, token.as_deref()) {
             eprintln!("serve: {error}");

@@ -16,19 +16,29 @@ EOF
 chmod 755 "$WORK/tmux"
 export SPAWN_TMUX_PROGRAM="$WORK/tmux"
 
-# A random port keeps parallel scenarios apart (not the pid: in the gate's
-# PID namespace it is the same every run).
-port=$((20000 + $(od -An -N2 -tu2 /dev/urandom) % 20000))
-guarded_port=$((port + 20000))
+# Port 0: the kernel picks a free port and serve prints the one it bound.
+# (A guessed port can collide with another listener or an outbound
+# connection's ephemeral port.)
+bound_port() { # <log>: the port from serve's first line, bounded wait
+    i=0
+    while [ "$i" -lt 50 ]; do
+        i=$((i + 1))
+        p=$(sed -n 's#^serve: http://[^ ]*:\([0-9][0-9]*\) .*#\1#p' "$1" 2>/dev/null | head -n 1)
+        [ -n "$p" ] && { echo "$p"; return 0; }
+        sleep 0.1
+    done
+    return 1
+}
 web=$WORK/web
 mkdir -p "$web"
 printf '<!doctype html><title>spawn</title>\n' >"$web/index.html"
 
-"$SPAWN_BIN" serve --address "127.0.0.1:$port" --web "$web" \
+"$SPAWN_BIN" serve --address "127.0.0.1:0" --web "$web" \
     >"$WORK/serve.log" 2>&1 &
 serve_pid=$!
 guarded_pid=
 trap 'kill $serve_pid $guarded_pid 2>/dev/null' EXIT
+port=$(bound_port "$WORK/serve.log") || fail "serve did not start: $(cat "$WORK/serve.log")"
 
 # Wait for the listener. Bounded: 50 tries, 0.1s apart.
 ready=0
@@ -89,16 +99,18 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/../Cargo.t
 
 # --- off loopback: no token, no server --------------------------------------
 # Bounded, so a server that wrongly starts cannot hang the scenario.
-capture env -u SPAWN_SERVE_TOKEN SPAWN_SERVE_ADDRESS="0.0.0.0:$guarded_port" \
+capture env -u SPAWN_SERVE_TOKEN SPAWN_SERVE_ADDRESS="0.0.0.0:0" \
     timeout 5 "$SPAWN_BIN" serve --web "$web"
 assert_eq "$status" 1 "serve on 0.0.0.0 without a token exit"
 assert_contains "$(err)" "without SPAWN_SERVE_TOKEN" "the refusal names the token"
 
 # --- with a token, every API request carries it ------------------------------
 token=bb-serve-token-$$
-SPAWN_SERVE_TOKEN=$token "$SPAWN_BIN" serve --address "0.0.0.0:$guarded_port" \
+SPAWN_SERVE_TOKEN=$token "$SPAWN_BIN" serve --address "0.0.0.0:0" \
     --web "$web" >"$WORK/guarded.log" 2>&1 &
 guarded_pid=$!
+guarded_port=$(bound_port "$WORK/guarded.log") ||
+    fail "guarded serve did not start: $(cat "$WORK/guarded.log")"
 guarded="http://127.0.0.1:$guarded_port"
 wait_for 40 curl -fsS -H "Authorization: Bearer $token" "$guarded/api/overview" ||
     fail "guarded serve did not answer on port $guarded_port: $(cat "$WORK/guarded.log")"
