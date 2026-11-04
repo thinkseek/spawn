@@ -20,6 +20,7 @@ use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::port::CommandQueue;
 use spawn_postgres::{LivenessFacts, PostgresStore};
 
+use crate::config::spawn_program;
 use crate::{env_or, open_store};
 
 /// Agent of the supervisor.
