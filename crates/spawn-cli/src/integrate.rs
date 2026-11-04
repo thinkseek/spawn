@@ -410,7 +410,30 @@ impl Integrator {
         ])
         .is_ok()
         {
-            branch
+            // Large files are workspace state, never source: a branch head
+            // that names a large-file manifest lands as a commit of the same
+            // tree without it, so nothing forked from main inherits them.
+            let message = git(&["--git-dir", &mirror_path, "show", "-s", "--format=%B", &branch])?;
+            if spawn_host::chunks::trailer_of(&message).is_some() {
+                let tree = git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "rev-parse",
+                    &format!("{branch}^{{tree}}"),
+                ])?;
+                git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &branch,
+                    "-m",
+                    &format!("Land task {}", task.id),
+                ])?
+            } else {
+                branch
+            }
         } else {
             // Main moved since the worker started: land the merge of both.
             let Ok(tree) = git(&[
