@@ -483,15 +483,26 @@ impl WorkspaceStore for GitWorkspace {
         let reference = format!("refs/heads/{branch}");
         let parent = self.git_output(&["rev-parse", &reference])?;
         let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
-        if tree == parent_tree {
+        // A merge of main whose conflicts are now resolved: main is the
+        // second parent, even when the tree did not change.
+        let merged = self.resolved_merge(&branch, &directory);
+        if tree == parent_tree && merged.is_none() {
             return Ok(Commit::Unchanged);
         }
-        let commit = self.git_output(&["commit-tree", &tree, "-p", &parent, "-m", message])?;
+        let mut arguments = vec!["commit-tree", tree.as_str(), "-p", parent.as_str()];
+        if let Some(main) = merged.as_deref() {
+            arguments.extend(["-p", main]);
+        }
+        arguments.extend(["-m", message]);
+        let commit = self.git_output(&arguments)?;
         // Expected old value: a branch that moved is not overwritten.
         self.git_output(&["update-ref", &reference, &commit, &parent])
             .map_err(|error| {
                 WorkspaceError::Unavailable(format!("{error} (branch moved under the commit)"))
             })?;
+        if merged.is_some() {
+            self.clear_pending(&branch);
+        }
         CommitId::new(commit)
             .map(Commit::Created)
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
@@ -579,9 +590,26 @@ impl GitWorkspace {
     /// a file the merge changes differs from the branch; only then does the
     /// branch move, by compare-and-swap. The other order would let the next
     /// checkpoint commit the old files over the merge and revert `main`.
+    ///
+    /// A content conflict is written into the directory the same safe way,
+    /// conflict markers and all, and `main` waits under `.merge/<branch>` as
+    /// the second parent of the checkpoint that has them resolved (the way
+    /// `git merge` leaves `MERGE_HEAD`). Until then no newer `main` is merged:
+    /// markers never stack. A conflict markers cannot show (modify/delete,
+    /// renames, binary files) changes nothing.
     fn merge_main(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let branch = workspace.sandbox().to_string();
         let directory = self.checked_path(workspace)?;
+        if let Some((_, files)) = self.pending_merge(&branch) {
+            if unresolved(&directory, &files) {
+                return Ok(BaseMerge::Conflicted {
+                    files,
+                    marked: true,
+                });
+            }
+            // Resolved: the next checkpoint commits the merge.
+            return Ok(BaseMerge::Current);
+        }
         let reference = format!("refs/heads/{branch}");
         let head = self.commit_id_of(&reference)?;
         let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
@@ -610,17 +638,25 @@ impl GitWorkspace {
             .output()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut fields = stdout.split('\0');
-        let merged = fields.next().unwrap_or_default().trim().to_string();
+        let (merged, files, kinds) = merge_tree_output(&stdout);
+        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
         match output.status.code() {
             Some(0) => {}
             Some(1) => {
-                let mut files: Vec<String> = fields
-                    .take_while(|field| !field.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                files.dedup();
-                return Ok(BaseMerge::Conflicted { files });
+                // Only a conflict in a file's lines is shown by markers; a
+                // listing without any conflict kind is not trusted.
+                let mut conflicts = kinds.iter().filter(|kind| kind.starts_with("CONFLICT"));
+                let marked = conflicts.clone().next().is_some()
+                    && conflicts.all(|kind| kind == "CONFLICT (contents)");
+                if marked {
+                    self.update_directory(&branch, &directory, &head_tree, &merged)?;
+                    if let Err(error) = self.write_pending(&branch, &main, &files) {
+                        // Without its pending parent the merge must not stay.
+                        let _ = self.update_directory(&branch, &directory, &merged, &head_tree);
+                        return Err(error);
+                    }
+                }
+                return Ok(BaseMerge::Conflicted { files, marked });
             }
             _ => {
                 return Err(WorkspaceError::Unavailable(format!(
@@ -629,7 +665,6 @@ impl GitWorkspace {
                 )));
             }
         }
-        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
         self.update_directory(&branch, &directory, &head_tree, &merged)?;
         let changed =
             self.git_output(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
@@ -699,4 +734,105 @@ impl GitWorkspace {
         let _ = std::fs::remove_file(&index);
         result.map(|_| ())
     }
+
+    /// Where a merge of `main` whose conflicts are not resolved yet waits:
+    /// `main`'s commit, then the conflicted paths, NUL-separated.
+    fn pending_path(&self, branch: &str) -> PathBuf {
+        self.root.join(".merge").join(branch)
+    }
+
+    /// The pending merge of a branch: `main`'s commit and the conflicted
+    /// paths. An unreadable or malformed file counts as none.
+    fn pending_merge(&self, branch: &str) -> Option<(String, Vec<String>)> {
+        let text = std::fs::read_to_string(self.pending_path(branch)).ok()?;
+        let mut fields = text.split('\0').filter(|field| !field.is_empty());
+        let main = fields.next()?.to_string();
+        if !main.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some((main, fields.map(str::to_string).collect()))
+    }
+
+    /// Record a pending merge, atomically: a write to a temporary file, then
+    /// a rename.
+    fn write_pending(
+        &self,
+        branch: &str,
+        main: &str,
+        files: &[String],
+    ) -> Result<(), WorkspaceError> {
+        let path = self.pending_path(branch);
+        let unavailable = |what: &str, error: std::io::Error| {
+            WorkspaceError::Unavailable(format!("{what} {}: {error}", path.display()))
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| unavailable("create", error))?;
+        }
+        let mut text = format!("{main}\0");
+        for file in files {
+            text.push_str(file);
+            text.push('\0');
+        }
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, text).map_err(|error| unavailable("write", error))?;
+        std::fs::rename(&temporary, &path).map_err(|error| unavailable("rename", error))
+    }
+
+    /// The second parent of the next checkpoint of `branch`: the pending
+    /// `main`, once no conflicted file in `directory` holds a marker. A
+    /// pending `main` the branch already contains is cleared.
+    fn resolved_merge(&self, branch: &str, directory: &Path) -> Option<String> {
+        let (main, files) = self.pending_merge(branch)?;
+        let contained = self
+            .commit_id_of(&format!("refs/heads/{branch}"))
+            .and_then(|head| self.is_ancestor(&main, &head));
+        if matches!(contained, Ok(true)) {
+            self.clear_pending(branch);
+            return None;
+        }
+        (!unresolved(directory, &files)).then_some(main)
+    }
+
+    fn clear_pending(&self, branch: &str) {
+        let _ = std::fs::remove_file(self.pending_path(branch));
+    }
+}
+
+/// The tree, the conflicted paths and the message kinds (`Auto-merging`,
+/// `CONFLICT (contents)`, `CONFLICT (modify/delete)`, ...: stable, never
+/// translated) of `git merge-tree --write-tree --name-only -z`.
+fn merge_tree_output(stdout: &str) -> (String, Vec<String>, Vec<String>) {
+    let mut fields = stdout.split('\0');
+    let tree = fields.next().unwrap_or_default().trim().to_string();
+    let mut files: Vec<String> = fields
+        .by_ref()
+        .take_while(|field| !field.is_empty())
+        .map(str::to_string)
+        .collect();
+    files.dedup();
+    // Each message: a path count, the paths, its kind, its text.
+    let mut kinds = Vec::new();
+    while let Some(count) = fields.next().and_then(|field| field.parse::<usize>().ok()) {
+        if fields.by_ref().take(count).count() < count {
+            break;
+        }
+        let Some(kind) = fields.next() else { break };
+        kinds.push(kind.to_string());
+        fields.next();
+    }
+    (tree, files, kinds)
+}
+
+/// Whether any of `files` in `directory` still holds a conflict marker: a
+/// line that starts with `<<<<<<< ` or `>>>>>>> `, or is `=======`. A
+/// deleted file holds none.
+fn unresolved(directory: &Path, files: &[String]) -> bool {
+    files.iter().any(|file| {
+        std::fs::read(directory.join(file)).is_ok_and(|bytes| {
+            bytes.split(|byte| *byte == b'\n').any(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> ") || line == b"======="
+            })
+        })
+    })
 }

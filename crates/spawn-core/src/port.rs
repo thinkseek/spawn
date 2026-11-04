@@ -156,10 +156,16 @@ pub enum BaseMerge {
         /// Paths the merge changed in the workspace.
         files: Vec<String>,
     },
-    /// `main` conflicts with the branch in `files`; nothing changed.
+    /// `main` conflicts with the branch in `files`. The branch did not move.
     Conflicted {
         /// Conflicting paths.
         files: Vec<String>,
+        /// The workspace holds the merge with conflict markers in `files`
+        /// (written now, or by an earlier call and not resolved yet); the
+        /// checkpoint after they are resolved commits the merge. False: a
+        /// conflict markers cannot show (a file deleted or renamed on one
+        /// side), and nothing changed.
+        marked: bool,
     },
 }
 
@@ -188,8 +194,12 @@ pub trait WorkspaceStore: Send + Sync {
 
     /// Merge the base (the source's `main`) into the branch of a mounted,
     /// idle workspace whose state is committed: the directory first, then
-    /// the branch. A conflict, or a directory that differs from the branch,
-    /// changes nothing. A store without a moving base is always current.
+    /// the branch. A content conflict writes the merge with conflict markers
+    /// into the directory and leaves the branch where it is; the checkpoint
+    /// after the markers are resolved commits the merge (see
+    /// [`BaseMerge::Conflicted`]). A directory that differs from the branch,
+    /// or a conflict markers cannot show, changes nothing. A store without a
+    /// moving base is always current.
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let _ = workspace;
         Ok(BaseMerge::Current)

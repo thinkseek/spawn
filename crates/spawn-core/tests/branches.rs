@@ -232,18 +232,30 @@ fn a_conflict_is_a_warning_and_records_nothing() {
     bridge.tick().expect("start");
     store.set_base_merge(BaseMerge::Conflicted {
         files: vec!["README.md".to_string()],
+        marked: true,
     });
     transcript(&store, &[prompt("1"), turn_end("1")]);
     bridge.tick().expect("read the turn");
     let report = bridge.tick().expect("checkpoint the turn");
-    assert!(
-        report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("conflicts") && warning.contains("README.md")),
-        "{:?}",
-        report.warnings
-    );
+    let warned = |report: &TickReport, words: &str| {
+        report.warnings.iter().any(|warning| {
+            warning.contains("conflicts")
+                && warning.contains("README.md")
+                && warning.contains(words)
+        })
+    };
+    assert!(warned(&report, "markers there"), "{:?}", report.warnings);
+    assert!(checkpoints(&store).is_empty());
+
+    // A conflict markers cannot show is said to be left unmerged.
+    store.set_base_merge(BaseMerge::Conflicted {
+        files: vec!["README.md".to_string()],
+        marked: false,
+    });
+    transcript(&store, &[prompt("2"), turn_end("2")]);
+    bridge.tick().expect("read the turn");
+    let report = bridge.tick().expect("checkpoint the turn");
+    assert!(warned(&report, "left unmerged"), "{:?}", report.warnings);
     assert!(checkpoints(&store).is_empty());
 }
 

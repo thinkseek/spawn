@@ -450,10 +450,19 @@ impl Bridge {
                     },
                 )?;
             }
-            Ok(BaseMerge::Conflicted { files }) => report.warnings.push(format!(
-                "{session}: main conflicts with the branch in {}; left unmerged",
-                files.join(", ")
-            )),
+            Ok(BaseMerge::Conflicted { files, marked }) => report.warnings.push(if marked {
+                format!(
+                    "{session}: main conflicts with the branch in {}; the workspace carries \
+                     conflict markers there until they are resolved",
+                    files.join(", ")
+                )
+            } else {
+                format!(
+                    "{session}: main conflicts with the branch in {} in a way conflict markers \
+                     cannot show (a file deleted or renamed on one side); left unmerged",
+                    files.join(", ")
+                )
+            }),
             Err(error) => report
                 .warnings
                 .push(format!("{session}: merge main: {error}")),
