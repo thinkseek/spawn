@@ -14,8 +14,8 @@ pub(crate) const DELIVERY_TASKS: &str = r"
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
-         k.revisions, k.review_note, k.command_id,
-         m.text as mission_text, m.sources as mission_sources,
+         k.revisions, k.review_note, k.delivered_at_ms,
+         m.text as mission_text,
          m.gate is not null as gated,
          r.charter, r.name as resident
     from mission_tasks k
@@ -32,21 +32,17 @@ from (
 pub(crate) const MISSION_NEWS: &str = r"
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
-                 'id', m.id, 'text', left(m.text, 400), 'origin', m.origin,
-                 'sources', m.sources) order by m.id)
+                 'id', m.id, 'text', left(m.text, 400), 'origin', m.origin) order by m.id)
                from mission_missions m where m.state = 'open'), '[]'::jsonb),
   'reports', coalesce((select jsonb_agg(jsonb_build_object(
                  'id', k.id, 'mission_id', k.mission_id, 'kind', k.kind,
-                 'agent_id', k.agent_id, 'session_id', k.session_id,
+                 'session_id', k.session_id, 'revisions', k.revisions,
                  'report', left(k.report, 600)) order by k.id)
                from mission_tasks k where k.state = 'reported'), '[]'::jsonb),
   'approved', coalesce((select jsonb_agg(jsonb_build_object('name', r.name) order by r.name)
                from mission_residents r
               where r.state = 'approved'
                 and r.updated_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb),
-  'proposed', coalesce((select jsonb_agg(jsonb_build_object(
-                 'name', r.name, 'charter', left(r.charter, 400)) order by r.name)
-               from mission_residents r where r.state = 'proposed'), '[]'::jsonb),
   'human', coalesce((select jsonb_agg(jsonb_build_object(
                  'command_id', c.id, 'session_id', c.session_id,
                  'text', left(coalesce(c.action ->> 'text', c.action ->> 'prompt', c.action ->> 'type'), 200))
@@ -116,10 +112,10 @@ from (
   select m.id, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
          m.gate_rejections, m.gate_aborts, m.objectives, m.sources ->> 0 as source,
          coalesce((select jsonb_agg(jsonb_build_object(
-                     'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
+                     'id', k.id, 'agent_id', k.agent_id,
                      'session_id', k.session_id, 'state', k.state, 'base', k.base,
                      'candidate', k.candidate, 'scenario', k.scenario,
-                     'objective', k.objective, 'delivered_at_ms', k.delivered_at_ms)
+                     'delivered_at_ms', k.delivered_at_ms)
                      order by k.id)
                    from mission_tasks k
                   where k.mission_id = m.id

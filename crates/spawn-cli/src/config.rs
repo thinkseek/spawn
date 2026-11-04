@@ -1,13 +1,14 @@
-//! Configuration read from the environment, and the store it points at.
+//! Configuration read from the environment and flags, and the store it
+//! points at.
 //!
 //! Configuration is environment first, so a terminal started by the Bridge
 //! carries everything its hook and runner need.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use spawn_postgres::PostgresStore;
 
-use crate::flags::Flags;
 use crate::trace;
 
 pub(crate) fn env_value(name: &str) -> Option<String> {
@@ -105,5 +106,40 @@ mod tests {
     fn workspace_root_reads_the_root_flag() {
         let flags = Flags::parse(&["--root".to_string(), "/w".to_string()]).unwrap();
         assert_eq!(workspace_root(&flags).as_deref(), Some("/w"));
+    }
+}
+
+/// `--name value` arguments, as every subcommand takes them.
+#[derive(Debug, Default)]
+pub(crate) struct Flags {
+    values: HashMap<String, String>,
+}
+
+impl Flags {
+    pub(crate) fn parse(arguments: &[String]) -> Result<Self, String> {
+        let mut flags = Self::default();
+        let mut rest = arguments.iter();
+        while let Some(word) = rest.next() {
+            let Some(name) = word.strip_prefix("--") else {
+                return Err(format!("unexpected argument {word}"));
+            };
+            let Some(next) = rest.next() else {
+                return Err(format!("--{name} needs a value"));
+            };
+            if next.starts_with("--") {
+                return Err(format!("--{name} needs a value, found {next}"));
+            }
+            flags.values.insert(name.to_string(), next.clone());
+        }
+        Ok(flags)
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        self.values.get(name).cloned()
+    }
+
+    pub(crate) fn required(&self, name: &str) -> Result<String, String> {
+        self.get(name)
+            .ok_or_else(|| format!("--{name} is required"))
     }
 }

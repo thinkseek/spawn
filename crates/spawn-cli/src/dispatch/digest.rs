@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use spawn_core::command::CommandAction;
 use spawn_core::observation::SemanticState;
 
-use super::facts::{Escalation, Facts, Order, Why};
+use super::{Escalation, Facts, Order, Why};
 use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
 
 /// Escalations per digest; the rest wait for the next one.
@@ -38,25 +38,16 @@ pub(super) fn told(supervisor: Option<&Facts>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Whether the supervisor can take a digest now: live, idle at its prompt,
-/// nothing in flight.
+/// Whether the supervisor can take a digest now: live, idle on its latest
+/// fact, nothing in flight.
 fn supervisor_idle(supervisor: &Facts) -> bool {
     supervisor.live_and_free()
-        && supervisor.observation.as_ref().is_some_and(|observation| {
+        && supervisor.current_observation().is_some_and(|observation| {
             matches!(
                 observation.state,
                 SemanticState::Waiting | SemanticState::Completed
             )
         })
-}
-
-fn fnv(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
 }
 
 /// What the supervisor is asked to do about an item.
@@ -71,6 +62,7 @@ fn heading(why: Why) -> &'static str {
         Why::Report => "report, review it (`task accept` or `task reject`)",
         Why::Approved => "resident approved",
         Why::Human => "human message",
+        Why::DeliveryFailed => "delivery failed",
     }
 }
 
@@ -110,7 +102,7 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
         key: format!(
             "dispatch-digest-{}-{:016x}",
             supervisor.observation_event_id.unwrap_or(0),
-            fnv(&markers)
+            crate::sources::fnv(&markers)
         ),
         action: CommandAction::Input {
             text: text(&items, spawn),

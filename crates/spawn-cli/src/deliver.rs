@@ -15,31 +15,24 @@
 //!   the end: the worker's workspace is the candidate, so it stays (and its
 //!   next task waits) until the work lands or the gate sends it back.
 //!
-//! Missions, reports, approvals and human messages to workers become digest
-//! items for the supervisor ([`news`]). Like the dispatcher, delivery keeps
-//! no state: idempotency keys and the task rows say what was already done.
+//! Missions, reports, approvals, human messages to workers and failed
+//! deliveries become digest items for the supervisor ([`news_items`]). Like
+//! the dispatcher, delivery keeps no state: idempotency keys and the task
+//! rows say what was already done.
 //!
 //! [`orders`] is pure; [`collect_reports`] is the one step with side effects
-//! (the report file and the task row). What workers are told is in
-//! [`prompt`].
-
-mod news;
-mod prompt;
+//! (the report file and the task row).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Deserialize;
-use serde_json::Value;
 use spawn_core::command::CommandAction;
 use spawn_core::event::Engine;
 use spawn_core::mission::TaskState;
 use spawn_postgres::PostgresStore;
 
-use crate::dispatch::{Facts, Order};
-
-pub(crate) use news::news_items;
-pub(crate) use prompt::task_prompt;
+use crate::dispatch::{Escalation, Facts, Order, Why};
 
 /// Where a worker writes its report, relative to its workspace.
 pub(crate) const REPORT: &str = ".spawn/report.md";
@@ -70,6 +63,10 @@ pub(crate) struct TaskRow {
     /// The mission has a gate: its accepted work still has to land.
     #[serde(default)]
     pub(crate) gated: bool,
+    /// When the current delivery was recorded; a report older than it is
+    /// left over from before.
+    #[serde(default)]
+    pub(crate) delivered_at_ms: Option<i64>,
 }
 
 impl TaskRow {
@@ -85,6 +82,11 @@ impl TaskRow {
             || (self.state == TaskState::Accepted && !self.gated)
     }
 
+    /// Idempotency key of this task's current delivery.
+    fn delivery_key(&self) -> String {
+        format!("deliver-{}-{}", self.id, self.revisions)
+    }
+
     /// A command to this task's session that delivers or retires it.
     fn order(&self, key: String, action: CommandAction) -> Order {
         Order {
@@ -97,17 +99,52 @@ impl TaskRow {
     }
 }
 
+/// An open mission, for the supervisor's inbox.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MissionNote {
+    pub(crate) id: i64,
+    pub(crate) text: String,
+    pub(crate) origin: String,
+}
+
+/// A task waiting for review.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ReportNote {
+    pub(crate) id: i64,
+    pub(crate) mission_id: i64,
+    pub(crate) kind: String,
+    pub(crate) session_id: String,
+    #[serde(default)]
+    pub(crate) revisions: i32,
+    pub(crate) report: String,
+}
+
+/// A resident a human approved.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ApprovedNote {
+    pub(crate) name: String,
+}
+
+/// Something a human typed to a worker.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct HumanNote {
+    pub(crate) command_id: i64,
+    pub(crate) session_id: String,
+    #[serde(default)]
+    pub(crate) text: String,
+}
+
 /// What the supervisor should hear about besides worker states.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct News {
     #[serde(default)]
-    pub(crate) missions: Vec<Value>,
+    pub(crate) missions: Vec<MissionNote>,
     #[serde(default)]
-    pub(crate) reports: Vec<Value>,
+    pub(crate) reports: Vec<ReportNote>,
     #[serde(default)]
-    pub(crate) approved: Vec<Value>,
+    pub(crate) approved: Vec<ApprovedNote>,
     #[serde(default)]
-    pub(crate) human: Vec<Value>,
+    pub(crate) human: Vec<HumanNote>,
 }
 
 /// Everything delivery decides from, besides the per-session facts.
@@ -204,22 +241,17 @@ impl<'a> Turns<'a> {
 
 /// How a waiting task reaches its worker, given the worker's facts.
 fn delivery(task: &TaskRow, found: Option<&Facts>) -> Option<Order> {
-    let key = format!("deliver-{}-{}", task.id, task.revisions);
+    let key = task.delivery_key();
     match found {
         Some(facts) if facts.open_command => None,
-        Some(facts) if facts.live => facts.idle_at_prompt().then(|| {
-            task.order(
-                key,
-                CommandAction::Input {
-                    text: prompt::typed(task),
-                },
-            )
-        }),
+        Some(facts) if facts.live => facts
+            .idle_at_prompt()
+            .then(|| task.order(key, CommandAction::Input { text: typed(task) })),
         // Ran before: resume, so a resident keeps its context.
         Some(facts) if facts.execution_id.is_some() => Some(task.order(
             key,
             CommandAction::Resume {
-                prompt: Some(prompt::resume_prompt(task)),
+                prompt: Some(resume_prompt(task)),
             },
         )),
         _ => Some(task.order(
@@ -287,6 +319,159 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
     orders
 }
 
+/// How every task asks to be reported on.
+fn report_contract() -> String {
+    format!(
+        "When the task is finished, or you cannot go on, write `{REPORT}` \
+at the root of your workspace with three sections: `## Outcome` (done, blocked or failed, in one \
+line), `## What changed` (files, commits, results) and `## Open issues`. Then stop and wait. Do not \
+start other work. If a person must decide something, say so in the report."
+    )
+}
+
+/// Who a resident is, for every prompt that starts its session.
+pub(crate) fn resident_role(name: &str, charter: &str) -> String {
+    format!(
+        "You are `{name}`, a long-lived resident worker of Spawn. Your charter:\n{charter}\n\n\
+Tasks inside your charter arrive one at a time; keep what you learn about your domain."
+    )
+}
+
+/// The full prompt that starts a task in a new or resumed session.
+pub(crate) fn task_prompt(task: &TaskRow) -> String {
+    let role = match (&task.resident, &task.charter) {
+        (Some(name), Some(charter)) => resident_role(name, charter),
+        _ => "You are a Spawn worker started for one task. Work only on it.".to_string(),
+    };
+    format!(
+        "{role}\n\nMission #{}: {}\n\nTask #{}:\n{}\n\n{}",
+        task.mission_id,
+        task.mission_text,
+        task.id,
+        task.brief,
+        report_contract()
+    )
+}
+
+/// What a live worker gets typed for a task: a new task, or a revision.
+fn typed(task: &TaskRow) -> String {
+    if task.is_revision() {
+        format!(
+            "Task #{} was sent back by the supervisor: {}\nFix it, then rewrite `{REPORT}`.",
+            task.id,
+            task.review_note.as_deref().unwrap_or("see the review")
+        )
+    } else {
+        format!(
+            "New task #{} for mission #{}: {}\n\nTask:\n{}\n\n{}",
+            task.id,
+            task.mission_id,
+            task.mission_text,
+            task.brief,
+            report_contract()
+        )
+    }
+}
+
+/// The prompt that resumes a session for a task; a revision also carries
+/// the reviewer's note.
+fn resume_prompt(task: &TaskRow) -> String {
+    let prompt = task_prompt(task);
+    if task.is_revision() {
+        format!("{prompt}\n\n{}", typed(task))
+    } else {
+        prompt
+    }
+}
+
+/// `text` on one line, cut to `limit` characters.
+fn one_line(text: &str, limit: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= limit {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(limit).collect::<String>())
+    }
+}
+
+/// Digest items from the mission layer: new missions, reports (once per
+/// revision), approved residents, human messages, and deliveries whose
+/// command failed, which leave a task delivered to nobody.
+pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
+    let news = &work.news;
+    let mut items = Vec::new();
+    for mission in &news.missions {
+        items.push(Escalation {
+            session_id: "missions".to_string(),
+            id: format!("mission-{}", mission.id),
+            why: Why::Mission,
+            line: format!(
+                "#{} from {}: {}",
+                mission.id,
+                mission.origin,
+                one_line(&mission.text, 300)
+            ),
+        });
+    }
+    for report in &news.reports {
+        items.push(Escalation {
+            session_id: report.session_id.clone(),
+            id: format!("report-{}-{}", report.id, report.revisions),
+            why: Why::Report,
+            line: format!(
+                "task #{} ({}, mission #{}): {}",
+                report.id,
+                report.kind,
+                report.mission_id,
+                one_line(&report.report, 400)
+            ),
+        });
+    }
+    for resident in &news.approved {
+        let name = &resident.name;
+        items.push(Escalation {
+            session_id: format!("session_resident_{name}"),
+            id: format!("approved-{name}"),
+            why: Why::Approved,
+            line: format!(
+                "a human approved resident `{name}`; assign it tasks with --kind resident --worker {name}"
+            ),
+        });
+    }
+    for message in &news.human {
+        items.push(Escalation {
+            session_id: message.session_id.clone(),
+            id: format!("human-{}", message.command_id),
+            why: Why::Human,
+            line: format!("a human told it: {}", one_line(&message.text, 200)),
+        });
+    }
+    for task in work
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Delivered)
+    {
+        let key = task.delivery_key();
+        let failed = rows
+            .iter()
+            .find(|facts| facts.session_id == task.session_id)
+            .and_then(|facts| facts.sent(&key))
+            .is_some_and(|sent| sent.succeeded == Some(false));
+        if failed {
+            items.push(Escalation {
+                session_id: task.session_id.clone(),
+                id: key,
+                why: Why::DeliveryFailed,
+                line: format!(
+                    "task #{} never reached its worker; cancel it and assign it again",
+                    task.id
+                ),
+            });
+        }
+    }
+    items
+}
+
 /// Move a collected report to `.spawn/reports/task-<id>.md` under the
 /// workspace, or delete it if it cannot be moved, so the next task starts
 /// clean.
@@ -300,6 +485,20 @@ fn put_aside(path: &Path, workspace: &Path, task: i64) {
     if moved.is_none() {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Whether the file at `path` was written at or after `since_ms`; a report
+/// older than the delivery belongs to something else.
+fn written_since(path: &Path, since_ms: Option<i64>) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    let modified_ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    since_ms.is_none_or(|since| modified_ms >= since)
 }
 
 /// Collect the reports of delivered tasks whose worker is idle. Returns log
@@ -325,6 +524,9 @@ pub(crate) fn collect_reports(
         }
         let workspace = root.join(&task.agent_id);
         let path = workspace.join(REPORT);
+        if !written_since(&path, task.delivered_at_ms) {
+            continue;
+        }
         let Ok(report) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -345,8 +547,10 @@ pub(crate) fn collect_reports(
 
 #[cfg(test)]
 mod tests {
-    use super::{News, TaskRow, Work, news_items, orders, task_prompt};
-    use crate::dispatch::{Facts, Why};
+    use super::{
+        News, TaskRow, Work, news_items, orders, report_contract, task_prompt, written_since,
+    };
+    use crate::dispatch::{Facts, Sent, Why};
     use serde_json::json;
     use spawn_core::command::CommandAction;
     use spawn_core::event::SessionSeq;
@@ -368,6 +572,7 @@ mod tests {
             charter: Some("Owns spawn-core".to_string()),
             resident: Some("core".to_string()),
             gated: false,
+            delivered_at_ms: None,
         }
     }
 
@@ -519,23 +724,79 @@ mod tests {
 
     #[test]
     fn missions_reports_and_human_messages_become_digest_items() {
-        let news = News {
-            missions: vec![json!({"id": 2, "text": "Ship it", "origin": "human"})],
-            reports: vec![json!({"id": 7, "mission_id": 2, "kind": "ephemeral",
-                                 "session_id": "session_worker_x_7", "report": "## Outcome\ndone"})],
-            approved: vec![json!({"name": "core"})],
-            human: vec![
-                json!({"command_id": 40, "session_id": "session_worker_x_7", "text": "use eu"}),
-            ],
-        };
-        let items = news_items(&news);
+        let news: News = serde_json::from_value(json!({
+            "missions": [{"id": 2, "text": "Ship it", "origin": "human"}],
+            "reports": [{"id": 7, "mission_id": 2, "kind": "ephemeral", "revisions": 1,
+                         "session_id": "session_worker_x_7", "report": "## Outcome\ndone"}],
+            "approved": [{"name": "core"}],
+            "human": [{"command_id": 40, "session_id": "session_worker_x_7", "text": "use eu"}],
+        }))
+        .expect("the shape mission_news returns");
+        let items = news_items(
+            &Work {
+                news,
+                ..Work::default()
+            },
+            &[],
+        );
         let whys: Vec<Why> = items.iter().map(|item| item.why).collect();
         assert_eq!(
             whys,
             vec![Why::Mission, Why::Report, Why::Approved, Why::Human]
         );
-        assert_eq!(items[1].marker(), "[spawn:esc session_worker_x_7 report-7]");
+        assert_eq!(
+            items[1].marker(),
+            "[spawn:esc session_worker_x_7 report-7-1]",
+            "a report after a revision is news again"
+        );
         assert!(items[1].line.contains("## Outcome done"));
+    }
+
+    #[test]
+    fn a_failed_delivery_reaches_the_supervisor() {
+        let delivered = task(4, TaskState::Delivered, "resident");
+        let mut facts = worker(false, false);
+        facts.dispatched.push(Sent {
+            key: "deliver-4-0".to_string(),
+            text: None,
+            created_at_ms: 0,
+            finished_at_ms: Some(1),
+            succeeded: Some(true),
+        });
+        let tasks = work(vec![delivered]);
+        assert!(news_items(&tasks, std::slice::from_ref(&facts)).is_empty());
+        facts.dispatched[0].succeeded = Some(false);
+        let items = news_items(&tasks, &[facts]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::DeliveryFailed);
+        assert_eq!(
+            items[0].marker(),
+            "[spawn:esc session_resident_core deliver-4-0]"
+        );
+    }
+
+    #[test]
+    fn a_report_older_than_the_delivery_is_not_collected() {
+        let dir = std::env::temp_dir().join(format!("spawn-report-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("report.md");
+        std::fs::write(&path, "## Outcome\ndone").expect("write");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or_default();
+        assert!(written_since(&path, None));
+        assert!(written_since(&path, Some(now - 60_000)));
+        assert!(!written_since(&path, Some(now + 60_000)), "left over");
+        assert!(!written_since(&dir.join("missing.md"), None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_report_contract_names_the_report_file() {
+        assert!(report_contract().starts_with(
+            "When the task is finished, or you cannot go on, write `.spawn/report.md` at the root"
+        ));
     }
 
     #[test]

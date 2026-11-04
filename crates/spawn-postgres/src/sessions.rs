@@ -56,7 +56,7 @@ pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
                      where e.session_id = $1
                      order by e.started_at_ms desc, e.execution_id desc limit 1
                  ), last_cmd as (
-                    select c.principal, c.action ->> 'type' as kind
+                    select c.action ->> 'type' as kind
                       from spawn_commands c where c.session_id = $1
                      order by c.id desc limit 1
                  )
@@ -66,7 +66,6 @@ pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
                     (select execution_id from last_exec) as execution_id,
                     coalesce((select ended_at_ms is null from last_exec), false) as live,
                     (select cause from last_exec) as cause,
-                    (select principal from last_cmd) as last_principal,
                     (select kind from last_cmd) as last_kind,
                     exists (select 1 from spawn_events e
                              where e.session_id = $1
@@ -169,8 +168,6 @@ pub struct LivenessFacts {
     pub live: bool,
     /// How the newest execution ended.
     pub cause: Option<String>,
-    /// Principal of the newest command.
-    pub last_principal: Option<String>,
     /// Action type of the newest command.
     pub last_kind: Option<String>,
     /// The engine reported a native session at least once.
@@ -298,7 +295,6 @@ impl PostgresStore {
             execution_id: row.get("execution_id"),
             live: row.get("live"),
             cause: row.get("cause"),
-            last_principal: row.get("last_principal"),
             last_kind: row.get("last_kind"),
             native_bound: row.get("native_bound"),
             failures: u32::try_from(row.get::<_, i64>("failures")).unwrap_or(u32::MAX),

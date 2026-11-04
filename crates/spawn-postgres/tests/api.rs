@@ -981,3 +981,50 @@ fn view_columns_match_the_snapshot() {
     ];
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn a_delivered_task_starts_a_new_episode_and_a_nudge_does_not() {
+    let (store, _schema) = store("episode");
+    let worker = AgentId::new("agent_worker_a").expect("valid agent");
+    let session = SessionId::new("session_worker_a").expect("valid session");
+    store
+        .append(NewEvent {
+            agent_id: worker.clone(),
+            session_id: session.clone(),
+            ..message(EventKind::TurnStopped {
+                input_tokens: None,
+                output_tokens: None,
+            })
+        })
+        .expect("append succeeds");
+    let submit = |principal: &str, key: &str| {
+        let submission = Submission {
+            agent_id: worker.clone(),
+            idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+            action: CommandAction::Input {
+                text: key.to_string(),
+            },
+            ..start(session.clone(), key)
+        };
+        let id = store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &submission,
+            )
+            .expect("submit succeeds");
+        i64::try_from(id.0).expect("small id")
+    };
+    let episode = || {
+        let facts = store.dispatch_facts().expect("facts");
+        let row = &facts.as_array().expect("rows")[0];
+        (
+            row["episode"].as_i64(),
+            row["episode_action"].as_str().map(str::to_string),
+        )
+    };
+    let human = submit("human", "human-1");
+    submit("spawn-dispatch", "dispatch-nudge-session_worker_a-1");
+    assert_eq!(episode(), (Some(human), Some("input".to_string())));
+    let delivered = submit("spawn-dispatch", "deliver-4-0");
+    assert_eq!(episode().0, Some(delivered), "a new task is a new episode");
+}

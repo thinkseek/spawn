@@ -20,28 +20,192 @@
 //! escalation in each delivered digest marks what the supervisor was told.
 //! It commands only `agent_worker_*` sessions, plus digests to the supervisor.
 //!
-//! Layout: [`facts`] is the shared vocabulary, [`worker`] the per-worker
-//! ladder, [`digest`] the supervisor digest. Task delivery (the mission
-//! layer's rules) lives in [`crate::deliver`]; this module combines both
-//! into one [`Plan`] ([`decide_with`]) and submits it ([`step`]).
+//! Layout: this file holds the shared vocabulary (facts, orders,
+//! escalations) and the step; [`worker`] is the per-worker ladder and
+//! [`digest`] the supervisor digest. Task delivery (the mission layer's
+//! rules) lives in [`crate::deliver`]; this module combines both into one
+//! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
 
 mod digest;
-mod facts;
 mod worker;
 
 use std::path::Path;
 
-use spawn_core::command::Submission;
+use serde::Deserialize;
+use spawn_core::command::{CommandAction, Submission};
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
+use spawn_core::observation::{Ambiguity, Observation, SemanticState};
 use spawn_core::port::CommandQueue;
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::{self, Work};
 use crate::supervise::SUPERVISOR_SESSION;
 
-#[cfg(test)]
-pub(crate) use facts::Sent;
-pub(crate) use facts::{Escalation, Facts, Order, Plan, Why};
+/// One command the dispatcher sent.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub(crate) struct Sent {
+    pub(crate) key: String,
+    #[serde(default)]
+    pub(crate) text: Option<String>,
+    pub(crate) created_at_ms: i64,
+    #[serde(default)]
+    pub(crate) finished_at_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) succeeded: Option<bool>,
+}
+
+/// Facts about one session, as `dispatch_facts` returns them.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Facts {
+    pub(crate) session_id: String,
+    pub(crate) agent_id: String,
+    #[serde(default)]
+    pub(crate) live: bool,
+    #[serde(default)]
+    pub(crate) execution_id: Option<String>,
+    #[serde(default)]
+    pub(crate) end_cause: Option<String>,
+    #[serde(default)]
+    pub(crate) observation: Option<Observation>,
+    #[serde(default)]
+    pub(crate) observation_event_id: Option<i64>,
+    #[serde(default)]
+    pub(crate) observation_at_ms: Option<i64>,
+    /// Session position of the latest fact (not an observation).
+    #[serde(default)]
+    pub(crate) evidence_seq: Option<u64>,
+    #[serde(default)]
+    pub(crate) episode: Option<i64>,
+    /// Action of that command (`start`, `input`, `resume`, `stop`).
+    #[serde(default)]
+    pub(crate) episode_action: Option<String>,
+    #[serde(default)]
+    pub(crate) open_command: bool,
+    #[serde(default)]
+    pub(crate) dispatched: Vec<Sent>,
+}
+
+impl Facts {
+    /// The command the dispatcher sent under `key`, if any.
+    pub(crate) fn sent(&self, key: &str) -> Option<&Sent> {
+        self.dispatched.iter().find(|sent| sent.key == key)
+    }
+
+    /// The latest judgement, unless it is older than the latest fact.
+    ///
+    /// A judgement older than the latest fact describes a moment that has
+    /// passed (for example the ready screen just before the prompt was
+    /// typed); the Observer is about to judge again.
+    pub(crate) fn current_observation(&self) -> Option<&Observation> {
+        self.observation.as_ref().filter(|observation| {
+            self.evidence_seq
+                .is_none_or(|latest| observation.based_on_seq.0 >= latest)
+        })
+    }
+
+    /// Live, with no command in flight.
+    pub(crate) fn live_and_free(&self) -> bool {
+        self.live && !self.open_command
+    }
+
+    /// Whether the worker sits idle at its prompt, judged on its latest
+    /// fact, with nothing in flight: the only moment typed input is safe.
+    pub(crate) fn idle_at_prompt(&self) -> bool {
+        self.live_and_free()
+            && self.current_observation().is_some_and(|observation| {
+                observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
+                    && matches!(
+                        observation.state,
+                        SemanticState::Waiting | SemanticState::Completed
+                    )
+            })
+    }
+}
+
+/// Why a worker is escalated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// The observation asks for attention.
+    Attention,
+    /// A nudge was sent this episode and the worker stopped again.
+    NudgeFailed,
+    /// The execution was lost and the resume failed.
+    ResumeFailed,
+    /// The worker finished; someone should review the result.
+    Completed,
+    /// The worker stopped at its prompt and nothing allowed a nudge: it
+    /// waits for its next instruction.
+    Idle,
+    /// A new mission is in the inbox.
+    Mission,
+    /// A worker reported on its task.
+    Report,
+    /// A human approved a resident.
+    Approved,
+    /// A human wrote to a worker directly.
+    Human,
+    /// The command that delivered a task failed.
+    DeliveryFailed,
+}
+
+/// One escalation, identified so a digest can mark it delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Escalation {
+    pub(crate) session_id: String,
+    pub(crate) id: String,
+    pub(crate) why: Why,
+    pub(crate) line: String,
+}
+
+impl Escalation {
+    /// An escalation about the session `facts` describe.
+    pub(crate) fn about(facts: &Facts, id: String, why: Why, line: String) -> Self {
+        Self {
+            session_id: facts.session_id.clone(),
+            id,
+            why,
+            line,
+        }
+    }
+
+    /// Marker written into the digest; its presence in a delivered digest
+    /// means the supervisor was told.
+    pub(crate) fn marker(&self) -> String {
+        format!("[spawn:esc {} {}]", self.session_id, self.id)
+    }
+}
+
+/// One command to submit.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Order {
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    pub(crate) key: String,
+    pub(crate) action: CommandAction,
+    /// The task this command delivers, if any.
+    pub(crate) task: Option<i64>,
+}
+
+impl Order {
+    /// A command to the session `facts` describe, delivering no task.
+    pub(crate) fn to(facts: &Facts, key: String, action: CommandAction) -> Self {
+        Self {
+            agent_id: facts.agent_id.clone(),
+            session_id: facts.session_id.clone(),
+            key,
+            action,
+            task: None,
+        }
+    }
+}
+
+/// What one dispatcher step does.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Plan {
+    pub(crate) orders: Vec<Order>,
+    /// Escalations not delivered yet, whether or not a digest goes out now.
+    pub(crate) pending: Vec<Escalation>,
+}
 
 /// Principal the dispatcher submits as.
 pub(crate) const DISPATCHER: &str = "spawn-dispatch";
@@ -81,11 +245,13 @@ pub(crate) fn decide_with(
         if work.managed(&facts.session_id) && !in_flight.contains(facts.session_id.as_str()) {
             continue;
         }
-        let (order, escalation) = worker::decide_worker(facts, now_ms);
-        plan.orders.extend(order);
-        plan.pending.extend(escalation);
+        match worker::decide_worker(facts, now_ms) {
+            worker::Decision::Nothing => {}
+            worker::Decision::Act(order) => plan.orders.push(order),
+            worker::Decision::Escalate(escalation) => plan.pending.push(escalation),
+        }
     }
-    plan.pending.extend(deliver::news_items(&work.news));
+    plan.pending.extend(deliver::news_items(work, rows));
     plan.pending.retain(|item| !told.contains(&item.marker()));
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
@@ -105,8 +271,11 @@ fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
 /// The plan for the current facts, without submitting anything.
 pub(crate) fn plan(store: &PostgresStore, supervised: bool, spawn: &str) -> Result<Plan, String> {
     let (rows, work) = load(store)?;
-    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
-    Ok(decide_with(&rows, &work, supervised, now, spawn))
+    Ok(decide_with(&rows, &work, supervised, now_ms(), spawn))
+}
+
+fn now_ms() -> i64 {
+    spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
 /// Submit one order as the dispatcher; an order that delivers a task marks
@@ -137,13 +306,15 @@ pub(crate) fn step(
     spawn: &str,
     root: Option<&Path>,
 ) -> Result<Vec<String>, String> {
-    let mut lines = Vec::new();
-    if let Some(root) = root {
-        let (rows, work) = load(store)?;
-        lines.extend(deliver::collect_reports(store, &work, &rows, root));
+    let (mut rows, mut work) = load(store)?;
+    let mut lines = root.map_or_else(Vec::new, |root| {
+        deliver::collect_reports(store, &work, &rows, root)
+    });
+    if !lines.is_empty() {
+        // Collecting a report changed a task's state.
+        (rows, work) = load(store)?;
     }
-    // Planned on a fresh read: collecting reports changes task states.
-    let plan = plan(store, supervised, spawn)?;
+    let plan = decide_with(&rows, &work, supervised, now_ms(), spawn);
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for order in plan.orders {
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
@@ -360,6 +531,16 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_resident_is_left_to_the_liveness_rule() {
+        let mut lost = worker(judged(SemanticState::Unknown, 0.5));
+        lost.agent_id = "agent_resident_core".to_string();
+        lost.session_id = "session_resident_core".to_string();
+        lost.live = false;
+        lost.end_cause = Some("lost".to_string());
+        assert!(decide(&[lost], false, NOW, "spawn").orders.is_empty());
+    }
+
+    #[test]
     fn nudges_are_rate_limited_per_agent_hour() {
         let mut facts = worker(judged(SemanticState::Waiting, 0.9));
         for episode in 1..=3 {
@@ -425,5 +606,16 @@ mod tests {
             panic!("digest");
         };
         assert!(text.contains("completed, review it"));
+    }
+
+    #[test]
+    fn a_supervisor_judged_before_its_latest_fact_gets_no_digest() {
+        let mut blocked = judged(SemanticState::Blocked, 0.8);
+        blocked.attention = true;
+        let mut busy = idle_supervisor();
+        busy.evidence_seq = Some(10);
+        let plan = decide(&[worker(blocked), busy], true, NOW, "spawn");
+        assert!(plan.orders.is_empty());
+        assert_eq!(plan.pending.len(), 1);
     }
 }

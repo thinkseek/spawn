@@ -3,8 +3,8 @@
 use spawn_core::event::EventKind;
 use spawn_core::id::SessionId;
 
+use crate::Flags;
 use crate::config::open_store;
-use crate::flags::Flags;
 
 /// `spawn status`: the latest observation per session.
 pub(crate) fn status(_flags: &Flags) -> Result<i32, String> {

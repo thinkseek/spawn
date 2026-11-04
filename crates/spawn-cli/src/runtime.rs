@@ -10,8 +10,8 @@ use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_host::{GitWorkspace, TmuxHost, docker_prefix};
 use spawn_jev::{JevConfig, JevJudge};
 
+use crate::Flags;
 use crate::config::{env_or, env_value, open_store, required_env, spawn_program, workspace_root};
-use crate::flags::Flags;
 use crate::trace::{self, Timed};
 use crate::{context, sources, supervise};
 
@@ -114,7 +114,10 @@ fn bridge_config() -> Result<BridgeConfig, String> {
         vec![
             (
                 "SPAWN_DATABASE_URL".to_string(),
-                spawn_postgres::role_url(&required_env("SPAWN_DATABASE_URL")?, "spawn_supervisor"),
+                spawn_postgres::role_url(
+                    &required_env("SPAWN_DATABASE_URL")?,
+                    crate::supervise::SUPERVISOR_PRINCIPAL,
+                ),
             ),
             ("SPAWN_GATEWAY".to_string(), "1".to_string()),
         ],

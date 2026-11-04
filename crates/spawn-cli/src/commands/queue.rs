@@ -4,8 +4,8 @@ use spawn_core::command::{CommandAction, Submission};
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::port::CommandQueue;
 
+use crate::Flags;
 use crate::config::{env_value, open_store, spawn_program, supervised, workspace_root};
-use crate::flags::Flags;
 use crate::{dispatch, trace};
 
 /// `spawn submit`: write one command to the queue.

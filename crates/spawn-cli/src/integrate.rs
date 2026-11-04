@@ -208,7 +208,10 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let root = workspace_root(&flags)
         .map(PathBuf::from)
         .ok_or_else(|| format!("--root or SPAWN_WORKSPACE_ROOT is required\n{USAGE}"))?;
-    let gate = absolute(&env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))?;
+    // Resolved against the working directory: the gate must not resolve
+    // inside the tree it judges.
+    let gate = std::path::absolute(env_or("SPAWN_GATE", "scripts/rsi/gate.sh"))
+        .map_err(|error| format!("SPAWN_GATE: {error}"))?;
     let integrator = Integrator { root, gate };
     loop {
         if let Err(error) = integrator.pass() {
@@ -222,18 +225,6 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         }
         std::thread::sleep(loop_interval().max(Duration::from_secs(5)));
     }
-}
-
-/// Resolve a path against the working directory: the gate must not resolve
-/// inside the tree it judges.
-fn absolute(path: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    std::env::current_dir()
-        .map(|base| base.join(path))
-        .map_err(|error| format!("current directory: {error}"))
 }
 
 struct Integrator {

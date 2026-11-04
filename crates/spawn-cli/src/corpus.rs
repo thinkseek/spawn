@@ -9,13 +9,49 @@
 //! episodes from the model to the rules without losing agreement.
 
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spawn_core::observation::SemanticState;
 use spawn_core::observe::{JudgeInput, RulesVerdict, rules};
 use spawn_postgres::PostgresStore;
+
+use crate::{Flags, open_store};
+
+/// `spawn corpus export [--since-hours N]`: model judgements with their
+/// outcomes, one JSON line each, on stdout.
+pub(crate) fn command(rest: &[String]) -> Result<i32, String> {
+    let Some(("export", rest)) = rest.split_first().map(|(word, rest)| (word.as_str(), rest))
+    else {
+        return Err("usage: spawn corpus export [--since-hours N]".to_string());
+    };
+    let flags = Flags::parse(rest)?;
+    let hours: i64 = flags.get("since-hours").map_or(Ok(24 * 365), |text| {
+        text.parse()
+            .map_err(|_| format!("bad --since-hours {text}"))
+    })?;
+    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+    let store = open_store()?;
+    let mut out = std::io::stdout().lock();
+    for record in export(&store, now.saturating_sub(hours.saturating_mul(3_600_000)))? {
+        let line = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+        writeln!(out, "{line}").map_err(|error| error.to_string())?;
+    }
+    Ok(0)
+}
+
+/// `spawn judge --replay <corpus.jsonl>`: which tier the current rules leave
+/// each recorded episode to, and how well they agree.
+pub(crate) fn judge(flags: &Flags) -> Result<i32, String> {
+    let path = flags.required("replay")?;
+    let records = read(&path)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&replay(&records)).unwrap_or_default()
+    );
+    Ok(0)
+}
 
 /// One corpus record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
