@@ -446,3 +446,95 @@ Open items:
    git repository, files, or none) instead of one `SPAWN_GIT_REPO`.
 6. e2e: extend `scripts/mvp-e2e.sh` with a mission that the supervisor splits
    into a resident task and an ephemeral task, both reporting back.
+
+## 10. One log, one landing path (decided 2026-11-04)
+
+Occam's razor, applied without touching the invariants. Two decisions:
+
+1. RSI is a mission whose tasks the gate accepts. The separate controller
+   (`evolve` iterations, `rsi_*` tables, `spawn-rsi`, `repo.git`) retires.
+2. Missions, tasks, residents and landings are events in `spawn_events`.
+   The `mission_*` tables become a projection of them.
+
+### 10.1 The control stream
+
+- **Where it lives:** one stream with session `control`, agent
+  `agent_control` and source `control`. Every record is the event
+  `control.recorded`, whose detail is `{type, ...}`.
+- **Record types:** `mission.added`, `mission.closed`, `mission.halted`,
+  `mission.resumed`, `task.assigned`, `task.delivered`, `task.reported`,
+  `task.reviewed`, `task.cancelled`, `task.gated`, `task.landed`,
+  `resident.proposed`, `resident.approved`, `resident.retired`,
+  `legacy.imported`.
+- **Who writes it:** only the checked mission functions do. Engine logins
+  cannot, because `spawn_append` refuses source `control`.
+- **The tables are a projection.** `spawn_control_apply(record)` is the only
+  writer of `mission_*`, and it runs in the same transaction as the append.
+  `spawn_control_refold()` rebuilds the tables from the log, and a test
+  checks that the rebuilt tables equal the live ones.
+- **It is not an agent.** It is left out of the session projection, and the
+  Bridge and the Observer skip it.
+
+### 10.2 One gate
+
+- **The script:** `scripts/gate.sh <repo> <base> <candidate> <scenarios>
+  [<scenario>]` is the RSI judge with its rules unchanged:
+  - it refuses changes to `rsi/`, `scripts/rsi/`, `build.rs` and `.cargo/`;
+  - when a task has a scenario, that scenario must fail on the base and pass
+    on the candidate;
+  - every non-ratchet scenario must pass on the candidate.
+- **merge-gate's checks become scenarios.** Clippy, the tests, the e2e and
+  the web build each become one. The rule that the scenario count never
+  falls then protects them too.
+
+### 10.3 Landing
+
+- **Mission settings:** a mission may name a gate (a scenarios directory in
+  the controller's checkout) and how its tasks are accepted:
+  - `review`: the supervisor accepts, then the gate runs;
+  - `gate`: the gate alone decides.
+- **The integrator:** `spawn integrate` (unit `spawn-integrate`) replaces
+  `spawn-rsi`. For each task that is ready, it:
+  1. commits the workspace;
+  2. builds the candidate: the branch itself, or a merge of it with `main`
+     when `main` has moved. A conflict sends the task back.
+  3. runs the gate;
+  4. records `task.gated` (verdict, log, metric) before git moves;
+  5. moves `main` on the source with a compare-and-swap push;
+  6. records `task.landed`.
+- **On rejection:** the task goes back to the worker (`revise`), with the
+  gate log as the note.
+- **Halt rules,** per mission and read from the log:
+  - three gate rejections in a row;
+  - three gate aborts in a row;
+  - the scenario count below its floor;
+  - the source's `main` not where the last landing left it.
+
+  A halted mission lands nothing until a human runs `spawn mission resume`.
+
+### 10.4 RSI as a mission
+
+- **The RSI mission:**
+  - source: `missions/spawn.git`;
+  - gate: `rsi/scenarios`;
+  - acceptance: `gate`;
+  - worker: the resident `rsi`, approved by a human.
+- **Tasks come from the backlog** (`rsi/backlog`, in the controller's
+  checkout). The integrator gives the lowest open objective one task at a
+  time.
+  - The prompt is the objective plus its attempt history, read from the log.
+  - The task's scenario is `rsi/scenarios/<id>.sh`.
+- **Budgets:** the 45-minute and 60-tool-call limits become mission fields.
+  A task over budget is aborted, which counts as an abort, not a rejection.
+- **Migration:** the `rsi_attempts` rows are imported as `legacy.imported`,
+  so objective status and history carry over. After that, the `rsi_*`
+  tables, the iteration machine, `spawn-rsi` and `repo.git` retire.
+
+### 10.5 Order
+
+1. The control stream and its projection.
+2. One gate, with the check scenarios.
+3. The integrator, and landing for missions with a gate.
+4. The RSI mission, the import, and retiring the old controller.
+
+Each step is tested red, then green, gated, and committed.
