@@ -5,10 +5,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use spawn_core::event::{EndCause, EventKind, NewEvent, Source};
+use spawn_core::id::{AgentId, ExecutionId, SessionId};
 use spawn_core::ingest::{claude_hook, codex_line};
 use spawn_core::port::EventLog;
-
-use spawn_core::id::{AgentId, ExecutionId, SessionId};
 
 use crate::config::{env_or, env_value, open_store, required_env};
 
