@@ -53,10 +53,12 @@ pub(crate) enum GateFailure {
 }
 
 /// The gate's environment, read through `lookup`: the [`GATE_ENV`]
-/// variables that are set. A SPAWN_TEST_DATABASE_URL that names the same
-/// database as SPAWN_DATABASE_URL is withheld: candidate tests never get
-/// the owner's database, even by that name. (Not an error: mvp-e2e runs
-/// an integrator whose own database is the test database.)
+/// variables that are set. A SPAWN_TEST_DATABASE_URL on the same cluster
+/// as SPAWN_DATABASE_URL (same host and port, or same socket directory) is
+/// withheld, whatever database it names: the test login is a superuser, and
+/// a superuser on the owner's cluster reaches the owner's database. (Not an
+/// error: mvp-e2e runs an integrator whose own database is the test
+/// database.)
 pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     let owner = lookup("SPAWN_DATABASE_URL");
     GATE_ENV
@@ -70,16 +72,36 @@ pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, 
             name != "SPAWN_TEST_DATABASE_URL"
                 || owner
                     .as_deref()
-                    .is_none_or(|owner| database_of(owner) != database_of(value))
+                    .is_none_or(|owner| cluster_of(owner) != cluster_of(value))
         })
         .collect()
 }
 
-/// `host:port/name` of a postgres URL, without credentials or parameters.
-fn database_of(url: &str) -> &str {
+/// The cluster a postgres URL names: its host, with a percent-encoded
+/// socket directory decoded and `localhost`/`::1` read as 127.0.0.1, and
+/// its port (5432 when absent).
+fn cluster_of(url: &str) -> (String, String) {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, rest)| rest);
-    rest.split('?').next().unwrap_or(rest)
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && (!host.starts_with('[') || host.ends_with(']')) =>
+        {
+            (host, port)
+        }
+        _ => (authority, "5432"),
+    };
+    let host = host.replace("%2F", "/").replace("%2f", "/");
+    let host = match host.trim_start_matches('[').trim_end_matches(']') {
+        "localhost" | "::1" | "127.0.0.1" => "127.0.0.1".to_string(),
+        _ => host.trim_end_matches('/').to_string(),
+    };
+    (host, port.to_string())
 }
 
 /// Judge `candidate` against `base` in `repo` with the scenarios in
@@ -499,5 +521,65 @@ mod tests {
             env.iter()
                 .all(|(name, _)| name != "SPAWN_TEST_DATABASE_URL")
         );
+    }
+
+    /// Whether the test URL reaches the gate, next to this owner URL.
+    fn passed(owner: &str, test: &str) -> bool {
+        let lookup = |name: &str| match name {
+            "SPAWN_TEST_DATABASE_URL" => Some(test.to_string()),
+            "SPAWN_DATABASE_URL" => Some(owner.to_string()),
+            _ => None,
+        };
+        gate_env(lookup)
+            .iter()
+            .any(|(name, _)| name == "SPAWN_TEST_DATABASE_URL")
+    }
+
+    #[test]
+    fn a_test_database_on_the_owners_cluster_is_withheld_whatever_its_name() {
+        let owner = "postgres://owner:pw@127.0.0.1:15433/spawn";
+        // The reviewer's case: another database on the same cluster.
+        assert!(!passed(
+            owner,
+            "postgres://postgres:pw@127.0.0.1:15433/spawn_test"
+        ));
+        assert!(!passed(
+            owner,
+            "postgres://postgres:pw@localhost:15433/other"
+        ));
+        assert!(!passed(
+            "postgres://owner:pw@[::1]:15433/spawn",
+            "postgres://t:pw@127.0.0.1:15433/x"
+        ));
+        assert!(passed(
+            owner,
+            "postgres://postgres:pw@127.0.0.1:15434/spawn_test"
+        ));
+        assert!(passed(
+            owner,
+            "postgres://postgres:pw@%2Fhome%2Fu%2Fsock/spawn_test"
+        ));
+        // Default ports compare equal.
+        assert!(!passed(
+            "postgres://o:pw@db.local/spawn",
+            "postgres://t:pw@db.local:5432/spawn_test"
+        ));
+    }
+
+    #[test]
+    fn a_test_database_on_the_owners_socket_is_withheld() {
+        let owner = "postgres://owner:pw@%2Fhome%2Fu%2Fsock/spawn";
+        assert!(!passed(
+            owner,
+            "postgres://postgres:pw@%2Fhome%2Fu%2Fsock/spawn_test"
+        ));
+        assert!(!passed(
+            owner,
+            "postgres://postgres:pw@%2fhome%2fu%2fsock%2F/x"
+        ));
+        assert!(passed(
+            owner,
+            "postgres://postgres:pw@%2Fhome%2Fu%2Fother/spawn_test"
+        ));
     }
 }
