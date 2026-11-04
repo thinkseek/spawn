@@ -86,7 +86,7 @@ pub(crate) fn parse_metrics(log: &str) -> Vec<Metric> {
     metric_lines(&section)
 }
 
-fn metric_lines(text: &str) -> Vec<Metric> {
+pub(crate) fn metric_lines(text: &str) -> Vec<Metric> {
     let mut metrics: Vec<Metric> = Vec::new();
     for line in text.lines() {
         let line = line.trim_start_matches('|').trim();
