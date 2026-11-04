@@ -6,6 +6,8 @@ After=docker.service
 WorkingDirectory=%h/projects/Spawn
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# The deployed UI build (deploy/deploy.sh installs it), not the checkout's.
+Environment=SPAWN_WEB_DIR=%h/.local/share/spawn-rsi/web
 ExecStart=%h/.local/share/spawn-rsi/bin/spawn serve
 Restart=always
 RestartSec=3
