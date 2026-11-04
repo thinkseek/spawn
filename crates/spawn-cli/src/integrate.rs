@@ -47,9 +47,9 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId, WorkspaceId};
+use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::mission::TaskState;
-use spawn_core::port::{CommandQueue, WorkspaceStore};
+use spawn_core::port::CommandQueue;
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
@@ -401,7 +401,6 @@ impl Integrator {
             return Ok(objectives::assign_next(store, mission)?.is_some());
         };
         self.judge(store, &mirror, source, &main, &scenarios, count, task)
-            .map(|()| true)
     }
 
     /// Abort delivered tasks over budget. True when it aborted one.
@@ -468,9 +467,10 @@ impl Integrator {
         }
     }
 
-    /// Judge one task. True when what it recorded may move another mission's
-    /// view; a stale push moves nothing.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    /// Judge one task from its pushed branch. True when what it recorded may
+    /// move another mission's view; a stale push moves nothing, so the other
+    /// missions still get their turn in this pass.
+    #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
         store: &PostgresStore,
@@ -481,8 +481,54 @@ impl Integrator {
         count: u32,
         task: &Task,
     ) -> Result<bool, String> {
-        // Read only: the integrator never commits a workspace, so the store
-        // needs no chunk store of its own.
+        let branch = match Self::pushed_candidate(store, mirror, source, &task.agent_id)? {
+            Freshness::Fresh(branch) => Some(branch),
+            Freshness::Nothing => None,
+            Freshness::Stale(reason) => {
+                // Not a verdict on the work: the pusher has not caught up.
+                if !sources::shares_branches(source, &push_sources()) {
+                    eprintln!(
+                        "integrate: {source} does not receive agents' branches; list it in \
+                         SPAWN_PUSH_SOURCES for its work to land"
+                    );
+                }
+                record(
+                    store,
+                    &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                            "reason": reason}),
+                )?;
+                println!("integrate: task {} stale: {reason}", task.id);
+                return Ok(false);
+            }
+        };
+        self.judge_pushed(
+            store,
+            mirror,
+            source,
+            main,
+            scenarios,
+            count,
+            task,
+            branch.as_deref(),
+        )
+        .map(|()| true)
+    }
+
+    /// Judge `branch`, the agent's pushed head already in the mirror (`None`:
+    /// the agent has nothing to land).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn judge_pushed(
+        &self,
+        store: &PostgresStore,
+        mirror: &Path,
+        source: &str,
+        main: &str,
+        scenarios: &Path,
+        count: u32,
+        task: &Task,
+        branch: Option<&str>,
+    ) -> Result<(), String> {
+        // Read only: the integrator never commits a workspace.
         let repo = GitWorkspace::new(mirror, &self.root);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
@@ -504,21 +550,8 @@ impl Integrator {
         };
 
         let mirror_path = mirror.to_string_lossy().to_string();
-        let branch = match Self::pushed_candidate(store, mirror, source, &task.agent_id)? {
-            Freshness::Fresh(branch) => branch,
-            Freshness::Nothing => {
-                return rejected("the worker has no branch to land", "").map(|()| true);
-            }
-            Freshness::Stale(reason) => {
-                // Not a verdict on the work: the pusher has not caught up.
-                record(
-                    store,
-                    &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
-                            "reason": reason}),
-                )?;
-                println!("integrate: task {} stale: {reason}", task.id);
-                return Ok(false);
-            }
+        let Some(branch) = branch.map(str::to_string) else {
+            return rejected("the worker has no branch to land", "");
         };
         // A merge of main whose markers are not resolved is not judged: the
         // markers could land, and a file rewritten instead of resolved would
