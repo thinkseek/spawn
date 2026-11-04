@@ -264,8 +264,7 @@ pub trait ChunkStore: Send + Sync + std::fmt::Debug {
     /// Remove the object `name` only if it is still at least `older_than`
     /// old, read again just before it goes: the bytes freed, or `None` when
     /// it was kept (made young meanwhile, or already gone).
-    fn remove_if_older(&self, name: &str, older_than: Duration)
-    -> Result<Option<u64>, ChunkError>;
+    fn remove_if_older(&self, name: &str, older_than: Duration) -> Result<Option<u64>, ChunkError>;
 }
 
 /// Terminal failure.

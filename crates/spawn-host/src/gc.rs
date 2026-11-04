@@ -66,8 +66,7 @@ pub fn repositories(default: &Path, root: &Path) -> Result<Vec<PathBuf>, String>
 /// The manifests named by the `Spawn-Large` trailers of every commit
 /// reachable from any ref of `repo`.
 pub fn manifests_named(repo: &Path) -> Result<BTreeSet<String>, String> {
-    let unreadable =
-        |why: &str| format!("cannot read repository {}: {why}", repo.display());
+    let unreadable = |why: &str| format!("cannot read repository {}: {why}", repo.display());
     if !repo.is_dir() {
         return Err(unreadable("not a directory"));
     }
@@ -260,9 +259,16 @@ mod tests {
         assert_eq!(collected.removed, 2, "the dropped manifest and its chunk");
         assert!(collected.freed > 0);
         assert!(!store.contains(&dropped).expect("contains"));
-        assert!(store.contains(&old_chunks[0]).expect("contains"), "an older commit's chunk");
+        assert!(
+            store.contains(&old_chunks[0]).expect("contains"),
+            "an older commit's chunk"
+        );
         let again = collect(&store, std::slice::from_ref(&repo), HOUR).expect("collect again");
-        assert_eq!((again.removed, again.kept), (0, collected.kept), "nothing new, nothing removed");
+        assert_eq!(
+            (again.removed, again.kept),
+            (0, collected.kept),
+            "nothing new, nothing removed"
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -275,14 +281,21 @@ mod tests {
         let old = store.put(b"old").expect("put");
         age(&store, &young, Duration::from_secs(29 * 60));
         age(&store, &old, Duration::from_secs(31 * 60));
-        let collected = collect(&store, std::slice::from_ref(&repo), Duration::from_secs(30 * 60))
-            .expect("collect");
+        let collected = collect(
+            &store,
+            std::slice::from_ref(&repo),
+            Duration::from_secs(30 * 60),
+        )
+        .expect("collect");
         assert_eq!((collected.kept, collected.removed), (1, 1));
         assert!(store.contains(&young).expect("contains"));
         assert!(!store.contains(&old).expect("contains"));
         // The store reads the age again before it removes.
         let refreshed = store.put(b"refreshed").expect("put");
-        assert_eq!(store.remove_if_older(&refreshed, HOUR).expect("remove"), None);
+        assert_eq!(
+            store.remove_if_older(&refreshed, HOUR).expect("remove"),
+            None
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -319,7 +332,10 @@ mod tests {
         git(&repo, &["update-ref", "refs/heads/agent", &head]);
         let error = collect(&store, std::slice::from_ref(&repo), HOUR).expect_err("missing");
         assert!(error.contains(&absent), "{error}");
-        assert!(store.contains(&garbage).expect("contains"), "nothing deleted");
+        assert!(
+            store.contains(&garbage).expect("contains"),
+            "nothing deleted"
+        );
 
         let (name, _) = manifest(&store, &[b"chunk"]);
         let head = commit(&repo, None, Some(&name));
@@ -331,8 +347,14 @@ mod tests {
         std::fs::write(&path, bytes).expect("corrupt manifest");
         let error = collect(&store, std::slice::from_ref(&repo), HOUR).expect_err("corrupt");
         assert!(error.contains(&name), "{error}");
-        assert!(store.contains(&garbage).expect("contains"), "nothing deleted");
-        assert!(store.contains(&name).expect("contains"), "never unreferenced");
+        assert!(
+            store.contains(&garbage).expect("contains"),
+            "nothing deleted"
+        );
+        assert!(
+            store.contains(&name).expect("contains"),
+            "never unreferenced"
+        );
 
         let error = collect(&store, &[directory.join("absent.git")], HOUR).expect_err("no repo");
         assert!(error.contains("absent.git"), "{error}");

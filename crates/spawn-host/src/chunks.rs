@@ -363,7 +363,8 @@ impl ChunkStore for LocalChunkStore {
             if !is_fan_out || !path.is_dir() {
                 continue;
             }
-            let entries = std::fs::read_dir(&path).map_err(|error| unavailable("list", &path, &error))?;
+            let entries =
+                std::fs::read_dir(&path).map_err(|error| unavailable("list", &path, &error))?;
             for entry in entries {
                 let entry = entry.map_err(|error| unavailable("list", &path, &error))?;
                 let name = entry.file_name().to_string_lossy().to_string();

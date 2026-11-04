@@ -1,10 +1,11 @@
 //! Host adapters: tmux terminals, the git workspace store and the local
-//! chunk store.
+//! chunk store, with its collection of unreferenced objects ([`gc`]).
 //!
 //! Both adapters call an external program and read its exit code, so they
 //! share the same failure rules as the programs they wrap.
 
 pub mod chunks;
+pub mod gc;
 pub mod git;
 pub mod tmux;
 
