@@ -26,6 +26,23 @@ pub(crate) fn open_store() -> Result<PostgresStore, String> {
     PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 
+/// The chunk store that keeps workspaces' large files (docs/storage.md):
+/// the directory `SPAWN_CHUNK_STORE` names, else `<root>/.chunks`, which
+/// mount and unmount never clear.
+pub(crate) fn chunk_store(root: &str) -> std::sync::Arc<dyn spawn_core::port::ChunkStore> {
+    std::sync::Arc::new(spawn_host::LocalChunkStore::new(resolve_chunk_store(
+        env_value("SPAWN_CHUNK_STORE"),
+        root,
+    )))
+}
+
+fn resolve_chunk_store(configured: Option<String>, root: &str) -> PathBuf {
+    configured.map_or_else(
+        || PathBuf::from(root).join(spawn_host::DEFAULT_CHUNK_DIRECTORY),
+        PathBuf::from,
+    )
+}
+
 /// Whether this host runs the supervisor (`SPAWN_SUPERVISOR` is set).
 pub(crate) fn supervised() -> bool {
     env_value("SPAWN_SUPERVISOR").is_some()
@@ -67,6 +84,18 @@ pub(crate) fn loop_interval() -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chunk_store_is_configurable_and_defaults_under_the_root() {
+        assert_eq!(
+            resolve_chunk_store(Some("/srv/chunks".into()), "/ws"),
+            PathBuf::from("/srv/chunks")
+        );
+        assert_eq!(
+            resolve_chunk_store(None, "/ws"),
+            PathBuf::from("/ws/.chunks")
+        );
+    }
 
     #[test]
     fn spawn_program_prefers_the_environment() {
