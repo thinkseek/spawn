@@ -7,8 +7,9 @@
 //! 2. One guarded nudge: when Jev judged that a worker stopped at an idle
 //!    prompt without needing anyone (WAITING, confident, `needs_human` and
 //!    `stuck` low), it gets `continue` typed in, once per episode and at most
-//!    [`NUDGES_PER_HOUR`] times per agent-hour. Jev's judgement is an input,
-//!    never the chooser of the action, and the action is reversible.
+//!    [`NUDGES_PER_HOUR`](worker::NUDGES_PER_HOUR) times per agent-hour.
+//!    Jev's judgement is an input, never the chooser of the action, and the
+//!    action is reversible.
 //! 3. Everything else escalates: attention, a nudge that did not help, a
 //!    resume that failed, and completions (so work gets reviewed). Escalations
 //!    are coalesced into one digest typed into the supervisor's pane while it
@@ -18,440 +19,36 @@
 //! command queue: idempotency keys mark nudges and resumes, and a marker per
 //! escalation in each delivered digest marks what the supervisor was told.
 //! It commands only `agent_worker_*` sessions, plus digests to the supervisor.
+//!
+//! Layout: [`facts`] is the shared vocabulary, [`worker`] the per-worker
+//! ladder, [`digest`] the supervisor digest. Task delivery (the mission
+//! layer's rules) lives in [`crate::deliver`]; this module combines both
+//! into one [`Plan`] ([`decide_with`]) and submits it ([`step`]).
 
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
+mod digest;
+mod facts;
+mod worker;
+
 use std::path::Path;
 
-use serde::Deserialize;
-use spawn_core::command::{CommandAction, Submission};
+use spawn_core::command::Submission;
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
-use spawn_core::observation::{Ambiguity, Observation, SemanticState, WaitReason};
 use spawn_core::port::CommandQueue;
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::{self, Work};
-use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
+use crate::supervise::SUPERVISOR_SESSION;
+
+#[cfg(test)]
+pub(crate) use facts::Sent;
+pub(crate) use facts::{Escalation, Facts, Order, Plan, Why};
 
 /// Principal the dispatcher submits as.
 pub(crate) const DISPATCHER: &str = "spawn-dispatch";
 
-/// Nudges per worker per hour, across episodes.
-const NUDGES_PER_HOUR: usize = 3;
-
-/// Least confidence of a WAITING judgement that may nudge.
-const NUDGE_CONFIDENCE: f64 = 0.7;
-
-/// Most `needs_human` that may nudge.
-const NUDGE_NEEDS_HUMAN: f64 = 0.2;
-
-/// Most `stuck` that may nudge.
-const NUDGE_STUCK: f64 = 0.5;
-
-/// Escalations per digest; the rest wait for the next one.
-const DIGEST_ITEMS: usize = 8;
-
-/// One command the dispatcher sent.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub(crate) struct Sent {
-    pub(crate) key: String,
-    #[serde(default)]
-    pub(crate) text: Option<String>,
-    pub(crate) created_at_ms: i64,
-    #[serde(default)]
-    pub(crate) finished_at_ms: Option<i64>,
-    #[serde(default)]
-    pub(crate) succeeded: Option<bool>,
-}
-
-/// Facts about one session, as `dispatch_facts` returns them.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Facts {
-    pub(crate) session_id: String,
-    pub(crate) agent_id: String,
-    #[serde(default)]
-    pub(crate) live: bool,
-    #[serde(default)]
-    pub(crate) execution_id: Option<String>,
-    #[serde(default)]
-    pub(crate) end_cause: Option<String>,
-    #[serde(default)]
-    pub(crate) observation: Option<Observation>,
-    #[serde(default)]
-    pub(crate) observation_event_id: Option<i64>,
-    #[serde(default)]
-    pub(crate) observation_at_ms: Option<i64>,
-    /// Session position of the latest fact (not an observation).
-    #[serde(default)]
-    pub(crate) evidence_seq: Option<u64>,
-    #[serde(default)]
-    pub(crate) episode: Option<i64>,
-    /// Action of that command (`start`, `input`, `resume`, `stop`).
-    #[serde(default)]
-    pub(crate) episode_action: Option<String>,
-    #[serde(default)]
-    pub(crate) open_command: bool,
-    #[serde(default)]
-    pub(crate) dispatched: Vec<Sent>,
-}
-
-/// Why a worker is escalated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Why {
-    /// The observation asks for attention.
-    Attention,
-    /// A nudge was sent this episode and the worker stopped again.
-    NudgeFailed,
-    /// The execution was lost and the resume failed.
-    ResumeFailed,
-    /// The worker finished; someone should review the result.
-    Completed,
-    /// The worker stopped at its prompt and nothing allowed a nudge: it
-    /// waits for its next instruction.
-    Idle,
-    /// A new mission is in the inbox.
-    Mission,
-    /// A worker reported on its task.
-    Report,
-    /// A human approved a resident.
-    Approved,
-    /// A human wrote to a worker directly.
-    Human,
-}
-
-/// One escalation, identified so a digest can mark it delivered.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Escalation {
-    pub(crate) session_id: String,
-    pub(crate) id: String,
-    pub(crate) why: Why,
-    pub(crate) line: String,
-}
-
-impl Escalation {
-    /// Marker written into the digest; its presence in a delivered digest
-    /// means the supervisor was told.
-    pub(crate) fn marker(&self) -> String {
-        format!("[spawn:esc {} {}]", self.session_id, self.id)
-    }
-}
-
-/// One command to submit.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Order {
-    pub(crate) agent_id: String,
-    pub(crate) session_id: String,
-    pub(crate) key: String,
-    pub(crate) action: CommandAction,
-    /// The task this command delivers, if any.
-    pub(crate) task: Option<i64>,
-}
-
-/// What one dispatcher step does.
-#[derive(Debug, Default, PartialEq)]
-pub(crate) struct Plan {
-    pub(crate) orders: Vec<Order>,
-    /// Escalations not delivered yet, whether or not a digest goes out now.
-    pub(crate) pending: Vec<Escalation>,
-}
-
-fn sent<'a>(facts: &'a Facts, key: &str) -> Option<&'a Sent> {
-    facts.dispatched.iter().find(|sent| sent.key == key)
-}
-
-fn percent(value: Option<f64>) -> String {
-    value.map_or_else(|| "-".to_string(), |value| format!("{:.0}%", value * 100.0))
-}
-
-fn describe(observation: &Observation) -> String {
-    let mut parts = vec![format!(
-        "{} by {} ({:.0}%)",
-        observation.state.key(),
-        observation.judge,
-        observation.confidence.value() * 100.0
-    )];
-    if let Some(ambiguity) = observation.ambiguity {
-        parts.push(format!("rules could not decide: {ambiguity:?}"));
-    }
-    if observation.needs_human.is_some() || observation.stuck.is_some() {
-        parts.push(format!(
-            "needs_human {} stuck {}",
-            percent(observation.needs_human),
-            percent(observation.stuck)
-        ));
-    }
-    if observation.reason == Some(WaitReason::JudgeUnavailable) {
-        parts.push("Jev unreachable, rules' guess".to_string());
-    }
-    parts.join("; ")
-}
-
-/// Whether Jev's judgement allows the one reversible nudge.
-fn nudgeable(observation: &Observation) -> bool {
-    observation.judge == "jev"
-        && observation.state == SemanticState::Waiting
-        && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
-        && !observation.attention
-        && observation.confidence.value() >= NUDGE_CONFIDENCE
-        && observation
-            .needs_human
-            .is_some_and(|value| value <= NUDGE_NEEDS_HUMAN)
-        && observation.stuck.is_none_or(|value| value < NUDGE_STUCK)
-}
-
-fn order(facts: &Facts, key: String, action: CommandAction) -> Order {
-    Order {
-        agent_id: facts.agent_id.clone(),
-        session_id: facts.session_id.clone(),
-        key,
-        action,
-        task: None,
-    }
-}
-
-fn escalate(facts: &Facts, id: String, why: Why, line: String) -> Escalation {
-    Escalation {
-        session_id: facts.session_id.clone(),
-        id,
-        why,
-        line,
-    }
-}
-
-/// Rule: a lost execution is resumed once; a failed resume escalates.
-fn resume_lost(facts: &Facts) -> (Option<Order>, Option<Escalation>) {
-    let execution = facts.execution_id.as_deref().unwrap_or("none");
-    let key = format!("dispatch-resume-{execution}");
-    match sent(facts, &key) {
-        None => (
-            Some(order(
-                facts,
-                key,
-                CommandAction::Resume {
-                    prompt: Some(
-                        "Spawn restarted your engine after it was lost. Check where you were \
-                         and continue your task."
-                            .to_string(),
-                    ),
-                },
-            )),
-            None,
-        ),
-        Some(resume) if resume.succeeded == Some(false) => (
-            None,
-            Some(escalate(
-                facts,
-                format!("resume-{execution}"),
-                Why::ResumeFailed,
-                "engine was lost and the automatic resume failed".to_string(),
-            )),
-        ),
-        Some(_) => (None, None),
-    }
-}
-
-/// The guarded nudge, for a worker Jev judged idle and fine: `continue`
-/// once per episode within the hourly limit; a nudge that did not help, or
-/// the limit, escalates.
-fn nudge(
-    facts: &Facts,
-    observation: &Observation,
-    now_ms: i64,
-) -> (Option<Order>, Option<Escalation>) {
-    let episode = facts.episode.unwrap_or(0);
-    let judged_at = facts.observation_at_ms.unwrap_or(0);
-    let key = format!("dispatch-nudge-{}-{episode}", facts.session_id);
-    match sent(facts, &key) {
-        None => {
-            let recent = facts
-                .dispatched
-                .iter()
-                .filter(|sent| {
-                    sent.key.starts_with("dispatch-nudge-")
-                        && now_ms.saturating_sub(sent.created_at_ms) < 3_600_000
-                })
-                .count();
-            if recent < NUDGES_PER_HOUR {
-                let text = "continue".to_string();
-                return (Some(order(facts, key, CommandAction::Input { text })), None);
-            }
-            (
-                None,
-                Some(escalate(
-                    facts,
-                    format!("nudges-{episode}"),
-                    Why::NudgeFailed,
-                    format!(
-                        "stopped again; nudge limit of {NUDGES_PER_HOUR}/hour reached ({})",
-                        describe(observation)
-                    ),
-                )),
-            )
-        }
-        // Judged idle again after the nudge landed: it did not help.
-        Some(sent) if sent.finished_at_ms.is_some_and(|done| judged_at > done) => (
-            None,
-            Some(escalate(
-                facts,
-                format!("nudge-{episode}"),
-                Why::NudgeFailed,
-                format!("stopped again after `continue` ({})", describe(observation)),
-            )),
-        ),
-        Some(_) => (None, None),
-    }
-}
-
-/// The policy for one worker: at most one order and at most one escalation.
-fn decide_worker(facts: &Facts, now_ms: i64) -> (Option<Order>, Option<Escalation>) {
-    // Something is in flight; its outcome is the next fact.
-    if facts.open_command {
-        return (None, None);
-    }
-    // 1. Rules over facts.
-    if !facts.live && facts.end_cause.as_deref() == Some("lost") {
-        return resume_lost(facts);
-    }
-    let Some(observation) = &facts.observation else {
-        return (None, None);
-    };
-    // A judgement older than the latest fact describes a moment that has
-    // passed (for example the ready screen just before the prompt was typed).
-    // Act only on a current one; the Observer is about to judge again.
-    if facts
-        .evidence_seq
-        .is_some_and(|latest| observation.based_on_seq.0 < latest)
-    {
-        return (None, None);
-    }
-    // 2. The one reversible action a Jev judgement may trigger.
-    if facts.live && nudgeable(observation) {
-        return nudge(facts, observation, now_ms);
-    }
-    // 3. Everything else that matters escalates.
-    if observation.attention {
-        let id = facts.observation_event_id.map_or_else(
-            || format!("seq-{}", observation.based_on_seq.0),
-            |id| id.to_string(),
-        );
-        return (
-            None,
-            Some(escalate(facts, id, Why::Attention, describe(observation))),
-        );
-    }
-    let episode = facts.episode.unwrap_or(0);
-    // Stopped at its prompt and not nudged: someone has to give the next
-    // step or review the result. Once per episode.
-    if facts.live && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle) {
-        let (why, line) = if observation.state == SemanticState::Completed {
-            (Why::Completed, "finished its task")
-        } else {
-            (Why::Idle, "stopped at its prompt")
-        };
-        return (
-            None,
-            Some(escalate(
-                facts,
-                format!("idle-{episode}"),
-                why,
-                format!("{line} ({})", describe(observation)),
-            )),
-        );
-    }
-    // An execution someone stopped ended by their decision; telling them
-    // again is noise.
-    if !facts.live
-        && observation.state == SemanticState::Completed
-        && facts.episode_action.as_deref() != Some("stop")
-    {
-        return (
-            None,
-            Some(escalate(
-                facts,
-                format!("done-{episode}"),
-                Why::Completed,
-                format!("execution ended, task finished ({})", describe(observation)),
-            )),
-        );
-    }
-    (None, None)
-}
-
-/// Escalations the supervisor already received, from the markers in the
-/// digests that reached its pane.
-fn delivered(supervisor: Option<&Facts>) -> BTreeSet<String> {
-    supervisor
-        .map(|facts| {
-            facts
-                .dispatched
-                .iter()
-                .filter(|sent| sent.succeeded == Some(true))
-                .filter_map(|sent| sent.text.as_deref())
-                .flat_map(|text| {
-                    text.lines()
-                        .filter_map(|line| {
-                            let start = line.find("[spawn:esc ")?;
-                            let end = line[start..].find(']')? + start + 1;
-                            Some(line[start..end].to_string())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Whether the supervisor can take a digest now: live, idle at its prompt,
-/// nothing in flight.
-fn supervisor_idle(supervisor: &Facts) -> bool {
-    supervisor.live
-        && !supervisor.open_command
-        && supervisor.observation.as_ref().is_some_and(|observation| {
-            matches!(
-                observation.state,
-                SemanticState::Waiting | SemanticState::Completed
-            )
-        })
-}
-
-fn fnv(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
-}
-
-/// The digest typed into the supervisor's pane.
-fn digest(items: &[Escalation], spawn: &str) -> String {
-    let mut text = format!(
-        "Spawn dispatcher: {} update{} for you. Check a worker with `{spawn} tail --session \
-<session>` before acting; missions and tasks with `{spawn} mission list`.\n",
-        items.len(),
-        if items.len() == 1 { "" } else { "s" },
-    );
-    for item in items {
-        let kind = match item.why {
-            Why::Attention => "attention",
-            Why::NudgeFailed => "nudge did not help",
-            Why::ResumeFailed => "resume failed",
-            Why::Completed => "completed, review it",
-            Why::Idle => "idle, give it the next step or review it",
-            Why::Mission => "new mission, plan it and assign tasks",
-            Why::Report => "report, review it (`task accept` or `task reject`)",
-            Why::Approved => "resident approved",
-            Why::Human => "human message",
-        };
-        let _ = writeln!(
-            text,
-            "- {} — {kind}: {} {}",
-            item.session_id,
-            item.line,
-            item.marker()
-        );
-    }
-    text
+/// Whether the dispatcher's worker ladder applies to this agent.
+fn is_worker(facts: &Facts) -> bool {
+    facts.agent_id.starts_with("agent_worker_") || facts.agent_id.starts_with("agent_resident_")
 }
 
 /// The whole policy as a pure function of the facts, without missions.
@@ -460,7 +57,8 @@ pub(crate) fn decide(rows: &[Facts], supervised: bool, now_ms: i64, spawn: &str)
     decide_with(rows, &Work::default(), supervised, now_ms, spawn)
 }
 
-/// The whole policy as a pure function of the facts and the mission rows.
+/// The whole policy as a pure function of the facts and the mission rows:
+/// delivery orders first, then the worker ladder, then at most one digest.
 pub(crate) fn decide_with(
     rows: &[Facts],
     work: &Work,
@@ -471,52 +69,32 @@ pub(crate) fn decide_with(
     let supervisor = rows
         .iter()
         .find(|facts| facts.session_id == SUPERVISOR_SESSION);
-    let told = delivered(supervisor);
+    let told = digest::told(supervisor);
     let mut plan = Plan {
         orders: deliver::orders(work, rows),
         pending: Vec::new(),
     };
     let in_flight = work.in_flight();
-    for facts in rows.iter().filter(|facts| {
-        facts.agent_id.starts_with("agent_worker_") || facts.agent_id.starts_with("agent_resident_")
-    }) {
+    for facts in rows.iter().filter(|facts| is_worker(facts)) {
         // A managed worker between tasks is not news: its report already
         // was, and the supervisor decides what comes next.
         if work.managed(&facts.session_id) && !in_flight.contains(facts.session_id.as_str()) {
             continue;
         }
-        let (order, escalation) = decide_worker(facts, now_ms);
+        let (order, escalation) = worker::decide_worker(facts, now_ms);
         plan.orders.extend(order);
         plan.pending.extend(escalation);
     }
     plan.pending.extend(deliver::news_items(&work.news));
     plan.pending.retain(|item| !told.contains(&item.marker()));
-    let Some(supervisor) = supervisor.filter(|_| supervised) else {
-        return plan;
-    };
-    if plan.pending.is_empty() || !supervisor_idle(supervisor) {
-        return plan;
+    if let Some(supervisor) = supervisor.filter(|_| supervised) {
+        plan.orders
+            .extend(digest::order(supervisor, &plan.pending, spawn));
     }
-    let items: Vec<Escalation> = plan.pending.iter().take(DIGEST_ITEMS).cloned().collect();
-    let markers: String = items.iter().map(Escalation::marker).collect();
-    plan.orders.push(Order {
-        agent_id: SUPERVISOR_AGENT.to_string(),
-        session_id: SUPERVISOR_SESSION.to_string(),
-        // A new supervisor judgement allows one retry of an undelivered digest.
-        key: format!(
-            "dispatch-digest-{}-{:016x}",
-            supervisor.observation_event_id.unwrap_or(0),
-            fnv(&markers)
-        ),
-        action: CommandAction::Input {
-            text: digest(&items, spawn),
-        },
-        task: None,
-    });
     plan
 }
 
-/// Facts and mission rows, read once per step.
+/// Facts and mission rows, read once.
 fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     let rows: Vec<Facts> =
         serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
@@ -529,6 +107,26 @@ pub(crate) fn plan(store: &PostgresStore, supervised: bool, spawn: &str) -> Resu
     let (rows, work) = load(store)?;
     let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
     Ok(decide_with(&rows, &work, supervised, now, spawn))
+}
+
+/// Submit one order as the dispatcher; an order that delivers a task marks
+/// the task delivered with the command's id.
+fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<(), String> {
+    let submission = Submission {
+        agent_id: AgentId::new(order.agent_id).map_err(|error| error.to_string())?,
+        session_id: SessionId::new(order.session_id).map_err(|error| error.to_string())?,
+        idempotency_key: IdempotencyKey::new(order.key).map_err(|error| error.to_string())?,
+        action: order.action,
+    };
+    let command = store
+        .submit(principal, &submission)
+        .map_err(|error| error.to_string())?;
+    if let Some(task) = order.task {
+        store
+            .task_delivered(task, i64::try_from(command.0).unwrap_or(i64::MAX))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Run one dispatcher step against the store: collect reports from idle
@@ -544,26 +142,13 @@ pub(crate) fn step(
         let (rows, work) = load(store)?;
         lines.extend(deliver::collect_reports(store, &work, &rows, root));
     }
+    // Planned on a fresh read: collecting reports changes task states.
     let plan = plan(store, supervised, spawn)?;
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for order in plan.orders {
-        let submission = Submission {
-            agent_id: AgentId::new(order.agent_id.clone()).map_err(|error| error.to_string())?,
-            session_id: SessionId::new(order.session_id.clone())
-                .map_err(|error| error.to_string())?,
-            idempotency_key: IdempotencyKey::new(order.key.clone())
-                .map_err(|error| error.to_string())?,
-            action: order.action,
-        };
-        let command = store
-            .submit(&principal, &submission)
-            .map_err(|error| error.to_string())?;
-        if let Some(task) = order.task {
-            store
-                .task_delivered(task, i64::try_from(command.0).unwrap_or(i64::MAX))
-                .map_err(|error| error.to_string())?;
-        }
-        lines.push(format!("dispatch: {} -> {}", order.key, order.session_id));
+        let line = format!("dispatch: {} -> {}", order.key, order.session_id);
+        submit(store, &principal, order)?;
+        lines.push(line);
     }
     Ok(lines)
 }
