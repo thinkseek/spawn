@@ -6,6 +6,7 @@
 //! - `submit` writes one command to the queue.
 //! - `tick` runs one Bridge and Observer pass.
 //! - `integrate` lands gated missions' work and assigns objectives (RSI).
+//! - `chunks gc` removes chunk-store objects no reachable commit names.
 //! - `status` prints the latest observation per session.
 //! - `hook` accepts and ignores a hook payload from an engine started by an
 //!   older build; the Bridge reads engines' transcripts instead.
@@ -39,9 +40,9 @@ mod supervise;
 // Re-exported at the crate root, where the command modules import them.
 pub(crate) use config::{Flags, env_or, env_value, open_store};
 
-use commands::{engine, inspect, loops, queue};
+use commands::{chunks, engine, inspect, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|corpus|judge|serve|status|fleet|tail|hook|run|version>";
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|chunks|corpus|judge|serve|status|fleet|tail|hook|run|version>";
 
 /// Usage of `spawn dispatch`, the one command that mixes a bare switch with
 /// valued flags.
@@ -76,6 +77,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "serve" => serve::serve(&Flags::parse(&rest)?),
         "dispatch" => queue::dispatch_once(&rest),
         "integrate" => integrate::integrate(&rest),
+        "chunks" => chunks::command(&rest),
         "corpus" => corpus::command(&rest),
         "mission" => missions::mission(&rest),
         "charter" => {

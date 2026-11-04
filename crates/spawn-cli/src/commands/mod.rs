@@ -4,6 +4,7 @@
 //! `mission`, `task`, `resident`, `corpus`, `judge`, `charter`) live in their
 //! crate-level modules; `init-db` and `version` are in `main`.
 
+pub(crate) mod chunks;
 pub(crate) mod engine;
 pub(crate) mod inspect;
 pub(crate) mod loops;
