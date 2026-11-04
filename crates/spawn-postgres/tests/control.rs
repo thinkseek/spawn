@@ -399,43 +399,7 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
     assert_eq!(history[0]["verdict"], "rejected");
     assert_eq!(history[0]["reason"], "scenario fails on the candidate");
 
-    // The RSI page's reads: the open objective mission with its resident and
-    // its tasks' gate verdicts, newest task first.
-    let page = store.objective_missions().expect("objective missions");
-    assert_eq!(page.as_array().map(Vec::len), Some(1));
-    assert_eq!(page[0]["id"], mission);
-    assert_eq!(page[0]["accept"], "gate");
-    assert_eq!(page[0]["resident"]["session_id"], "session_resident_rsi");
-    assert_eq!(page[0]["tasks"][0]["id"], task);
-    assert_eq!(page[0]["tasks"][0]["gates"][0]["verdict"], "rejected");
-    assert_eq!(
-        page[0]["tasks"][0]["gates"][0]["reason"],
-        "scenario fails on the candidate"
-    );
-    assert!(
-        page[0]["tasks"][0]["gates"][0]["log"].is_null(),
-        "no logs in the overview"
-    );
-    assert_eq!(page[0]["tasks"][1]["state"], "landed");
-    assert_eq!(
-        page[0]["tasks"][1]["metric"],
-        "METRIC x baseline=2 candidate=1"
-    );
-    let detail = store
-        .objective_task(task)
-        .expect("one task")
-        .expect("it exists");
-    assert_eq!(detail["mission_id"], mission);
-    assert_eq!(detail["brief"], "brief");
-    assert_eq!(detail["gates"][0]["verdict"], "rejected");
-    assert!(store.objective_task(task + 1000).expect("read").is_none());
-    let board = store.mission_board(10).expect("board");
-    let row = board["missions"][0]["tasks"]
-        .as_array()
-        .and_then(|tasks| tasks.iter().find(|row| row["id"] == task))
-        .cloned()
-        .expect("the task on the board");
-    assert_eq!(row["last_gate"]["verdict"], "rejected");
+    the_rsi_page_reads_it(&store, mission, task);
 
     let mut client = admin(&schema);
     let live = tables(&mut client);
@@ -535,4 +499,45 @@ fn one_integrator_holds_the_lock() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(held, "a dead integrator never blocks the next one");
+}
+
+/// The RSI page's reads on the objective mission built above: the mission
+/// with its resident and its tasks' gate verdicts, newest task first; one
+/// task with its logs; and the board's last verdict per task.
+fn the_rsi_page_reads_it(store: &PostgresStore, mission: i64, task: i64) {
+    let page = store.objective_missions().expect("objective missions");
+    assert_eq!(page.as_array().map(Vec::len), Some(1));
+    assert_eq!(page[0]["id"], mission);
+    assert_eq!(page[0]["accept"], "gate");
+    assert_eq!(page[0]["resident"]["session_id"], "session_resident_rsi");
+    assert_eq!(page[0]["tasks"][0]["id"], task);
+    assert_eq!(page[0]["tasks"][0]["gates"][0]["verdict"], "rejected");
+    assert_eq!(
+        page[0]["tasks"][0]["gates"][0]["reason"],
+        "scenario fails on the candidate"
+    );
+    assert!(
+        page[0]["tasks"][0]["gates"][0]["log"].is_null(),
+        "no logs in the overview"
+    );
+    assert_eq!(page[0]["tasks"][1]["state"], "landed");
+    assert_eq!(
+        page[0]["tasks"][1]["metric"],
+        "METRIC x baseline=2 candidate=1"
+    );
+    let detail = store
+        .objective_task(task)
+        .expect("one task")
+        .expect("it exists");
+    assert_eq!(detail["mission_id"], mission);
+    assert_eq!(detail["brief"], "brief");
+    assert_eq!(detail["gates"][0]["verdict"], "rejected");
+    assert!(store.objective_task(task + 1000).expect("read").is_none());
+    let board = store.mission_board(10).expect("board");
+    let row = board["missions"][0]["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.iter().find(|row| row["id"] == task))
+        .cloned()
+        .expect("the task on the board");
+    assert_eq!(row["last_gate"]["verdict"], "rejected");
 }
