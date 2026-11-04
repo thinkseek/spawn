@@ -70,6 +70,8 @@ export interface MissionTask {
   /** The gate's metric line of the accepted candidate. */
   metric: string | null;
   last_gate: LastGate | null;
+  /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
+  model: string | null;
   created_by: string | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
@@ -178,6 +180,7 @@ function normalizeTask(value: unknown): MissionTask | null {
     objective: optionalNumber(value.objective),
     metric: optionalText(value.metric),
     last_gate: normalizeLastGate(value.last_gate),
+    model: optionalText(value.model),
     created_by: optionalText(value.created_by),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
