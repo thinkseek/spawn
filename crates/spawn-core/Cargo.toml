@@ -12,5 +12,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[features]
+# The in-memory backend and the conformance suite, for tests only.
+testing = []
+
+[dev-dependencies]
+spawn-core = { path = ".", features = ["testing"] }
+
 [lints]
 workspace = true

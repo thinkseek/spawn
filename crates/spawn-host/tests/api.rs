@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
+use spawn_core::contract;
 use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
 use spawn_core::port::{Commit, Launch, TerminalError, TerminalHost, WorkspaceStore};
 use spawn_host::{GitWorkspace, PrefixBuilder, TmuxHost, container_name, docker_prefix};
@@ -354,6 +355,23 @@ fn tmux_calls_go_through_the_container_prefix() {
     );
     assert!(log.contains("new-session"), "{log}");
     assert!(log.contains("-c /tmp"), "{log}");
+}
+
+/// The real adapters obey the same contract as the memory fake the Bridge
+/// tests run on.
+#[test]
+fn the_adapters_pass_the_shared_contract() {
+    let _exclusive = exclusive();
+    let (repo, root) = repository("contract");
+    contract::workspace_store("host_ws", &GitWorkspace::new(&repo, &root));
+    let host = TmuxHost::local(&isolated_tmux("contract"));
+    // A second session keeps the private server up: killing its last session
+    // shuts it down, and a `has-session` racing that shutdown fails with
+    // "server exited unexpectedly" instead of reporting the terminal gone.
+    let holder = terminal("contract-holder");
+    start_session(&host, &launch(&holder)).expect("start the holder");
+    contract::terminal("host_tty", &host);
+    host.terminate(&holder, &workspace()).expect("clean up");
 }
 
 /// tmux must exist: a silent skip would hide a broken host.
