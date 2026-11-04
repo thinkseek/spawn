@@ -191,7 +191,7 @@ pub(crate) fn brief(task: &Task, current: Option<f64>, history: &[GateRecord]) -
     brief.push_str(
         "\nWork only inside this workspace. Do not run git commands and do not create \
          commits: the host commits your workspace. Do not edit `rsi/`, `scripts/rsi/`, \
-         `scripts/blackbox/` or `scripts/mvp-e2e.sh`: the gate refuses any change there. \
+         `scripts/blackbox/` or `scripts/e2e.sh`: the gate refuses any change there. \
          The gate builds your tree, runs this objective's scenario (it must fail on the \
          current main and pass on yours) and every other check (clippy, the tests, the \
          e2e, the black-box scenarios, the web build). If it rejects your work, you get \

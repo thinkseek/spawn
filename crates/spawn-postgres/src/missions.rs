@@ -207,9 +207,7 @@ select (select jsonb_build_object(
                 and r ->> 'id' = k.id::text), '[]'::jsonb))
           from mission_tasks k where k.id = $1)";
 
-/// The integrator's advisory lock: one integrator per database. The key is
-/// the one the retired RSI controller held, so an old controller and an
-/// integrator can never run at once.
+/// The integrator's advisory lock: one integrator per database.
 pub(crate) const INTEGRATOR_LOCK_KEY: i64 = 1_399_957_336;
 
 /// Tool calls a session started after a moment. `$1` session, `$2` ms.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Black box: a large file an engine writes is kept (docs/storage.md, phase 1).
+# Black box: a large file an engine writes is kept (docs/storage.md).
 #
 # A fake Claude engine writes a 20 MiB file (deterministic, incompressible)
 # and a small text file into its workspace and exits. The execution ends:
