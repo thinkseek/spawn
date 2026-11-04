@@ -55,6 +55,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
             engine: Engine::Claude,
             prompt: "hello".to_string(),
             parent_session_id: None,
+            from: None,
         },
     }
 }
@@ -345,6 +346,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
                 terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: CommandId(1),
+                fork: None,
             },
         ))
         .expect("append succeeds");
@@ -484,6 +486,7 @@ fn a_task_lists_its_command_and_execution_events() {
                 terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: command,
+                fork: None,
             },
         ))
         .expect("append succeeds");
@@ -834,6 +837,7 @@ fn status_joins_the_judgement_and_the_latest_execution() {
                 terminal: TerminalName::new("spawn-exec_status").expect("valid terminal"),
                 workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
                 command_id: CommandId(1),
+                fork: None,
             },
         ))
         .expect("append succeeds");

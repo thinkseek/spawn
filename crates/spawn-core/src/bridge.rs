@@ -17,14 +17,14 @@ use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, Outcome};
 use crate::event::{
-    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, EventRecord, GlobalPosition,
+    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, EventRecord, Fork, GlobalPosition,
     NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use crate::ingest::{claude_line, codex_line};
 use crate::port::{
-    CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError, TerminalHost, WorkspaceError,
-    WorkspaceStore,
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
+    TerminalHost, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
@@ -42,6 +42,18 @@ struct Run<'a> {
     /// `native` names an earlier session to resume, not a new one.
     resume: bool,
     prompt: &'a str,
+}
+
+/// What one start asks for. Grouped so that [`Bridge::start`] keeps a
+/// readable parameter list.
+struct Begin<'a> {
+    engine: Engine,
+    prompt: &'a str,
+    parent: Option<&'a SessionId>,
+    /// A session to resume.
+    native: Option<&'a str>,
+    /// Where a new branch starts (`start {from}`).
+    from: Option<&'a str>,
 }
 
 /// Bridge settings.
@@ -109,6 +121,10 @@ struct Active {
     // idle session repeats one no-op commit per tick; record attempts if
     // Workspace calls get expensive.
     checkpoint: Option<CheckpointReason>,
+    /// A turn runs: a prompt reached the engine (or the Bridge typed one), or
+    /// a tool started, and no turn end followed. The base is never merged
+    /// into a workspace while a turn runs.
+    turn_open: bool,
     /// The runner reported the engine exit; cleanup is still due.
     reported_end: Option<(EndCause, Option<i32>)>,
     /// When the execution started: transcript lines before it belong to
@@ -221,7 +237,7 @@ impl Bridge {
             else {
                 break;
             };
-            let outcome = self.handle(&claimed)?;
+            let outcome = self.handle(&claimed, &mut report)?;
             self.queue.finish(&claimed, &outcome)?;
             report.commands += 1;
             self.catch_up()?;
@@ -282,6 +298,7 @@ impl Bridge {
                         workspace: workspace.clone(),
                         engine: *engine,
                         checkpoint: None,
+                        turn_open: false,
                         reported_end: None,
                         started_ms: record.recorded_at.0,
                         follow: Follow::default(),
@@ -318,10 +335,13 @@ impl Bridge {
                 }
             }
             other => {
-                if let Some(reason) = other.checkpoint_reason()
-                    && let Some(active) = view.active.as_mut()
-                {
-                    active.checkpoint = Some(reason);
+                if let Some(active) = view.active.as_mut() {
+                    if let Some(open) = opens_turn(other) {
+                        active.turn_open = open;
+                    }
+                    if let Some(reason) = other.checkpoint_reason() {
+                        active.checkpoint = Some(reason);
+                    }
                 }
             }
         }
@@ -345,6 +365,7 @@ impl Bridge {
                     view.active = None;
                 } else if let Some(held) = view.active.as_mut() {
                     held.checkpoint = None;
+                    held.turn_open = active.turn_open;
                     held.follow = active.follow;
                 }
             }
@@ -389,9 +410,55 @@ impl Bridge {
             return self.end(agent_id, session, active, cause, exit_code, report);
         }
         if let Some(reason) = active.checkpoint {
-            self.checkpoint(agent_id, session, active, reason, report)?;
+            let committed = self.checkpoint(agent_id, session, active, reason, report)?;
+            // An idle workspace whose state is on its branch takes the
+            // source's main. `turn_open` includes what was read just now.
+            if committed && reason == CheckpointReason::TurnStopped && !active.turn_open {
+                self.merge_base(agent_id, session, active, report)?;
+            }
         }
         Ok(false)
+    }
+
+    /// Merge the source's main into the branch of an idle workspace, and
+    /// record the merge as a checkpoint. A conflict changes nothing and is
+    /// only reported: landing tells the agent.
+    fn merge_base(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        report: &mut TickReport,
+    ) -> Result<(), StoreError> {
+        match self.workspaces.merge_base(&active.workspace) {
+            Ok(BaseMerge::Current) => {}
+            Ok(BaseMerge::Merged { commit, .. }) => {
+                let artifact = ArtifactRef {
+                    project: self.workspaces.project().to_string(),
+                    branch: BranchName::for_agent(agent_id),
+                    commit,
+                };
+                self.append(
+                    agent_id,
+                    session,
+                    Some(&active.execution_id),
+                    Source::Bridge,
+                    Some(format!("commit:{}", artifact.commit)),
+                    EventKind::ArtifactCommitted {
+                        reason: CheckpointReason::BaseMerged,
+                        artifact,
+                    },
+                )?;
+            }
+            Ok(BaseMerge::Conflicted { files }) => report.warnings.push(format!(
+                "{session}: main conflicts with the branch in {}; left unmerged",
+                files.join(", ")
+            )),
+            Err(error) => report
+                .warnings
+                .push(format!("{session}: merge main: {error}")),
+        }
+        Ok(())
     }
 
     /// The exit status the runner wrote when the engine exited, if it has.
@@ -504,6 +571,9 @@ impl Bridge {
                 Engine::Codex => Source::Codex,
             };
             for (key, kind) in events {
+                if let Some(open) = opens_turn(&kind) {
+                    active.turn_open = open;
+                }
                 self.append(
                     agent_id,
                     session,
@@ -613,6 +683,9 @@ impl Bridge {
         Ok(true)
     }
 
+    /// Commit the workspace and record a new commit. Returns whether the
+    /// workspace's state is now on its branch (false: the commit failed and
+    /// was reported).
     fn checkpoint(
         &self,
         agent_id: &AgentId,
@@ -620,7 +693,7 @@ impl Bridge {
         active: &Active,
         reason: CheckpointReason,
         report: &mut TickReport,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let message = format!("spawn checkpoint {}", active.execution_id);
         match self.workspaces.commit(&active.workspace, &message) {
             Ok(Commit::Unchanged) => {}
@@ -643,12 +716,14 @@ impl Bridge {
                 report
                     .warnings
                     .push(format!("commit refused {code}: {message}"));
+                return Ok(false);
             }
             Err(WorkspaceError::Unavailable(text)) => {
                 report.warnings.push(format!("commit unavailable: {text}"));
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn append(
@@ -671,7 +746,11 @@ impl Bridge {
         Ok(())
     }
 
-    fn handle(&mut self, claimed: &Claimed) -> Result<Outcome, StoreError> {
+    fn handle(
+        &mut self,
+        claimed: &Claimed,
+        report: &mut TickReport,
+    ) -> Result<Outcome, StoreError> {
         let Ok(action) = claimed.action() else {
             return Ok(Outcome::Failed("stored action is not valid".to_string()));
         };
@@ -680,10 +759,21 @@ impl Bridge {
                 engine,
                 prompt,
                 parent_session_id,
-            } => self.start(claimed, engine, &prompt, parent_session_id.as_ref(), None),
+                from,
+            } => self.start(
+                claimed,
+                &Begin {
+                    engine,
+                    prompt: &prompt,
+                    parent: parent_session_id.as_ref(),
+                    native: None,
+                    from: from.as_deref(),
+                },
+                report,
+            ),
             CommandAction::Input { text } => self.input(claimed, &text),
             CommandAction::Stop => self.stop(claimed),
-            CommandAction::Resume { prompt } => self.resume(claimed, prompt.as_deref()),
+            CommandAction::Resume { prompt } => self.resume(claimed, prompt.as_deref(), report),
         }
     }
 
@@ -694,11 +784,16 @@ impl Bridge {
     fn start(
         &mut self,
         claimed: &Claimed,
-        engine: Engine,
-        prompt: &str,
-        parent: Option<&SessionId>,
-        native: Option<&str>,
+        begin: &Begin<'_>,
+        report: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
+        let Begin {
+            engine,
+            prompt,
+            parent,
+            native,
+            from,
+        } = *begin;
         if self.running(&claimed.session_id).is_some() {
             return Ok(Outcome::Failed(format!(
                 "{} already runs an execution",
@@ -706,9 +801,10 @@ impl Bridge {
             )));
         }
         let branch = BranchName::for_agent(&claimed.agent_id);
-        if let Err(error) = self.workspaces.ensure_branch(&branch) {
-            return Ok(Outcome::Failed(format!("ensure branch {branch}: {error}")));
-        }
+        let fork = match self.ensure_branch(claimed, &branch, from, report) {
+            Ok(fork) => fork,
+            Err(why) => return Ok(Outcome::Failed(why)),
+        };
         // ponytail: a crash between mount and `execution.started` leaks one
         // mount; a startup sweep of unrecorded mounts fixes it if it shows up.
         let workspace = match self.workspaces.mount(&branch) {
@@ -734,6 +830,7 @@ impl Bridge {
             workspace,
             engine,
             checkpoint: None,
+            turn_open: false,
             reported_end: None,
             started_ms: self.clock.now().0,
             follow: Follow::default(),
@@ -751,6 +848,7 @@ impl Bridge {
                 terminal: active.terminal.clone(),
                 workspace: active.workspace.clone(),
                 command_id: claimed.command_id,
+                fork,
             },
         )?;
         let fresh = self.name_session(claimed, engine, native, &active)?;
@@ -765,40 +863,64 @@ impl Bridge {
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
-            let mut report = TickReport::default();
-            self.end(
-                &claimed.agent_id,
-                &claimed.session_id,
-                &active,
-                EndCause::Lost,
-                None,
-                &mut report,
-            )?;
-            report
-                .warnings
-                .insert(0, format!("start terminal: {error}"));
-            return Ok(Outcome::Failed(report.warnings.join("; ")));
+            return self.abandon(claimed, &active, format!("start terminal: {error}"));
         }
         if engine == Engine::Claude && !prompt.is_empty() {
             let outcome = self.type_prompt(claimed, &active, prompt)?;
-            if let Outcome::Failed(why) = &outcome {
+            if let Outcome::Failed(why) = outcome {
                 // An engine that never got its prompt must not look alive:
                 // whoever started it would wait on it forever.
-                let mut report = TickReport::default();
-                self.end(
-                    &claimed.agent_id,
-                    &claimed.session_id,
-                    &active,
-                    EndCause::Lost,
-                    None,
-                    &mut report,
-                )?;
-                report.warnings.insert(0, why.clone());
-                return Ok(Outcome::Failed(report.warnings.join("; ")));
+                return self.abandon(claimed, &active, why);
             }
             return Ok(outcome);
         }
         Ok(Outcome::Succeeded)
+    }
+
+    /// End a start that failed as lost; the failure names `why` first.
+    fn abandon(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        why: String,
+    ) -> Result<Outcome, StoreError> {
+        let mut report = TickReport::default();
+        self.end(
+            &claimed.agent_id,
+            &claimed.session_id,
+            active,
+            EndCause::Lost,
+            None,
+            &mut report,
+        )?;
+        report.warnings.insert(0, why);
+        Ok(Outcome::Failed(report.warnings.join("; ")))
+    }
+
+    /// The agent's branch, created at `from` (else at the base) unless it
+    /// exists. Returns where a new branch began; an existing branch ignores
+    /// `from`, with a warning.
+    fn ensure_branch(
+        &self,
+        claimed: &Claimed,
+        branch: &BranchName,
+        from: Option<&str>,
+        report: &mut TickReport,
+    ) -> Result<Option<Fork>, String> {
+        let fork = match self.workspaces.ensure_branch(branch, from) {
+            Ok(Branch::Created(fork)) => Some(fork),
+            Ok(Branch::Existing) => None,
+            Err(error) => return Err(format!("ensure branch {branch}: {error}")),
+        };
+        if let Some(from) = from
+            && fork.as_ref().is_none_or(|fork| fork.from != from)
+        {
+            report.warnings.push(format!(
+                "{}: branch {branch} exists; from {from} ignored",
+                claimed.session_id
+            ));
+        }
+        Ok(fork)
     }
 
     /// A new Claude session gets its id from the Bridge, recorded before the
@@ -991,7 +1113,17 @@ impl Bridge {
             .terminals
             .submit_text(&active.terminal, &active.workspace, text)
         {
-            Ok(()) => Ok(Outcome::Succeeded),
+            Ok(()) => {
+                // A turn starts now, before its transcript says so.
+                if let Some(held) = self
+                    .sessions
+                    .get_mut(&claimed.session_id)
+                    .and_then(|view| view.active.as_mut())
+                {
+                    held.turn_open = true;
+                }
+                Ok(Outcome::Succeeded)
+            }
             Err(error) => Ok(Outcome::Failed(format!("submit text: {error}"))),
         }
     }
@@ -1017,7 +1149,12 @@ impl Bridge {
         }
     }
 
-    fn resume(&mut self, claimed: &Claimed, prompt: Option<&str>) -> Result<Outcome, StoreError> {
+    fn resume(
+        &mut self,
+        claimed: &Claimed,
+        prompt: Option<&str>,
+        report: &mut TickReport,
+    ) -> Result<Outcome, StoreError> {
         if self.running(&claimed.session_id).is_some() {
             return Ok(Outcome::Failed(format!(
                 "{} still runs an execution",
@@ -1035,7 +1172,27 @@ impl Bridge {
         if engine == Engine::Codex && prompt.is_empty() {
             return Ok(Outcome::Failed("codex resume needs a prompt".to_string()));
         }
-        self.start(claimed, engine, prompt, None, Some(native.as_str()))
+        self.start(
+            claimed,
+            &Begin {
+                engine,
+                prompt,
+                parent: None,
+                native: Some(native.as_str()),
+                from: None,
+            },
+            report,
+        )
+    }
+}
+
+/// Whether an event opens a turn (`Some(true)`), ends one (`Some(false)`),
+/// or says nothing about turns.
+fn opens_turn(kind: &EventKind) -> Option<bool> {
+    match kind {
+        EventKind::MessageReceived | EventKind::ToolStarted { .. } => Some(true),
+        EventKind::TurnStopped { .. } | EventKind::TurnFailed { .. } => Some(false),
+        _ => None,
     }
 }
 

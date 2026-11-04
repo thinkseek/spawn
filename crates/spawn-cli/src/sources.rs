@@ -9,18 +9,32 @@
 //!
 //! A mirror follows its source: before a new agent's branch is created,
 //! `main` is fetched again, so a worker starts from the source as it is now
-//! (a merge that landed since is in). An agent's existing branch keeps the
-//! base it started from.
+//! (a merge that landed since is in), and at a turn end at most every
+//! [`REFRESH_EVERY`], so `main` can be merged into the idle branch
+//! (docs/storage.md, "Main into branches automatically").
+//!
+//! Branches live on the source too: every checkpoint's branch is pushed, in
+//! the background ([`crate::push`]), to the source's `spawn/<agent>`. A host
+//! that starts an agent whose branch it lacks takes that branch from the
+//! source when it is there (resume on another host), and fast-forwards a
+//! local branch another host moved on since.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use spawn_core::id::{BranchName, WorkspaceId};
-use spawn_core::port::{Commit, WorkspaceError, WorkspaceStore};
+use spawn_core::event::Fork;
+use spawn_core::id::{AgentId, BranchName, CommitId, WorkspaceId};
+use spawn_core::port::{BaseMerge, Branch, Commit, WorkspaceError, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
+
+use crate::push::{Pusher, pushed_ref};
+
+/// Least time between two refreshes of one mirror's `main` at turn ends.
+pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(30);
 
 /// Builds a store for one bare repository (local, or in containers).
 pub(crate) type Factory = Arc<dyn Fn(&Path) -> GitWorkspace + Send + Sync>;
@@ -32,6 +46,9 @@ pub(crate) struct MissionWorkspaces {
     store: Arc<PostgresStore>,
     factory: Factory,
     mirrors: Mutex<HashMap<String, Routed>>,
+    /// When each mirror's `main` was last fetched.
+    refreshed: Mutex<HashMap<PathBuf, Instant>>,
+    pusher: Pusher,
 }
 
 /// One agent's store and, for a mission with a source, where its mirror
@@ -105,7 +122,30 @@ impl MissionWorkspaces {
             store,
             factory,
             mirrors: Mutex::new(HashMap::new()),
+            refreshed: Mutex::new(HashMap::new()),
+            pusher: Pusher::new(),
         }
+    }
+
+    /// Fetch a mirror's `main` from its source, unless that happened less
+    /// than [`REFRESH_EVERY`] ago and `force` is false.
+    fn refresh_main(&self, mirror: &Path, source: &str, force: bool) {
+        {
+            let mut refreshed = self
+                .refreshed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            if !force
+                && refreshed
+                    .get(mirror)
+                    .is_some_and(|at| now.duration_since(*at) < REFRESH_EVERY)
+            {
+                return;
+            }
+            refreshed.insert(mirror.to_path_buf(), now);
+        }
+        refresh(mirror, source);
     }
 
     /// The store for one agent's workspace.
@@ -203,17 +243,124 @@ pub(crate) fn refresh(mirror: &Path, source: &str) {
     }
 }
 
-/// Whether a bare repository already has a branch.
-fn has_branch(repo: &Path, branch: &BranchName) -> bool {
+/// The commit a ref of a bare repository points at, if it exists.
+fn ref_commit(repo: &Path, reference: &str) -> Option<String> {
     git(&[
         "--git-dir",
         &repo.to_string_lossy(),
         "rev-parse",
         "--verify",
         "--quiet",
-        &format!("refs/heads/{}", branch.as_str()),
+        &format!("{reference}^{{commit}}"),
     ])
-    .is_ok()
+    .ok()
+}
+
+/// Whether a bare repository already has a branch.
+fn has_branch(repo: &Path, branch: &str) -> bool {
+    ref_commit(repo, &format!("refs/heads/{branch}")).is_some()
+}
+
+/// What [`adopt_pushed`] did with the branch the source holds for an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Adopted {
+    /// The source has no `spawn/<agent>`.
+    Absent,
+    /// The mirror lacked the branch; it was created at the source's head.
+    Created(String),
+    /// Another host moved the branch on; the mirror's was fast-forwarded.
+    Advanced(String),
+    /// The mirror's branch is the source's, or ahead of it.
+    Kept,
+    /// Both moved: two writers. The mirror's branch stays.
+    Diverged {
+        /// The mirror's head.
+        local: String,
+        /// The source's head.
+        pushed: String,
+    },
+}
+
+/// Bring the agent's branch the source holds (`spawn/<agent>`, pushed by
+/// whichever host ran it last) into the mirror: create the local branch
+/// from it, or fast-forward the local one. A local branch is never moved
+/// back or sideways. An unreachable source is an error.
+pub(crate) fn adopt_pushed(
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+) -> Result<Adopted, WorkspaceError> {
+    let Some(pushed) = fetch_pushed(mirror, source, agent)? else {
+        return Ok(Adopted::Absent);
+    };
+    let path = mirror.to_string_lossy().to_string();
+    let reference = format!("refs/heads/{agent}");
+    let Some(local) = ref_commit(mirror, &reference) else {
+        // An empty old value: only if no branch appeared meanwhile.
+        git(&["--git-dir", &path, "update-ref", &reference, &pushed, ""])?;
+        return Ok(Adopted::Created(pushed));
+    };
+    let ancestor =
+        |a: &str, b: &str| git(&["--git-dir", &path, "merge-base", "--is-ancestor", a, b]).is_ok();
+    if local == pushed || ancestor(&pushed, &local) {
+        return Ok(Adopted::Kept);
+    }
+    if ancestor(&local, &pushed) {
+        git(&[
+            "--git-dir",
+            &path,
+            "update-ref",
+            &reference,
+            &pushed,
+            &local,
+        ])?;
+        return Ok(Adopted::Advanced(pushed));
+    }
+    Ok(Adopted::Diverged { local, pushed })
+}
+
+/// The source's `spawn/<agent>`, fetched into the mirror under
+/// `refs/remotes/source/`, or `None` when the source has none.
+fn fetch_pushed(
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+) -> Result<Option<String>, WorkspaceError> {
+    if source.starts_with('-') {
+        return Err(unavailable(format!("source {source} starts with '-'")));
+    }
+    let remote = pushed_ref(agent);
+    let path = mirror.to_string_lossy().to_string();
+    let listed = git(&[
+        "--git-dir",
+        &path,
+        "ls-remote",
+        "--refs",
+        "--",
+        source,
+        &remote,
+    ])?;
+    if !listed
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(remote.as_str()))
+    {
+        return Ok(None);
+    }
+    let tracking = format!("refs/remotes/source/spawn/{agent}");
+    git(&[
+        "--git-dir",
+        &path,
+        "fetch",
+        "--quiet",
+        "--",
+        source,
+        &format!("+{remote}:{tracking}"),
+    ])?;
+    Ok(ref_commit(mirror, &tracking))
+}
+
+fn commit_id(commit: String) -> Result<CommitId, WorkspaceError> {
+    CommitId::new(commit).map_err(|error| unavailable(error.to_string()))
 }
 
 impl WorkspaceStore for MissionWorkspaces {
@@ -221,14 +368,66 @@ impl WorkspaceStore for MissionWorkspaces {
         "missions"
     }
 
-    fn ensure_branch(&self, branch: &BranchName) -> Result<(), WorkspaceError> {
+    fn ensure_branch(
+        &self,
+        branch: &BranchName,
+        from: Option<&str>,
+    ) -> Result<Branch, WorkspaceError> {
         let routed = self.route(branch.as_str())?;
-        if let Some((repo, source)) = &routed.mirror
-            && !has_branch(repo, branch)
-        {
-            refresh(repo, source);
+        let Some((repo, source)) = routed.mirror.clone() else {
+            return routed.store.ensure_branch(branch, from);
+        };
+        let agent = branch.as_str();
+        let local = has_branch(&repo, agent);
+        if !local {
+            self.refresh_main(&repo, &source, true);
         }
-        routed.store.ensure_branch(branch)
+        // Another host may have run this agent: its branch is on the source.
+        match adopt_pushed(&repo, &source, agent) {
+            Ok(Adopted::Created(commit)) => {
+                return Ok(Branch::Created(Fork {
+                    from: format!("spawn/{agent}"),
+                    commit: commit_id(commit)?,
+                }));
+            }
+            Ok(Adopted::Diverged { local, pushed }) => eprintln!(
+                "sources: {agent} is at {local} here but at {pushed} on {source}: \
+                 two writers; this host keeps its own"
+            ),
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "sources: could not read {} from {source}: {error}",
+                pushed_ref(agent)
+            ),
+        }
+        // A fork from an agent this mirror has no branch of: its head as the
+        // source holds it.
+        let mut resolved = from.map(str::to_string);
+        if let Some(from) = from
+            && !local
+            && AgentId::new(from).is_ok()
+            && !has_branch(&repo, from)
+        {
+            match fetch_pushed(&repo, &source, from) {
+                Ok(Some(commit)) => resolved = Some(commit),
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "sources: could not read {} from {source}: {error}",
+                    pushed_ref(from)
+                ),
+            }
+        }
+        let made = match routed.store.ensure_branch(branch, resolved.as_deref())? {
+            Branch::Created(fork) => Branch::Created(Fork {
+                from: from.map_or(fork.from, str::to_string),
+                commit: fork.commit,
+            }),
+            Branch::Existing => Branch::Existing,
+        };
+        // A new branch shares its fork point; an existing one is pushed
+        // again in case its last push was lost with a process.
+        self.pusher.mark(&repo, &source, agent);
+        Ok(made)
     }
 
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
@@ -236,19 +435,138 @@ impl WorkspaceStore for MissionWorkspaces {
     }
 
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
-        self.route(workspace.sandbox())?
-            .store
-            .commit(workspace, message)
+        let routed = self.route(workspace.sandbox())?;
+        let commit = routed.store.commit(workspace, message)?;
+        if let (Commit::Created(_), Some((repo, source))) = (&commit, &routed.mirror) {
+            self.pusher.mark(repo, source, workspace.sandbox());
+        }
+        Ok(commit)
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         self.route(workspace.sandbox())?.store.unmount(workspace)
     }
+
+    fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+        let routed = self.route(workspace.sandbox())?;
+        if let Some((repo, source)) = &routed.mirror {
+            self.refresh_main(repo, source, false);
+        }
+        let merged = routed.store.merge_base(workspace)?;
+        if let (BaseMerge::Merged { .. }, Some((repo, source))) = (&merged, &routed.mirror) {
+            self.pusher.mark(repo, source, workspace.sandbox());
+        }
+        Ok(merged)
+    }
+}
+
+impl Drop for MissionWorkspaces {
+    /// A process that ends (`spawn tick`) pushes what is still waiting.
+    fn drop(&mut self) {
+        self.pusher.flush();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::mirror_name;
+    use super::{Adopted, adopt_pushed, ensure_mirror, git, mirror_name};
+    use crate::push::{Pushed, push_branch};
+    use spawn_core::id::{BranchName, WorkspaceId};
+    use spawn_core::port::{Commit, WorkspaceStore};
+    use spawn_host::GitWorkspace;
+    use std::path::Path;
+
+    /// One host's checkpoint of `agent` in its mirror: a new file.
+    fn checkpoint(store: &GitWorkspace, agent: &str, file: &str) -> String {
+        let branch = BranchName::new(agent).expect("valid branch");
+        store.ensure_branch(&branch, None).expect("branch");
+        let workspace: WorkspaceId = store.mount(&branch).expect("mount");
+        std::fs::write(Path::new(workspace.path()).join(file), file).expect("write");
+        let Commit::Created(commit) = store.commit(&workspace, "work").expect("commit") else {
+            panic!("a change");
+        };
+        store.unmount(&workspace).expect("unmount");
+        commit.as_str().to_string()
+    }
+
+    #[test]
+    fn a_branch_pushed_by_one_host_is_resumed_and_advanced_on_another() {
+        let base = std::env::temp_dir().join(format!("spawn-sources-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            &seed_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+
+        let (root_a, root_b) = (base.join("a"), base.join("b"));
+        let mirror_a = ensure_mirror(&root_a, Some(&source)).expect("mirror a");
+        let mirror_b = ensure_mirror(&root_b, Some(&source)).expect("mirror b");
+        let host_a = GitWorkspace::new(&mirror_a, &root_a);
+        let host_b = GitWorkspace::new(&mirror_b, &root_b);
+
+        // Host A works and pushes; host B, which never ran the agent, takes
+        // the branch from the source.
+        let first = checkpoint(&host_a, "agent_x", "one.txt");
+        assert_eq!(push_branch(&mirror_a, &source, "agent_x"), Pushed::Done);
+        assert_eq!(
+            adopt_pushed(&mirror_b, &source, "agent_x").expect("adopt"),
+            Adopted::Created(first.clone())
+        );
+        assert_eq!(
+            adopt_pushed(&mirror_b, &source, "agent_none").expect("absent"),
+            Adopted::Absent
+        );
+
+        // A moves on; B's stale branch is fast-forwarded.
+        let second = checkpoint(&host_a, "agent_x", "two.txt");
+        assert_eq!(push_branch(&mirror_a, &source, "agent_x"), Pushed::Done);
+        assert_eq!(
+            adopt_pushed(&mirror_b, &source, "agent_x").expect("adopt"),
+            Adopted::Advanced(second.clone())
+        );
+        assert_eq!(
+            adopt_pushed(&mirror_a, &source, "agent_x").expect("same"),
+            Adopted::Kept
+        );
+
+        // Both write: the second push is refused, not forced, and the
+        // divergence is seen.
+        checkpoint(&host_b, "agent_x", "three.txt");
+        assert_eq!(push_branch(&mirror_b, &source, "agent_x"), Pushed::Done);
+        checkpoint(&host_a, "agent_x", "four.txt");
+        assert!(matches!(
+            push_branch(&mirror_a, &source, "agent_x"),
+            Pushed::Rejected(_)
+        ));
+        assert!(matches!(
+            adopt_pushed(&mirror_a, &source, "agent_x").expect("diverged"),
+            Adopted::Diverged { .. }
+        ));
+
+        // An unreachable source is an error, not "absent".
+        let gone = base.join("gone.git").to_string_lossy().to_string();
+        assert!(adopt_pushed(&mirror_a, &gone, "agent_x").is_err());
+        assert!(matches!(
+            push_branch(&mirror_a, &gone, "agent_x"),
+            Pushed::Failed(_)
+        ));
+    }
 
     #[test]
     fn mirrors_are_named_by_source_and_unique() {
