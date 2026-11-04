@@ -290,6 +290,10 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
     let after = row(&mut client);
     assert!(after["missions"][0]["halted"].is_null());
     assert!(after["missions"][0]["baseline"].is_null());
+    assert_eq!(
+        after["missions"][0]["scenario_floor"], 0,
+        "a resume takes the scenarios as they are now"
+    );
     assert!(
         store.mission_resume(mission).is_err(),
         "not halted any more"

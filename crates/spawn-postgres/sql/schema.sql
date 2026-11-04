@@ -883,9 +883,11 @@ begin
         update mission_missions set halted = p_record ->> 'reason', updated_at_ms = p_at
          where id = v_id;
     when 'mission.resumed' then
-        -- The next gate records the source's main as the new baseline.
+        -- The next gate records the source's main as the new baseline, and
+        -- the scenario count as the new floor: a human who resumes has seen
+        -- the scenarios as they are (only the owner changes them).
         update mission_missions set halted = null, baseline = null, gate_rejections = 0,
-                                    gate_aborts = 0, updated_at_ms = p_at
+                                    gate_aborts = 0, scenario_floor = 0, updated_at_ms = p_at
          where id = v_id;
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
