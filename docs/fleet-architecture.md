@@ -567,6 +567,15 @@ Each step is tested red, then green, gated, and committed.
 - **A shared source has one baseline.** A landing moves the baseline of
   every mission on that source, so RSI and fleet work on Spawn don't halt
   each other.
-- **Left on purpose:** the RSI page still reads the frozen `rsi_*` history.
-  Moving it to the objective mission is the first fleet mission that lands
-  through the gate.
+- **The RSI page reads the objective mission** (mission 5, the first fleet
+  mission that lands through the gate):
+  - `/api/rsi` lists the open objective missions: the backlog's objectives
+    with their status and landed metric values, the tasks with their
+    `task.gated` verdicts, the halt reason and the baseline. The shape is
+    documented in `crates/spawn-cli/src/serve.rs`.
+  - `/api/rsi/task/<id>` replaces `/api/rsi/iteration/<n>`; `/api/rsi/pane`
+    shows the mission resident's terminal.
+  - Nothing reads `rsi_*` any more. The tables stay as history.
+  - The integrator's advisory lock moved into the missions code, with the
+    old controller's key, so the two could never run at once.
+  - `spawn mission import-rsi` is gone: its one import ran.
