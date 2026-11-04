@@ -244,9 +244,17 @@ fn delivery(task: &TaskRow, found: Option<&Facts>) -> Option<Order> {
     let key = task.delivery_key();
     match found {
         Some(facts) if facts.open_command => None,
-        Some(facts) if facts.live => facts
-            .idle_at_prompt()
-            .then(|| task.order(key, CommandAction::Input { text: typed(task) })),
+        // A revision answers the worker's own report, which may have asked
+        // a question (judged BLOCKED): a stopped turn is enough. New work
+        // waits for a worker that is not blocked.
+        Some(facts) if facts.live => {
+            let ready = if task.is_revision() {
+                facts.turn_stopped_idle()
+            } else {
+                facts.idle_at_prompt()
+            };
+            ready.then(|| task.order(key, CommandAction::Input { text: typed(task) }))
+        }
         // Ran before: resume, so a resident keeps its context.
         Some(facts) if facts.execution_id.is_some() => Some(task.order(
             key,
@@ -616,6 +624,28 @@ mod tests {
             tasks,
             ..Work::default()
         }
+    }
+
+    #[test]
+    fn a_revision_reaches_a_blocked_worker_at_its_prompt_but_new_work_does_not() {
+        let mut blocked = worker(true, true);
+        if let Some(observation) = blocked.observation.as_mut() {
+            observation.state = SemanticState::Blocked;
+        }
+        let revise = orders(
+            &work(vec![task(7, TaskState::Revise, "resident")]),
+            &[blocked.clone()],
+        );
+        assert_eq!(revise.len(), 1, "the revision is typed in");
+        assert!(matches!(revise[0].action, CommandAction::Input { .. }));
+        let new = orders(
+            &work(vec![task(8, TaskState::Assigned, "resident")]),
+            &[blocked],
+        );
+        assert!(
+            new.is_empty(),
+            "new work waits for a worker that is not blocked"
+        );
     }
 
     #[test]
