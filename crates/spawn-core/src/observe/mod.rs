@@ -10,34 +10,22 @@
 //! evidence the model saw. A judge failure keeps the rules' guess, marks it
 //! `JudgeUnavailable` and asks for attention; it never reports "dead".
 //!
-//! Layout, by responsibility:
-//!
-//! - [`judge`]: the judge contract ([`JudgeInput`], [`Judgement`],
-//!   [`StateJudge`]) and the deterministic [`HeuristicJudge`].
-//! - [`classify`]: the rules tier ([`rules`], [`RulesVerdict`]).
-//! - [`interpret`]: reading a model answer against the facts ([`narrow`],
-//!   [`attention_reason`]).
-//! - [`evidence`]: what the model is shown beyond the log
-//!   ([`ObservationContext`], [`human_question`]) and its fingerprint.
-//! - [`snapshot`]: the per-session facts folded from the log.
-//! - [`observer`]: the [`Observer`] loop that ties them together.
+//! `judge` holds the judge contract, `snapshot` the per-session facts,
+//! `classify` reads facts against answers (the rules, and narrowing a model
+//! answer), and `observer` is the loop, with what the model is shown.
 //!
 //! [`Ambiguity`]: crate::observation::Ambiguity
 
 use std::time::Duration;
 
 mod classify;
-mod evidence;
-mod interpret;
 mod judge;
 mod observer;
 mod snapshot;
 
-pub use classify::{RulesVerdict, rules};
-pub use evidence::{ObservationContext, human_question};
-pub use interpret::{attention_reason, narrow};
+pub use classify::{RulesVerdict, attention_reason, narrow, rules};
 pub use judge::{HeuristicJudge, JudgeError, JudgeInput, Judgement, StateJudge, TurnFact};
-pub use observer::Observer;
+pub use observer::{ObservationContext, Observer};
 
 /// A live execution with no open tool and no fact for this long is ambiguous.
 pub const QUIET_AFTER: Duration = Duration::from_mins(2);
