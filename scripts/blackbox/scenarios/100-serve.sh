@@ -30,10 +30,10 @@ while [ "$i" -lt 50 ]; do
 done
 [ "$ready" -eq 1 ] || fail "serve did not answer on port $port"
 
-# Empty store: no session, no RSI state.
+# Empty store: no session. (The retired RSI controller's block is not
+# pinned: RSI is an objective mission, docs/fleet-architecture.md §10.4.)
 assert_contains "$(cat "$WORK/overview.json")" '"sessions":[]' \
     "overview lists no session on an empty store"
-assert_contains "$(cat "$WORK/overview.json")" '"rsi":' "overview carries the rsi block"
 
 code=$(curl -s -o "$WORK/session.json" -w '%{http_code}' \
     "http://127.0.0.1:$port/api/session/session_absent")
