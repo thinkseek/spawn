@@ -414,7 +414,13 @@ impl Bridge {
                     self.follow_screen(agent_id, session, active)?;
                     None
                 }
-                Ok(false) => Some((EndCause::Lost, None)),
+                // The engine may have written its exit status and closed the
+                // pane between the read above and this check: read it again
+                // before calling the execution lost.
+                Ok(false) => Some(
+                    self.exit_status(session, active, report)
+                        .unwrap_or((EndCause::Lost, None)),
+                ),
                 Err(error) => {
                     report
                         .warnings
