@@ -820,8 +820,15 @@ create table if not exists mission_tasks (
     metric          text,
     objective       integer,
     scenario        text,
-    delivered_at_ms bigint
+    delivered_at_ms bigint,
+    -- The models the task's worker runs on (docs/fleet-architecture.md,
+    -- "Engine models"): `default`, or `cheap` for simple, well-specified work.
+    model           text   not null default 'default' check (model in ('default', 'cheap'))
 );
+
+-- Tables made before the column existed get it in place.
+alter table mission_tasks add column if not exists model text not null default 'default'
+    check (model in ('default', 'cheap'));
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
 
@@ -872,11 +879,12 @@ begin
                                  where m.id = v_id and m.gate is not null)));
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
-                                   created_by, objective, scenario, created_at_ms, updated_at_ms)
+                                   created_by, objective, scenario, model,
+                                   created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
-                p_record ->> 'scenario', p_at, p_at);
+                p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'), p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -997,7 +1005,8 @@ begin
             select * from jsonb_populate_record(null::mission_residents, p_record -> 'row');
         when 'mission_tasks' then
             insert into mission_tasks
-            select * from jsonb_populate_record(null::mission_tasks, p_record -> 'row');
+            select * from jsonb_populate_record(null::mission_tasks,
+                jsonb_build_object('model', 'default') || (p_record -> 'row'));
         else
             raise exception 'legacy record of unknown table %', p_record ->> 'table';
         end case;
@@ -1085,7 +1094,10 @@ end $$;
 
 -- Assign one task. A resident must be approved; an ephemeral worker gets a
 -- new agent named after the label and the task, used for this task only.
-create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_worker text, p_brief text)
+-- `p_model` is the profile the worker runs the task on.
+drop function if exists spawn_task_assign(bigint, text, text, text);
+create or replace function spawn_task_assign(p_mission bigint, p_kind text, p_worker text,
+                                             p_brief text, p_model text default 'default')
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
@@ -1104,6 +1116,9 @@ begin
     end if;
     if coalesce(trim(p_brief), '') = '' then
         raise exception 'a task needs a brief';
+    end if;
+    if p_model is null or p_model not in ('default', 'cheap') then
+        raise exception 'a task runs on the default or cheap model profile, not %', p_model;
     end if;
     if p_kind = 'resident' then
         select agent_id, session_id into v_agent, v_session
@@ -1124,7 +1139,7 @@ begin
     end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', p_kind,
-        'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief,
+        'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief, 'model', p_model,
         'created_by', case when v_caller = 'owner' then 'human' else v_caller end));
     return v_id;
 end $$;
@@ -1424,7 +1439,8 @@ declare
 begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text)', 'spawn_task_review(bigint, boolean, text)',
+        'spawn_task_assign(bigint, text, text, text, text)',
+        'spawn_task_review(bigint, boolean, text)',
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
@@ -1438,7 +1454,8 @@ begin
     end loop;
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
-        'spawn_task_assign(bigint, text, text, text)', 'spawn_task_review(bigint, boolean, text)',
+        'spawn_task_assign(bigint, text, text, text, text)',
+        'spawn_task_review(bigint, boolean, text)',
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)'] loop
         execute format('grant execute on function %s to spawn_supervisor', v_function);

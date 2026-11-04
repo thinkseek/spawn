@@ -201,8 +201,11 @@ fn revive(
     let (action, key) = match decision {
         Revive::Nothing => return Ok(None),
         Revive::Resume => (
+            // No profile named: a revived session keeps the one it last
+            // started with, so a resident keeps its models.
             CommandAction::Resume {
                 prompt: Some(resume(&facts)),
+                model: None,
             },
             format!("{session}-resume-{execution}-{}", facts.failures),
         ),
@@ -212,6 +215,7 @@ fn revive(
                 prompt: start(handoff),
                 parent_session_id: None,
                 from: None,
+                model: None,
             },
             format!(
                 "{session}-start-{execution}-{}-{}",

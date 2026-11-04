@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::event::Engine;
+use crate::event::{Engine, ModelProfile};
 use crate::id::{AgentId, CommandId, IdempotencyKey, SessionId};
 
 /// Command vocabulary accepted by the SQL gateway.
@@ -24,6 +24,10 @@ pub enum CommandAction {
         /// warns that `from` was ignored.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
+        /// Models the engine runs on. Unset: the profile the session last
+        /// started with, or the default for a session that never ran.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelProfile>,
     },
     /// Type text into the running Claude session.
     Input {
@@ -43,6 +47,10 @@ pub enum CommandAction {
         /// Prompt for the resumed session. Codex requires one.
         #[serde(default)]
         prompt: Option<String>,
+        /// Models the resumed engine runs on. Unset: the profile the session
+        /// last started with, so a resumed cheap worker stays cheap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelProfile>,
     },
 }
 
