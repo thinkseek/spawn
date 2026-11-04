@@ -119,9 +119,11 @@ fn ensure_branch_is_idempotent_and_mount_extracts_the_base() {
     let _exclusive = exclusive();
     let (repo, root) = repository("mount");
     let store = GitWorkspace::new(&repo, &root);
-    store.ensure_branch(&branch()).expect("create the branch");
     store
-        .ensure_branch(&branch())
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
+    store
+        .ensure_branch(&branch(), None)
         .expect("creating twice is harmless");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let extracted = fs::read_to_string(PathBuf::from(workspace.path()).join("README.md"))
@@ -141,7 +143,9 @@ fn an_untouched_workspace_produces_no_commit() {
     let _exclusive = exclusive();
     let (repo, root) = repository("unchanged");
     let store = GitWorkspace::new(&repo, &root);
-    store.ensure_branch(&branch()).expect("create the branch");
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     assert!(matches!(
         store.commit(&workspace, "empty").expect("commit succeeds"),
@@ -155,7 +159,9 @@ fn a_changed_workspace_advances_the_branch() {
     let _exclusive = exclusive();
     let (repo, root) = repository("created");
     let store = GitWorkspace::new(&repo, &root);
-    store.ensure_branch(&branch()).expect("create the branch");
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     fs::write(PathBuf::from(workspace.path()).join("new.txt"), "work\n")
         .expect("write into the workspace");
@@ -178,7 +184,9 @@ fn a_large_file_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
     let _exclusive = exclusive();
     let (repo, root) = repository("large");
     let store = GitWorkspace::new(&repo, &root);
-    store.ensure_branch(&branch()).expect("create the branch");
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
     let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 1;
@@ -210,7 +218,9 @@ fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
     let (repo, root) = repository("identity");
     let store = GitWorkspace::new(&repo, &root);
-    store.ensure_branch(&branch()).expect("create the branch");
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     assert_eq!(workspace.sandbox(), "agent_test");
     assert_eq!(

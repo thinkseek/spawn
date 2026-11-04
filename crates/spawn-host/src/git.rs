@@ -14,8 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{Commit, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{BaseMerge, Branch, Commit, ForkFrom, WorkspaceError, WorkspaceStore};
 
 /// Ref a new branch is forked from.
 const BASE: &str = "main";
@@ -368,7 +369,11 @@ impl WorkspaceStore for GitWorkspace {
         self.repo.to_str().unwrap_or("")
     }
 
-    fn ensure_branch(&self, branch: &BranchName) -> Result<(), WorkspaceError> {
+    fn ensure_branch(
+        &self,
+        branch: &BranchName,
+        from: Option<&str>,
+    ) -> Result<Branch, WorkspaceError> {
         // A name that starts with '-' would reach git as an option.
         if branch.as_str().starts_with('-') {
             return Err(WorkspaceError::Unavailable(format!(
@@ -383,10 +388,23 @@ impl WorkspaceStore for GitWorkspace {
             .git_output(&["rev-parse", "--verify", "--quiet", &reference])
             .is_ok()
         {
-            return Ok(());
+            return Ok(Branch::Existing);
         }
-        self.git_output(&["branch", branch.as_str(), BASE])?;
-        Ok(())
+        let (label, commit) = match from {
+            None => (
+                BASE.to_string(),
+                self.commit_id_of(&format!("refs/heads/{BASE}"))?,
+            ),
+            Some(from) => (from.to_string(), self.resolve_from(from)?),
+        };
+        // An empty old value: create only, never move a branch that
+        // appeared meanwhile.
+        self.git_output(&["update-ref", &reference, &commit, ""])?;
+        Ok(Branch::Created(Fork {
+            from: label,
+            commit: CommitId::new(commit)
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+        }))
     }
 
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
@@ -495,5 +513,185 @@ impl WorkspaceStore for GitWorkspace {
                 directory.display()
             ))),
         }
+    }
+
+    fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+        self.merge_main(workspace)
+    }
+}
+
+/// Branching and merging (docs/storage.md, "Branching and merging").
+impl GitWorkspace {
+    /// The commit a start's `from` names: another agent's branch head or a
+    /// full commit id present in the repository. Anything else is refused.
+    pub fn resolve_from(&self, from: &str) -> Result<String, WorkspaceError> {
+        let refused = |message: String| WorkspaceError::Refused {
+            code: "NoSuchFrom".to_string(),
+            message,
+        };
+        match ForkFrom::parse(from)? {
+            ForkFrom::Agent(agent) => self
+                .commit_id_of(&format!("refs/heads/{agent}"))
+                .map_err(|_| refused(format!("{agent} has no branch in {}", self.project()))),
+            ForkFrom::Commit(commit) => {
+                let found = self
+                    .git_output(&[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("{commit}^{{commit}}"),
+                    ])
+                    .map_err(|_| refused(format!("no commit {commit} in {}", self.project())))?;
+                if found != commit.as_str() {
+                    return Err(refused(format!("{commit} resolves to {found}")));
+                }
+                Ok(found)
+            }
+        }
+    }
+
+    /// Whether `ancestor` is reachable from `commit`.
+    fn is_ancestor(&self, ancestor: &str, commit: &str) -> Result<bool, WorkspaceError> {
+        let status = self
+            .command()
+            .args(["merge-base", "--is-ancestor", ancestor, commit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(WorkspaceError::Unavailable(format!(
+                "git merge-base --is-ancestor {ancestor} {commit}: {status}"
+            ))),
+        }
+    }
+
+    /// [`WorkspaceStore::merge_base`]: merge `main` into the workspace's
+    /// branch when it moved.
+    ///
+    /// The merge rules come from `main`'s `.gitattributes`
+    /// (`--attr-source`; a bare repository ignores in-tree attributes
+    /// otherwise), which only the gate moves. The directory moves first, by a
+    /// two-tree `read-tree -m -u` against a temporary index that refuses when
+    /// a file the merge changes differs from the branch; only then does the
+    /// branch move, by compare-and-swap. The other order would let the next
+    /// checkpoint commit the old files over the merge and revert `main`.
+    fn merge_main(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+        let branch = workspace.sandbox().to_string();
+        let directory = self.checked_path(workspace)?;
+        let reference = format!("refs/heads/{branch}");
+        let head = self.commit_id_of(&reference)?;
+        let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
+        if self.is_ancestor(&main, &head)? {
+            return Ok(BaseMerge::Current);
+        }
+        // `main` first, as the integrator lands it: a union merge orders the
+        // lines the same way the landing would.
+        let output = self
+            .command()
+            .arg(format!("--attr-source={main}"))
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "-z",
+                &main,
+                &head,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut fields = stdout.split('\0');
+        let merged = fields.next().unwrap_or_default().trim().to_string();
+        match output.status.code() {
+            Some(0) => {}
+            Some(1) => {
+                let mut files: Vec<String> = fields
+                    .take_while(|field| !field.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                files.dedup();
+                return Ok(BaseMerge::Conflicted { files });
+            }
+            _ => {
+                return Err(WorkspaceError::Unavailable(format!(
+                    "git merge-tree {main} {head}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
+        self.update_directory(&branch, &directory, &head_tree, &merged)?;
+        let changed =
+            self.git_output(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
+        let files = changed
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect();
+        // The branch keeps its own large files: their manifest trailer, if
+        // the head names one, goes on the merge commit.
+        let trailers =
+            self.git_output(&["log", "-1", "--format=%(trailers:key=Spawn-Large)", &head])?;
+        let mut message = format!("spawn: merge main {main} into {branch}");
+        if !trailers.is_empty() {
+            message = format!("{message}\n\n{trailers}");
+        }
+        let commit = self.git_output(&[
+            "commit-tree",
+            &merged,
+            "-p",
+            &head,
+            "-p",
+            &main,
+            "-m",
+            &message,
+        ])?;
+        self.git_output(&["update-ref", &reference, &commit, &head])
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!("{error} (branch moved under the merge)"))
+            })?;
+        Ok(BaseMerge::Merged {
+            commit: CommitId::new(commit)
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            files,
+        })
+    }
+
+    /// Move the files of `directory` from tree `from` to tree `to`, or
+    /// refuse, changing nothing, when a file that differs between them also
+    /// differs in the directory from `from` (or is in the way untracked).
+    fn update_directory(
+        &self,
+        branch: &str,
+        directory: &Path,
+        from: &str,
+        to: &str,
+    ) -> Result<(), WorkspaceError> {
+        let index = self.root.join(".index").join(format!("{branch}.merge"));
+        if let Some(parent) = index.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+            })?;
+        }
+        let _ = std::fs::remove_file(&index);
+        let result = self
+            .output_in(directory, &index, &["read-tree", from])
+            .and_then(|_| {
+                // Stat information for the fresh index, so unchanged files
+                // count as up to date; what differs is caught below.
+                let _ = self.output_in(directory, &index, &["update-index", "-q", "--refresh"]);
+                self.output_in(directory, &index, &["read-tree", "-m", "-u", from, to])
+                    .map_err(|error| WorkspaceError::Refused {
+                        code: "WorkspaceDiffers".to_string(),
+                        message: error.to_string(),
+                    })
+            });
+        let _ = std::fs::remove_file(&index);
+        result.map(|_| ())
     }
 }

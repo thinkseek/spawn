@@ -205,6 +205,7 @@ fn revive(
                 engine: Engine::Claude,
                 prompt: start(handoff),
                 parent_session_id: None,
+                from: None,
             },
             format!(
                 "{session}-start-{execution}-{}-{}",
