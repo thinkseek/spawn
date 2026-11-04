@@ -391,6 +391,30 @@ mod tests {
     const AT: &str = r#""timestamp":"2026-11-04T05:46:12.345Z""#;
 
     #[test]
+    fn a_prompt_that_opens_with_the_merge_notice_is_its_receipt() {
+        let notice = format!(
+            r#"{{"type":"user","uuid":"u1",{AT},"message":{{"content":[{{"type":"text","text":"{}: a.rs. Re-read them before editing.\n\nnext"}}]}}}}"#,
+            super::MERGE_NOTICE_OPENING
+        );
+        assert_eq!(
+            kinds(&notice),
+            vec![
+                ("message.received".into(), Some("u1".into())),
+                ("notice.received".into(), Some("u1:notice".into())),
+            ]
+        );
+        // Quoting the notice later in a prompt is not receiving it.
+        let quoted = format!(
+            r#"{{"type":"user","uuid":"u2",{AT},"message":{{"content":"why did you say {}?"}}}}"#,
+            super::MERGE_NOTICE_OPENING
+        );
+        assert_eq!(
+            kinds(&quoted),
+            vec![("message.received".into(), Some("u2".into()))]
+        );
+    }
+
+    #[test]
     fn a_transcript_gives_the_turn_and_its_tools() {
         let prompt = format!(
             r#"{{"type":"user","uuid":"u1",{AT},"message":{{"role":"user","content":"fix it"}}}}"#
