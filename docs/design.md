@@ -116,11 +116,11 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 | 命令 | 行为 |
 | --- | --- |
-| `Start{engine,prompt,parent_session_id,from}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ mount → 写 `execution.started`（新分支带 fork）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
+| `Start{engine,prompt,parent_session_id,from,model}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ mount → 写 `execution.started`（新分支带 fork）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
 | `Input{text}` | 屏尾非 Ready 直接拒绝，Ready 才 `send-keys` |
 | `Stop` | 走结束流程，原因记为 `Stopped`；最后一次 checkpoint 失败时工作区不卸载 |
 | `Discard` | 同 `Stop`，但最后一次 checkpoint 失败也卸载工作区，未提交的内容丢失；只由人或 supervisor 在 `execution.end_stalled` 之后发出 |
-| `Resume{prompt}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
+| `Resume{prompt,model}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
 
 一次启动的参数由 `claude_arguments` 与 `codex_arguments` 生成：
 
@@ -128,6 +128,8 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 | --- | --- |
 | Claude | `--ax-screen-reader --allow-dangerously-skip-permissions --settings <内联 JSON> (--session-id <uuid> \| --resume <uuid>)` |
 | Codex | `exec --json [resume <id>] -- <prompt>` |
+
+引擎模型（[fleet-architecture.md §3.3](fleet-architecture.md#33-engine-models)）：`Start`/`Resume` 的可选 `model` 是模型档位，`default` 或 `cheap`；不写就沿用该会话上一次执行的档位（从 `execution.started` 的 `model` 折叠，默认档位不写进记录），从没跑过的会话用 `default`。内联 `--settings` 由 `claude_settings(relay, profile)` 生成：Claude Code 把它合并在用户 settings 之上，键以内联为准，`env` 按名字逐个合并（2.1.318 实测：内联 `env` 只写基址和 haiku 槽位时，主模型和 `ANTHROPIC_AUTH_TOKEN` 仍来自 `~/.claude/settings.json`），所以网关 token 不经过 Spawn。有模型中继（`SPAWN_MODEL_RELAY`，默认 `http://127.0.0.1:8791`，`off` 关闭）时 `env` 写 `ANTHROPIC_BASE_URL` 指向中继、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 为小模型（`SPAWN_SMALL_MODEL`，默认 `deepseek-flash`）；`cheap` 另把 `ANTHROPIC_MODEL` 与 opus、sonnet 槽位设为 `SPAWN_CHEAP_MODEL`（默认 `deepseek-v4-pro`）。每次启动前 Bridge 先连一下中继：连不上时 `default` 不写 `env`、照 Claude Code 自己的设置跑并在 tick 报告里警告，`cheap` 直接失败；Codex 不支持 `cheap`。
 
 不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`，Codex 输出另存到 `SPAWN_ENGINE_OUTPUT`；终端里没有数据库登录。
 

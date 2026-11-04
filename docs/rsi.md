@@ -100,7 +100,7 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 - **不加新的事件种类。** `EventKind` 是封闭枚举；任务与落地都是 `control.recorded` 事件，类型在 detail 里。
 - **不从事件里取 commit id。** 积分器在宿主侧提交工作区。
-- **不做不可重启的 daemon。** `spawn loop`（Bridge、Observer、派发、存活规则）与 `spawn integrate`（门禁与落地）各是一个进程，状态全在事件日志里，杀掉即重启，不丢工作。拉起交给 systemd（`deploy/systemd/`：`spawn-loop`、`spawn-integrate`、`spawn-serve`、`spawn-jev-relay`、`spawn-backup.timer`）；运行 Spawn 的单元直接执行 `spawn`，不经包装脚本：`KillMode=process` 只杀主进程，主进程若是脚本，被替换的 `spawn loop` 会留下来跟新的并跑。哪些部分能边跑边换、哪些必须停机，见 [upgrading.md](upgrading.md)。
+- **不做不可重启的 daemon。** `spawn loop`（Bridge、Observer、派发、存活规则）与 `spawn integrate`（门禁与落地）各是一个进程，状态全在事件日志里，杀掉即重启，不丢工作。拉起交给 systemd（`deploy/systemd/`：`spawn-loop`、`spawn-integrate`、`spawn-serve`、`spawn-jev-relay`、`spawn-model-relay`、`spawn-backup.timer`）；运行 Spawn 的单元直接执行 `spawn`，不经包装脚本：`KillMode=process` 只杀主进程，主进程若是脚本，被替换的 `spawn loop` 会留下来跟新的并跑。哪些部分能边跑边换、哪些必须停机，见 [upgrading.md](upgrading.md)。
 - **不做并行种群。** 门禁是 pass/fail，选不出更好的那个；一个目标任务一次只有一个任务在做。
 - **不让 agent 改 backlog、场景或门禁脚本。**
 - **不在 agent 的工作区里判定。** 门禁把基线与候选导出到自己的临时目录里构建和运行。
