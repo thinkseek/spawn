@@ -2,6 +2,7 @@
 
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
+use spawn_core::port::CommandQueue;
 
 use crate::config::{env_value, open_store, spawn_program, supervised};
 use crate::flags::Flags;
