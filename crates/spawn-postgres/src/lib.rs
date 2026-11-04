@@ -13,8 +13,7 @@
 //! - `sessions`: per-session read side over the `agent_*` views.
 //! - `gateway`: grant-filtered reads and submissions for restricted logins.
 //! - `fleet`: the dashboard and dispatcher read model.
-//! - `missions`: missions, tasks and residents.
-//! - `rsi`: controller state of the self-improvement loop.
+//! - `missions`: missions, tasks and residents, and the integrator's lock.
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
@@ -32,12 +31,8 @@ mod gateway;
 mod missions;
 mod queries;
 mod row;
-mod rsi;
 mod sessions;
 
-pub use rsi::{
-    RSI_AGENT, RSI_SESSION, RsiAttempt, RsiCommand, RsiIteration, RsiIterationRow, RsiState,
-};
 pub use sessions::{ExecutionRow, Freshness, LivenessFacts, OpenTool, SessionState, TimelineEntry};
 
 /// Schema installed by [`PostgresStore::migrate`].
@@ -118,8 +113,8 @@ impl PostgresStore {
 /// URL a terminal uses: the controller's URL with the restricted login.
 ///
 /// The agent runs inside the terminal and reads its environment. Handing it
-/// the controller URL would let a candidate write `rsi_state` and advance its
-/// own baseline past the gate, so the pane gets the login that can only
+/// the controller URL would let a candidate write the mission tables and
+/// move its own baseline past the gate, so the pane gets the login that can only
 /// append engine events.
 #[must_use]
 pub fn terminal_url(controller: &str) -> String {
