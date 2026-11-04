@@ -221,7 +221,7 @@ Rules for the session itself:
   submitted or an event about it, so a handoff can always be rebuilt.
 - Its uptime, restarts, resumes and handoffs are first-class facts in the UI.
 
-### 3.2 Missions, tasks and workers (agreed 2026-11-04, not built yet)
+### 3.2 Missions, tasks and workers (agreed and built 2026-11-04)
 
 Spawn works for missions, not repositories. A repository is just one possible
 input of a mission.
@@ -420,7 +420,7 @@ One loop, end to end, before anything else:
 4. Limits: none fixed. The supervisor decides fleet size; humans stop what
    overreaches, and the UI shows live workers and spend.
 
-### 9.1 Build order for §3.2
+### 9.1 Build order for §3.2 (all six steps built; `scripts/mvp-e2e.sh` covers them)
 
 1. Mission inbox: `mission_*` tables, `spawn mission add` (principal human),
    a "new mission" digest to the supervisor, missions in `spawn fleet` and

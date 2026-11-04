@@ -506,7 +506,10 @@ mod tests {
 
     #[test]
     fn the_next_task_waits_for_the_review() {
-        let tasks = vec![task(3, "reported", "resident"), task(4, "assigned", "resident")];
+        let tasks = vec![
+            task(3, "reported", "resident"),
+            task(4, "assigned", "resident"),
+        ];
         assert!(orders(&work(tasks), &[worker(true, true)]).is_empty());
         let mut revise = task(3, "revise", "resident");
         revise.revisions = 1;
