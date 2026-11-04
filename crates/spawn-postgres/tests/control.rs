@@ -274,6 +274,15 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
     assert_eq!(after["tasks"][0]["state"], "landed");
     assert_eq!(after["missions"][0]["baseline"], "c1");
 
+    let source = "/tmp/source.git";
+    assert_eq!(
+        store.source_moved(source, "b1", "d1").expect("moved"),
+        0,
+        "only a mission whose baseline is `from` moves"
+    );
+    assert_eq!(store.source_moved(source, "c1", "d1").expect("moved"), 1);
+    assert_eq!(row(&mut client)["missions"][0]["baseline"], "d1");
+
     store
         .integrator_record(
             &json!({"type": "mission.halted", "id": mission, "reason": "main moved"}),

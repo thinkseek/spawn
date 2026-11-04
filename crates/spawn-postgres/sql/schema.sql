@@ -890,6 +890,12 @@ begin
         update mission_missions set halted = null, baseline = null, gate_rejections = 0,
                                     gate_aborts = 0, scenario_floor = 0, updated_at_ms = p_at
          where id = v_id;
+    when 'source.moved' then
+        -- The owner moved a source's main on purpose (a deploy), forward from
+        -- where the last landing left it: the missions on that source take
+        -- the new main as their baseline instead of halting at the next pass.
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+         where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from';
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
                                  delivered_at_ms = p_at, updated_at_ms = p_at
@@ -1318,6 +1324,28 @@ begin
     perform spawn_control_record(jsonb_build_object('type', 'mission.resumed', 'id', p_mission));
 end $$;
 
+-- The owner moved a source's main forward outside the gate (a deploy): the
+-- missions whose baseline is `p_from` take `p_to` instead of halting. The
+-- caller checks that `p_to` descends from `p_from`; returns how many missions
+-- moved. A mission without a baseline yet, or halted, is left alone.
+create or replace function spawn_source_moved(p_source text, p_from text, p_to text)
+returns integer language plpgsql security definer as $$
+declare
+    v_count integer;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner moves a source outside the gate' using errcode = '42501';
+    end if;
+    select count(*) into v_count from mission_missions
+     where sources ->> 0 = p_source and baseline = p_from;
+    if v_count > 0 then
+        perform spawn_control_record(jsonb_build_object(
+            'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to));
+    end if;
+    return v_count;
+end $$;
+
 -- The integrator's records (`spawn integrate`, owner only): gate verdicts,
 -- landings, aborts over budget, and halts.
 create or replace function spawn_integrator_record(p_record jsonb)
@@ -1399,6 +1427,7 @@ begin
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
+        'spawn_source_moved(text, text, text)',
         'spawn_objective_assign(bigint, integer, text, text)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
