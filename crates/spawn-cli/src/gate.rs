@@ -1,21 +1,40 @@
 //! Running the gate (`scripts/rsi/gate.sh`, docs/fleet-architecture.md
 //! §10.2): one black-box judge for every landing, with a wall clock.
 //!
-//! The verdict is the gate's last line on stdout and nothing else: scenario
-//! output reaches stdout only through the gate's `| ` prefix, and stderr is
-//! open to whatever the candidate's processes print.
+//! The verdict is the file the gate writes at `SPAWN_GATE_VERDICT`, in a
+//! private directory this process creates and the gate's sandbox hides, and
+//! it counts only when the gate exits 0. Stdout is the record, not the
+//! verdict: candidate code once wrote an accepted line to the gate's stdout
+//! through /proc and killed the gate. A gate that exits non-zero, or dies
+//! of a signal, is an abort whatever it printed.
+//!
+//! The gate runs with a cleared environment: [`GATE_ENV`] and nothing else.
+//! The integrator's own database URL never reaches candidate code.
 
 use std::fmt::Write as _;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+/// The integrator's variables the gate receives (scripts/rsi/gate.sh lists
+/// what it reads). Everything else, the owner's SPAWN_DATABASE_URL first,
+/// stays out.
+pub(crate) const GATE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "TMPDIR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "SPAWN_TEST_DATABASE_URL",
+];
 
 /// One gate verdict.
 #[derive(Debug, Clone)]
 pub(crate) struct Verdict {
     pub(crate) accepted: bool,
     pub(crate) reason: String,
-    /// The candidate's task metric, from the verdict line only.
+    /// The candidate's task metric, from the verdict only.
     pub(crate) metric: Option<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
@@ -26,12 +45,52 @@ pub(crate) struct Verdict {
 pub(crate) enum GateFailure {
     /// The gate ran past its wall clock. Infrastructure, not the candidate.
     Timeout,
-    /// The gate could not start or printed no verdict.
+    /// The gate could not start.
     Failed(String),
+    /// The gate ran but gave no verdict to believe: a non-zero or signalled
+    /// exit, or no verdict file. `log` is what it printed.
+    Aborted { reason: String, log: String },
+}
+
+/// The gate's environment, read through `lookup`: the [`GATE_ENV`]
+/// variables that are set. Refused when the test database is the owner's.
+pub(crate) fn gate_env(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let env: Vec<(String, String)> = GATE_ENV
+        .iter()
+        .filter_map(|name| {
+            lookup(name)
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*name).to_string(), value))
+        })
+        .collect();
+    if let (Some(test), Some(owner)) = (
+        lookup("SPAWN_TEST_DATABASE_URL"),
+        lookup("SPAWN_DATABASE_URL"),
+    ) && !test.is_empty()
+        && database_of(&test) == database_of(&owner)
+    {
+        return Err(
+            "SPAWN_TEST_DATABASE_URL names the owner's database; the gate runs candidate \
+             tests against it"
+                .to_string(),
+        );
+    }
+    Ok(env)
+}
+
+/// `host:port/name` of a postgres URL, without credentials or parameters.
+fn database_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, rest)| rest);
+    rest.split('?').next().unwrap_or(rest)
 }
 
 /// Judge `candidate` against `base` in `repo` with the scenarios in
-/// `scenarios`, and the task scenario when there is one.
+/// `scenarios`, and the task scenario when there is one. `env` is the
+/// gate's whole environment ([`gate_env`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn judge(
     gate: &Path,
     repo: &Path,
@@ -39,8 +98,11 @@ pub(crate) fn judge(
     candidate: &str,
     scenarios: &Path,
     scenario: Option<&Path>,
+    env: &[(String, String)],
     limit: Duration,
 ) -> Result<Verdict, GateFailure> {
+    let directory = PrivateDirectory::create().map_err(|error| failed(&error))?;
+    let verdict_path = directory.path().join("verdict");
     let mut command = Command::new("sh");
     command
         .arg(gate)
@@ -51,105 +113,160 @@ pub(crate) fn judge(
     if let Some(scenario) = scenario {
         command.arg(scenario);
     }
-    let (stdout, stderr) = run_bounded(command, limit)?;
-    let line = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .filter(|line| line.starts_with('{'))
-        .ok_or_else(|| GateFailure::Failed("gate produced no verdict".to_string()))?;
-    // The record keeps stderr, marked `! ` so no line of it can pass for a
-    // verdict or a section header, and the verdict stays last.
-    let mut output = stdout[..stdout.rfind(line).unwrap_or(stdout.len())].to_string();
-    for text in stderr.lines() {
-        let _ = writeln!(output, "! {text}");
-    }
-    let _ = writeln!(output, "{line}");
-    let verdict: serde_json::Value = serde_json::from_str(line)
-        .map_err(|error| GateFailure::Failed(format!("gate verdict: {error}")))?;
-    let text = |name: &str| {
-        verdict
-            .get(name)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
+    command
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .env("SPAWN_GATE_VERDICT", &verdict_path);
+    let run = run_bounded(command, limit, directory.path())?;
+    let verdict = std::fs::read_to_string(&verdict_path).ok();
+    decide(&run, verdict.as_deref())
+}
+
+/// The verdict of a finished gate run: the verdict file's, only after a
+/// clean exit.
+fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
+    // The record: stdout, then stderr marked `! ` so no line of it can pass
+    // for a verdict or a section header. An abort keeps all of it.
+    let record = |stdout: &str| {
+        let mut output = stdout.to_string();
+        for text in run.stderr.lines() {
+            let _ = writeln!(output, "! {text}");
+        }
+        output
     };
+    let aborted = |reason: String| GateFailure::Aborted {
+        reason,
+        log: record(&run.stdout),
+    };
+    if !run.status.success() {
+        return Err(aborted(format!("the gate ended with {}", run.status)));
+    }
+    let Some(line) = verdict
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.contains('\n'))
+    else {
+        return Err(aborted("the gate wrote no verdict".to_string()));
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|error| aborted(format!("gate verdict: {error}")))?;
+    let text = |name: &str| value.get(name).and_then(|v| v.as_str()).map(str::to_string);
+    let accepted = match text("verdict").as_deref() {
+        Some("accepted") => true,
+        Some("rejected") => false,
+        _ => return Err(aborted(format!("gate verdict: {line}"))),
+    };
+    // A believed verdict is recorded last, and once: stdout's copy goes.
+    let stdout = run
+        .stdout
+        .trim_end()
+        .strip_suffix(line)
+        .filter(|head| head.is_empty() || head.ends_with('\n'))
+        .unwrap_or(&run.stdout);
+    let mut output = record(stdout);
+    let _ = writeln!(output, "{line}");
     Ok(Verdict {
-        accepted: text("verdict").as_deref() == Some("accepted"),
+        accepted,
         reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
         metric: text("metric"),
         output,
     })
 }
 
-/// Run a command with a wall clock, returning its stdout and stderr.
+fn failed(error: &std::io::Error) -> GateFailure {
+    GateFailure::Failed(error.to_string())
+}
+
+/// A new directory, mode 0700, under the temporary directory; removed on
+/// drop. The gate's stdout, stderr and verdict file live in it.
+struct PrivateDirectory(PathBuf);
+
+impl PrivateDirectory {
+    fn create() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let path =
+            std::env::temp_dir().join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A finished command.
+#[derive(Debug)]
+pub(crate) struct Run {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+/// Run a command with a wall clock and no stdin, its stdout and stderr in
+/// files in `directory`.
 ///
 /// The child writes to files, not to pipes: a pipe that fills up would block
-/// the child while this loop waits for it to exit. The files live in a new
-/// private directory per run. The child leads its own process group, and the
-/// whole group is killed when the gate ends or times out, so nothing the
-/// candidate started outlives the verdict.
-///
-/// ponytail: same-uid code can still reach the files through /proc; the real
-/// boundary is running the gate in a container.
+/// the child while this loop waits for it to exit. The child leads its own
+/// process group, and the whole group is killed when the gate ends or times
+/// out, so nothing the candidate started outlives the verdict (the gate's
+/// sandbox also dies with its parent).
 pub(crate) fn run_bounded(
     mut command: Command,
     limit: Duration,
-) -> Result<(String, String), GateFailure> {
-    use std::os::unix::fs::DirBuilderExt as _;
+    directory: &Path,
+) -> Result<Run, GateFailure> {
     use std::os::unix::process::CommandExt as _;
 
-    let failed = |error: std::io::Error| GateFailure::Failed(error.to_string());
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let directory =
-        std::env::temp_dir().join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
-        .map_err(failed)?;
-    let result = (|| {
-        let out_path = directory.join("stdout");
-        let err_path = directory.join("stderr");
-        let stdout = std::fs::File::create(&out_path).map_err(failed)?;
-        let stderr = std::fs::File::create(&err_path).map_err(failed)?;
-        let mut child = command
-            .stdout(stdout)
-            .stderr(stderr)
-            .process_group(0)
-            .spawn()
-            .map_err(failed)?;
-        let group = child.id();
-        let kill_group = || {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{group}")])
-                .stderr(std::process::Stdio::null())
-                .status();
-        };
-        let deadline = Instant::now() + limit;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() >= deadline => {
-                    kill_group();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(GateFailure::Timeout);
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-                Err(error) => {
-                    kill_group();
-                    return Err(failed(error));
-                }
+    let out_path = directory.join("stdout");
+    let err_path = directory.join("stderr");
+    let stdout = std::fs::File::create(&out_path).map_err(|error| failed(&error))?;
+    let stderr = std::fs::File::create(&err_path).map_err(|error| failed(&error))?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .process_group(0)
+        .spawn()
+        .map_err(|error| failed(&error))?;
+    let group = child.id();
+    let kill_group = || {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{group}")])
+            .stderr(Stdio::null())
+            .status();
+    };
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                kill_group();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GateFailure::Timeout);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(error) => {
+                kill_group();
+                return Err(failed(&error));
             }
         }
-        kill_group();
-        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-        Ok((stdout, stderr))
-    })();
-    let _ = std::fs::remove_dir_all(&directory);
-    result
+    };
+    kill_group();
+    Ok(Run {
+        status,
+        stdout: std::fs::read_to_string(&out_path).unwrap_or_default(),
+        stderr: std::fs::read_to_string(&err_path).unwrap_or_default(),
+    })
 }
 
 /// Scenario files in the controller's checkout.
@@ -173,7 +290,8 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GateFailure, run_bounded};
+    use super::{GateFailure, PrivateDirectory, gate_env, judge, run_bounded};
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -183,24 +301,30 @@ mod tests {
         command
     }
 
+    fn bounded(script: &str, limit: Duration) -> Result<super::Run, GateFailure> {
+        let directory = PrivateDirectory::create().expect("directory");
+        run_bounded(shell(script), limit, directory.path())
+    }
+
     #[test]
     fn a_command_past_its_deadline_is_killed() {
         let started = Instant::now();
-        let killed = run_bounded(shell("exec sleep 30"), Duration::from_millis(300));
+        let killed = bounded("exec sleep 30", Duration::from_millis(300));
         assert!(matches!(killed, Err(GateFailure::Timeout)));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
     fn a_command_inside_its_deadline_returns_its_output() {
-        let (stdout, stderr) = run_bounded(
-            shell("echo accepted; echo forged >&2"),
+        let run = bounded(
+            "echo accepted; echo forged >&2; exit 3",
             Duration::from_secs(10),
         )
         .expect("output");
-        assert!(stdout.contains("accepted"));
-        assert!(!stdout.contains("forged"), "stderr stays out of stdout");
-        assert!(stderr.contains("forged"));
+        assert!(run.stdout.contains("accepted"));
+        assert!(!run.stdout.contains("forged"), "stderr stays out of stdout");
+        assert!(run.stderr.contains("forged"));
+        assert_eq!(run.status.code(), Some(3));
     }
 
     #[test]
@@ -208,9 +332,177 @@ mod tests {
         let marker = std::env::temp_dir().join(format!("spawn-group-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
         let script = format!("(sleep 2; touch {}) & sleep 30", marker.display());
-        let killed = run_bounded(shell(&script), Duration::from_millis(300));
+        let killed = bounded(&script, Duration::from_millis(300));
         assert!(matches!(killed, Err(GateFailure::Timeout)));
         std::thread::sleep(Duration::from_secs(3));
         assert!(!marker.exists(), "the background child died with the gate");
+    }
+
+    /// A stand-in gate: `body` runs as the gate script, with the usual
+    /// arguments.
+    struct FakeGate {
+        directory: PrivateDirectory,
+    }
+
+    impl FakeGate {
+        fn new(body: &str) -> Self {
+            let directory = PrivateDirectory::create().expect("directory");
+            std::fs::write(directory.path().join("gate.sh"), body).expect("gate");
+            Self { directory }
+        }
+
+        fn judge(&self, env: &[(String, String)]) -> Result<super::Verdict, GateFailure> {
+            let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
+            judge(
+                &path("gate.sh"),
+                Path::new("/nonexistent/repo.git"),
+                "base",
+                "candidate",
+                &path("scenarios"),
+                None,
+                env,
+                Duration::from_secs(20),
+            )
+        }
+    }
+
+    fn path_only() -> Vec<(String, String)> {
+        vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]
+    }
+
+    #[test]
+    fn the_verdict_file_after_a_clean_exit_is_the_verdict() {
+        let gate = FakeGate::new(
+            "echo '| == candidate: build'\n\
+             echo '{\"verdict\":\"accepted\",\"metric\":\"METRIC x candidate=1\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+             echo '{\"verdict\":\"accepted\",\"metric\":\"METRIC x candidate=1\"}'\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert!(verdict.accepted);
+        assert_eq!(verdict.metric.as_deref(), Some("METRIC x candidate=1"));
+        assert_eq!(
+            verdict.output.matches("\"verdict\"").count(),
+            1,
+            "the verdict is recorded once: {}",
+            verdict.output
+        );
+        assert!(verdict.output.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn an_accepted_line_on_stdout_alone_is_no_verdict() {
+        let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}'\n");
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::Aborted { reason, .. }) if reason.contains("no verdict")
+        ));
+    }
+
+    #[test]
+    fn a_killed_gate_is_an_abort_whatever_it_wrote() {
+        // The reviewer's forgery: an accepted verdict everywhere, then
+        // SIGKILL before the gate finishes.
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+             echo '{\"verdict\":\"accepted\"}'\n\
+             kill -9 $$\n",
+        );
+        let Err(GateFailure::Aborted { reason, log }) = gate.judge(&path_only()) else {
+            panic!("a signalled gate must abort");
+        };
+        assert!(reason.contains("signal"), "{reason}");
+        assert!(log.contains("accepted"), "the log keeps what it printed");
+    }
+
+    #[test]
+    fn a_non_zero_exit_is_an_abort() {
+        let gate =
+            FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\nexit 1\n");
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::Aborted { reason, .. }) if reason.contains("exit status: 1")
+        ));
+    }
+
+    #[test]
+    fn the_file_outranks_stdout() {
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"rejected\",\"reason\":\"a \\\"quoted\\\" reason\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+             echo '{\"verdict\":\"accepted\"}'\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert!(!verdict.accepted);
+        assert_eq!(verdict.reason, "a \"quoted\" reason");
+    }
+
+    #[test]
+    fn the_gate_sees_only_the_environment_it_is_given() {
+        // Cargo sets CARGO_PKG_NAME for this test process; the gate must not
+        // inherit it, nor anything else.
+        assert!(std::env::var_os("CARGO_PKG_NAME").is_some());
+        let gate = FakeGate::new(
+            "if [ -n \"${CARGO_PKG_NAME-}\" ] || [ -n \"${SPAWN_DATABASE_URL-}\" ] \
+                 || [ \"$SPAWN_TEST_DATABASE_URL\" != postgres://t@127.0.0.1:15434/spawn_test ]; then\n\
+                 echo '{\"verdict\":\"rejected\",\"reason\":\"leak\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+             else\n\
+                 echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n\
+             fi\n",
+        );
+        let lookup = |name: &str| match name {
+            "PATH" => Some("/usr/bin:/bin".to_string()),
+            "SPAWN_TEST_DATABASE_URL" => {
+                Some("postgres://t@127.0.0.1:15434/spawn_test".to_string())
+            }
+            "SPAWN_DATABASE_URL" => Some("postgres://o@127.0.0.1:15433/spawn".to_string()),
+            _ => None,
+        };
+        let env = gate_env(lookup).expect("env");
+        let verdict = gate.judge(&env).expect("verdict");
+        assert!(verdict.accepted, "{}", verdict.reason);
+    }
+
+    #[test]
+    fn the_allowlist_passes_what_gate_sh_reads_and_nothing_else() {
+        let lookup = |name: &str| match name {
+            "PATH" | "HOME" | "LANG" | "TMPDIR" | "CARGO_HOME" | "RUSTUP_HOME" => {
+                Some(format!("{name}-value"))
+            }
+            "SPAWN_TEST_DATABASE_URL" => Some("postgres://t:p@127.0.0.1:15434/spawn_test".into()),
+            "SPAWN_DATABASE_URL" => Some("postgres://o:p@127.0.0.1:15433/spawn".into()),
+            "SPAWN_JUDGE_URL" | "http_proxy" | "SSH_AUTH_SOCK" => Some("secret".into()),
+            _ => None,
+        };
+        let env = gate_env(lookup).expect("env");
+        let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "PATH",
+                "HOME",
+                "LANG",
+                "TMPDIR",
+                "CARGO_HOME",
+                "RUSTUP_HOME",
+                "SPAWN_TEST_DATABASE_URL"
+            ]
+        );
+        let unset = |name: &str| (name == "PATH").then(|| "/usr/bin".to_string());
+        assert_eq!(
+            gate_env(unset).expect("env").len(),
+            1,
+            "unset names are left out"
+        );
+    }
+
+    #[test]
+    fn a_test_database_that_is_the_owners_is_refused() {
+        let lookup = |name: &str| match name {
+            "SPAWN_TEST_DATABASE_URL" => Some("postgres://other:pw@127.0.0.1:15433/spawn".into()),
+            "SPAWN_DATABASE_URL" => {
+                Some("postgres://owner:pw@127.0.0.1:15433/spawn?sslmode=disable".into())
+            }
+            _ => None,
+        };
+        assert!(gate_env(lookup).is_err());
     }
 }
