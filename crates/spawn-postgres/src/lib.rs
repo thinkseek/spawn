@@ -4,9 +4,8 @@
 //! Every write goes through the SQL functions in `sql/schema.sql`; the
 //! ordering guarantees live there and are shared by every writer.
 //!
-//! Layout: the SQL text lives in `queries`, grouped by responsibility; the
-//! modules below bind its parameters and map its rows (`row` holds the
-//! shared column decoders).
+//! Layout: each module holds its SQL next to the code that binds its
+//! parameters and maps its rows (`row` holds the shared column decoders).
 //!
 //! - `event_log`: the [`EventLog`] port.
 //! - `command_queue`: the [`CommandQueue`] port.
@@ -30,7 +29,6 @@ mod event_log;
 mod fleet;
 mod gateway;
 mod missions;
-mod queries;
 mod row;
 mod rsi;
 mod sessions;
