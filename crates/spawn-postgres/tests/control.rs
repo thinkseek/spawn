@@ -399,6 +399,44 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
     assert_eq!(history[0]["verdict"], "rejected");
     assert_eq!(history[0]["reason"], "scenario fails on the candidate");
 
+    // The RSI page's reads: the open objective mission with its resident and
+    // its tasks' gate verdicts, newest task first.
+    let page = store.objective_missions().expect("objective missions");
+    assert_eq!(page.as_array().map(Vec::len), Some(1));
+    assert_eq!(page[0]["id"], mission);
+    assert_eq!(page[0]["accept"], "gate");
+    assert_eq!(page[0]["resident"]["session_id"], "session_resident_rsi");
+    assert_eq!(page[0]["tasks"][0]["id"], task);
+    assert_eq!(page[0]["tasks"][0]["gates"][0]["verdict"], "rejected");
+    assert_eq!(
+        page[0]["tasks"][0]["gates"][0]["reason"],
+        "scenario fails on the candidate"
+    );
+    assert!(
+        page[0]["tasks"][0]["gates"][0]["log"].is_null(),
+        "no logs in the overview"
+    );
+    assert_eq!(page[0]["tasks"][1]["state"], "landed");
+    assert_eq!(
+        page[0]["tasks"][1]["metric"],
+        "METRIC x baseline=2 candidate=1"
+    );
+    let detail = store
+        .objective_task(task)
+        .expect("one task")
+        .expect("it exists");
+    assert_eq!(detail["mission_id"], mission);
+    assert_eq!(detail["brief"], "brief");
+    assert_eq!(detail["gates"][0]["verdict"], "rejected");
+    assert!(store.objective_task(task + 1000).expect("read").is_none());
+    let board = store.mission_board(10).expect("board");
+    let row = board["missions"][0]["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.iter().find(|row| row["id"] == task))
+        .cloned()
+        .expect("the task on the board");
+    assert_eq!(row["last_gate"]["verdict"], "rejected");
+
     let mut client = admin(&schema);
     let live = tables(&mut client);
     assert_eq!(live["tasks"][1]["agent_id"], "agent_resident_rsi");
@@ -472,4 +510,29 @@ fn a_landing_moves_the_baseline_of_every_mission_on_its_source() {
     );
     refold(&mut client);
     assert_eq!(tables(&mut client), live);
+}
+
+#[test]
+fn one_integrator_holds_the_lock() {
+    let (first, schema) = store("control_integrator_lock");
+    let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
+    assert!(
+        first.integrator_try_lock().expect("lock"),
+        "the first takes it"
+    );
+    assert!(
+        !second.integrator_try_lock().expect("lock"),
+        "the second waits for the first"
+    );
+    drop(first);
+    // The lock dies with its connection; the server notices asynchronously.
+    let mut held = false;
+    for _ in 0..50 {
+        held = second.integrator_try_lock().expect("lock");
+        if held {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(held, "a dead integrator never blocks the next one");
 }
