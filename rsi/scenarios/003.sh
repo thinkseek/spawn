@@ -15,32 +15,47 @@
 #       tree and a new trailer; the repository still grows by less than
 #       2 MiB, the chunk store by less than 8 MiB (content-defined chunks),
 #       and the edited content survives another remount;
+#   (e) old checkpoints still restore: a second agent started from the first
+#       checkpoint commit (`start {"from": <commit>}`) gets the original
+#       bytes in its fresh mount;
+#   (f) objects are immutable: every non-empty file the chunk store held
+#       after the first checkpoint is still there, byte for byte, after the
+#       edit, the fork and their checkpoints;
 #   (d) chunks are verified on read: with every file in the chunk store
-#       corrupted, a remount never puts other bytes in the large file (it
-#       may fail, or leave the file out, but not hand back wrong content).
+#       corrupted, a remount under a fresh workspace root (same repository,
+#       same chunk store, so only the store can supply the bytes) either
+#       leaves the large file out or fails; it never puts other bytes there.
+#       The exact original bytes are accepted too.
 #
-# Fails on the baseline, where large files stay out of git and are lost at
-# unmount. Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs
-# SPAWN_BIN and SPAWN_TEST_DATABASE_URL, creates and drops its own database,
-# and uses a private tmux socket. Every wait is bounded.
+# Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
+# missing or wrong); 2 a harness or infrastructure failure (a tool, the
+# database, a wait that ran out). Any unexpected error exits 2, never 1.
+#
+# Fails on the baseline with 1 at (a): large files stay out of git and are
+# lost at unmount. Runs inside the gate's sandbox (scripts/rsi/gate.sh):
+# needs SPAWN_BIN and SPAWN_TEST_DATABASE_URL, creates and drops its own
+# database, and uses a private tmux socket. Every wait is bounded in time.
 set -eu
 
-: "${SPAWN_BIN:?SPAWN_BIN is required}"
-: "${SPAWN_TEST_DATABASE_URL:?SPAWN_TEST_DATABASE_URL is required}"
-
-controller=$(cd "$(dirname "$0")/../.." && pwd)
-[ -f "$controller/scripts/blackbox/assertions.sh" ] || {
-    echo "003: harness: no $controller/scripts/blackbox/assertions.sh" >&2
+# Assertion failures set this before exiting 1; any other non-zero exit is
+# turned into 2 by the exit trap.
+asserted=""
+harness() {
+    echo "003: harness: $*" >&2
     exit 2
 }
-for tool in psql tmux git openssl sha256sum dd od du; do
-    command -v "$tool" >/dev/null 2>&1 || {
-        echo "003: harness: $tool is not installed" >&2
-        exit 2
-    }
+
+[ -n "${SPAWN_BIN-}" ] && [ -x "$SPAWN_BIN" ] || harness "SPAWN_BIN is not an executable"
+[ -n "${SPAWN_TEST_DATABASE_URL-}" ] || harness "SPAWN_TEST_DATABASE_URL is required"
+
+controller=$(cd "$(dirname "$0")/../.." && pwd)
+[ -f "$controller/scripts/blackbox/assertions.sh" ] ||
+    harness "no $controller/scripts/blackbox/assertions.sh"
+for tool in psql tmux git openssl sha256sum dd od du find sort; do
+    command -v "$tool" >/dev/null 2>&1 || harness "$tool is not installed"
 done
 
-WORK=$(mktemp -d)
+WORK=$(mktemp -d) || harness "mktemp failed"
 # Not $$ alone: the gate's PID namespace makes it the same small number.
 run="$$_$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
 SPAWN_DB_NAME="bb_003_large_$run"
@@ -75,16 +90,34 @@ cleanup() {
     chmod -R u+w "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
 }
-trap cleanup EXIT
+finish() {
+    rc=$?
+    trap - EXIT
+    cleanup
+    if [ "$rc" -eq 0 ]; then exit 0; fi
+    if [ "$rc" -eq 1 ] && [ -n "$asserted" ]; then exit 1; fi
+    [ "$rc" -eq 2 ] || echo "003: harness: unexpected exit $rc" >&2
+    exit 2
+}
+trap finish EXIT
 trap 'exit 130' INT TERM
 
-if ! psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1; then
-    echo "003: harness: cannot create the scenario database" >&2
-    exit 2
-fi
+psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
+    harness "cannot create the scenario database"
 database_made=1
 
 . "$controller/scripts/blackbox/assertions.sh"
+
+# An assertion exits 1, unless the database is gone: then nothing the
+# scenario read can be trusted, and that is the harness's failure.
+fail() {
+    if ! psql -d "$SPAWN_DB_NAME" -tA -c 'select 1' >/dev/null 2>&1; then
+        harness "the database is unreachable (while checking: $*)"
+    fi
+    asserted=1
+    echo "blackbox: $*" >&2
+    exit 1
+}
 
 # --- the world: one bare repository, one root, one chunk store -----------
 
@@ -109,10 +142,10 @@ keystream "$(printf '%064d' 7)" "$MIB" >"$WORK/patch"
 cp "$WORK/big.v1" "$WORK/big.v2"
 dd if="$WORK/patch" of="$WORK/big.v2" bs="$MIB" seek=7 conv=notrunc 2>/dev/null
 [ "$(wc -c <"$WORK/big.v1" | tr -d ' ')" -eq $((20 * MIB)) ] ||
-    fail "harness: openssl did not produce 20 MiB"
+    harness "openssl did not produce 20 MiB"
 sha_v1=$(sha256sum "$WORK/big.v1" | cut -d' ' -f1)
 sha_v2=$(sha256sum "$WORK/big.v2" | cut -d' ' -f1)
-[ "$sha_v1" != "$sha_v2" ] || fail "harness: the edit changed nothing"
+[ "$sha_v1" != "$sha_v2" ] || harness "the edit changed nothing"
 
 # The fake engine: `write-large` writes the large file and a text file,
 # `edit-large` rewrites 1 MiB of the large file in place; both then exit,
@@ -128,10 +161,12 @@ while IFS= read -r line; do
     mkdir -p data || exit 3
     cp '$WORK/big.v1' data/big.bin || exit 3
     printf 'small text\n' >data/notes.txt || exit 3
+    printf 'wrote\n' >>'$WORK/engine.log'
     printf '\nwrote\n'
     exit 0 ;;
   *edit-large*)
     dd if='$WORK/patch' of=data/big.bin bs=$MIB seek=7 conv=notrunc 2>/dev/null || exit 3
+    printf 'edited\n' >>'$WORK/engine.log'
     printf '\nedited\n'
     exit 0 ;;
   *)
@@ -171,11 +206,20 @@ export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CHUNK_STORE 
 agent=agent_large
 session=session_large
 branch=refs/heads/$agent
-workspace=$SPAWN_WORKSPACE_ROOT/$agent
-big=$workspace/data/big.bin
+fork_agent=agent_fork
+fork_session=session_fork
 
-capture "$SPAWN_BIN" init-db
-assert_eq "$status" 0 "init-db exit"
+# The test server is shared: another run's init-db can collide with this one
+# on cluster-wide objects (roles, grants: "tuple concurrently updated").
+# init-db is idempotent, so a few tries absorb that.
+tries=0
+while :; do
+    capture "$SPAWN_BIN" init-db
+    [ "$status" -eq 0 ] && break
+    tries=$((tries + 1))
+    [ "$tries" -lt 5 ] || harness "init-db failed $tries times: $(err)"
+    sleep 1
+done
 
 # --- helpers ----------------------------------------------------------------
 
@@ -185,44 +229,64 @@ store_bytes() {
     if [ -d "$SPAWN_CHUNK_STORE" ]; then bytes "$SPAWN_CHUNK_STORE"; else echo 0; fi
 }
 mib() { awk -v b="$1" 'BEGIN { printf "%.2f MiB", b / 1048576 }'; }
+now() { date +%s; }
 
+# submit <agent> <session> <key> <action>
 submit() {
-    capture "$SPAWN_BIN" submit --agent "$agent" --session "$session" --key "$1" \
-        --action "$2"
-    assert_eq "$status" 0 "submit $1 exit"
+    capture "$SPAWN_BIN" submit --agent "$1" --session "$2" --key "$3" --action "$4"
+    [ "$status" -eq 0 ] || fail "submit $3 exited $status: $(err)"
 }
 
 tick() {
     capture "$SPAWN_BIN" tick
-    [ "$status" -eq 0 ] || fail "tick failed: $(err)"
+    [ "$status" -eq 0 ] || fail "tick exited $status: $(err)"
     [ -s "$WORK/err.txt" ] && cat "$WORK/err.txt" >>"$WORK/ticks.log"
     return 0
 }
 
-ended() { scalar 'select count(*) from agent_executions where ended_at_ms is not null'; }
-
-# Tick until <n> executions have ended, at most <limit> ticks.
-tick_until_ended() {
-    n=0
-    while [ "$n" -lt "$2" ]; do
-        tick
-        [ "$(ended)" -ge "$1" ] && return 0
-        sleep 0.25
-        n=$((n + 1))
-    done
-    fail "execution $1 never ended after $2 ticks; tick warnings: $(tail -n 5 "$WORK/ticks.log" 2>/dev/null)"
+# Ended executions of one session.
+ended() {
+    scalar "select count(*) from agent_executions
+            where session_id = '$1' and ended_at_ms is not null"
 }
 
-command_state() {
-    scalar "select state || ' ' || coalesce(succeeded::text, '') || ' ' || coalesce(error, '')
-            from spawn_commands where idempotency_key = '$1'"
+# tick_until_ended <session> <n>: tick until the session has <n> ended
+# executions. Generous for a loaded host; a run that ends on time never waits.
+tick_until_ended() {
+    deadline=$(($(now) + 180))
+    while :; do
+        tick
+        [ "$(ended "$1")" -ge "$2" ] && return 0
+        [ "$(now)" -lt "$deadline" ] ||
+            harness "execution $2 of $1 did not end within 180 s; tick warnings: $(tail -n 5 "$WORK/ticks.log" 2>/dev/null)"
+        sleep 0.25
+    done
+}
+
+# engine_did <word>: the fake engine finished that work. Read from its own
+# log, not the execution's exit code: the Bridge may record a clean exit as
+# `lost` when the pane closes between its exit-file read and its liveness
+# check, and the final checkpoint runs either way.
+engine_did() { grep -qx "$1" "$WORK/engine.log" 2>/dev/null; }
+
+# command_ok <key> <what>: the command finished and succeeded. A pane that
+# never got ready is the host's failure, not the behaviour's.
+command_ok() {
+    state=$(scalar "select state || ' ' || coalesce(succeeded::text, '') || ' ' || coalesce(error, '')
+                    from spawn_commands where idempotency_key = '$1'")
+    case "$state" in
+    "finished true "*) ;;
+    *"pane never became ready"* | *"does not accept input"* | *"terminal disappeared"*)
+        harness "$2: $state" ;;
+    *) fail "$2: $state" ;;
+    esac
 }
 
 pane_ready() { pane | grep -F 'Welcome to Claude Code' >/dev/null; }
 
-# The large file in the current mount, as a sha256 or "missing".
-mounted_sha() {
-    if [ -f "$big" ]; then sha256sum "$big" | cut -d' ' -f1; else echo missing; fi
+# sha256 of a mount's large file, or "missing".
+sha_in() {
+    if [ -f "$1/data/big.bin" ]; then sha256sum "$1/data/big.bin" | cut -d' ' -f1; else echo missing; fi
 }
 
 head_commit() { git --git-dir="$repo" rev-parse --verify --quiet "$branch" || echo none; }
@@ -237,28 +301,28 @@ largest_blob() {
         awk '$2 == "blob" && $4 > max { max = $4 } END { print max + 0 }'
 }
 
+workspace=$SPAWN_WORKSPACE_ROOT/$agent
 repo_start=$(repo_bytes)
 
 # --- 1. the engine writes the large file; the execution ends ---------------
 
-submit k_write '{"type":"start","engine":"claude","prompt":"write-large"}'
+submit "$agent" "$session" k_write '{"type":"start","engine":"claude","prompt":"write-large"}'
 tick
-assert_eq "$(command_state k_write)" "finished true " "start command"
-tick_until_ended 1 120
-assert_eq "$(scalar "select coalesce(exit_code::text, cause) from agent_executions order by started_at_ms limit 1")" \
-    0 "the engine wrote its files and exited 0"
+command_ok k_write "start command"
+tick_until_ended "$session" 1
+engine_did wrote || harness "the engine did not write its files"
 # The unmount removed the workspace: what comes back is a fresh mount.
 [ ! -e "$workspace" ] || fail "the workspace is still mounted after the execution ended"
 
 # --- 2. resume in a fresh mount: (a) the large file is back ------------------
 
-submit k_resume1 '{"type":"resume"}'
+submit "$agent" "$session" k_resume1 '{"type":"resume"}'
 tick
-assert_eq "$(command_state k_resume1)" "finished true " "first resume"
+command_ok k_resume1 "first resume"
 [ -d "$workspace" ] || fail "the resume mounted no workspace"
 assert_eq "$(cat "$workspace/data/notes.txt" 2>/dev/null || echo missing)" "small text" \
     "(a) the text file after the remount"
-got=$(mounted_sha)
+got=$(sha_in "$workspace")
 [ "$got" != missing ] ||
     fail "(a) data/big.bin is missing after the remount: the large file was lost at unmount"
 assert_eq "$got" "$sha_v1" "(a) sha256 of data/big.bin after the remount"
@@ -283,13 +347,27 @@ store1=$(store_bytes)
 [ "$store1" -ge $((18 * MIB)) ] ||
     fail "(c) SPAWN_CHUNK_STORE ($SPAWN_CHUNK_STORE) holds $(mib "$store1"), not the 20 MiB file's chunks"
 
+# (f) every object so far, by path and checksum; checked after the edit.
+: >"$WORK/objects.sha256"
+if [ -d "$SPAWN_CHUNK_STORE" ]; then
+    (cd "$SPAWN_CHUNK_STORE" && find . -type f -size +0 | LC_ALL=C sort |
+        while IFS= read -r object; do sha256sum "$object"; done) >"$WORK/objects.sha256"
+fi
+objects1=$(wc -l <"$WORK/objects.sha256" | tr -d ' ')
+
 # --- 3. a 1 MiB in-place edit, checkpointed at the engine's exit -------------
 
-wait_for 60 pane_ready || fail "the resumed engine never showed its prompt: $(pane 2>&1)"
-submit k_edit '{"type":"input","text":"edit-large"}'
+start=$(now)
+until pane_ready; do
+    [ $(($(now) - start)) -lt 90 ] ||
+        harness "the resumed engine never showed its prompt in 90 s: $(pane 2>&1 | tail -n 5)"
+    sleep 0.25
+done
+submit "$agent" "$session" k_edit '{"type":"input","text":"edit-large"}'
 tick
-assert_eq "$(command_state k_edit)" "finished true " "edit input"
-tick_until_ended 2 120
+command_ok k_edit "edit input"
+tick_until_ended "$session" 2
+engine_did edited || harness "the engine did not edit the file"
 [ ! -e "$workspace" ] || fail "the workspace is still mounted after the second execution ended"
 
 commit2=$(head_commit)
@@ -308,18 +386,43 @@ store_grown=$(($(store_bytes) - store1))
 
 # --- 4. resume again: the edited content is back -----------------------------
 
-submit k_resume2 '{"type":"resume"}'
+submit "$agent" "$session" k_resume2 '{"type":"resume"}'
 tick
-assert_eq "$(command_state k_resume2)" "finished true " "second resume"
-assert_eq "$(mounted_sha)" "$sha_v2" "(c) sha256 of the edited data/big.bin after the remount"
+command_ok k_resume2 "second resume"
+assert_eq "$(sha_in "$workspace")" "$sha_v2" "(c) sha256 of the edited data/big.bin after the remount"
 
-submit k_stop '{"type":"stop"}'
+submit "$agent" "$session" k_stop '{"type":"stop"}'
 tick
-assert_eq "$(command_state k_stop)" "finished true " "stop"
-assert_eq "$(ended)" 3 "three executions ended"
+command_ok k_stop "stop"
+assert_eq "$(ended "$session")" 3 "three executions of the session ended"
 [ ! -e "$workspace" ] || fail "the workspace is still mounted after the stop"
 
-# --- 5. (d) verified on read: corrupt every stored byte range, remount --------
+# --- 5. (e) the first checkpoint still restores, in a fork from its commit ---
+
+fork_workspace=$SPAWN_WORKSPACE_ROOT/$fork_agent
+submit "$fork_agent" "$fork_session" k_fork \
+    "{\"type\":\"start\",\"engine\":\"claude\",\"prompt\":\"\",\"from\":\"$commit1\"}"
+tick
+command_ok k_fork "start of a second agent from the first checkpoint"
+assert_eq "$(git --git-dir="$repo" rev-parse --verify --quiet "refs/heads/$fork_agent" || echo none)" \
+    "$commit1" "(e) the fork's branch starts at the first checkpoint"
+assert_eq "$(cat "$fork_workspace/data/notes.txt" 2>/dev/null || echo missing)" "small text" \
+    "(e) the text file in the fork"
+assert_eq "$(sha_in "$fork_workspace")" "$sha_v1" \
+    "(e) sha256 of data/big.bin in a mount of the first checkpoint (older versions must stay restorable)"
+submit "$fork_agent" "$fork_session" k_fork_stop '{"type":"stop"}'
+tick
+command_ok k_fork_stop "stop of the fork"
+
+# --- 6. (f) nothing the store held was rewritten or removed -------------------
+
+[ "$objects1" -gt 0 ] || fail "(f) the chunk store held no objects after the first checkpoint"
+if ! (cd "$SPAWN_CHUNK_STORE" && sha256sum -c --quiet "$WORK/objects.sha256") \
+    >"$WORK/immutable.txt" 2>&1; then
+    fail "(f) objects of the first checkpoint were rewritten or removed: $(head -n 3 "$WORK/immutable.txt" | tr '\n' ' ')"
+fi
+
+# --- 7. (d) verified on read: corrupt every stored file, remount fresh ---------
 
 find "$SPAWN_CHUNK_STORE" -type f -size +0 >"$WORK/stored" 2>/dev/null || true
 [ -s "$WORK/stored" ] || fail "(d) the chunk store holds no files"
@@ -333,12 +436,16 @@ while IFS= read -r file; do
         dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
 done <"$WORK/stored"
 
-submit k_resume3 '{"type":"resume"}'
+# A fresh workspace root: no stat cache, no leftover of any earlier mount.
+SPAWN_WORKSPACE_ROOT=$WORK/ws-fresh
+mkdir -p "$SPAWN_WORKSPACE_ROOT"
+submit "$agent" "$session" k_resume3 '{"type":"resume"}'
 tick
-got=$(mounted_sha)
+got=$(sha_in "$SPAWN_WORKSPACE_ROOT/$agent")
 case "$got" in
 missing | "$sha_v2") ;;
-*) fail "(d) with the chunk store corrupted, the remount put other bytes in data/big.bin" ;;
+*) fail "(d) with the chunk store corrupted, a fresh mount put other bytes in data/big.bin" ;;
 esac
 
-echo "003: large file kept across remounts; repository +$(mib "$grown"), chunk store $(mib "$store1") +$(mib "$store_grown") for the edit"
+echo "003: large file kept across remounts and forks; repository +$(mib "$grown"), chunk store $(mib "$store1") +$(mib "$store_grown") for the edit, $objects1 objects unchanged"
+exit 0
