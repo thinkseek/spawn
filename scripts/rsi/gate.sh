@@ -174,8 +174,8 @@ bound() {
     old_ifs=$IFS
     IFS='
 '
-    for root in $home_binds; do
-        case "$1" in "$root" | "$root"/*)
+    for bound_root in $home_binds; do
+        case "$1" in "$bound_root" | "$bound_root"/*)
             IFS=$old_ifs
             return 0
             ;;
@@ -192,6 +192,9 @@ for tool in $home_tools; do
     under_home "$real" || continue
     root=$(dirname "$real")
     [ "$(basename "$root")" = bin ] && root=$(dirname "$root")
+    # A plain file in ~/bin or ~/.local/bin: that file, not the directory
+    # above it.
+    case "$root" in "$HOME" | "$HOME/.local") root=$real ;; esac
     bound "$real" || bind_home "$root"
     if [ "$found" != "$real" ] && under_home "$found" && ! bound "$found"; then
         home_links="$home_links$real|$found
