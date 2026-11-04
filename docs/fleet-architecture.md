@@ -221,7 +221,7 @@ Rules for the session itself:
   submitted or an event about it, so a handoff can always be rebuilt.
 - Its uptime, restarts, resumes and handoffs are first-class facts in the UI.
 
-### 3.2 Missions, tasks and workers (proposal, under discussion)
+### 3.2 Missions, tasks and workers (agreed 2026-11-04, not built yet)
 
 Spawn works for missions, not repositories. A repository is just one possible
 input of a mission.
@@ -407,11 +407,36 @@ One loop, end to end, before anything else:
 5. Experience views, `spawn corpus export`, replay commands.
 6. RSI objectives over the corpus (rules coverage first), replacing the ingest-speed demo objective.
 
-## 9. Open questions
+## 9. Decisions on §3.2 (2026-11-04)
 
-1. Who defines residents: charters written by a human, or proposed and
-   created by the supervisor (with or without human approval)?
-2. How does a worker report: a report file in its workspace, or its final
-   message?
-3. Limits on the supervisor's authority: concurrent workers, residents, cost.
-4. May a human talk to a worker directly, or only through the supervisor?
+1. Residents: the supervisor proposes a resident and its charter; it starts
+   only after a human approves. The approval is a stored command with
+   principal `human`.
+2. Reports: a worker ends by writing `.spawn/report.md` (outcome, what
+   changed, open issues). The Bridge stores it as part of the task; the
+   supervisor reads the report, not the transcript.
+3. Human to worker: allowed directly. The message is delivered and recorded,
+   and the supervisor gets a one-line summary in its next digest.
+4. Limits: none fixed. The supervisor decides fleet size; humans stop what
+   overreaches, and the UI shows live workers and spend.
+
+### 9.1 Build order for §3.2
+
+1. Mission inbox: `mission_*` tables, `spawn mission add` (principal human),
+   a "new mission" digest to the supervisor, missions in `spawn fleet` and
+   the UI.
+2. Tasks: `spawn task assign --mission --kind resident|ephemeral --worker
+   --brief` for the supervisor (checked like the gateway), creating the task
+   record and its delivery atomically; the dispatcher delivers, keeps one
+   task in flight per worker, collects `.spawn/report.md` and digests reports.
+   The dispatcher's own judgement-free rules (resume, nudge, escalate) stay.
+3. Worker lifecycles: generalize the supervisor's liveness rule to residents
+   (resumed after outages, a stop respected); ephemeral workers end when the
+   supervisor accepts their report.
+4. Resident proposals: `spawn resident propose --name --charter` by the
+   supervisor, `spawn resident approve` by a human; charters stored and given
+   to the resident at every start and handoff.
+5. Mission sources: per-worker workspaces from the mission's sources (any
+   git repository, files, or none) instead of one `SPAWN_GIT_REPO`.
+6. e2e: extend `scripts/mvp-e2e.sh` with a mission that the supervisor splits
+   into a resident task and an ephemeral task, both reporting back.
