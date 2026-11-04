@@ -72,7 +72,7 @@ impl PostgresStore {
         let client = Client::connect(url, NoTls).map_err(|error| backend(&error))?;
         Ok(Self {
             client: Mutex::new(client),
-            password: url_password(url).to_string(),
+            password: url_password(url),
         })
     }
 
@@ -116,24 +116,49 @@ impl PostgresStore {
             .batch_execute(SCHEMA)
             .map_err(|error| backend(&error))?;
         for role in LOGINS {
-            // Hex only, so the literal needs no quoting beyond the quotes.
-            let password = role_password(&self.password, role);
+            // No owner password (peer or trust login, PGPASSWORD): a password
+            // derived from "" would be a constant anyone can compute, so the
+            // logins get none and cannot log in with one.
+            let password = if self.password.is_empty() {
+                "null".to_string()
+            } else {
+                // Hex only, so the literal needs no quoting beyond the quotes.
+                format!("'{}'", role_password(&self.password, role))
+            };
             client
-                .batch_execute(&format!(
-                    "alter role {role} with login password '{password}'"
-                ))
+                .batch_execute(&format!("alter role {role} with login password {password}"))
                 .map_err(|error| backend(&error))?;
         }
         Ok(())
     }
 }
 
-/// The password part of a `scheme://user:password@host/...` URL, or "".
-fn url_password(url: &str) -> &str {
-    url.split_once("://")
+/// The password part of a `scheme://user:password@host/...` URL, decoded
+/// (`%40` is `@`), or "": every spelling of one password derives the same
+/// login passwords.
+fn url_password(url: &str) -> String {
+    let raw = url
+        .split_once("://")
         .and_then(|(_, rest)| rest.rsplit_once('@'))
         .and_then(|(userinfo, _)| userinfo.split_once(':'))
-        .map_or("", |(_, password)| password)
+        .map_or("", |(_, password)| password);
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut rest = raw.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        let escaped = (byte == b'%')
+            .then(|| tail.get(..2))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        if let Some(decoded) = escaped {
+            bytes.push(decoded);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// The password of one restricted login: SHA-256 over the owner's password
@@ -154,14 +179,24 @@ fn role_password(owner_password: &str, role: &str) -> String {
 /// the login's privileges; its password keeps anyone who lacks the owner's
 /// credentials from using it, which matters once the database is reachable
 /// from elsewhere.
-#[must_use]
-pub fn role_url(owner: &str, role: &str) -> String {
-    let Some((scheme, rest)) = owner.split_once("://") else {
-        return owner.to_string();
+///
+/// # Errors
+///
+/// When the owner's URL is not `scheme://...` or carries no password: the
+/// logins' passwords derive from it, and from nothing they would be public.
+pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
+    let password = url_password(owner);
+    let Some((scheme, rest)) = owner.split_once("://").filter(|_| !password.is_empty()) else {
+        return Err(format!(
+            "{role}: the database URL must be scheme://user:password@host/... \
+             (the restricted logins' passwords derive from the owner's)"
+        ));
     };
     let host = rest.rsplit_once('@').map_or(rest, |(_, tail)| tail);
-    let password = role_password(url_password(owner), role);
-    format!("{scheme}://{role}:{password}@{host}")
+    Ok(format!(
+        "{scheme}://{role}:{}@{host}",
+        role_password(&password, role)
+    ))
 }
 
 /// Statement parameters, as the driver takes them.
@@ -200,5 +235,34 @@ impl PostgresStore {
         self.lock()
             .execute(sql, params)
             .map_err(|error| backend(&error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{role_url, url_password};
+
+    #[test]
+    fn every_spelling_of_the_owner_password_derives_the_same_logins() {
+        assert_eq!(url_password("postgres://o:p%40ss@h/db"), "p@ss");
+        assert_eq!(url_password("postgres://o:p@ss@h/db"), "p@ss");
+        assert_eq!(
+            role_url("postgres://o:p%40ss@h:5432/db", "spawn_reader"),
+            role_url("postgres://o:p@ss@h:5432/db", "spawn_reader")
+        );
+        assert_eq!(
+            url_password("postgres://o:100%@h/db"),
+            "100%",
+            "a stray % stays"
+        );
+    }
+
+    #[test]
+    fn no_owner_password_means_no_login_url() {
+        assert!(role_url("postgres://spawn@localhost/spawn", "spawn_reader").is_err());
+        assert!(role_url("host=/run/postgresql dbname=spawn", "spawn_reader").is_err());
+        let url = role_url("postgres://o:pw@h:1/db?sslmode=disable", "spawn_reader").unwrap();
+        assert!(url.starts_with("postgres://spawn_reader:"));
+        assert!(url.ends_with("@h:1/db?sslmode=disable"));
     }
 }

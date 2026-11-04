@@ -140,6 +140,10 @@ pub struct Launch {
     pub environment: Vec<(String, String)>,
 }
 
+/// The most bytes one [`TerminalHost::read_from`] returns: a file an agent
+/// writes cannot make the Bridge hold an unbounded buffer.
+pub const READ_LIMIT: usize = 8 << 20;
+
 /// Named interactive terminals.
 pub trait TerminalHost: Send + Sync {
     /// Start a detached terminal that runs the launch.
@@ -181,9 +185,12 @@ pub trait TerminalHost: Send + Sync {
     ) -> Result<String, TerminalError>;
 
     /// The bytes of the file at `path`, as the terminal's process sees it,
-    /// from byte `offset` to the end; `None` when there is no such file.
-    /// How the Bridge follows what an engine writes (its transcript, the
-    /// runner's exit status) without the engine reporting anything itself.
+    /// from byte `offset`, at most [`READ_LIMIT`] of them; `None` when there
+    /// is no such file. How the Bridge follows what an engine writes (its
+    /// transcript, the runner's exit status) without the engine reporting
+    /// anything itself. The agent controls these paths: anything but a
+    /// regular file (a FIFO, a device, a symlink) is an error, and a read
+    /// must never block.
     fn read_from(
         &self,
         workspace: &WorkspaceId,

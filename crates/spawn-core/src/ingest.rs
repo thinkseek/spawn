@@ -50,12 +50,29 @@ fn text_of(value: &Value) -> String {
     }
 }
 
-/// Milliseconds since the epoch of an RFC 3339 UTC time such as
-/// `2026-11-04T05:46:12.345Z`, the form Claude Code writes.
+/// A time with a `+HH:MM`/`-HH:MM` zone: the time without it, and the
+/// zone's offset from UTC in milliseconds.
+fn numeric_zone(text: &str) -> Option<(&str, i64)> {
+    let split = text.len().checked_sub(6)?;
+    let (text, zone) = (text.get(..split)?, text.get(split..)?);
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let (hours, minutes) = zone.get(1..)?.split_once(':')?;
+    let minutes = hours.parse::<i64>().ok()? * 60 + minutes.parse::<i64>().ok()?;
+    Some((text, sign * minutes * 60_000))
+}
+
+/// Milliseconds since the epoch of an RFC 3339 time such as
+/// `2026-11-04T05:46:12.345Z` (the form Claude Code writes) or one with a
+/// numeric offset, `2026-11-04T13:46:12.345+08:00`.
 pub fn utc_ms(text: &str) -> Option<i64> {
-    let text = text
-        .strip_suffix('Z')
-        .or_else(|| text.strip_suffix("+00:00"))?;
+    let (text, offset_ms) = match text.strip_suffix('Z') {
+        Some(text) => (text, 0),
+        None => numeric_zone(text)?,
+    };
     let (date, time) = text.split_once('T')?;
     let mut date = date.splitn(3, '-').map(str::parse::<i64>);
     let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
@@ -77,7 +94,7 @@ pub fn utc_ms(text: &str) -> Option<i64> {
     let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146_097 + day_of_era - 719_468;
-    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis)
+    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis - offset_ms)
 }
 
 fn block_type(block: &Value) -> Option<&str> {
@@ -160,8 +177,11 @@ pub fn claude_line(line: &str, since_ms: i64) -> Vec<Normalized> {
         return Vec::new();
     };
     let field = |name: &str| value.get(name).and_then(Value::as_str);
+    // A line older than the execution is an earlier execution's (a resumed
+    // session appends to the same file). A line whose time cannot be read is
+    // kept, not dropped: its `uuid` key stops a second append if it was.
     let written = field("timestamp").and_then(utc_ms);
-    if written.is_none_or(|at| at < since_ms)
+    if written.is_some_and(|at| at < since_ms)
         || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
     {
         return Vec::new();
@@ -323,6 +343,32 @@ mod tests {
         assert_eq!(utc_ms("2000-03-01T00:00:01.5Z"), Some(951_868_801_500));
         assert_eq!(utc_ms("2026-11-04T05:46:12.345Z"), Some(1_793_771_172_345));
         assert_eq!(utc_ms("2026-11-04 05:46:12"), None);
+        // A numeric offset names the same instant.
+        assert_eq!(
+            utc_ms("2026-11-04T13:46:12.345+08:00"),
+            Some(1_793_771_172_345)
+        );
+        assert_eq!(
+            utc_ms("2026-11-04T00:46:12.345-05:00"),
+            Some(1_793_771_172_345)
+        );
+        assert_eq!(
+            utc_ms("2026-11-04T05:46:12.345+00:00"),
+            Some(1_793_771_172_345)
+        );
+    }
+
+    #[test]
+    fn a_line_whose_time_cannot_be_read_is_kept() {
+        let untimed = r#"{"type":"user","uuid":"u9","message":{"content":"fix it"}}"#;
+        assert_eq!(
+            claude_line(untimed, 1_793_771_172_346).len(),
+            1,
+            "kept, not judged older than the execution"
+        );
+        let odd =
+            r#"{"type":"user","uuid":"u9","timestamp":"yesterday","message":{"content":"x"}}"#;
+        assert_eq!(claude_line(odd, 1_793_771_172_346).len(), 1);
     }
 
     fn kinds(line: &str) -> Vec<(String, Option<String>)> {

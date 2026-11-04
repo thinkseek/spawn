@@ -23,7 +23,7 @@ use crate::event::{
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use crate::ingest::{claude_line, codex_line};
 use crate::port::{
-    CommandQueue, Commit, EventLog, Launch, StoreError, TerminalHost, WorkspaceError,
+    CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError, TerminalHost, WorkspaceError,
     WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
@@ -134,8 +134,11 @@ struct Follow {
     seen: Option<ScreenState>,
     /// When this Bridge first followed the execution, by its own clock.
     first_seen: Option<i64>,
-    /// The engine's file is missing after the start grace; warned once.
+    /// The engine's file is missing after the start grace, or unreadable;
+    /// warned once.
     warned: bool,
+    /// The runner's exit file is unreadable; warned once.
+    exit_warned: bool,
 }
 
 /// What the Bridge knows about one session.
@@ -361,7 +364,10 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         self.follow_output(agent_id, session, native, active, report)?;
-        let end = match active.reported_end.or_else(|| self.exit_status(active)) {
+        let end = match active
+            .reported_end
+            .or_else(|| self.exit_status(session, active, report))
+        {
             Some(end) => Some(end),
             None => match self.terminals.is_alive(&active.terminal, &active.workspace) {
                 Ok(true) => {
@@ -389,11 +395,29 @@ impl Bridge {
     }
 
     /// The exit status the runner wrote when the engine exited, if it has.
-    fn exit_status(&self, active: &Active) -> Option<(EndCause, Option<i32>)> {
-        let bytes = self
+    /// An unreadable file (not a regular file, a host error) is warned once
+    /// and the engine counts as running: the pane's liveness still ends it.
+    fn exit_status(
+        &self,
+        session: &SessionId,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) -> Option<(EndCause, Option<i32>)> {
+        let bytes = match self
             .terminals
             .read_from(&active.workspace, &exit_file(active), 0)
-            .ok()??;
+        {
+            Ok(bytes) => bytes?,
+            Err(error) => {
+                if !active.follow.exit_warned {
+                    active.follow.exit_warned = true;
+                    report
+                        .warnings
+                        .push(format!("{session}: exit file: {error}"));
+                }
+                return None;
+            }
+        };
         let text = String::from_utf8_lossy(&bytes);
         Some((EndCause::Exited, text.trim().parse().ok()))
     }
@@ -436,11 +460,25 @@ impl Bridge {
                 return Ok(());
             }
             Err(error) => {
-                report.warnings.push(format!("read {path}: {error}"));
+                if !active.follow.warned {
+                    active.follow.warned = true;
+                    report
+                        .warnings
+                        .push(format!("{session}: read {path}: {error}"));
+                }
                 return Ok(());
             }
         };
         let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+            // A full read without a newline is one line longer than the
+            // limit: skip what was read rather than stall on it forever (the
+            // rest of it parses as nothing).
+            if bytes.len() >= READ_LIMIT {
+                active.follow.offset += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                report.warnings.push(format!(
+                    "{session}: skipped a line over {READ_LIMIT} bytes in {path}"
+                ));
+            }
             return Ok(());
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {

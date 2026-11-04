@@ -77,19 +77,22 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     // engine does from its files and screen. The supervisor's pane gets its
     // own login: it reads the fleet and commands workers through the
     // gateway, nothing more.
-    config.session_environment.push((
-        supervise::SUPERVISOR_SESSION.to_string(),
-        vec![
-            (
-                "SPAWN_DATABASE_URL".to_string(),
-                spawn_postgres::role_url(
-                    &required_env("SPAWN_DATABASE_URL")?,
-                    crate::supervise::SUPERVISOR_PRINCIPAL,
-                ),
-            ),
-            ("SPAWN_GATEWAY".to_string(), "1".to_string()),
-        ],
-    ));
+    // Without an owner password there is no supervisor login to hand out:
+    // fatal on a supervised host, irrelevant elsewhere.
+    match spawn_postgres::role_url(
+        &required_env("SPAWN_DATABASE_URL")?,
+        crate::supervise::SUPERVISOR_PRINCIPAL,
+    ) {
+        Ok(url) => config.session_environment.push((
+            supervise::SUPERVISOR_SESSION.to_string(),
+            vec![
+                ("SPAWN_DATABASE_URL".to_string(), url),
+                ("SPAWN_GATEWAY".to_string(), "1".to_string()),
+            ],
+        )),
+        Err(error) if crate::config::supervised() => return Err(error),
+        Err(_) => {}
+    }
     Ok(config)
 }
 

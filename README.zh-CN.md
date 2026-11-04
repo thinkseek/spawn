@@ -35,7 +35,8 @@ cargo install --path crates/spawn-cli
 安装 schema：
 
 ```bash
-export SPAWN_DATABASE_URL=postgres://spawn@localhost/spawn
+# 必须带密码：受限登录（supervisor、看板）的密码由它派生；没有密码时它们无法登录。
+export SPAWN_DATABASE_URL=postgres://spawn:PASSWORD@localhost/spawn
 spawn init-db
 ```
 

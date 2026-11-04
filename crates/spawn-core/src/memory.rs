@@ -18,7 +18,7 @@ use crate::id::{
     WorkspaceId,
 };
 use crate::port::{
-    CommandQueue, Commit, EventLog, Launch, StoreError, TerminalError, TerminalHost,
+    CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError, TerminalError, TerminalHost,
     WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
@@ -420,7 +420,7 @@ impl TerminalHost for MemoryStore {
             let start = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(bytes.len());
-            bytes[start..].to_vec()
+            bytes[start..bytes.len().min(start.saturating_add(READ_LIMIT))].to_vec()
         }))
     }
 
