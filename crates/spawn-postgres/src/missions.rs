@@ -1,4 +1,5 @@
-//! Missions, tasks and residents (docs/fleet-architecture.md §3.2).
+//! Missions, tasks and residents (docs/fleet-architecture.md §3.2), and
+//! the integrator's lock (§10.3).
 //!
 //! Every decision goes through the checked SQL functions, so the supervisor's
 //! restricted login and the owner's CLI share one set of rules. The
@@ -102,6 +103,16 @@ impl PostgresStore {
         self.query_json(missions::OBJECTIVE_HISTORY, &[&mission, &objective, &limit])
     }
 
+    /// Take the integrator's lock. False means another integrator runs now.
+    ///
+    /// The lock belongs to the connection, and the connection dies with the
+    /// process, so a killed integrator never blocks the next one.
+    pub fn integrator_try_lock(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .query_one(missions::INTEGRATOR_TRY_LOCK, &[&missions::INTEGRATOR_LOCK_KEY])?
+            .get("held"))
+    }
+
     /// Clear a halted mission. A human's decision: owner only.
     pub fn mission_resume(&self, mission: i64) -> Result<(), StoreError> {
         self.execute(missions::MISSION_RESUME, &[&mission])?;
@@ -175,6 +186,18 @@ impl PostgresStore {
     /// Missions with their tasks, and the resident roster.
     pub fn mission_board(&self, limit: i64) -> Result<Value, StoreError> {
         self.query_json(missions::MISSION_BOARD, &[&limit])
+    }
+
+    /// Open objective missions with their resident and their tasks' gate
+    /// verdicts: the RSI page.
+    pub fn objective_missions(&self) -> Result<Value, StoreError> {
+        self.query_json(missions::OBJECTIVE_MISSIONS, &[])
+    }
+
+    /// One task with its brief, report and every gate verdict with its log;
+    /// `Value::Null` when there is no such task.
+    pub fn objective_task(&self, task: i64) -> Result<Value, StoreError> {
+        self.query_json(missions::OBJECTIVE_TASK, &[&task])
     }
 
     /// Tasks the dispatcher has to deliver, watch or wind down.

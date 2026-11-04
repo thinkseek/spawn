@@ -66,7 +66,18 @@ select jsonb_build_object(
                  'review_note', k.review_note, 'report', k.report,
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
-                 'updated_at_ms', k.updated_at_ms) order by k.id)
+                 'updated_at_ms', k.updated_at_ms,
+                 'last_gate', (select jsonb_build_object(
+                                 'verdict', r ->> 'verdict', 'reason', r ->> 'reason',
+                                 'metric', r ->> 'metric', 'candidate', r ->> 'candidate',
+                                 'at_ms', e.recorded_at_ms)
+                                 from spawn_events e
+                                cross join lateral (select e.kind -> 'detail' -> 'record' as r) g
+                                where e.session_id = 'session_control'
+                                  and e.event_name = 'control.recorded'
+                                  and r ->> 'type' = 'task.gated'
+                                  and r ->> 'id' = k.id::text
+                                order by e.session_seq desc limit 1)) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
         from mission_missions m
        order by m.id desc limit $1) x), '[]'::jsonb),
@@ -114,6 +125,76 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
                                          where mission_id = $1 and objective = $2)
          order by e.session_seq desc
          limit $3) z";
+/// Open objective missions (`objectives` = `{backlog, resident}`), for the
+/// RSI page: settings, the resident, and every task newest first with its
+/// gate verdicts from the control stream (oldest first, without logs).
+pub(crate) const OBJECTIVE_MISSIONS: &str = r"
+select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
+from (
+  select m.id, m.text, m.state, m.sources, m.gate, m.accept, m.budget, m.baseline, m.halted,
+         m.scenario_floor, m.gate_rejections, m.gate_aborts, m.objectives,
+         m.created_at_ms, m.updated_at_ms,
+         (select jsonb_build_object('name', r.name, 'agent_id', r.agent_id,
+                                    'session_id', r.session_id, 'state', r.state)
+            from mission_residents r where r.name = m.objectives ->> 'resident') as resident,
+         coalesce((select jsonb_agg(jsonb_build_object(
+                     'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
+                     'session_id', k.session_id, 'state', k.state, 'revisions', k.revisions,
+                     'objective', k.objective, 'candidate', k.candidate, 'base', k.base,
+                     'metric', k.metric, 'scenario', k.scenario,
+                     'brief', left(k.brief, 600), 'review_note', left(k.review_note, 2000),
+                     'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
+                     'delivered_at_ms', k.delivered_at_ms, 'updated_at_ms', k.updated_at_ms,
+                     'gates', coalesce((
+                        select jsonb_agg(jsonb_build_object(
+                                 'verdict', r ->> 'verdict', 'reason', r ->> 'reason',
+                                 'metric', r ->> 'metric', 'candidate', r ->> 'candidate',
+                                 'at_ms', e.recorded_at_ms) order by e.session_seq)
+                          from spawn_events e
+                         cross join lateral (select e.kind -> 'detail' -> 'record' as r) g
+                         where e.session_id = 'session_control'
+                           and e.event_name = 'control.recorded'
+                           and r ->> 'type' = 'task.gated'
+                           and r ->> 'id' = k.id::text), '[]'::jsonb))
+                     order by k.id desc)
+                   from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
+    from mission_missions m
+   where m.objectives is not null and m.state in ('open', 'active')
+) x";
+
+/// One task of an objective mission with its full brief, report, last gate
+/// log, and every gate verdict with its log, oldest first; null when there
+/// is no such task. `$1` task.
+pub(crate) const OBJECTIVE_TASK: &str = r"
+select (select jsonb_build_object(
+          'id', k.id, 'mission_id', k.mission_id, 'kind', k.kind, 'agent_id', k.agent_id,
+          'session_id', k.session_id, 'state', k.state, 'revisions', k.revisions,
+          'objective', k.objective, 'candidate', k.candidate, 'base', k.base,
+          'metric', k.metric, 'scenario', k.scenario, 'brief', k.brief,
+          'review_note', k.review_note, 'report', k.report, 'gate_log', k.gate_log,
+          'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
+          'delivered_at_ms', k.delivered_at_ms, 'updated_at_ms', k.updated_at_ms,
+          'gates', coalesce((
+             select jsonb_agg(jsonb_build_object(
+                      'verdict', r ->> 'verdict', 'reason', r ->> 'reason',
+                      'metric', r ->> 'metric', 'candidate', r ->> 'candidate',
+                      'log', r ->> 'log', 'at_ms', e.recorded_at_ms) order by e.session_seq)
+               from spawn_events e
+              cross join lateral (select e.kind -> 'detail' -> 'record' as r) g
+              where e.session_id = 'session_control'
+                and e.event_name = 'control.recorded'
+                and r ->> 'type' = 'task.gated'
+                and r ->> 'id' = k.id::text), '[]'::jsonb))
+          from mission_tasks k where k.id = $1)";
+
+/// The integrator's advisory lock: one integrator per database. The key is
+/// the one the retired RSI controller held, so an old controller and an
+/// integrator can never run at once.
+pub(crate) const INTEGRATOR_LOCK_KEY: i64 = 1_399_957_336;
+
+/// `$1` the lock key; true when this connection now holds it.
+pub(crate) const INTEGRATOR_TRY_LOCK: &str = "select pg_try_advisory_lock($1) as held";
+
 /// `$1` mission.
 pub(crate) const MISSION_RESUME: &str = "select spawn_mission_resume($1)";
 /// `$1` the record; returns its event id.
