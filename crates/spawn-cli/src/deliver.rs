@@ -14,8 +14,15 @@
 //!   so is a retired resident.
 //!
 //! Missions, reports, approvals and human messages to workers become digest
-//! items for the supervisor. Like the dispatcher, delivery keeps no state:
-//! idempotency keys and the task rows say what was already done.
+//! items for the supervisor ([`news`]). Like the dispatcher, delivery keeps
+//! no state: idempotency keys and the task rows say what was already done.
+//!
+//! [`orders`] is pure; [`collect_reports`] is the one step with side effects
+//! (the report file and the task row). What workers are told is in
+//! [`prompt`].
+
+mod news;
+mod prompt;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -24,13 +31,18 @@ use serde::Deserialize;
 use serde_json::Value;
 use spawn_core::command::CommandAction;
 use spawn_core::event::Engine;
-use spawn_core::observation::{Ambiguity, SemanticState};
 use spawn_postgres::PostgresStore;
 
-use crate::dispatch::{Escalation, Facts, Order, Why};
+use crate::dispatch::{Facts, Order};
+
+pub(crate) use news::news_items;
+pub(crate) use prompt::task_prompt;
 
 /// Where a worker writes its report, relative to its workspace.
 pub(crate) const REPORT: &str = ".spawn/report.md";
+
+/// Where collected reports are kept, relative to the workspace.
+const KEPT_REPORTS: &str = ".spawn/reports";
 
 /// One task row from `delivery_rows`.
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +64,24 @@ pub(crate) struct TaskRow {
     pub(crate) charter: Option<String>,
     #[serde(default)]
     pub(crate) resident: Option<String>,
+}
+
+impl TaskRow {
+    /// Sent back by the supervisor, waiting to be delivered again.
+    fn is_revision(&self) -> bool {
+        self.state == "revise"
+    }
+
+    /// A command to this task's session that delivers or retires it.
+    fn order(&self, key: String, action: CommandAction) -> Order {
+        Order {
+            agent_id: self.agent_id.clone(),
+            session_id: self.session_id.clone(),
+            key,
+            action,
+            task: Some(self.id),
+        }
+    }
 }
 
 /// What the supervisor should hear about besides worker states.
@@ -89,24 +119,25 @@ impl Work {
         })
     }
 
-    /// Sessions whose open task (delivered, under review, or sent back)
-    /// keeps the next one waiting: a revision continues in the same context,
-    /// and no other task is mixed in before the supervisor closes it.
-    pub(crate) fn blocked(&self) -> BTreeSet<&str> {
+    /// Sessions whose tasks are in one of `states`.
+    fn sessions_in(&self, states: &[&str]) -> BTreeSet<&str> {
         self.tasks
             .iter()
-            .filter(|task| matches!(task.state.as_str(), "delivered" | "reported"))
+            .filter(|task| states.contains(&task.state.as_str()))
             .map(|task| task.session_id.as_str())
             .collect()
     }
 
+    /// Sessions whose open task (delivered, under review, or sent back)
+    /// keeps the next one waiting: a revision continues in the same context,
+    /// and no other task is mixed in before the supervisor closes it.
+    pub(crate) fn blocked(&self) -> BTreeSet<&str> {
+        self.sessions_in(&["delivered", "reported"])
+    }
+
     /// Sessions with a task being worked on right now.
     pub(crate) fn in_flight(&self) -> BTreeSet<&str> {
-        self.tasks
-            .iter()
-            .filter(|task| task.state == "delivered")
-            .map(|task| task.session_id.as_str())
-            .collect()
+        self.sessions_in(&["delivered"])
     }
 
     /// Sessions the mission layer manages (they have recent tasks, or are
@@ -117,66 +148,64 @@ impl Work {
     }
 }
 
-/// Whether a worker sits idle at its prompt, judged on its latest fact,
-/// with nothing in flight: the only moment typed input is safe.
-pub(crate) fn idle(facts: &Facts) -> bool {
-    facts.live
-        && !facts.open_command
-        && facts.observation.as_ref().is_some_and(|observation| {
-            facts
-                .evidence_seq
-                .is_none_or(|latest| observation.based_on_seq.0 >= latest)
-                && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
-                && matches!(
-                    observation.state,
-                    SemanticState::Waiting | SemanticState::Completed
-                )
-        })
+/// Which waiting task of each session gets its one delivery: a task sent
+/// back goes first (it is the one the worker has in mind), then the oldest
+/// new task. Tasks are offered in row order.
+struct Turns<'a> {
+    /// Sessions with a revision not offered yet.
+    revisions: BTreeSet<&'a str>,
+    /// Sessions whose turn is taken, by a revision or a new task.
+    taken: BTreeSet<&'a str>,
 }
 
-const REPORT_CONTRACT: &str = "When the task is finished, or you cannot go on, write `.spawn/report.md` \
-at the root of your workspace with three sections: `## Outcome` (done, blocked or failed, in one \
-line), `## What changed` (files, commits, results) and `## Open issues`. Then stop and wait. Do not \
-start other work. If a person must decide something, say so in the report.";
+impl<'a> Turns<'a> {
+    fn new(work: &'a Work) -> Self {
+        let revisions = work.sessions_in(&["revise"]);
+        Self {
+            taken: revisions.clone(),
+            revisions,
+        }
+    }
 
-/// The full prompt that starts a task in a new or resumed session.
-pub(crate) fn task_prompt(task: &TaskRow) -> String {
-    let role = match (&task.resident, &task.charter) {
-        (Some(name), Some(charter)) => format!(
-            "You are `{name}`, a long-lived resident worker of Spawn. Your charter:\n{charter}\n\n\
-Tasks inside your charter arrive one at a time; keep what you learn about your domain."
-        ),
-        _ => "You are a Spawn worker started for one task. Work only on it.".to_string(),
-    };
-    format!(
-        "{role}\n\nMission #{}: {}\n\nTask #{}:\n{}\n\n{REPORT_CONTRACT}",
-        task.mission_id, task.mission_text, task.id, task.brief
-    )
-}
-
-/// What a live worker gets typed for a task: a new task, or a revision.
-fn typed(task: &TaskRow) -> String {
-    if task.state == "revise" {
-        format!(
-            "Task #{} was sent back by the supervisor: {}\nFix it, then rewrite `.spawn/report.md`.",
-            task.id,
-            task.review_note.as_deref().unwrap_or("see the review")
-        )
-    } else {
-        format!(
-            "New task #{} for mission #{}: {}\n\nTask:\n{}\n\n{REPORT_CONTRACT}",
-            task.id, task.mission_id, task.mission_text, task.brief
-        )
+    /// Whether `task` is the one its session delivers now.
+    fn take(&mut self, task: &'a TaskRow) -> bool {
+        let session = task.session_id.as_str();
+        if task.is_revision() {
+            self.revisions.remove(session)
+        } else {
+            self.taken.insert(session)
+        }
     }
 }
 
-fn order(task: &TaskRow, key: String, action: CommandAction) -> Order {
-    Order {
-        agent_id: task.agent_id.clone(),
-        session_id: task.session_id.clone(),
-        key,
-        action,
-        task: Some(task.id),
+/// How a waiting task reaches its worker, given the worker's facts.
+fn delivery(task: &TaskRow, found: Option<&Facts>) -> Option<Order> {
+    let key = format!("deliver-{}-{}", task.id, task.revisions);
+    match found {
+        Some(facts) if facts.open_command => None,
+        Some(facts) if facts.live => facts.idle_at_prompt().then(|| {
+            task.order(
+                key,
+                CommandAction::Input {
+                    text: prompt::typed(task),
+                },
+            )
+        }),
+        // Ran before: resume, so a resident keeps its context.
+        Some(facts) if facts.execution_id.is_some() => Some(task.order(
+            key,
+            CommandAction::Resume {
+                prompt: Some(prompt::resume_prompt(task)),
+            },
+        )),
+        _ => Some(task.order(
+            key,
+            CommandAction::Start {
+                engine: Engine::Claude,
+                prompt: task_prompt(task),
+                parent_session_id: None,
+            },
+        )),
     }
 }
 
@@ -186,72 +215,23 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
         .iter()
         .map(|facts| (facts.session_id.as_str(), facts))
         .collect();
-    let busy = work.blocked();
-    // A task sent back goes first: it is the one the worker has in mind.
-    let mut served: BTreeSet<&str> = work
-        .tasks
-        .iter()
-        .filter(|task| task.state == "revise")
-        .map(|task| task.session_id.as_str())
-        .collect();
-    let mut sent_back = served.clone();
+    let blocked = work.blocked();
+    let mut turns = Turns::new(work);
     let mut orders = Vec::new();
     for task in &work.tasks {
         let session = task.session_id.as_str();
         let found = facts.get(session).copied();
         match task.state.as_str() {
             "assigned" | "revise" => {
-                // One open task per worker, oldest first, revisions before
-                // new work.
-                let first = if task.state == "revise" {
-                    sent_back.remove(session)
-                } else {
-                    served.insert(session)
-                };
-                if busy.contains(session) || !first {
-                    continue;
-                }
-                let key = format!("deliver-{}-{}", task.id, task.revisions);
-                match found {
-                    Some(facts) if facts.open_command => {}
-                    Some(facts) if facts.live => {
-                        if idle(facts) {
-                            let text = typed(task);
-                            orders.push(order(task, key, CommandAction::Input { text }));
-                        }
-                    }
-                    // Ran before: resume, so a resident keeps its context.
-                    Some(facts) if facts.execution_id.is_some() => {
-                        let mut prompt = task_prompt(task);
-                        if task.state == "revise" {
-                            prompt = format!("{prompt}\n\n{}", typed(task));
-                        }
-                        orders.push(order(
-                            task,
-                            key,
-                            CommandAction::Resume {
-                                prompt: Some(prompt),
-                            },
-                        ));
-                    }
-                    _ => orders.push(order(
-                        task,
-                        key,
-                        CommandAction::Start {
-                            engine: Engine::Claude,
-                            prompt: task_prompt(task),
-                            parent_session_id: None,
-                        },
-                    )),
+                let turn = turns.take(task);
+                if turn && !blocked.contains(session) {
+                    orders.extend(delivery(task, found));
                 }
             }
             "accepted" | "cancelled" if task.kind == "ephemeral" => {
-                if let Some(facts) = found
-                    && facts.live
-                    && !facts.open_command
-                {
+                if found.is_some_and(Facts::live_and_free) {
                     let key = format!("retire-task-{}", task.id);
-                    orders.push(order(task, key, CommandAction::Stop));
+                    orders.push(task.order(key, CommandAction::Stop));
                 }
             }
             _ => {}
@@ -259,8 +239,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
     }
     for (agent, session) in &work.retired {
         if let Some(facts) = facts.get(session.as_str())
-            && facts.live
-            && !facts.open_command
+            && facts.live_and_free()
         {
             orders.push(Order {
                 agent_id: agent.clone(),
@@ -277,71 +256,21 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
     orders
 }
 
-fn field<'a>(value: &'a Value, key: &str) -> &'a str {
-    value.get(key).and_then(Value::as_str).unwrap_or_default()
-}
-
-fn whole(value: &Value, key: &str) -> i64 {
-    value.get(key).and_then(Value::as_i64).unwrap_or_default()
-}
-
-fn one_line(text: &str, limit: usize) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= limit {
-        flat
-    } else {
-        format!("{}…", flat.chars().take(limit).collect::<String>())
+/// Move a collected report to `.spawn/reports/task-<id>.md` under the
+/// workspace, or delete it if it cannot be moved, so the next task starts
+/// clean.
+fn put_aside(path: &Path, workspace: &Path, task: i64) {
+    let kept = workspace
+        .join(KEPT_REPORTS)
+        .join(format!("task-{task}.md"));
+    let moved = kept
+        .parent()
+        .map(std::fs::create_dir_all)
+        .and_then(Result::ok)
+        .and_then(|()| std::fs::rename(path, &kept).ok());
+    if moved.is_none() {
+        let _ = std::fs::remove_file(path);
     }
-}
-
-/// Digest items from the mission layer.
-pub(crate) fn news_items(news: &News) -> Vec<Escalation> {
-    let mut items = Vec::new();
-    for mission in &news.missions {
-        let id = whole(mission, "id");
-        items.push(Escalation {
-            session_id: "missions".to_string(),
-            id: format!("mission-{id}"),
-            why: Why::Mission,
-            line: format!(
-                "#{id} from {}: {}",
-                field(mission, "origin"),
-                one_line(field(mission, "text"), 300)
-            ),
-        });
-    }
-    for report in &news.reports {
-        let id = whole(report, "id");
-        items.push(Escalation {
-            session_id: field(report, "session_id").to_string(),
-            id: format!("report-{id}"),
-            why: Why::Report,
-            line: format!(
-                "task #{id} ({}, mission #{}): {}",
-                field(report, "kind"),
-                whole(report, "mission_id"),
-                one_line(field(report, "report"), 400)
-            ),
-        });
-    }
-    for resident in &news.approved {
-        let name = field(resident, "name");
-        items.push(Escalation {
-            session_id: format!("session_resident_{name}"),
-            id: format!("approved-{name}"),
-            why: Why::Approved,
-            line: format!("a human approved resident `{name}`; assign it tasks with --kind resident --worker {name}"),
-        });
-    }
-    for message in &news.human {
-        items.push(Escalation {
-            session_id: field(message, "session_id").to_string(),
-            id: format!("human-{}", whole(message, "command_id")),
-            why: Why::Human,
-            line: format!("a human told it: {}", one_line(field(message, "text"), 200)),
-        });
-    }
-    items
 }
 
 /// Collect the reports of delivered tasks whose worker is idle. Returns log
@@ -354,16 +283,15 @@ pub(crate) fn collect_reports(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for task in work.tasks.iter().filter(|task| task.state == "delivered") {
-        let Some(facts) = rows
+        let idle = rows
             .iter()
             .find(|facts| facts.session_id == task.session_id)
-        else {
-            continue;
-        };
-        if !idle(facts) {
+            .is_some_and(Facts::idle_at_prompt);
+        if !idle {
             continue;
         }
-        let path = root.join(&task.agent_id).join(REPORT);
+        let workspace = root.join(&task.agent_id);
+        let path = workspace.join(REPORT);
         let Ok(report) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -372,18 +300,7 @@ pub(crate) fn collect_reports(
         }
         match store.task_reported(task.id, report.trim()) {
             Ok(true) => {
-                let kept = root
-                    .join(&task.agent_id)
-                    .join(".spawn/reports")
-                    .join(format!("task-{}.md", task.id));
-                let moved = kept
-                    .parent()
-                    .map(std::fs::create_dir_all)
-                    .and_then(Result::ok)
-                    .and_then(|()| std::fs::rename(&path, &kept).ok());
-                if moved.is_none() {
-                    let _ = std::fs::remove_file(&path);
-                }
+                put_aside(&path, &workspace, task.id);
                 lines.push(format!("deliver: task #{} reported", task.id));
             }
             Ok(false) => {}
