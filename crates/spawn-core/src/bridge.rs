@@ -8,7 +8,7 @@
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -21,7 +21,7 @@ use crate::event::{
     NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
-use crate::ingest::{claude_line, codex_line};
+use crate::ingest::{MERGE_NOTICE_OPENING, claude_line, codex_line};
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
     TerminalHost, WorkspaceError, WorkspaceStore,
@@ -195,48 +195,139 @@ struct SessionView {
     agent_id: AgentId,
     native: Option<(Engine, String)>,
     active: Option<Active>,
-    /// What merges of main changed under the agent since the last prompt it
-    /// received: told with the next prompt the Bridge types.
+    /// What merges of main changed under the agent and it has not been
+    /// told: told with the next prompt the Bridge types.
     notice: Notice,
 }
 
 /// Files merges of main changed in an agent's workspace that the agent has
-/// not been told of yet. Folded from the log: a merge adds its files, a
-/// prompt reaching the engine clears them (the Bridge put the notice in it).
+/// not been told of yet, each with the position of the last merge event that
+/// named it. Folded from the log: a merge adds its files; `notice.typed`
+/// records which of them a prompt the Bridge typed carried; the
+/// `notice.received` read from the engine's transcript (for Codex, whose
+/// prompt is its argument, the execution's first prompt) clears those. No
+/// other prompt clears anything: a turn someone else typed told the agent
+/// nothing.
 #[derive(Debug, Clone, Default)]
 struct Notice {
-    merged: std::collections::BTreeSet<String>,
-    conflicted: std::collections::BTreeSet<String>,
+    merged: BTreeMap<String, GlobalPosition>,
+    conflicted: BTreeMap<String, GlobalPosition>,
+    /// The notice typed last and not received yet.
+    typed: Option<Typed>,
+}
+
+/// A notice the Bridge typed.
+#[derive(Debug, Clone)]
+struct Typed {
+    /// What it told of: merge events up to this position.
+    through: GlobalPosition,
+    /// The execution it was typed into.
+    execution: Option<ExecutionId>,
+    /// Typed as a Codex prompt (an argument): the execution's first prompt
+    /// is that prompt.
+    codex: bool,
 }
 
 impl Notice {
-    /// The text that goes before the next prompt, if anything is to be told.
-    fn text(&self) -> Option<String> {
-        let list = |files: &std::collections::BTreeSet<String>| {
-            files.iter().cloned().collect::<Vec<_>>().join(", ")
+    /// The text that goes before the next prompt, if anything is to be
+    /// told, and the position of the last merge event it tells of.
+    fn text(&self) -> Option<(String, GlobalPosition)> {
+        let list = |files: &[&String]| {
+            files
+                .iter()
+                .map(|file| file.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let merged: std::collections::BTreeSet<String> =
-            self.merged.difference(&self.conflicted).cloned().collect();
-        match (merged.is_empty(), self.conflicted.is_empty()) {
-            (true, true) => None,
-            (false, true) => Some(format!(
-                "Spawn merged main into your workspace since your last turn: {}. Re-read them \
-                 before editing.",
+        let merged: Vec<&String> = self
+            .merged
+            .keys()
+            .filter(|file| !self.conflicted.contains_key(*file))
+            .collect();
+        let conflicted: Vec<&String> = self.conflicted.keys().collect();
+        let through = self
+            .merged
+            .values()
+            .chain(self.conflicted.values())
+            .max()
+            .copied()?;
+        let text = match (merged.is_empty(), conflicted.is_empty()) {
+            (true, true) => return None,
+            (false, true) => format!(
+                "{MERGE_NOTICE_OPENING}: {}. Re-read them before editing.",
                 list(&merged)
-            )),
-            (true, false) => Some(format!(
-                "Spawn merged main into your workspace since your last turn; these files carry \
+            ),
+            (true, false) => format!(
+                "{MERGE_NOTICE_OPENING}; these files carry conflict markers: {}. Resolve them \
+                 by editing the marked regions; do not rewrite the files from memory.",
+                list(&conflicted)
+            ),
+            (false, false) => format!(
+                "{MERGE_NOTICE_OPENING}: {}. Re-read them before editing. These files carry \
                  conflict markers: {}. Resolve them by editing the marked regions; do not \
                  rewrite the files from memory.",
-                list(&self.conflicted)
-            )),
-            (false, false) => Some(format!(
-                "Spawn merged main into your workspace since your last turn: {}. Re-read them \
-                 before editing. These files carry conflict markers: {}. Resolve them by \
-                 editing the marked regions; do not rewrite the files from memory.",
                 list(&merged),
-                list(&self.conflicted)
-            )),
+                list(&conflicted)
+            ),
+        };
+        Some((text, through))
+    }
+
+    /// Fold one event of the session: merges add files, the Bridge's
+    /// `notice.typed` records what a prompt carried, its receipt clears it.
+    /// `active` is the session's running execution.
+    fn fold(&mut self, record: &EventRecord, active: Option<&Active>) {
+        let event = &record.event;
+        match &event.kind {
+            EventKind::ArtifactCommitted {
+                reason: CheckpointReason::BaseMerged,
+                files,
+                ..
+            } => {
+                for file in files {
+                    self.merged.insert(file.clone(), record.position);
+                }
+            }
+            EventKind::MergeConflicted {
+                files,
+                marked: true,
+            } => {
+                for file in files {
+                    self.conflicted.insert(file.clone(), record.position);
+                }
+            }
+            EventKind::NoticeTyped { through } if event.source == Source::Bridge => {
+                let codex = active.is_some_and(|active| {
+                    active.engine == Engine::Codex
+                        && event.execution_id.as_ref() == Some(&active.execution_id)
+                });
+                self.typed = Some(Typed {
+                    through: *through,
+                    execution: event.execution_id.clone(),
+                    codex,
+                });
+            }
+            EventKind::NoticeReceived => self.received(),
+            // A Codex execution's first prompt is the argument it started
+            // with, which carried the notice.
+            EventKind::MessageReceived
+                if self.typed.as_ref().is_some_and(|typed| {
+                    typed.codex
+                        && typed.execution.is_some()
+                        && typed.execution == event.execution_id
+                }) =>
+            {
+                self.received();
+            }
+            _ => {}
+        }
+    }
+
+    /// The typed notice reached the engine: what it told of is told.
+    fn received(&mut self) {
+        if let Some(typed) = self.typed.take() {
+            self.merged.retain(|_, at| *at > typed.through);
+            self.conflicted.retain(|_, at| *at > typed.through);
         }
     }
 }
@@ -357,19 +448,7 @@ impl Bridge {
                 active: None,
                 notice: Notice::default(),
             });
-        match &event.kind {
-            EventKind::ArtifactCommitted {
-                reason: CheckpointReason::BaseMerged,
-                files,
-                ..
-            } => view.notice.merged.extend(files.iter().cloned()),
-            EventKind::MergeConflicted {
-                files,
-                marked: true,
-            } => view.notice.conflicted.extend(files.iter().cloned()),
-            EventKind::MessageReceived => view.notice = Notice::default(),
-            _ => {}
-        }
+        view.notice.fold(record, view.active.as_ref());
         let current = view
             .active
             .as_ref()
@@ -1373,7 +1452,7 @@ impl Bridge {
                 reading.state
             )));
         }
-        let typed = self.with_notice(&claimed.session_id, text);
+        let (typed, through) = self.with_notice(&claimed.session_id, text);
         match self
             .terminals
             .submit_text(&active.terminal, &active.workspace, &typed)
@@ -1381,7 +1460,7 @@ impl Bridge {
             Ok(()) => {
                 // A turn starts now, before its transcript says so.
                 self.open_turn(&claimed.session_id);
-                self.notice_delivered(&claimed.session_id);
+                self.notice_typed(claimed, &active, through)?;
                 Ok(Outcome::Succeeded)
             }
             Err(error) => Ok(Outcome::Failed(format!("submit text: {error}"))),
@@ -1475,8 +1554,8 @@ impl Bridge {
         }
         // What merges changed goes with the prompt; nothing is typed
         // unprompted.
-        let prompt = if prompt.is_empty() {
-            String::new()
+        let (prompt, through) = if prompt.is_empty() {
+            (String::new(), None)
         } else {
             self.with_notice(&claimed.session_id, prompt)
         };
@@ -1491,30 +1570,52 @@ impl Bridge {
             },
             report,
         )?;
-        if outcome == Outcome::Succeeded && !prompt.is_empty() {
-            self.notice_delivered(&claimed.session_id);
+        // The execution the prompt went to, folded (a Codex start does not
+        // fold it itself).
+        self.catch_up()?;
+        if outcome == Outcome::Succeeded
+            && let Some(active) = self.running(&claimed.session_id)
+        {
+            self.notice_typed(claimed, &active, through)?;
         }
         Ok(outcome)
     }
 
-    /// `prompt`, after what merges of main changed under the agent since
-    /// its last prompt, if anything did.
-    fn with_notice(&self, session: &SessionId, prompt: &str) -> String {
+    /// `prompt`, after what merges of main changed under the agent and it
+    /// was not told yet, if anything did; and the position of the last merge
+    /// event the notice tells of.
+    fn with_notice(&self, session: &SessionId, prompt: &str) -> (String, Option<GlobalPosition>) {
         match self
             .sessions
             .get(session)
             .and_then(|view| view.notice.text())
         {
-            Some(notice) => format!("{notice}\n\n{prompt}"),
-            None => prompt.to_string(),
+            Some((notice, through)) => (format!("{notice}\n\n{prompt}"), Some(through)),
+            None => (prompt.to_string(), None),
         }
     }
 
-    /// The notice went out with a typed prompt (which the command records).
-    fn notice_delivered(&mut self, session: &SessionId) {
-        if let Some(view) = self.sessions.get_mut(session) {
-            view.notice = Notice::default();
-        }
+    /// A prompt with the notice through `through` went to the engine:
+    /// record it, so the notice clears when that prompt reaches the engine
+    /// (`notice.received`), and only then.
+    fn notice_typed(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        through: Option<GlobalPosition>,
+    ) -> Result<(), StoreError> {
+        let Some(through) = through else {
+            return Ok(());
+        };
+        self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("cmd_{}:notice", claimed.command_id.0)),
+            EventKind::NoticeTyped { through },
+        )?;
+        self.catch_up()
     }
 }
 

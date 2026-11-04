@@ -166,6 +166,20 @@ pub enum EventKind {
     /// A prompt reached the engine.
     #[serde(rename = "message.received")]
     MessageReceived,
+    /// The Bridge typed a prompt that opens with the merge notice
+    /// ([`crate::ingest::MERGE_NOTICE_OPENING`]): what merges of main changed
+    /// in the agent's workspace, up to and including the event at `through`.
+    /// The notice stays due until that prompt reaches the engine.
+    #[serde(rename = "notice.typed")]
+    NoticeTyped {
+        /// The last merge event the typed notice told of.
+        through: GlobalPosition,
+    },
+    /// A prompt that opens with the merge notice reached the engine: the
+    /// notice the Bridge typed last is delivered. Read from the engine's
+    /// transcript, never inferred from any prompt.
+    #[serde(rename = "notice.received")]
+    NoticeReceived,
     /// The engine asked for attention, for example a permission prompt.
     #[serde(rename = "notification.received")]
     NotificationReceived {
@@ -319,6 +333,8 @@ impl EventKind {
             Self::NativeSessionEnded { .. } => "session.native_ended",
             Self::SessionLinked { .. } => "session.linked",
             Self::MessageReceived => "message.received",
+            Self::NoticeTyped { .. } => "notice.typed",
+            Self::NoticeReceived => "notice.received",
             Self::NotificationReceived { .. } => "notification.received",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolCompleted { .. } => "tool.completed",

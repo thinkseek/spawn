@@ -19,6 +19,11 @@ use serde_json::Value;
 
 use crate::event::{Engine, EventKind};
 
+/// How every merge notice the Bridge types opens (docs/storage.md, "Main into
+/// branches automatically"). A prompt that opens with it is the Bridge's
+/// notice reaching the engine: `notice.received`.
+pub const MERGE_NOTICE_OPENING: &str = "Spawn merged main into your workspace since your last turn";
+
 /// Maximum characters kept from engine error text.
 const MAX_ERROR_CHARS: usize = 2000;
 
@@ -156,6 +161,11 @@ fn user_text(content: &Value, uuid: &str) -> Vec<Normalized> {
         || text.starts_with("<local-command-")
     {
         Vec::new()
+    } else if text.starts_with(MERGE_NOTICE_OPENING) {
+        vec![
+            keyed(EventKind::MessageReceived, uuid.to_string()),
+            keyed(EventKind::NoticeReceived, format!("{uuid}:notice")),
+        ]
     } else {
         vec![keyed(EventKind::MessageReceived, uuid.to_string())]
     }

@@ -133,6 +133,30 @@ fn prompt(id: &str) -> String {
     format!(r#"{{"type":"user","uuid":"p-{id}",{AT},"message":{{"content":"next"}}}}"#)
 }
 
+/// The transcript line of a prompt whose text is `text`, as the engine
+/// records what was typed into it.
+fn prompt_of(id: &str, text: &str) -> String {
+    let content = serde_json::to_string(text).expect("a JSON string");
+    format!(r#"{{"type":"user","uuid":"p-{id}",{AT},"message":{{"content":{content}}}}}"#)
+}
+
+/// What the pane of the first execution shows after its last ready line:
+/// the text typed since the pane was last reset.
+fn typed_last(store: &MemoryStore) -> String {
+    let pane = pane(store, 1);
+    pane.rsplit("tok/s").next().unwrap_or_default().to_string()
+}
+
+/// The last prompt typed into the first execution that opened with the
+/// merge notice.
+fn typed_notice(store: &MemoryStore) -> String {
+    let pane = pane(store, 1);
+    let at = pane
+        .rfind(spawn_core::ingest::MERGE_NOTICE_OPENING)
+        .expect("a typed notice");
+    pane[at..].trim_end().to_string()
+}
+
 fn quiet(report: &TickReport) {
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 }
@@ -477,8 +501,12 @@ fn what_a_merge_changed_is_recorded_and_told_with_the_next_prompt_only() {
     let told = typed.find(MERGED_NOTICE).expect("the notice was typed");
     assert!(typed[told..].contains("\n\nnext"), "{typed}");
 
-    // Told once: the next prompt goes alone, after a restart too.
-    transcript(&store, &[prompt("2"), turn_end("2")]);
+    // Told once that prompt reached the engine: the next prompt goes alone,
+    // after a restart too.
+    transcript(
+        &store,
+        &[prompt_of("2", &typed_notice(&store)), turn_end("2")],
+    );
     bridge.tick().expect("read the turn");
     bridge.tick().expect("checkpoint");
     let mut bridge = self::bridge(&store);
@@ -513,6 +541,109 @@ fn what_a_merge_changed_is_recorded_and_told_with_the_next_prompt_only() {
             && typed.contains("do not rewrite the files from memory")
             && typed.contains("fix it"),
         "{typed}"
+    );
+}
+
+#[test]
+fn only_the_bridges_own_notice_reaching_the_engine_clears_it() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("e".repeat(40)).expect("valid commit"),
+        files: vec!["src/a.rs".to_string()],
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint and merge");
+    store.set_base_merge(BaseMerge::Current);
+
+    // A turn the Bridge did not type (a person at the pane, the engine
+    // going on by itself) tells the agent nothing.
+    transcript(&store, &[prompt("2"), turn_end("2")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    input(&store, "key_input_1", "next");
+    bridge.tick().expect("type");
+    assert!(
+        typed_last(&store).contains(MERGED_NOTICE),
+        "{}",
+        pane(&store, 1)
+    );
+
+    // Typed, but not in the transcript yet: a restart still owes it, and
+    // the next prompt carries it again.
+    let typed = typed_notice(&store);
+    let mut bridge = self::bridge(&store);
+    bridge.recover().expect("recover");
+    reset_pane(&store, 1);
+    input(&store, "key_input_2", "more");
+    bridge.tick().expect("type");
+    assert!(
+        typed_last(&store).contains(MERGED_NOTICE),
+        "{}",
+        pane(&store, 1)
+    );
+
+    // The typed prompt reaches the engine: told, also for a restarted
+    // Bridge.
+    transcript(&store, &[prompt_of("3", &typed), turn_end("3")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    assert!(
+        events(&store)
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::NoticeReceived))
+    );
+    let mut bridge = self::bridge(&store);
+    bridge.recover().expect("recover");
+    reset_pane(&store, 1);
+    input(&store, "key_input_3", "again");
+    bridge.tick().expect("type");
+    let last = typed_last(&store);
+    assert!(
+        last.contains("again") && !last.contains("Spawn merged"),
+        "{last}"
+    );
+}
+
+#[test]
+fn a_merge_after_the_notice_was_typed_is_told_next_time() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("e".repeat(40)).expect("valid commit"),
+        files: vec!["src/a.rs".to_string()],
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint and merge");
+    input(&store, "key_input_1", "next");
+    bridge.tick().expect("type");
+    let typed = typed_notice(&store);
+
+    // Another merge lands before the typed prompt shows in the transcript.
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("f".repeat(40)).expect("valid commit"),
+        files: vec!["src/b.rs".to_string()],
+    });
+    transcript(&store, &[turn_end("x")]);
+    bridge.tick().expect("read the turn end");
+    bridge.tick().expect("checkpoint and merge");
+    store.set_base_merge(BaseMerge::Current);
+    transcript(&store, &[prompt_of("2", &typed), turn_end("2")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    reset_pane(&store, 1);
+    input(&store, "key_input_2", "again");
+    bridge.tick().expect("type");
+    let last = typed_last(&store);
+    assert!(
+        last.contains("since your last turn: src/b.rs.") && !last.contains("src/a.rs"),
+        "{last}"
     );
 }
 
