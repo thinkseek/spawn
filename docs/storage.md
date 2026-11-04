@@ -138,7 +138,7 @@ files, a chunk fetch.
   changes, so `main` must not become its parent (the next idle merge writes
   the merge again). Either way main is never recorded as a parent over a
   tree without its changes. A merge holds the branch's index lock, as a
-  checkpoint does (the integrator commits the same workspace). No later
+  checkpoint does. No later
   `main` is merged on top of unresolved markers. A conflict markers cannot
   show (modify/delete, renames, binary files) changes nothing; the
   tick-report warning says so. Large files are not merged: the branch keeps
@@ -161,9 +161,32 @@ files, a chunk fetch.
   does not change that. `discard` (`{"type":"discard"}`, a person's or the
   supervisor's decision) tries the checkpoint once more and unmounts even if
   it fails, losing what was not committed.
-- **Landing**: text only. The gate judges the git candidate; the
-  integrator commits host-side and moves `main` by compare-and-swap. Large
-  files are workspace state, not source, and never land.
+- **Landing**: text only, from what the agent published. The candidate is
+  the source's `refs/heads/spawn/<agent>`, the branch the pusher publishes,
+  fetched into the integrator's mirror as `refs/spawn-integrate/<agent>`,
+  never into `refs/heads/<agent>` (on the Bridge's host that branch is the
+  Bridge's, and the integrator never moves it). The integrator never commits
+  a mounted workspace, so it works the same on a host that never ran the
+  agent, and a file written after the last checkpoint, never pushed, does
+  not land. **Stale pushes do not land**: the pushed head must be the commit
+  of the agent's latest `artifact.committed` event (its last checkpoint or
+  merge of `main`) or a descendant of it. A push that lags (behind it,
+  diverged from it, or no `spawn/<agent>` at all while the agent has a
+  checkpoint) is fetched again for up to 12 s (the pusher pushes a branch at
+  most every 5 s), then gated `stale`: the gate does not run, the task goes
+  back to `reported` (`accepted` under review), no rejection is counted,
+  nothing reaches the worker, and a later pass judges again once the pusher
+  has caught up. An agent with neither a checkpoint nor a pushed branch is
+  rejected ("the worker has no branch to land"). So a remote source must
+  share branches (`SPAWN_PUSH_SOURCES`) for its agents' work to land. The
+  rest is unchanged: a branch behind a moved `main` lands as the merge by
+  `main`'s merge rules, marker blocks in the files the branch changes are
+  gated `conflict`, a pending merge of `main` (it lives with the workspace
+  directory, on the Bridge's host) blocks judging when that directory is on
+  the integrator's host, and its markers, once checkpointed and pushed, are
+  caught by the marker check wherever the integrator runs. The gate judges
+  the candidate; the integrator moves `main` by a compare-and-swap push.
+  Large files are workspace state, not source, and never land.
 
 ## The chunk store
 
@@ -206,10 +229,7 @@ files, a chunk fetch.
   that a branch with large files resumes on any host.
 - **Streams as segments**: transcripts and gate logs as compressed segments
   in the chunk store, indexed by execution in PostgreSQL.
-- **Backlog, scenarios and gate versioned with the source**, and **the
-  integrator judging an agent's work from its pushed branch**
-  (`spawn/<agent>` on the source) instead of from the workspace on its own
-  host, so that work done on another host lands too.
+- **Backlog, scenarios and gate versioned with the source**.
 - **PostgreSQL reachable from other hosts** through a Cloudflare Tunnel +
   Access.
 
@@ -223,6 +243,7 @@ files, a chunk fetch.
 | Full transcript text | `~/.claude/projects/...` on the compute host | **No** (streams as segments are not built) |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
 | Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed to the source as `spawn/<agent>` | Yes for missions with a source; no for scratch missions and the default repository |
+| Work a task lands | the source's `spawn/<agent>`, fetched by the integrator into its mirror's `refs/spawn-integrate/<agent>`; judged only when it contains the agent's latest checkpoint (its `artifact.committed` in the event log) | Yes: the source holds it; nothing on the host that ran the agent is needed |
 | Large files in workspaces | the chunk store (`SPAWN_CHUNK_STORE`, else `<root>/.chunks`), named by the branch head's `Spawn-Large` trailer | **No**: host-local (chunks in R2 are not built) |
 | Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host (versioning them with the source is not built) |
 | Secrets | `spawn.env`, `~/.config/spawn/*`, mode 600 | Deliberately not stored |
