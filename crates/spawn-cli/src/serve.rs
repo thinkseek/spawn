@@ -255,8 +255,7 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 
 /// The RSI page (docs/fleet-architecture.md §10.4): every open objective
 /// mission, read from the mission tables, the control stream and the
-/// mission's backlog. Nothing here reads the retired controller's `rsi_*`
-/// tables, which stay in the database as history.
+/// mission's backlog.
 ///
 /// `GET /api/rsi` answers:
 ///
@@ -305,7 +304,7 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///
 /// `GET /api/rsi/task/<id>` answers one task: the fields above plus the full
 /// `brief`, `report`, `gate_log` (the latest), `mission_id`, and `log` on
-/// every gate verdict. It replaces the retired `/api/rsi/iteration/<n>`.
+/// every gate verdict.
 ///
 /// `GET /api/rsi/pane[?mission=<id>]` answers the live pane of the mission's
 /// resident (the first open objective mission by default), in the shape of
