@@ -66,6 +66,8 @@ struct State {
     base_merge: BaseMerge,
     /// Workspace calls in order, for tests of the call order.
     workspace_calls: Vec<String>,
+    /// Commits fail while set.
+    commit_fails: bool,
     terminals: HashSet<TerminalName>,
     panes: HashMap<TerminalName, String>,
     files: HashMap<String, Vec<u8>>,
@@ -161,6 +163,11 @@ impl MemoryStore {
     /// Test helper.
     pub fn workspace_calls(&self) -> Vec<String> {
         self.lock().workspace_calls.clone()
+    }
+
+    /// Make every commit fail (`true`) or work again. Test helper.
+    pub fn fail_commits(&self, fail: bool) {
+        self.lock().commit_fails = fail;
     }
 
     /// Mark a workspace as holding uncommitted changes. Test helper.
@@ -390,6 +397,9 @@ impl WorkspaceStore for MemoryStore {
     fn commit(&self, workspace: &WorkspaceId, _message: &str) -> Result<Commit, WorkspaceError> {
         let mut state = self.lock();
         state.workspace_calls.push("commit".to_string());
+        if state.commit_fails {
+            return Err(WorkspaceError::Unavailable("commit fails".to_string()));
+        }
         let Some(mount) = state.mounts.get_mut(workspace) else {
             return Err(WorkspaceError::Refused {
                 code: "NoSuchWorkspace".to_string(),

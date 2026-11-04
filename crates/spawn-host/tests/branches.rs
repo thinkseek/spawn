@@ -8,7 +8,7 @@ use std::process::Command;
 
 use spawn_core::id::{BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, Commit, WorkspaceStore};
-use spawn_host::GitWorkspace;
+use spawn_host::{GitWorkspace, has_conflict_block};
 
 /// Output of git in `directory`, which must succeed.
 fn git(directory: &Path, arguments: &[&str]) -> String {
@@ -476,4 +476,103 @@ fn a_merge_keeps_the_branchs_large_file_manifest() {
         &["log", "-1", "--format=%B", commit.as_str()],
     );
     assert!(message.contains("Spawn-Large: abc123"), "{message}");
+}
+
+#[test]
+fn only_a_whole_marker_block_is_a_conflict() {
+    assert!(has_conflict_block(
+        b"a\n<<<<<<< main\nx\n=======\ny\n>>>>>>> agent\nb\n"
+    ));
+    assert!(has_conflict_block(
+        b"<<<<<<< main\r\nx\r\n=======\r\ny\r\n>>>>>>> agent\r\n"
+    ));
+    assert!(
+        !has_conflict_block(b"Title\n=======\n\ntext\n"),
+        "a Setext heading"
+    );
+    assert!(
+        !has_conflict_block(b"<<<<<<< main\nx\n>>>>>>> agent\n"),
+        "no middle"
+    );
+    assert!(
+        !has_conflict_block(b"=======\n<<<<<<< a\n>>>>>>> b\n"),
+        "out of order"
+    );
+    assert!(
+        !has_conflict_block(b"  <<<<<<< a\n=======\n>>>>>>> b\n"),
+        "not at line start"
+    );
+}
+
+#[test]
+fn a_resolution_with_a_heading_underline_is_resolved() {
+    let fixture = Fixture::new("setext", &[("README.md", "Title\n=======\n\nbase\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("README.md", "Title\n=======\n\nmine\n")]);
+    let main = fixture.land(&[("README.md", "Title\n=======\n\ntheirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    let resolved = fixture.work(&workspace, &[("README.md", "Title\n=======\n\nboth\n")]);
+    assert_eq!(parents(&fixture, &resolved)[1], main);
+    assert!(!pending(&directory, "agent_a").exists());
+}
+
+#[test]
+fn a_pending_merge_lives_only_in_its_directory() {
+    let fixture = Fixture::new("pending-mount", &[("README.md", "base\n")]);
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    let head = fixture.work(&workspace, &[("README.md", "mine\n")]);
+    fixture.land(&[("README.md", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    assert!(pending(&directory, "agent_a").exists());
+    // The directory goes (say the final checkpoint failed): so does the merge.
+    fixture.store.unmount(&workspace).expect("unmount");
+    assert!(!pending(&directory, "agent_a").exists());
+
+    // A fresh mount of the pre-merge head never takes main as a parent.
+    let workspace = fixture.store.mount(&branch).expect("mount");
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    fs::write(pending(&directory, "agent_a"), "stale").expect("a stale file");
+    let workspace = fixture.store.mount(&branch).expect("mount again");
+    assert!(!pending(&directory, "agent_a").exists(), "mount clears it");
+    let after = fixture.work(&workspace, &[("work.txt", "more\n")]);
+    assert_eq!(parents(&fixture, &after), vec![head]);
+}
+
+#[test]
+fn committed_markers_are_found_against_main() {
+    let fixture = Fixture::new("markers", &[("README.md", "base\n"), ("notes.md", "n\n")]);
+    let (_, workspace, _) = fixture.mount("agent_a");
+    let main = fixture.head("main");
+    let clean = fixture.work(&workspace, &[("notes.md", "Title\n=======\n")]);
+    assert!(
+        fixture
+            .store
+            .conflict_markers(&main, &clean)
+            .expect("scan")
+            .is_empty()
+    );
+    let marked = fixture.work(
+        &workspace,
+        &[(
+            "README.md",
+            "<<<<<<< main\nbase\n=======\nmine\n>>>>>>> agent_a\n",
+        )],
+    );
+    assert_eq!(
+        fixture
+            .store
+            .conflict_markers(&main, &marked)
+            .expect("scan"),
+        vec!["README.md"]
+    );
+    assert!(!fixture.store.has_pending_merge("agent_a"));
 }

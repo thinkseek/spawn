@@ -337,6 +337,18 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// The owner moved `source`'s main from `from` to `to` outside the gate
+    /// (owner only; the caller checks `to` descends from `from`). Returns how
+    /// many missions took `to` as their baseline.
+    pub fn source_moved(&self, source: &str, from: &str, to: &str) -> Result<i32, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_source_moved($1, $2, $3)",
+                &[&source, &from, &to],
+            )?
+            .get(0))
+    }
+
     /// Record a gate verdict, a landing, an abort or a halt (owner only).
     pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self

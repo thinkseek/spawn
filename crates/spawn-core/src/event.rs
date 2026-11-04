@@ -240,6 +240,19 @@ pub enum EventKind {
         reason: CheckpointReason,
         /// Commit reference.
         artifact: ArtifactRef,
+        /// For a merge of main (`base_merged`): the files it changed in the
+        /// workspace, under the agent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+    },
+    /// Merging the source's `main` into an idle workspace conflicted.
+    #[serde(rename = "merge.conflicted")]
+    MergeConflicted {
+        /// Conflicting paths.
+        files: Vec<String>,
+        /// The workspace now holds the merge, with conflict markers in
+        /// `files`; false: a conflict markers cannot show, nothing changed.
+        marked: bool,
     },
     /// The SQL gateway accepted a command.
     #[serde(rename = "command.accepted")]
@@ -299,6 +312,7 @@ impl EventKind {
             Self::ExecutionStarted { .. } => "execution.started",
             Self::ExecutionEnded { .. } => "execution.ended",
             Self::ArtifactCommitted { .. } => "artifact.committed",
+            Self::MergeConflicted { .. } => "merge.conflicted",
             Self::CommandAccepted { .. } => "command.accepted",
             Self::CommandFinished { .. } => "command.finished",
             Self::ScreenObserved { .. } => "screen.observed",
