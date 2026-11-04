@@ -543,6 +543,7 @@ fn artifact_and_relation_views_read_their_events() {
     let (store, schema) = store("artifacts");
     store
         .append(message(EventKind::ArtifactCommitted {
+            files: Vec::new(),
             reason: CheckpointReason::TurnStopped,
             artifact: ArtifactRef {
                 project: "shop".to_string(),
