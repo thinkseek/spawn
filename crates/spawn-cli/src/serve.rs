@@ -82,7 +82,7 @@ fn handle(request: Request, web: &Path) -> Result<(), String> {
         "/api/rsi" => rsi_overview(),
         "/api/rsi/pane" => rsi_pane(query),
         "/api/fleet" => fleet(),
-        "/api/missions" => open_store().and_then(|store| store.mission_board(50).map_err(err)),
+        "/api/missions" => missions(),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 session(id, query)
@@ -146,6 +146,38 @@ fn now_ms() -> i64 {
         .map_or(0, |time| {
             i64::try_from(time.as_millis()).unwrap_or(i64::MAX)
         })
+}
+
+/// `/api/missions`: the board, each task with its last gate verdict
+/// (`last_gate`: `{verdict, reason, metric, candidate, at_ms}` or null).
+fn missions() -> Result<Value, String> {
+    let store = open_store()?;
+    let mut board = store.mission_board(50).map_err(err)?;
+    let gates = store.last_gates().map_err(err)?;
+    with_last_gates(&mut board, &gates);
+    Ok(board)
+}
+
+/// Put each task's last gate verdict from `gates` (keyed by task id) on the
+/// board.
+fn with_last_gates(board: &mut Value, gates: &Value) {
+    let Some(missions) = board.get_mut("missions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for task in missions
+        .iter_mut()
+        .filter_map(|mission| mission.get_mut("tasks").and_then(Value::as_array_mut))
+        .flatten()
+    {
+        let gate = task["id"]
+            .as_i64()
+            .and_then(|id| gates.get(id.to_string()))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Some(fields) = task.as_object_mut() {
+            fields.insert("last_gate".to_string(), gate);
+        }
+    }
 }
 
 /// The RSI page (docs/fleet-architecture.md §10.4): every open objective
@@ -655,7 +687,7 @@ fn content_type(path: &str) -> &'static str {
 mod tests {
     use serde_json::json;
 
-    use super::{objective_json, rsi_summary};
+    use super::{objective_json, rsi_summary, with_last_gates};
     use crate::objectives::Task;
 
     fn objective(id: u32, recurring: bool) -> Task {
@@ -731,6 +763,17 @@ mod tests {
         let recurring = objective_json(&objective(2, true), &tasks);
         assert_eq!(recurring["status"], "open");
         assert_eq!(recurring["current"], 1200.0);
+    }
+
+    #[test]
+    fn the_board_gets_each_tasks_last_gate() {
+        let mut board = json!({"missions": [{"tasks": [{"id": 7}, {"id": 8}]}]});
+        with_last_gates(&mut board, &json!({"7": {"verdict": "accepted"}}));
+        assert_eq!(
+            board["missions"][0]["tasks"][0]["last_gate"]["verdict"],
+            "accepted"
+        );
+        assert!(board["missions"][0]["tasks"][1]["last_gate"].is_null());
     }
 
     #[test]

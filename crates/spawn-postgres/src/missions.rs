@@ -191,6 +191,12 @@ impl PostgresStore {
         self.query_json(missions::MISSION_BOARD, &[&limit])
     }
 
+    /// The last gate verdict of every task, keyed by task id. Needs read
+    /// access to `spawn_events` (the owner, the dashboard's reader).
+    pub fn last_gates(&self) -> Result<Value, StoreError> {
+        self.query_json(missions::LAST_GATES, &[])
+    }
+
     /// Open objective missions with their resident and their tasks' gate
     /// verdicts: the RSI page.
     pub fn objective_missions(&self) -> Result<Value, StoreError> {

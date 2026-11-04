@@ -66,18 +66,7 @@ select jsonb_build_object(
                  'review_note', k.review_note, 'report', k.report,
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
-                 'updated_at_ms', k.updated_at_ms,
-                 'last_gate', (select jsonb_build_object(
-                                 'verdict', r ->> 'verdict', 'reason', r ->> 'reason',
-                                 'metric', r ->> 'metric', 'candidate', r ->> 'candidate',
-                                 'at_ms', e.recorded_at_ms)
-                                 from spawn_events e
-                                cross join lateral (select e.kind -> 'detail' -> 'record' as r) g
-                                where e.session_id = 'session_control'
-                                  and e.event_name = 'control.recorded'
-                                  and r ->> 'type' = 'task.gated'
-                                  and r ->> 'id' = k.id::text
-                                order by e.session_seq desc limit 1)) order by k.id)
+                 'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
         from mission_missions m
        order by m.id desc limit $1) x), '[]'::jsonb),
@@ -125,6 +114,22 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
                                          where mission_id = $1 and objective = $2)
          order by e.session_seq desc
          limit $3) z";
+/// The last `task.gated` record of every task, keyed by task id:
+/// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
+/// [`MISSION_BOARD`]: the supervisor's login reads the board and may not
+/// read `spawn_events`.
+pub(crate) const LAST_GATES: &str = r"
+select coalesce(jsonb_object_agg(z.task, z.gate), '{}'::jsonb)
+  from (select distinct on (r ->> 'id') r ->> 'id' as task,
+               jsonb_build_object('verdict', r ->> 'verdict', 'reason', r ->> 'reason',
+                                  'metric', r ->> 'metric', 'candidate', r ->> 'candidate',
+                                  'at_ms', e.recorded_at_ms) as gate
+          from spawn_events e
+         cross join lateral (select e.kind -> 'detail' -> 'record' as r) g
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and r ->> 'type' = 'task.gated'
+         order by r ->> 'id', e.session_seq desc) z";
+
 /// Open objective missions (`objectives` = `{backlog, resident}`), for the
 /// RSI page: settings, the resident, and every task newest first with its
 /// gate verdicts from the control stream (oldest first, without logs).

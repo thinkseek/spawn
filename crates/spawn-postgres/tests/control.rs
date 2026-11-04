@@ -533,11 +533,6 @@ fn the_rsi_page_reads_it(store: &PostgresStore, mission: i64, task: i64) {
     assert_eq!(detail["brief"], "brief");
     assert_eq!(detail["gates"][0]["verdict"], "rejected");
     assert!(store.objective_task(task + 1000).expect("read").is_none());
-    let board = store.mission_board(10).expect("board");
-    let row = board["missions"][0]["tasks"]
-        .as_array()
-        .and_then(|tasks| tasks.iter().find(|row| row["id"] == task))
-        .cloned()
-        .expect("the task on the board");
-    assert_eq!(row["last_gate"]["verdict"], "rejected");
+    let gates = store.last_gates().expect("last gates");
+    assert_eq!(gates[task.to_string()]["verdict"], "rejected");
 }
