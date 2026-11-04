@@ -1,6 +1,6 @@
 # Spawn 技术方案与接口契约
 
-结论：Spawn 用 5 个 crate 连接现成组件。`spawn-core` 不碰 IO，只定义类型、端口与编排逻辑；实现层分别是 PostgreSQL、HTTP 判定、tmux 与 git 子进程；`spawn-cli` 做装配。全部代码同步阻塞。本文给出 crate 边界、ADT、端口契约、SQL 对象与验收口径，代码按本文实现。
+结论：Spawn 用 5 个 crate 连接现成组件。`spawn-core` 不碰 IO，只定义类型、端口与编排逻辑；实现层分别是 PostgreSQL、HTTP 判定、tmux 与 git 子进程；`spawn-cli` 做装配。全部代码同步阻塞。本文描述 crate 边界、ADT、端口契约、SQL 对象与验收口径。
 
 ## 1. 模块边界
 
@@ -22,7 +22,7 @@ spawn-core
         ↑ 只有 spawn-cli 依赖全部实现层
 ```
 
-`spawn-core` 的 13 个模块：`bridge`、`command`、`contract`、`event`、`id`、`ingest`、`memory`、`observation`、`observe`、`port`、`screen`、`shell`、`time`。
+`spawn-core` 的 14 个模块：`bridge`、`command`、`contract`、`event`、`id`、`ingest`、`memory`、`mission`、`observation`、`observe`、`port`、`screen`、`shell`、`time`。
 
 ## 2. 身份与 ID
 
@@ -53,15 +53,15 @@ spawn-core
 
 信封 `NewEvent { agent_id, session_id, execution_id, source, source_event_id, kind }`，写入返回 `EventRecord { position, session_seq, recorded_at, event }` 与 `Appended { record, inserted }`。
 
-`Source`：Claude、Codex、Bridge、Observer、Gateway。`Layerfs` 只为旧行保留，新写入不再使用。
+`Source`：Claude、Codex、Bridge、Observer、Gateway、Control。
 
 | 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |
-| `session.native_started` | Bridge（新会话由它命名）、旧版 hook、Codex | engine、native_session_id、transcript_path |
-| `session.native_ended` | 旧版 hook、Codex | reason |
+| `session.native_started` | Bridge（新会话由它命名）、Codex（`thread.started`） | engine、native_session_id、transcript_path |
+| `session.native_ended` | 无；保留它以读取日志里已有的行 | reason |
 | `session.linked` | Bridge | parent_session_id |
 | `message.received` | 会话记录（transcript） | 无 |
-| `notification.received` | 旧版 hook（不再产生） | notification_type |
+| `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |
 | `tool.started` | 会话记录、Codex | tool_name、tool_use_id |
 | `tool.completed` | 会话记录、Codex | tool_use_id、duration_ms |
 | `tool.failed` | 会话记录、Codex | tool_use_id、error |
@@ -69,11 +69,13 @@ spawn-core
 | `turn.failed` | 会话记录（API 错误行）、Codex | error |
 | `execution.started` | Bridge | engine、terminal、workspace、command_id；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code |
-| `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact |
+| `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
+| `merge.conflicted` | Bridge | files、marked |
 | `command.accepted` | Gateway 事务 | command_id |
 | `command.finished` | Worker | command_id、succeeded、error |
 | `screen.observed` | Bridge | state、evidence |
 | `observation.recorded` | Observer | observation |
+| `control.recorded` | 控制流（任务函数） | record（`{type, ...}`，见 fleet-architecture.md §10.1） |
 
 `turn.stopped` 只表示模型本轮停止，不等于任务完成。任务完成只由 `SemanticState::Completed` 表达。
 
@@ -81,7 +83,7 @@ spawn-core
 
 ## 4. 端口契约
 
-`spawn-core::port` 定义四个 trait 与错误类型。
+`spawn-core::port` 定义五个 trait 与错误类型。
 
 | trait | 方法 | 语义 |
 | --- | --- | --- |
@@ -92,7 +94,8 @@ spawn-core
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进空闲工作区的分支：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
-| `TerminalHost` | `start`、`submit_text`、`is_alive`、`capture_tail`、`terminate` | 终端生命周期与屏尾读取；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
+| `ChunkStore` | `put`、`get`、`contains` | 按内容寻址的大文件对象存储：对象以其字节的哈希命名，写一次、不改，读时校验（见 [storage.md](./storage.md)） |
+| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`capture_tail`、`read_from`、`terminate` | 终端生命周期、屏尾读取与读取引擎写的文件；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 
 错误类型：
 
@@ -119,7 +122,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 | 引擎 | 参数 |
 | --- | --- |
-| Claude | `--ax-screen-reader --settings <内联 JSON> [--resume <id>]` |
+| Claude | `--ax-screen-reader --allow-dangerously-skip-permissions --settings <内联 JSON> (--session-id <uuid> \| --resume <uuid>)` |
 | Codex | `exec --json [resume <id>] -- <prompt>` |
 
 不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`，Codex 输出另存到 `SPAWN_ENGINE_OUTPUT`；终端里没有数据库登录。
@@ -137,10 +140,10 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 | 来源 | 触发 | `cause` |
 | --- | --- | --- |
 | `Stop` 命令 | 用户 | `Stopped` |
-| `spawn run` | 引擎退出，runner 写引擎来源的 `execution.ended`，键 `<exec>:exited` | `Exited`，带退出码 |
+| `spawn run` | 引擎退出，runner 把退出码写进 `SPAWN_EXIT_FILE`，Bridge 下一个 tick 读到后走结束流程 | `Exited`，带退出码 |
 | tick 发现终端不在 | 进程崩溃或终端被外部杀掉 | `Lost` |
 
-引擎来源的结束事件只是报告；Bridge 下一次 tick 读到后执行结束流程并写自己的结束事件。折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行。
+折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行；其他来源的同名事件只是退出报告（`agent_executions.exit_reported`）。
 
 恢复：每次 `spawn tick` 是新进程，从位置 0 折叠全部事件得到活跃执行、原生会话 id 与待提交的 checkpoint。`Resume` 复用最新原生会话 id，新开 Execution 与 mount，优先 `--resume`；逻辑 Session 不变。
 
@@ -177,10 +180,11 @@ Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来
 
 Observer 每次 tick：
 
-1. 从游标读取增量，折叠成会话快照。
-2. 调 `StateJudge`。
-3. 状态或原因变化才追加 `observation.recorded`，`based_on_seq` 记录依据。
-4. `source = Observer` 的事件不进入快照；`observation.recorded` 只恢复上一次结论与 `based_on_seq`，新进程不重复写同一结论。
+1. 从游标读取增量，折叠成会话快照；控制流不进快照。
+2. 规则（`rules`）先判：事实能定的状态直接成为结论，`judge = rules`。
+3. 事实定不了的情形（`Ambiguity`）交给 `StateJudge`，附上歧义种类与规则的猜测；同一份证据（按指纹）不问第二次。
+4. 规则的结论在状态或原因变化时才追加 `observation.recorded`；判定器的每次回答都追加，带证据与指纹。`based_on_seq` 记录依据。
+5. `source = Observer` 的事件不进入快照；`observation.recorded` 只恢复上一次结论、`based_on_seq` 与指纹，新进程不重复写同一结论。
 
 快照规则：引擎事件（工具、消息、回合）比屏尾读数新，到达时清空 `screen` 与 `permission_pending`。
 
@@ -188,10 +192,10 @@ Observer 每次 tick：
 
 | 实现 | 用途 |
 | --- | --- |
-| `HeuristicJudge` | 纯规则，离线可用，测试基线。`name()` 返回 `heuristic` |
+| `HeuristicJudge` | 没有 Jev 地址（`SPAWN_JUDGE_URL`、`--judge-url`）时回答歧义情形的确定性判定器，离线可用，测试也用它；它不是规则层。`name()` 返回 `heuristic` |
 | `JevJudge` | HTTP，见第 8 节。`name()` 返回 `jev` |
 
-判定错误只产生 `Unknown + JudgeUnavailable`，不标记 Agent 死亡。
+判定错误时写规则的猜测，原因 `JudgeUnavailable`、置信度 0、要求关注；不标记 Agent 死亡，按退避重试。
 
 ## 8. Jev HTTP 契约
 
@@ -239,7 +243,7 @@ Observer 每次 tick：
 
 投影：`spawn_session_state` 每会话一行（最后序号、最后 id、事件数、最新 observation），由 `spawn_append` 在同一事务内更新，`session_seq` 守卫：行恰好落后一个事件时步进，否则从日志重折；迁移持 append 锁重折不一致的会话。会话归属取首个事件的 agent。
 
-视图：`agent_state`（读投影，每会话最新 observation，带 `event_id`）、`agent_status`（判定加最近一次执行，`live` 标记未结束）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`（带 `prompt`）、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记 runner 已报告退出，带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。视图取代早期物化视图与 CDC 方案。
+视图：`agent_state`（读投影，每会话最新 observation，带 `event_id`）、`agent_status`（判定加最近一次执行，`live` 标记未结束）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`（带 `prompt`）、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记 runner 已报告退出，带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。不用物化视图与 CDC：状态类视图读投影表，其余视图读时折叠。
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
 
@@ -264,7 +268,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | `mount` | `git archive refs/heads/<b> \| tar -x -C <dir>`；配置了镜像时再 `docker run -d -v <dir>:<dir> -w <dir>` |
 | `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A` → `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref` |
 | `unmount` | `docker rm -f`，再删工作树目录 |
-| `merge_base` | `main` 是分支头的祖先则 `Current`；否则 `git --attr-source=<main> merge-tree --write-tree --name-only -z <main> <head>`（合并规则取自 `main` 的 `.gitattributes`，只有 gate 能动它；裸仓库不加 `--attr-source` 不读树内属性）。退出码 1 为 `Conflicted`：消息种类（`-z` 输出里的稳定字符串）只有 `CONFLICT (contents)` 时，按下述同一安全流程把带冲突标记的合并树写进目录，分支不动，`main` 作为待定的第二父提交原子地写进 `<root>/.merge/<b>`（`main` 与冲突路径，NUL 分隔）；有别的冲突种类（modify/delete、改名、二进制）时什么都不改。待定合并存在时不再合并更新的 `main`：标记未解决返回 `Conflicted{marked: true}`，已解决返回 `Current`。`merge_base` 全程持有与 `commit` 相同的 `<index>.spawn-lock`；`mount`、`unmount` 都删掉待定文件（待定合并只属于写入它的那个目录）。`commit` 在待定合并列出的冲突文件里都没有完整的标记块（行首 `<<<<<<< `，其后一行恰为 `=======`，再其后行首 `>>>>>>> `；单独的 `=======` 不算）时以 `-p <head> -p <待定 main>` 提交（树未变也提交）并删掉待定文件，否则照常单父提交；干净时先动目录：临时索引 `read-tree <head 树>`、`update-index -q --refresh`、`read-tree -m -u <head 树> <合并树>`（目录里要改的文件与分支不符、或未跟踪文件挡路时拒绝，返回错误、什么都不改），再 `commit-tree -p <head> -p <main>`（保留 head 的 `Spawn-Large` trailer）和带旧值的 `update-ref`。顺序不能反：先动 ref 会让下一次 checkpoint 把旧文件提交回去，抹掉 `main` 的改动 |
+| `merge_base` | `main` 是分支头的祖先则 `Current`；否则 `git --attr-source=<main> merge-tree --write-tree --name-only -z <main> <head>`（合并规则取自 `main` 的 `.gitattributes`，只有 gate 能动它；裸仓库不加 `--attr-source` 不读树内属性）。退出码 1 为 `Conflicted`：消息种类（`-z` 输出里的稳定字符串）只有 `CONFLICT (contents)` 时，按下述同一安全流程把带冲突标记的合并树写进目录，分支不动，`main` 作为待定的第二父提交原子地写进 `<root>/.merge/<b>`（`main` 与冲突路径，NUL 分隔）；有别的冲突种类（modify/delete、改名、二进制）时什么都不改。待定合并存在时不合并更晚的 `main`：标记未解决返回 `Conflicted{marked: true}`，已解决返回 `Current`。`merge_base` 全程持有与 `commit` 相同的 `<index>.spawn-lock`；`mount`、`unmount` 都删掉待定文件（待定合并只属于写入它的那个目录）。`commit` 在待定合并列出的冲突文件里都没有完整的标记块（行首 `<<<<<<< `，其后一行恰为 `=======`，再其后行首 `>>>>>>> `；单独的 `=======` 不算）时以 `-p <head> -p <待定 main>` 提交（树未变也提交）并删掉待定文件，否则照常单父提交；干净时先动目录：临时索引 `read-tree <head 树>`、`update-index -q --refresh`、`read-tree -m -u <head 树> <合并树>`（目录里要改的文件与分支不符、或未跟踪文件挡路时拒绝，返回错误、什么都不改），再 `commit-tree -p <head> -p <main>`（保留 head 的 `Spawn-Large` trailer）和带旧值的 `update-ref`。顺序不能反：先动 ref 会让下一次 checkpoint 把旧文件提交回去，抹掉 `main` 的改动 |
 
 积分器（integrator）在评判前拒绝带待定合并（`<root>/.merge/<agent>`）或改动文件里有完整标记块（`GitWorkspace::conflict_markers`）的分支：记 `conflict`，附「先解决冲突标记」的说明。
 
@@ -284,13 +288,13 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 驱动隔离 | `postgres` 只在 `spawn-postgres`，HTTP 只在 `spawn-jev` |
 | 工具链 | edition 2024，`rust-version` 1.95 |
 | 调试信息 | dev `debug="line-tables-only"`、`split-debuginfo="packed"`；release `lto="thin"`、`codegen-units=1` |
-| 编译缓存 | 远端门禁 `RUSTC_WRAPPER=kache`，`CARGO_INCREMENTAL=0` |
+| 编译缓存 | 开发时可用 kache；门禁沙箱清空环境，`deploy/deploy.sh` 置空 `RUSTC_WRAPPER`，二者都不用它 |
 | 登录开销 | dev profile 对 `sha2`、`hmac`、`postgres-protocol` 开 `opt-level = 3`，SCRAM 登录从约 50 ms 降到约 6 ms |
-| 目标目录 | 远端固定 `CARGO_TARGET_DIR`，kache 复用，避免多轮 rsync 占盘 |
+| 目标目录 | 门禁的构建钩子把 `CARGO_TARGET_DIR` 固定在被测树内，两棵树不共用 |
 
 ## 12. 测试策略
 
-只测公开 API：断言全部位于各 crate 的 `tests/api.rs`，库内不写 `#[cfg(test)]`。
+库 crate 只测公开 API：断言位于各 crate 的 `tests/`（`api.rs` 等），库内不写 `#[cfg(test)]`。`spawn-cli` 是二进制，它的单元测试写在模块里。
 
 | crate | 覆盖 |
 | --- | --- |
@@ -299,34 +303,32 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
 | `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（列集快照、投影等于日志折叠、状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、非 owner 直查视图被拒、有授权写入与读函数过滤、共享一致性套件 |
 
-共享一致性套件 |
-
 共享一致性套件在 `spawn-core::contract`：`event_log`、`command_queue`、`workspace_store`、`terminal` 四个函数，任一实现都必须通过。
 
-门禁在 digest 执行：
+门禁：
 
 | 步骤 | 命令 |
 | --- | --- |
 | 唯一门禁 | `scripts/rsi/gate.sh <repo> <base> <candidate> rsi/scenarios`：`rsi/scenarios/build` 构建，`check-clippy`、`check-tests`（需 `SPAWN_TEST_DATABASE_URL`）、`check-e2e`、`check-blackbox`、`check-web` 逐个必过 |
-| 端到端 | `scripts/mvp-e2e.sh`：真 PG、真 git、真 tmux、脚本化引擎，覆盖整条决策链、任务、落地与目标任务 |
+| 端到端 | `scripts/e2e.sh`：真 PG、真 git、真 tmux、脚本化引擎，覆盖整条决策链、任务、落地与目标任务 |
 | 黑盒 | `scripts/blackbox/run-scenarios.sh`：CLI 契约、工作区导出（不含 `.git`）、提示落屏、视图与授权 |
 
 缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 
 ## 13. 已知限制
 
-| 项 | 现状 | 升级路径 |
+| 项 | 限制 | 改法 |
 | --- | --- | --- |
-| 无常驻进程 | 每次 `spawn tick` 连接 PG、从位置 0 折叠全部事件；耗时随事件数线性增长 | 常驻 worker 持有游标，或按会话快照 |
+| 启动折叠 | `spawn tick` 每次、`spawn loop` 每次启动都从位置 0 折叠全部事件；耗时随事件数线性增长 | 按会话快照 |
 | 租约续期 | Bridge 不续租；单条命令超过 `lease_ttl`（2 分钟）会被别的 worker 重取 | tick 内续租，或缩短单命令时长 |
 | 重试上限 | `spawn_claim` 无最大 attempt，坏命令会被反复领取 | 加 `max_attempts`，超限直接 `finish(failed)` |
 | schema 版本 | `migrate` 每次整体执行 `schema.sql`，无版本表 | 编号迁移文件与版本表 |
 | 子进程超时 | `git`、`docker`、`tmux` 调用没有超时 | `wait_timeout` 或独立线程计时 |
-| 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 由会话记录的 `turn.failed` 取代 |
+| 屏尾报错 | `Error` 状态靠关键字匹配，误判可能 | 只用会话记录的 `turn.failed` |
 | 视图读取 | 状态与新鲜度读投影表，其余视图读时折叠；迁移每次按会话聚合全量日志 | 日志很大时加迁移版本号，只跑一次，见 [view-architecture.md](./view-architecture.md) |
 | 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 | 接入 `LISTEN/NOTIFY` |
 | 写入串行 | `spawn_append` 用一把全局 advisory lock | 按会话分锁 |
 | 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 | 用真实服务做契约测试 |
-| 大文件 | git 按内容寻址，改动一次就整份重存；工作树里不应放大文件 | 需要时接 git LFS |
+| 大文件 | 超过 8 MiB 的文件存在主机本地的块存储里，换一台主机就挂载失败 | 块存储放到 R2（见 [storage.md](./storage.md)） |
 | tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 | `paste-buffer` |
 | mount 泄漏 | mount 与 `execution.started` 之间崩溃会遗留一个 mount | 启动时清扫未记录的 mount |
