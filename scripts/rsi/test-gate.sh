@@ -18,6 +18,12 @@ mkdir -p "$HOME/.config/spawn" "$HOME/.ssh" "$HOME/.local/share/spawn-rsi"
 echo owner-secret >"$HOME/.config/spawn/secret"
 echo owner-key >"$HOME/.ssh/id_test"
 echo owner-session >"$HOME/.claude.json"
+# Files no deny-list named: the allow-list hides them too.
+printf '[credential]\n\thelper = owner-helper\n' >"$HOME/.gitconfig"
+echo owner-oauth >"$HOME/.claude.json.backup"
+echo 'export TOKEN=owner' >"$HOME/.bash_history"
+mkdir -p "$HOME/.hermes"
+echo owner-hermes >"$HOME/.hermes/key"
 echo SPAWN_DATABASE_URL=owner >"$HOME/.local/share/spawn-rsi/spawn.env"
 
 repo=$work/repo.git
@@ -33,6 +39,23 @@ commit() {
 printf 'one\n' >"$seed/value"
 mkdir -p "$seed/judge"
 printf 'keep\n' >"$seed/judge/rule"
+# A crate with tests and lint configuration, for the ratchets.
+mkdir -p "$seed/crates/lib/src"
+printf '[package]\nname = "lib"\n\n[lints.clippy]\nall = "deny"\n' >"$seed/crates/lib/Cargo.toml"
+cat >"$seed/crates/lib/src/lib.rs" <<'EOF'
+#![deny(missing_docs)]
+//! A library.
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one() {}
+
+    #[tokio::test]
+    async fn two() {}
+}
+EOF
+lib=$seed/crates/lib/src/lib.rs
 base=$(commit base)
 
 # The controller's scenarios: a build hook that writes a "binary", a task
@@ -206,6 +229,71 @@ sandboxed=$(commit sandbox)
 expect "candidate code is confined" "$(judge "$sandboxed")" 'exit=0 {"verdict":"accepted"}'
 [ ! -e "$work/escaped" ] || { echo "FAIL the sandbox wrote $work/escaped"; exit 1; }
 
+# 3b. $HOME is an allow-list: a file nobody thought to mask is not there.
+branch home
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+fail=0
+for f in .gitconfig .claude.json.backup .bash_history .hermes/key; do
+    if cat "$HOME/$f" 2>/dev/null | grep -q owner; then echo "read ~/$f"; fail=1; fi
+done
+exit $fail
+EOF
+home=$(commit home)
+expect "a \$HOME file outside the allow-list is not readable" "$(judge "$home")" 'exit=0 {"verdict":"accepted"}'
+
+# 3b'. A tool PATH finds under $HOME (node through a ~/.local/bin symlink)
+# still runs; its neighbours in ~/.local/bin stay hidden.
+mkdir -p "$HOME/opt/node/bin" "$HOME/.local/bin" "$HOME/.cargo/bin"
+printf '#!/bin/sh\necho fake-node\n' >"$HOME/opt/node/bin/node"
+chmod 755 "$HOME/opt/node/bin/node"
+ln -s "$HOME/opt/node/bin/node" "$HOME/.local/bin/node"
+printf '#!/bin/sh\n# token=owner\n' >"$HOME/.local/bin/owner-tool"
+branch tools
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+[ "$(node)" = fake-node ] || { echo "node does not run"; exit 1; }
+[ ! -e "$HOME/.local/bin/owner-tool" ] || { echo "sees ~/.local/bin/owner-tool"; exit 1; }
+EOF
+tools=$(commit tools)
+expect "a tool under \$HOME runs, its neighbours stay hidden" \
+    "$(PATH="$HOME/.local/bin:$PATH" judge "$tools")" 'exit=0 {"verdict":"accepted"}'
+
+# 3c. No network but loopback: a host listener and the live database port
+# are unreachable; the sandbox's own loopback works.
+listener=$work/listener.port
+python3 -c '
+import socket, sys, time
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+print(s.getsockname()[1], flush=True)
+time.sleep(600)' >"$listener" &
+listener_pid=$!
+trap 'kill "$listener_pid" 2>/dev/null; rm -rf "$work" "$marker"' EXIT
+while [ ! -s "$listener" ]; do sleep 0.1; done
+host_port=$(cat "$listener")
+# The probe's control: the host listener answers from outside the sandbox.
+python3 -c "import socket; socket.create_connection(('127.0.0.1', $host_port), 2)"
+branch network
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<EOF
+#!/bin/sh
+fail=0
+for port in $host_port 15433; do
+    if python3 -c "import socket; socket.create_connection(('127.0.0.1', \$port), 2)" 2>/dev/null; then
+        echo "reached 127.0.0.1:\$port"; fail=1
+    fi
+done
+python3 -c '
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
+socket.create_connection(s.getsockname(), 2)' || { echo "no loopback"; fail=1; }
+exit \$fail
+EOF
+network=$(commit network)
+expect "the host's listeners (and 127.0.0.1:15433) are unreachable" "$(judge "$network")" 'exit=0 {"verdict":"accepted"}'
+
 # 4. A build script by another name: `build = ` in any Cargo.toml, however
 # spelled. `[build-dependencies]` and `build-override` are not build keys.
 branch buildkey
@@ -243,6 +331,59 @@ printf '#!/bin/sh\necho "METRIC speed baseline=10 candidate=1"\n' >"$seed/noise.
 twice=$(commit metric-twice)
 expect "two METRIC lines on stdout: no metric" "$(judge "$twice" "$scenarios/008.sh")" 'exit=0 {"verdict":"accepted"}'
 expect "two METRIC lines are reported" "$(cat "$work/gate.out")" 'two or more METRIC lines'
+
+# 7. The candidate may not weaken its own tests: the count of test
+# attributes minus ignores may not fall. A moved test is not a drop.
+branch tests-dropped
+printf 'two\n' >"$seed/value"
+sed -i '/#\[tokio::test\]/,/async fn two/d' "$lib"
+dropped=$(commit tests-dropped)
+expect "a dropped test is refused" "$(judge "$dropped")" 'drops or ignores tests (2 -> 1)'
+branch tests-ignored
+printf 'two\n' >"$seed/value"
+sed -i 's/^    #\[test\]$/    #[test]\n    #[ignore = "flaky"]/' "$lib"
+ignored=$(commit tests-ignored)
+expect "an ignored test is refused" "$(judge "$ignored")" 'drops or ignores tests (2 -> 1)'
+branch tests-cfg-ignored
+printf 'two\n' >"$seed/value"
+sed -i 's/^    #\[tokio::test\]$/    #[tokio::test] #[cfg_attr(all(), ignore)]/' "$lib"
+cfg_ignored=$(commit tests-cfg-ignored)
+expect "a test ignored through cfg_attr is refused" "$(judge "$cfg_ignored")" 'drops or ignores tests'
+branch tests-moved
+printf 'two\n' >"$seed/value"
+sed -i '/#\[tokio::test\]/,/async fn two/d' "$lib"
+mkdir -p "$seed/crates/lib/tests"
+printf '#[tokio::test]\nasync fn two() {}\n' >"$seed/crates/lib/tests/two.rs"
+moved=$(commit tests-moved)
+expect "a moved test is not a drop" "$(judge "$moved")" 'exit=0 {"verdict":"accepted"}'
+
+# 8. Nor relax its lints: [lints] tables, clippy.toml, crate-level allows,
+# a removed crate-level deny.
+branch lints-table
+printf 'two\n' >"$seed/value"
+sed -i 's/^all = "deny"$/all = "allow"/' "$seed/crates/lib/Cargo.toml"
+table=$(commit lints-table)
+expect "a relaxed [lints] table is refused" "$(judge "$table")" 'lint configuration'
+branch lints-clippy-toml
+printf 'two\n' >"$seed/value"
+printf 'too-many-lines-threshold = 1000\n' >"$seed/clippy.toml"
+clippy_toml=$(commit lints-clippy-toml)
+expect "a new clippy.toml is refused" "$(judge "$clippy_toml")" 'lint configuration'
+branch lints-allow
+printf 'two\n' >"$seed/value"
+sed -i '1i #![allow(\n    clippy::all,\n)]' "$lib"
+allowed=$(commit lints-allow)
+expect "a new crate-level allow (multi-line) is refused" "$(judge "$allowed")" 'relaxes crate-level lints'
+branch lints-deny-removed
+printf 'two\n' >"$seed/value"
+sed -i '/#!\[deny(missing_docs)\]/d' "$lib"
+undenied=$(commit lints-deny-removed)
+expect "a removed crate-level deny is refused" "$(judge "$undenied")" 'relaxes crate-level lints'
+branch lints-deny-added
+printf 'two\n' >"$seed/value"
+sed -i '1i #![forbid(unsafe_code)]' "$lib"
+tightened=$(commit lints-deny-added)
+expect "a new crate-level forbid is fine" "$(judge "$tightened")" 'exit=0 {"verdict":"accepted"}'
 
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted

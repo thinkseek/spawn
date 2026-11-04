@@ -32,21 +32,40 @@
 # `cargo metadata` on the candidate's manifests. Inside it the root is
 # read-only, /tmp is private, the PID namespace is new (the gate and the
 # integrator are not in /proc), the tree under test is the only writable
-# path, the base tree is read-only, and the owner's secrets under $HOME (see
-# `masked` below), the user's runtime directory and the docker socket are
-# hidden. The environment is cleared down to the list below. The network is
-# shared: the checks reach the test database. Cargo gets a private
+# path, the base tree is read-only, and the user's runtime directory, the
+# docker socket and the host's TMPDIR are hidden. $HOME is an empty tmpfs
+# with an allow-list bound back read-only (see `home_binds` below): the
+# Rust toolchain, the install roots of node/npm/bun when they live there,
+# and the controller's `scripts` and `web/node_modules` (the controller is
+# the directory two levels above the scenarios). The network namespace is
+# new: loopback only, so no host service (the live database, serve, the Jev
+# relay) is reachable. The checks reach the test database through its Unix
+# socket: when SPAWN_TEST_DATABASE_URL's host is a percent-encoded path, that
+# directory is bound in; a TCP test URL does not work inside. The
+# environment is cleared down to the list below. Cargo gets a private
 # CARGO_HOME whose registry and git caches are the real ones, read-only, and
 # runs offline: a candidate cannot fetch a new crate or rewrite a cached one.
 # Git reads the gate's own config (an identity, no signing), not the
 # owner's.
-# The checks find the controller's checkout through the read-only root, so
-# the scenarios directory must not live under /tmp or a masked path.
+#
+# The candidate's own tests and lints judge it too (check-tests,
+# check-clippy), so it may not weaken them. Two cheap text rules, on the
+# exported trees, before anything runs:
+# - Test count: over every .rs file, the test attributes (`#[test]`,
+#   `#[tokio::test]`, any `#[<path>::test]`) minus the `#[ignore]`s (also
+#   inside `cfg_attr`) may not fall from base to candidate.
+# - Lint configuration: a change to a `[lints]` / `[workspace.lints]` table
+#   (or `lints.` keys) in any Cargo.toml, any change to clippy.toml or
+#   .clippy.toml, a new crate-level `#![allow(..)]` / `#![expect(..)]` (or one
+#   in `cfg_attr`), or a removed `#![warn|deny|forbid(..)]` is refused.
+# Neither rule sees a test module dropped from the build (`mod tests;`
+# removed, `#[cfg(any())]`) or an item-level `#[allow]`: a reviewer's job.
 #
 # Environment (the integrator passes these and nothing else, gate.rs):
 #   PATH, HOME, LANG, TMPDIR   as usual
 #   CARGO_HOME, RUSTUP_HOME    when the toolchain is not under $HOME
-#   SPAWN_TEST_DATABASE_URL    the throwaway database the checks may use
+#   SPAWN_TEST_DATABASE_URL    the throwaway database the checks may use, as
+#                              a socket URL (postgres://u:p@%2Fdir/db)
 #   SPAWN_GATE_VERDICT         a file in a directory the integrator owns; the
 #                              verdict is written there too, and the
 #                              integrator believes that file only, and only
@@ -127,10 +146,85 @@ if [ -n "$scenario" ] && [ ! -f "$scenario" ]; then
     exit 0
 fi
 
-# The owner's secrets: hidden from every sandboxed process.
-masked=".config .claude .claude.json .ssh .local/share/spawn-rsi .codex .docker .gnupg
-.netrc .git-credentials .npmrc .pgpass .aws .kube .cargo/credentials .cargo/credentials.toml"
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
+rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+# The controller's checkout, as the checks locate it (two levels above the
+# scenarios directory).
+controller=$(cd "$scenarios/../.." && pwd)
+
+# $HOME in the sandbox is an empty tmpfs. Bound back read-only, one path per
+# line: the Rust toolchain (rustup's proxies and toolchains), the install
+# root of each tool in `home_tools` that lives under $HOME (with a symlink
+# where PATH found it), and the controller's `scripts` and
+# `web/node_modules`, which the checks use. Nothing else of $HOME is
+# visible: not ~/.gitconfig, not ~/.claude.json.backup, not shell history.
+home_tools="node npm npx bun"
+home_binds=""
+home_links=""
+under_home() {
+    case "$1" in "$HOME"/*) return 0 ;; esac
+    return 1
+}
+bind_home() {
+    [ -e "$1" ] || return 0
+    home_binds="$home_binds$1
+"
+}
+bound() {
+    old_ifs=$IFS
+    IFS='
+'
+    for bound_root in $home_binds; do
+        case "$1" in "$bound_root" | "$bound_root"/*)
+            IFS=$old_ifs
+            return 0
+            ;;
+        esac
+    done
+    IFS=$old_ifs
+    return 1
+}
+under_home "$cargo_home/bin" && bind_home "$cargo_home/bin"
+under_home "$rustup_home" && bind_home "$rustup_home"
+for tool in $home_tools; do
+    found=$(command -v "$tool" 2>/dev/null) || continue
+    real=$(readlink -f "$found")
+    under_home "$real" || continue
+    root=$(dirname "$real")
+    [ "$(basename "$root")" = bin ] && root=$(dirname "$root")
+    # A plain file in ~/bin or ~/.local/bin: that file, not the directory
+    # above it.
+    case "$root" in "$HOME" | "$HOME/.local") root=$real ;; esac
+    bound "$real" || bind_home "$root"
+    if [ "$found" != "$real" ] && under_home "$found" && ! bound "$found"; then
+        home_links="$home_links$real|$found
+"
+    fi
+done
+for path in "$controller/scripts" "$controller/web/node_modules"; do
+    under_home "$path" && bind_home "$path"
+done
+
+# The test database, reached over its Unix socket: the sandbox has no
+# network but its own loopback. A URL whose host is a percent-encoded path
+# (postgres://user:pw@%2Fpath%2Fto%2Fdir/db) names the socket directory.
+db_socket=""
+case "${SPAWN_TEST_DATABASE_URL-}" in
+*://*)
+    db_host=${SPAWN_TEST_DATABASE_URL#*://}
+    db_host=${db_host##*@}
+    db_host=${db_host%%/*}
+    db_host=${db_host%%\?*}
+    case "$db_host" in
+    %2[Ff]*)
+        db_host=${db_host%:[0-9]*}
+        db_socket=$(printf '%s' "$db_host" | sed 's/%2[Ff]/\//g')
+        case "$db_socket" in *%*) db_socket="" ;; esac
+        [ -d "$db_socket" ] || db_socket=""
+        ;;
+    esac
+    ;;
+esac
 
 # sandbox <tree> <command...>: run a command inside the tree, in bwrap.
 sandbox() {
@@ -138,37 +232,39 @@ sandbox() {
     shift
     count=$#
     set -- "$@" bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
-        --unshare-pid --die-with-parent --new-session
-    for name in $masked; do
-        if [ -d "$HOME/$name" ]; then
-            set -- "$@" --tmpfs "$HOME/$name"
-        elif [ -e "$HOME/$name" ]; then
-            set -- "$@" --ro-bind /dev/null "$HOME/$name"
-        fi
-    done
+        --unshare-pid --unshare-net --die-with-parent --new-session
     runtime=/run/user/$(id -u)
     [ -d "$runtime" ] && set -- "$@" --tmpfs "$runtime"
     for socket in /run/docker.sock /var/run/docker.sock; do
         [ -S "$socket" ] && set -- "$@" --ro-bind /dev/null "$socket"
     done
-    # The host's TMPDIR when it is not /tmp (unless it holds $HOME), the
-    # gate's own files and the integrator's verdict directory, wherever
-    # TMPDIR put them.
+    for name in credentials credentials.toml; do
+        [ -e "$cargo_home/$name" ] && set -- "$@" --ro-bind /dev/null "$cargo_home/$name"
+    done
+    # The host's TMPDIR when it is not /tmp, the gate's own files and the
+    # integrator's verdict directory, wherever TMPDIR put them.
     case "${TMPDIR:-/tmp}" in
-    / | /tmp | /tmp/ | "$HOME" | "$HOME"/*) ;;
-    *)
-        case "$HOME/" in
-        "${TMPDIR%/}"/*) ;;
-        *) [ -d "$TMPDIR" ] && set -- "$@" --tmpfs "$TMPDIR" ;;
-        esac
-        ;;
+    / | /tmp | /tmp/) ;;
+    *) [ -d "$TMPDIR" ] && set -- "$@" --tmpfs "$TMPDIR" ;;
     esac
     set -- "$@" --tmpfs "$work"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         set -- "$@" --tmpfs "$(dirname "$SPAWN_GATE_VERDICT")"
     fi
+    set -- "$@" --tmpfs "$HOME"
+    old_ifs=$IFS
+    IFS='
+'
+    for path in $home_binds; do
+        set -- "$@" --ro-bind "$path" "$path"
+    done
+    for link in $home_links; do
+        set -- "$@" --symlink "${link%%|*}" "${link#*|}"
+    done
+    IFS=$old_ifs
     set -- "$@" --ro-bind "$scenarios" "$scenarios"
     [ -n "$scenario" ] && set -- "$@" --ro-bind "$scenario" "$scenario"
+    [ -n "$db_socket" ] && set -- "$@" --ro-bind "$db_socket" "$db_socket"
     if [ "$tree" != "$work/baseline" ] && [ -d "$work/baseline" ]; then
         set -- "$@" --ro-bind "$work/baseline" "$work/baseline"
     fi
@@ -282,6 +378,87 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
         verdict rejected "candidate adds build-time code (a build script target)"
         exit 0
     fi
+fi
+
+# The candidate's own tests and lints judge it (check-tests, check-clippy):
+# it may not weaken them (the rules are in the header). Text only, on the
+# exported trees, before anything is built.
+
+# test_count <tree>: test attributes minus ignores, over every .rs file.
+test_count() {
+    find "$1" -name '*.rs' -type f -exec cat {} + 2>/dev/null | awk '
+        {
+            tests += gsub(/#\[([A-Za-z_][A-Za-z0-9_]*::)*test[[:space:]]*[](]/, "")
+            ignored += gsub(/#\[ignore[[:space:]]*[]=(]/, "")
+            ignored += gsub(/#\[cfg_attr\([^]]*[(,[:space:]]ignore[[:space:]]*[]),=]/, "")
+        }
+        END { print tests - ignored + 0 }'
+}
+base_tests=$(test_count "$work/baseline")
+candidate_tests=$(test_count "$work/candidate")
+if [ "$candidate_tests" -lt "$base_tests" ]; then
+    echo "| test attributes minus #[ignore]: $base_tests on the base, $candidate_tests on the candidate"
+    verdict rejected "candidate drops or ignores tests ($base_tests -> $candidate_tests)"
+    exit 0
+fi
+
+# lint_config <tree>: every [lints]/[workspace.lints] line (and `lints.`
+# key) of every Cargo.toml, and every clippy.toml, one fact per line.
+lint_config() {
+    (
+        cd "$1" || exit 1
+        find . -name Cargo.toml -type f | sort | while IFS= read -r manifest; do
+            awk -v file="$manifest" '
+                { sub(/#.*/, "") }
+                /^[[:space:]]*\[/ { inlints = ($0 ~ /^[[:space:]]*\[(workspace\.)?lints([].])/) }
+                inlints || /^[[:space:]]*(workspace\.)?lints[[:space:]]*[.=]/ {
+                    gsub(/[[:space:]]+/, "")
+                    if ($0 != "") print file ": " $0
+                }' "$manifest"
+        done
+        find . \( -name clippy.toml -o -name .clippy.toml \) -type f | sort | while IFS= read -r file; do
+            sed "s|^|$file: |" "$file"
+        done
+    )
+}
+if [ "$(lint_config "$work/baseline")" != "$(lint_config "$work/candidate")" ]; then
+    echo "| candidate changes lint configuration ([lints] tables or clippy.toml)"
+    verdict rejected "candidate changes lint configuration"
+    exit 0
+fi
+
+# crate_lints <tree>: crate-level lint attributes, `file|attribute`, with
+# whitespace removed and a multi-line attribute joined.
+crate_lints() {
+    (
+        cd "$1" || exit 1
+        find . -name '*.rs' -type f -exec awk '
+            FNR == 1 { open = 0 }
+            {
+                line = $0
+                if (!open && match(line, /#![[:space:]]*\[/)) { open = 1; text = ""; line = substr(line, RSTART) }
+                if (open) {
+                    text = text line
+                    if (index(line, "]")) {
+                        open = 0
+                        gsub(/[[:space:]]+/, "", text)
+                        text = substr(text, 1, index(text, "]"))
+                        if (text ~ /^#!\[(allow|expect|warn|deny|forbid|cfg_attr)\(/) print FILENAME "|" text
+                    }
+                }
+            }' {} + | sort -u
+    )
+}
+crate_lints "$work/baseline" >"$work/lints.base"
+crate_lints "$work/candidate" >"$work/lints.candidate"
+relaxed=$( {
+    comm -13 "$work/lints.base" "$work/lints.candidate" | grep -E '\|#!\[(allow|expect|cfg_attr)\(' || true
+    comm -23 "$work/lints.base" "$work/lints.candidate" | grep -E '\|#!\[(warn|deny|forbid|cfg_attr)\(' || true
+})
+if [ -n "$relaxed" ]; then
+    echo "| candidate relaxes crate-level lints: $(echo "$relaxed" | sed 's|^\./||' | tr '\n' ' ')"
+    verdict rejected "candidate relaxes crate-level lints"
+    exit 0
 fi
 
 if [ -n "$scenario" ]; then
