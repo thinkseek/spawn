@@ -26,7 +26,8 @@
 #      landed work);
 #   2. a pg_dump of the live database into the backups directory (the
 #      password reaches pg_dump through PGPASSWORD, never argv);
-#   3. a release build without the compiler cache (kache stays out of deploys);
+#   3. a release build without the compiler cache (kache stays out of deploys)
+#      and the UI build (web/, served from $live/web);
 #   4. the binary is installed next to the old one (spawn.prev), by rename;
 #   5. the integrator is stopped, main is read again (it must still be the
 #      verdict's base), the schema migrated, main moves forward (never
@@ -82,10 +83,17 @@ with_db "$SPAWN_DATABASE_URL" pg_dump -Fc -f "$dump"
 say "backup $dump ($(stat -c %s "$dump") bytes)"
 
 RUSTC_WRAPPER= cargo build --release -q
+# The UI is built from the same commit and served from the live directory,
+# so edits in the checkout never reach the served UI before a deploy.
+rm -rf "$live/web.new"
+(cd web && ./node_modules/.bin/tsc --noEmit && ./node_modules/.bin/vite build --logLevel warn --outDir "$live/web.new" --emptyOutDir)
 cp target/release/spawn "$live/bin/spawn.new"
 cp "$live/bin/spawn" "$live/bin/spawn.prev"
 mv "$live/bin/spawn.new" "$live/bin/spawn"
-say "installed $("$live/bin/spawn" version 2>/dev/null || echo "$head")"
+rm -rf "$live/web.prev"
+[ ! -d "$live/web" ] || mv "$live/web" "$live/web.prev"
+mv "$live/web.new" "$live/web"
+say "installed $("$live/bin/spawn" version 2>/dev/null || echo "$head") and the UI"
 
 restart() { systemctl --user restart spawn-loop spawn-integrate spawn-serve; }
 # From here on, a failure must not leave the integrator stopped.
