@@ -49,7 +49,10 @@ impl PostgresStore {
             )
             .map_err(|error| backend(&error))?;
         let row = client
-            .query_opt(gateway::NEWEST_COMMAND_ID, &[&submission.session_id.as_str()])
+            .query_opt(
+                gateway::NEWEST_COMMAND_ID,
+                &[&submission.session_id.as_str()],
+            )
             .map_err(|error| backend(&error))?;
         Ok(CommandId(row.map_or(0, |row| {
             row.get::<_, i64>("command_id").unsigned_abs()

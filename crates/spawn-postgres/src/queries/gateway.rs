@@ -3,7 +3,8 @@
 //! sees and sends exactly what `spawn_grants` allows.
 
 /// The fleet as one JSON array.
-pub(crate) const FLEET: &str = "select coalesce(jsonb_agg(row_to_json(f) order by f.session_id), '[]'::jsonb) as fleet
+pub(crate) const FLEET: &str =
+    "select coalesce(jsonb_agg(row_to_json(f) order by f.session_id), '[]'::jsonb) as fleet
                    from (
                      select s.session_id, s.agent_id, s.state, s.live, s.engine,
                             s.execution_id, s.started_at_ms, s.ended_at_ms, s.last_event_at_ms,
@@ -51,7 +52,8 @@ pub(crate) const TAIL: &str = "select jsonb_build_object(
 /// Submit as the database login. No RETURNING: that needs SELECT on the
 /// view, which a restricted login does not hold.
 /// `$1` agent, `$2` session, `$3` idempotency key, `$4` action.
-pub(crate) const SUBMIT: &str = "insert into agent_commands (agent_id, session_id, idempotency_key, action)
+pub(crate) const SUBMIT: &str =
+    "insert into agent_commands (agent_id, session_id, idempotency_key, action)
                  values ($1, $2, $3, $4)";
 
 /// Newest command of a session the login may see. `$1` session.
