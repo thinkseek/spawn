@@ -21,6 +21,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use serde::Deserialize;
 use spawn_core::command::{CommandAction, Submission};
@@ -29,6 +30,7 @@ use spawn_core::observation::{Ambiguity, Observation, SemanticState, WaitReason}
 use spawn_core::port::CommandQueue;
 use spawn_postgres::PostgresStore;
 
+use crate::deliver::{self, Work};
 use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
 
 /// Principal the dispatcher submits as.
@@ -107,6 +109,14 @@ pub(crate) enum Why {
     /// The worker stopped at its prompt and nothing allowed a nudge: it
     /// waits for its next instruction.
     Idle,
+    /// A new mission is in the inbox.
+    Mission,
+    /// A worker reported on its task.
+    Report,
+    /// A human approved a resident.
+    Approved,
+    /// A human wrote to a worker directly.
+    Human,
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -133,6 +143,8 @@ pub(crate) struct Order {
     pub(crate) session_id: String,
     pub(crate) key: String,
     pub(crate) action: CommandAction,
+    /// The task this command delivers, if any.
+    pub(crate) task: Option<i64>,
 }
 
 /// What one dispatcher step does.
@@ -193,6 +205,7 @@ fn order(facts: &Facts, key: String, action: CommandAction) -> Order {
         session_id: facts.session_id.clone(),
         key,
         action,
+        task: None,
     }
 }
 
@@ -413,11 +426,10 @@ fn fnv(text: &str) -> u64 {
 /// The digest typed into the supervisor's pane.
 fn digest(items: &[Escalation], spawn: &str) -> String {
     let mut text = format!(
-        "Spawn dispatcher: {} worker{} need{} a decision. Check each with `{spawn} tail --session \
-<session>` before acting.\n",
+        "Spawn dispatcher: {} update{} for you. Check a worker with `{spawn} tail --session \
+<session>` before acting; missions and tasks with `{spawn} mission list`.\n",
         items.len(),
         if items.len() == 1 { "" } else { "s" },
-        if items.len() == 1 { "s" } else { "" },
     );
     for item in items {
         let kind = match item.why {
@@ -426,6 +438,10 @@ fn digest(items: &[Escalation], spawn: &str) -> String {
             Why::ResumeFailed => "resume failed",
             Why::Completed => "completed, review it",
             Why::Idle => "idle, give it the next step or review it",
+            Why::Mission => "new mission, plan it and assign tasks",
+            Why::Report => "report, review it (`task accept` or `task reject`)",
+            Why::Approved => "resident approved",
+            Why::Human => "human message",
         };
         let _ = writeln!(
             text,
@@ -438,25 +454,43 @@ fn digest(items: &[Escalation], spawn: &str) -> String {
     text
 }
 
-/// The whole policy as a pure function of the facts.
+/// The whole policy as a pure function of the facts, without missions.
+#[cfg(test)]
 pub(crate) fn decide(rows: &[Facts], supervised: bool, now_ms: i64, spawn: &str) -> Plan {
+    decide_with(rows, &Work::default(), supervised, now_ms, spawn)
+}
+
+/// The whole policy as a pure function of the facts and the mission rows.
+pub(crate) fn decide_with(
+    rows: &[Facts],
+    work: &Work,
+    supervised: bool,
+    now_ms: i64,
+    spawn: &str,
+) -> Plan {
     let supervisor = rows
         .iter()
         .find(|facts| facts.session_id == SUPERVISOR_SESSION);
     let told = delivered(supervisor);
-    let mut plan = Plan::default();
-    for facts in rows
-        .iter()
-        .filter(|facts| facts.agent_id.starts_with("agent_worker_"))
-    {
+    let mut plan = Plan {
+        orders: deliver::orders(work, rows),
+        pending: Vec::new(),
+    };
+    let in_flight = work.in_flight();
+    for facts in rows.iter().filter(|facts| {
+        facts.agent_id.starts_with("agent_worker_") || facts.agent_id.starts_with("agent_resident_")
+    }) {
+        // A managed worker between tasks is not news: its report already
+        // was, and the supervisor decides what comes next.
+        if work.managed(&facts.session_id) && !in_flight.contains(facts.session_id.as_str()) {
+            continue;
+        }
         let (order, escalation) = decide_worker(facts, now_ms);
         plan.orders.extend(order);
-        if let Some(escalation) = escalation
-            && !told.contains(&escalation.marker())
-        {
-            plan.pending.push(escalation);
-        }
+        plan.pending.extend(escalation);
     }
+    plan.pending.extend(deliver::news_items(&work.news));
+    plan.pending.retain(|item| !told.contains(&item.marker()));
     let Some(supervisor) = supervisor.filter(|_| supervised) else {
         return plan;
     };
@@ -477,28 +511,41 @@ pub(crate) fn decide(rows: &[Facts], supervised: bool, now_ms: i64, spawn: &str)
         action: CommandAction::Input {
             text: digest(&items, spawn),
         },
+        task: None,
     });
     plan
 }
 
-/// The plan for the current facts, without submitting anything.
-pub(crate) fn plan(store: &PostgresStore, supervised: bool, spawn: &str) -> Result<Plan, String> {
+/// Facts and mission rows, read once per step.
+fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     let rows: Vec<Facts> =
         serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
             .map_err(|error| format!("dispatch facts: {error}"))?;
-    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
-    Ok(decide(&rows, supervised, now, spawn))
+    Ok((rows, Work::load(store)?))
 }
 
-/// Run one dispatcher step against the store. Returns log lines.
+/// The plan for the current facts, without submitting anything.
+pub(crate) fn plan(store: &PostgresStore, supervised: bool, spawn: &str) -> Result<Plan, String> {
+    let (rows, work) = load(store)?;
+    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+    Ok(decide_with(&rows, &work, supervised, now, spawn))
+}
+
+/// Run one dispatcher step against the store: collect reports from idle
+/// workers under `root`, then submit the plan. Returns log lines.
 pub(crate) fn step(
     store: &PostgresStore,
     supervised: bool,
     spawn: &str,
+    root: Option<&Path>,
 ) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    if let Some(root) = root {
+        let (rows, work) = load(store)?;
+        lines.extend(deliver::collect_reports(store, &work, &rows, root));
+    }
     let plan = plan(store, supervised, spawn)?;
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
-    let mut lines = Vec::new();
     for order in plan.orders {
         let submission = Submission {
             agent_id: AgentId::new(order.agent_id.clone()).map_err(|error| error.to_string())?,
@@ -508,9 +555,14 @@ pub(crate) fn step(
                 .map_err(|error| error.to_string())?,
             action: order.action,
         };
-        store
+        let command = store
             .submit(&principal, &submission)
             .map_err(|error| error.to_string())?;
+        if let Some(task) = order.task {
+            store
+                .task_delivered(task, i64::try_from(command.0).unwrap_or(i64::MAX))
+                .map_err(|error| error.to_string())?;
+        }
         lines.push(format!("dispatch: {} -> {}", order.key, order.session_id));
     }
     Ok(lines)

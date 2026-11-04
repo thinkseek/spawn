@@ -573,7 +573,10 @@ struct Supervisor;
 
 impl ObservationContext for Supervisor {
     fn screen_tail(&self, _session: &SessionId) -> Option<String> {
-        Some("you: deploy it\nclaude: The build is green.\nclaude: HUMAN: which region?\n$ ".to_string())
+        Some(
+            "you: deploy it\nclaude: The build is green.\nclaude: HUMAN: which region?\n$ "
+                .to_string(),
+        )
     }
 
     fn task(&self, _session: &SessionId) -> Option<String> {
@@ -605,7 +608,11 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     turn_stopped(&store);
     observer.tick().expect("tick");
     let last = observations(&store).pop().expect("an observation");
-    assert_eq!(last.state, SemanticState::Waiting, "COMPLETED folds into WAITING");
+    assert_eq!(
+        last.state,
+        SemanticState::Waiting,
+        "COMPLETED folds into WAITING"
+    );
     assert!(last.confidence.value() > 0.95, "0.98 of the allowed mass");
     assert_eq!(
         last.probabilities.and_then(|p| p.get("COMPLETED").copied()),

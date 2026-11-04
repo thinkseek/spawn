@@ -12,7 +12,13 @@
 #   5. with Jev down, a stalled worker is escalated on rules alone, not nudged;
 #   6. killing the supervisor's engine, then its tmux server, then the loop,
 #      each ends with session_supervisor live again, resumed natively;
-#   7. the corpus exports and replay reports a tier per episode.
+#   7. the corpus exports and replay reports a tier per episode;
+#   8. missions: a human mission reaches the supervisor; a resident is
+#      proposed by the supervisor and runs only after a human approves it;
+#      its tasks are delivered one at a time, reported, sent back once and
+#      accepted; an ephemeral worker reports and is stopped once accepted; a
+#      human message to a worker reaches the supervisor; a resident killed is
+#      resumed, a resident stopped by the supervisor stays down.
 #
 # Usage: SPAWN_DATABASE_URL=postgres://... scripts/mvp-e2e.sh
 # Runs in its own schema (dropped afterwards) and its own tmux socket.
@@ -87,6 +93,7 @@ mkdir -p "$work/ws"
 #   E2E:WORK   one tool call, then "DONE", then stop
 #   E2E:STALL  stop partway ("STALLED"); a later "continue" finishes it
 #   E2E:ASK    stop with a HUMAN: question
+#   E2E:REPORT write .spawn/report.md, then stop
 # Other lines are read silently; one second of quiet ends the turn.
 cat >"$work/claude" <<'ENGINE'
 #!/usr/bin/env bash
@@ -127,6 +134,13 @@ while :; do
       hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
       tool
       printf 'DONE: finished after continue\n'
+      stop; pending=0 ;;
+    *E2E:REPORT*)
+      hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
+      tool
+      mkdir -p .spawn
+      printf '## Outcome\ndone: %s\n## What changed\nnothing real\n## Open issues\nnone\n' "$line" >.spawn/report.md
+      printf 'DONE: reported\n'
       stop; pending=0 ;;
     *E2E:ASK*)
       hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
@@ -292,6 +306,74 @@ tail_of session_worker_d | jq -e '[.commands[]? | select(.principal == "spawn-di
   fail "worker d was nudged without Jev"
 pass "with Jev down the stalled worker was escalated, not nudged"
 start_jev
+
+# --- 8. missions, residents, tasks, reports --------------------------------
+sup() { SPAWN_DATABASE_URL=$sup_url "$bin" "$@"; }
+board() { sup mission list; }
+task_state() { board | jq -r --argjson id "$1" '.missions[].tasks[] | select(.id == $id) | .state'; }
+state_is() { [ "$(task_state "$1")" = "$2" ]; }
+
+mission=$("$bin" mission add --text "E2E mission: prove the mission layer" | jq -r .mission)
+wait_for 60 "the new mission in the supervisor's digest" digest_has missions
+
+sup resident propose --name core --charter "Owns the e2e core concern." >/dev/null
+if sup task assign --mission "$mission" --kind resident --worker core --brief "E2E:REPORT one" >/dev/null 2>&1; then
+  fail "an unapproved resident got a task"
+fi
+if sup resident approve --name core >/dev/null 2>&1; then
+  fail "the supervisor approved its own resident"
+fi
+"$bin" resident approve --name core >/dev/null
+wait_for 60 "the approval in the supervisor's digest" digest_has session_resident_core
+pass "a resident runs only after a human approves the supervisor's proposal"
+
+t1=$(sup task assign --mission "$mission" --kind resident --worker core --brief "E2E:REPORT first" | jq -r .task)
+t2=$(sup task assign --mission "$mission" --kind resident --worker core --brief "E2E:REPORT second" | jq -r .task)
+wait_for 60 "task $t1 to be delivered" state_is "$t1" delivered
+[ "$(task_state "$t2")" = assigned ] || fail "the resident got two tasks at once"
+wait_for 60 "task $t1's report" state_is "$t1" reported
+wait_for 60 "the report in the supervisor's digest" digest_has session_resident_core
+board | jq -e --argjson id "$t1" '.missions[].tasks[] | select(.id == $id) | .report | test("done: .*E2E:REPORT first")' >/dev/null ||
+  fail "task $t1's report was not stored"
+sup task reject --id "$t1" --note "E2E:REPORT redo with more care" >/dev/null
+wait_for 60 "task $t1 to come back after the note" state_is "$t1" reported
+board | jq -e --argjson id "$t1" '.missions[].tasks[] | select(.id == $id) | .revisions == 1 and (.report | test("redo"))' >/dev/null ||
+  fail "the revision did not carry the note"
+sup task accept --id "$t1" >/dev/null
+wait_for 60 "task $t2 to be delivered after $t1" state_is "$t2" delivered
+wait_for 60 "task $t2's report" state_is "$t2" reported
+sup task accept --id "$t2" >/dev/null
+pass "resident tasks: one at a time, reported, sent back once, accepted"
+
+t3=$(sup task assign --mission "$mission" --kind ephemeral --worker probe --brief "E2E:REPORT probe" | jq -r .task)
+probe=$(board | jq -r --argjson id "$t3" '.missions[].tasks[] | select(.id == $id) | .session_id')
+wait_for 60 "the ephemeral report" state_is "$t3" reported
+sup task accept --id "$t3" >/dev/null
+gone() { ! live "$probe"; }
+wait_for 60 "the ephemeral worker to be stopped" gone
+pass "an ephemeral worker reported and was stopped once accepted"
+
+"$bin" submit --principal human --agent agent_resident_core --session session_resident_core \
+  --key "human-$(date +%s%N)" --action '{"type":"input","text":"hello from a human"}' >/dev/null
+human_noted() { pane session_supervisor | grep -q '\[spawn:esc session_resident_core human-'; }
+wait_for 60 "the human message in the supervisor's digest" human_noted
+pass "a human message to a worker reached the supervisor"
+
+before=$(execution_of session_resident_core)
+runner=$("$tmux" -L "$socket" list-panes -t "=spawn-$before:" -F '#{pane_pid}')
+kill -KILL "$(pgrep -P "$runner" | head -1)"
+resident_back() { live session_resident_core && [ "$(execution_of session_resident_core)" != "$before" ]; }
+wait_for 60 "the resident back after its engine was killed" resident_back
+grep -q -- "^session_resident_core .*--resume" "$work/argv.log" || fail "the resident was not resumed natively"
+SPAWN_DATABASE_URL=$sup_url SPAWN_GATEWAY=1 "$bin" submit --agent agent_resident_core --session session_resident_core \
+  --key "sup-stop-$(date +%s%N)" --action '{"type":"stop"}' >/dev/null
+down() { ! live session_resident_core; }
+wait_for 30 "the resident to stop" down
+stopped_at=$(execution_of session_resident_core)
+sleep 6
+[ "$(execution_of session_resident_core)" = "$stopped_at" ] && ! live session_resident_core ||
+  fail "a resident stopped by the supervisor was revived"
+pass "a killed resident is resumed; one the supervisor stopped stays down"
 
 # --- 6. the supervisor never ends -----------------------------------------
 resumed_count() { grep -c -- "^session_supervisor .*--resume" "$work/argv.log" || true; }
