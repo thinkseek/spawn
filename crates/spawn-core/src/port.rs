@@ -227,7 +227,8 @@ pub enum ChunkError {
 /// error, never an answer. A local directory first, any S3-compatible bucket
 /// later, behind this one port.
 pub trait ChunkStore: Send + Sync + std::fmt::Debug {
-    /// Store `bytes` unless an object of the same content exists; its name.
+    /// Store `bytes` unless a sound object of the same content exists; its
+    /// name. A corrupt object of that content is replaced.
     fn put(&self, bytes: &[u8]) -> Result<String, ChunkError>;
 
     /// The bytes of the object `name`, verified against the name.
