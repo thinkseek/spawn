@@ -459,6 +459,101 @@ sed -i '1i #![forbid(unsafe_code)]' "$lib"
 tightened=$(commit lints-deny-added)
 expect "a new crate-level forbid is fine" "$(judge "$tightened")" 'exit=0 {"verdict":"accepted"}'
 
+# 9. Objectives are judged on the base before any candidate code runs, and
+# cached. A fake shared test server (a Unix socket the gate binds in, as it
+# binds the test database's) that candidate code can break, as a superuser
+# login could break the real one.
+server_dir=$work/fakedb
+mkdir -p "$server_dir"
+python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+broken, count = False, 0
+while True:
+    c, _ = s.accept()
+    command = c.recv(64).decode().strip()
+    if command == "break": broken = True
+    elif command == "fix": broken = False
+    elif command == "count": count += 1
+    elif command == "reset": count = 0
+    c.sendall((str(count) if command == "count" else ("broken" if broken else "ok")).encode())
+    c.close()' "$server_dir/server" &
+server_pid=$!
+trap 'kill "$listener_pid" "$server_pid" 2>/dev/null; rm -rf "$work" "$marker"' EXIT
+while [ ! -S "$server_dir/server" ]; do sleep 0.1; done
+# server <command>: ok, broken, or a count.
+cat >"$work/server-client" <<EOF
+#!/bin/sh
+exec python3 -c '
+import socket, sys
+c = socket.socket(socket.AF_UNIX); c.connect(sys.argv[1]); c.sendall(sys.argv[2].encode())
+print(c.recv(64).decode())' "$server_dir/server" "\$1"
+EOF
+server() { sh "$work/server-client" "$1"; }
+export SPAWN_TEST_DATABASE_URL="postgres://u:p@$(printf '%s' "$server_dir" | sed 's|/|%2F|g')/db"
+objectives=$work/objectives
+cp -r "$scenarios" "$objectives"
+cp "$work/server-client" "$objectives/server-client"
+# The build runs the candidate's own build step, as cargo runs its code.
+printf '#!/bin/sh\ncp value built\n[ ! -f sabotage.sh ] || sh sabotage.sh\n' >"$objectives/build"
+# 011: solved on the base (value is not three); a broken server is a
+# harness error, exit 2.
+cat >"$objectives/011.sh" <<'EOF'
+#!/bin/sh
+[ "$(sh "$(dirname "$0")/server-client" status)" = ok ] || exit 2
+[ "$(cat value)" != three ] || exit 1
+EOF
+
+branch sabotage
+printf 'three\n' >"$seed/value"
+cat >"$seed/sabotage.sh" <<EOF
+#!/bin/sh
+sh '$objectives/server-client' break >/dev/null
+EOF
+sabotage=$(commit sabotage)
+server fix >/dev/null
+expect "a candidate that breaks the server cannot make a solved objective unsolved" \
+    "$(judge "$sabotage" "" "$objectives")" 'regression: 011.sh fails on the candidate'
+expect "the base was judged before the candidate built" \
+    "$(sed -n '/== candidate: build/q;p' "$work/gate.out")" '| == base: 011.sh: solved'
+
+server fix >/dev/null
+expect "a cached base result is used" "$(judge "$good" "" "$objectives")" 'exit=0 {"verdict":"accepted"}'
+expect "the cache hit runs nothing on the base" "$(cat "$work/gate.out")" '| == base: 011.sh: solved (cached)'
+refuse "no base build on a cache hit" "$(cat "$work/gate.out")" '== base: build'
+
+printf '# a comment changes the scenario\n' >>"$objectives/011.sh"
+expect "a changed scenario is judged again" "$(judge "$good" "" "$objectives")" 'exit=0 {"verdict":"accepted"}'
+refuse "not from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+
+# A harness error on the base aborts the gate: no verdict, never a skip.
+server break >/dev/null
+printf '# changed again, so not cached\n' >>"$objectives/011.sh"
+expect "a harness exit on the base aborts the gate" "$(judge "$good" "" "$objectives")" 'exit=4 '
+refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'verdict'
+expect "and says why" "$(cat "$work/gate.out")" '011.sh exited 2 on the base: a harness error'
+server fix >/dev/null
+
+# The task scenario's red run: exactly 1 on the base, twice.
+task_scenarios=$work/task-objectives
+cp -r "$objectives" "$task_scenarios"
+rm "$task_scenarios/011.sh"
+printf '#!/bin/sh\n[ "$(cat value)" = two ] || exit 7\n' >"$task_scenarios/012.sh"
+expect "a task scenario that exits 7 on the base aborts" \
+    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=4 '
+cat >"$task_scenarios/012.sh" <<'EOF'
+#!/bin/sh
+# Flaky on the base: fails the first time, passes the second.
+[ "$(cat value)" = two ] && exit 0
+[ "$(sh "$(dirname "$0")/server-client" count)" -ge 2 ] && exit 0
+exit 1
+EOF
+server reset >/dev/null
+expect "an unsolved result needs two runs that agree" \
+    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=4 '
+expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
+unset SPAWN_TEST_DATABASE_URL
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
