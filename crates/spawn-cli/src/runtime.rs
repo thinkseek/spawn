@@ -10,7 +10,9 @@ use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_host::{GitWorkspace, TmuxHost, docker_prefix};
 use spawn_jev::{JevConfig, JevJudge};
 
-use crate::config::{env_or, env_value, open_store, required_env, workspace_root};
+use crate::config::{
+    env_or, env_value, open_store, required_env, spawn_program, workspace_root,
+};
 use crate::flags::Flags;
 use crate::trace::{self, Timed};
 use crate::{context, sources, supervise};
@@ -97,11 +99,7 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
 /// Programs and environment the Bridge puts into every terminal it starts.
 fn bridge_config() -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
-    config.spawn_program = env_or(
-        "SPAWN_PROGRAM",
-        &std::env::current_exe()
-            .map_or_else(|_| "spawn".to_string(), |path| path.display().to_string()),
-    );
+    config.spawn_program = spawn_program();
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
     config.codex_program = env_or("SPAWN_CODEX_PROGRAM", "codex");
     // The hook and the runner inside the terminal write to the same log, but
