@@ -32,21 +32,27 @@
 # `cargo metadata` on the candidate's manifests. Inside it the root is
 # read-only, /tmp is private, the PID namespace is new (the gate and the
 # integrator are not in /proc), the tree under test is the only writable
-# path, the base tree is read-only, and the owner's secrets under $HOME (see
-# `masked` below), the user's runtime directory and the docker socket are
-# hidden. The environment is cleared down to the list below. The network is
-# shared: the checks reach the test database. Cargo gets a private
+# path, the base tree is read-only, and the user's runtime directory, the
+# docker socket and the host's TMPDIR are hidden. $HOME is an empty tmpfs
+# with an allow-list bound back read-only (see `home_binds` below): the
+# Rust toolchain, the install roots of node/npm/bun when they live there,
+# and the controller's `scripts` and `web/node_modules` (the controller is
+# the directory two levels above the scenarios). The network namespace is
+# new: loopback only, so no host service (the live database, serve, the Jev
+# relay) is reachable. The checks reach the test database through its Unix
+# socket: when SPAWN_TEST_DATABASE_URL's host is a percent-encoded path, that
+# directory is bound in; a TCP test URL does not work inside. The
+# environment is cleared down to the list below. Cargo gets a private
 # CARGO_HOME whose registry and git caches are the real ones, read-only, and
 # runs offline: a candidate cannot fetch a new crate or rewrite a cached one.
 # Git reads the gate's own config (an identity, no signing), not the
 # owner's.
-# The checks find the controller's checkout through the read-only root, so
-# the scenarios directory must not live under /tmp or a masked path.
 #
 # Environment (the integrator passes these and nothing else, gate.rs):
 #   PATH, HOME, LANG, TMPDIR   as usual
 #   CARGO_HOME, RUSTUP_HOME    when the toolchain is not under $HOME
-#   SPAWN_TEST_DATABASE_URL    the throwaway database the checks may use
+#   SPAWN_TEST_DATABASE_URL    the throwaway database the checks may use, as
+#                              a socket URL (postgres://u:p@%2Fdir/db)
 #   SPAWN_GATE_VERDICT         a file in a directory the integrator owns; the
 #                              verdict is written there too, and the
 #                              integrator believes that file only, and only
@@ -127,10 +133,82 @@ if [ -n "$scenario" ] && [ ! -f "$scenario" ]; then
     exit 0
 fi
 
-# The owner's secrets: hidden from every sandboxed process.
-masked=".config .claude .claude.json .ssh .local/share/spawn-rsi .codex .docker .gnupg
-.netrc .git-credentials .npmrc .pgpass .aws .kube .cargo/credentials .cargo/credentials.toml"
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
+rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+# The controller's checkout, as the checks locate it (two levels above the
+# scenarios directory).
+controller=$(cd "$scenarios/../.." && pwd)
+
+# $HOME in the sandbox is an empty tmpfs. Bound back read-only, one path per
+# line: the Rust toolchain (rustup's proxies and toolchains), the install
+# root of each tool in `home_tools` that lives under $HOME (with a symlink
+# where PATH found it), and the controller's `scripts` and
+# `web/node_modules`, which the checks use. Nothing else of $HOME is
+# visible: not ~/.gitconfig, not ~/.claude.json.backup, not shell history.
+home_tools="node npm npx bun"
+home_binds=""
+home_links=""
+under_home() {
+    case "$1" in "$HOME"/*) return 0 ;; esac
+    return 1
+}
+bind_home() {
+    [ -e "$1" ] || return 0
+    home_binds="$home_binds$1
+"
+}
+bound() {
+    old_ifs=$IFS
+    IFS='
+'
+    for root in $home_binds; do
+        case "$1" in "$root" | "$root"/*)
+            IFS=$old_ifs
+            return 0
+            ;;
+        esac
+    done
+    IFS=$old_ifs
+    return 1
+}
+under_home "$cargo_home/bin" && bind_home "$cargo_home/bin"
+under_home "$rustup_home" && bind_home "$rustup_home"
+for tool in $home_tools; do
+    found=$(command -v "$tool" 2>/dev/null) || continue
+    real=$(readlink -f "$found")
+    under_home "$real" || continue
+    root=$(dirname "$real")
+    [ "$(basename "$root")" = bin ] && root=$(dirname "$root")
+    bound "$real" || bind_home "$root"
+    if [ "$found" != "$real" ] && under_home "$found" && ! bound "$found"; then
+        home_links="$home_links$real|$found
+"
+    fi
+done
+for path in "$controller/scripts" "$controller/web/node_modules"; do
+    under_home "$path" && bind_home "$path"
+done
+
+# The test database, reached over its Unix socket: the sandbox has no
+# network but its own loopback. A URL whose host is a percent-encoded path
+# (postgres://user:pw@%2Fpath%2Fto%2Fdir/db) names the socket directory.
+db_socket=""
+case "${SPAWN_TEST_DATABASE_URL-}" in
+*://*)
+    db_host=${SPAWN_TEST_DATABASE_URL#*://}
+    db_host=${db_host##*@}
+    db_host=${db_host%%/*}
+    db_host=${db_host%%\?*}
+    case "$db_host" in
+    %2[Ff]*)
+        db_host=${db_host%:[0-9]*}
+        db_socket=$(printf '%s' "$db_host" | sed 's/%2[Ff]/\//g')
+        case "$db_socket" in *%*) db_socket="" ;; esac
+        [ -d "$db_socket" ] || db_socket=""
+        ;;
+    esac
+    ;;
+esac
 
 # sandbox <tree> <command...>: run a command inside the tree, in bwrap.
 sandbox() {
@@ -138,37 +216,39 @@ sandbox() {
     shift
     count=$#
     set -- "$@" bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
-        --unshare-pid --die-with-parent --new-session
-    for name in $masked; do
-        if [ -d "$HOME/$name" ]; then
-            set -- "$@" --tmpfs "$HOME/$name"
-        elif [ -e "$HOME/$name" ]; then
-            set -- "$@" --ro-bind /dev/null "$HOME/$name"
-        fi
-    done
+        --unshare-pid --unshare-net --die-with-parent --new-session
     runtime=/run/user/$(id -u)
     [ -d "$runtime" ] && set -- "$@" --tmpfs "$runtime"
     for socket in /run/docker.sock /var/run/docker.sock; do
         [ -S "$socket" ] && set -- "$@" --ro-bind /dev/null "$socket"
     done
-    # The host's TMPDIR when it is not /tmp (unless it holds $HOME), the
-    # gate's own files and the integrator's verdict directory, wherever
-    # TMPDIR put them.
+    for name in credentials credentials.toml; do
+        [ -e "$cargo_home/$name" ] && set -- "$@" --ro-bind /dev/null "$cargo_home/$name"
+    done
+    # The host's TMPDIR when it is not /tmp, the gate's own files and the
+    # integrator's verdict directory, wherever TMPDIR put them.
     case "${TMPDIR:-/tmp}" in
-    / | /tmp | /tmp/ | "$HOME" | "$HOME"/*) ;;
-    *)
-        case "$HOME/" in
-        "${TMPDIR%/}"/*) ;;
-        *) [ -d "$TMPDIR" ] && set -- "$@" --tmpfs "$TMPDIR" ;;
-        esac
-        ;;
+    / | /tmp | /tmp/) ;;
+    *) [ -d "$TMPDIR" ] && set -- "$@" --tmpfs "$TMPDIR" ;;
     esac
     set -- "$@" --tmpfs "$work"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         set -- "$@" --tmpfs "$(dirname "$SPAWN_GATE_VERDICT")"
     fi
+    set -- "$@" --tmpfs "$HOME"
+    old_ifs=$IFS
+    IFS='
+'
+    for path in $home_binds; do
+        set -- "$@" --ro-bind "$path" "$path"
+    done
+    for link in $home_links; do
+        set -- "$@" --symlink "${link%%|*}" "${link#*|}"
+    done
+    IFS=$old_ifs
     set -- "$@" --ro-bind "$scenarios" "$scenarios"
     [ -n "$scenario" ] && set -- "$@" --ro-bind "$scenario" "$scenario"
+    [ -n "$db_socket" ] && set -- "$@" --ro-bind "$db_socket" "$db_socket"
     if [ "$tree" != "$work/baseline" ] && [ -d "$work/baseline" ]; then
         set -- "$@" --ro-bind "$work/baseline" "$work/baseline"
     fi
