@@ -8,7 +8,7 @@
 
 | 能力 | 实现方 | Spawn 做的事 |
 | --- | --- | --- |
-| 计算 | Claude Code、Codex CLI | 启动进程、投递提示、采集 hooks |
+| 计算 | Claude Code、Codex CLI | 启动进程、投递提示、读取 transcript、屏幕与退出文件 |
 | 工作区 | git | 裸仓库加每分支一份工作树，`git archive` 导出、`commit-tree` 收口 |
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
 | 语义状态 | 判定模型 `/v1/systemone` 或内置规则 | 发一次 HTTP 请求，写一条 observation |
@@ -51,10 +51,12 @@ spawn_submit(principal, key, agent, session, action)
   → command.accepted          PG 事务，幂等
   → spawn_claim(worker, ttl)  单会话串行，租约 fencing
   → git branch / archive 导出工作树
-  → tmux new-session          运行 spawn run -- claude --ax-screen-reader
+  → tmux new-session          运行 spawn run -- claude --ax-screen-reader --session-id <uuid>
   → 屏尾判定 Ready            capture-pane 尾行解析
   → tmux send-keys            投递提示
-  → Claude hooks              spawn hook 归一为统一事件
+  → Claude transcript         Bridge 每轮读 <projects>/<工作区>/<uuid>.jsonl，claude_line 归一为统一事件
+  → 屏幕                      Bridge 每轮抓屏，两次读数一致才写 screen.observed
+  → 退出文件                  spawn run 把退出码写入 .spawn/exit-<execution>，Bridge 读到后写 execution.ended
   → spawn_append              写 spawn_events，双序号
   → Observer tick             规则或模型判定语义状态
   → observation.recorded
@@ -63,9 +65,11 @@ spawn_submit(principal, key, agent, session, action)
 
 两条链路互不依赖：数据链路是引擎到事件到 SQL，状态链路是事件到判定再回到事件。
 
+worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。Codex 的 `exec --json` 输出由 `spawn run` 复制到 `.spawn/codex-<execution>.jsonl`，Bridge 同样按行读取。
+
 ## 4. 终端接入：尾行解析
 
-Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信号来源。hooks 提供结构化事件，屏尾只回答两个问题：现在能否输入，是否被阻塞。
+Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信号来源。transcript 提供结构化事件，屏尾只回答两个问题：现在能否输入，是否被阻塞。
 
 | 判定项 | 规则 |
 | --- | --- |
@@ -74,6 +78,7 @@ Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信
 | 状态 | Ready、Drafted、Busy、Permission、Error、Unknown |
 | 可输入 | 只有 Ready 允许投递 |
 | 证据 | 每个状态附带决定它的原始行，写入 `screen.observed` |
+| 记录 | Bridge 每轮读一次屏；连续两次读数一致才记录，状态变化时记一条，Busy 持续时每 30 秒再记一条 |
 
 必须做严格尾匹配：窗口外的旧 spinner、旧报错、旧提示符都不影响判定。
 
@@ -86,7 +91,7 @@ Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信
 | `session_seq` | 单会话，从 1 稠密递增 | 会话内因果、Observer 游标 |
 | 事件 `id` | 全局 | 全局增量读取 |
 
-去重键 `(session_id, source, source_event_id)`：Bridge 重放同一 hook 输入不产生第二条事实。
+去重键 `(session_id, source, source_event_id)`：Bridge 重读同一行 transcript 不产生第二条事实（键是引擎给的行 `uuid` 或 `tool_use_id`）。
 
 事件名与载荷见 [design.md 第 3 节](./design.md)。
 
@@ -125,8 +130,8 @@ spawn status
 | `submit` | 写一条命令，幂等键重复则返回原命令 |
 | `tick` | 跑一轮 Bridge 与 Observer |
 | `status` | 扫描全部事件，打印每会话最新一条 observation |
-| `hook` | 从标准输入接收一条 Claude hook 载荷 |
-| `run` | 在终端内启动引擎，退出时写 `execution.ended{Exited}`，转发退出码 |
+| `hook` | 读取并丢弃标准输入；仅为旧版本以 hook 启动的引擎保留 |
+| `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
 | `evolve` | 推进一步递归自改循环：开迭代、收补丁、跑黑盒门禁、前移基线 |
 
 | 环境变量 | 默认值 | 说明 |
@@ -136,13 +141,14 @@ spawn status
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
 | `SPAWN_CODEX_PROGRAM` | `codex` | Codex 可执行文件 |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录（Bridge 所见路径） |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件 |
 | `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket |
 | `SPAWN_EXEC_IMAGE` | 未设 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker 可执行文件 |
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
-| `SPAWN_TRACE` | 未设 | 设置后每次端口调用向 stderr 打印一行 `spawn-trace <stage> <us>` |
+| `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |
 | `SPAWN_GATE` | `scripts/rsi/gate.sh` | `spawn integrate` 的门禁脚本，输出一行 JSON 判定 |
 
 ## 8. 验证

@@ -8,11 +8,10 @@ be replaced while it runs and which need the engine to stop.
 | Process | Started by | Lifetime | In-memory state |
 | --- | --- | --- | --- |
 | engine | `spawn run` in a tmux pane | one execution | native session context |
-| runner | Bridge `launch` | parent of the engine | none |
-| Bridge | `spawn tick` or `spawn loop` | one tick or the loop | session map, log cursor |
+| runner | Bridge `launch` | parent of the engine; writes its exit file | none |
+| Bridge | `spawn tick` or `spawn loop` | one tick or the loop | session map, log cursor, transcript read offsets, last screen reading |
 | Observer | same process as the Bridge | same | log cursor, per-session tracking |
 | integrator | `spawn integrate` | the process | none |
-| hook | the engine, on every event | milliseconds | none |
 | UI server | `spawn serve` | the process | none |
 
 ## Hot: replace and restart
@@ -21,13 +20,15 @@ These hold no state that is not rebuildable.
 
 - **Bridge and Observer.** `recover()` replays `spawn_events` and rebuilds the
   cursor and the session map. A running execution keeps running in its tmux
-  pane while the Bridge is down; the next tick folds the events that piled up.
+  pane while the Bridge is down; the next tick reads its transcript from the
+  start (event keys make a second read a no-op) and its exit file, if the
+  engine ended meanwhile.
 - **Integrator.** Its state is the control stream of the event log (task and
   mission rows are folds of it). It records a verdict before it moves git, so
   a killed integrator resumes from the recorded state.
-- **Hook.** Each hook event starts a new process. The settings passed with
-  `--settings` hold an absolute path, so replacing the binary changes the hook
-  of an already running engine at its next event.
+- **`spawn hook`.** A no-op. Engines started by a build that still installed
+  hooks call it by absolute path on every event; the replaced binary accepts
+  and ignores the payload, and their events come from the transcript.
 - **UI server.** Read-only. No writes exist in `spawn serve`.
 
 ## Cold: needs the execution to end
@@ -42,10 +43,10 @@ These hold no state that is not rebuildable.
 
 These are not about process lifetime. They break when two versions meet.
 
-1. **`EventKind` is a closed enum.** An upgraded hook that writes a new event
-   name, read by an older Bridge, produces `StoreError::Corrupt`. The next tick
-   exits 1. The hook and the Bridge must therefore carry the same enum. Today
-   the hook writes only kinds that already exist.
+1. **`EventKind` is a closed enum.** A new event name written by an upgraded
+   Bridge or Observer, read by an older one, produces `StoreError::Corrupt`.
+   The next tick exits 1. Every process that reads the log must therefore
+   carry the same enum.
 2. **The schema.** `migrate()` runs `create or replace` on every connect. An
    additive column or view is safe for an older reader. A removed or renamed
    column is not. The resident loop holds one connection, so a new schema takes
@@ -54,7 +55,17 @@ These are not about process lifetime. They break when two versions meet.
    `spawn_finish` keep the ordering guarantees. A running transaction sees one
    version of a function, so replacing them mid-transaction is safe; a change
    to their meaning is not.
-4. **The prompt contract.** Delivery writes the task prompt and the
+4. **The runner's files.** A running runner is the binary it was started
+   with. It writes the exit code to `SPAWN_EXIT_FILE` (`.spawn/exit-<execution>`
+   in the workspace) and, for Codex, a copy of the output to
+   `SPAWN_ENGINE_OUTPUT`; the Bridge reads both, so their paths and format
+   must stay the same across versions. An engine started before the transcript
+   reader has no exit file (its runner wrote through the retired
+   `spawn_terminal` login); the Bridge ends it as `Lost` once its pane is gone.
+5. **The Claude transcript.** Its format is the engine's. `claude_line` skips
+   lines it does not know, so a new engine release adds no failure, but a
+   renamed field silently drops the events it carried.
+6. **The prompt contract.** Delivery writes the task prompt and the
    `.spawn/report.md` convention. The engine reads them as plain text. A
    change here is hot for the dispatcher and cold for the engine only in that
    the running turn keeps the old instruction.

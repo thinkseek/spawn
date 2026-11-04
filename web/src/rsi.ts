@@ -4,6 +4,8 @@
 // field is normalized, so a server that omits one renders an empty value
 // instead of crashing the page.
 
+import { apiHeaders } from "./api";
+
 export type Direction = "lower" | "higher";
 
 /** `open` until solved (one-shot) or met (recurring, metric at target). */
@@ -404,7 +406,7 @@ async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(url, {
     signal,
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers: apiHeaders(),
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();

@@ -6,7 +6,7 @@ Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它
 
 - 调用方向 PostgreSQL 中的队列提交命令（start、input、resume、stop）。
 - `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 tmux 会话中启动引擎。
-- Claude Code hooks、Codex JSON 输出与终端屏尾转为日志中的类型化事件。
+- Claude Code 的 transcript、Codex JSON 输出、终端屏幕与引擎退出状态转为日志中的类型化事件。引擎所在终端不持有数据库登录。
 - Observer 判定每个会话的状态（可输入、运行中、阻塞、失败），并把结论作为事件写回。
 
 日志是唯一的状态。每次 `spawn tick` 是新进程，从日志重建视图，进程崩溃不丢状态。
@@ -67,8 +67,8 @@ spawn status
 | `submit` | 向队列写一条命令。参数：`--agent`、`--session`、`--key`、`--action`、`--principal`（默认 `spawn`） |
 | `tick` | 领取并执行排队命令，推进活跃执行，记录判定。参数：`--repo`、`--root`、`--judge-url` |
 | `status` | 打印每个会话的最新判定 |
-| `hook` | 从标准输入读取一条 Claude Code hook 载荷。由 Spawn 配置，无需手动调用 |
-| `run` | 在终端内运行引擎并记录退出。由 Spawn 配置，无需手动调用 |
+| `hook` | 读取并忽略标准输入。仅为旧版本以 hook 启动、仍在运行的引擎保留；Spawn 不再配置它 |
+| `run` | 在终端内运行引擎，把退出状态写入文件供 Bridge 读取。由 Spawn 配置，无需手动调用 |
 
 `--action` 的取值：
 
@@ -93,9 +93,9 @@ spawn status
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker 路径 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
 | `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI 路径 |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录（Bridge 所见路径） |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
 | `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时用本地启发式判定 |
-| `SPAWN_TRACE` | 未设置 | 设置后在标准错误输出每次端口调用的耗时 |
 
 ## 开发
 

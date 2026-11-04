@@ -6,7 +6,7 @@ Spawn runs Claude Code and Codex CLI agents in isolated workspaces and records e
 
 - A caller submits a command (start, input, resume, stop) to a queue in PostgreSQL.
 - `spawn tick` claims the command, forks a git branch, exports it into a working tree and starts the engine in a tmux session.
-- Claude Code hooks, Codex JSON output and the terminal tail become typed events in the log.
+- Claude Code's transcript, Codex JSON output, the terminal screen and the engine's exit status become typed events in the log. The engine's terminal holds no database login.
 - An Observer judges each session (ready, working, blocked, failed) and writes the result back as an event.
 
 The log is the only state. Each `spawn tick` is a new process that rebuilds its view from the log, so a crash loses no state.
@@ -74,9 +74,9 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `dispatch [--dry-run] [--root <dir>]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. `--root` is the workspace root (default `SPAWN_WORKSPACE_ROOT`), as for `loop` and `tick`. |
 | `corpus export [--since-hours N]` | Model judgements with their evidence and outcome labels, one JSON line each. |
 | `judge --replay <file>` | Runs the current rules over a corpus: which tier decides each episode, coverage, agreement. |
-| `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. |
-| `hook` | Reads one Claude Code hook payload from standard input. Spawn configures this; you do not call it. |
-| `run` | Runs the engine inside the terminal and records its exit. Spawn configures this; you do not call it. |
+| `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
+| `hook` | Accepts and ignores standard input. Kept for engines an older build started with hooks; Spawn no longer configures it. |
+| `run` | Runs the engine inside the terminal and writes its exit status to a file the Bridge reads. Spawn configures this; you do not call it. |
 
 Actions for `--action`:
 
@@ -117,9 +117,12 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker path |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
 | `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI path |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts, as the Bridge sees that directory |
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it a local heuristic judges |
-| `SPAWN_TRACE` | unset | When set, prints the time of each port call to standard error |
+| `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
+| `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | Address `spawn serve` binds (`--address` overrides it) |
+| `SPAWN_SERVE_TOKEN` | unset | Token every `spawn serve` API request must carry; required off loopback |
 
 ## Development
 
