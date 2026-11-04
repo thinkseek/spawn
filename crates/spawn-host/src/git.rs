@@ -666,6 +666,8 @@ impl WorkspaceStore for GitWorkspace {
             &format!("refs/heads/{branch}"),
         ])
         .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
+        // A pending merge lives only in the directory it was written into.
+        self.clear_pending(branch.as_str());
 
         let directory = self.root.join(branch.as_str());
         if directory.exists() {
@@ -771,6 +773,8 @@ impl WorkspaceStore for GitWorkspace {
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         let directory = self.checked_path(workspace)?;
+        // A pending merge lives only in the directory it was written into.
+        self.clear_pending(workspace.sandbox());
         if let Some(container) = self.container.as_ref() {
             let _ = Command::new(&container.docker)
                 .args(["rm", "-f", &container_name(workspace.sandbox())])
@@ -861,6 +865,9 @@ impl GitWorkspace {
     fn merge_main(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let branch = workspace.sandbox().to_string();
         let directory = self.checked_path(workspace)?;
+        // The integrator commits this workspace too: no checkpoint reads the
+        // directory halfway through a merge.
+        let _lock = self.lock_branch(&branch)?;
         if let Some((_, files)) = self.pending_merge(&branch) {
             if unresolved(&directory, &files) {
                 return Ok(BaseMerge::Conflicted {
@@ -1057,6 +1064,64 @@ impl GitWorkspace {
     fn clear_pending(&self, branch: &str) {
         let _ = std::fs::remove_file(self.pending_path(branch));
     }
+
+    /// Hold the branch's `<index>.spawn-lock`, as a checkpoint does, until
+    /// the returned file is dropped.
+    fn lock_branch(&self, branch: &str) -> Result<std::fs::File, WorkspaceError> {
+        let lock_path = self.index(branch).with_extension("spawn-lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+            })?;
+        }
+        let lock = std::fs::File::create(&lock_path).map_err(|error| {
+            WorkspaceError::Unavailable(format!("create {}: {error}", lock_path.display()))
+        })?;
+        lock.lock().map_err(|error| {
+            WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
+        })?;
+        Ok(lock)
+    }
+
+    /// Whether a merge of `main` into `branch` waits for its conflict
+    /// markers to be resolved.
+    pub fn has_pending_merge(&self, branch: &str) -> bool {
+        self.pending_merge(branch).is_some()
+    }
+
+    /// The files `commit` changes against `base` that hold a whole conflict
+    /// marker block ([`has_conflict_block`]): work that must not be judged,
+    /// let alone land.
+    pub fn conflict_markers(
+        &self,
+        base: &str,
+        commit: &str,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        let changed = self.git_output(&[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "--diff-filter=AM",
+            "-z",
+            base,
+            commit,
+        ])?;
+        let mut marked = Vec::new();
+        for path in changed.split('\0').filter(|path| !path.is_empty()) {
+            let output = self
+                .command()
+                .args(["cat-file", "blob", &format!("{commit}:{path}")])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| {
+                    WorkspaceError::Unavailable(format!("run {}: {error}", self.git))
+                })?;
+            if output.status.success() && has_conflict_block(&output.stdout) {
+                marked.push(path.to_string());
+            }
+        }
+        Ok(marked)
+    }
 }
 
 /// The tree, the conflicted paths and the message kinds (`Auto-merging`,
@@ -1084,16 +1149,28 @@ fn merge_tree_output(stdout: &str) -> (String, Vec<String>, Vec<String>) {
     (tree, files, kinds)
 }
 
-/// Whether any of `files` in `directory` still holds a conflict marker: a
-/// line that starts with `<<<<<<< ` or `>>>>>>> `, or is `=======`. A
-/// deleted file holds none.
+/// Whether any of `files` (the ones the merge listed) in `directory` still
+/// holds a whole conflict marker block. A deleted file holds none.
 fn unresolved(directory: &Path, files: &[String]) -> bool {
     files.iter().any(|file| {
-        std::fs::read(directory.join(file)).is_ok_and(|bytes| {
-            bytes.split(|byte| *byte == b'\n').any(|line| {
-                let line = line.strip_suffix(b"\r").unwrap_or(line);
-                line.starts_with(b"<<<<<<< ") || line.starts_with(b">>>>>>> ") || line == b"======="
-            })
-        })
+        std::fs::read(directory.join(file)).is_ok_and(|bytes| has_conflict_block(&bytes))
     })
+}
+
+/// Whether `bytes` hold a whole conflict marker block: a line that starts
+/// with `<<<<<<< `, later a line that is exactly `=======`, later a line
+/// that starts with `>>>>>>> `. A lone `=======` (a Markdown heading's
+/// underline) is not one.
+pub fn has_conflict_block(bytes: &[u8]) -> bool {
+    let mut stage = 0;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        stage = match stage {
+            0 if line.starts_with(b"<<<<<<< ") => 1,
+            1 if line == b"=======" => 2,
+            2 if line.starts_with(b">>>>>>> ") => return true,
+            other => other,
+        };
+    }
+    false
 }

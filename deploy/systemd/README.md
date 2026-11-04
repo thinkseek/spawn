@@ -21,3 +21,7 @@ Configuration lives in `~/.local/share/spawn-rsi/spawn.env` (KEY=VALUE),
 including `SPAWN_SUPERVISOR=1`, `SPAWN_MISSION_FILE`, and `SPAWN_SERVE_ADDRESS`
 with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
 `openssl rand -hex 32`).
+
+## Deploying
+
+`deploy/deploy.sh` deploys the checked-out commit: backup, release build (no kache), binary swap (`spawn.prev` kept), then with the integrator stopped it migrates the schema, moves the missions repo's `main` forward (never forced) and records `spawn mission moved`, so gated missions take the new main as their baseline instead of halting as if someone had pushed outside the gate. It refuses a dirty tree or a HEAD that does not contain the current `main`.

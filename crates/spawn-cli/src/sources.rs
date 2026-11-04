@@ -49,6 +49,9 @@ pub(crate) struct MissionWorkspaces {
     /// When each mirror's `main` was last fetched.
     refreshed: Mutex<HashMap<PathBuf, Instant>>,
     pusher: Pusher,
+    /// Remote sources that may receive and give agents' branches
+    /// (`SPAWN_PUSH_SOURCES`); see [`shares_branches`].
+    push_sources: Vec<String>,
 }
 
 /// One agent's store and, for a mission with a source, where its mirror
@@ -124,6 +127,20 @@ impl MissionWorkspaces {
             mirrors: Mutex::new(HashMap::new()),
             refreshed: Mutex::new(HashMap::new()),
             pusher: Pusher::new(),
+            push_sources: std::env::var("SPAWN_PUSH_SOURCES")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
+    /// Queue a push of an agent's branch, to a source that shares branches.
+    fn mark(&self, mirror: &Path, source: &str, agent: &str) {
+        if shares_branches(source, &self.push_sources) {
+            self.pusher.mark(mirror, source, agent);
         }
     }
 
@@ -261,6 +278,19 @@ fn has_branch(repo: &Path, branch: &str) -> bool {
     ref_commit(repo, &format!("refs/heads/{branch}")).is_some()
 }
 
+/// Whether agents' branches are pushed to `source` and adopted from it: a
+/// directory on this host (the central store) by default; a remote URL only
+/// when `allowed` (`SPAWN_PUSH_SOURCES`, comma-separated) names it exactly. A
+/// remote may be public, and every agent commit would leave the host; and
+/// whoever can push `spawn/*` there would choose an agent's starting tree.
+pub(crate) fn shares_branches(source: &str, allowed: &[String]) -> bool {
+    if allowed.iter().any(|listed| listed == source) {
+        return true;
+    }
+    let path = Path::new(source);
+    !source.contains("://") && path.is_absolute() && path.is_dir()
+}
+
 /// What [`adopt_pushed`] did with the branch the source holds for an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Adopted {
@@ -382,8 +412,14 @@ impl WorkspaceStore for MissionWorkspaces {
         if !local {
             self.refresh_main(&repo, &source, true);
         }
+        let shared = shares_branches(&source, &self.push_sources);
         // Another host may have run this agent: its branch is on the source.
-        match adopt_pushed(&repo, &source, agent) {
+        let adopted = if shared {
+            adopt_pushed(&repo, &source, agent)
+        } else {
+            Ok(Adopted::Absent)
+        };
+        match adopted {
             Ok(Adopted::Created(commit)) => {
                 return Ok(Branch::Created(Fork {
                     from: format!("spawn/{agent}"),
@@ -404,6 +440,7 @@ impl WorkspaceStore for MissionWorkspaces {
         // source holds it.
         let mut resolved = from.map(str::to_string);
         if let Some(from) = from
+            && shared
             && !local
             && AgentId::new(from).is_ok()
             && !has_branch(&repo, from)
@@ -426,7 +463,7 @@ impl WorkspaceStore for MissionWorkspaces {
         };
         // A new branch shares its fork point; an existing one is pushed
         // again in case its last push was lost with a process.
-        self.pusher.mark(&repo, &source, agent);
+        self.mark(&repo, &source, agent);
         Ok(made)
     }
 
@@ -438,7 +475,7 @@ impl WorkspaceStore for MissionWorkspaces {
         let routed = self.route(workspace.sandbox())?;
         let commit = routed.store.commit(workspace, message)?;
         if let (Commit::Created(_), Some((repo, source))) = (&commit, &routed.mirror) {
-            self.pusher.mark(repo, source, workspace.sandbox());
+            self.mark(repo, source, workspace.sandbox());
         }
         Ok(commit)
     }
@@ -454,7 +491,7 @@ impl WorkspaceStore for MissionWorkspaces {
         }
         let merged = routed.store.merge_base(workspace)?;
         if let (BaseMerge::Merged { .. }, Some((repo, source))) = (&merged, &routed.mirror) {
-            self.pusher.mark(repo, source, workspace.sandbox());
+            self.mark(repo, source, workspace.sandbox());
         }
         Ok(merged)
     }
@@ -469,7 +506,7 @@ impl Drop for MissionWorkspaces {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adopted, adopt_pushed, ensure_mirror, git, mirror_name};
+    use super::{Adopted, adopt_pushed, ensure_mirror, git, mirror_name, shares_branches};
     use crate::push::{Pushed, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
     use spawn_core::port::{Commit, WorkspaceStore};
@@ -566,6 +603,23 @@ mod tests {
             push_branch(&mirror_a, &gone, "agent_x"),
             Pushed::Failed(_)
         ));
+    }
+
+    #[test]
+    fn only_local_or_listed_sources_share_branches() {
+        let here = std::env::temp_dir();
+        let here = here.to_string_lossy();
+        assert!(shares_branches(&here, &[]), "a directory on this host");
+        let remote = "https://github.com/acme/widget.git";
+        assert!(!shares_branches(remote, &[]));
+        assert!(!shares_branches("git@github.com:acme/widget.git", &[]));
+        assert!(!shares_branches("/no/such/directory.git", &[]));
+        assert!(!shares_branches("file:///srv/widget.git", &[]));
+        assert!(shares_branches(remote, &[remote.to_string()]), "listed");
+        assert!(
+            !shares_branches(remote, &[format!("{remote}/")]),
+            "an exact match only"
+        );
     }
 
     #[test]

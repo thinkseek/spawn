@@ -457,7 +457,13 @@ t7=$(sup task assign --mission "$gm" --kind ephemeral --worker breaker --brief "
 wait_for 60 "the breaking report" state_is "$t7" reported
 sup task accept --id "$t7" >/dev/null
 integrate
-state_is "$t7" revise || fail "rejected work was not sent back: $(task_state "$t7")"
+# The loop keeps running: by the time this looks, the revision may already be
+# delivered, and the fake worker may have reported again. Any of those states
+# is "sent back"; the gate's note below is what proves the rejection.
+case "$(task_state "$t7")" in
+  revise | delivered | reported) ;;
+  *) fail "rejected work was not sent back: $(task_state "$t7")" ;;
+esac
 board | jq -e --argjson id "$t7" '.missions[].tasks[] | select(.id == $id) | .review_note | test("check-no-bad")' >/dev/null ||
   fail "the note does not carry the gate's output"
 ! on_main BAD || fail "rejected work landed"

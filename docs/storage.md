@@ -75,7 +75,12 @@ files, a chunk fetch.
   overwritten), from a background pusher off the Bridge's loop: at most one
   push per branch every 5 s, carrying the head as it is then, failures
   retried with backoff, and what still waits pushed when the store drops (a
-  one-shot `spawn tick`). Chunks in R2 (phase 3).
+  one-shot `spawn tick`). Only a source that is a directory on this host (the
+  central store) shares branches by default, both ways (pushes and adopting
+  `spawn/<agent>`): a remote may be public, and whoever can push `spawn/*`
+  there would choose an agent's starting tree. A remote URL shares branches
+  only when `SPAWN_PUSH_SOURCES` (comma-separated) names it exactly. Chunks
+  in R2 (phase 3).
 - **Main into branches automatically**: right after the checkpoint of a turn
   end, and on an idle live execution (no turn open, nothing read that asks for
   a checkpoint, the screen last read ready) at most every 30 s by the Bridge's
@@ -89,23 +94,43 @@ files, a chunk fetch.
   -m -u` against a temporary index, which refuses if a file the merge changes
   differs from the branch), then moves the branch by compare-and-swap to a
   merge commit (parents: the head, `main`), recorded as `artifact.committed`
-  with reason `base_merged`. A conflict in files' lines is made resolvable
+  with reason `base_merged` and the files it changed. A merge changes files
+  under the agent, and an agent that rewrites one from stale context would
+  make its branch revert `main`; so the Bridge tells it, with the next prompt
+  it types for the session (an `Input` or a `Resume` prompt; never
+  unprompted): "Spawn merged main into your workspace since your last turn:
+  <files>. Re-read them before editing." (for conflicts: the files carry
+  conflict markers; edit the marked regions, do not rewrite the files from
+  memory). The notice is folded from the log and cleared by the next prompt
+  the engine receives. A conflict in files' lines is made resolvable
   the way `git merge` does it: the merge tree with conflict markers is written
   into the idle workspace by the same safe procedure (a directory that differs
   from the branch refuses, changing nothing), the branch stays where it is,
   and `main` waits as the pending second parent under the store root
-  (`.merge/<agent>`, written atomically). The agent hears of the conflict at
-  landing, as today, and finds the markers in its files. Checkpoints keep
-  single parents while any conflicted file still holds a marker (a line that
-  starts with `<<<<<<< ` or `>>>>>>> `, or is `=======`); the first one
-  without commits with parents (head, pending `main`) and clears it, after
-  which the branch lands clean. No newer `main` is merged on top of
+  (`.merge/<agent>`, written atomically), recorded once per conflict as
+  `merge.conflicted {files, marked}`. The agent hears of the conflict at
+  landing and with its next prompt, and finds the markers in its files.
+  Checkpoints keep single parents while any conflicted file the merge listed
+  still holds a whole marker block (a line starting `<<<<<<< `, later one
+  that is exactly `=======`, later one starting `>>>>>>> `; a lone `=======`
+  heading underline is not one); the first one without commits with parents
+  (head, pending `main`) and clears it, after which the branch lands clean.
+  The integrator does not judge a branch with a pending merge, or with marker
+  blocks in the files it changes against `main`: it is gated `conflict` with
+  a note to resolve the markers first. A pending merge lives only in the
+  directory it was written into: mount and unmount clear it, and an end
+  whose final checkpoint fails keeps the execution and its workspace and
+  tries again each tick (after 20 failed attempts it unmounts with a loud
+  warning), so main is never recorded as a parent over a tree without its
+  changes. A merge holds the branch's index lock, as a checkpoint does (the
+  integrator commits the same workspace). No newer `main` is merged on top of
   unresolved markers. A conflict markers cannot show (modify/delete, renames,
   binary files) changes nothing; the tick-report warning says so. Large files
   are not merged: the branch keeps its own (a merge commit carries the head's
-  `Spawn-Large` trailer). The pending parent is host-local: an agent resumed
-  on another host before resolving commits the resolution with one parent,
-  and `main` is merged again there.
+  `Spawn-Large` trailer). Because the pending parent lives with the
+  directory, markers committed and then unmounted unresolved are resolved as
+  ordinary edits, and the next merge of `main` may conflict once more on the
+  same lines.
 - **Landing**: unchanged and text only. The gate judges the git candidate; the
   integrator commits host-side and moves `main` by compare-and-swap. Large
   files are workspace state, not source, and never land.

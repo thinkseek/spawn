@@ -15,6 +15,7 @@ const USAGE: &str = "usage:
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
                 [--backlog <dir> --resident <name>]   (owner only)
   spawn mission resume --id N
+  spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
   spawn mission list [--limit N]
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
@@ -152,6 +153,28 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let mission = id(&flags, "id")?;
             store.mission_resume(mission).map_err(err)?;
             print(&json!({ "mission": mission, "resumed": true }));
+        }
+        "moved" => {
+            let source = text(&flags, "source")?;
+            let from = text(&flags, "from")?;
+            let to = text(&flags, "to")?;
+            // Forward only: a main that dropped landed work is a halt, not a deploy.
+            let forward = std::process::Command::new("git")
+                .args([
+                    "--git-dir",
+                    &source,
+                    "merge-base",
+                    "--is-ancestor",
+                    &from,
+                    &to,
+                ])
+                .status()
+                .map_err(|error| format!("git: {error}"))?;
+            if !forward.success() {
+                return Err(format!("{to} does not descend from {from} in {source}"));
+            }
+            let missions = store.source_moved(&source, &from, &to).map_err(err)?;
+            print(&json!({ "source": source, "to": to, "missions": missions }));
         }
         "list" => {
             let limit = flags

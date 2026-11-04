@@ -400,6 +400,15 @@ impl Integrator {
         let Ok(branch) = repo.commit_id_of(&format!("refs/heads/{}", task.agent_id)) else {
             return rejected("the worker has no branch to land", "");
         };
+        // A merge of main whose markers are not resolved is not judged: the
+        // markers could land, and a file rewritten instead of resolved would
+        // revert main.
+        let marked = repo
+            .conflict_markers(main, &branch)
+            .map_err(|error| error.to_string())?;
+        if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
+            return gated("conflict", json!({ "note": note }));
+        }
         let candidate = if git(&[
             "--git-dir",
             &mirror_path,
@@ -541,6 +550,25 @@ impl Integrator {
     }
 }
 
+/// The note that sends work back before it is judged, when a merge of main
+/// waits for its markers (`pending`) or the branch carries marker blocks in
+/// the files it changes (`marked`).
+fn markers_note(pending: bool, marked: &[String]) -> Option<String> {
+    if !pending && marked.is_empty() {
+        return None;
+    }
+    let files = if marked.is_empty() {
+        "the files the merge listed".to_string()
+    } else {
+        marked.join(", ")
+    };
+    Some(format!(
+        "Your work still carries conflict markers from merging the source's main ({files}). \
+         Resolve them first: edit the marked regions (<<<<<<< / ======= / >>>>>>>), keeping \
+         both sides' intent; do not rewrite the files from memory. Then report again."
+    ))
+}
+
 /// The record of a gate run without a verdict to believe. A gate that never
 /// returns, cannot run, or dies (killed, or exiting non-zero, whatever it
 /// printed) says nothing about the work: an abort, never an acceptance.
@@ -636,9 +664,21 @@ fn stop(store: &PostgresStore, task: &Task) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mission, aborted, halt_reason, over_budget};
+    use super::{Mission, aborted, halt_reason, markers_note, over_budget};
     use crate::gate::GateFailure;
     use serde_json::json;
+
+    #[test]
+    fn unresolved_markers_send_work_back_before_the_gate() {
+        assert_eq!(markers_note(false, &[]), None);
+        let note = markers_note(false, &["README.md".to_string()]).expect("a note");
+        assert!(
+            note.contains("README.md") && note.contains("do not rewrite"),
+            "{note}"
+        );
+        let note = markers_note(true, &[]).expect("a pending merge is enough");
+        assert!(note.contains("the files the merge listed"), "{note}");
+    }
 
     #[test]
     fn a_gate_without_a_believable_verdict_is_recorded_as_an_abort_with_its_log() {
