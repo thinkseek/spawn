@@ -5,7 +5,7 @@
 //! - `init-db` installs the SQL schema.
 //! - `submit` writes one command to the queue.
 //! - `tick` runs one Bridge and Observer pass.
-//! - `evolve` advances the recursive self-improvement loop by one step.
+//! - `integrate` lands gated missions' work and assigns objectives (RSI).
 //! - `status` prints the latest observation per session.
 //! - `hook` ingests one Claude Code hook payload from standard input.
 //! - `run` starts the engine inside the terminal, records its exit, and
@@ -25,11 +25,11 @@ mod context;
 mod corpus;
 mod deliver;
 mod dispatch;
-mod evolve;
 mod flags;
 mod gate;
 mod integrate;
 mod missions;
+mod objectives;
 mod runtime;
 mod serve;
 mod sources;
@@ -42,7 +42,7 @@ pub(crate) use flags::Flags;
 
 use commands::{admin, engine, inspect, judging, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|corpus|judge|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>";
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|corpus|judge|serve|status|fleet|tail|hook|run|version>";
 
 /// Usage of `spawn dispatch`, the one command that mixes a bare switch with
 /// valued flags.
@@ -71,8 +71,6 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "tick" => loops::tick(&Flags::parse(&rest)?),
         "loop" => loops::resident_loop(&Flags::parse(&rest)?),
         "serve" => serve::serve(&Flags::parse(&rest)?),
-        "evolve" => loops::evolve_once(&Flags::parse(&rest)?),
-        "rsi-loop" => loops::rsi_loop(&Flags::parse(&rest)?),
         "dispatch" => queue::dispatch_once(&rest),
         "integrate" => integrate::integrate(&rest),
         "corpus" => judging::corpus(&rest),

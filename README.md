@@ -57,7 +57,7 @@ Print the latest observation for each session:
 spawn status
 ```
 
-Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `spawn loop` running: it ticks the Bridge and the Observer and keeps the supervisor alive. The RSI controller runs separately as `spawn rsi-loop` (see docs/rsi.md).
+Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `spawn loop` running: it ticks the Bridge and the Observer and keeps the supervisor alive. Landing and RSI run separately as `spawn integrate` (docs/fleet-architecture.md §10): it lands gated missions' work through the gate, and RSI is an objective mission whose tasks come from `rsi/backlog`.
 
 ## Commands
 
@@ -68,7 +68,7 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `tick` | Claims and runs queued commands, advances live executions, records observations. Flags: `--repo`, `--root`, `--judge-url`. |
 | `status` | Prints the latest observation for each session. |
 | `loop` | Runs the fleet until killed: Bridge, Observer, dispatcher, and (with `SPAWN_SUPERVISOR=1`) the supervisor's liveness rule. |
-| `rsi-loop` | Runs the RSI controller (`evolve` in a loop); exits 2 on HALT. |
+| `integrate [--once] [--root <dir>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh`, lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog task. |
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
 | `dispatch [--dry-run] [--root <dir>]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. `--root` is the workspace root (default `SPAWN_WORKSPACE_ROOT`), as for `loop` and `tick`. |
@@ -108,7 +108,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | required | PostgreSQL connection string |
-| `SPAWN_GIT_REPO` | required | Bare repository that holds the base commits |
+| `SPAWN_GIT_REPO` | required | Bare repository for agents no mission owns (the supervisor, ad hoc workers) |
 | `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick`, `loop` and `dispatch` |
 | `SPAWN_WORKER` | `spawn-worker` | Worker name on claimed commands |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux path |

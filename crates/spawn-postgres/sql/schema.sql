@@ -875,6 +875,10 @@ alter table mission_missions add column if not exists halted text;
 alter table mission_missions add column if not exists scenario_floor integer not null default 0;
 alter table mission_missions add column if not exists gate_rejections integer not null default 0;
 alter table mission_missions add column if not exists gate_aborts integer not null default 0;
+-- An objective mission (§10.4): `{"backlog": <dir>, "resident": <name>}`.
+-- The integrator gives the resident the lowest open backlog objective, one
+-- task at a time; the backlog lives in the controller's checkout.
+alter table mission_missions add column if not exists objectives jsonb;
 alter table mission_missions drop constraint if exists mission_missions_accept_check;
 alter table mission_missions add constraint mission_missions_accept_check
     check (accept in ('review', 'gate'));
@@ -942,7 +946,8 @@ begin
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
         update mission_missions set gate = p_record ->> 'gate', accept = p_record ->> 'accept',
-                                    budget = p_record -> 'budget', updated_at_ms = p_at
+                                    budget = p_record -> 'budget',
+                                    objectives = p_record -> 'objectives', updated_at_ms = p_at
          where id = v_id;
     when 'mission.halted' then
         update mission_missions set halted = p_record ->> 'reason', updated_at_ms = p_at
@@ -1279,7 +1284,9 @@ begin
 end $$;
 
 -- Landing settings and halts are a human's (§10.3): the owner's login only.
-create or replace function spawn_mission_configure(p_mission bigint, p_gate text, p_accept text, p_budget jsonb)
+drop function if exists spawn_mission_configure(bigint, text, text, jsonb);
+create or replace function spawn_mission_configure(p_mission bigint, p_gate text, p_accept text,
+                                                   p_budget jsonb, p_objectives jsonb)
 returns void language plpgsql security definer as $$
 begin
     if spawn_mission_caller() is distinct from 'owner' then
@@ -1294,9 +1301,75 @@ begin
     if not exists (select 1 from mission_missions where id = p_mission and state in ('open', 'active')) then
         raise exception 'mission % is not open', p_mission;
     end if;
+    if p_objectives is not null and (left(coalesce(p_objectives ->> 'backlog', ''), 1) <> '/'
+                                     or coalesce(p_objectives ->> 'resident', '') = '') then
+        raise exception 'objectives need an absolute backlog and a resident';
+    end if;
+    if p_objectives is not null and p_gate is null then
+        raise exception 'objectives need a gate to land on';
+    end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.configured', 'id', p_mission, 'gate', p_gate,
-        'accept', coalesce(p_accept, 'review'), 'budget', p_budget));
+        'accept', coalesce(p_accept, 'review'), 'budget', p_budget, 'objectives', p_objectives));
+end $$;
+
+-- The integrator assigns an objective mission's next task (owner only), to
+-- the mission's resident, which must be approved.
+create or replace function spawn_objective_assign(p_mission bigint, p_objective integer,
+                                                  p_scenario text, p_brief text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_id bigint;
+    v_agent text;
+    v_session text;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not assign objectives', session_user using errcode = '42501';
+    end if;
+    select r.agent_id, r.session_id into v_agent, v_session
+      from mission_missions m join mission_residents r on r.name = m.objectives ->> 'resident'
+     where m.id = p_mission and m.state in ('open', 'active') and r.state = 'approved';
+    if v_agent is null then
+        raise exception 'mission % has no open objectives with an approved resident', p_mission;
+    end if;
+    v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', 'resident',
+        'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief,
+        'created_by', 'spawn-integrate', 'objective', p_objective, 'scenario', p_scenario));
+    return v_id;
+end $$;
+
+-- A landed attempt of the retired RSI controller, imported once as a landed
+-- objective task (owner only), so objective status carries over.
+create or replace function spawn_objective_import(p_mission bigint, p_objective integer,
+                                                  p_metric text, p_note text, p_at bigint)
+returns boolean language plpgsql security definer as $$
+declare
+    v_agent text;
+    v_session text;
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not import attempts', session_user using errcode = '42501';
+    end if;
+    if exists (select 1 from mission_tasks where mission_id = p_mission and objective = p_objective
+                 and created_by = 'rsi' and created_at_ms = p_at) then
+        return false;
+    end if;
+    select r.agent_id, r.session_id into v_agent, v_session
+      from mission_missions m join mission_residents r on r.name = m.objectives ->> 'resident'
+     where m.id = p_mission;
+    if v_agent is null then
+        raise exception 'mission % has no objectives resident', p_mission;
+    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'legacy.imported', 'table', 'mission_tasks', 'row', jsonb_build_object(
+            'id', nextval(pg_get_serial_sequence('mission_tasks', 'id')), 'mission_id', p_mission,
+            'kind', 'resident', 'agent_id', v_agent, 'session_id', v_session,
+            'brief', coalesce(p_note, 'RSI attempt'), 'state', 'landed', 'revisions', 0,
+            'created_by', 'rsi', 'created_at_ms', p_at, 'updated_at_ms', p_at,
+            'objective', p_objective, 'metric', p_metric)));
+    return true;
 end $$;
 
 create or replace function spawn_mission_resume(p_mission bigint)
@@ -1374,15 +1447,19 @@ begin
         'spawn_resident_approve(text)', 'spawn_resident_retire(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
-        'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb)',
-        'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)'] loop
+        'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
+        'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
+        'spawn_objective_assign(bigint, integer, text, text)',
+        'spawn_objective_import(bigint, integer, text, text, bigint)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
         if v_function not in ('spawn_resident_approve(text)', 'spawn_task_delivered(bigint, bigint)',
                               'spawn_task_reported(bigint, text)', 'spawn_control_apply(jsonb, bigint)',
                               'spawn_control_record(jsonb)', 'spawn_control_refold()',
-                              'spawn_mission_configure(bigint, text, text, jsonb)',
-                              'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)') then
+                              'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
+                              'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
+                              'spawn_objective_assign(bigint, integer, text, text)',
+                              'spawn_objective_import(bigint, integer, text, text, bigint)') then
             execute format('grant execute on function %s to spawn_supervisor', v_function);
         end if;
     end loop;

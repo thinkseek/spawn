@@ -10,10 +10,12 @@ use serde_json::{Value, json};
 use crate::{Flags, open_store};
 
 const USAGE: &str = "usage:
-  spawn mission add --text <mission> [--source <git repo path or URL>]
-                    [--gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]]
-  spawn mission configure --id N [--gate <scenarios dir>] [--accept review|gate] [--minutes N] [--tool-calls N]
+  spawn mission add --text <mission> [--source <git repo path or URL>] [<settings>]
+  spawn mission configure --id N <settings>
+      settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
+                [--backlog <dir> --resident <name>]   (owner only)
   spawn mission resume --id N
+  spawn mission import-rsi --id N
   spawn mission list [--limit N]
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
@@ -52,14 +54,13 @@ fn split(rest: &[String]) -> Result<(&str, Flags), String> {
     Ok((verb.as_str(), Flags::parse(rest)?))
 }
 
-/// A mission's landing settings from the flags: the gate as an absolute
-/// path (resolved against the working directory), the acceptance rule, and
-/// the budget. `None` when no flag sets a gate.
-fn landing(flags: &Flags) -> Result<Option<(String, String, Option<Value>)>, String> {
-    let Some(gate) = flags.get("gate") else {
+/// An absolute path for a directory flag, resolved against the working
+/// directory.
+fn directory(flags: &Flags, name: &str) -> Result<Option<String>, String> {
+    let Some(text) = flags.get(name) else {
         return Ok(None);
     };
-    let path = std::path::PathBuf::from(&gate);
+    let path = std::path::PathBuf::from(&text);
     let path = if path.is_absolute() {
         path
     } else {
@@ -68,30 +69,103 @@ fn landing(flags: &Flags) -> Result<Option<(String, String, Option<Value>)>, Str
             .join(path)
     };
     if !path.is_dir() {
-        return Err(format!("--gate {} is not a directory", path.display()));
+        return Err(format!("--{name} {} is not a directory", path.display()));
     }
-    let accept = flags.get("accept").unwrap_or_else(|| "review".to_string());
-    let number = |name: &str| -> Result<Option<i64>, String> {
-        flags
-            .get(name)
-            .map(|text| {
-                text.parse()
-                    .map_err(|_| format!("--{name} must be a number"))
-            })
-            .transpose()
-    };
-    let mut budget = serde_json::Map::new();
-    if let Some(minutes) = number("minutes")? {
-        budget.insert("minutes".to_string(), json!(minutes));
+    Ok(Some(path.display().to_string()))
+}
+
+/// A mission's landing settings (docs/fleet-architecture.md §10.3-10.4).
+struct Settings {
+    gate: Option<String>,
+    accept: String,
+    budget: Option<Value>,
+    objectives: Option<Value>,
+}
+
+impl Settings {
+    fn from(flags: &Flags) -> Result<Self, String> {
+        let number = |name: &str| -> Result<Option<i64>, String> {
+            flags
+                .get(name)
+                .map(|text| {
+                    text.parse()
+                        .map_err(|_| format!("--{name} must be a number"))
+                })
+                .transpose()
+        };
+        let mut budget = serde_json::Map::new();
+        if let Some(minutes) = number("minutes")? {
+            budget.insert("minutes".to_string(), json!(minutes));
+        }
+        if let Some(calls) = number("tool-calls")? {
+            budget.insert("tool_calls".to_string(), json!(calls));
+        }
+        let objectives = match (directory(flags, "backlog")?, flags.get("resident")) {
+            (Some(backlog), Some(resident)) => {
+                Some(json!({"backlog": backlog, "resident": resident}))
+            }
+            (None, None) => None,
+            _ => return Err(format!("--backlog and --resident go together\n{USAGE}")),
+        };
+        Ok(Self {
+            gate: directory(flags, "gate")?,
+            accept: flags.get("accept").unwrap_or_else(|| "review".to_string()),
+            budget: (!budget.is_empty()).then_some(Value::Object(budget)),
+            objectives,
+        })
     }
-    if let Some(calls) = number("tool-calls")? {
-        budget.insert("tool_calls".to_string(), json!(calls));
+
+    fn apply(&self, store: &spawn_postgres::PostgresStore, mission: i64) -> Result<(), String> {
+        store
+            .mission_configure(
+                mission,
+                self.gate.as_deref(),
+                &self.accept,
+                self.budget.as_ref(),
+                self.objectives.as_ref(),
+            )
+            .map_err(|error| error.to_string())
     }
-    Ok(Some((
-        path.display().to_string(),
-        accept,
-        (!budget.is_empty()).then_some(Value::Object(budget)),
-    )))
+}
+
+/// Bring the retired RSI controller's landed attempts into an objective
+/// mission, once, so objective status carries over.
+fn import_rsi(store: &spawn_postgres::PostgresStore, mission: i64) -> Result<Value, String> {
+    let attempts = store
+        .rsi_recent_attempts(100_000)
+        .map_err(|error| error.to_string())?;
+    let mut imported = 0;
+    for attempt in attempts.iter().filter(|attempt| attempt.accepted) {
+        let metric = crate::objectives::parse_metrics(&attempt.gate_log)
+            .first()
+            .map(|metric| {
+                let value = |number: Option<f64>| number.map_or("?".to_string(), |v| v.to_string());
+                format!(
+                    "METRIC {} baseline={} candidate={}",
+                    metric.name,
+                    value(metric.baseline),
+                    value(metric.candidate)
+                )
+            });
+        let objective = i32::try_from(attempt.task_id).map_err(|error| error.to_string())?;
+        let note = format!(
+            "RSI iteration {} (attempt {}), landed by the retired controller",
+            attempt.iteration, attempt.attempt
+        );
+        if store
+            .objective_import(
+                mission,
+                objective,
+                metric.as_deref(),
+                &note,
+                attempt.created_at_ms,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            imported += 1;
+        }
+    }
+    Ok(json!({ "mission": mission, "imported": imported }))
 }
 
 /// `spawn mission ...`
@@ -104,37 +178,30 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let sources = flags
                 .get("source")
                 .map_or_else(|| json!([]), |source| json!([source]));
-            let landing = landing(&flags)?;
+            let settings = Settings::from(&flags)?;
             let id = store
                 .mission_add(&text(&flags, "text")?, &sources, "human")
                 .map_err(err)?;
-            if let Some((gate, accept, budget)) = landing {
-                store
-                    .mission_configure(id, Some(&gate), &accept, budget.as_ref())
-                    .map_err(err)?;
+            if settings.gate.is_some() {
+                settings.apply(&store, id)?;
             }
             print(&json!({ "mission": id }));
         }
         "configure" => {
             let mission = id(&flags, "id")?;
-            let (gate, accept, budget) = landing(&flags)?.map_or(
-                (
-                    None,
-                    flags.get("accept").unwrap_or_else(|| "review".to_string()),
-                    None,
-                ),
-                |(gate, accept, budget)| (Some(gate), accept, budget),
+            let settings = Settings::from(&flags)?;
+            settings.apply(&store, mission)?;
+            print(
+                &json!({ "mission": mission, "gate": settings.gate, "accept": settings.accept,
+                           "objectives": settings.objectives }),
             );
-            store
-                .mission_configure(mission, gate.as_deref(), &accept, budget.as_ref())
-                .map_err(err)?;
-            print(&json!({ "mission": mission, "gate": gate, "accept": accept }));
         }
         "resume" => {
             let mission = id(&flags, "id")?;
             store.mission_resume(mission).map_err(err)?;
             print(&json!({ "mission": mission, "resumed": true }));
         }
+        "import-rsi" => print(&import_rsi(&store, id(&flags, "id")?)?),
         "list" => {
             let limit = flags
                 .get("limit")

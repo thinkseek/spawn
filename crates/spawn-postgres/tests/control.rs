@@ -206,17 +206,24 @@ fn rows_from_before_the_stream_are_imported_once() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
     let (store, schema) = store("control_landing");
     let mission = store
         .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
         .expect("add");
     store
-        .mission_configure(mission, Some("/controller/rsi/scenarios"), "review", None)
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "review",
+            None,
+            None,
+        )
         .expect("configure");
     assert!(
         store
-            .mission_configure(mission, Some("relative/path"), "review", None)
+            .mission_configure(mission, Some("relative/path"), "review", None, None)
             .is_err(),
         "a gate is an absolute path"
     );
@@ -311,4 +318,95 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
         live,
         "the tables are the fold of the log"
     );
+}
+
+#[test]
+fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
+    let (store, schema) = store("control_objectives");
+    let mission = store
+        .mission_add("Improve", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let objectives = json!({"backlog": "/controller/rsi/backlog", "resident": "rsi"});
+    assert!(
+        store
+            .mission_configure(mission, None, "gate", None, Some(&objectives))
+            .is_err(),
+        "objectives need a gate"
+    );
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            Some(&objectives),
+        )
+        .expect("configure");
+    assert!(
+        store.objective_assign(mission, 2, None, "brief").is_err(),
+        "the resident is not approved yet"
+    );
+    store
+        .resident_propose("rsi", "Pursues objectives")
+        .expect("propose");
+    store.resident_approve("rsi").expect("approve");
+
+    assert!(
+        store
+            .objective_import(
+                mission,
+                2,
+                Some("METRIC x baseline=2 candidate=1"),
+                "old",
+                1000
+            )
+            .expect("import")
+    );
+    assert!(
+        !store
+            .objective_import(
+                mission,
+                2,
+                Some("METRIC x baseline=2 candidate=1"),
+                "old",
+                1000
+            )
+            .expect("import again"),
+        "an attempt is imported once"
+    );
+    let task = store
+        .objective_assign(
+            mission,
+            2,
+            Some("/controller/rsi/scenarios/002.sh"),
+            "brief",
+        )
+        .expect("assign");
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+                                   "reason": "scenario fails on the candidate", "base": "b"}),
+        )
+        .expect("a verdict");
+
+    let landings = store.objective_landings(mission).expect("landings");
+    assert_eq!(
+        landings,
+        json!([{"objective": 2, "metric": "METRIC x baseline=2 candidate=1"}])
+    );
+    let history = store.objective_history(mission, 2, 6).expect("history");
+    assert_eq!(history[0]["task"], task);
+    assert_eq!(history[0]["verdict"], "rejected");
+    assert_eq!(history[0]["reason"], "scenario fails on the candidate");
+
+    let mut client = admin(&schema);
+    let live = tables(&mut client);
+    assert_eq!(live["tasks"][1]["agent_id"], "agent_resident_rsi");
+    assert_eq!(live["tasks"][1]["created_by"], "spawn-integrate");
+    assert_eq!(
+        live["tasks"][1]["scenario"],
+        "/controller/rsi/scenarios/002.sh"
+    );
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live);
 }
