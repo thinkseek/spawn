@@ -105,7 +105,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据库，缺失时测试失败而非跳过。`scripts/e2e-smoke.sh` 用真实 PostgreSQL 与 tmux 跑端到端流程。`scripts/run-gate-on-remote.sh` 在远端主机上运行全部检查。
+PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据库，缺失时测试失败而非跳过。对一棵树跑全部检查，用的就是落地时的同一个门禁：`scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios`（构建、clippy、测试、`scripts/mvp-e2e.sh`、`scripts/blackbox/` 黑盒场景、web 构建）。
 
 ## 文档
 

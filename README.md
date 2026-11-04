@@ -129,7 +129,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The PostgreSQL tests need `SPAWN_TEST_DATABASE_URL` set to a disposable database; they do not skip. `scripts/e2e-smoke.sh` runs an end-to-end pass with real PostgreSQL and tmux. `scripts/run-gate-on-remote.sh` runs all checks on a remote host.
+The PostgreSQL tests need `SPAWN_TEST_DATABASE_URL` set to a disposable database; they do not skip. All checks on one tree, through the same gate that lands work: `scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios` (build, clippy, tests, `scripts/mvp-e2e.sh`, the black-box scenarios in `scripts/blackbox/`, the web build).
 
 ## Documentation
 
