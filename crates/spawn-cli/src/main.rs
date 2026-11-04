@@ -38,6 +38,7 @@ mod dispatch;
 mod evolve;
 mod missions;
 mod serve;
+mod sources;
 mod supervise;
 mod trace;
 use trace::Timed;
@@ -109,6 +110,10 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "dispatch" => cmd_dispatch(&rest),
         "corpus" => cmd_corpus(&rest),
         "mission" => missions::mission(&rest),
+        "charter" => {
+            println!("{}", supervise::current_charter());
+            Ok(0)
+        }
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),
         "judge" => cmd_judge(&Flags::parse(&rest)?),
@@ -207,10 +212,21 @@ fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
 
     // The engine runs in a container when an image is configured. That
     // container also hosts tmux, so the terminal host needs the same image.
-    let workspaces: Arc<dyn WorkspaceStore> = Arc::new(match image.as_ref() {
-        Some(image) => GitWorkspace::with_container(&repo, &root, &docker, image),
-        None => GitWorkspace::new(&repo, &root),
-    });
+    // Every agent's workspace comes from its mission's source; agents no
+    // mission owns use the default repository.
+    let factory: sources::Factory = {
+        let (root, docker, image) = (root.clone(), docker.clone(), image.clone());
+        Arc::new(move |repo: &std::path::Path| match image.as_ref() {
+            Some(image) => GitWorkspace::with_container(repo, &root, &docker, image),
+            None => GitWorkspace::new(repo, &root),
+        })
+    };
+    let workspaces: Arc<dyn WorkspaceStore> = Arc::new(sources::MissionWorkspaces::new(
+        factory(std::path::Path::new(&repo)),
+        std::path::Path::new(&root),
+        store.clone(),
+        factory,
+    ));
     let terminals: Arc<dyn TerminalHost> = match image.as_ref() {
         Some(_) => Arc::new(TmuxHost::in_workspaces(
             &tmux,

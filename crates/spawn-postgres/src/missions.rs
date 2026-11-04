@@ -239,6 +239,24 @@ impl PostgresStore {
         Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
     }
 
+    /// Where an agent's workspace comes from: `None` when no mission owns
+    /// the agent, `Some(None)` for a mission without sources (a scratch
+    /// workspace), `Some(Some(source))` otherwise. The agent's first task
+    /// decides, so a resident's workspace never jumps between sources.
+    pub fn agent_source(&self, agent: &str) -> Result<Option<Option<String>>, StoreError> {
+        let mut client = self.lock();
+        let rows = client
+            .query(
+                "select m.sources ->> 0
+                   from mission_tasks k join mission_missions m on m.id = k.mission_id
+                  where k.agent_id = $1
+                  order by k.id limit 1",
+                &[&agent],
+            )
+            .map_err(|error| backend(&error))?;
+        Ok(rows.first().map(|row| row.get::<_, Option<String>>(0)))
+    }
+
     /// Record that a task's delivery command was submitted.
     pub fn task_delivered(&self, task: i64, command: i64) -> Result<(), StoreError> {
         let mut client = self.lock();

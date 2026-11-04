@@ -143,6 +143,14 @@ ephemeral workers should not exist.
     )
 }
 
+/// The charter as this build writes it, for re-briefing a running supervisor.
+pub(crate) fn current_charter() -> String {
+    charter(
+        &env_or("SPAWN_PROGRAM", "spawn"),
+        &env_or("SPAWN_MISSION_FILE", "mission.md"),
+    )
+}
+
 /// Summary of the log for a new native session.
 fn handoff(store: &PostgresStore) -> String {
     let fleet = store.fleet_json().map_or_else(

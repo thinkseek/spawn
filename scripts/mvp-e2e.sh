@@ -139,7 +139,7 @@ while :; do
       hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$native\"}"
       tool
       mkdir -p .spawn
-      printf '## Outcome\ndone: %s\n## What changed\nnothing real\n## Open issues\nnone\n' "$line" >.spawn/report.md
+      printf '## Outcome\ndone: %s\n## What changed\nfiles: %s\n## Open issues\nnone\n' "$line" "$(ls | tr '\n' ' ')" >.spawn/report.md
       printf 'DONE: reported\n'
       stop; pending=0 ;;
     *E2E:ASK*)
@@ -345,13 +345,26 @@ wait_for 60 "task $t2's report" state_is "$t2" reported
 sup task accept --id "$t2" >/dev/null
 pass "resident tasks: one at a time, reported, sent back once, accepted"
 
-t3=$(sup task assign --mission "$mission" --kind ephemeral --worker probe --brief "E2E:REPORT probe" | jq -r .task)
+board | jq -e --argjson id "$t2" '.missions[].tasks[] | select(.id == $id) | .report | test("README") | not' >/dev/null ||
+  fail "a mission without sources saw the default repository"
+pass "a mission without sources works in a scratch workspace"
+
+# A mission sourced from another repository, whose default branch is not main.
+other=$work/other
+git init -q --initial-branch=trunk "$other"
+printf 'x\n' >"$other/OTHER_MARKER.txt"
+git -C "$other" add -A
+git -C "$other" -c user.name=e2e -c user.email=e2e@localhost commit -qm other
+sourced=$("$bin" mission add --text "E2E sourced mission" --source "$other" | jq -r .mission)
+t3=$(sup task assign --mission "$sourced" --kind ephemeral --worker probe --brief "E2E:REPORT probe" | jq -r .task)
 probe=$(board | jq -r --argjson id "$t3" '.missions[].tasks[] | select(.id == $id) | .session_id')
 wait_for 60 "the ephemeral report" state_is "$t3" reported
+board | jq -e --argjson id "$t3" '.missions[].tasks[] | select(.id == $id) | .report | test("OTHER_MARKER")' >/dev/null ||
+  fail "the sourced mission's worker did not get its repository"
 sup task accept --id "$t3" >/dev/null
 gone() { ! live "$probe"; }
 wait_for 60 "the ephemeral worker to be stopped" gone
-pass "an ephemeral worker reported and was stopped once accepted"
+pass "an ephemeral worker got its mission's repository, reported, and was stopped once accepted"
 
 "$bin" submit --principal human --agent agent_resident_core --session session_resident_core \
   --key "human-$(date +%s%N)" --action '{"type":"input","text":"hello from a human"}' >/dev/null
