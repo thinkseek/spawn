@@ -382,6 +382,8 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
             "brief",
         )
         .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
     store
         .integrator_record(
             &json!({"type": "task.gated", "id": task, "verdict": "rejected",
@@ -472,4 +474,38 @@ fn a_landing_moves_the_baseline_of_every_mission_on_its_source() {
     );
     refold(&mut client);
     assert_eq!(tables(&mut client), live);
+}
+
+#[test]
+fn a_verdict_does_not_bring_back_a_cancelled_task() {
+    let (store, _schema) = store("control_cancelled_verdict");
+    let mission = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            None,
+        )
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    // The gate is running when the supervisor cancels the task.
+    store.task_cancel(task).expect("cancel");
+    for record in [
+        json!({"type": "task.gated", "id": task, "verdict": "accepted", "base": "b", "candidate": "c"}),
+        json!({"type": "task.landed", "id": task, "from": "b", "to": "c"}),
+        json!({"type": "task.aborted", "id": task, "reason": "budget"}),
+    ] {
+        assert!(
+            store.integrator_record(&record).is_err(),
+            "{record} must not touch a cancelled task"
+        );
+    }
 }

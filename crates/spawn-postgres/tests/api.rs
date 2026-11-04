@@ -871,6 +871,63 @@ fn status_joins_the_judgement_and_the_latest_execution() {
 }
 
 #[test]
+fn the_gateway_refuses_a_session_another_agent_owns() {
+    let (store, schema) = store("session_owner");
+    let mut client = admin(&schema);
+    store
+        .append(message(EventKind::MessageReceived))
+        .expect("session_one belongs to agent_one");
+    client
+        .execute(
+            "insert into spawn_grants (principal, agent_id) values (session_user, 'agent_worker_*')",
+            &[],
+        )
+        .expect("grant the workers");
+    let error = client
+        .execute(
+            "insert into agent_commands (agent_id, session_id, idempotency_key, action) \
+             values ('agent_worker_x', 'session_one', 'k1', '{\"type\":\"stop\"}'::jsonb)",
+            &[],
+        )
+        .expect_err("a worker grant does not reach agent_one's session");
+    assert_eq!(
+        error.code(),
+        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+    );
+    client
+        .execute(
+            "insert into agent_commands (agent_id, session_id, idempotency_key, action) \
+             values ('agent_worker_x', 'session_worker_x', 'k2', '{\"type\":\"stop\"}'::jsonb)",
+            &[],
+        )
+        .expect("a new session is the worker's own");
+}
+
+#[test]
+fn a_gateway_submission_returns_its_own_command() {
+    let (store, schema) = store("gateway_id");
+    let mut client = admin(&schema);
+    client
+        .execute(
+            "insert into spawn_grants (principal, agent_id) values (session_user, 'agent_one')",
+            &[],
+        )
+        .expect("grant");
+    let mine = store
+        .submit_via_gateway(&start(session(), "mine"))
+        .expect("submit");
+    let principal = Principal::new("spawn").expect("valid principal");
+    let newer = store
+        .submit(&principal, &start(session(), "newer"))
+        .expect("a newer command in the same session");
+    let again = store
+        .submit_via_gateway(&start(session(), "mine"))
+        .expect("the same key again");
+    assert_ne!(mine, newer);
+    assert_eq!(again, mine, "the retry names the command it made");
+}
+
+#[test]
 fn views_are_closed_to_other_roles() {
     let (_store, schema) = store("revoke");
     let mut client = admin(&schema);

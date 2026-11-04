@@ -6,8 +6,8 @@ use spawn_core::command::Submission;
 use spawn_core::id::{CommandId, SessionId};
 use spawn_core::port::StoreError;
 
+use crate::PostgresStore;
 use crate::queries::gateway;
-use crate::{PostgresStore, backend};
 
 impl PostgresStore {
     /// The fleet as one JSON array, read through the grant-filtered
@@ -33,29 +33,17 @@ impl PostgresStore {
     pub fn submit_via_gateway(&self, submission: &Submission) -> Result<CommandId, StoreError> {
         let action = serde_json::to_value(&submission.action)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
-        // One lock across both statements: the id is read back through the
-        // grant-filtered reader (the gateway has no RETURNING), and no other
-        // statement on this connection may run in between.
-        let mut client = self.lock();
-        client
-            .execute(
-                gateway::SUBMIT,
-                &[
-                    &submission.agent_id.as_str(),
-                    &submission.session_id.as_str(),
-                    &submission.idempotency_key.as_str(),
-                    &action,
-                ],
-            )
-            .map_err(|error| backend(&error))?;
-        let row = client
-            .query_opt(
-                gateway::NEWEST_COMMAND_ID,
-                &[&submission.session_id.as_str()],
-            )
-            .map_err(|error| backend(&error))?;
-        Ok(CommandId(row.map_or(0, |row| {
-            row.get::<_, i64>("command_id").unsigned_abs()
-        })))
+        // The gateway's trigger returns the command it made (a new one, or
+        // the one an earlier call with this key made), and RETURNING reads it.
+        let row = self.query_one(
+            gateway::SUBMIT,
+            &[
+                &submission.agent_id.as_str(),
+                &submission.session_id.as_str(),
+                &submission.idempotency_key.as_str(),
+                &action,
+            ],
+        )?;
+        Ok(CommandId(row.get::<_, i64>(0).unsigned_abs()))
     }
 }

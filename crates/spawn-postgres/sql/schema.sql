@@ -411,6 +411,16 @@ begin
         raise exception 'principal % has no grant for agent %', session_user, new.agent_id
             using errcode = '42501';
     end if;
+    -- A session belongs to the agent that first used it: a grant for one
+    -- agent must not reach another agent's session (the Bridge acts on the
+    -- session, not the agent).
+    if exists (select 1 from spawn_session_state p
+                where p.session_id = new.session_id and p.agent_id <> new.agent_id)
+       or exists (select 1 from spawn_commands c
+                   where c.session_id = new.session_id and c.agent_id <> new.agent_id) then
+        raise exception 'session % belongs to another agent than %', new.session_id, new.agent_id
+            using errcode = '42501';
+    end if;
 
     select s.out_id into v_id
         from spawn_submit(session_user::text, new.idempotency_key, new.agent_id, new.session_id, new.action) s;
@@ -655,6 +665,9 @@ revoke select on agent_state, agent_status, agent_timeline, agent_judgements, ag
     agent_lineage, agent_open_tools, agent_freshness
     from public;
 grant insert on agent_commands to public;
+-- RETURNING id gives the caller the command it made; the id column is all
+-- a caller can read back, never another agent's commands.
+grant select (id) on agent_commands to public;
 
 revoke execute on function spawn_append(text, text, text, text, text, jsonb) from public;
 revoke execute on function spawn_append_trusted(text, text, text, text, text, jsonb) from public;
@@ -1105,6 +1118,8 @@ declare
     v_caller text := spawn_mission_caller();
     v_id bigint;
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if v_caller is null then
         raise exception '% may not add missions', session_user using errcode = '42501';
     end if;
@@ -1123,6 +1138,8 @@ end $$;
 create or replace function spawn_mission_close(p_mission bigint, p_state text, p_summary text)
 returns void language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is null then
         raise exception '% may not close missions', session_user using errcode = '42501';
     end if;
@@ -1147,6 +1164,8 @@ declare
     v_session text;
     v_label text;
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if v_caller is null then
         raise exception '% may not assign tasks', session_user using errcode = '42501';
     end if;
@@ -1186,6 +1205,8 @@ end $$;
 create or replace function spawn_task_delivered(p_task bigint, p_command bigint)
 returns boolean language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record deliveries', session_user using errcode = '42501';
     end if;
@@ -1200,6 +1221,8 @@ end $$;
 create or replace function spawn_task_reported(p_task bigint, p_report text)
 returns boolean language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record reports', session_user using errcode = '42501';
     end if;
@@ -1215,6 +1238,8 @@ end $$;
 create or replace function spawn_task_review(p_task bigint, p_accept boolean, p_note text)
 returns void language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is null then
         raise exception '% may not review tasks', session_user using errcode = '42501';
     end if;
@@ -1231,6 +1256,8 @@ end $$;
 create or replace function spawn_task_cancel(p_task bigint)
 returns void language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is null then
         raise exception '% may not cancel tasks', session_user using errcode = '42501';
     end if;
@@ -1247,6 +1274,8 @@ returns void language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if v_caller is null then
         raise exception '% may not propose residents', session_user using errcode = '42501';
     end if;
@@ -1267,6 +1296,8 @@ end $$;
 create or replace function spawn_resident_approve(p_name text)
 returns void language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only a human approves a resident' using errcode = '42501';
     end if;
@@ -1279,6 +1310,8 @@ end $$;
 create or replace function spawn_resident_retire(p_name text)
 returns void language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is null then
         raise exception '% may not retire residents', session_user using errcode = '42501';
     end if;
@@ -1294,6 +1327,8 @@ create or replace function spawn_mission_configure(p_mission bigint, p_gate text
                                                    p_budget jsonb, p_objectives jsonb)
 returns void language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only a human sets a mission''s gate' using errcode = '42501';
     end if;
@@ -1328,6 +1363,8 @@ declare
     v_agent text;
     v_session text;
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not assign objectives', session_user using errcode = '42501';
     end if;
@@ -1354,6 +1391,8 @@ declare
     v_agent text;
     v_session text;
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not import attempts', session_user using errcode = '42501';
     end if;
@@ -1380,6 +1419,8 @@ end $$;
 create or replace function spawn_mission_resume(p_mission bigint)
 returns void language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only a human resumes a halted mission' using errcode = '42501';
     end if;
@@ -1394,6 +1435,8 @@ end $$;
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
@@ -1403,6 +1446,17 @@ begin
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'aborted', 'stale') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
+    end if;
+    -- The gate runs for minutes: the task may have been closed meanwhile.
+    -- A verdict only moves work that is still waiting for it.
+    if p_record ->> 'type' like 'task.%' and not exists (
+        select 1 from mission_tasks
+         where id = (p_record ->> 'id')::bigint
+           and state = any (case p_record ->> 'type'
+                              when 'task.landed' then array['landing']
+                              when 'task.aborted' then array['delivered']
+                              else array['reported', 'accepted', 'landing'] end)) then
+        raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
     end if;
     return spawn_control_record(p_record);
 end $$;
