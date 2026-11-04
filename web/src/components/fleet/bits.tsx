@@ -33,7 +33,7 @@ export function JudgeBadge({
         "border border-dashed border-border-strong text-faint-foreground ring-0",
       icon: <Cpu size={11} />,
       label: "Heuristic",
-      title: "Legacy heuristic judgement",
+      title: "Judged by the built-in heuristic (no model judge configured)",
     },
     other: {
       className: "bg-transparent text-faint-foreground ring-surface-border",

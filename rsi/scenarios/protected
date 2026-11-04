@@ -4,4 +4,4 @@
 rsi/
 scripts/rsi/
 scripts/blackbox/
-scripts/mvp-e2e.sh
+scripts/e2e.sh

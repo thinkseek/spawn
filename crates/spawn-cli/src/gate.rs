@@ -58,7 +58,7 @@ pub(crate) enum GateFailure {
 /// withheld here, whatever database it names: the test login is a
 /// superuser, and a superuser on the owner's cluster reaches the owner's
 /// database. Text is only the cheap first pass; [`withhold_owners_cluster`]
-/// decides by the servers' identity. (Not an error: mvp-e2e runs an
+/// decides by the servers' identity. (Not an error: the e2e runs an
 /// integrator whose own database is the test database.)
 pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     let owner = lookup("SPAWN_DATABASE_URL");

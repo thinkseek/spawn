@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MVP end to end: the whole decision ladder with a scripted engine and a stub
-# Jev, on real PostgreSQL, git and tmux (docs/fleet-architecture.md §7).
+# End to end: the whole decision ladder with a scripted engine and a stub
+# Jev, on real PostgreSQL, git and tmux (docs/fleet-architecture.md).
 #
 # It asserts every hop:
 #   1. a rule decides WORKING while a tool runs (no model call);
@@ -20,7 +20,7 @@
 #      human message to a worker reaches the supervisor; a resident killed is
 #      resumed, a resident stopped by the supervisor stays down.
 #
-# Usage: SPAWN_DATABASE_URL=postgres://... scripts/mvp-e2e.sh
+# Usage: SPAWN_DATABASE_URL=postgres://... scripts/e2e.sh
 # Runs in its own schema (dropped afterwards when psql is installed) and its own tmux socket.
 set -euo pipefail
 
@@ -37,8 +37,8 @@ work=$(mktemp -d)
 # namespace, where $$ is the same small number every time, and a schema
 # left by an earlier run would be reused.
 run="$$_${RANDOM}${RANDOM}"
-socket="spawn-mvp-$run"
-schema="mvp_e2e_$run"
+socket="spawn-e2e-$run"
+schema="e2e_$run"
 loop_pid=""
 jev_pid=""
 
@@ -63,17 +63,17 @@ cleanup() {
   if [ "${KEEP:-0}" != 1 ] && command -v psql >/dev/null; then
     psql -q "$base_url" -c "drop schema if exists $schema cascade" >/dev/null 2>&1 || true
   fi
-  if [ "${KEEP:-0}" != 1 ]; then rm -rf "$work"; else echo "mvp-e2e: kept $work" >&2; fi
+  if [ "${KEEP:-0}" != 1 ]; then rm -rf "$work"; else echo "e2e: kept $work" >&2; fi
 }
 trap cleanup EXIT
 
 fail() {
-  echo "mvp-e2e: FAIL: $*" >&2
+  echo "e2e: FAIL: $*" >&2
   echo "--- loop log (tail)" >&2
   tail -n 40 "$work/loop.log" >&2 || true
   exit 1
 }
-pass() { echo "mvp-e2e: ok: $*"; }
+pass() { echo "e2e: ok: $*"; }
 
 # wait_for <seconds> <description> <command...>
 wait_for() {
@@ -248,7 +248,7 @@ export SPAWN_DATABASE_URL=$url
 export SPAWN_GIT_REPO=$repo SPAWN_WORKSPACE_ROOT=$work/ws
 export SPAWN_CLAUDE_PROGRAM=$work/claude SPAWN_PROGRAM=$bin
 export SPAWN_TMUX_PROGRAM=$tmux SPAWN_TMUX_SOCKET=$socket
-export SPAWN_WORKER=worker-mvp SPAWN_LOOP_INTERVAL_MS=300
+export SPAWN_WORKER=worker-e2e SPAWN_LOOP_INTERVAL_MS=300
 export SPAWN_JUDGE_MODEL=stub
 export SPAWN_SUPERVISOR=1 SPAWN_MISSION_FILE=$work/mission.md
 : >"$work/mission.md"
@@ -578,4 +578,4 @@ records=$(wc -l <"$work/corpus.jsonl")
 jq -e '.total > 0 and (.by_tier | length) > 0' "$work/replay.json" >/dev/null || fail "replay has no tiers"
 pass "corpus exported ($records records); replay: $(jq -c '{coverage, by_tier}' "$work/replay.json")"
 
-echo "mvp-e2e: PASS"
+echo "e2e: PASS"
