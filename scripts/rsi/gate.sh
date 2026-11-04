@@ -49,17 +49,21 @@
 # owner's.
 #
 # The candidate's own tests and lints judge it too (check-tests,
-# check-clippy), so it may not weaken them. Two cheap text rules, on the
-# exported trees, before anything runs:
-# - Test count: over every .rs file, the test attributes (`#[test]`,
-#   `#[tokio::test]`, any `#[<path>::test]`) minus the `#[ignore]`s (also
-#   inside `cfg_attr`) may not fall from base to candidate.
-# - Lint configuration: a change to a `[lints]` / `[workspace.lints]` table
-#   (or `lints.` keys) in any Cargo.toml, any change to clippy.toml or
-#   .clippy.toml, a new crate-level `#![allow(..)]` / `#![expect(..)]` (or one
-#   in `cfg_attr`), or a removed `#![warn|deny|forbid(..)]` is refused.
-# Neither rule sees a test module dropped from the build (`mod tests;`
-# removed, `#[cfg(any())]`) or an item-level `#[allow]`: a reviewer's job.
+# check-clippy), so it may not weaken them:
+# - Tests: the number of tests cargo runs may not fall from base to
+#   candidate. After the candidate's build, inside the sandbox, each tree
+#   runs `cargo test --workspace -- --list --format terse`, and the same
+#   with `--ignored`; runnable = listed minus ignored. A test deleted,
+#   ignored, commented out, in a file no `mod` includes, or behind
+#   `#[cfg(any())]` is not listed. The listing comes from the trees' own
+#   test binaries, so code that forges libtest's output at start-up could
+#   inflate it: this stops weakening, not a forger.
+# - Lint configuration (text, before anything runs): a change to a
+#   `[lints]` / `[workspace.lints]` table (or `lints.` keys) in any
+#   Cargo.toml, any change to clippy.toml or .clippy.toml, a new crate-level
+#   `#![allow(..)]` / `#![expect(..)]` (or one in `cfg_attr`), or a removed
+#   `#![warn|deny|forbid(..)]` is refused. An item-level `#[allow]` is a
+#   reviewer's job.
 #
 # Environment (the integrator passes these and nothing else, gate.rs):
 #   PATH, HOME, LANG, TMPDIR   as usual
@@ -380,27 +384,9 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     fi
 fi
 
-# The candidate's own tests and lints judge it (check-tests, check-clippy):
-# it may not weaken them (the rules are in the header). Text only, on the
-# exported trees, before anything is built.
-
-# test_count <tree>: test attributes minus ignores, over every .rs file.
-test_count() {
-    find "$1" -name '*.rs' -type f -exec cat {} + 2>/dev/null | awk '
-        {
-            tests += gsub(/#\[([A-Za-z_][A-Za-z0-9_]*::)*test[[:space:]]*[](]/, "")
-            ignored += gsub(/#\[ignore[[:space:]]*[]=(]/, "")
-            ignored += gsub(/#\[cfg_attr\([^]]*[(,[:space:]]ignore[[:space:]]*[]),=]/, "")
-        }
-        END { print tests - ignored + 0 }'
-}
-base_tests=$(test_count "$work/baseline")
-candidate_tests=$(test_count "$work/candidate")
-if [ "$candidate_tests" -lt "$base_tests" ]; then
-    echo "| test attributes minus #[ignore]: $base_tests on the base, $candidate_tests on the candidate"
-    verdict rejected "candidate drops or ignores tests ($base_tests -> $candidate_tests)"
-    exit 0
-fi
+# The candidate's own lints judge it (check-clippy): it may not relax them
+# (the rules are in the header). Text only, on the exported trees, before
+# anything is built. The test ratchet runs after the build, below.
 
 # lint_config <tree>: every [lints]/[workspace.lints] line (and `lints.`
 # key) of every Cargo.toml, and every clippy.toml, one fact per line.
@@ -479,6 +465,52 @@ echo "| == candidate: build"
 if ! build "$work/candidate"; then
     verdict rejected "candidate does not build"
     exit 0
+fi
+
+# runnable_tests <writable dir> <tree> <target dir>: how many tests cargo
+# runs in the tree, from inside the sandbox: libtest's `<name>: test` lines
+# of `--list`, minus those of `--list --ignored`.
+runnable_tests() {
+    list_dir=$1
+    list_tree=$2
+    list_target=$3
+    for list_mode in all ignored; do
+        set -- --list --format terse
+        [ "$list_mode" = ignored ] && set -- "$@" --ignored
+        sandbox "$list_dir" env CARGO_TARGET_DIR="$list_target" cargo test --quiet --workspace \
+            --manifest-path "$list_tree/Cargo.toml" -- "$@" \
+            >"$work/tests.$list_mode" 2>>"$work/tests.log" || return 1
+    done
+    echo $(($(grep -c ': test$' "$work/tests.all") - $(grep -c ': test$' "$work/tests.ignored")))
+}
+
+# The candidate may not run fewer tests than the base. Counted from what
+# cargo runs, so a test deleted, ignored, commented out, left in a file no
+# `mod` includes, or behind `#[cfg(any())]` is gone. The base tree stays
+# read-only: its cargo writes to a target directory of its own. The
+# candidate's target directory is the one check-tests reuses.
+if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; then
+    echo "| == tests: what cargo runs, base and candidate"
+    listing_started=$(date +%s)
+    mkdir -p "$work/base-target"
+    : >"$work/tests.log"
+    if ! base_tests=$(runnable_tests "$work/base-target" "$work/baseline" "$work/base-target"); then
+        sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
+        verdict rejected "base tests do not build"
+        exit 0
+    fi
+    : >"$work/tests.log"
+    if ! candidate_tests=$(runnable_tests "$work/candidate" "$work/candidate" "$work/candidate/target"); then
+        sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
+        verdict rejected "candidate tests do not build"
+        exit 0
+    fi
+    echo "| tests cargo runs: $base_tests on the base, $candidate_tests on the candidate" \
+        "(listed in $(($(date +%s) - listing_started)) s)"
+    if [ "$candidate_tests" -lt "$base_tests" ]; then
+        verdict rejected "candidate runs fewer tests ($base_tests -> $candidate_tests)"
+        exit 0
+    fi
 fi
 
 if [ -n "$scenario" ]; then

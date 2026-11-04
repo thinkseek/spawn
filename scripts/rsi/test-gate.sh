@@ -1,10 +1,16 @@
 #!/bin/sh
 # Tests of the gate (scripts/rsi/gate.sh) on throwaway repositories: no
-# cargo, no database. Prints one line per case and exits non-zero on the
-# first wrong verdict. Needs bwrap, as the gate does.
+# database; cargo only for the test-count cases (a crate with no
+# dependencies, offline). Prints one line per case and exits non-zero on
+# the first wrong verdict. Needs bwrap, as the gate does.
 #
 # usage: scripts/rsi/test-gate.sh
 set -eu
+
+# rustup finds its toolchains under the real $HOME, which is replaced below.
+if [ -z "${RUSTUP_HOME-}" ] && [ -d "$HOME/.rustup" ]; then
+    export RUSTUP_HOME="$HOME/.rustup"
+fi
 
 gate=$(cd "$(dirname "$0")" && pwd)/gate.sh
 work=$(mktemp -d)
@@ -336,30 +342,82 @@ twice=$(commit metric-twice)
 expect "two METRIC lines on stdout: no metric" "$(judge "$twice" "$scenarios/008.sh")" 'exit=0 {"verdict":"accepted"}'
 expect "two METRIC lines are reported" "$(cat "$work/gate.out")" 'two or more METRIC lines'
 
-# 7. The candidate may not weaken its own tests: the count of test
-# attributes minus ignores may not fall. A moved test is not a drop.
-branch tests-dropped
-printf 'two\n' >"$seed/value"
-sed -i '/#\[tokio::test\]/,/async fn two/d' "$lib"
-dropped=$(commit tests-dropped)
-expect "a dropped test is refused" "$(judge "$dropped")" 'drops or ignores tests (2 -> 1)'
-branch tests-ignored
-printf 'two\n' >"$seed/value"
-sed -i 's/^    #\[test\]$/    #[test]\n    #[ignore = "flaky"]/' "$lib"
-ignored=$(commit tests-ignored)
-expect "an ignored test is refused" "$(judge "$ignored")" 'drops or ignores tests (2 -> 1)'
-branch tests-cfg-ignored
-printf 'two\n' >"$seed/value"
-sed -i 's/^    #\[tokio::test\]$/    #[tokio::test] #[cfg_attr(all(), ignore)]/' "$lib"
-cfg_ignored=$(commit tests-cfg-ignored)
-expect "a test ignored through cfg_attr is refused" "$(judge "$cfg_ignored")" 'drops or ignores tests'
-branch tests-moved
-printf 'two\n' >"$seed/value"
-sed -i '/#\[tokio::test\]/,/async fn two/d' "$lib"
-mkdir -p "$seed/crates/lib/tests"
-printf '#[tokio::test]\nasync fn two() {}\n' >"$seed/crates/lib/tests/two.rs"
-moved=$(commit tests-moved)
-expect "a moved test is not a drop" "$(judge "$moved")" 'exit=0 {"verdict":"accepted"}'
+# 7. The candidate may not run fewer tests than the base, as cargo counts
+# them: a tiny crate on a base of its own (the only cases that run cargo,
+# offline, no dependencies). Its base runs 3: a, b and extra (c is ignored).
+branch base-rust
+printf '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n' >"$seed/Cargo.toml"
+mkdir -p "$seed/src" "$seed/tests"
+cat >"$seed/src/lib.rs" <<'EOF'
+//! A crate with tests.
+
+/// One.
+pub fn one() -> u32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a() {
+        assert_eq!(super::one(), 1);
+    }
+
+    #[test]
+    fn b() {}
+
+    #[test]
+    #[ignore]
+    fn c() {}
+}
+EOF
+printf '#[test]\nfn extra() {}\n' >"$seed/tests/extra.rs"
+(cd "$seed" && CARGO_NET_OFFLINE=true cargo generate-lockfile -q)
+rust_base=$(commit base-rust)
+rust_branch() {
+    git -C "$seed" checkout -q -B "$1" "$rust_base"
+    printf 'two\n' >"$seed/value"
+}
+judge_rust() {
+    saved_base=$base
+    base=$rust_base
+    judge "$1"
+    base=$saved_base
+}
+rust_branch rust-same
+same=$(commit rust-same)
+expect "the same tests land" "$(judge_rust "$same")" 'exit=0 {"verdict":"accepted"}'
+expect "the counts are reported" "$(cat "$work/gate.out")" 'tests cargo runs: 3 on the base, 3 on the candidate'
+rust_branch rust-comment
+sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
+printf '\n// #[test]\n// fn b() {}\n/// A string, not a test.\npub const B: &str = "#[test] fn b() {}";\n' \
+    >>"$seed/src/lib.rs"
+comment=$(commit rust-comment)
+expect "a test replaced by a comment and a string is refused" "$(judge_rust "$comment")" \
+    'runs fewer tests (3 -> 2)'
+rust_branch rust-orphan
+sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
+printf '#[test]\nfn b() {}\n' >"$seed/src/orphan.rs"
+orphan=$(commit rust-orphan)
+expect "a test moved to a file no mod includes is refused" "$(judge_rust "$orphan")" \
+    'runs fewer tests (3 -> 2)'
+rust_branch rust-ignored
+sed -i 's/^    fn b() {}$/    #[ignore]\n    fn b() {}/' "$seed/src/lib.rs"
+ignored=$(commit rust-ignored)
+expect "an ignored test is refused" "$(judge_rust "$ignored")" 'runs fewer tests (3 -> 2)'
+rust_branch rust-cfg
+sed -i 's/^#\[cfg(test)\]$/#[cfg(any())]/' "$seed/src/lib.rs"
+uncompiled=$(commit rust-cfg)
+expect "a test module compiled out is refused" "$(judge_rust "$uncompiled")" 'runs fewer tests (3 -> 1)'
+rust_branch rust-moved
+sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
+printf '#[test]\nfn b() {}\n' >>"$seed/tests/extra.rs"
+moved=$(commit rust-moved)
+expect "a moved test is not a drop" "$(judge_rust "$moved")" 'exit=0 {"verdict":"accepted"}'
+rust_branch rust-broken
+printf '#[test]\nfn broken() { let x: u32 = "no"; }\n' >>"$seed/tests/extra.rs"
+broken=$(commit rust-broken)
+expect "tests that do not build are refused" "$(judge_rust "$broken")" 'candidate tests do not build'
 
 # 8. Nor relax its lints: [lints] tables, clippy.toml, crate-level allows,
 # a removed crate-level deny.
