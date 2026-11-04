@@ -366,6 +366,17 @@ gone() { ! live "$probe"; }
 wait_for 60 "the ephemeral worker to be stopped" gone
 pass "an ephemeral worker got its mission's repository, reported, and was stopped once accepted"
 
+# The source moves on (a merge lands); the next new worker starts from it.
+printf 'y\n' >"$other/NEWER_MARKER.txt"
+git -C "$other" add -A
+git -C "$other" -c user.name=e2e -c user.email=e2e@localhost commit -qm newer
+t4=$(sup task assign --mission "$sourced" --kind ephemeral --worker probe2 --brief "E2E:REPORT probe2" | jq -r .task)
+wait_for 60 "the second ephemeral report" state_is "$t4" reported
+board | jq -e --argjson id "$t4" '.missions[].tasks[] | select(.id == $id) | .report | test("NEWER_MARKER")' >/dev/null ||
+  fail "a new worker started from a stale copy of its mission's source"
+sup task accept --id "$t4" >/dev/null
+pass "a new worker starts from the source as it is now, not as it was first mirrored"
+
 "$bin" submit --principal human --agent agent_resident_core --session session_resident_core \
   --key "human-$(date +%s%N)" --action '{"type":"input","text":"hello from a human"}' >/dev/null
 human_noted() { pane session_supervisor | grep -q '\[spawn:esc session_resident_core human-'; }
