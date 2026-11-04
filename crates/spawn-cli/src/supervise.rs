@@ -21,6 +21,7 @@ use spawn_core::mission::TaskState;
 use spawn_core::port::CommandQueue;
 use spawn_postgres::{LivenessFacts, PostgresStore};
 
+use crate::config::spawn_program;
 use crate::{env_or, open_store};
 
 /// Agent of the supervisor.
@@ -147,7 +148,7 @@ ephemeral workers should not exist.
 /// The charter as this build writes it, for re-briefing a running supervisor.
 pub(crate) fn current_charter() -> String {
     charter(
-        &env_or("SPAWN_PROGRAM", "spawn"),
+        &spawn_program(),
         &env_or("SPAWN_MISSION_FILE", "mission.md"),
     )
 }
@@ -183,7 +184,7 @@ pub(crate) fn keep_alive() -> Result<Option<String>, String> {
         .map_err(|error| error.to_string())?;
     let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
     let decision = decide(&facts, now);
-    let spawn = env_or("SPAWN_PROGRAM", "spawn");
+    let spawn = spawn_program();
     let mission = env_or("SPAWN_MISSION_FILE", "mission.md");
     let execution = facts
         .execution_id
