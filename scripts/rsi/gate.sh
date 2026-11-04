@@ -48,6 +48,19 @@
 # Git reads the gate's own config (an identity, no signing), not the
 # owner's.
 #
+# The candidate's own tests and lints judge it too (check-tests,
+# check-clippy), so it may not weaken them. Two cheap text rules, on the
+# exported trees, before anything runs:
+# - Test count: over every .rs file, the test attributes (`#[test]`,
+#   `#[tokio::test]`, any `#[<path>::test]`) minus the `#[ignore]`s (also
+#   inside `cfg_attr`) may not fall from base to candidate.
+# - Lint configuration: a change to a `[lints]` / `[workspace.lints]` table
+#   (or `lints.` keys) in any Cargo.toml, any change to clippy.toml or
+#   .clippy.toml, a new crate-level `#![allow(..)]` / `#![expect(..)]` (or one
+#   in `cfg_attr`), or a removed `#![warn|deny|forbid(..)]` is refused.
+# Neither rule sees a test module dropped from the build (`mod tests;`
+# removed, `#[cfg(any())]`) or an item-level `#[allow]`: a reviewer's job.
+#
 # Environment (the integrator passes these and nothing else, gate.rs):
 #   PATH, HOME, LANG, TMPDIR   as usual
 #   CARGO_HOME, RUSTUP_HOME    when the toolchain is not under $HOME
@@ -362,6 +375,87 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
         verdict rejected "candidate adds build-time code (a build script target)"
         exit 0
     fi
+fi
+
+# The candidate's own tests and lints judge it (check-tests, check-clippy):
+# it may not weaken them (the rules are in the header). Text only, on the
+# exported trees, before anything is built.
+
+# test_count <tree>: test attributes minus ignores, over every .rs file.
+test_count() {
+    find "$1" -name '*.rs' -type f -exec cat {} + 2>/dev/null | awk '
+        {
+            tests += gsub(/#\[([A-Za-z_][A-Za-z0-9_]*::)*test[[:space:]]*[](]/, "")
+            ignored += gsub(/#\[ignore[[:space:]]*[]=(]/, "")
+            ignored += gsub(/#\[cfg_attr\([^]]*[(,[:space:]]ignore[[:space:]]*[]),=]/, "")
+        }
+        END { print tests - ignored + 0 }'
+}
+base_tests=$(test_count "$work/baseline")
+candidate_tests=$(test_count "$work/candidate")
+if [ "$candidate_tests" -lt "$base_tests" ]; then
+    echo "| test attributes minus #[ignore]: $base_tests on the base, $candidate_tests on the candidate"
+    verdict rejected "candidate drops or ignores tests ($base_tests -> $candidate_tests)"
+    exit 0
+fi
+
+# lint_config <tree>: every [lints]/[workspace.lints] line (and `lints.`
+# key) of every Cargo.toml, and every clippy.toml, one fact per line.
+lint_config() {
+    (
+        cd "$1" || exit 1
+        find . -name Cargo.toml -type f | sort | while IFS= read -r manifest; do
+            awk -v file="$manifest" '
+                { sub(/#.*/, "") }
+                /^[[:space:]]*\[/ { inlints = ($0 ~ /^[[:space:]]*\[(workspace\.)?lints([].])/) }
+                inlints || /^[[:space:]]*(workspace\.)?lints[[:space:]]*[.=]/ {
+                    gsub(/[[:space:]]+/, "")
+                    if ($0 != "") print file ": " $0
+                }' "$manifest"
+        done
+        find . \( -name clippy.toml -o -name .clippy.toml \) -type f | sort | while IFS= read -r file; do
+            sed "s|^|$file: |" "$file"
+        done
+    )
+}
+if [ "$(lint_config "$work/baseline")" != "$(lint_config "$work/candidate")" ]; then
+    echo "| candidate changes lint configuration ([lints] tables or clippy.toml)"
+    verdict rejected "candidate changes lint configuration"
+    exit 0
+fi
+
+# crate_lints <tree>: crate-level lint attributes, `file|attribute`, with
+# whitespace removed and a multi-line attribute joined.
+crate_lints() {
+    (
+        cd "$1" || exit 1
+        find . -name '*.rs' -type f -exec awk '
+            FNR == 1 { open = 0 }
+            {
+                line = $0
+                if (!open && match(line, /#![[:space:]]*\[/)) { open = 1; text = ""; line = substr(line, RSTART) }
+                if (open) {
+                    text = text line
+                    if (index(line, "]")) {
+                        open = 0
+                        gsub(/[[:space:]]+/, "", text)
+                        text = substr(text, 1, index(text, "]"))
+                        if (text ~ /^#!\[(allow|expect|warn|deny|forbid|cfg_attr)\(/) print FILENAME "|" text
+                    }
+                }
+            }' {} + | sort -u
+    )
+}
+crate_lints "$work/baseline" >"$work/lints.base"
+crate_lints "$work/candidate" >"$work/lints.candidate"
+relaxed=$( {
+    comm -13 "$work/lints.base" "$work/lints.candidate" | grep -E '\|#!\[(allow|expect|cfg_attr)\(' || true
+    comm -23 "$work/lints.base" "$work/lints.candidate" | grep -E '\|#!\[(warn|deny|forbid|cfg_attr)\(' || true
+})
+if [ -n "$relaxed" ]; then
+    echo "| candidate relaxes crate-level lints: $(echo "$relaxed" | sed 's|^\./||' | tr '\n' ' ')"
+    verdict rejected "candidate relaxes crate-level lints"
+    exit 0
 fi
 
 if [ -n "$scenario" ]; then
