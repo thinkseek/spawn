@@ -359,11 +359,8 @@ impl Observer {
             observation
         };
         let Ok(raw) = answer else {
-            let mut observation = model_observation(
-                guess,
-                Some(WaitReason::JudgeUnavailable),
-                Confidence::ZERO,
-            );
+            let mut observation =
+                model_observation(guess, Some(WaitReason::JudgeUnavailable), Confidence::ZERO);
             observation.attention = true;
             observation.attention_reason = Some("judge_unavailable".to_string());
             return (observation, true);
