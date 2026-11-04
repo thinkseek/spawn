@@ -70,3 +70,55 @@ select jsonb_build_object(
       select name, agent_id, session_id, charter, state, proposed_by, approved_by,
              created_at_ms, updated_at_ms from mission_residents) r), '[]'::jsonb)
 )";
+
+// Checked decisions, one SQL function each.
+
+/// `$1` text, `$2` sources, `$3` origin; returns the mission id.
+pub(crate) const MISSION_ADD: &str = "select spawn_mission_add($1, $2, $3)";
+/// `$1` mission, `$2` final state, `$3` summary.
+pub(crate) const MISSION_CLOSE: &str = "select spawn_mission_close($1, $2, $3)";
+/// `$1` mission, `$2` kind, `$3` worker, `$4` brief; returns the task id.
+pub(crate) const TASK_ASSIGN: &str = "select spawn_task_assign($1, $2, $3, $4)";
+/// `$1` task, `$2` accept, `$3` note.
+pub(crate) const TASK_REVIEW: &str = "select spawn_task_review($1, $2, $3)";
+/// `$1` task.
+pub(crate) const TASK_CANCEL: &str = "select spawn_task_cancel($1)";
+/// `$1` name, `$2` charter.
+pub(crate) const RESIDENT_PROPOSE: &str = "select spawn_resident_propose($1, $2)";
+/// `$1` name.
+pub(crate) const RESIDENT_APPROVE: &str = "select spawn_resident_approve($1)";
+/// `$1` name.
+pub(crate) const RESIDENT_RETIRE: &str = "select spawn_resident_retire($1)";
+
+// Residents and workspaces.
+
+/// Approved residents that have run before, as (agent, session, charter).
+pub(crate) const RESIDENTS_TO_KEEP: &str = "select r.agent_id, r.session_id, r.charter
+                   from mission_residents r
+                  where r.state = 'approved'
+                    and exists (select 1 from spawn_events e
+                                 where e.session_id = r.session_id
+                                   and e.event_name = 'execution.started')
+                  order by r.name";
+
+/// Retired residents, as (agent, session).
+pub(crate) const RETIRED_RESIDENTS: &str =
+    "select agent_id, session_id from mission_residents where state = 'retired'";
+
+/// First source of the mission behind an agent's first task. `$1` agent.
+pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
+                   from mission_tasks k join mission_missions m on m.id = k.mission_id
+                  where k.agent_id = $1
+                  order by k.id limit 1";
+
+// Delivery bookkeeping, run by the dispatcher as the owner.
+
+/// `$1` task, `$2` delivery command.
+pub(crate) const TASK_DELIVERED: &str = "update mission_tasks set state = 'delivered', command_id = $2,
+                        updated_at_ms = spawn_now_ms()
+                  where id = $1 and state in ('assigned', 'revise')";
+
+/// `$1` task, `$2` report.
+pub(crate) const TASK_REPORTED: &str = "update mission_tasks set state = 'reported', report = $2,
+                        updated_at_ms = spawn_now_ms()
+                  where id = $1 and state = 'delivered'";
