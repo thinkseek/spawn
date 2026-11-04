@@ -33,6 +33,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use spawn_core::command::{CommandAction, Submission};
+use spawn_core::event::ModelProfile;
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::observation::{Ambiguity, Observation, SemanticState};
 use spawn_core::port::CommandQueue;
@@ -83,6 +84,9 @@ pub(crate) struct Facts {
     pub(crate) open_command: bool,
     #[serde(default)]
     pub(crate) dispatched: Vec<Sent>,
+    /// The model profile of the session's latest execution.
+    #[serde(default)]
+    pub(crate) model: ModelProfile,
 }
 
 impl Facts {
@@ -338,7 +342,7 @@ pub(crate) fn step(
 mod tests {
     use super::{Facts, Sent, Why, decide};
     use spawn_core::command::CommandAction;
-    use spawn_core::event::SessionSeq;
+    use spawn_core::event::{ModelProfile, SessionSeq};
     use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
 
     const NOW: i64 = 10_000_000;
@@ -372,6 +376,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            model: ModelProfile::Default,
         }
     }
 
@@ -405,6 +410,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            model: ModelProfile::Default,
         }
     }
 

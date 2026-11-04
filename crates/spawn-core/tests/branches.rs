@@ -66,6 +66,7 @@ fn start(store: &MemoryStore, from: Option<&str>) {
             prompt: "work".to_string(),
             parent_session_id: None,
             from: from.map(str::to_string),
+            model: None,
         },
     );
 }
@@ -667,6 +668,7 @@ fn a_resume_prompt_carries_the_notice() {
         "key_resume",
         CommandAction::Resume {
             prompt: Some("go on".to_string()),
+            model: None,
         },
     );
     bridge.tick().expect("resume");

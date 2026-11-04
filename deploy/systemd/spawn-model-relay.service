@@ -1,0 +1,20 @@
+[Unit]
+Description=Spawn: local relay from the engines to their model APIs (DeepSeek, the gateway)
+After=network-online.target
+
+[Service]
+# DEEPSEEK_API_KEY. The key stays in this process.
+EnvironmentFile=%h/.hermes/.env
+# Both upstreams go through the local proxy, as Claude Code's own calls do.
+Environment=http_proxy=http://127.0.0.1:10801 https_proxy=http://127.0.0.1:10801
+Environment=no_proxy=127.0.0.1,localhost
+Environment=MODEL_RELAY_ADDRESS=127.0.0.1:8791
+# The gateway every non-DeepSeek model goes to: by default the
+# env.ANTHROPIC_BASE_URL of ~/.claude/settings.json, read at start.
+# Environment=MODEL_RELAY_UPSTREAM=https://gateway.example
+ExecStart=/usr/bin/python3 -I %h/.local/share/spawn-rsi/bin/model-relay.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

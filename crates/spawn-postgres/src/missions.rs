@@ -15,7 +15,7 @@ pub(crate) const DELIVERY_TASKS: &str = r"
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
-         k.revisions, k.review_note, k.delivered_at_ms,
+         k.revisions, k.review_note, k.delivered_at_ms, k.model,
          m.text as mission_text,
          m.gate is not null as gated,
          r.charter, r.name as resident
@@ -67,6 +67,7 @@ select jsonb_build_object(
                  'state', k.state, 'revisions', k.revisions,
                  'review_note', k.review_note, 'report', k.report,
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
+                 'model', k.model,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
                  'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
@@ -381,17 +382,18 @@ impl PostgresStore {
             .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 
-    /// Assign a task; returns its id.
+    /// Assign a task, run on the model profile `model`; returns its id.
     pub fn task_assign(
         &self,
         mission: i64,
         kind: &str,
         worker: &str,
         brief: &str,
+        model: &str,
     ) -> Result<i64, StoreError> {
         let row = self.query_one(
-            "select spawn_task_assign($1, $2, $3, $4)",
-            &[&mission, &kind, &worker, &brief],
+            "select spawn_task_assign($1, $2, $3, $4, $5)",
+            &[&mission, &kind, &worker, &brief, &model],
         )?;
         Ok(row.get(0))
     }

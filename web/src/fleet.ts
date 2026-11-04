@@ -3,7 +3,7 @@
 // so a server that omits one renders an empty value instead of crashing.
 
 import type { SessionState } from "./api";
-import { apiHeaders } from "./api";
+import { apiError, apiHeaders } from "./api";
 import type { RsiPane } from "./rsi";
 import { normalizePane } from "./rsi";
 
@@ -419,7 +419,7 @@ async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
     } catch {
       // Not JSON; the status is enough.
     }
-    throw new Error(detail ? `HTTP ${response.status}: ${detail}` : `HTTP ${response.status}`);
+    throw apiError(response.status, detail);
   }
   return response.json();
 }

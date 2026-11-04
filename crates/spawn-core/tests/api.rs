@@ -3,11 +3,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use spawn_core::bridge::{Bridge, BridgeConfig, claude_arguments, claude_session_id};
+use spawn_core::bridge::{
+    Bridge, BridgeConfig, claude_arguments, claude_session_id, claude_settings,
+};
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
-    EndCause, Engine, EventKind, GlobalPosition, NewEvent, SessionSeq, Source,
+    EndCause, Engine, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq, Source,
 };
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
@@ -179,7 +181,11 @@ fn screen_reads_the_tail_not_the_history() {
 
 #[test]
 fn claude_arguments_name_the_session_and_install_no_hooks() {
-    let arguments = claude_arguments(Some("native-1"), true);
+    let arguments = claude_arguments(
+        Some("native-1"),
+        true,
+        &claude_settings(None, ModelProfile::Default),
+    );
     assert_eq!(arguments[0], "--ax-screen-reader");
     assert_eq!(arguments[1], "--allow-dangerously-skip-permissions");
     assert_eq!(arguments[2], "--settings");
@@ -188,14 +194,14 @@ fn claude_arguments_name_the_session_and_install_no_hooks() {
         !settings.contains("hooks"),
         "events come from the transcript"
     );
-    // `--settings` replaces the user settings file, so the engine must not
-    // stop on a permission dialog the Bridge cannot answer.
+    // The engine must not stop on a permission dialog the Bridge cannot
+    // answer, whatever the user's own settings say.
     assert!(settings.contains("skipDangerousModePermissionPrompt"));
     assert_eq!(
         arguments[4..],
         ["--resume".to_string(), "native-1".to_string()]
     );
-    let fresh = claude_arguments(Some("native-2"), false);
+    let fresh = claude_arguments(Some("native-2"), false, settings);
     assert_eq!(
         fresh[4..],
         ["--session-id".to_string(), "native-2".to_string()]
@@ -226,6 +232,7 @@ fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
                     prompt: prompt.to_string(),
                     parent_session_id: None,
                     from: None,
+                    model: None,
                 },
             },
         )
@@ -298,6 +305,7 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
             prompt: "second".to_string(),
             parent_session_id: None,
             from: None,
+            model: None,
         },
     );
     tick_fresh(&store);
@@ -677,6 +685,7 @@ fn bridge_resumes_the_stored_native_session() {
                 idempotency_key: IdempotencyKey::new("key_resume").expect("valid key"),
                 action: CommandAction::Resume {
                     prompt: Some("继续".to_string()),
+                    model: None,
                 },
             },
         )
@@ -725,6 +734,7 @@ fn observer_writes_only_on_change() {
                 workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"),
                 command_id: CommandId(1),
                 fork: None,
+                model: ModelProfile::Default,
             },
         })
         .expect("append succeeds");
@@ -805,6 +815,7 @@ fn lease_ttl_expires_and_takes_the_command_again() {
             prompt: "x".to_string(),
             parent_session_id: None,
             from: None,
+            model: None,
         },
     };
     let id = store

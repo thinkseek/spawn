@@ -8,6 +8,9 @@
 //!   context is the point of a resident), a live one gets the task typed in,
 //!   but only while it is idle at its prompt;
 //! - a task sent back is delivered again with the reviewer's note;
+//! - a task runs on its own model profile: a start or resume names it, and a
+//!   live worker on another profile is stopped first, then resumed on the
+//!   task's (a running engine keeps the models it started with);
 //! - a report (`.spawn/report.md`) is collected once its worker is idle, and
 //!   moved aside so the next task starts clean;
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
@@ -28,7 +31,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use spawn_core::command::CommandAction;
-use spawn_core::event::Engine;
+use spawn_core::event::{Engine, ModelProfile};
 use spawn_core::mission::TaskState;
 use spawn_postgres::PostgresStore;
 
@@ -67,6 +70,9 @@ pub(crate) struct TaskRow {
     /// left over from before.
     #[serde(default)]
     pub(crate) delivered_at_ms: Option<i64>,
+    /// The models the task's worker runs on.
+    #[serde(default)]
+    pub(crate) model: ModelProfile,
 }
 
 impl TaskRow {
@@ -261,6 +267,7 @@ fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
 /// How a waiting task reaches its worker, given the worker's facts.
 /// `settled`: the worker's last task is closed (see [`last_delivery_closed`]).
 fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Order> {
+    let model = Some(task.model);
     let key = task.delivery_key();
     match found {
         Some(facts) if facts.open_command => None,
@@ -274,13 +281,23 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
             } else {
                 facts.idle_at_prompt() || (settled && facts.turn_stopped_idle())
             };
-            ready.then(|| task.order(key, CommandAction::Input { text: typed(task) }))
+            if !ready {
+                return None;
+            }
+            if facts.model != task.model {
+                // Stopped at the same moment typing would be safe; the next
+                // pass resumes it, context kept, on the task's models.
+                let key = format!("switch-model-{}-{}", task.id, task.revisions);
+                return Some(task.order(key, CommandAction::Stop));
+            }
+            Some(task.order(key, CommandAction::Input { text: typed(task) }))
         }
         // Ran before: resume, so a resident keeps its context.
         Some(facts) if facts.execution_id.is_some() => Some(task.order(
             key,
             CommandAction::Resume {
                 prompt: Some(resume_prompt(task)),
+                model,
             },
         )),
         _ => Some(task.order(
@@ -290,6 +307,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
                 prompt: task_prompt(task),
                 parent_session_id: None,
                 from: None,
+                model,
             },
         )),
     }
@@ -596,7 +614,7 @@ mod tests {
     use crate::dispatch::{Facts, Sent, Why};
     use serde_json::json;
     use spawn_core::command::CommandAction;
-    use spawn_core::event::SessionSeq;
+    use spawn_core::event::{ModelProfile, SessionSeq};
     use spawn_core::mission::TaskState;
     use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
 
@@ -616,6 +634,7 @@ mod tests {
             resident: Some("core".to_string()),
             gated: false,
             delivered_at_ms: None,
+            model: ModelProfile::Default,
         }
     }
 
@@ -648,6 +667,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            model: ModelProfile::Default,
         }
     }
 
@@ -743,6 +763,63 @@ mod tests {
             &[worker(false, false)],
         );
         assert!(matches!(plan[0].action, CommandAction::Resume { .. }));
+    }
+
+    #[test]
+    fn a_cheap_task_starts_and_resumes_its_worker_on_the_cheap_profile() {
+        let cheap = TaskRow {
+            model: ModelProfile::Cheap,
+            ..task(4, TaskState::Assigned, "ephemeral")
+        };
+        let started = orders(&work(vec![cheap.clone()]), &[]);
+        assert!(matches!(
+            started[0].action,
+            CommandAction::Start {
+                model: Some(ModelProfile::Cheap),
+                ..
+            }
+        ));
+        let resumed = orders(&work(vec![cheap]), &[worker(false, false)]);
+        assert!(matches!(
+            resumed[0].action,
+            CommandAction::Resume {
+                model: Some(ModelProfile::Cheap),
+                ..
+            }
+        ));
+        // A default task names its profile too: a worker that last ran
+        // cheap does not stay cheap for it.
+        let plain = orders(
+            &work(vec![task(5, TaskState::Assigned, "resident")]),
+            &[worker(false, false)],
+        );
+        assert!(matches!(
+            plain[0].action,
+            CommandAction::Resume {
+                model: Some(ModelProfile::Default),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_live_worker_on_another_profile_is_stopped_when_idle_then_resumed() {
+        let cheap = TaskRow {
+            model: ModelProfile::Cheap,
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        assert!(orders(&work(vec![cheap.clone()]), &[worker(true, false)]).is_empty());
+        let plan = orders(&work(vec![cheap.clone()]), &[worker(true, true)]);
+        assert_eq!(plan.len(), 1);
+        assert!(matches!(plan[0].action, CommandAction::Stop));
+        assert_eq!(plan[0].key, "switch-model-4-0");
+        // On the task's profile already: typed in as usual.
+        let on_cheap = Facts {
+            model: ModelProfile::Cheap,
+            ..worker(true, true)
+        };
+        let plan = orders(&work(vec![cheap]), &[on_cheap]);
+        assert!(matches!(plan[0].action, CommandAction::Input { .. }));
     }
 
     #[test]
