@@ -698,3 +698,46 @@ fn the_control_stream_is_not_an_agent_to_observe() {
     assert!(observations(&fixture.store).is_empty());
     assert_eq!(judge.calls(), 0);
 }
+
+#[test]
+fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge);
+    started(&fixture.store);
+    let in_execution = |command: u64, kind: EventKind| {
+        fixture
+            .store
+            .append(NewEvent {
+                agent_id: agent(),
+                session_id: session(),
+                execution_id: Some(ExecutionId::for_command(CommandId(command))),
+                source: Source::Bridge,
+                source_event_id: None,
+                kind,
+            })
+            .expect("append succeeds");
+    };
+    in_execution(
+        2,
+        EventKind::ExecutionStarted {
+            engine: Engine::Claude,
+            terminal: TerminalName::new("spawn-exec_2").expect("valid"),
+            workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+            command_id: CommandId(2),
+        },
+    );
+    in_execution(
+        1,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Stopped,
+            exit_code: None,
+        },
+    );
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_ne!(
+        last.state,
+        SemanticState::Completed,
+        "execution 2 is still running"
+    );
+}

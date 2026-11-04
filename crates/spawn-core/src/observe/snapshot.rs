@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use super::SCREEN_STALE;
 use super::judge::{JudgeInput, TurnFact};
 use crate::event::{EndCause, Engine, EventKind, EventRecord, SessionSeq};
-use crate::id::{AgentId, SessionId};
+use crate::id::{AgentId, ExecutionId, SessionId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
 
@@ -13,6 +13,8 @@ use crate::time::Timestamp;
 #[derive(Debug, Clone, Default)]
 pub(super) struct Snapshot {
     engine: Option<Engine>,
+    /// The newest execution started.
+    execution: Option<ExecutionId>,
     pub(super) execution_active: bool,
     last_end: Option<EndCause>,
     open_tools: HashSet<String>,
@@ -49,6 +51,7 @@ impl Snapshot {
         match &record.event.kind {
             EventKind::ExecutionStarted { engine, .. } => {
                 self.engine = Some(*engine);
+                self.execution.clone_from(&record.event.execution_id);
                 self.execution_active = true;
                 self.last_end = None;
                 self.exit_code = None;
@@ -57,6 +60,12 @@ impl Snapshot {
                 self.screen = None;
                 self.turn = None;
             }
+            // A late end report of an older execution says nothing about
+            // the current one.
+            EventKind::ExecutionEnded { .. }
+                if record.event.execution_id.is_some()
+                    && self.execution.is_some()
+                    && record.event.execution_id != self.execution => {}
             EventKind::ExecutionEnded { cause, exit_code } => {
                 self.execution_active = false;
                 self.last_end = Some(*cause);

@@ -57,7 +57,8 @@ pub fn narrow(
     (guess, Confidence::ZERO)
 }
 
-/// Whether an observation should draw a person's or a higher tier's eye.
+/// Why an observation should draw a person's or a higher tier's eye, in one
+/// word, or `None` when it should not.
 ///
 /// What matters is the chance that someone is needed, not how sure the model
 /// is about which harmless state applies: WAITING 0.56 against COMPLETED 0.40
@@ -66,16 +67,6 @@ pub fn narrow(
 /// without one, a low confidence does. When most of the model's mass sits on
 /// states the facts rule out, the model and the facts disagree, which is
 /// itself worth a look.
-pub fn needs_attention(
-    ambiguity: Option<Ambiguity>,
-    state: SemanticState,
-    confidence: Confidence,
-    judgement: &Judgement,
-) -> bool {
-    attention_reason(ambiguity, state, confidence, judgement).is_some()
-}
-
-/// Why [`needs_attention`] holds, in one word, or `None`.
 pub fn attention_reason(
     ambiguity: Option<Ambiguity>,
     state: SemanticState,

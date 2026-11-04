@@ -578,7 +578,6 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "spawn-core",
- "thiserror",
 ]
 
 [[package]]
@@ -588,7 +587,6 @@ dependencies = [
  "serde",
  "serde_json",
  "spawn-core",
- "thiserror",
 ]
 
 [[package]]
@@ -599,7 +597,6 @@ dependencies = [
  "serde",
  "serde_json",
  "spawn-core",
- "thiserror",
 ]
 
 [[package]]
