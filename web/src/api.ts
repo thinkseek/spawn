@@ -278,17 +278,24 @@ export function normalizeSession(value: unknown): SessionDetail {
 
 const TOKEN_KEY = "spawn.serve.token";
 
-/** The token `spawn serve` wants off loopback (`SPAWN_SERVE_TOKEN`): read
- * once from the page URL's `?token=`, then kept in sessionStorage so a
- * reload or a link without it still works. */
+/** The token `spawn serve` wants (`SPAWN_SERVE_TOKEN`): read from the page
+ * URL's `?token=` once, then kept in this browser's localStorage, so new
+ * tabs, reloads and restarts of the server need no token in the URL. The
+ * token only reads; a wrong one is replaced by the next `?token=`. */
 const serveToken: string | null = (() => {
+  const fromUrl = new URLSearchParams(window.location.search).get("token");
   try {
-    const fromUrl = new URLSearchParams(window.location.search).get("token");
-    if (fromUrl) sessionStorage.setItem(TOKEN_KEY, fromUrl);
-    return sessionStorage.getItem(TOKEN_KEY);
+    if (fromUrl) {
+      localStorage.setItem(TOKEN_KEY, fromUrl);
+      // Keep the token out of the address bar, history and screenshots.
+      const url = new URL(window.location.href);
+      url.searchParams.delete("token");
+      window.history.replaceState(null, "", url.toString());
+    }
+    return localStorage.getItem(TOKEN_KEY);
   } catch {
     // Storage disabled: the URL is all there is.
-    return new URLSearchParams(window.location.search).get("token");
+    return fromUrl;
   }
 })();
 
@@ -305,6 +312,13 @@ async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
     cache: "no-store",
     headers: apiHeaders(),
   });
+  if (response.status === 401) {
+    throw new Error(
+      serveToken
+        ? "HTTP 401: the saved token is wrong; open this page once as /?token=<SPAWN_SERVE_TOKEN>"
+        : "HTTP 401: no token; open this page once as /?token=<SPAWN_SERVE_TOKEN>",
+    );
+  }
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
