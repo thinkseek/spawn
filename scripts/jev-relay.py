@@ -12,7 +12,8 @@ event log, or the agent's terminal.
 Environment:
   TYPESAFE_API_KEY      required
   TYPESAFE_BASE_URL     default https://api.typesafe.ai
-  JEV_RELAY_ADDRESS     default 127.0.0.1:8790
+  JEV_RELAY_ADDRESS     default 127.0.0.1:8790; a bare port (":8790" or
+                        "8790") means host 127.0.0.1
   https_proxy           honored; the hosted API answers 451 from some regions
 """
 
@@ -27,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 KEY = os.environ.get("TYPESAFE_API_KEY", "")
 BASE = os.environ.get("TYPESAFE_BASE_URL", "https://api.typesafe.ai").rstrip("/")
 HOST, _, PORT = os.environ.get("JEV_RELAY_ADDRESS", "127.0.0.1:8790").rpartition(":")
+# An empty host would bind every interface; a bare port means loopback.
+HOST = HOST or "127.0.0.1"
 PATH = "/v1/systemone"
 TIMEOUT = 20
 # A judgement request is a few kilobytes of evidence; refuse anything larger.
@@ -96,9 +99,8 @@ def main():
     if not KEY:
         sys.exit("jev-relay: TYPESAFE_API_KEY is not set")
     # Whoever reaches the relay spends the key, so it serves loopback only.
-    # An empty host (":8790") would bind every interface.
     if HOST not in ("127.0.0.1", "::1", "[::1]", "localhost"):
-        sys.exit(f"jev-relay: refusing to listen on {HOST or 'every interface'}; use 127.0.0.1")
+        sys.exit(f"jev-relay: refusing to listen on {HOST}; use 127.0.0.1")
     server = ThreadingHTTPServer((HOST, int(PORT)), Relay)
     sys.stderr.write(f"jev-relay: http://{HOST}:{PORT}{PATH} -> {BASE}{PATH}\n")
     server.serve_forever()
