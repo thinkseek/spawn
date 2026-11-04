@@ -7,13 +7,15 @@ use std::sync::Arc;
 
 use spawn_core::bridge::{Bridge, BridgeConfig, TickReport, claude_session_id};
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::{CheckpointReason, Engine, EventKind, Fork, GlobalPosition, NewEvent};
+use spawn_core::event::{
+    CheckpointReason, EndCause, Engine, EventKind, Fork, GlobalPosition, NewEvent,
+};
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
     TerminalName,
 };
 use spawn_core::memory::MemoryStore;
-use spawn_core::port::{BaseMerge, CommandQueue, EventLog, WorkspaceStore};
+use spawn_core::port::{BaseMerge, CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_core::time::{ManualClock, Timestamp};
 
 /// A ready pane: input box empty, status line below it.
@@ -92,9 +94,9 @@ fn checkpoints(store: &MemoryStore) -> Vec<(CheckpointReason, String)> {
     events(store)
         .into_iter()
         .filter_map(|event| match event.kind {
-            EventKind::ArtifactCommitted { reason, artifact } => {
-                Some((reason, artifact.commit.as_str().to_string()))
-            }
+            EventKind::ArtifactCommitted {
+                reason, artifact, ..
+            } => Some((reason, artifact.commit.as_str().to_string())),
             _ => None,
         })
         .collect()
@@ -404,4 +406,223 @@ fn an_idle_execution_is_offered_main_every_thirty_seconds_and_never_in_a_turn() 
     wait(60);
     bridge.tick().expect("busy");
     assert_eq!(merges(&store), busy, "only a ready screen is idle");
+}
+
+fn pane(store: &MemoryStore, command: u64) -> String {
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(command)));
+    store
+        .capture_tail(
+            &terminal,
+            &spawn_core::id::WorkspaceId::new("1:/w").expect("valid"),
+            200,
+        )
+        .expect("a pane")
+}
+
+fn reset_pane(store: &MemoryStore, command: u64) {
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(command)));
+    store.set_pane(&terminal, READY);
+}
+
+fn input(store: &MemoryStore, key: &str, text: &str) {
+    submit(
+        store,
+        key,
+        CommandAction::Input {
+            text: text.to_string(),
+        },
+    );
+}
+
+const MERGED_NOTICE: &str = "Spawn merged main into your workspace since your last turn: src/a.rs. Re-read them before editing.";
+
+#[test]
+fn what_a_merge_changed_is_recorded_and_told_with_the_next_prompt_only() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("e".repeat(40)).expect("valid commit"),
+        files: vec!["src/a.rs".to_string()],
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint and merge");
+    store.set_base_merge(BaseMerge::Current);
+    let files: Vec<Vec<String>> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ArtifactCommitted {
+                reason: CheckpointReason::BaseMerged,
+                files,
+                ..
+            } => Some(files),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(files, vec![vec!["src/a.rs".to_string()]]);
+    bridge.tick().expect("idle");
+    assert!(
+        !pane(&store, 1).contains("Spawn merged"),
+        "never typed unprompted"
+    );
+
+    // A Bridge restarted before the next prompt still knows what to tell.
+    let mut bridge = self::bridge(&store);
+    bridge.recover().expect("recover");
+    input(&store, "key_input_1", "next");
+    bridge.tick().expect("type");
+    let typed = pane(&store, 1);
+    let told = typed.find(MERGED_NOTICE).expect("the notice was typed");
+    assert!(typed[told..].contains("\n\nnext"), "{typed}");
+
+    // Told once: the next prompt goes alone, after a restart too.
+    transcript(&store, &[prompt("2"), turn_end("2")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    let mut bridge = self::bridge(&store);
+    bridge.recover().expect("recover");
+    reset_pane(&store, 1);
+    input(&store, "key_input_2", "again");
+    bridge.tick().expect("type");
+    let typed = pane(&store, 1);
+    assert!(
+        typed.contains("again") && !typed.contains("Spawn merged"),
+        "{typed}"
+    );
+
+    // A conflict is recorded with its files and told as markers to edit.
+    store.set_base_merge(BaseMerge::Conflicted {
+        files: vec!["b.rs".to_string()],
+        marked: true,
+    });
+    transcript(&store, &[prompt("3"), turn_end("3")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint and merge");
+    assert!(events(&store).iter().any(|event| matches!(
+        &event.kind,
+        EventKind::MergeConflicted { files, marked: true } if files == &["b.rs".to_string()]
+    )));
+    reset_pane(&store, 1);
+    input(&store, "key_input_3", "fix it");
+    bridge.tick().expect("type");
+    let typed = pane(&store, 1);
+    assert!(
+        typed.contains("these files carry conflict markers: b.rs")
+            && typed.contains("do not rewrite the files from memory")
+            && typed.contains("fix it"),
+        "{typed}"
+    );
+}
+
+#[test]
+fn a_resume_prompt_carries_the_notice() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: CommitId::new("e".repeat(40)).expect("valid commit"),
+        files: vec!["src/a.rs".to_string()],
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint and merge");
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    submit(
+        &store,
+        "key_resume",
+        CommandAction::Resume {
+            prompt: Some("go on".to_string()),
+        },
+    );
+    bridge.tick().expect("resume");
+    let typed = pane(&store, 3);
+    assert!(
+        typed.contains(MERGED_NOTICE) && typed.contains("go on"),
+        "{typed}"
+    );
+}
+
+fn ended(store: &MemoryStore) -> Vec<EndCause> {
+    events(store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ExecutionEnded { cause, .. } => Some(cause),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unmounts(store: &MemoryStore) -> usize {
+    store
+        .workspace_calls()
+        .iter()
+        .filter(|call| *call == "unmount")
+        .count()
+}
+
+#[test]
+fn a_failed_final_checkpoint_keeps_the_workspace_and_is_tried_again() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.fail_commits(true);
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    assert_eq!(unmounts(&store), 0, "the workspace stays");
+    assert!(ended(&store).is_empty());
+    let report = bridge.tick().expect("again");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("final checkpoint failed (3 of 20)")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(unmounts(&store), 0);
+    store.fail_commits(false);
+    bridge.tick().expect("the checkpoint works");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1);
+}
+
+#[test]
+fn a_final_checkpoint_that_keeps_failing_unmounts_loudly_after_twenty_ticks() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.fail_commits(true);
+    submit(&store, "key_stop", CommandAction::Stop);
+    // The stop tries once, and the same tick's pass over executions again.
+    bridge.tick().expect("stop: attempts 1 and 2");
+    let attempts = |store: &MemoryStore| {
+        store
+            .workspace_calls()
+            .iter()
+            .filter(|call| *call == "commit")
+            .count()
+    };
+    assert_eq!(attempts(&store), 2);
+    while attempts(&store) < 19 {
+        bridge.tick().expect("attempt");
+        assert!(ended(&store).is_empty());
+    }
+    let report = bridge.tick().expect("attempt 20");
+    assert_eq!(attempts(&store), 20);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("FINAL CHECKPOINT FAILED 20 TIMES")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1);
 }
