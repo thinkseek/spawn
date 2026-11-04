@@ -21,8 +21,8 @@
 //!    ([`objectives`]).
 //!
 //! Like the dispatcher, it keeps no state of its own: the control stream
-//! says what was judged and landed. Passes are serialized by the same
-//! advisory lock the RSI controller takes, so two gates never run at once.
+//! says what was judged and landed. An advisory lock allows one integrator
+//! per database, so two gates never run at once.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

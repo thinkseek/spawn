@@ -708,8 +708,8 @@ drop function if exists spawn_read_open_tools(text);
 -- The retired RSI controller's tables; its history is in the control stream.
 drop table if exists rsi_attempts, rsi_iterations, rsi_state;
 
--- The login engine terminals used to append their own events. Nothing uses
--- it any more; an existing one may no longer log in or call anything here.
+-- `spawn_terminal`, a login for engine terminals to append their own
+-- events, is unused: an existing one may not log in or call anything here.
 do $$
 begin
     if exists (select 1 from pg_roles where rolname = 'spawn_terminal') then

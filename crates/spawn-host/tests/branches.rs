@@ -446,7 +446,7 @@ fn a_merge_keeps_the_branchs_large_file_manifest() {
     let fixture = Fixture::new("trailer", &[("README.md", "base\n")]);
     let (_, workspace, _) = fixture.mount("agent_a");
     let head = fixture.work(&workspace, &[("work.txt", "mine\n")]);
-    // A checkpoint that names a large-file manifest (storage phase 1).
+    // A checkpoint that names a large-file manifest.
     let tree = git(
         &fixture.checkout,
         &["rev-parse", &format!("{head}^{{tree}}")],

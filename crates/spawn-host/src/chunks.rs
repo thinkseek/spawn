@@ -1,4 +1,4 @@
-//! Chunk store adapter and the large-file manifest (docs/storage.md, phase 1).
+//! Chunk store adapter and the large-file manifest (docs/storage.md).
 //!
 //! A large file is cut into content-defined chunks (a gear-hash FastCDC), each
 //! named by the BLAKE3 hash of its bytes and stored zstd-compressed in a local
