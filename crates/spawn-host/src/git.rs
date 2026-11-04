@@ -581,16 +581,128 @@ impl GitWorkspace {
         Ok(crate::chunks::trailer_of(&message))
     }
 
+    /// The manifest object `name`, read and checked.
+    fn manifest(&self, name: &str) -> Result<Manifest, WorkspaceError> {
+        let bytes = self.chunks.get(name).map_err(chunk_failure)?;
+        Manifest::from_bytes(&bytes).map_err(chunk_failure)
+    }
+
+    /// The large files of `manifest` that `tree` has no room for: the tree
+    /// holds an entry at the file's own path, or something other than a
+    /// directory (a symlink, a file) at one of its parent directories. Such a
+    /// file cannot be materialized without replacing a tracked file or
+    /// writing through a symlink, so a merge that makes one is refused and a
+    /// mount of one fails.
+    fn large_clashes(
+        &self,
+        manifest: &Manifest,
+        tree: &str,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        // `<tree>:<path>` per line, then the object type or `missing`.
+        let mut asked = Vec::new();
+        let mut clashes = Vec::new();
+        for file in &manifest.files {
+            if file.path.contains('\n') {
+                clashes.push(file.path.clone());
+                continue;
+            }
+            let mut prefix = String::new();
+            for component in file.path.split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(component);
+                asked.push((
+                    file.path.clone(),
+                    prefix.clone(),
+                    prefix.len() == file.path.len(),
+                ));
+            }
+        }
+        if asked.is_empty() {
+            return Ok(clashes);
+        }
+        let mut child = self
+            .command()
+            .args(["cat-file", "--batch-check=%(objecttype)"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
+        let mut input = String::new();
+        for (_, path, _) in &asked {
+            input.push_str(tree);
+            input.push(':');
+            input.push_str(path);
+            input.push('\n');
+        }
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(input.as_bytes()).map_err(|error| {
+                WorkspaceError::Unavailable(format!("write to git cat-file: {error}"))
+            })?;
+        }
+        let output = report(child.wait_with_output(), "cat-file --batch-check")?;
+        let answers: Vec<&str> = output.lines().collect();
+        if answers.len() != asked.len() {
+            return Err(WorkspaceError::Unavailable(format!(
+                "git cat-file answered {} of {} paths",
+                answers.len(),
+                asked.len()
+            )));
+        }
+        for ((file, _, whole), answer) in asked.iter().zip(answers) {
+            let missing = answer.ends_with(" missing");
+            let clash = if *whole {
+                !missing
+            } else {
+                !missing && answer != "tree"
+            };
+            if clash && !clashes.contains(file) {
+                clashes.push(file.clone());
+            }
+        }
+        Ok(clashes)
+    }
+
+    /// The manifest `head` names, which a merge commit over `tree` keeps,
+    /// and the large files of it `tree` has no room for. The branch keeps its
+    /// own large files, so a main that put a file or a symlink where a large
+    /// file or its directory is would make the next mount write through it:
+    /// the merge is refused, like a conflict markers cannot show.
+    fn manifest_over(
+        &self,
+        head: &str,
+        tree: &str,
+    ) -> Result<(Option<String>, Vec<String>), WorkspaceError> {
+        let Some(name) = self.manifest_of(head)? else {
+            return Ok((None, Vec::new()));
+        };
+        let clashes = self.large_clashes(&self.manifest(&name)?, tree)?;
+        Ok((Some(name), clashes))
+    }
+
     /// Write the large files the branch head names into a fresh mount, and
     /// remember their stat so the next checkpoint does not chunk them again.
-    /// Every chunk is verified; a file is written whole or not at all.
+    /// Every chunk is verified; a file is written whole or not at all, and
+    /// only inside the workspace ([`materialize`]). A manifest the head's
+    /// tree has no room for ([`Self::large_clashes`]) fails the mount.
     fn materialize_large(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
-        let Some(name) = self.manifest_of(&format!("refs/heads/{branch}"))? else {
+        let head = format!("refs/heads/{branch}");
+        let Some(name) = self.manifest_of(&head)? else {
             self.write_cache(branch, &BTreeMap::new());
             return Ok(());
         };
-        let bytes = self.chunks.get(&name).map_err(chunk_failure)?;
-        let manifest = Manifest::from_bytes(&bytes).map_err(chunk_failure)?;
+        let manifest = self.manifest(&name)?;
+        let clashes = self.large_clashes(&manifest, &format!("{head}^{{tree}}"))?;
+        if !clashes.is_empty() {
+            return Err(WorkspaceError::Unavailable(format!(
+                "large files {} clash with the tree of {branch}: a tracked entry is at the \
+                 path, or a symlink or a file at a parent directory",
+                clashes.join(", ")
+            )));
+        }
         let mut known = BTreeMap::new();
         for file in &manifest.files {
             materialize(self.chunks.as_ref(), directory, file).map_err(|error| {
@@ -933,6 +1045,13 @@ impl GitWorkspace {
                 )));
             }
         }
+        let (manifest, clashes) = self.manifest_over(&head, &merged)?;
+        if !clashes.is_empty() {
+            return Ok(BaseMerge::Conflicted {
+                files: clashes,
+                marked: false,
+            });
+        }
         self.update_directory(&branch, &directory, &head_tree, &merged)?;
         let changed =
             self.git_output(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
@@ -941,14 +1060,10 @@ impl GitWorkspace {
             .filter(|path| !path.is_empty())
             .map(str::to_string)
             .collect();
-        // The branch keeps its own large files: their manifest trailer, if
-        // the head names one, goes on the merge commit.
-        let trailers =
-            self.git_output(&["log", "-1", "--format=%(trailers:key=Spawn-Large)", &head])?;
-        let mut message = format!("spawn: merge main {main} into {branch}");
-        if !trailers.is_empty() {
-            message = format!("{message}\n\n{trailers}");
-        }
+        let message = crate::chunks::with_trailer(
+            &format!("spawn: merge main {main} into {branch}"),
+            manifest.as_deref(),
+        );
         let commit = self.git_output(&[
             "commit-tree",
             &merged,
