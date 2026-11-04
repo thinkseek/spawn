@@ -132,8 +132,8 @@ impl PostgresStore {
 
     /// Store a delivered task's report.
     pub fn task_reported(&self, task: i64, report: &str) -> Result<bool, StoreError> {
-        let changed = self.execute(missions::TASK_REPORTED, &[&task, &report])?;
-        Ok(changed == 1)
+        let row = self.query_one(missions::TASK_REPORTED, &[&task, &report])?;
+        Ok(row.get(0))
     }
 }
 

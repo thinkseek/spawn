@@ -43,6 +43,9 @@ pub enum Source {
     Observer,
     /// SQL gateway command intake and completion.
     Gateway,
+    /// The control stream: missions, tasks, residents and landings
+    /// (docs/fleet-architecture.md §10.1).
+    Control,
 }
 
 impl Source {
@@ -55,6 +58,7 @@ impl Source {
             Self::Layerfs => "layerfs",
             Self::Observer => "observer",
             Self::Gateway => "gateway",
+            Self::Control => "control",
         }
     }
 
@@ -67,6 +71,7 @@ impl Source {
             Self::Layerfs,
             Self::Observer,
             Self::Gateway,
+            Self::Control,
         ]
         .into_iter()
         .find(|source| source.as_str() == text)
@@ -256,6 +261,15 @@ pub enum EventKind {
         /// Judgement.
         observation: Observation,
     },
+    /// One record of the control stream: a mission, task, resident or
+    /// landing fact. The record's `type` names it; the database folds the
+    /// records into the `mission_*` tables (docs/fleet-architecture.md
+    /// §10.1). It belongs to no agent, so nothing observes or bridges it.
+    #[serde(rename = "control.recorded")]
+    ControlRecorded {
+        /// The record, `{"type": ..., ...}`.
+        record: serde_json::Value,
+    },
 }
 
 impl EventKind {
@@ -279,7 +293,14 @@ impl EventKind {
             Self::CommandFinished { .. } => "command.finished",
             Self::ScreenObserved { .. } => "screen.observed",
             Self::ObservationRecorded { .. } => "observation.recorded",
+            Self::ControlRecorded { .. } => "control.recorded",
         }
+    }
+
+    /// Whether this is a control-stream record rather than a fact about an
+    /// agent's session.
+    pub fn is_control(&self) -> bool {
+        matches!(self, Self::ControlRecorded { .. })
     }
 
     /// Checkpoint the Bridge must take after this event, if any.

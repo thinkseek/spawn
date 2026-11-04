@@ -200,6 +200,10 @@ impl Bridge {
 
     fn fold(&mut self, record: &EventRecord) {
         let event = &record.event;
+        // The control stream is not an agent's session.
+        if event.kind.is_control() {
+            return;
+        }
         let view = self
             .sessions
             .entry(event.session_id.clone())

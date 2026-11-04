@@ -114,12 +114,7 @@ pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
 // Delivery bookkeeping, run by the dispatcher as the owner.
 
 /// `$1` task, `$2` delivery command.
-pub(crate) const TASK_DELIVERED: &str =
-    "update mission_tasks set state = 'delivered', command_id = $2,
-                        updated_at_ms = spawn_now_ms()
-                  where id = $1 and state in ('assigned', 'revise')";
+pub(crate) const TASK_DELIVERED: &str = "select spawn_task_delivered($1, $2)";
 
-/// `$1` task, `$2` report.
-pub(crate) const TASK_REPORTED: &str = "update mission_tasks set state = 'reported', report = $2,
-                        updated_at_ms = spawn_now_ms()
-                  where id = $1 and state = 'delivered'";
+/// `$1` task, `$2` report. True when the report was recorded.
+pub(crate) const TASK_REPORTED: &str = "select spawn_task_reported($1, $2)";

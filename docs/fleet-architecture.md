@@ -458,7 +458,7 @@ Occam's razor, applied without touching the invariants. Two decisions:
 
 ### 10.1 The control stream
 
-- **Where it lives:** one stream with session `control`, agent
+- **Where it lives:** one stream with session `session_control`, agent
   `agent_control` and source `control`. Every record is the event
   `control.recorded`, whose detail is `{type, ...}`.
 - **Record types:** `mission.added`, `mission.closed`, `mission.halted`,
