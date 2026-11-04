@@ -2,7 +2,7 @@
 // server that omits one (or sends null) renders an empty value instead of
 // crashing. Read-only: this module only ever issues GET requests.
 
-import { apiHeaders } from "./api";
+import { apiError, apiHeaders } from "./api";
 
 export const TASK_STATES = [
   "assigned",
@@ -280,7 +280,7 @@ export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
     cache: "no-store",
     headers: apiHeaders(),
   });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) throw apiError(response.status);
   return normalizeMissions(await response.json());
 }
 
