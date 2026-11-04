@@ -6,6 +6,7 @@
 //! resident). Every command prints JSON.
 
 use serde_json::{Value, json};
+use spawn_core::event::ModelProfile;
 
 use crate::{Flags, open_store};
 
@@ -19,6 +20,7 @@ const USAGE: &str = "usage:
   spawn mission list [--limit N]
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
+                    [--model default|cheap]   (cheap: every model on DeepSeek)
   spawn task accept --id N
   spawn task reject --id N --note <what to fix>
   spawn task cancel --id N
@@ -45,6 +47,15 @@ fn text(flags: &Flags, name: &str) -> Result<String, String> {
     flags
         .get(name)
         .ok_or_else(|| format!("--{name} is required\n{USAGE}"))
+}
+
+/// The `--model` profile a task runs on, `default` when unset.
+fn model(flags: &Flags) -> Result<ModelProfile, String> {
+    let Some(text) = flags.get("model") else {
+        return Ok(ModelProfile::Default);
+    };
+    ModelProfile::parse(&text)
+        .ok_or_else(|| format!("--model is default or cheap, not {text}\n{USAGE}"))
 }
 
 fn split(rest: &[String]) -> Result<(&str, Flags), String> {
@@ -206,15 +217,17 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
     let err = |error: spawn_core::port::StoreError| error.to_string();
     match verb {
         "assign" => {
+            let model = model(&flags)?;
             let task = store
                 .task_assign(
                     id(&flags, "mission")?,
                     &text(&flags, "kind")?,
                     &flags.get("worker").unwrap_or_default(),
                     &text(&flags, "brief")?,
+                    model.as_str(),
                 )
                 .map_err(err)?;
-            print(&json!({ "task": task }));
+            print(&json!({ "task": task, "model": model.as_str() }));
         }
         "accept" => {
             let task = id(&flags, "id")?;
