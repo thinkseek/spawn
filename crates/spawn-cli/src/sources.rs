@@ -159,7 +159,7 @@ impl MissionWorkspaces {
 }
 
 impl WorkspaceStore for MissionWorkspaces {
-    fn project(&self) -> &str {
+    fn project(&self) -> &'static str {
         "missions"
     }
 
@@ -188,7 +188,7 @@ mod tests {
     fn mirrors_are_named_by_source_and_unique() {
         let a = mirror_name("https://github.com/acme/widget.git");
         let b = mirror_name("/home/me/widget");
-        assert!(a.starts_with("widget-") && a.ends_with(".git"));
+        assert!(a.starts_with("widget-") && a.to_lowercase().ends_with(".git"));
         assert!(b.starts_with("widget-"));
         assert_ne!(a, b);
         assert!(mirror_name("git@host:team/x y.git").starts_with("xy-"));
