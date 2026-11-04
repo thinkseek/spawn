@@ -10,7 +10,7 @@
 //! Files over [`LARGE_FILE_BYTES`] never enter git: they are cut into
 //! chunks in the chunk store, the checkpoint commit names their manifest in a
 //! `Spawn-Large: <hash>` trailer, and a mount materializes them again from
-//! the branch head (docs/storage.md, phase 1). The branch head alone is the
+//! the branch head (docs/storage.md). The branch head alone is the
 //! whole workspace.
 //!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
