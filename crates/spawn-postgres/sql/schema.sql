@@ -995,8 +995,13 @@ begin
          where id = v_mission;
     when 'task.landed' then
         update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
-        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
-         where id = (select mission_id from mission_tasks where id = v_id);
+        -- Every mission on the same source sees the same main: the landing
+        -- moves the baseline of each one that has one.
+        update mission_missions m set baseline = p_record ->> 'to', updated_at_ms = p_at
+          from mission_missions own join mission_tasks k on k.mission_id = own.id
+         where k.id = v_id
+           and (m.id = own.id
+                or (m.baseline is not null and m.sources ->> 0 = own.sources ->> 0));
     when 'task.aborted' then
         -- Over budget: the work is dropped, and it counts toward the abort halt.
         update mission_tasks set state = 'cancelled', review_note = p_record ->> 'reason',

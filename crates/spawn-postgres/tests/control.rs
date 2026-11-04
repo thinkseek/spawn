@@ -410,3 +410,66 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
     refold(&mut client);
     assert_eq!(tables(&mut client), live);
 }
+
+#[test]
+fn a_landing_moves_the_baseline_of_every_mission_on_its_source() {
+    let (store, schema) = store("control_shared_source");
+    let source = json!(["/tmp/shared.git"]);
+    let first = store.mission_add("First", &source, "human").expect("add");
+    let second = store.mission_add("Second", &source, "human").expect("add");
+    let other = store
+        .mission_add("Elsewhere", &json!(["/tmp/other.git"]), "human")
+        .expect("add");
+    for mission in [first, second, other] {
+        store
+            .mission_configure(
+                mission,
+                Some("/controller/rsi/scenarios"),
+                "gate",
+                None,
+                None,
+            )
+            .expect("configure");
+    }
+    let mut tasks = Vec::new();
+    for mission in [first, second, other] {
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+                                       "base": "b0", "note": "no"}),
+            )
+            .expect("a first verdict sets the baselines");
+        tasks.push(task);
+    }
+    store.task_delivered(tasks[0], 2).expect("delivered");
+    assert!(store.task_reported(tasks[0], "done").expect("reported"));
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "id": tasks[0], "verdict": "accepted",
+                                   "base": "b0", "candidate": "c1"}),
+        )
+        .expect("accepted");
+    store
+        .integrator_record(
+            &json!({"type": "task.landed", "id": tasks[0], "from": "b0", "to": "c1"}),
+        )
+        .expect("landed");
+    let mut client = admin(&schema);
+    let live = tables(&mut client);
+    assert_eq!(live["missions"][0]["baseline"], "c1");
+    assert_eq!(
+        live["missions"][1]["baseline"], "c1",
+        "same source, same main"
+    );
+    assert_eq!(
+        live["missions"][2]["baseline"], "b0",
+        "another source is untouched"
+    );
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live);
+}
