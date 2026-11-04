@@ -46,7 +46,8 @@ fn unavailable(text: String) -> WorkspaceError {
     WorkspaceError::Unavailable(text)
 }
 
-fn git(arguments: &[&str]) -> Result<String, WorkspaceError> {
+/// Run git and return its trimmed stdout, or the failure as an error.
+pub(crate) fn git(arguments: &[&str]) -> Result<String, WorkspaceError> {
     let output = Command::new("git")
         .args(arguments)
         .stdin(Stdio::null())
@@ -103,48 +104,7 @@ impl MissionWorkspaces {
 
     /// Bare repository for a source, cloned on first use.
     fn mirror(&self, source: Option<&str>) -> Result<PathBuf, WorkspaceError> {
-        let directory = self.root.join(".sources");
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| unavailable(format!("create {}: {error}", directory.display())))?;
-        let Some(source) = source else {
-            let scratch = directory.join("scratch.git");
-            if !scratch.exists() {
-                git(&["init", "--quiet", "--bare", &scratch.to_string_lossy()])?;
-            }
-            return Ok(scratch);
-        };
-        // A source is handed to git; one that looks like an option is not.
-        if source.starts_with('-') {
-            return Err(unavailable(format!("source {source} starts with '-'")));
-        }
-        let mirror = directory.join(mirror_name(source));
-        if !mirror.exists() {
-            git(&[
-                "clone",
-                "--quiet",
-                "--bare",
-                "--",
-                source,
-                &mirror.to_string_lossy(),
-            ])?;
-            let path = mirror.to_string_lossy().to_string();
-            // Workspaces branch from `main`; a repository whose default
-            // branch is called otherwise gets `main` at its HEAD.
-            if git(&[
-                "--git-dir",
-                &path,
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                "refs/heads/main",
-            ])
-            .is_err()
-            {
-                let head = git(&["--git-dir", &path, "rev-parse", "HEAD"])?;
-                git(&["--git-dir", &path, "update-ref", "refs/heads/main", &head])?;
-            }
-        }
-        Ok(mirror)
+        ensure_mirror(&self.root, source)
     }
 
     /// The store for one agent's workspace.
@@ -177,10 +137,57 @@ impl MissionWorkspaces {
     }
 }
 
+/// The mirror of a mission's source under `<root>/.sources/`, cloned on
+/// first use; an empty scratch repository when the mission has none.
+pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf, WorkspaceError> {
+    let directory = root.join(".sources");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| unavailable(format!("create {}: {error}", directory.display())))?;
+    let Some(source) = source else {
+        let scratch = directory.join("scratch.git");
+        if !scratch.exists() {
+            git(&["init", "--quiet", "--bare", &scratch.to_string_lossy()])?;
+        }
+        return Ok(scratch);
+    };
+    // A source is handed to git; one that looks like an option is not.
+    if source.starts_with('-') {
+        return Err(unavailable(format!("source {source} starts with '-'")));
+    }
+    let mirror = directory.join(mirror_name(source));
+    if !mirror.exists() {
+        git(&[
+            "clone",
+            "--quiet",
+            "--bare",
+            "--",
+            source,
+            &mirror.to_string_lossy(),
+        ])?;
+        let path = mirror.to_string_lossy().to_string();
+        // Workspaces branch from `main`; a repository whose default
+        // branch is called otherwise gets `main` at its HEAD.
+        if git(&[
+            "--git-dir",
+            &path,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/main",
+        ])
+        .is_err()
+        {
+            let head = git(&["--git-dir", &path, "rev-parse", "HEAD"])?;
+            git(&["--git-dir", &path, "update-ref", "refs/heads/main", &head])?;
+        }
+    }
+    Ok(mirror)
+}
+
 /// Bring a mirror's `main` up to its source's default branch. A source that
 /// cannot be reached leaves the mirror as it was: the worker still starts,
 /// from the last copy, and the reason is logged.
-fn refresh(mirror: &Path, source: &str) {
+pub(crate) fn refresh(mirror: &Path, source: &str) {
     let path = mirror.to_string_lossy();
     if let Err(error) = git(&[
         "--git-dir",

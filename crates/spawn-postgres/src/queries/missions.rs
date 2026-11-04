@@ -11,12 +11,14 @@ from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
          k.revisions, k.review_note, k.command_id,
          m.text as mission_text, m.sources as mission_sources,
+         m.gate is not null as gated,
          r.charter, r.name as resident
     from mission_tasks k
     join mission_missions m on m.id = k.mission_id
     left join mission_residents r on r.agent_id = k.agent_id
-   where k.state in ('assigned', 'delivered', 'reported', 'revise')
-      or (k.state in ('accepted', 'cancelled') and k.kind = 'ephemeral'
+   where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
+      or (k.state = 'accepted' and m.gate is not null)
+      or (k.state in ('accepted', 'cancelled', 'landed') and k.kind = 'ephemeral'
           and k.updated_at_ms > spawn_now_ms() - 86400000)
 ) t";
 
@@ -55,12 +57,14 @@ pub(crate) const MISSION_BOARD: &str = r"
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
       select m.id, m.text, m.origin, m.sources, m.state, m.summary,
+             m.gate, m.accept, m.budget, m.baseline, m.halted,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
                  'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
                  'session_id', k.session_id, 'brief', left(k.brief, 600),
                  'state', k.state, 'revisions', k.revisions,
                  'review_note', k.review_note, 'report', k.report,
+                 'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
                  'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
@@ -77,6 +81,37 @@ select jsonb_build_object(
 pub(crate) const MISSION_ADD: &str = "select spawn_mission_add($1, $2, $3)";
 /// `$1` mission, `$2` final state, `$3` summary.
 pub(crate) const MISSION_CLOSE: &str = "select spawn_mission_close($1, $2, $3)";
+/// `$1` mission, `$2` gate (absolute path or null), `$3` accept, `$4` budget.
+pub(crate) const MISSION_CONFIGURE: &str = "select spawn_mission_configure($1, $2, $3, $4)";
+/// `$1` mission.
+pub(crate) const MISSION_RESUME: &str = "select spawn_mission_resume($1)";
+/// `$1` the record; returns its event id.
+pub(crate) const INTEGRATOR_RECORD: &str = "select spawn_integrator_record($1)";
+
+/// Missions with a gate that are still open, with their tasks the
+/// integrator may have to act on.
+pub(crate) const GATED: &str = r"
+select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
+from (
+  select m.id, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
+         m.gate_rejections, m.gate_aborts, m.sources ->> 0 as source,
+         coalesce((select jsonb_agg(jsonb_build_object(
+                     'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
+                     'session_id', k.session_id, 'state', k.state, 'base', k.base,
+                     'candidate', k.candidate, 'scenario', k.scenario,
+                     'objective', k.objective, 'delivered_at_ms', k.delivered_at_ms)
+                     order by k.id)
+                   from mission_tasks k
+                  where k.mission_id = m.id
+                    and k.state in ('delivered', 'reported', 'accepted', 'landing')), '[]'::jsonb) as tasks
+    from mission_missions m
+   where m.gate is not null and m.state in ('open', 'active')
+) x";
+
+/// Tool calls a session started after a moment. `$1` session, `$2` ms.
+pub(crate) const TOOL_CALLS_SINCE: &str = "select count(*) from spawn_events
+                  where session_id = $1 and event_name = 'tool.started' and recorded_at_ms > $2";
+
 /// `$1` mission, `$2` kind, `$3` worker, `$4` brief; returns the task id.
 pub(crate) const TASK_ASSIGN: &str = "select spawn_task_assign($1, $2, $3, $4)";
 /// `$1` task, `$2` accept, `$3` note.

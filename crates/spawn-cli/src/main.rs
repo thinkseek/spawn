@@ -27,6 +27,8 @@ mod deliver;
 mod dispatch;
 mod evolve;
 mod flags;
+mod gate;
+mod integrate;
 mod missions;
 mod runtime;
 mod serve;
@@ -40,7 +42,7 @@ pub(crate) use flags::Flags;
 
 use commands::{admin, engine, inspect, judging, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|corpus|judge|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>";
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|corpus|judge|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>";
 
 /// Usage of `spawn dispatch`, the one command that mixes a bare switch with
 /// valued flags.
@@ -72,6 +74,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "evolve" => loops::evolve_once(&Flags::parse(&rest)?),
         "rsi-loop" => loops::rsi_loop(&Flags::parse(&rest)?),
         "dispatch" => queue::dispatch_once(&rest),
+        "integrate" => integrate::integrate(&rest),
         "corpus" => judging::corpus(&rest),
         "mission" => missions::mission(&rest),
         "charter" => {

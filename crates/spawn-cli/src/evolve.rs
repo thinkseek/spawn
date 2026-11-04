@@ -11,8 +11,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::Engine;
@@ -21,6 +20,7 @@ use spawn_core::port::{CommandQueue, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
+use crate::gate::{GateFailure, count_scenarios};
 use crate::{Flags, env_or, env_value, open_store};
 
 /// Rejections in a row that stop the loop.
@@ -782,15 +782,6 @@ struct GateVerdict {
     output: String,
 }
 
-/// Why the gate produced no verdict.
-#[derive(Debug)]
-enum GateFailure {
-    /// The gate ran past `GATE_WALL_CLOCK`. Infrastructure, not the candidate.
-    Timeout,
-    /// The gate could not start or printed no verdict.
-    Failed(String),
-}
-
 fn judge_candidate(
     gate: &Path,
     workspaces: &GitWorkspace,
@@ -800,129 +791,20 @@ fn judge_candidate(
     iteration: &spawn_postgres::RsiIteration,
 ) -> Result<GateVerdict, GateFailure> {
     let scenario = scenarios.join(format!("{:03}.sh", iteration.task_id));
-    let mut command = Command::new("sh");
-    command
-        .arg(gate)
-        .arg(workspaces.project())
-        .arg(baseline)
-        .arg(candidate)
-        .arg(scenarios)
-        .arg(&scenario);
-    let (stdout, stderr) = run_bounded(command, GATE_WALL_CLOCK)?;
-    // The verdict is the gate's last line on stdout, nothing else: scenario
-    // output reaches stdout only through the gate's `| ` prefix, and stderr
-    // is open to whatever the candidate's processes print.
-    let line = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .filter(|line| line.starts_with('{'))
-        .ok_or_else(|| GateFailure::Failed("gate produced no verdict".to_string()))?;
-    // The record keeps stderr, marked `! ` so no line of it can pass for a
-    // verdict or a section header, and the verdict stays last.
-    let mut output = stdout[..stdout.rfind(line).unwrap_or(stdout.len())].to_string();
-    for text in stderr.lines() {
-        let _ = writeln!(output, "! {text}");
-    }
-    let _ = writeln!(output, "{line}");
-    let verdict: serde_json::Value = serde_json::from_str(line)
-        .map_err(|error| GateFailure::Failed(format!("gate verdict: {error}")))?;
+    let verdict = crate::gate::judge(
+        gate,
+        Path::new(workspaces.project()),
+        baseline,
+        candidate,
+        scenarios,
+        Some(&scenario),
+        GATE_WALL_CLOCK,
+    )?;
     Ok(GateVerdict {
-        accepted: verdict.get("verdict").and_then(|v| v.as_str()) == Some("accepted"),
-        reason: verdict
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("gate rejected the candidate")
-            .to_string(),
-        output,
+        accepted: verdict.accepted,
+        reason: verdict.reason,
+        output: verdict.output,
     })
-}
-
-/// Run a command with a wall clock, returning its stdout and stderr.
-///
-/// The child writes to files, not to pipes: a pipe that fills up would block
-/// the child while this loop waits for it to exit. The files live in a new
-/// private directory per run. The child leads its own process group, and the
-/// whole group is killed when the gate ends or times out, so nothing the
-/// candidate started outlives the verdict.
-///
-/// ponytail: same-uid code can still reach the files through /proc; the real
-/// boundary is running the gate in a container.
-fn run_bounded(mut command: Command, limit: Duration) -> Result<(String, String), GateFailure> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    use std::os::unix::process::CommandExt as _;
-
-    let failed = |error: std::io::Error| GateFailure::Failed(error.to_string());
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let directory =
-        std::env::temp_dir().join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
-        .map_err(failed)?;
-    let result = (|| {
-        let out_path = directory.join("stdout");
-        let err_path = directory.join("stderr");
-        let stdout = std::fs::File::create(&out_path).map_err(failed)?;
-        let stderr = std::fs::File::create(&err_path).map_err(failed)?;
-        let mut child = command
-            .stdout(stdout)
-            .stderr(stderr)
-            .process_group(0)
-            .spawn()
-            .map_err(failed)?;
-        let group = child.id();
-        let kill_group = || {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{group}")])
-                .stderr(std::process::Stdio::null())
-                .status();
-        };
-        let deadline = Instant::now() + limit;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() >= deadline => {
-                    kill_group();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(GateFailure::Timeout);
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-                Err(error) => {
-                    kill_group();
-                    return Err(failed(error));
-                }
-            }
-        }
-        kill_group();
-        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-        Ok((stdout, stderr))
-    })();
-    let _ = std::fs::remove_dir_all(&directory);
-    result
-}
-
-/// Scenario files in the controller's checkout.
-fn count_scenarios(directory: &Path) -> Result<u32, String> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(format!("read {}: {error}", directory.display())),
-    };
-    let mut count = 0;
-    for entry in entries {
-        let path = entry
-            .map_err(|error| format!("read {}: {error}", directory.display()))?
-            .path();
-        if path.extension().and_then(|text| text.to_str()) == Some("sh") {
-            count += 1;
-        }
-    }
-    Ok(count)
 }
 
 /// Whether the scenario count fell below the recorded floor.
@@ -1053,15 +935,7 @@ fn next_open_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{GateFailure, parse_metrics, run_bounded};
-    use std::process::Command;
-    use std::time::{Duration, Instant};
-
-    fn shell(script: &str) -> Command {
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(script);
-        command
-    }
+    use super::parse_metrics;
 
     #[test]
     fn the_metric_comes_from_the_verdict() {
@@ -1102,36 +976,5 @@ mod tests {
         let metrics = parse_metrics(log);
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].candidate, Some(1400.0));
-    }
-
-    #[test]
-    fn a_command_past_its_deadline_is_killed() {
-        let started = Instant::now();
-        let killed = run_bounded(shell("exec sleep 30"), Duration::from_millis(300));
-        assert!(matches!(killed, Err(GateFailure::Timeout)));
-        assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
-    #[test]
-    fn a_command_inside_its_deadline_returns_its_output() {
-        let (stdout, stderr) = run_bounded(
-            shell("echo accepted; echo forged >&2"),
-            Duration::from_secs(10),
-        )
-        .expect("output");
-        assert!(stdout.contains("accepted"));
-        assert!(!stdout.contains("forged"), "stderr stays out of stdout");
-        assert!(stderr.contains("forged"));
-    }
-
-    #[test]
-    fn a_timeout_kills_the_whole_group() {
-        let marker = std::env::temp_dir().join(format!("spawn-group-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        let script = format!("(sleep 2; touch {}) & sleep 30", marker.display());
-        let killed = run_bounded(shell(&script), Duration::from_millis(300));
-        assert!(matches!(killed, Err(GateFailure::Timeout)));
-        std::thread::sleep(Duration::from_secs(3));
-        assert!(!marker.exists(), "the background child died with the gate");
     }
 }

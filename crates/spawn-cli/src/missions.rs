@@ -11,6 +11,9 @@ use crate::{Flags, open_store};
 
 const USAGE: &str = "usage:
   spawn mission add --text <mission> [--source <git repo path or URL>]
+                    [--gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]]
+  spawn mission configure --id N [--gate <scenarios dir>] [--accept review|gate] [--minutes N] [--tool-calls N]
+  spawn mission resume --id N
   spawn mission list [--limit N]
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
@@ -49,6 +52,48 @@ fn split(rest: &[String]) -> Result<(&str, Flags), String> {
     Ok((verb.as_str(), Flags::parse(rest)?))
 }
 
+/// A mission's landing settings from the flags: the gate as an absolute
+/// path (resolved against the working directory), the acceptance rule, and
+/// the budget. `None` when no flag sets a gate.
+fn landing(flags: &Flags) -> Result<Option<(String, String, Option<Value>)>, String> {
+    let Some(gate) = flags.get("gate") else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(&gate);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("current directory: {error}"))?
+            .join(path)
+    };
+    if !path.is_dir() {
+        return Err(format!("--gate {} is not a directory", path.display()));
+    }
+    let accept = flags.get("accept").unwrap_or_else(|| "review".to_string());
+    let number = |name: &str| -> Result<Option<i64>, String> {
+        flags
+            .get(name)
+            .map(|text| {
+                text.parse()
+                    .map_err(|_| format!("--{name} must be a number"))
+            })
+            .transpose()
+    };
+    let mut budget = serde_json::Map::new();
+    if let Some(minutes) = number("minutes")? {
+        budget.insert("minutes".to_string(), json!(minutes));
+    }
+    if let Some(calls) = number("tool-calls")? {
+        budget.insert("tool_calls".to_string(), json!(calls));
+    }
+    Ok(Some((
+        path.display().to_string(),
+        accept,
+        (!budget.is_empty()).then_some(Value::Object(budget)),
+    )))
+}
+
 /// `spawn mission ...`
 pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
     let (verb, flags) = split(rest)?;
@@ -59,10 +104,36 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let sources = flags
                 .get("source")
                 .map_or_else(|| json!([]), |source| json!([source]));
+            let landing = landing(&flags)?;
             let id = store
                 .mission_add(&text(&flags, "text")?, &sources, "human")
                 .map_err(err)?;
+            if let Some((gate, accept, budget)) = landing {
+                store
+                    .mission_configure(id, Some(&gate), &accept, budget.as_ref())
+                    .map_err(err)?;
+            }
             print(&json!({ "mission": id }));
+        }
+        "configure" => {
+            let mission = id(&flags, "id")?;
+            let (gate, accept, budget) = landing(&flags)?.map_or(
+                (
+                    None,
+                    flags.get("accept").unwrap_or_else(|| "review".to_string()),
+                    None,
+                ),
+                |(gate, accept, budget)| (Some(gate), accept, budget),
+            );
+            store
+                .mission_configure(mission, gate.as_deref(), &accept, budget.as_ref())
+                .map_err(err)?;
+            print(&json!({ "mission": mission, "gate": gate, "accept": accept }));
+        }
+        "resume" => {
+            let mission = id(&flags, "id")?;
+            store.mission_resume(mission).map_err(err)?;
+            print(&json!({ "mission": mission, "resumed": true }));
         }
         "list" => {
             let limit = flags

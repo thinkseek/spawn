@@ -27,17 +27,23 @@ pub enum TaskState {
     Accepted,
     /// Cancelled before it was accepted.
     Cancelled,
+    /// Passed its mission's gate; its work is being landed on the source.
+    Landing,
+    /// Its work landed on the mission's source.
+    Landed,
 }
 
 impl TaskState {
     /// All states in the order of the SQL check constraint.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Assigned,
         Self::Delivered,
         Self::Reported,
         Self::Revise,
         Self::Accepted,
         Self::Cancelled,
+        Self::Landing,
+        Self::Landed,
     ];
 
     /// The SQL value.
@@ -50,6 +56,8 @@ impl TaskState {
             Self::Revise => "revise",
             Self::Accepted => "accepted",
             Self::Cancelled => "cancelled",
+            Self::Landing => "landing",
+            Self::Landed => "landed",
         }
     }
 }
@@ -89,6 +97,8 @@ mod tests {
             (TaskState::Revise, "revise"),
             (TaskState::Accepted, "accepted"),
             (TaskState::Cancelled, "cancelled"),
+            (TaskState::Landing, "landing"),
+            (TaskState::Landed, "landed"),
         ];
         assert_eq!(TaskState::ALL.len(), expected.len());
         for (state, sql) in expected {

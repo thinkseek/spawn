@@ -204,3 +204,111 @@ fn rows_from_before_the_stream_are_imported_once() {
         .expect("assign");
     assert!(next > task);
 }
+
+#[test]
+fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
+    let (store, schema) = store("control_landing");
+    let mission = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/controller/rsi/scenarios"), "review", None)
+        .expect("configure");
+    assert!(
+        store
+            .mission_configure(mission, Some("relative/path"), "review", None)
+            .is_err(),
+        "a gate is an absolute path"
+    );
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    store.task_review(task, true, "").expect("accept");
+
+    let gated = |verdict: &str, extra: serde_json::Value| {
+        let mut record = json!({"type": "task.gated", "id": task, "verdict": verdict,
+                                "base": "b1", "log": format!("log {verdict}"), "scenarios": 7});
+        record
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        store.integrator_record(&record).expect("record a verdict");
+    };
+    let mut client = admin(&schema);
+    let row = |client: &mut Client| tables(client);
+
+    gated("rejected", json!({"note": "check-tests fails"}));
+    let after = row(&mut client);
+    assert_eq!(after["tasks"][0]["state"], "revise");
+    assert_eq!(after["tasks"][0]["review_note"], "check-tests fails");
+    assert_eq!(after["missions"][0]["gate_rejections"], 1);
+    assert_eq!(
+        after["missions"][0]["baseline"], "b1",
+        "the first gate sets the baseline"
+    );
+    assert_eq!(after["missions"][0]["scenario_floor"], 7);
+
+    store.task_delivered(task, 2).expect("delivered again");
+    assert!(store.task_reported(task, "fixed").expect("reported"));
+    store.task_review(task, true, "").expect("accept again");
+    gated("aborted", json!({}));
+    assert_eq!(row(&mut client)["missions"][0]["gate_aborts"], 1);
+    assert_eq!(
+        row(&mut client)["tasks"][0]["state"],
+        "accepted",
+        "an abort leaves the task"
+    );
+    gated("stale", json!({}));
+    assert_eq!(row(&mut client)["tasks"][0]["state"], "accepted");
+    gated(
+        "accepted",
+        json!({"candidate": "c1", "metric": "METRIC x candidate=1"}),
+    );
+    let after = row(&mut client);
+    assert_eq!(after["tasks"][0]["state"], "landing");
+    assert_eq!(after["tasks"][0]["candidate"], "c1");
+    assert_eq!(after["missions"][0]["gate_rejections"], 0);
+    assert_eq!(after["missions"][0]["gate_aborts"], 0);
+    assert!(
+        store.task_cancel(task).is_err(),
+        "landing work is not cancelled"
+    );
+
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": task, "from": "b1", "to": "c1"}))
+        .expect("landed");
+    let after = row(&mut client);
+    assert_eq!(after["tasks"][0]["state"], "landed");
+    assert_eq!(after["missions"][0]["baseline"], "c1");
+
+    store
+        .integrator_record(
+            &json!({"type": "mission.halted", "id": mission, "reason": "main moved"}),
+        )
+        .expect("halt");
+    assert_eq!(row(&mut client)["missions"][0]["halted"], "main moved");
+    assert!(
+        store
+            .integrator_record(&json!({"type": "mission.closed", "id": mission}))
+            .is_err(),
+        "the integrator records only its own types"
+    );
+    store.mission_resume(mission).expect("resume");
+    let after = row(&mut client);
+    assert!(after["missions"][0]["halted"].is_null());
+    assert!(after["missions"][0]["baseline"].is_null());
+    assert!(
+        store.mission_resume(mission).is_err(),
+        "not halted any more"
+    );
+
+    let live = row(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
