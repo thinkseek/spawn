@@ -104,12 +104,12 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
          order by e.session_seq desc
          limit $3) z";
 
-/// Missions with a gate that are still open, with their tasks the
-/// integrator may have to act on.
+/// Missions with a gate that are open, or done with accepted work still to
+/// land, with the tasks the integrator may have to act on.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
-  select m.id, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
+  select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
          m.gate_rejections, m.gate_aborts, m.objectives, m.sources ->> 0 as source,
          coalesce((select jsonb_agg(jsonb_build_object(
                      'id', k.id, 'agent_id', k.agent_id,
@@ -122,7 +122,10 @@ from (
                     and k.state in ('assigned', 'delivered', 'reported', 'revise',
                                     'accepted', 'landing')), '[]'::jsonb) as tasks
     from mission_missions m
-   where m.gate is not null and m.state in ('open', 'active')
+   where m.gate is not null
+     and (m.state in ('open', 'active')
+          or (m.state = 'done' and exists (select 1 from mission_tasks k
+                where k.mission_id = m.id and k.state in ('accepted', 'landing'))))
 ) x";
 
 /// Tool calls a session started after a moment. `$1` session, `$2` ms.

@@ -469,3 +469,74 @@ fn a_verdict_does_not_bring_back_a_cancelled_task() {
         );
     }
 }
+
+#[test]
+fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
+    let (store, schema) = store("control_closed");
+    let accepted_task = |text: &str| {
+        let mission = store
+            .mission_add(text, &json!(["/tmp/source.git"]), "human")
+            .expect("add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "review", None, None)
+            .expect("configure");
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "").expect("accept");
+        (mission, task)
+    };
+    let gated_ids = || -> Vec<i64> {
+        store
+            .gated_missions()
+            .expect("gated")
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter_map(|row| row["id"].as_i64())
+            .collect()
+    };
+    let (done, done_task) = accepted_task("Done");
+    let (dropped, dropped_task) = accepted_task("Dropped");
+    store.mission_close(done, "done", "shipped").expect("close");
+    store
+        .mission_close(dropped, "dropped", "gone")
+        .expect("close");
+    assert_eq!(
+        gated_ids(),
+        vec![done],
+        "the integrator still lands done work"
+    );
+
+    let mut client = admin(&schema);
+    let state = |client: &mut Client, task: i64| -> String {
+        client
+            .query_one("select state from mission_tasks where id = $1", &[&task])
+            .expect("task")
+            .get(0)
+    };
+    assert_eq!(state(&mut client, dropped_task), "cancelled");
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "id": done_task, "verdict": "accepted",
+                                   "base": "b1", "candidate": "c1", "scenarios": 1}),
+        )
+        .expect("gate");
+    store
+        .integrator_record(
+            &json!({"type": "task.landed", "id": done_task, "from": "b1", "to": "c1"}),
+        )
+        .expect("landed");
+    assert_eq!(state(&mut client, done_task), "landed");
+    assert!(gated_ids().is_empty(), "nothing left to land");
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}

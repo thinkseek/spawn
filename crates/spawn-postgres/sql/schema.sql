@@ -942,9 +942,15 @@ begin
         update mission_missions set state = p_record ->> 'state', summary = p_record ->> 'summary',
                                     updated_at_ms = p_at
          where id = v_id;
-        -- Work still queued for a closed mission is dropped.
+        -- Work still queued for a closed mission is dropped. Accepted work
+        -- of a gated mission still lands when the mission is done, and is
+        -- dropped with the mission otherwise.
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at
-         where mission_id = v_id and state in ('assigned', 'revise');
+         where mission_id = v_id
+           and (state in ('assigned', 'revise')
+                or (state = 'accepted' and p_record ->> 'state' = 'dropped'
+                    and exists (select 1 from mission_missions m
+                                 where m.id = v_id and m.gate is not null)));
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, created_at_ms, updated_at_ms)

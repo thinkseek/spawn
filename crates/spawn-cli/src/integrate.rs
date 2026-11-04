@@ -63,6 +63,9 @@ const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>]";
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Mission {
     pub(crate) id: i64,
+    /// `open` or `active`; `done` while accepted work still lands.
+    #[serde(default)]
+    pub(crate) state: String,
     pub(crate) gate: String,
     pub(crate) accept: String,
     #[serde(default)]
@@ -294,7 +297,11 @@ impl Integrator {
             .map(|()| true);
         }
         let Some(task) = mission.ready() else {
-            // An objective mission with nothing open gets its next task.
+            // An objective mission with nothing open gets its next task; a
+            // closed mission gets none.
+            if mission.state == "done" {
+                return Ok(false);
+            }
             return Ok(objectives::assign_next(store, mission)?.is_some());
         };
         self.judge(store, &mirror, source, &main, &scenarios, count, task)
