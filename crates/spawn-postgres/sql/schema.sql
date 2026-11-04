@@ -676,13 +676,15 @@ $$;
 
 -- Grant-filtered readers: `spawn_read_<view>()` for the views that list
 -- sessions, `spawn_read_<view>(session_id)` for per-session views. Each
--- returns the rows whose agent `session_user` holds a grant for.
+-- returns the rows whose agent `session_user` holds a grant for, and every
+-- row to the owner (the role these functions run as).
 do $$
 declare
     v_view text;
     v_filter constant text :=
-        'exists (select 1 from spawn_grants g where g.principal = session_user::text'
-        ' and spawn_grant_matches(g.agent_id, r.agent_id))';
+        '(session_user = current_user or exists (select 1 from spawn_grants g'
+        ' where g.principal = session_user::text'
+        ' and spawn_grant_matches(g.agent_id, r.agent_id)))';
 begin
     foreach v_view in array array['state', 'status', 'tasks', 'freshness'] loop
         execute format(
