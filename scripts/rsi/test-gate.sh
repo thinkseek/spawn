@@ -244,22 +244,26 @@ home=$(commit home)
 expect "a \$HOME file outside the allow-list is not readable" "$(judge "$home")" 'exit=0 {"verdict":"accepted"}'
 
 # 3b'. A tool PATH finds under $HOME (node through a ~/.local/bin symlink)
-# still runs; its neighbours in ~/.local/bin stay hidden.
-mkdir -p "$HOME/opt/node/bin" "$HOME/.local/bin" "$HOME/.cargo/bin"
+# still runs; its neighbours in ~/.local/bin stay hidden, and so does a
+# tool not on the allow-list (bun, though PATH finds it).
+mkdir -p "$HOME/opt/node/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.bun/bin"
 printf '#!/bin/sh\necho fake-node\n' >"$HOME/opt/node/bin/node"
 chmod 755 "$HOME/opt/node/bin/node"
 ln -s "$HOME/opt/node/bin/node" "$HOME/.local/bin/node"
 printf '#!/bin/sh\n# token=owner\n' >"$HOME/.local/bin/owner-tool"
+printf '#!/bin/sh\necho fake-bun\n' >"$HOME/.bun/bin/bun"
+chmod 755 "$HOME/.bun/bin/bun"
 branch tools
 printf 'two\n' >"$seed/value"
 cat >"$seed/probe.sh" <<'EOF'
 #!/bin/sh
 [ "$(node)" = fake-node ] || { echo "node does not run"; exit 1; }
 [ ! -e "$HOME/.local/bin/owner-tool" ] || { echo "sees ~/.local/bin/owner-tool"; exit 1; }
+[ ! -e "$HOME/.bun" ] || { echo "sees ~/.bun"; exit 1; }
 EOF
 tools=$(commit tools)
-expect "a tool under \$HOME runs, its neighbours stay hidden" \
-    "$(PATH="$HOME/.local/bin:$PATH" judge "$tools")" 'exit=0 {"verdict":"accepted"}'
+expect "a tool under \$HOME runs, its neighbours and ~/.bun stay hidden" \
+    "$(PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH" judge "$tools")" 'exit=0 {"verdict":"accepted"}'
 
 # 3c. No network but loopback: a host listener and the live database port
 # are unreachable; the sandbox's own loopback works.
