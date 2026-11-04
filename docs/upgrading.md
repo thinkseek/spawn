@@ -14,6 +14,7 @@ be replaced while it runs and which need the engine to stop.
 | dispatcher and liveness rule | `spawn loop` | the loop | none: idempotency keys and digest markers are in the commands they submitted |
 | integrator | `spawn integrate` | the process | none |
 | UI server | `spawn serve` | the process | none |
+| model relay | `spawn-model-relay` (systemd) | the process | none: each request is relayed and forgotten; streams in flight |
 
 ## Hot: replace and restart
 
@@ -34,6 +35,17 @@ These hold no state that is not rebuildable.
   configures no hooks; an engine whose settings name it calls it by absolute
   path, and its events come from the transcript.
 - **UI server.** Read-only. No writes exist in `spawn serve`.
+- **Model relay.** `scripts/model-relay.py` keeps nothing between requests.
+  Install the new script over the old one
+  (`install -m 755 scripts/model-relay.py ~/.local/share/spawn-rsi/bin/`)
+  and `systemctl --user restart spawn-model-relay`. The restart cuts the
+  model calls in flight: a running engine sees an API error for those turns
+  and Claude Code retries them; engines that start while it is down run the
+  default profile on Claude Code's own settings, and cheap starts fail and
+  reach the supervisor (docs/fleet-architecture.md §3.3). Restart it when
+  the engines are idle if a cut turn matters. Setting or changing `SPAWN_MODEL_RELAY`,
+  `SPAWN_CHEAP_MODEL` or `SPAWN_SMALL_MODEL` takes a `spawn-loop` restart and
+  applies to engines started after it.
 
 ## Cold: needs the execution to end
 
@@ -42,6 +54,10 @@ These hold no state that is not rebuildable.
   session id. The transcript survives, the turn in flight does not.
 - **The runner.** It is the engine's parent process. Killing it kills the
   engine.
+- **The engine's models.** An engine keeps the base URL and model slots it
+  started with. A new profile, a relay that came back, or new model names
+  reach it only through a stop and a resume (delivery does this when a task
+  needs another profile).
 
 ## Version-coupled boundaries
 
@@ -68,7 +84,11 @@ These are not about process lifetime. They break when two versions meet.
 5. **The Claude transcript.** Its format is the engine's. `claude_line` skips
    lines it does not know, so an engine release that adds line types causes
    no failure, but a renamed field silently drops the events it carried.
-6. **The prompt contract.** Delivery writes the task prompt and the
+6. **Commands with a model profile.** `CommandAction` refuses unknown
+   fields, so a binary from before `model` fails a `start` or `resume` that
+   names one (delivery always does). `execution.started` carries `model` only
+   for the cheap profile, and readers ignore fields they do not know.
+7. **The prompt contract.** Delivery writes the task prompt and the
    `.spawn/report.md` convention. The engine reads them as plain text. A
    change here is hot for the dispatcher and cold for the engine only in that
    the running turn keeps the old instruction.

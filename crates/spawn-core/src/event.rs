@@ -88,6 +88,44 @@ impl Engine {
     }
 }
 
+/// Which models a Claude Code engine runs on (docs/fleet-architecture.md,
+/// "Engine models"). A session keeps the profile it last started with
+/// until a start or resume names another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProfile {
+    /// The main model of Claude Code's own settings; the small model (the
+    /// haiku slot, for background work) through the model relay.
+    #[default]
+    Default,
+    /// Every model through the model relay, on the cheap provider: for
+    /// simple, well-specified work.
+    Cheap,
+}
+
+impl ModelProfile {
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Cheap => "cheap",
+        }
+    }
+
+    /// Parse a wire name.
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Default, Self::Cheap]
+            .into_iter()
+            .find(|profile| profile.as_str() == text)
+    }
+
+    /// The default profile, which a record leaves out.
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+    pub fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
 /// Why a checkpoint commit was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,6 +276,9 @@ pub enum EventKind {
         /// Set when this start created the agent's branch: where it began.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork: Option<Fork>,
+        /// Models the engine runs on; left out for the default profile.
+        #[serde(default, skip_serializing_if = "ModelProfile::is_default")]
+        model: ModelProfile,
     },
     /// The execution ended.
     #[serde(rename = "execution.ended")]

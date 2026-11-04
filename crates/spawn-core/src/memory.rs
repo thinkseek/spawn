@@ -69,6 +69,8 @@ struct State {
     /// Commits fail while set.
     commit_fails: bool,
     terminals: HashSet<TerminalName>,
+    /// Every terminal start, in order.
+    launches: Vec<Launch>,
     panes: HashMap<TerminalName, String>,
     files: HashMap<String, Vec<u8>>,
     /// Engines that exit at the next liveness check: the file is written
@@ -163,6 +165,11 @@ impl MemoryStore {
     /// Test helper.
     pub fn workspace_calls(&self) -> Vec<String> {
         self.lock().workspace_calls.clone()
+    }
+
+    /// Every terminal start so far, in order. Test helper.
+    pub fn launches(&self) -> Vec<Launch> {
+        self.lock().launches.clone()
     }
 
     /// Make every commit fail (`true`) or work again. Test helper.
@@ -463,6 +470,7 @@ impl TerminalHost for MemoryStore {
             )));
         }
         state.terminals.insert(launch.terminal.clone());
+        state.launches.push(launch.clone());
         state.panes.entry(launch.terminal.clone()).or_default();
         Ok(())
     }

@@ -1,7 +1,7 @@
 [Unit]
 Description=Spawn fleet: Bridge + Observer + supervisor liveness (never stops on its own)
-After=spawn-jev-relay.service docker.service
-Wants=spawn-jev-relay.service
+After=spawn-jev-relay.service spawn-model-relay.service docker.service
+Wants=spawn-jev-relay.service spawn-model-relay.service
 
 [Service]
 WorkingDirectory=%h/projects/Spawn
