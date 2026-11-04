@@ -68,8 +68,9 @@ spawn status
 | `submit` | 向队列写一条命令。参数：`--agent`、`--session`、`--key`、`--action`、`--principal`（默认 `spawn`） |
 | `tick` | 领取并执行排队命令，推进活跃执行，记录判定。参数：`--repo`、`--root`、`--judge-url` |
 | `status` | 打印每个会话的最新判定 |
-| `hook` | 读取并忽略标准输入。仅为旧版本以 hook 启动、仍在运行的引擎保留；Spawn 不再配置它 |
+| `hook` | 读取并忽略标准输入。Spawn 不配置 hook；它只为设置里写了它的引擎存在 |
 | `run` | 在终端内运行引擎，把退出状态写入文件供 Bridge 读取。由 Spawn 配置，无需手动调用 |
+| `version` | 打印 `spawn <版本>` |
 
 `--action` 的取值：
 
@@ -85,7 +86,7 @@ spawn status
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | 必填 | PostgreSQL 连接串 |
-| `SPAWN_GIT_REPO` | 必填 | 存放基线 commit 的裸仓库 |
+| `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_WORKER` | `spawn-worker` | 领取命令时记录的 worker 名 |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 路径 |
@@ -106,7 +107,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据库，缺失时测试失败而非跳过。对一棵树跑全部检查，用的就是落地时的同一个门禁：`scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios`（构建、clippy、测试、`scripts/mvp-e2e.sh`、`scripts/blackbox/` 黑盒场景、web 构建）。
+PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据库，缺失时测试失败而非跳过。对一棵树跑全部检查，用的就是落地时的同一个门禁：`scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios`（构建、clippy、测试、`scripts/e2e.sh`、`scripts/blackbox/` 黑盒场景、web 构建）。
 
 ## 文档
 
@@ -115,6 +116,10 @@ PostgreSQL 测试需要 `SPAWN_TEST_DATABASE_URL` 指向一个可丢弃的数据
 | [docs/architecture.md](./docs/architecture.md) | 架构总览 |
 | [docs/design.md](./docs/design.md) | 技术方案、事件协议、端口契约、已知限制 |
 | [docs/view-architecture.md](./docs/view-architecture.md) | 读视图设计 |
+| [docs/fleet-architecture.md](./docs/fleet-architecture.md) | 舰队：判定、控制、任务、落地（英文） |
+| [docs/storage.md](./docs/storage.md) | 各类对象的存放位置，分支与合并（英文） |
+| [docs/rsi.md](./docs/rsi.md) | RSI：目标任务与门禁 |
+| [docs/upgrading.md](./docs/upgrading.md) | 运行中替换各进程（英文） |
 
 ## 许可证
 
