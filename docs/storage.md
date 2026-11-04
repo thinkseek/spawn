@@ -27,7 +27,7 @@ So each kind of object goes where its shape fits.
 | --- | --- | --- | --- | --- |
 | Facts | events, commands, missions, tasks, gate verdicts, landings | small rows, append-only | no branches: one truth, folded | PostgreSQL (`spawn_events` and folds), as today |
 | Source text | code, docs, configs, scenarios, backlog | small text files | branch per agent; three-way merge with the source's `.gitattributes` rules (read from `main`) | git: the mission's source repository |
-| Workspace snapshots | the whole tree an agent works in, at every tool call | many files, few change per checkpoint | a branch is a pointer to a manifest; fork is O(1); merge per path by kind | manifest rows in PostgreSQL, content in the chunk store |
+| Workspace snapshots | the whole tree an agent works in, at every tool call | many files, few change per checkpoint | a branch is a git commit (text) plus a large-file manifest it names; fork is O(1) | the agent's git branch + the chunk store |
 | Large and binary files | weights, datasets, images, archives, anything over 8 MiB | MB–GB, opaque, small edits | no three-way merge: per-path rule, newest wins or conflict | content-defined chunks (FastCDC), zstd, by hash, in the chunk store |
 | Streams | transcripts, engine output, gate logs | append-only, read in order | none | compressed segments in the chunk store, indexed by execution in PostgreSQL |
 | Derived caches | `target/`, `node_modules/`, the kache store | rebuildable, large, hot | none; never authoritative | local to each host (kache may share a remote) |
@@ -41,43 +41,52 @@ about 1 MiB, not 200.
 
 ## Branching and merging
 
-- **Checkpoint** (every tool call, turn end, exit): the Bridge snapshots the
-  workspace into a manifest (path, mode, size, chunk list). A stat cache
-  re-reads only files whose size or mtime changed. Unchanged manifests are not
-  written again. Cost is proportional to what changed.
-- **Branch**: a row `(branch, manifest, parent)` in PostgreSQL; moving it is a
-  compare-and-swap on the old manifest, like the source baseline today.
-- **Fork from any commit**: a new branch row pointing at an existing manifest.
-  No data is copied; sub-agents fork recursively.
-- **Resume anywhere**: a host that lacks a branch's chunks fetches only the
-  missing ones; a local chunk cache with reflinks makes a remount cheap.
-- **Text out to git at turn boundaries**: the snapshot's text files become a
-  commit on the agent's git branch (`spawn/<agent>` on the source), pushed
-  without force so two writers of one branch are caught. People review agent
-  work in git, and the gate and landing work on git as today.
+A workspace snapshot is a pair, carried by one git commit: the commit's tree
+holds the text (every file git would commit, up to 8 MiB), and a trailer in
+its message, `Spawn-Large: <manifest hash>`, names the manifest of the large
+files (path, mode, size, chunk list) in the chunk store. The branch head alone
+is the whole workspace, so everything below is a git operation plus, for large
+files, a chunk fetch.
+
+- **Checkpoint** (every tool call, turn end, exit): the Bridge commits the
+  text against the kept index (a stat cache: only changed files are hashed)
+  and chunks only the large files whose size or mtime changed. A checkpoint
+  where only a large file changed is a commit with the same tree and a new
+  trailer. Cost is proportional to what changed.
+- **Branch**: `refs/heads/<agent>`, moved by compare-and-swap on the old
+  commit, as today.
+- **Fork from any commit**: a new branch at an existing commit. No data is
+  copied; the large files' chunks are shared; sub-agents fork recursively.
+- **Resume anywhere**: a host fetches the branch and only the chunks it lacks.
+- **Central**: branches pushed to the mission's source as `spawn/<agent>`
+  without force (two writers of one branch are caught), at turn boundaries and
+  coalesced, not per tool call; chunks in R2.
 - **Main into branches automatically**: at a turn end, when the source's
   `main` moved, it is merged into the agent's branch (`merge-tree
-  --attr-source=main`; a large file by its path rule). A clean merge updates
-  the idle workspace in place (`read-tree -m -u`, which refuses if the tree
-  differs from the branch) and is recorded as a checkpoint; a conflict changes
-  nothing and the agent hears of it at landing, as today.
-- **Landing**: unchanged. The gate judges the git candidate; the integrator
-  commits host-side and moves `main` by compare-and-swap.
+  --attr-source=main`, so the rules come from `main`, which only the gate
+  moves). A clean merge updates the idle workspace in place (`read-tree -m
+  -u`, which refuses if the tree differs from the branch) and is recorded as a
+  checkpoint; a conflict changes nothing and the agent hears of it at landing,
+  as today. Large files are not merged: the branch keeps its own.
+- **Landing**: unchanged and text only. The gate judges the git candidate; the
+  integrator commits host-side and moves `main` by compare-and-swap. Large
+  files are workspace state, not source, and never land.
 
 ## Phases
 
 0. **Done.** The checkpoint index is kept between checkpoints (stat cache),
    and files over 8 MiB stay out of git commits (a warning names them once;
    until phase 1 they are not on the branch and are lost at unmount).
-1. **Chunk store and snapshots.** `spawn_snapshots` / `spawn_branches`
-   tables, a chunk-store port (local directory adapter), FastCDC + zstd.
-   Checkpoints become snapshots; large files are kept again, deduplicated.
+1. **Chunk store; large files kept.** A chunk-store port with a local
+   directory adapter (content-defined chunks, BLAKE3, zstd, verified on read);
+   the large-file manifest and the `Spawn-Large` trailer; mount materializes
+   the large files again.
 2. **Branches in the store.** Fork from any commit (`start {from}`), resume on
-   any host, text pushed to `spawn/<agent>` at turn ends, `main` merged into
-   idle branches automatically.
+   any host, branches pushed to `spawn/<agent>`, `main` merged into idle
+   branches automatically.
 3. **Streams and reach.** Transcripts and gate logs as segments; the chunk
-   store on S3-compatible storage; PostgreSQL reachable from other hosts (TLS
-   client in `spawn-postgres`, or a private network).
+   store in R2; PostgreSQL reachable from other hosts through a Cloudflare
+   Tunnel; `pg_dump` backups to R2.
 
 ## Where state lives today
 
