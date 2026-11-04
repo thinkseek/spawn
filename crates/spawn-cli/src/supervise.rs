@@ -301,7 +301,7 @@ pub(crate) fn keep_residents(store: &PostgresStore) -> Result<Vec<String>, Strin
         let prompt = work
             .tasks
             .iter()
-            .find(|task| task.session_id == session && task.state == "delivered")
+            .find(|task| task.session_id == session && task.state == spawn_core::mission::TaskState::Delivered)
             .map_or_else(
                 || format!("You are a long-lived resident worker of Spawn. Your charter:\n{charter}\n\nWait for your next task."),
                 crate::deliver::task_prompt,
