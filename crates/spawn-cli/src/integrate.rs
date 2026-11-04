@@ -36,7 +36,7 @@ use spawn_core::port::{CommandQueue, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
-use crate::config::{loop_interval, workspace_root};
+use crate::config::{chunk_store, loop_interval, workspace_root};
 use crate::gate::{self, GateFailure};
 use crate::{Flags, env_or, open_store};
 use crate::{objectives, sources};
@@ -368,7 +368,8 @@ impl Integrator {
         count: u32,
         task: &Task,
     ) -> Result<(), String> {
-        let repo = GitWorkspace::new(mirror, &self.root);
+        let repo = GitWorkspace::new(mirror, &self.root)
+            .with_chunks(chunk_store(&self.root.to_string_lossy()));
         let directory = self.root.join(&task.agent_id);
         if directory.exists() {
             let workspace = WorkspaceId::new(format!("{}:{}", task.agent_id, directory.display()))
@@ -409,7 +410,37 @@ impl Integrator {
         ])
         .is_ok()
         {
-            branch
+            // Large files are workspace state, never source: a branch head
+            // that names a large-file manifest lands as a commit of the same
+            // tree without it, so nothing forked from main inherits them.
+            let message = git(&[
+                "--git-dir",
+                &mirror_path,
+                "show",
+                "-s",
+                "--format=%B",
+                &branch,
+            ])?;
+            if spawn_host::chunks::trailer_of(&message).is_some() {
+                let tree = git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "rev-parse",
+                    &format!("{branch}^{{tree}}"),
+                ])?;
+                git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &branch,
+                    "-m",
+                    &format!("Land task {}", task.id),
+                ])?
+            } else {
+                branch
+            }
         } else {
             // Main moved since the worker started: land the merge of both,
             // by main's merge rules (a bare repository reads no in-tree

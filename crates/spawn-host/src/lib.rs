@@ -1,10 +1,15 @@
-//! Host adapters: tmux terminals and the git workspace store.
+//! Host adapters: tmux terminals, the git workspace store and the local
+//! chunk store.
 //!
 //! Both adapters call an external program and read its exit code, so they
 //! share the same failure rules as the programs they wrap.
 
+pub mod chunks;
 pub mod git;
 pub mod tmux;
 
-pub use git::{GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix};
+pub use chunks::LocalChunkStore;
+pub use git::{
+    DEFAULT_CHUNK_DIRECTORY, GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix,
+};
 pub use tmux::{PrefixBuilder, TmuxHost};

@@ -7,16 +7,30 @@
 //! A commit is written with plumbing against a temporary index, so it never
 //! touches a checked-out tree and needs no branch to be current.
 //!
+//! Files over [`LARGE_FILE_BYTES`] never enter git: they are cut into
+//! chunks in the chunk store, the checkpoint commit names their manifest in a
+//! `Spawn-Large: <hash>` trailer, and a mount materializes them again from
+//! the branch head (docs/storage.md, phase 1). The branch head alone is the
+//! whole workspace.
+//!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
 //! part before the colon, and the container of an execution is named from it,
 //! so every call rebuilds the mapping from the identifier alone.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+
+use serde_json::{Value, json};
 
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{BaseMerge, Branch, Commit, ForkFrom, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{
+    BaseMerge, Branch, ChunkStore, Commit, ForkFrom, WorkspaceError, WorkspaceStore,
+};
+
+use crate::chunks::{LargeFile, LocalChunkStore, Manifest, materialize, mode_of, store_file};
 
 /// Ref a new branch is forked from.
 const BASE: &str = "main";
@@ -24,10 +38,10 @@ const BASE: &str = "main";
 /// Paths that never enter a commit.
 const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
 
-/// Files larger than this stay out of git (docs/storage.md): git stores
-/// every version of a file whole, so one rewritten 200 MiB binary costs
-/// seconds per checkpoint on the Bridge's loop and its full size again in
-/// the repository each time.
+/// Files larger than this stay out of git and go to the chunk store
+/// (docs/storage.md): git stores every version of a file whole, so one
+/// rewritten 200 MiB binary costs seconds per checkpoint on the Bridge's loop
+/// and its full size again in the repository each time.
 pub const LARGE_FILE_BYTES: u64 = 8 << 20;
 
 /// Docker settings for a workspace that hosts the engine.
@@ -80,9 +94,39 @@ pub struct GitWorkspace {
     root: PathBuf,
     git: String,
     container: Option<Container>,
-    /// Large files already reported, by branch, path and size: one warning
-    /// per version, not one per checkpoint.
-    reported: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Where large files are kept, as content-defined chunks.
+    chunks: Arc<dyn ChunkStore>,
+}
+
+/// Directory of the default chunk store under a workspace root: mount and
+/// unmount never clear it, and it is never inside a workspace.
+pub const DEFAULT_CHUNK_DIRECTORY: &str = ".chunks";
+
+/// What a checkpoint knew of one large file: its stat and its chunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Known {
+    size: u64,
+    mtime_ns: i128,
+    mode: u32,
+    chunks: Vec<String>,
+}
+
+/// Size and modification time of a file, `None` when it is not a regular
+/// file.
+fn stat_of(path: &Path) -> Option<(u64, i128, u32)> {
+    let metadata = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| i128::try_from(since.as_nanos()).unwrap_or(0));
+    Some((metadata.len(), mtime, mode_of(&metadata)))
+}
+
+fn chunk_failure(error: impl std::fmt::Display) -> WorkspaceError {
+    WorkspaceError::Unavailable(format!("chunk store: {error}"))
 }
 
 impl GitWorkspace {
@@ -93,8 +137,18 @@ impl GitWorkspace {
             root: root.as_ref().to_path_buf(),
             git: "git".to_string(),
             container: None,
-            reported: std::sync::Arc::default(),
+            chunks: Arc::new(LocalChunkStore::new(
+                root.as_ref().join(DEFAULT_CHUNK_DIRECTORY),
+            )),
         }
+    }
+
+    /// The same store keeping large files in `chunks` instead of the default
+    /// directory under the root.
+    #[must_use]
+    pub fn with_chunks(mut self, chunks: Arc<dyn ChunkStore>) -> Self {
+        self.chunks = chunks;
+        self
     }
 
     /// Store whose working trees are mounted into one disposable container.
@@ -286,18 +340,18 @@ impl GitWorkspace {
         self.root.join(".index").join(branch)
     }
 
-    /// Tree of the work tree in `directory`, built against `index`.
+    /// Tree of the work tree in `directory`, built against `index`, and the
+    /// large files left out of it.
     ///
     /// Build output and files over [`LARGE_FILE_BYTES`] leave the index after
     /// `add -A`, so a `.gitignore` inside the tree cannot re-include them; a
     /// large file is excluded before it is hashed.
     fn tree_of(
         &self,
-        branch: &str,
         directory: &Path,
         index: &Path,
-    ) -> Result<String, WorkspaceError> {
-        let large = self.large_files(directory, index)?;
+    ) -> Result<(String, Vec<(String, u64)>), WorkspaceError> {
+        let mut large = self.large_files(directory, index)?;
         let mut add = vec!["add", "-A", "--", "."];
         let excluded: Vec<String> = large
             .iter()
@@ -306,17 +360,20 @@ impl GitWorkspace {
         add.extend(excluded.iter().map(String::as_str));
         self.output_in(directory, index, &add)?;
         self.unstage(directory, index, &large)?;
-        self.report_large(branch, &large);
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the limit between the size check and `add`
-        // was hashed anyway; keep it off the branch all the same.
+        // was hashed anyway; keep it off the branch all the same, and in the
+        // chunk store with the other large files.
         let grown = self.large_blobs(&tree)?;
         if grown.is_empty() {
-            return Ok(tree);
+            return Ok((tree, large));
         }
         self.unstage(directory, index, &grown)?;
-        self.report_large(branch, &grown);
-        self.output_in(directory, index, &["write-tree"])
+        large.extend(grown);
+        large.sort();
+        large.dedup();
+        let tree = self.output_in(directory, index, &["write-tree"])?;
+        Ok((tree, large))
     }
 
     /// Take build output and `paths` out of the index. Paths go to git as
@@ -387,21 +444,172 @@ impl GitWorkspace {
         Ok(large)
     }
 
-    /// Say once per version that a large file stays out of the checkpoint:
-    /// it lives in the workspace until unmount and is not on the branch.
-    fn report_large(&self, branch: &str, large: &[(String, u64)]) {
-        let mut reported = self
-            .reported
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (path, size) in large {
-            if reported.insert(format!("{branch}\0{path}\0{size}")) {
-                eprintln!(
-                    "git: {branch}: {path} ({size} bytes) is over {LARGE_FILE_BYTES} \
-                     bytes and stays out of the checkpoint (docs/storage.md)"
+    /// The stat cache of one branch's large files, beside its kept index:
+    /// only files whose size, mtime or mode changed are chunked again.
+    fn large_cache(&self, branch: &str) -> PathBuf {
+        self.root.join(".large").join(branch)
+    }
+
+    fn read_cache(&self, branch: &str) -> BTreeMap<String, Known> {
+        let Ok(bytes) = std::fs::read(self.large_cache(branch)) else {
+            return BTreeMap::new();
+        };
+        let Ok(Value::Object(files)) = serde_json::from_slice::<Value>(&bytes) else {
+            return BTreeMap::new();
+        };
+        files
+            .into_iter()
+            .filter_map(|(path, entry)| {
+                let known = Known {
+                    size: entry.get("size")?.as_u64()?,
+                    mtime_ns: entry.get("mtime_ns")?.as_str()?.parse().ok()?,
+                    mode: u32::try_from(entry.get("mode")?.as_u64()?).ok()?,
+                    chunks: entry
+                        .get("chunks")?
+                        .as_array()?
+                        .iter()
+                        .map(|chunk| chunk.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()?,
+                };
+                Some((path, known))
+            })
+            .collect()
+    }
+
+    /// Best effort: a lost cache only costs one re-chunk.
+    fn write_cache(&self, branch: &str, known: &BTreeMap<String, Known>) {
+        let path = self.large_cache(branch);
+        if known.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let files: serde_json::Map<String, Value> = known
+            .iter()
+            .map(|(file, known)| {
+                (
+                    file.clone(),
+                    json!({"size": known.size, "mtime_ns": known.mtime_ns.to_string(),
+                           "mode": known.mode, "chunks": known.chunks}),
+                )
+            })
+            .collect();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let temporary = path.with_extension("tmp");
+        if std::fs::write(&temporary, Value::Object(files).to_string()).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
+        }
+    }
+
+    /// Chunk the large files of a checkpoint into the store and store their
+    /// manifest; its name, or `None` when there are no large files.
+    fn store_large(
+        &self,
+        branch: &str,
+        directory: &Path,
+        large: &[(String, u64)],
+    ) -> Result<Option<String>, WorkspaceError> {
+        let cached = self.read_cache(branch);
+        let mut known = BTreeMap::new();
+        let mut files = Vec::with_capacity(large.len());
+        for (path, _) in large {
+            let full = directory.join(path);
+            let Some((size, mtime_ns, mode)) = stat_of(&full) else {
+                continue;
+            };
+            let chunks = match cached.get(path) {
+                Some(entry)
+                    if entry.size == size && entry.mtime_ns == mtime_ns && entry.mode == mode =>
+                {
+                    entry.chunks.clone()
+                }
+                _ => {
+                    let (chunks, read) =
+                        store_file(self.chunks.as_ref(), &full).map_err(chunk_failure)?;
+                    // A file that changed while it was read is recorded as
+                    // read and chunked again at the next checkpoint.
+                    let stable = stat_of(&full) == Some((size, mtime_ns, mode)) && read == size;
+                    files.push(LargeFile {
+                        path: path.clone(),
+                        mode,
+                        size: read,
+                        chunks: chunks.clone(),
+                    });
+                    if stable {
+                        known.insert(
+                            path.clone(),
+                            Known {
+                                size,
+                                mtime_ns,
+                                mode,
+                                chunks,
+                            },
+                        );
+                    }
+                    continue;
+                }
+            };
+            files.push(LargeFile {
+                path: path.clone(),
+                mode,
+                size,
+                chunks: chunks.clone(),
+            });
+            known.insert(
+                path.clone(),
+                Known {
+                    size,
+                    mtime_ns,
+                    mode,
+                    chunks,
+                },
+            );
+        }
+        self.write_cache(branch, &known);
+        if files.is_empty() {
+            return Ok(None);
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = Manifest { files }.to_bytes();
+        self.chunks.put(&manifest).map(Some).map_err(chunk_failure)
+    }
+
+    /// The large-file manifest a commit names in its `Spawn-Large` trailer.
+    fn manifest_of(&self, commit: &str) -> Result<Option<String>, WorkspaceError> {
+        let message = self.git_output(&["show", "-s", "--format=%B", commit, "--"])?;
+        Ok(crate::chunks::trailer_of(&message))
+    }
+
+    /// Write the large files the branch head names into a fresh mount, and
+    /// remember their stat so the next checkpoint does not chunk them again.
+    /// Every chunk is verified; a file is written whole or not at all.
+    fn materialize_large(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
+        let Some(name) = self.manifest_of(&format!("refs/heads/{branch}"))? else {
+            self.write_cache(branch, &BTreeMap::new());
+            return Ok(());
+        };
+        let bytes = self.chunks.get(&name).map_err(chunk_failure)?;
+        let manifest = Manifest::from_bytes(&bytes).map_err(chunk_failure)?;
+        let mut known = BTreeMap::new();
+        for file in &manifest.files {
+            materialize(self.chunks.as_ref(), directory, file).map_err(|error| {
+                WorkspaceError::Unavailable(format!("large file {}: {error}", file.path))
+            })?;
+            if let Some((size, mtime_ns, mode)) = stat_of(&directory.join(&file.path)) {
+                known.insert(
+                    file.path.clone(),
+                    Known {
+                        size,
+                        mtime_ns,
+                        mode,
+                        chunks: file.chunks.clone(),
+                    },
                 );
             }
         }
+        self.write_cache(branch, &known);
+        Ok(())
     }
 }
 
@@ -499,6 +707,7 @@ impl WorkspaceStore for GitWorkspace {
                 "extract {branch}: tar exited {extracted}"
             )));
         }
+        self.materialize_large(branch.as_str(), &directory)?;
 
         self.start_container(branch.as_str(), &directory)?;
 
@@ -524,11 +733,12 @@ impl WorkspaceStore for GitWorkspace {
         lock.lock().map_err(|error| {
             WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
         })?;
-        let tree = self.tree_of(&branch, &directory, &index);
+        let tree = self.tree_of(&directory, &index);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
-        let tree = tree?;
+        let (tree, large) = tree?;
+        let manifest = self.store_large(&branch, &directory, &large)?;
 
         let reference = format!("refs/heads/{branch}");
         let parent = self.git_output(&["rev-parse", &reference])?;
@@ -536,14 +746,15 @@ impl WorkspaceStore for GitWorkspace {
         // A merge of main whose conflicts are now resolved: main is the
         // second parent, even when the tree did not change.
         let merged = self.resolved_merge(&branch, &directory);
-        if tree == parent_tree && merged.is_none() {
+        if tree == parent_tree && merged.is_none() && manifest == self.manifest_of(&parent)? {
             return Ok(Commit::Unchanged);
         }
+        let message = crate::chunks::with_trailer(message, manifest.as_deref());
         let mut arguments = vec!["commit-tree", tree.as_str(), "-p", parent.as_str()];
         if let Some(main) = merged.as_deref() {
             arguments.extend(["-p", main]);
         }
-        arguments.extend(["-m", message]);
+        arguments.extend(["-m", message.as_str()]);
         let commit = self.git_output(&arguments)?;
         // Expected old value: a branch that moved is not overwritten.
         self.git_output(&["update-ref", &reference, &commit, &parent])
