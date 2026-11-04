@@ -240,7 +240,10 @@ impl Integrator {
         // A store per pass: the advisory lock belongs to the connection, and
         // is released with it.
         let store = open_store()?;
-        if !store.rsi_try_lock().map_err(|error| error.to_string())? {
+        if !store
+            .integrator_try_lock()
+            .map_err(|error| error.to_string())?
+        {
             return Ok(());
         }
         let missions: Vec<Mission> =

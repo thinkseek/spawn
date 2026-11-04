@@ -2,7 +2,7 @@ import { Eye, GitBranch, Terminal, Wrench } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { Observation, RsiSummary, SessionDetail } from "../api";
-import { formatBytes, formatDuration, relativeTime } from "../format";
+import { formatDuration, relativeTime } from "../format";
 import { Card, CardHeader, cx } from "./ui";
 
 interface DetailsRailProps {
@@ -188,44 +188,42 @@ export function RailContent({
 
       {rsi && (
         <Card>
-          <CardHeader icon={<GitBranch size={14} />} title="RSI" />
+          <CardHeader icon={<GitBranch size={14} />} title={`RSI · mission #${rsi.mission}`} />
           <div className="space-y-2 p-4">
             <Field
               label="Baseline"
               value={
-                <span className="font-mono">{rsi.baseline.slice(0, 8)}</span>
+                <span className="font-mono">
+                  {rsi.baseline ? rsi.baseline.slice(0, 8) : "—"}
+                </span>
               }
             />
-            <Field label="Iteration" value={String(rsi.iteration)} />
-            <Field label="Phase" value={rsi.open_iteration?.phase ?? "—"} />
+            <Field label="Halted" value={rsi.halted ?? "no"} />
             <Field
-              label="Rejected in a row"
-              value={String(rsi.consecutive_rejected)}
+              label="Task"
+              value={
+                rsi.open_task
+                  ? `#${rsi.open_task.id} · ${rsi.open_task.state}`
+                  : "—"
+              }
             />
-            {rsi.open_iteration && (
+            {rsi.open_task && (
               <Field
-                label="Patch"
-                value={formatBytes(rsi.open_iteration.patch_bytes)}
+                label="Objective"
+                value={
+                  rsi.open_task.objective !== null
+                    ? String(rsi.open_task.objective)
+                    : "—"
+                }
               />
             )}
             <Field
-              label="Solved tasks"
-              value={
-                rsi.solved_tasks.length === 0 ? (
-                  "—"
-                ) : (
-                  <span className="flex flex-wrap justify-end gap-1">
-                    {rsi.solved_tasks.map((task) => (
-                      <span
-                        key={task}
-                        className="rounded bg-muted px-1.5 py-px font-mono text-micro text-muted-foreground"
-                      >
-                        {task}
-                      </span>
-                    ))}
-                  </span>
-                )
-              }
+              label="Last verdict"
+              value={rsi.open_task?.last_verdict ?? "—"}
+            />
+            <Field
+              label="Objectives"
+              value={`${rsi.objectives.open} open · ${rsi.objectives.solved} solved · ${rsi.objectives.met} met`}
             />
           </div>
         </Card>

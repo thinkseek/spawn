@@ -52,9 +52,8 @@ function niceTicks(low: number, high: number, count = 4): number[] {
 }
 
 /**
- * The ratchet: a step line through the landed values, with every gated
- * attempt as a point. Landed points are filled, rejected ones hollow; the
- * target is a dashed rule.
+ * The ratchet: a step line through the landed values, with every landing
+ * (a landed task's metric line) as a point. The target is a dashed rule.
  */
 export function MetricChart({
   points,
@@ -88,10 +87,10 @@ export function MetricChart({
             <ChartLine size={15} />
           </span>
           <p className="text-label font-medium text-muted-foreground">
-            No gated measurements yet
+            No landed measurements yet
           </p>
           <p className="max-w-xs text-caption text-faint-foreground">
-            The first gated attempt records the starting baseline
+            The first landing records the starting baseline
             {target !== null ? ` and plots it against the ${formatMetric(target, unit)} target` : ""}
             .
           </p>
@@ -158,7 +157,7 @@ export function MetricChart({
           width={width}
           height={height}
           role="img"
-          aria-label={`Metric history, ${direction} is better`}
+          aria-label={`Landed metric values, ${direction} is better`}
           onMouseLeave={() => setHover(null)}
           onMouseMove={(event) => {
             const box = event.currentTarget.getBoundingClientRect();
@@ -244,7 +243,7 @@ export function MetricChart({
             if (value === null) return null;
             return (
               <circle
-                key={`${point.iteration}-${index}`}
+                key={`${point.task}-${index}`}
                 cx={x(index + 1)}
                 cy={y(value)}
                 r={hover === index ? radius + 1.5 : radius}
@@ -276,7 +275,7 @@ export function MetricChart({
           {usable.map((point, index) =>
             (slots - 1 - index) % every === 0 ? (
               <text
-                key={`label-${point.iteration}-${index}`}
+                key={`label-${point.task}-${index}`}
                 x={x(index + 1)}
                 y={height - 7}
                 textAnchor="middle"
@@ -285,7 +284,7 @@ export function MetricChart({
                   hover === index ? "fill-foreground" : "fill-faint-foreground",
                 )}
               >
-                {`#${point.iteration}`}
+                {`T${point.task}`}
               </text>
             ) : null,
           )}
@@ -305,7 +304,7 @@ export function MetricChart({
         >
           <div className="mb-1 flex items-center justify-between">
             <span className="tnum font-medium text-foreground">
-              Iteration #{hovered.iteration}
+              Task #{hovered.task}
             </span>
             <span
               className={
@@ -347,10 +346,6 @@ export function ChartLegend({ hasTarget }: { hasTarget: boolean }) {
       <span className="inline-flex items-center gap-1.5">
         <span className="inline-block size-2 rounded-full bg-success" />
         landed
-      </span>
-      <span className="inline-flex items-center gap-1.5">
-        <span className="inline-block size-2 rounded-full border-[1.5px] border-destructive" />
-        rejected
       </span>
       {hasTarget && (
         <span className="inline-flex items-center gap-1.5">
