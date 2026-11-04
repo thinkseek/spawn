@@ -55,37 +55,8 @@ pub(crate) struct Metric {
     pub(crate) candidate: Option<f64>,
 }
 
-/// The candidate's metric from a gate log.
-///
-/// Scenario output is written by candidate code, so a `METRIC` line in it
-/// proves nothing: a regression scenario could print a better number after the
-/// real one. The gate puts the candidate run's metric into its verdict, and
-/// that is what counts. Without one (logs from before that change, or a run
-/// that printed none) only the first candidate section is read: it ends
-/// before any regression output, and the scenario prints its own line last.
-pub(crate) fn parse_metrics(log: &str) -> Vec<Metric> {
-    let verdict = log
-        .lines()
-        .rev()
-        .find(|line| line.trim_start().starts_with('{'))
-        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok());
-    if let Some(metric) = verdict
-        .as_ref()
-        .and_then(|verdict| verdict.get("metric"))
-        .and_then(serde_json::Value::as_str)
-    {
-        return metric_lines(metric);
-    }
-    let section = log
-        .lines()
-        .skip_while(|line| !line.starts_with("| == candidate"))
-        .skip(1)
-        .take_while(|line| !line.starts_with("| =="))
-        .collect::<Vec<_>>()
-        .join("\n");
-    metric_lines(&section)
-}
-
+/// The `METRIC <name> baseline=<n> candidate=<n>` lines of a text (a
+/// verdict's metric line), the last line of each name winning.
 pub(crate) fn metric_lines(text: &str) -> Vec<Metric> {
     let mut metrics: Vec<Metric> = Vec::new();
     for line in text.lines() {
@@ -306,7 +277,7 @@ pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Op
 
 #[cfg(test)]
 mod tests {
-    use super::{Landing, Task, next_open, parse_metrics};
+    use super::{Landing, Task, metric_lines, next_open};
 
     fn objective(id: u32, recurring: bool) -> Task {
         Task {
@@ -363,43 +334,11 @@ mod tests {
     }
 
     #[test]
-    fn the_metric_comes_from_the_verdict() {
-        let log = "| == candidate: 002.sh must pass\n\
-                   | METRIC ingest_total_ns baseline=1540 candidate=1400\n\
-                   | == regression: 001.sh must still pass\n\
-                   | METRIC ingest_total_ns baseline=1540 candidate=1\n\
-                   {\"verdict\":\"accepted\",\"metric\":\"METRIC ingest_total_ns baseline=1540 candidate=1400\"}";
-        let metrics = parse_metrics(log);
+    fn a_metric_line_is_read() {
+        let metrics = metric_lines("METRIC ingest_total_ns baseline=1573 candidate=1021");
         assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].baseline, Some(1540.0));
-        assert_eq!(metrics[0].candidate, Some(1400.0));
-    }
-
-    #[test]
-    fn an_old_verdict_falls_back_to_the_candidate_section() {
-        // Iteration 6's real log: the verdict line carries no metric.
-        let log = "| == baseline: 002.sh must fail\n\
-                   | METRIC ingest_total_ns baseline=1578 candidate=1586\n\
-                   | == candidate: 002.sh must pass\n\
-                   | METRIC ingest_total_ns baseline=1573 candidate=1021\n\
-                   | == regression: 001.sh must still pass\n\
-                   | METRIC ingest_total_ns baseline=1573 candidate=1\n\
-                   {\"verdict\":\"accepted\"}";
-        let metrics = parse_metrics(log);
-        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "ingest_total_ns");
+        assert_eq!(metrics[0].baseline, Some(1573.0));
         assert_eq!(metrics[0].candidate, Some(1021.0));
-    }
-
-    #[test]
-    fn an_old_log_is_read_from_the_candidate_section_only() {
-        let log = "| == baseline: 002.sh must fail\n\
-                   | METRIC ingest_total_ns baseline=1544 candidate=1550\n\
-                   | == candidate: 002.sh must pass\n\
-                   | METRIC ingest_total_ns baseline=1540 candidate=1400\n\
-                   | == regression: 001.sh must still pass\n\
-                   | METRIC ingest_total_ns baseline=1540 candidate=1\n";
-        let metrics = parse_metrics(log);
-        assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].candidate, Some(1400.0));
     }
 }
