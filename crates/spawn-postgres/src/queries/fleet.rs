@@ -223,14 +223,16 @@ from (
 
 /// One session's judgements, newest first, with the evidence each saw.
 /// `$1` session, `$2` limit.
-pub(crate) const SESSION_JUDGEMENTS: &str = "select coalesce(jsonb_agg(row_to_json(j) order by j.session_seq desc), '[]'::jsonb)
+pub(crate) const SESSION_JUDGEMENTS: &str =
+    "select coalesce(jsonb_agg(row_to_json(j) order by j.session_seq desc), '[]'::jsonb)
                    from (select session_seq, recorded_at_ms, observation
                            from agent_judgements where session_id = $1
                           order by session_seq desc limit $2) j";
 
 /// Commands into one session, newest first, with who sent them.
 /// `$1` session, `$2` limit.
-pub(crate) const SESSION_COMMANDS: &str = "select coalesce(jsonb_agg(row_to_json(c) order by c.command_id desc), '[]'::jsonb)
+pub(crate) const SESSION_COMMANDS: &str =
+    "select coalesce(jsonb_agg(row_to_json(c) order by c.command_id desc), '[]'::jsonb)
                    from (select id as command_id, principal, action ->> 'type' as action,
                                 left(coalesce(action ->> 'prompt', action ->> 'text'), 600) as text,
                                 state, succeeded, error, created_at_ms, finished_at_ms

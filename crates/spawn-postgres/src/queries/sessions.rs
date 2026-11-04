@@ -19,7 +19,8 @@ pub(crate) const STATE: &str = concat!(
 );
 
 /// Timeline entries after a sequence. `$1` session, `$2` after, `$3` limit.
-pub(crate) const TIMELINE: &str = "select session_seq, id, execution_id, source, event_name, detail, recorded_at_ms
+pub(crate) const TIMELINE: &str =
+    "select session_seq, id, execution_id, source, event_name, detail, recorded_at_ms
                    from agent_timeline
                   where session_id = $1 and session_seq > $2
                   order by session_seq
@@ -64,7 +65,8 @@ pub(crate) const COMMANDS_BY: &str = "select coalesce(jsonb_agg(c order by c.id 
                           order by id desc limit $2) c";
 
 /// Prompt of the newest start, resume or input command. `$1` session.
-pub(crate) const LATEST_TASK: &str = "select coalesce(action ->> 'prompt', action ->> 'text') as task
+pub(crate) const LATEST_TASK: &str =
+    "select coalesce(action ->> 'prompt', action ->> 'text') as task
                    from spawn_commands
                   where session_id = $1
                     and action ->> 'type' in ('start', 'resume', 'input')
@@ -79,18 +81,21 @@ pub(crate) const LATEST_TERMINAL: &str = "select kind -> 'detail' ->> 'terminal'
                   order by id desc limit 1";
 
 /// Executions of one session, newest first. `$1` session.
-pub(crate) const EXECUTIONS: &str = "select execution_id, command_id, engine, started_at_ms, ended_at_ms, cause,
+pub(crate) const EXECUTIONS: &str =
+    "select execution_id, command_id, engine, started_at_ms, ended_at_ms, cause,
                         exit_code, exit_reported, duration_ms
                    from agent_executions
                   where session_id = $1
                   order by started_at_ms desc, execution_id";
 
 /// Tool calls without a result, in sequence order. `$1` session.
-pub(crate) const OPEN_TOOLS: &str = "select execution_id, tool_use_id, tool_name, session_seq, started_at_ms
+pub(crate) const OPEN_TOOLS: &str =
+    "select execution_id, tool_use_id, tool_name, session_seq, started_at_ms
                    from agent_open_tools
                   where session_id = $1
                   order by session_seq";
 
 /// Position of one session's log. `$1` session.
-pub(crate) const FRESHNESS: &str = "select last_session_seq, last_event_id, last_event_at_ms, event_count
+pub(crate) const FRESHNESS: &str =
+    "select last_session_seq, last_event_id, last_event_at_ms, event_count
                    from agent_freshness where session_id = $1";
