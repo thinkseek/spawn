@@ -331,10 +331,12 @@ impl Manifest {
 pub fn is_safe_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains('\0')
-        && Path::new(path).components().all(|component| match component {
-            Component::Normal(name) => name != ".git",
-            _ => false,
-        })
+        && Path::new(path)
+            .components()
+            .all(|component| match component {
+                Component::Normal(name) => name != ".git",
+                _ => false,
+            })
 }
 
 /// The commit message with the manifest named in a trailer, or unchanged
@@ -393,7 +395,8 @@ pub fn materialize(
     let parent = target
         .parent()
         .ok_or_else(|| format!("{} has no parent", target.display()))?;
-    std::fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
     let name = target
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -435,7 +438,8 @@ pub fn materialize(
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let permissions = std::fs::Permissions::from_mode(if mode == 0o100_755 { 0o755 } else { 0o644 });
+    let permissions =
+        std::fs::Permissions::from_mode(if mode == 0o100_755 { 0o755 } else { 0o644 });
     std::fs::set_permissions(path, permissions)
         .map_err(|error| format!("chmod {}: {error}", path.display()))
 }
@@ -495,9 +499,16 @@ mod tests {
         let chunks = chunks_of(&data);
         assert_eq!(chunks.concat(), data);
         let (last, rest) = chunks.split_last().expect("chunks");
-        assert!(rest.iter().all(|chunk| (MIN_CHUNK..=MAX_CHUNK).contains(&chunk.len())));
+        assert!(
+            rest.iter()
+                .all(|chunk| (MIN_CHUNK..=MAX_CHUNK).contains(&chunk.len()))
+        );
         assert!(last.len() <= MAX_CHUNK);
-        assert!(chunks.len() > 4, "about {} chunks of {AVG_CHUNK}", chunks.len());
+        assert!(
+            chunks.len() > 4,
+            "about {} chunks of {AVG_CHUNK}",
+            chunks.len()
+        );
         assert!(chunks_of(&[]).is_empty());
         assert_eq!(chunks_of(b"tiny"), vec![b"tiny".to_vec()]);
     }
@@ -507,14 +518,19 @@ mod tests {
         let data = noise(2, 12 << 20);
         let mut edited = data.clone();
         edited[5 << 20..6 << 20].copy_from_slice(&noise(3, 1 << 20));
-        let before: std::collections::HashSet<_> =
-            chunks_of(&data).iter().map(|chunk| hash_of(chunk)).collect();
+        let before: std::collections::HashSet<_> = chunks_of(&data)
+            .iter()
+            .map(|chunk| hash_of(chunk))
+            .collect();
         let new_bytes: usize = chunks_of(&edited)
             .iter()
             .filter(|chunk| !before.contains(&hash_of(chunk)))
             .map(Vec::len)
             .sum();
-        assert!(new_bytes < 5 << 20, "{new_bytes} new bytes for a 1 MiB edit");
+        assert!(
+            new_bytes < 5 << 20,
+            "{new_bytes} new bytes for a 1 MiB edit"
+        );
         assert!(new_bytes >= 1 << 20);
     }
 
@@ -565,7 +581,10 @@ mod tests {
         };
         let workspace = directory.join("ws");
         materialize(&store, &workspace, &file).expect("materialize");
-        assert_eq!(std::fs::read(workspace.join("data/big.bin")).expect("read"), bytes);
+        assert_eq!(
+            std::fs::read(workspace.join("data/big.bin")).expect("read"),
+            bytes
+        );
 
         let object = store.directory().join(&name[..2]).join(&name);
         let mut stored = std::fs::read(&object).expect("read object");
@@ -613,7 +632,10 @@ mod tests {
     fn the_trailer_round_trips_through_a_message() {
         let name = hash_of(b"manifest");
         let message = with_trailer("spawn checkpoint x", Some(&name));
-        assert_eq!(message, format!("spawn checkpoint x\n\nSpawn-Large: {name}\n"));
+        assert_eq!(
+            message,
+            format!("spawn checkpoint x\n\nSpawn-Large: {name}\n")
+        );
         assert_eq!(trailer_of(&message), Some(name));
         assert_eq!(with_trailer("plain", None), "plain");
         assert_eq!(trailer_of("plain"), None);

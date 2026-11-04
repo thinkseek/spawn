@@ -248,7 +248,12 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
     ));
     let trailer = git_out(
         &repo,
-        &["log", "-1", "--format=%(trailers:key=Spawn-Large,valueonly)", &reference],
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Spawn-Large,valueonly)",
+            &reference,
+        ],
     );
     assert_eq!(trailer.len(), 64, "{trailer}");
     let tree = git_out(&repo, &["rev-parse", &format!("{reference}^{{tree}}")]);
@@ -258,7 +263,10 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
     // A fresh mount brings the large file back, byte for byte.
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
-    assert_eq!(fs::read(directory.join("data/model.bin")).expect("read"), original);
+    assert_eq!(
+        fs::read(directory.join("data/model.bin")).expect("read"),
+        original
+    );
     assert_eq!(
         store.commit(&workspace, "again").expect("commit succeeds"),
         Commit::Unchanged,
@@ -279,7 +287,12 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
     );
     let edited_trailer = git_out(
         &repo,
-        &["log", "-1", "--format=%(trailers:key=Spawn-Large,valueonly)", &reference],
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Spawn-Large,valueonly)",
+            &reference,
+        ],
     );
     assert_eq!(edited_trailer.len(), 64);
     assert_ne!(edited_trailer, trailer);
@@ -290,7 +303,12 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
     let mut pending = vec![root.join(spawn_host::DEFAULT_CHUNK_DIRECTORY)];
     while let Some(path) = pending.pop() {
         if path.is_dir() {
-            pending.extend(fs::read_dir(&path).expect("read").flatten().map(|e| e.path()));
+            pending.extend(
+                fs::read_dir(&path)
+                    .expect("read")
+                    .flatten()
+                    .map(|e| e.path()),
+            );
         } else {
             let mut bytes = fs::read(&path).expect("read object");
             let middle = bytes.len() / 2;
