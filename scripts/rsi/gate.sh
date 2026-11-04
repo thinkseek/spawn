@@ -38,6 +38,8 @@
 # shared: the checks reach the test database. Cargo gets a private
 # CARGO_HOME whose registry and git caches are the real ones, read-only, and
 # runs offline: a candidate cannot fetch a new crate or rewrite a cached one.
+# Git reads the gate's own config (an identity, no signing), not the
+# owner's.
 # The checks find the controller's checkout through the read-only root, so
 # the scenarios directory must not live under /tmp or a masked path.
 #
@@ -70,6 +72,18 @@ fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# Sandboxed git reads this, never the owner's ~/.gitconfig.
+cat >"$work/gitconfig" <<'EOF'
+[user]
+	name = spawn-gate
+	email = gate@localhost
+[init]
+	defaultBranch = main
+[commit]
+	gpgsign = false
+[tag]
+	gpgsign = false
+EOF
 
 metric=""
 
@@ -159,6 +173,9 @@ sandbox() {
         set -- "$@" --ro-bind "$work/baseline" "$work/baseline"
     fi
     set -- "$@" --bind "$tree" "$tree"
+    # Git: the gate's config, not the owner's (signing keys, credential
+    # helpers).
+    set -- "$@" --ro-bind "$work/gitconfig" /tmp/gitconfig
     # Cargo: a private home over the real caches, read-only, offline.
     set -- "$@" --dir /tmp/cargo-home
     for name in registry git config config.toml; do
@@ -166,7 +183,8 @@ sandbox() {
     done
     set -- "$@" --clearenv --setenv HOME "$HOME" --setenv PATH "$PATH" --setenv TMPDIR /tmp \
         --setenv CARGO_HOME /tmp/cargo-home --setenv CARGO_NET_OFFLINE true \
-        --setenv npm_config_cache /tmp/npm-cache
+        --setenv npm_config_cache /tmp/npm-cache \
+        --setenv GIT_CONFIG_GLOBAL /tmp/gitconfig
     for name in LANG RUSTUP_HOME SPAWN_TEST_DATABASE_URL; do
         eval "value=\${$name-}"
         [ -n "$value" ] && set -- "$@" --setenv "$name" "$value"
