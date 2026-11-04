@@ -116,7 +116,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
   shift
 done
-dir=$SPAWN_CLAUDE_PROJECTS/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+dir=$E2E_WORK/claude-projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
 mkdir -p "$dir"
 transcript=$dir/$native.jsonl
 c=0

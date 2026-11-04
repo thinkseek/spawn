@@ -36,8 +36,10 @@ cleanup() {
     if [ -n "${db:-}" ]; then
         $SPAWN_PSQL -d postgres -tA -c "drop database if exists $db with (force)" >/dev/null 2>&1
     fi
-    if [ -n "${SPAWN_TMUX_SOCKET:-}" ]; then
-        tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1
+    # Only a socket this runner made: an inherited SPAWN_TMUX_SOCKET may be
+    # a live fleet's.
+    if [ -n "${own_socket:-}" ]; then
+        tmux -L "$own_socket" kill-server >/dev/null 2>&1
     fi
     return 0
 }
@@ -87,6 +89,7 @@ FAKE
     SPAWN_CLAUDE_PROGRAM=$work/claude
     SPAWN_CODEX_PROGRAM=$work/claude
     SPAWN_TMUX_SOCKET="bb-$slug-$run"
+    own_socket=$SPAWN_TMUX_SOCKET
     SPAWN_WORKER=worker-bb
     WORK=$work
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
