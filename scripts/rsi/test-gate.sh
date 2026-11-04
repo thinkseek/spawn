@@ -169,6 +169,18 @@ printf 'two\n' >"$seed/other"
 regress=$(commit regress-2)
 expect "a failing check rejects" "$(judge "$regress")" '"verdict":"rejected"'
 
+# 5b. An objective scenario the base fails too is unsolved, not a regression;
+# one the base passes and the candidate breaks is a regression.
+unsolved_scenarios=$work/unsolved
+cp -r "$scenarios" "$unsolved_scenarios"
+printf '#!/bin/sh\n[ -f solved ]\n' >"$unsolved_scenarios/010.sh"
+expect "an unsolved objective does not block other work" \
+    "$(judge "$good" "" "$unsolved_scenarios")" 'exit=0 {"verdict":"accepted"}'
+expect "it is reported as unsolved" "$(cat "$work/gate.out")" 'an unsolved objective, not a regression'
+printf '#!/bin/sh\n[ "$(cat value)" = one ]\n' >"$unsolved_scenarios/010.sh"
+expect "breaking a solved objective is a regression" \
+    "$(judge "$good" "" "$unsolved_scenarios")" 'regression: 010.sh fails on the candidate'
+
 expect "relative scenarios refused" "$(sh "$gate" "$repo" "$base" "$good" scenarios | tail -n 1)" 'not absolute'
 
 # 1. The reviewer's forgery: candidate code finds the gate in /proc, writes

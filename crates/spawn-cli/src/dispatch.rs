@@ -110,6 +110,16 @@ impl Facts {
 
     /// Whether the worker sits idle at its prompt, judged on its latest
     /// fact, with nothing in flight: the only moment typed input is safe.
+    /// The turn stopped and the pane waits at its prompt, whatever Jev made
+    /// of it: a fact the rules settle. A report written by then is the
+    /// worker's answer even when it asks a question (judged BLOCKED).
+    pub(crate) fn turn_stopped_idle(&self) -> bool {
+        self.live_and_free()
+            && self.current_observation().is_some_and(|observation| {
+                observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
+            })
+    }
+
     pub(crate) fn idle_at_prompt(&self) -> bool {
         self.live_and_free()
             && self.current_observation().is_some_and(|observation| {
@@ -363,6 +373,19 @@ mod tests {
             open_command: false,
             dispatched: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_blocked_worker_at_its_prompt_has_its_report_collected_but_gets_no_new_work() {
+        let blocked = worker(judged(SemanticState::Blocked, 0.9));
+        assert!(blocked.turn_stopped_idle(), "its report is collected");
+        assert!(!blocked.idle_at_prompt(), "but nothing new is delivered");
+        let mut running = judged(SemanticState::Working, 0.9);
+        running.ambiguity = None;
+        assert!(
+            !worker(running).turn_stopped_idle(),
+            "a running turn is not idle"
+        );
     }
 
     fn idle_supervisor() -> Facts {

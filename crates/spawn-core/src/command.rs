@@ -18,6 +18,12 @@ pub enum CommandAction {
         /// Parent session when this agent works for another agent.
         #[serde(default)]
         parent_session_id: Option<SessionId>,
+        /// Where a new branch starts instead of the source's `main`: another
+        /// agent of the same mission source (its branch head) or a full
+        /// commit id. An agent whose branch exists keeps it, and the Bridge
+        /// warns that `from` was ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
     },
     /// Type text into the running Claude session.
     Input {

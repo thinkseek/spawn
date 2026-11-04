@@ -10,8 +10,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::command::{Claimed, Outcome, Submission};
-use crate::event::{Appended, EventRecord, GlobalPosition, NewEvent};
-use crate::id::{BranchName, CommandId, CommitId, Principal, TerminalName, WorkspaceId};
+use crate::event::{Appended, EventRecord, Fork, GlobalPosition, NewEvent};
+use crate::id::{AgentId, BranchName, CommandId, CommitId, Principal, TerminalName, WorkspaceId};
 
 /// Storage failure.
 #[derive(Debug, Error)]
@@ -100,13 +100,88 @@ pub enum Commit {
     Unchanged,
 }
 
+/// Result of [`WorkspaceStore::ensure_branch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Branch {
+    /// The branch was already there and stays where it is.
+    Existing,
+    /// The branch was created.
+    Created(Fork),
+}
+
+/// What a start's `from` names: another agent's branch head, or a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkFrom {
+    /// The head of this agent's branch.
+    Agent(AgentId),
+    /// A full commit id (40 or 64 hex digits).
+    Commit(CommitId),
+}
+
+impl ForkFrom {
+    /// Parse a `from`. Anything but an agent id or a full lowercase commit
+    /// id is refused, so nothing that looks like an option reaches a backend.
+    pub fn parse(from: &str) -> Result<Self, WorkspaceError> {
+        let refused = || WorkspaceError::Refused {
+            code: "BadFrom".to_string(),
+            message: format!("from {from:?} is neither an agent id nor a full commit id"),
+        };
+        if from.starts_with('-') {
+            return Err(refused());
+        }
+        if let Ok(agent) = AgentId::new(from) {
+            return Ok(Self::Agent(agent));
+        }
+        let hex = from
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if hex && matches!(from.len(), 40 | 64) {
+            return CommitId::new(from).map(Self::Commit).map_err(|_| refused());
+        }
+        Err(refused())
+    }
+}
+
+/// Result of [`WorkspaceStore::merge_base`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BaseMerge {
+    /// The branch already contains the source's `main`.
+    #[default]
+    Current,
+    /// `main` was merged in: the workspace directory and then the branch
+    /// moved to `commit`; `files` changed in the directory.
+    Merged {
+        /// The merge commit, now the branch head.
+        commit: CommitId,
+        /// Paths the merge changed in the workspace.
+        files: Vec<String>,
+    },
+    /// `main` conflicts with the branch in `files`. The branch did not move.
+    Conflicted {
+        /// Conflicting paths.
+        files: Vec<String>,
+        /// The workspace holds the merge with conflict markers in `files`
+        /// (written now, or by an earlier call and not resolved yet); the
+        /// checkpoint after they are resolved commits the merge. False: a
+        /// conflict markers cannot show (a file deleted or renamed on one
+        /// side), and nothing changed.
+        marked: bool,
+    },
+}
+
 /// Versioned file storage used by the Bridge.
 pub trait WorkspaceStore: Send + Sync {
     /// Name of the store, recorded with every artifact.
     fn project(&self) -> &str;
 
-    /// Create `branch` from the base unless it exists.
-    fn ensure_branch(&self, branch: &BranchName) -> Result<(), WorkspaceError>;
+    /// Create `branch` unless it exists: at `from` when given (see
+    /// [`ForkFrom`]), else at the base. An existing branch ignores `from`.
+    /// A `from` that does not resolve to a commit is refused.
+    fn ensure_branch(
+        &self,
+        branch: &BranchName,
+        from: Option<&str>,
+    ) -> Result<Branch, WorkspaceError>;
 
     /// Materialize `branch` where the engine can run.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError>;
@@ -116,6 +191,19 @@ pub trait WorkspaceStore: Send + Sync {
 
     /// Unmount the workspace. Committed state stays on the branch.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError>;
+
+    /// Merge the base (the source's `main`) into the branch of a mounted,
+    /// idle workspace whose state is committed: the directory first, then
+    /// the branch. A content conflict writes the merge with conflict markers
+    /// into the directory and leaves the branch where it is; the checkpoint
+    /// after the markers are resolved commits the merge (see
+    /// [`BaseMerge::Conflicted`]). A directory that differs from the branch,
+    /// or a conflict markers cannot show, changes nothing. A store without a
+    /// moving base is always current.
+    fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+        let _ = workspace;
+        Ok(BaseMerge::Current)
+    }
 }
 
 /// Chunk store failure.

@@ -18,7 +18,11 @@
 # - With a task scenario: it must fail on the base and pass on the candidate.
 # - Every other scenario in the directory must pass on the candidate, except
 #   ratchet scenarios (a line `# rsi: ratchet`), which compare against the
-#   base and so fail on any tree that did not improve.
+#   base and so fail on any tree that did not improve, and objective
+#   scenarios (`<digits>.sh`) the base fails too: an objective nobody has
+#   solved yet is not a regression, and must not block unrelated work. The
+#   base is built for that only when a candidate fails one. `check-*`
+#   scenarios are invariants and always must pass.
 #
 # Scenarios run inside the tree with SPAWN_BIN (the tree's `spawn`, when the
 # build made one) and SPAWN_BASELINE_TREE set. Their output is printed with a
@@ -453,6 +457,7 @@ if [ -n "$scenario" ]; then
         verdict rejected "base does not build"
         exit 0
     fi
+    base_built=1
     red=0
     run_scenario "$work/baseline" "$scenario" || red=$?
     if [ "$red" -eq 0 ]; then
@@ -537,9 +542,28 @@ for other in "$scenarios"/*.sh; do
     [ "$other" = "$scenario" ] && continue
     grep -q '^# rsi: ratchet' "$other" && continue
     echo "| == regression: $(basename "$other") must still pass"
-    if ! run_scenario "$work/candidate" "$other"; then
-        verdict rejected "regression: $(basename "$other") fails on the candidate"
-        exit 0
+    if run_scenario "$work/candidate" "$other"; then
+        continue
     fi
+    case "$(basename "$other")" in
+    *[!0-9].sh | .sh) ;;
+    *)
+        # An objective scenario: a regression only if the base passes it.
+        if [ -z "${base_built-}" ]; then
+            echo "| == base: build (to tell an unsolved objective from a regression)"
+            if ! build "$work/baseline"; then
+                verdict rejected "base does not build"
+                exit 0
+            fi
+            base_built=1
+        fi
+        if ! run_scenario "$work/baseline" "$other"; then
+            echo "| $(basename "$other") fails on the base too: an unsolved objective, not a regression"
+            continue
+        fi
+        ;;
+    esac
+    verdict rejected "regression: $(basename "$other") fails on the candidate"
+    exit 0
 done
 verdict accepted

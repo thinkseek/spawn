@@ -1,6 +1,12 @@
 # Storage: one place, by kind of object
 
+<<<<<<< 0b37b9d90137f1764ea3b9def673aa5e0c8c3ff7
+Status: design (2026-11-04). Phase 0 and phase 2a (fork, `main` merged into
+idle branches, branches pushed to the source, resume on another host) are in
+the code; phases 1, 2b and 3 are the plan.
+=======
 Status: design (2026-11-04). Phases 0 and 1 are in the code; phases 2–3 are the plan.
+>>>>>>> b1d3a6531158f966a00d42b42cfb0982f35d20ca
 
 The goal: everything Spawn knows lives in one store that any machine with the
 right credentials can reach, and work in it branches and merges the way
@@ -57,17 +63,53 @@ files, a chunk fetch.
   commit, as today.
 - **Fork from any commit**: a new branch at an existing commit. No data is
   copied; the large files' chunks are shared; sub-agents fork recursively.
-- **Resume anywhere**: a host fetches the branch and only the chunks it lacks.
-- **Central**: branches pushed to the mission's source as `spawn/<agent>`
-  without force (two writers of one branch are caught), at turn boundaries and
-  coalesced, not per tool call; chunks in R2.
-- **Main into branches automatically**: at a turn end, when the source's
-  `main` moved, it is merged into the agent's branch (`merge-tree
-  --attr-source=main`, so the rules come from `main`, which only the gate
-  moves). A clean merge updates the idle workspace in place (`read-tree -m
-  -u`, which refuses if the tree differs from the branch) and is recorded as a
-  checkpoint; a conflict changes nothing and the agent hears of it at landing,
-  as today. Large files are not merged: the branch keeps its own.
+  `start {from}` names another agent of the same mission source (its branch
+  head) or a full commit id in the mirror; anything else fails the start. An
+  agent whose branch exists keeps it (the tick report warns that `from` was
+  ignored). The start that creates a branch records where it began on
+  `execution.started` (`fork: {from, commit}`; `from` is `main`, the start's
+  `from`, or `spawn/<agent>`).
+- **Resume anywhere**: a host that starts an agent whose branch its mirror
+  lacks takes `spawn/<agent>` from the source when it is there; a local
+  branch another host moved on since is fast-forwarded (diverged: warned, the
+  local one stays). Chunks it lacks come with phase 1 and 3.
+- **Central**: every branch that moved (a checkpoint commit, a merge, a new
+  branch) is pushed to the mission's source as `spawn/<agent>` without force
+  (two writers of one branch are caught: the push is refused and warned, not
+  overwritten), from a background pusher off the Bridge's loop: at most one
+  push per branch every 5 s, carrying the head as it is then, failures
+  retried with backoff, and what still waits pushed when the store drops (a
+  one-shot `spawn tick`). Chunks in R2 (phase 3).
+- **Main into branches automatically**: right after the checkpoint of a turn
+  end, and on an idle live execution (no turn open, nothing read that asks for
+  a checkpoint, the screen last read ready) at most every 30 s by the Bridge's
+  clock, so an agent already idle when the gate reports a conflict finds the
+  markers within about 30 s; never while a turn runs or a prompt is typed.
+  When the source's `main` moved (the mirror's
+  `main` is fetched at most every 30 s for this), it is merged into the
+  agent's branch (`merge-tree --attr-source=main`, so the rules come from
+  `main`, which only the gate moves; the integrator lands with the same
+  rules). A clean merge updates the idle workspace in place first (`read-tree
+  -m -u` against a temporary index, which refuses if a file the merge changes
+  differs from the branch), then moves the branch by compare-and-swap to a
+  merge commit (parents: the head, `main`), recorded as `artifact.committed`
+  with reason `base_merged`. A conflict in files' lines is made resolvable
+  the way `git merge` does it: the merge tree with conflict markers is written
+  into the idle workspace by the same safe procedure (a directory that differs
+  from the branch refuses, changing nothing), the branch stays where it is,
+  and `main` waits as the pending second parent under the store root
+  (`.merge/<agent>`, written atomically). The agent hears of the conflict at
+  landing, as today, and finds the markers in its files. Checkpoints keep
+  single parents while any conflicted file still holds a marker (a line that
+  starts with `<<<<<<< ` or `>>>>>>> `, or is `=======`); the first one
+  without commits with parents (head, pending `main`) and clears it, after
+  which the branch lands clean. No newer `main` is merged on top of
+  unresolved markers. A conflict markers cannot show (modify/delete, renames,
+  binary files) changes nothing; the tick-report warning says so. Large files
+  are not merged: the branch keeps its own (a merge commit carries the head's
+  `Spawn-Large` trailer). The pending parent is host-local: an agent resumed
+  on another host before resolving commits the resolution with one parent,
+  and `main` is merged again there.
 - **Landing**: unchanged and text only. The gate judges the git candidate; the
   integrator commits host-side and moves `main` by compare-and-swap. Large
   files are workspace state, not source, and never land.
@@ -75,6 +117,19 @@ files, a chunk fetch.
 ## Phases
 
 0. **Done.** The checkpoint index is kept between checkpoints (stat cache),
+<<<<<<< 0b37b9d90137f1764ea3b9def673aa5e0c8c3ff7
+   and files over 8 MiB stay out of git commits (a warning names them once;
+   until phase 1 they are not on the branch and are lost at unmount).
+1. **Chunk store; large files kept.** A chunk-store port with a local
+   directory adapter (content-defined chunks, BLAKE3, zstd, verified on read);
+   the large-file manifest and the `Spawn-Large` trailer; mount materializes
+   the large files again.
+2. **Branches in the store.** (a) **Done.** Fork from any commit (`start
+   {from}`), resume on any host, branches pushed to `spawn/<agent>`, `main`
+   merged into idle branches automatically. (b) Backlog, scenarios and gate
+   versioned with the source; the integrator judges `spawn/<agent>` from the
+   source, so work done on another host lands too.
+=======
    and files over 8 MiB stay out of git commits.
 1. **Done.** **Chunk store; large files kept.** A chunk-store port
    (`spawn_core::port::ChunkStore`) with a local directory adapter
@@ -92,6 +147,7 @@ files, a chunk fetch.
 2. **Branches in the store.** Fork from any commit (`start {from}`), resume on
    any host, branches pushed to `spawn/<agent>`, `main` merged into idle
    branches automatically.
+>>>>>>> b1d3a6531158f966a00d42b42cfb0982f35d20ca
 3. **Streams and reach.** Transcripts and gate logs as segments; the chunk
    store in R2; PostgreSQL reachable from other hosts through a Cloudflare
    Tunnel; `pg_dump` backups to R2.
@@ -101,12 +157,19 @@ files, a chunk fetch.
 | State | Where | Rebuildable? |
 | --- | --- | --- |
 | Event log | PostgreSQL, one container on this host, bound to 127.0.0.1 | It *is* the source |
+| Event log backups | daily encrypted `pg_dump` in R2 bucket `spawn-store`: `postgres/daily/` (15 d), `weekly/` (60 d), `monthly/` (400 d), bucket-locked against deletion, expired by R2 lifecycle; newest also in `~/.local/share/spawn-rsi/backups/` ([deploy/backup](../deploy/backup/README.md)) | They are the copy; the key is kept off-host |
 | What an engine did | read by the Bridge from transcript and pane into the log | Yes: in the log |
 | Full transcript text | `~/.claude/projects/...` on the compute host | **No**: phase 3 |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
+<<<<<<< 0b37b9d90137f1764ea3b9def673aa5e0c8c3ff7
+| Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed to the source as `spawn/<agent>` | Yes for missions with a source; no for scratch missions and the default repository |
+| Large files in workspaces | the workspace directory only | **No**: phase 1 |
+| Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host: versioned with the source in phase 2b |
+=======
 | Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`) | **No**: phase 2 |
 | Large files in workspaces | the chunk store (`SPAWN_CHUNK_STORE`, else `<root>/.chunks`), named by the branch head's `Spawn-Large` trailer | **No**: host-local until R2 (phase 3) |
 | Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host: versioned with the source in phase 2 |
+>>>>>>> b1d3a6531158f966a00d42b42cfb0982f35d20ca
 | Secrets | `spawn.env`, `~/.config/spawn/*`, mode 600 | Deliberately not stored |
 
 ## Where the one store runs

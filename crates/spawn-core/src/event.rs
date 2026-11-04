@@ -98,6 +98,9 @@ pub enum CheckpointReason {
     TurnStopped,
     /// The execution ended.
     ExecutionEnded,
+    /// The source's `main` moved and was merged into the idle branch after a
+    /// turn ended (docs/storage.md, "Main into branches automatically").
+    BaseMerged,
 }
 
 /// How an execution ended.
@@ -120,6 +123,17 @@ pub struct ArtifactRef {
     /// Branch that received the commit.
     pub branch: BranchName,
     /// Commit identifier.
+    pub commit: CommitId,
+}
+
+/// Where an agent's branch started, recorded by the start that created it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Fork {
+    /// What it was created from: `main`, the start's `from` (another agent's
+    /// id, meaning its branch head, or a full commit id), or
+    /// `spawn/<agent>` when another host pushed the branch to the source.
+    pub from: String,
+    /// The commit the branch was created at.
     pub commit: CommitId,
 }
 
@@ -207,6 +221,9 @@ pub enum EventKind {
         workspace: WorkspaceId,
         /// Command that created the execution.
         command_id: CommandId,
+        /// Set when this start created the agent's branch: where it began.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork: Option<Fork>,
     },
     /// The execution ended.
     #[serde(rename = "execution.ended")]

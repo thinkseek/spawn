@@ -75,7 +75,7 @@ spawn status
 
 | `type` | 字段 |
 | --- | --- |
-| `start` | `engine`（`claude` 或 `codex`）、`prompt`（Codex 必须非空）、可选 `parent_session_id` |
+| `start` | `engine`（`claude` 或 `codex`）、`prompt`（Codex 必须非空）、可选 `parent_session_id`、可选 `from`（同一任务源的另一个 agent，即其分支头，或完整 commit id：新分支从这里开始而不是 `main`） |
 | `input` | `text`；仅 Claude |
 | `resume` | 可选 `prompt`；Codex 必填 |
 | `stop` | 无 |

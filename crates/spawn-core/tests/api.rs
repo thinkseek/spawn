@@ -225,6 +225,7 @@ fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
                     engine: Engine::Claude,
                     prompt: prompt.to_string(),
                     parent_session_id: None,
+                    from: None,
                 },
             },
         )
@@ -296,6 +297,7 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
             engine: Engine::Claude,
             prompt: "second".to_string(),
             parent_session_id: None,
+            from: None,
         },
     );
     tick_fresh(&store);
@@ -688,6 +690,7 @@ fn observer_writes_only_on_change() {
                 terminal: TerminalName::new("spawn-exec_1").expect("valid"),
                 workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"),
                 command_id: CommandId(1),
+                fork: None,
             },
         })
         .expect("append succeeds");
@@ -767,6 +770,7 @@ fn lease_ttl_expires_and_takes_the_command_again() {
             engine: Engine::Claude,
             prompt: "x".to_string(),
             parent_session_id: None,
+            from: None,
         },
     };
     let id = store

@@ -117,6 +117,7 @@ fn started(store: &MemoryStore) {
             terminal: TerminalName::new("spawn-exec_1").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(1),
+            fork: None,
         },
     );
 }
@@ -724,6 +725,7 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
             terminal: TerminalName::new("spawn-exec_2").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(2),
+            fork: None,
         },
     );
     in_execution(

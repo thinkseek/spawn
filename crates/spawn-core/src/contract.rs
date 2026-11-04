@@ -12,7 +12,9 @@ use crate::event::{Appended, Engine, EventKind, GlobalPosition, NewEvent, Sessio
 use crate::id::{
     AgentId, BranchName, IdempotencyKey, Principal, SessionId, TerminalName, WorkspaceId,
 };
-use crate::port::{CommandQueue, Commit, EventLog, Launch, TerminalHost, WorkspaceStore};
+use crate::port::{
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, TerminalHost, WorkspaceStore,
+};
 
 fn agent(tag: &str) -> AgentId {
     AgentId::new(format!("agent_{tag}")).expect("tag forms a valid agent id")
@@ -100,6 +102,7 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
             engine: Engine::Claude,
             prompt: "first task".to_string(),
             parent_session_id: None,
+            from: None,
         },
     };
     let id = queue
@@ -169,18 +172,62 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
     assert_eq!(finished, 2);
 }
 
-/// Workspace rules: an unknown branch is refused, an untouched workspace
-/// produces no commit.
+/// Workspace rules: an unknown branch is refused; a new branch starts at
+/// the base, at another agent's head, or at a commit, and an existing one
+/// ignores `from`; a `from` that names no commit is refused; an untouched
+/// workspace produces no commit; a branch on an unmoved base is current.
 pub fn workspace_store(tag: &str, workspaces: &dyn WorkspaceStore) {
     let branch = BranchName::new(format!("branch_{tag}")).expect("valid branch");
     assert!(
         workspaces.mount(&branch).is_err(),
         "mounting an unknown branch must fail"
     );
-    workspaces.ensure_branch(&branch).expect("fork succeeds");
+    let Ok(Branch::Created(base)) = workspaces.ensure_branch(&branch, None) else {
+        panic!("a new branch is created");
+    };
+    assert_eq!(base.from, "main", "a branch without from starts at main");
+    assert!(
+        matches!(
+            workspaces.ensure_branch(&branch, None),
+            Ok(Branch::Existing)
+        ),
+        "fork is idempotent"
+    );
+
+    let source = BranchName::for_agent(&agent(tag));
     workspaces
-        .ensure_branch(&branch)
-        .expect("fork is idempotent");
+        .ensure_branch(&source, None)
+        .expect("the source agent's branch");
+    let forked = BranchName::new(format!("agent_{tag}_fork")).expect("valid branch");
+    match workspaces.ensure_branch(&forked, Some(source.as_str())) {
+        Ok(Branch::Created(fork)) => {
+            assert_eq!(fork.from, source.as_str());
+            assert_eq!(fork.commit, base.commit, "the source agent's head");
+        }
+        other => panic!("a fork from an agent is created: {other:?}"),
+    }
+    let pinned = BranchName::new(format!("agent_{tag}_pinned")).expect("valid branch");
+    match workspaces.ensure_branch(&pinned, Some(base.commit.as_str())) {
+        Ok(Branch::Created(fork)) => assert_eq!(fork.commit, base.commit),
+        other => panic!("a fork from a commit is created: {other:?}"),
+    }
+    assert!(
+        matches!(
+            workspaces.ensure_branch(&forked, Some(base.commit.as_str())),
+            Ok(Branch::Existing)
+        ),
+        "an existing branch ignores from"
+    );
+    let unknown = "f".repeat(40);
+    let nobody = format!("agent_{tag}_nobody");
+    for bad in ["-x", "main", "HEAD~1", nobody.as_str(), unknown.as_str()] {
+        let fresh = BranchName::new(format!("agent_{tag}_bad")).expect("valid branch");
+        assert!(
+            workspaces.ensure_branch(&fresh, Some(bad)).is_err(),
+            "from {bad} names no commit"
+        );
+    }
+
     let workspace: WorkspaceId = workspaces.mount(&branch).expect("mount succeeds");
     assert!(
         matches!(
@@ -188,6 +235,10 @@ pub fn workspace_store(tag: &str, workspaces: &dyn WorkspaceStore) {
             Ok(Commit::Unchanged)
         ),
         "an untouched workspace produces no commit"
+    );
+    assert!(
+        matches!(workspaces.merge_base(&workspace), Ok(BaseMerge::Current)),
+        "a branch on an unmoved base is current"
     );
     workspaces.unmount(&workspace).expect("unmount succeeds");
 }
