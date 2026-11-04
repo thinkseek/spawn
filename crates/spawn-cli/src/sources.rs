@@ -127,13 +127,7 @@ impl MissionWorkspaces {
             mirrors: Mutex::new(HashMap::new()),
             refreshed: Mutex::new(HashMap::new()),
             pusher: Pusher::new(),
-            push_sources: std::env::var("SPAWN_PUSH_SOURCES")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|source| !source.is_empty())
-                .map(str::to_string)
-                .collect(),
+            push_sources: push_sources(),
         }
     }
 
@@ -276,6 +270,17 @@ fn ref_commit(repo: &Path, reference: &str) -> Option<String> {
 /// Whether a bare repository already has a branch.
 fn has_branch(repo: &Path, branch: &str) -> bool {
     ref_commit(repo, &format!("refs/heads/{branch}")).is_some()
+}
+
+/// The remote sources listed in `SPAWN_PUSH_SOURCES` (comma-separated).
+pub(crate) fn push_sources() -> Vec<String> {
+    std::env::var("SPAWN_PUSH_SOURCES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Whether agents' branches are pushed to `source` and adopted from it: a
