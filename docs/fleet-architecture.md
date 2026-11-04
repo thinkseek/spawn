@@ -340,8 +340,10 @@ Claude start. Unreachable: a `default` engine starts on Claude Code's own
 settings (the gateway, its own small model) and the tick reports a warning;
 a `cheap` start fails, and the failed delivery reaches the supervisor's
 digest. An engine already running when the relay dies sees API errors until
-systemd restarts it (`Restart=always`). `SPAWN_MODEL_RELAY=off` turns the
-relay off for every engine.
+systemd restarts it (`Restart=always`). Engines use the relay only where
+`SPAWN_MODEL_RELAY` names it (`http://127.0.0.1:8791` in `spawn.env`):
+unset or `off`, every engine runs on Claude Code's own settings, nothing
+probes a relay, and a cheap start fails.
 
 ## 4. Experience
 

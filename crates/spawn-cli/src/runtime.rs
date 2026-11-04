@@ -103,17 +103,17 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     Ok(config)
 }
 
-/// The model relay's address unless `SPAWN_MODEL_RELAY` names another.
-const MODEL_RELAY: &str = "http://127.0.0.1:8791";
-
 /// The model relay (`scripts/model-relay.py`) Claude Code engines reach
-/// their models through: `SPAWN_MODEL_RELAY` (default [`MODEL_RELAY`],
-/// `off` for none), with the cheap profile's main model `SPAWN_CHEAP_MODEL`
-/// and every profile's small model `SPAWN_SMALL_MODEL`. Names only: the
-/// relay holds the keys.
+/// their models through: `SPAWN_MODEL_RELAY` (`http://127.0.0.1:8791` on a
+/// host that runs `spawn-model-relay`; unset or `off` for none), with the
+/// cheap profile's main model `SPAWN_CHEAP_MODEL` and every profile's small
+/// model `SPAWN_SMALL_MODEL`. Names only: the relay holds the keys.
+///
+/// Opt-in, so a host or test without a relay never probes one, and a
+/// configured relay that is down is a warning worth reading.
 fn model_relay() -> Option<ModelRelay> {
-    let url = env_or("SPAWN_MODEL_RELAY", MODEL_RELAY);
-    (url != "off").then(|| ModelRelay {
+    let url = env_value("SPAWN_MODEL_RELAY").filter(|url| url != "off")?;
+    Some(ModelRelay {
         url: url.trim_end_matches('/').to_string(),
         cheap_model: env_or("SPAWN_CHEAP_MODEL", "deepseek-v4-pro"),
         small_model: env_or("SPAWN_SMALL_MODEL", "deepseek-flash"),
