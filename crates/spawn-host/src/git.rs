@@ -26,13 +26,11 @@ use serde_json::{Value, json};
 
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-<<<<<<< 0b37b9d90137f1764ea3b9def673aa5e0c8c3ff7
-use spawn_core::port::{BaseMerge, Branch, Commit, ForkFrom, WorkspaceError, WorkspaceStore};
-=======
-use spawn_core::port::{ChunkStore, Commit, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{
+    BaseMerge, Branch, ChunkStore, Commit, ForkFrom, WorkspaceError, WorkspaceStore,
+};
 
 use crate::chunks::{LargeFile, LocalChunkStore, Manifest, materialize, mode_of, store_file};
->>>>>>> b1d3a6531158f966a00d42b42cfb0982f35d20ca
 
 /// Ref a new branch is forked from.
 const BASE: &str = "main";
@@ -353,7 +351,7 @@ impl GitWorkspace {
         directory: &Path,
         index: &Path,
     ) -> Result<(String, Vec<(String, u64)>), WorkspaceError> {
-        let large = self.large_files(directory, index)?;
+        let mut large = self.large_files(directory, index)?;
         let mut add = vec!["add", "-A", "--", "."];
         let excluded: Vec<String> = large
             .iter()
@@ -362,17 +360,20 @@ impl GitWorkspace {
         add.extend(excluded.iter().map(String::as_str));
         self.output_in(directory, index, &add)?;
         self.unstage(directory, index, &large)?;
-        self.report_large(branch, &large);
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the limit between the size check and `add`
-        // was hashed anyway; keep it off the branch all the same.
+        // was hashed anyway; keep it off the branch all the same, and in the
+        // chunk store with the other large files.
         let grown = self.large_blobs(&tree)?;
         if grown.is_empty() {
-            return Ok(tree);
+            return Ok((tree, large));
         }
         self.unstage(directory, index, &grown)?;
-        self.report_large(branch, &grown);
-        self.output_in(directory, index, &["write-tree"])
+        large.extend(grown);
+        large.sort();
+        large.dedup();
+        let tree = self.output_in(directory, index, &["write-tree"])?;
+        Ok((tree, large))
     }
 
     /// Take build output and `paths` out of the index. Paths go to git as
@@ -389,7 +390,6 @@ impl GitWorkspace {
             .collect();
         let mut remove = vec!["rm", "-r", "--cached", "--ignore-unmatch", "--"];
         remove.extend(BUILD_OUTPUT);
-<<<<<<< 0b37b9d90137f1764ea3b9def673aa5e0c8c3ff7
         remove.extend(literal.iter().map(String::as_str));
         self.output_in(directory, index, &remove).map(|_| ())
     }
@@ -408,12 +408,6 @@ impl GitWorkspace {
                 (kind == "blob" && size > LARGE_FILE_BYTES).then(|| (path.to_string(), size))
             })
             .collect())
-=======
-        remove.extend(large.iter().map(|(path, _)| path.as_str()));
-        self.output_in(directory, index, &remove)?;
-        let tree = self.output_in(directory, index, &["write-tree"])?;
-        Ok((tree, large))
->>>>>>> b1d3a6531158f966a00d42b42cfb0982f35d20ca
     }
 
     /// Files git would commit that are larger than [`LARGE_FILE_BYTES`], with
@@ -730,7 +724,6 @@ impl WorkspaceStore for GitWorkspace {
                 WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
             })?;
         }
-<<<<<<< 0b37b9d90137f1764ea3b9def673aa5e0c8c3ff7
         // The Bridge and the integrator both commit workspaces under one
         // root: the branch's index is theirs one at a time.
         let lock_path = index.with_extension("spawn-lock");
@@ -740,10 +733,7 @@ impl WorkspaceStore for GitWorkspace {
         lock.lock().map_err(|error| {
             WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
         })?;
-        let tree = self.tree_of(&branch, &directory, &index);
-=======
         let tree = self.tree_of(&directory, &index);
->>>>>>> b1d3a6531158f966a00d42b42cfb0982f35d20ca
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
@@ -753,26 +743,19 @@ impl WorkspaceStore for GitWorkspace {
         let reference = format!("refs/heads/{branch}");
         let parent = self.git_output(&["rev-parse", &reference])?;
         let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
-<<<<<<< 0b37b9d90137f1764ea3b9def673aa5e0c8c3ff7
         // A merge of main whose conflicts are now resolved: main is the
         // second parent, even when the tree did not change.
         let merged = self.resolved_merge(&branch, &directory);
-        if tree == parent_tree && merged.is_none() {
+        if tree == parent_tree && merged.is_none() && manifest == self.manifest_of(&parent)? {
             return Ok(Commit::Unchanged);
         }
+        let message = crate::chunks::with_trailer(message, manifest.as_deref());
         let mut arguments = vec!["commit-tree", tree.as_str(), "-p", parent.as_str()];
         if let Some(main) = merged.as_deref() {
             arguments.extend(["-p", main]);
         }
-        arguments.extend(["-m", message]);
+        arguments.extend(["-m", message.as_str()]);
         let commit = self.git_output(&arguments)?;
-=======
-        if tree == parent_tree && manifest == self.manifest_of(&parent)? {
-            return Ok(Commit::Unchanged);
-        }
-        let message = crate::chunks::with_trailer(message, manifest.as_deref());
-        let commit = self.git_output(&["commit-tree", &tree, "-p", &parent, "-m", &message])?;
->>>>>>> b1d3a6531158f966a00d42b42cfb0982f35d20ca
         // Expected old value: a branch that moved is not overwritten.
         self.git_output(&["update-ref", &reference, &commit, &parent])
             .map_err(|error| {
