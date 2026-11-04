@@ -538,3 +538,35 @@ Occam's razor, applied without touching the invariants. Two decisions:
 4. The RSI mission, the import, and retiring the old controller.
 
 Each step is tested red, then green, gated, and committed.
+
+### 10.6 Status (2026-11-04): built and live
+
+- **The control stream** is live. The live database's 12 rows were imported
+  once (`legacy.imported`). A refold inside a rolled-back transaction
+  reproduces the live tables exactly.
+- **One gate:** `scripts/rsi/gate.sh` replaced `judge-candidate.sh` and
+  `merge-gate.sh`.
+  - `rsi/scenarios` holds the build hook, the protected list, and five
+    check scenarios.
+  - `scripts/rsi/test-gate.sh` tests the gate itself.
+  - The gate run on the step-4 tree accepted it.
+- **`spawn integrate`** runs as `spawn-integrate`. The e2e covers:
+  - a fast-forward landing and a merge landing;
+  - a rejection that goes back with the gate's output;
+  - a halt from an outside push, which only a human can resume;
+  - an objective mission that the gate alone lands.
+- **RSI** is mission 4.
+  - Source: `missions/spawn.git`; gate: `rsi/scenarios`; acceptance:
+    `gate`; budget: 45 minutes and 60 tool calls; resident: `rsi`.
+  - Both old objectives were imported as landed, with objective 2 at
+    1021 ns against its 1,100 ns target, so the integrator is idle until the
+    backlog gets a new objective.
+  - `spawn-rsi` and `repo.git` are retired; their units and the repository
+    were moved to `~/.local/share/spawn-rsi/backups/`.
+  - The supervisor's default repository is now the scratch repository.
+- **A shared source has one baseline.** A landing moves the baseline of
+  every mission on that source, so RSI and fleet work on Spawn don't halt
+  each other.
+- **Left on purpose:** the RSI page still reads the frozen `rsi_*` history.
+  Moving it to the objective mission is the first fleet mission that lands
+  through the gate.
