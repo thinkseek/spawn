@@ -1,5 +1,4 @@
-//! Every SQL statement this crate sends, except the RSI controller's
-//! (`crate::rsi`), grouped by responsibility.
+//! Every SQL statement this crate sends, grouped by responsibility.
 //!
 //! The Rust modules next to this one bind parameters and map rows; the text
 //! here is what reaches the database. Writes call the SQL functions in
