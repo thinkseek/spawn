@@ -356,6 +356,23 @@ fn fetch_pushed(
     source: &str,
     agent: &str,
 ) -> Result<Option<String>, WorkspaceError> {
+    fetch_pushed_into(
+        mirror,
+        source,
+        agent,
+        &format!("refs/remotes/source/spawn/{agent}"),
+    )
+}
+
+/// The source's `spawn/<agent>`, fetched into the mirror as `tracking`, or
+/// `None` when the source has none (a `tracking` left from an earlier fetch
+/// is then removed). An unreachable source is an error.
+pub(crate) fn fetch_pushed_into(
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+    tracking: &str,
+) -> Result<Option<String>, WorkspaceError> {
     if source.starts_with('-') {
         return Err(unavailable(format!("source {source} starts with '-'")));
     }
@@ -374,9 +391,11 @@ fn fetch_pushed(
         .lines()
         .any(|line| line.split_whitespace().nth(1) == Some(remote.as_str()))
     {
+        if ref_commit(mirror, tracking).is_some() {
+            let _ = git(&["--git-dir", &path, "update-ref", "-d", tracking]);
+        }
         return Ok(None);
     }
-    let tracking = format!("refs/remotes/source/spawn/{agent}");
     git(&[
         "--git-dir",
         &path,
@@ -386,7 +405,7 @@ fn fetch_pushed(
         source,
         &format!("+{remote}:{tracking}"),
     ])?;
-    Ok(ref_commit(mirror, &tracking))
+    Ok(ref_commit(mirror, tracking))
 }
 
 fn commit_id(commit: String) -> Result<CommitId, WorkspaceError> {
