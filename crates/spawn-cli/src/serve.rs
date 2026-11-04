@@ -8,7 +8,8 @@
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
 //! it refuses to start without `SPAWN_SERVE_TOKEN`. With a token set, every
 //! API request must carry it (`Authorization: Bearer <token>` or
-//! `?token=<token>`). The built UI's static files are served without it:
+//! `?token=<token>`), except from loopback when `SPAWN_SERVE_LOCAL_OPEN=1`.
+//! The built UI's static files are served without it:
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
 
@@ -88,6 +89,12 @@ fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, 
 
 /// Whether every address `address` resolves to is a loopback one. An
 /// address that does not resolve counts as public.
+/// Whether loopback clients may read without the token
+/// (`SPAWN_SERVE_LOCAL_OPEN=1`).
+fn local_open() -> bool {
+    std::env::var("SPAWN_SERVE_LOCAL_OPEN").is_ok_and(|value| value == "1")
+}
+
 fn is_loopback(address: &str) -> bool {
     let Ok(resolved) = std::net::ToSocketAddrs::to_socket_addrs(address) else {
         return false;
@@ -140,8 +147,16 @@ fn handle(request: Request, web: &Path, token: Option<&str>) -> Result<(), Strin
         Some((path, query)) => (path, query),
         None => (url.as_str(), ""),
     };
+    // With SPAWN_SERVE_LOCAL_OPEN=1 a browser on this machine needs no
+    // token: anything that reaches loopback here runs as the owner's uid and
+    // can read the token file anyway. Off by default.
+    let local = local_open()
+        && request
+            .remote_addr()
+            .is_some_and(|address| address.ip().is_loopback());
     if let Some(token) = token
         && path.starts_with("/api/")
+        && !local
         && !authorized(&request, query, token)
     {
         let challenge =

@@ -299,6 +299,18 @@ const serveToken: string | null = (() => {
   }
 })();
 
+/** The error of a failed API read. A 401 says how to give the token. */
+export function apiError(status: number, detail = ""): Error {
+  if (status === 401) {
+    return new Error(
+      serveToken
+        ? "HTTP 401: the saved token is wrong; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>"
+        : "HTTP 401: no token; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>, or from this machine at http://127.0.0.1:8787",
+    );
+  }
+  return new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`);
+}
+
 /** Headers of every API read: JSON, plus the serve token when there is one. */
 export function apiHeaders(): Record<string, string> {
   const headers: Record<string, string> = { Accept: "application/json" };
@@ -312,14 +324,7 @@ async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
     cache: "no-store",
     headers: apiHeaders(),
   });
-  if (response.status === 401) {
-    throw new Error(
-      serveToken
-        ? "HTTP 401: the saved token is wrong; open this page once as /?token=<SPAWN_SERVE_TOKEN>"
-        : "HTTP 401: no token; open this page once as /?token=<SPAWN_SERVE_TOKEN>",
-    );
-  }
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) throw apiError(response.status);
   return response.json();
 }
 

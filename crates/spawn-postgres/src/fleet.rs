@@ -137,8 +137,9 @@ select jsonb_build_object(
 
 /// What the dispatcher decides from: every worker session and the
 /// supervisor, with the latest judgement, the episode (latest command from
-/// someone other than the dispatcher, or a task it delivered), whether a command is in flight, and what the
-/// dispatcher already sent there in the last day.
+/// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
+/// model profile of its latest execution, and what the dispatcher already
+/// sent there in the last day.
 pub(crate) const DISPATCH_FACTS: &str = r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
 from (
@@ -158,6 +159,9 @@ from (
     ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c
              where c.session_id = s.session_id and c.state <> 'finished') as open_command,
+    coalesce((select e.kind -> 'detail' ->> 'model' from spawn_events e
+               where e.session_id = s.session_id and e.event_name = 'execution.started'
+               order by e.session_seq desc limit 1), 'default') as model,
     (select coalesce(jsonb_agg(jsonb_build_object(
               'key', c.idempotency_key,
               'text', c.action ->> 'text',

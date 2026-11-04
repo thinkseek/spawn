@@ -59,10 +59,10 @@ fn every_mission_change_is_an_event_and_the_tables_are_its_fold() {
         .expect("propose");
     store.resident_approve("core").expect("approve");
     let first = store
-        .task_assign(mission, "resident", "core", "first")
+        .task_assign(mission, "resident", "core", "first", "default")
         .expect("assign to the resident");
     let second = store
-        .task_assign(mission, "ephemeral", "Probe!", "second")
+        .task_assign(mission, "ephemeral", "Probe!", "second", "cheap")
         .expect("assign to an ephemeral worker");
     store.task_delivered(first, 41).expect("delivered");
     assert!(store.task_reported(first, "done once").expect("reported"));
@@ -109,6 +109,8 @@ fn every_mission_change_is_an_event_and_the_tables_are_its_fold() {
         live["tasks"][1]["agent_id"],
         format!("agent_worker_probe_{second}")
     );
+    assert_eq!(live["tasks"][0]["model"], "default");
+    assert_eq!(live["tasks"][1]["model"], "cheap");
     assert_eq!(live["missions"][0]["state"], "done");
     assert_eq!(live["residents"][0]["state"], "retired");
 
@@ -135,14 +137,20 @@ fn a_refused_change_records_nothing() {
     let (store, schema) = store("control_refused");
     let mission = store.mission_add("One", &json!([]), "human").expect("add");
     let task = store
-        .task_assign(mission, "ephemeral", "w", "brief")
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
         .expect("assign");
     assert!(store.task_review(task, true, "").is_err(), "no report yet");
     assert!(store.resident_approve("nobody").is_err());
     assert!(
         store
-            .task_assign(mission, "resident", "nobody", "brief")
+            .task_assign(mission, "resident", "nobody", "brief", "default")
             .is_err()
+    );
+    assert!(
+        store
+            .task_assign(mission, "ephemeral", "w", "brief", "opus")
+            .is_err(),
+        "a profile is default or cheap"
     );
     let mut client = admin(&schema);
     assert_eq!(
@@ -156,7 +164,7 @@ fn rows_from_before_the_stream_are_imported_once() {
     let (store, schema) = store("control_import");
     let mission = store.mission_add("Old", &json!([]), "human").expect("add");
     store
-        .task_assign(mission, "ephemeral", "w", "brief")
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
         .expect("assign");
     let mut client = admin(&schema);
     // A database from before the control stream: rows, and no events.
@@ -184,9 +192,57 @@ fn rows_from_before_the_stream_are_imported_once() {
         .task_review(task, true, "")
         .expect("accept the old report");
     let next = store
-        .task_assign(mission, "ephemeral", "w", "more")
+        .task_assign(mission, "ephemeral", "w", "more", "default")
         .expect("assign");
     assert!(next > task);
+}
+
+#[test]
+fn the_task_model_column_migrates_in_place_and_old_records_fold_as_default() {
+    let (store, schema) = store("control_model");
+    let mission = store.mission_add("Old", &json!([]), "human").expect("add");
+    store
+        .task_assign(mission, "ephemeral", "w", "brief", "cheap")
+        .expect("assign");
+    let mut client = admin(&schema);
+    // A record written without the model, then a table from before the
+    // column.
+    client
+        .batch_execute(&format!(
+            "select spawn_control_record(jsonb_build_object(
+                 'type', 'task.assigned', 'id', 900, 'mission_id', {mission},
+                 'kind', 'ephemeral', 'agent_id', 'agent_worker_w_900',
+                 'session_id', 'session_worker_w_900', 'brief', 'old',
+                 'created_by', 'human'));
+             alter table mission_tasks drop column model;"
+        ))
+        .expect("simulate an old record and an old table");
+    store.migrate().expect("migrate");
+    let models = |client: &mut Client| -> Vec<String> {
+        client
+            .query("select model from mission_tasks order by id", &[])
+            .expect("read the models")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    // The new column takes its default; a refold restores the log's value.
+    assert_eq!(models(&mut client), ["default", "default"]);
+    refold(&mut client);
+    assert_eq!(models(&mut client), ["cheap", "default"]);
+    // A caller from before `--model` (four arguments) still assigns.
+    let row = client
+        .query_one(
+            "select spawn_task_assign($1, 'ephemeral', 'w', 'brief')",
+            &[&mission],
+        )
+        .expect("assign with four arguments");
+    let task: i64 = row.get(0);
+    let model: String = client
+        .query_one("select model from mission_tasks where id = $1", &[&task])
+        .expect("read the task")
+        .get(0);
+    assert_eq!(model, "default");
 }
 
 #[test]
@@ -212,7 +268,7 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
         "a gate is an absolute path"
     );
     let task = store
-        .task_assign(mission, "ephemeral", "w", "brief")
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
         .expect("assign");
     store.task_delivered(task, 1).expect("delivered");
     assert!(store.task_reported(task, "done").expect("reported"));
@@ -412,7 +468,7 @@ fn a_landing_moves_the_baseline_of_every_mission_on_its_source() {
     let mut tasks = Vec::new();
     for mission in [first, second, other] {
         let task = store
-            .task_assign(mission, "ephemeral", "w", "brief")
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
             .expect("assign");
         store.task_delivered(task, 1).expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));
@@ -468,7 +524,7 @@ fn a_verdict_does_not_bring_back_a_cancelled_task() {
         )
         .expect("configure");
     let task = store
-        .task_assign(mission, "ephemeral", "w", "brief")
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
         .expect("assign");
     store.task_delivered(task, 1).expect("delivered");
     assert!(store.task_reported(task, "done").expect("reported"));
@@ -497,7 +553,7 @@ fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
             .mission_configure(mission, Some("/scenarios"), "review", None, None)
             .expect("configure");
         let task = store
-            .task_assign(mission, "ephemeral", "w", "brief")
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
             .expect("assign");
         store.task_delivered(task, 1).expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));

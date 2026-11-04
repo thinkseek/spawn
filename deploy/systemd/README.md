@@ -8,6 +8,7 @@ The units this host runs, with `%h` for the home directory.
 | `spawn-integrate` | `spawn integrate`: lands gated missions' work through `scripts/rsi/gate.sh`, assigns objective tasks (RSI is an objective mission) | never; a halt is per mission, cleared by `spawn mission resume` |
 | `spawn-serve` | `spawn serve`: read-only UI and API, as `spawn_reader`; the UI is the build `deploy.sh` installs in `~/.local/share/spawn-rsi/web` (`SPAWN_WEB_DIR`), on `SPAWN_SERVE_ADDRESS` (default `127.0.0.1:8787`). Off loopback (e.g. `0.0.0.0:8787` for the LAN) it refuses to start without `SPAWN_SERVE_TOKEN`; open the UI once as `http://<host>:8787/?token=<token>` | never; without the token it exits and restarts every 3 s |
 | `spawn-jev-relay` | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key | never |
+| `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.hermes/.env`, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
 | `spawn-backup` (`.timer`) | `pg-backup.sh`: daily encrypted `pg_dump` to R2 (bucket-locked, R2 expires it); install and keys in [deploy/backup](../backup/README.md) | oneshot, daily at 03:30 + random delay |
 
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
@@ -16,7 +17,30 @@ a wrapper script as the main process, systemd would kill the wrapper and leave
 the old loop running beside the new one.
 
 Install: copy to `~/.config/systemd/user/`, then
-`systemctl --user daemon-reload && systemctl --user enable --now spawn-loop spawn-integrate spawn-serve spawn-jev-relay`.
+`systemctl --user daemon-reload && systemctl --user enable --now spawn-loop spawn-integrate spawn-serve spawn-jev-relay spawn-model-relay`.
+
+The relays' scripts run from `~/.local/share/spawn-rsi/bin/`, installed by
+hand (`deploy.sh` installs only the binary and the UI). The model relay:
+
+```sh
+install -m 755 scripts/model-relay.py ~/.local/share/spawn-rsi/bin/
+python3 -I scripts/model-relay-test.py        # self-test, loopback only
+cp deploy/systemd/spawn-model-relay.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-model-relay
+curl -s http://127.0.0.1:8791/healthz         # {"ok":true}
+journalctl --user -u spawn-model-relay -n 5   # the upstream hosts it routes to
+```
+
+Then point the loop at it: `SPAWN_MODEL_RELAY=http://127.0.0.1:8791` in
+`spawn.env`, and restart `spawn-loop` (agents keep running,
+`KillMode=process`). Unset or `off`, engines run on Claude Code's own
+settings and cheap tasks fail. The loop checks the relay before every Claude
+start: while it is down, default engines start without it (a tick warning)
+and cheap starts fail; engines already running keep the settings they
+started with. `SPAWN_CHEAP_MODEL` (default `deepseek-v4-pro`) and
+`SPAWN_SMALL_MODEL` (default `deepseek-flash`) go in `spawn.env` too. The relay's gateway is `MODEL_RELAY_UPSTREAM`, else the
+`env.ANTHROPIC_BASE_URL` of `~/.claude/settings.json` read at start.
 Configuration lives in `~/.local/share/spawn-rsi/spawn.env` (KEY=VALUE),
 including `SPAWN_SUPERVISOR=1`, `SPAWN_MISSION_FILE`, and `SPAWN_SERVE_ADDRESS`
 with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
