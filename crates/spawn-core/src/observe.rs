@@ -406,7 +406,10 @@ fn fold_completed(judgement: &Judgement) -> Judgement {
     };
     let mut folded = *judgement;
     if let Some(mut probabilities) = folded.probabilities {
-        let (waiting, completed) = (index(SemanticState::Waiting), index(SemanticState::Completed));
+        let (waiting, completed) = (
+            index(SemanticState::Waiting),
+            index(SemanticState::Completed),
+        );
         probabilities[waiting] += probabilities[completed];
         probabilities[completed] = 0.0;
         folded.probabilities = Some(probabilities);
@@ -946,11 +949,7 @@ impl Observer {
         };
         // The raw answer is stored; the folded one is what counts.
         let raw = judgement;
-        let judgement = if perpetual {
-            fold_completed(&raw)
-        } else {
-            raw
-        };
+        let judgement = if perpetual { fold_completed(&raw) } else { raw };
         let (state, confidence) = narrow(ambiguity, guess, &judgement);
         let mut observation = Observation::basic(
             state,

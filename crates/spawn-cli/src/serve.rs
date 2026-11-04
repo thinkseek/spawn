@@ -88,6 +88,7 @@ fn handle(request: Request, web: &Path) -> Result<(), String> {
         "/api/rsi" => rsi_overview(),
         "/api/rsi/pane" => pane(RSI_SESSION),
         "/api/fleet" => fleet(),
+        "/api/missions" => open_store().and_then(|store| store.mission_board(50).map_err(err)),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 session(id, query)

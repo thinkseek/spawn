@@ -33,8 +33,10 @@ use spawn_postgres::PostgresStore;
 
 mod context;
 mod corpus;
+mod deliver;
 mod dispatch;
 mod evolve;
+mod missions;
 mod serve;
 mod supervise;
 mod trace;
@@ -90,7 +92,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         return Err(
-            "usage: spawn <init-db|submit|tick|loop|dispatch|corpus|judge|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>"
+            "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|corpus|judge|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>"
                 .to_string(),
         );
     };
@@ -106,6 +108,9 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "rsi-loop" => cmd_rsi_loop(&Flags::parse(&rest)?),
         "dispatch" => cmd_dispatch(&rest),
         "corpus" => cmd_corpus(&rest),
+        "mission" => missions::mission(&rest),
+        "task" => missions::task(&rest),
+        "resident" => missions::resident(&rest),
         "judge" => cmd_judge(&Flags::parse(&rest)?),
         "status" => cmd_status(&Flags::parse(&rest)?),
         "fleet" => cmd_fleet(),
@@ -323,6 +328,10 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
     let dispatching = env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0");
     let spawn = env_or("SPAWN_PROGRAM", "spawn");
     let mut dispatch_store: Option<PostgresStore> = None;
+    let workspace_root = flags
+        .get("root")
+        .or_else(|| env_value("SPAWN_WORKSPACE_ROOT"))
+        .map(std::path::PathBuf::from);
     let mut failures: u32 = 0;
     loop {
         match bridge.tick() {
@@ -347,7 +356,7 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
                     .ok();
             }
             if let Some(store) = &dispatch_store {
-                match dispatch::step(store, supervised, &spawn) {
+                match dispatch::step(store, supervised, &spawn, workspace_root.as_deref()) {
                     Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
                     Err(error) => {
                         // A broken connection is reopened on the next step.
@@ -356,6 +365,12 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
                         eprintln!("spawn loop: dispatch: {error}");
                     }
                 }
+            }
+        }
+        if let Some(store) = &dispatch_store {
+            match supervise::keep_residents(store) {
+                Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
+                Err(error) => eprintln!("spawn loop: residents: {error}"),
             }
         }
         if supervised {
@@ -378,13 +393,15 @@ fn cmd_loop(flags: &Flags) -> Result<i32, String> {
 /// `spawn corpus export [--since-hours N]`: model judgements with their
 /// outcomes, one JSON line each, on stdout.
 fn cmd_corpus(rest: &[String]) -> Result<i32, String> {
-    let Some(("export", rest)) = rest.split_first().map(|(word, rest)| (word.as_str(), rest)) else {
+    let Some(("export", rest)) = rest.split_first().map(|(word, rest)| (word.as_str(), rest))
+    else {
         return Err("usage: spawn corpus export [--since-hours N]".to_string());
     };
     let flags = Flags::parse(rest)?;
-    let hours: i64 = flags
-        .get("since-hours")
-        .map_or(Ok(24 * 365), |text| text.parse().map_err(|_| format!("bad --since-hours {text}")))?;
+    let hours: i64 = flags.get("since-hours").map_or(Ok(24 * 365), |text| {
+        text.parse()
+            .map_err(|_| format!("bad --since-hours {text}"))
+    })?;
     let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
     let store = open_store()?;
     let mut out = std::io::stdout().lock();
@@ -431,7 +448,14 @@ fn cmd_dispatch(rest: &[String]) -> Result<i32, String> {
         }
         return Ok(0);
     }
-    for line in dispatch::step(&store, supervised, &spawn)? {
+    for line in dispatch::step(
+        &store,
+        supervised,
+        &spawn,
+        env_value("SPAWN_WORKSPACE_ROOT")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+    )? {
         println!("{line}");
     }
     Ok(0)

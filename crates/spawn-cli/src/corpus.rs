@@ -60,11 +60,17 @@ pub(crate) fn label(outcome: &Outcome, supervisor: bool) -> &'static str {
     // Input on its way at the judged moment (the first prompt after the
     // ready screen): the agent was waiting for it.
     if outcome.next_in_flight
-        && matches!(outcome.next_action.as_deref(), Some("start" | "input" | "resume"))
+        && matches!(
+            outcome.next_action.as_deref(),
+            Some("start" | "input" | "resume")
+        )
     {
         return "needed_input";
     }
-    match (outcome.next_action.as_deref(), outcome.next_principal.as_deref()) {
+    match (
+        outcome.next_action.as_deref(),
+        outcome.next_principal.as_deref(),
+    ) {
         (Some("input" | "resume"), Some("human" | "spawn_supervisor")) => "needed_decision",
         // The dispatcher types `continue` into workers; into the supervisor
         // it types digests, which are new input, not a nudge.
@@ -258,14 +264,26 @@ mod tests {
             "continued",
             "the agent moving first wins"
         );
-        assert_eq!(label_worker(&outcome(Some("input"), Some("human"))), "needed_decision");
+        assert_eq!(
+            label_worker(&outcome(Some("input"), Some("human"))),
+            "needed_decision"
+        );
         assert_eq!(
             label_worker(&outcome(Some("input"), Some("spawn_supervisor"))),
             "needed_decision"
         );
-        assert_eq!(label_worker(&outcome(Some("input"), Some("spawn-dispatch"))), "nudged");
-        assert_eq!(label_worker(&outcome(Some("resume"), Some("spawn-liveness"))), "restarted");
-        assert_eq!(label_worker(&outcome(Some("stop"), Some("spawn_supervisor"))), "stopped");
+        assert_eq!(
+            label_worker(&outcome(Some("input"), Some("spawn-dispatch"))),
+            "nudged"
+        );
+        assert_eq!(
+            label_worker(&outcome(Some("resume"), Some("spawn-liveness"))),
+            "restarted"
+        );
+        assert_eq!(
+            label_worker(&outcome(Some("stop"), Some("spawn_supervisor"))),
+            "stopped"
+        );
         assert_eq!(label_worker(&outcome(None, None)), "open");
         assert_eq!(
             label(&outcome(Some("input"), Some("spawn-dispatch")), true),

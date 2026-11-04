@@ -173,7 +173,8 @@ from (
         and c.created_at_ms > spawn_now_ms() - 86400000) as dispatched
   from agent_status s
   join spawn_session_state p using (session_id)
-  where s.agent_id like 'agent\_worker\_%' or s.session_id = 'session_supervisor'
+  where s.agent_id like 'agent\_worker\_%' or s.agent_id like 'agent\_resident\_%'
+     or s.session_id = 'session_supervisor'
 ) w";
 
 /// Every model judgement since a time, with the evidence it saw and what
