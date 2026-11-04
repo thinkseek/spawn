@@ -6,6 +6,11 @@
 //! into `<root>/.sources/`, or an empty scratch repository when the mission
 //! names none. Agents no mission owns (the supervisor, the RSI agent, ad hoc
 //! workers) use the default repository.
+//!
+//! A mirror follows its source: before a new agent's branch is created,
+//! `main` is fetched again, so a worker starts from the source as it is now
+//! (a merge that landed since is in). An agent's existing branch keeps the
+//! base it started from.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +31,15 @@ pub(crate) struct MissionWorkspaces {
     root: PathBuf,
     store: Arc<PostgresStore>,
     factory: Factory,
-    mirrors: Mutex<HashMap<String, Arc<GitWorkspace>>>,
+    mirrors: Mutex<HashMap<String, Routed>>,
+}
+
+/// One agent's store and, for a mission with a source, where its mirror
+/// lives and what it mirrors.
+#[derive(Clone)]
+struct Routed {
+    store: Arc<GitWorkspace>,
+    mirror: Option<(PathBuf, String)>,
 }
 
 fn unavailable(text: String) -> WorkspaceError {
@@ -135,27 +148,64 @@ impl MissionWorkspaces {
     }
 
     /// The store for one agent's workspace.
-    fn route(&self, agent: &str) -> Result<Arc<GitWorkspace>, WorkspaceError> {
+    fn route(&self, agent: &str) -> Result<Routed, WorkspaceError> {
         let source = self
             .store
             .agent_source(agent)
             .map_err(|error| unavailable(format!("mission source of {agent}: {error}")))?;
         let Some(source) = source else {
-            return Ok(self.default.clone());
+            return Ok(Routed {
+                store: self.default.clone(),
+                mirror: None,
+            });
         };
         let key = source.clone().unwrap_or_default();
         let mut mirrors = self
             .mirrors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(store) = mirrors.get(&key) {
-            return Ok(store.clone());
+        if let Some(routed) = mirrors.get(&key) {
+            return Ok(routed.clone());
         }
         let repo = self.mirror(source.as_deref())?;
-        let store = Arc::new((self.factory)(&repo));
-        mirrors.insert(key, store.clone());
-        Ok(store)
+        let routed = Routed {
+            store: Arc::new((self.factory)(&repo)),
+            mirror: source.map(|source| (repo, source)),
+        };
+        mirrors.insert(key, routed.clone());
+        Ok(routed)
     }
+}
+
+/// Bring a mirror's `main` up to its source's default branch. A source that
+/// cannot be reached leaves the mirror as it was: the worker still starts,
+/// from the last copy, and the reason is logged.
+fn refresh(mirror: &Path, source: &str) {
+    let path = mirror.to_string_lossy();
+    if let Err(error) = git(&[
+        "--git-dir",
+        &path,
+        "fetch",
+        "--quiet",
+        "--",
+        source,
+        "+HEAD:refs/heads/main",
+    ]) {
+        eprintln!("sources: could not refresh {path} from {source}: {error}");
+    }
+}
+
+/// Whether a bare repository already has a branch.
+fn has_branch(repo: &Path, branch: &BranchName) -> bool {
+    git(&[
+        "--git-dir",
+        &repo.to_string_lossy(),
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{}", branch.as_str()),
+    ])
+    .is_ok()
 }
 
 impl WorkspaceStore for MissionWorkspaces {
@@ -164,19 +214,27 @@ impl WorkspaceStore for MissionWorkspaces {
     }
 
     fn ensure_branch(&self, branch: &BranchName) -> Result<(), WorkspaceError> {
-        self.route(branch.as_str())?.ensure_branch(branch)
+        let routed = self.route(branch.as_str())?;
+        if let Some((repo, source)) = &routed.mirror
+            && !has_branch(repo, branch)
+        {
+            refresh(repo, source);
+        }
+        routed.store.ensure_branch(branch)
     }
 
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
-        self.route(branch.as_str())?.mount(branch)
+        self.route(branch.as_str())?.store.mount(branch)
     }
 
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
-        self.route(workspace.sandbox())?.commit(workspace, message)
+        self.route(workspace.sandbox())?
+            .store
+            .commit(workspace, message)
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
-        self.route(workspace.sandbox())?.unmount(workspace)
+        self.route(workspace.sandbox())?.store.unmount(workspace)
     }
 }
 
