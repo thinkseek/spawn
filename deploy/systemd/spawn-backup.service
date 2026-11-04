@@ -1,5 +1,5 @@
 [Unit]
-Description=Spawn: encrypted pg_dump of the event log to Cloudflare R2 (deploy/backup)
+Description=Spawn: encrypted pg_dump of the event log to Cloudflare R2, locked against deletion (deploy/backup)
 After=docker.service
 # Retry a failed run (proxy or network down) twice, 15 minutes apart.
 StartLimitIntervalSec=2h
@@ -14,6 +14,9 @@ Environment=https_proxy=http://127.0.0.1:10801 HTTPS_PROXY=http://127.0.0.1:1080
 Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 Restart=on-failure
 RestartSec=15min
+# 3 = the dump failed the plausibility check and went to postgres/suspect/:
+# a retry would only upload the same suspect dump again.
+RestartPreventExitStatus=3
 TimeoutStartSec=30min
 Nice=10
 IOSchedulingClass=idle
