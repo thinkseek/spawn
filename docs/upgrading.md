@@ -98,9 +98,21 @@ only where they exercise it.
 
 ## Deploying
 
-`deploy/deploy.sh` replaces the binary of the live fleet on this host: a
-backup, a release build, the binary swapped by rename (`spawn.prev` kept),
-then, with `spawn-integrate` stopped, the schema migrated and the missions
-repository's `main` moved forward, and finally `spawn-loop`,
-`spawn-integrate` and `spawn-serve` restarted. Details in
+`deploy/deploy.sh <verdict-file>` replaces the binary of the live fleet on
+this host. It refuses unless the verdict file is the gate's, accepted, for
+exactly the checked-out HEAD (`"candidate"`) over the missions repository's
+current `main` (`"base"`); the gate records both commits in every verdict.
+Then: a backup (the password reaches `pg_dump` through `PGPASSWORD`), a
+release build, the binary swapped by rename (`spawn.prev` kept), then, with
+`spawn-integrate` stopped and `main` checked again, the schema migrated and
+`main` moved forward, and finally `spawn-loop`, `spawn-integrate` and
+`spawn-serve` restarted. A failure after the integrator stopped restarts the
+services before the script exits. Details in
 [deploy/systemd/README.md](../deploy/systemd/README.md#deploying).
+
+Rolling back to `spawn.prev` is safe only until the deployed binary writes an
+event kind the previous one lacks (boundary 1 above): from then on the
+previous binary cannot decode the log. For example, a binary whose
+`EventKind` lacks `execution.end_stalled`, `notice.typed` or
+`notice.received` halts on the first one in the log (and one whose
+`CommandAction` lacks `discard` fails that command); roll forward instead.

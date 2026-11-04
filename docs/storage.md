@@ -32,7 +32,8 @@ So each kind of object goes where its shape fits.
 | Secrets | `spawn.env`, test URLs, keys | tiny | none | never stored centrally | yes |
 
 The chunk store is content-addressed: an object is named by the hash of its
-bytes, written once, never changed. Identical chunks across files, versions,
+bytes, written once, never changed (a corrupt copy is replaced, which is a
+repair, not a change). Identical chunks across files, versions,
 branches and agents are stored once, so a 1 MiB edit of a 200 MiB file costs
 about 1 MiB, not 200. Its adapter is a local directory; an S3-compatible
 adapter (R2) is not built.
@@ -98,13 +99,24 @@ files, a chunk fetch.
   unprompted): "Spawn merged main into your workspace since your last turn:
   <files>. Re-read them before editing." (for conflicts: the files carry
   conflict markers; edit the marked regions, do not rewrite the files from
-  memory). The notice is folded from the log and cleared by the next prompt
-  the engine receives. A conflict in files' lines is made resolvable
+  memory). The notice is folded from the log, each file with the position
+  of the last merge event that named it. When the Bridge types a prompt that
+  carries it, it records `notice.typed {through}` (the last merge event the
+  notice told of); the notice clears only when that prompt reaches the
+  engine: the transcript line of a prompt that opens with the notice's
+  fixed opening gives `notice.received` (for Codex, whose prompt is its
+  argument, the resumed execution's first prompt). Only the files told of
+  are cleared, so a merge that lands between the typing and the receipt is
+  told next time. A prompt the Bridge did not type (someone at the pane, the
+  engine going on by itself) clears nothing, and neither does a restart: a
+  notice typed and not yet received is typed again with the next prompt. A
+  conflict in files' lines is made resolvable
   the way `git merge` does it: the merge tree with conflict markers is written
   into the idle workspace by the same safe procedure (a directory that differs
   from the branch refuses, changing nothing), the branch stays where it is,
   and `main` waits as the pending second parent under the store root
-  (`.merge/<agent>`, written atomically), recorded once per conflict as
+  (`.merge/<agent>`, written atomically, with the branch head the merge was
+  written over), recorded once per conflict as
   `merge.conflicted {files, marked}`. The agent hears of the conflict at
   landing and with its next prompt, and finds the markers in its files.
   Checkpoints keep single parents while any conflicted file the merge listed
@@ -114,20 +126,41 @@ files, a chunk fetch.
   (head, pending `main`) and clears it, after which the branch lands clean.
   The integrator does not judge a branch with a pending merge, or with marker
   blocks in the files it changes against `main`: it is gated `conflict` with
-  a note to resolve the markers first. A pending merge lives only in the
-  directory it was written into: mount and unmount clear it, and an end
-  whose final checkpoint fails keeps the execution and its workspace and
-  tries again each tick (after 20 failed attempts it unmounts with a loud
-  warning), so main is never recorded as a parent over a tree without its
-  changes. A merge holds the branch's index lock, as a checkpoint does (the
-  integrator commits the same workspace). No later `main` is merged on top of
-  unresolved markers. A conflict markers cannot show (modify/delete, renames,
-  binary files) changes nothing; the tick-report warning says so. Large files
-  are not merged: the branch keeps its own (a merge commit carries the head's
-  `Spawn-Large` trailer). Because the pending parent lives with the
-  directory, markers committed and then unmounted unresolved are resolved as
-  ordinary edits, and the next merge of `main` may conflict once more on the
-  same lines.
+  a note to resolve the markers first. Mount and unmount keep a pending
+  merge only when the branch carries it: a checkpoint was taken since it was
+  written (the head moved on from the head it was written over), so the
+  committed tree holds the markers and `main`'s other changes and the next
+  export shows them, and `main` is not yet an ancestor of the branch. The
+  checkpoint that resolves the markers, in that execution or a later one,
+  then takes `main` as its second parent, and the next merge of `main` does
+  not merge the markers again. Otherwise the pending merge goes: with the
+  head still the pre-merge one, a fresh export holds none of `main`'s
+  changes, so `main` must not become its parent (the next idle merge writes
+  the merge again). Either way main is never recorded as a parent over a
+  tree without its changes. A merge holds the branch's index lock, as a
+  checkpoint does (the integrator commits the same workspace). No later
+  `main` is merged on top of unresolved markers. A conflict markers cannot
+  show (modify/delete, renames, binary files) changes nothing; the
+  tick-report warning says so. Large files are not merged: the branch keeps
+  its own (a merge commit carries the head's `Spawn-Large` trailer), so a
+  merged tree must have room for them: a `main` that puts a file or a
+  symlink at a large file's path or at one of its parent directories makes
+  the merge a conflict markers cannot show (`marked: false`, the large
+  files' paths), and nothing moves.
+- **Ending an execution**: final checkpoint, terminal killed, workspace
+  unmounted, then `execution.ended`. The workspace holds the only copy of
+  what the execution did not commit, so it is unmounted only after the final
+  checkpoint commits, or on a `discard` command. A final checkpoint that
+  fails keeps the execution and its workspace and is tried again each tick;
+  after 20 failures (`END_ATTEMPTS`) the end is stalled: the terminal is
+  killed, `execution.end_stalled {cause, exit_code, failures, error}` is
+  recorded and warned once, the Observer marks the session BLOCKED with
+  attention `end_stalled` (the fleet view and the supervisor's digest show
+  it), and the checkpoint is retried every 30 s (`END_RETRY_MS`) by the
+  Bridge's clock, also after a restart, until it commits. A plain `stop`
+  does not change that. `discard` (`{"type":"discard"}`, a person's or the
+  supervisor's decision) tries the checkpoint once more and unmounts even if
+  it fails, losing what was not committed.
 - **Landing**: text only. The gate judges the git candidate; the
   integrator commits host-side and moves `main` by compare-and-swap. Large
   files are workspace state, not source, and never land.
@@ -139,14 +172,28 @@ files, a chunk fetch.
 - **Port and adapter.** A chunk-store port (`spawn_core::port::ChunkStore`)
   with a local directory adapter (`spawn_host::chunks`): gear-hash FastCDC
   chunks of 128 KiB–2 MiB, about 512 KiB on average, named by BLAKE3,
-  zstd-compressed, written by temporary file and link so an object is never
-  rewritten, verified on read.
+  zstd-compressed, written by temporary file and link so a sound object is
+  never rewritten, verified on read. A `put` of content whose object exists
+  verifies that object first (once per process): a corrupt one (a torn
+  write, a disk error, a copy that died) is replaced by a rename over it,
+  which repairs every manifest that names it. The object file and its
+  fan-out directory are fsynced, and the store root when a fan-out
+  directory is created. Objects are never deleted: there is no garbage
+  collection, so the store only grows.
 - **Manifest.** The large-file manifest is a chunk-store object, and the
   checkpoint commit names it in a `Spawn-Large` trailer. Only large files
   whose size, mtime or mode changed are chunked again (a stat cache in
   `<root>/.large/<branch>`).
 - **Mount.** Mount materializes the large files again, each atomically, and
-  fails rather than write bytes that do not verify.
+  fails rather than write bytes that do not verify, or write outside the
+  workspace. A manifest whose large file the head's tree has no room for (a
+  tracked entry at its path, a file or a symlink at a parent directory)
+  fails the mount. Parent directories are walked one component at a time,
+  each opened with `O_NOFOLLOW` through the open descriptor of the one above
+  (`/proc/self/fd`) and made with `mkdir` when missing, so a symlink or a
+  file where the manifest has a directory fails the write; the temporary
+  file is created exclusively without following a symlink and renamed
+  inside the directory that was verified.
 - **Where.** The store is the directory `SPAWN_CHUNK_STORE` names, else
   `<root>/.chunks`. It is host-local: a branch with large files resumed on a
   host without its chunks fails to mount rather than lose them.

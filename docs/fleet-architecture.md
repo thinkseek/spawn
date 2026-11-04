@@ -492,8 +492,12 @@ the tree's own:
   scenarios: `check-clippy`, `check-tests`, `check-e2e`, `check-blackbox`,
   `check-web`. The halt rule on the scenario count (§10.3) protects them.
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
-  §4). The verdict is one JSON line; the integrator believes only the
-  verdict file it owns.
+  §4). The verdict is one JSON line that names the base and candidate
+  commits it judged; the integrator believes only the verdict file it owns.
+- objective results on the base are cached outside the sandbox, keyed by
+  the base commit and the scenario, build hook, controller helpers and gate
+  hashes; candidate code cannot see or write the cache, but any process of
+  the same uid outside the sandbox can (the same-uid limit).
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
