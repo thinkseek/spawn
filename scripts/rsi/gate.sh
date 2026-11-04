@@ -15,14 +15,28 @@
 #   `build =` key in any Cargo.toml of the tree (cargo would run the file it
 #   names as a build script).
 # - `<scenarios-dir>/build`, when present, builds each tree (run inside it).
-# - With a task scenario: it must fail on the base and pass on the candidate.
+# - With a task scenario: it must fail on the base (exit exactly 1) and pass
+#   on the candidate.
 # - Every other scenario in the directory must pass on the candidate, except
 #   ratchet scenarios (a line `# rsi: ratchet`), which compare against the
 #   base and so fail on any tree that did not improve, and objective
 #   scenarios (`<digits>.sh`) the base fails too: an objective nobody has
-#   solved yet is not a regression, and must not block unrelated work. The
-#   base is built for that only when a candidate fails one. `check-*`
-#   scenarios are invariants and always must pass.
+#   solved yet is not a regression, and must not block unrelated work.
+#   `check-*` scenarios are invariants and always must pass.
+#
+# Exit-code contract for objective scenarios and the task scenario: 0 =
+# pass, 1 = an assertion failed, anything else = a harness error (a missing
+# tool, an unreachable database, a timeout kill). Each is judged on the base
+# BEFORE any candidate code runs, since both share the test server and a
+# candidate could otherwise sabotage the base's run: 0 = solved, 1 (twice,
+# from two runs that agree) = unsolved, anything else aborts the gate (exit
+# 4, no verdict: the integrator records an abort, never a skip). Results are
+# cached per (base commit, sha256 of the scenario, of the build hook, of
+# this file) in ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-base, written outside
+# the sandbox and hidden from it; the base moves only on landings, so most
+# runs build and run nothing on the base. Helpers a scenario sources from
+# the controller (scripts/blackbox) are not in the key. The base is built
+# only on a cache miss.
 #
 # Scenarios run inside the tree with SPAWN_BIN (the tree's `spawn`, when the
 # build made one) and SPAWN_BASELINE_TREE set. Their output is printed with a
@@ -156,6 +170,11 @@ fi
 
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
 rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+# The base's objective results (see "The base's result" below): written
+# here, outside the sandbox, which never sees this directory.
+base_cache=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-base
+mkdir -p "$base_cache"
+chmod 700 "$base_cache"
 # The controller's checkout, as the checks locate it (two levels above the
 # scenarios directory).
 controller=$(cd "$scenarios/../.." && pwd)
@@ -255,7 +274,7 @@ sandbox() {
     / | /tmp | /tmp/) ;;
     *) [ -d "$TMPDIR" ] && set -- "$@" --tmpfs "$TMPDIR" ;;
     esac
-    set -- "$@" --tmpfs "$work"
+    set -- "$@" --tmpfs "$work" --tmpfs "$base_cache"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         set -- "$@" --tmpfs "$(dirname "$SPAWN_GATE_VERDICT")"
     fi
@@ -451,19 +470,76 @@ if [ -n "$relaxed" ]; then
     exit 0
 fi
 
-if [ -n "$scenario" ]; then
-    echo "| == base: $(basename "$scenario") must fail"
-    if ! build "$work/baseline"; then
-        verdict rejected "base does not build"
-        exit 0
+# The base's result for each objective scenario and for the task scenario,
+# decided before any candidate code runs: the base shares the test server
+# with the candidate, which could otherwise sabotage the base's run and turn
+# a solved objective into "unsolved". Exit 0 = solved, 1 = unsolved; any
+# other exit is a harness error and aborts the gate (no verdict). An
+# unsolved result needs two runs that agree. Results are cached per (base
+# commit, scenario, build hook, gate) in $base_cache, which the sandbox
+# cannot see, so a base that did not move costs nothing.
+base_commit=$(git --git-dir="$repo" rev-parse "$baseline^{commit}")
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+gate_sha=$(sha "$0")
+build_sha=$([ -f "$scenarios/build" ] && sha "$scenarios/build" || echo none)
+: >"$work/base-results"
+for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
+    [ -f "$objective" ] || continue
+    if [ "$objective" != "$scenario" ]; then
+        case "$(basename "$objective")" in *[!0-9].sh | .sh) continue ;; esac
+        grep -q '^# rsi: ratchet' "$objective" && continue
     fi
-    base_built=1
-    red=0
-    run_scenario "$work/baseline" "$scenario" || red=$?
-    if [ "$red" -eq 0 ]; then
-        verdict rejected "scenario already passes on the base"
-        exit 0
+    grep -qxF "$objective" "$work/base-results.seen" 2>/dev/null && continue
+    printf '%s\n' "$objective" >>"$work/base-results.seen"
+    objective_name=$(basename "$objective")
+    key=$(printf '%s %s %s %s\n' "$base_commit" "$(sha "$objective")" "$build_sha" "$gate_sha" |
+        sha256sum | cut -d' ' -f1)
+    if [ -f "$base_cache/$key" ]; then
+        result=$(cat "$base_cache/$key")
+        echo "| == base: $objective_name: $result (cached)"
+    else
+        if [ -z "${base_built-}" ]; then
+            echo "| == base: build"
+            if ! build "$work/baseline"; then
+                verdict rejected "base does not build"
+                exit 0
+            fi
+            base_built=1
+        fi
+        echo "| == base: $objective_name"
+        first=0
+        run_scenario "$work/baseline" "$objective" || first=$?
+        result=""
+        case "$first" in
+        0) result=solved ;;
+        1)
+            echo "| == base: $objective_name again (unsolved needs two runs that agree)"
+            again=0
+            run_scenario "$work/baseline" "$objective" || again=$?
+            [ "$again" -eq 1 ] && result=unsolved
+            first="1, then $again"
+            ;;
+        esac
+        if [ -z "$result" ]; then
+            echo "| $objective_name exited $first on the base: a harness error, not a verdict; the gate aborts"
+            exit 4
+        fi
+        printf '%s\n' "$result" >"$base_cache/$key.$$"
+        mv "$base_cache/$key.$$" "$base_cache/$key"
+        echo "| == base: $objective_name: $result"
     fi
+    printf '%s|%s\n' "$result" "$objective" >>"$work/base-results"
+done
+# base_result <scenario>: solved, unsolved, or none (not judged on the base).
+base_result() {
+    awk -F'|' -v want="$1" '
+        $2 == want { print $1; found = 1; exit }
+        END { if (!found) print "none" }' "$work/base-results"
+}
+
+if [ -n "$scenario" ] && [ "$(base_result "$scenario")" = solved ]; then
+    verdict rejected "scenario already passes on the base"
+    exit 0
 fi
 
 echo "| == candidate: build"
@@ -545,24 +621,12 @@ for other in "$scenarios"/*.sh; do
     if run_scenario "$work/candidate" "$other"; then
         continue
     fi
-    case "$(basename "$other")" in
-    *[!0-9].sh | .sh) ;;
-    *)
-        # An objective scenario: a regression only if the base passes it.
-        if [ -z "${base_built-}" ]; then
-            echo "| == base: build (to tell an unsolved objective from a regression)"
-            if ! build "$work/baseline"; then
-                verdict rejected "base does not build"
-                exit 0
-            fi
-            base_built=1
-        fi
-        if ! run_scenario "$work/baseline" "$other"; then
-            echo "| $(basename "$other") fails on the base too: an unsolved objective, not a regression"
-            continue
-        fi
-        ;;
-    esac
+    # An objective scenario is a regression only if the base solved it, as
+    # judged before any candidate code ran.
+    if [ "$(base_result "$other")" = unsolved ]; then
+        echo "| $(basename "$other") fails on the base too: an unsolved objective, not a regression"
+        continue
+    fi
     verdict rejected "regression: $(basename "$other") fails on the candidate"
     exit 0
 done

@@ -69,6 +69,9 @@ struct State {
     terminals: HashSet<TerminalName>,
     panes: HashMap<TerminalName, String>,
     files: HashMap<String, Vec<u8>>,
+    /// Engines that exit at the next liveness check: the file is written
+    /// and the terminal closes then, between the Bridge's two reads.
+    exits_on_check: HashMap<TerminalName, (String, Vec<u8>)>,
 }
 
 impl State {
@@ -124,6 +127,17 @@ impl MemoryStore {
     /// Replace the visible pane of a terminal. Test helper.
     pub fn set_pane(&self, terminal: &TerminalName, pane: &str) {
         self.lock().panes.insert(terminal.clone(), pane.to_string());
+    }
+
+    /// Make the engine of `terminal` exit at the next liveness check:
+    /// `path` gets `bytes` and the terminal closes in that same moment.
+    /// Test helper for the race between reading the exit file and asking
+    /// whether the terminal lives.
+    pub fn exit_on_next_check(&self, terminal: &TerminalName, path: &str, bytes: &str) {
+        self.lock().exits_on_check.insert(
+            terminal.clone(),
+            (path.to_string(), bytes.as_bytes().to_vec()),
+        );
     }
 
     /// Append to a file the terminal host can read, as an engine would.
@@ -481,7 +495,12 @@ impl TerminalHost for MemoryStore {
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError> {
-        Ok(self.lock().terminals.contains(terminal))
+        let mut state = self.lock();
+        if let Some((path, bytes)) = state.exits_on_check.remove(terminal) {
+            state.files.insert(path, bytes);
+            state.terminals.remove(terminal);
+        }
+        Ok(state.terminals.contains(terminal))
     }
 
     fn capture_tail(
