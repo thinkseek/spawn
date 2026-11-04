@@ -77,8 +77,10 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `corpus export [--since-hours N]` | Model judgements with their evidence and outcome labels, one JSON line each. |
 | `judge --replay <file>` | Runs the current rules over a corpus: which tier decides each episode, coverage, agreement. |
 | `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
-| `hook` | Accepts and ignores standard input. Kept for engines an older build started with hooks; Spawn no longer configures it. |
+| `mission`, `task`, `resident` | The mission layer: add, configure, close and resume missions; assign, accept and reject tasks; propose, approve and retire residents. Every command prints JSON. |
+| `hook` | Accepts and ignores standard input. Spawn configures no hooks; it exists for engines whose settings call it. |
 | `run` | Runs the engine inside the terminal and writes its exit status to a file the Bridge reads. Spawn configures this; you do not call it. |
+| `version` | Prints `spawn <version>`. |
 
 Actions for `--action`:
 
@@ -103,7 +105,7 @@ e2e, the black-box CLI scenarios and the web build are scenarios (`rsi/scenarios
 Its own tests: `scripts/rsi/test-gate.sh`.
 
 End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s):
-`SPAWN_DATABASE_URL=postgres://.../spawn_test scripts/mvp-e2e.sh`.
+`SPAWN_DATABASE_URL=postgres://.../spawn_test scripts/e2e.sh`.
 
 ## Configuration
 
@@ -134,7 +136,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The PostgreSQL tests need `SPAWN_TEST_DATABASE_URL` set to a disposable database; they do not skip. All checks on one tree, through the same gate that lands work: `scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios` (build, clippy, tests, `scripts/mvp-e2e.sh`, the black-box scenarios in `scripts/blackbox/`, the web build).
+The PostgreSQL tests need `SPAWN_TEST_DATABASE_URL` set to a disposable database; they do not skip. All checks on one tree, through the same gate that lands work: `scripts/rsi/gate.sh $PWD/.git HEAD HEAD $PWD/rsi/scenarios` (build, clippy, tests, `scripts/e2e.sh`, the black-box scenarios in `scripts/blackbox/`, the web build).
 
 ## Documentation
 
@@ -143,6 +145,10 @@ The PostgreSQL tests need `SPAWN_TEST_DATABASE_URL` set to a disposable database
 | [docs/architecture.md](./docs/architecture.md) | Architecture overview (Chinese) |
 | [docs/design.md](./docs/design.md) | Design, event protocol, port contracts, known limits (Chinese) |
 | [docs/view-architecture.md](./docs/view-architecture.md) | Read views (Chinese) |
+| [docs/fleet-architecture.md](./docs/fleet-architecture.md) | The fleet: observation, control, missions, landing |
+| [docs/storage.md](./docs/storage.md) | Where each kind of object is stored; branching and merging |
+| [docs/rsi.md](./docs/rsi.md) | RSI: the objective mission and its gate (Chinese) |
+| [docs/upgrading.md](./docs/upgrading.md) | Replacing processes of a running Spawn |
 
 ## License
 
