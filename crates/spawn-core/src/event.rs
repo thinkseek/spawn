@@ -34,11 +34,6 @@ pub enum Source {
     Codex,
     /// Agent Bridge lifecycle facts.
     Bridge,
-    /// Workspace commits recorded by an older build.
-    ///
-    /// New commits are recorded with [`Source::Bridge`]; this value stays so
-    /// stored rows keep parsing.
-    Layerfs,
     /// Observer judgements.
     Observer,
     /// SQL gateway command intake and completion.
@@ -55,7 +50,6 @@ impl Source {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Bridge => "bridge",
-            Self::Layerfs => "layerfs",
             Self::Observer => "observer",
             Self::Gateway => "gateway",
             Self::Control => "control",
@@ -68,7 +62,6 @@ impl Source {
             Self::Claude,
             Self::Codex,
             Self::Bridge,
-            Self::Layerfs,
             Self::Observer,
             Self::Gateway,
             Self::Control,
