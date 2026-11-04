@@ -32,12 +32,14 @@ curl -s http://127.0.0.1:8791/healthz         # {"ok":true}
 journalctl --user -u spawn-model-relay -n 5   # the upstream hosts it routes to
 ```
 
-`spawn loop` reaches it at `SPAWN_MODEL_RELAY` (default
-`http://127.0.0.1:8791`; `off` for none) and checks it before every Claude
-start, so no loop restart is needed for engines started afterwards; running
-engines keep the settings they started with. `SPAWN_CHEAP_MODEL` (default
-`deepseek-v4-pro`) and `SPAWN_SMALL_MODEL` (default `deepseek-flash`) go in
-`spawn.env`. The relay's gateway is `MODEL_RELAY_UPSTREAM`, else the
+Then point the loop at it: `SPAWN_MODEL_RELAY=http://127.0.0.1:8791` in
+`spawn.env`, and restart `spawn-loop` (agents keep running,
+`KillMode=process`). Unset or `off`, engines run on Claude Code's own
+settings and cheap tasks fail. The loop checks the relay before every Claude
+start: while it is down, default engines start without it (a tick warning)
+and cheap starts fail; engines already running keep the settings they
+started with. `SPAWN_CHEAP_MODEL` (default `deepseek-v4-pro`) and
+`SPAWN_SMALL_MODEL` (default `deepseek-flash`) go in `spawn.env` too. The relay's gateway is `MODEL_RELAY_UPSTREAM`, else the
 `env.ANTHROPIC_BASE_URL` of `~/.claude/settings.json` read at start.
 Configuration lives in `~/.local/share/spawn-rsi/spawn.env` (KEY=VALUE),
 including `SPAWN_SUPERVISOR=1`, `SPAWN_MISSION_FILE`, and `SPAWN_SERVE_ADDRESS`

@@ -43,7 +43,7 @@ These hold no state that is not rebuildable.
   and Claude Code retries them; engines that start while it is down run the
   default profile on Claude Code's own settings, and cheap starts fail and
   reach the supervisor (docs/fleet-architecture.md §3.3). Restart it when
-  the engines are idle if a cut turn matters. Changing `SPAWN_MODEL_RELAY`,
+  the engines are idle if a cut turn matters. Setting or changing `SPAWN_MODEL_RELAY`,
   `SPAWN_CHEAP_MODEL` or `SPAWN_SMALL_MODEL` takes a `spawn-loop` restart and
   applies to engines started after it.
 
