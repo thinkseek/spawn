@@ -118,6 +118,37 @@ pub trait WorkspaceStore: Send + Sync {
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError>;
 }
 
+/// Chunk store failure.
+#[derive(Debug, Error)]
+pub enum ChunkError {
+    /// No object has this name.
+    #[error("chunk {0} is missing")]
+    Missing(String),
+    /// The object's bytes do not hash to its name, or the name is not a hash.
+    #[error("chunk {0} is corrupt")]
+    Corrupt(String),
+    /// The backend could not run.
+    #[error("chunk store unavailable: {0}")]
+    Unavailable(String),
+}
+
+/// Content-addressed object store for large files (docs/storage.md).
+///
+/// An object is named by the hash of its bytes, written once and never
+/// changed. Every read is verified: bytes that do not hash to the name are an
+/// error, never an answer. A local directory first, any S3-compatible bucket
+/// later, behind this one port.
+pub trait ChunkStore: Send + Sync + std::fmt::Debug {
+    /// Store `bytes` unless an object of the same content exists; its name.
+    fn put(&self, bytes: &[u8]) -> Result<String, ChunkError>;
+
+    /// The bytes of the object `name`, verified against the name.
+    fn get(&self, name: &str) -> Result<Vec<u8>, ChunkError>;
+
+    /// Whether an object `name` is stored (not verified).
+    fn contains(&self, name: &str) -> Result<bool, ChunkError>;
+}
+
 /// Terminal failure.
 #[derive(Debug, Error)]
 #[error("terminal failure: {0}")]
