@@ -398,6 +398,12 @@ One loop, end to end, before anything else:
 | 2. Live run with real Claude workers and hosted Jev, nonzero decisions at every tier, interventions per agent-hour in the UI | Partly: a live supervisor → worker → Jev → digest → review → stop loop ran; rules, Jev, dispatcher, supervisor and liveness all decided; the UI shows the ladder and `human_per_agent_hour`. Needs sustained worker traffic. |
 | 3. One RSI landing on the rules-coverage objective | Not started: the corpus has ~30 episodes; the objective needs a few hundred labelled ones to judge agreement without overfitting. |
 
+Fleet work so far: missions 1 and 2 (four refactor branches and the Missions view, all by ephemeral workers, reviewed by the supervisor) passed `scripts/merge-gate.sh` one by one and merged together, and landed at fcff135. The corpus had 47 labelled episodes then.
+
+Open items:
+- A resident keeps one branch across tasks, so merges that land in its mission source after it started never reach it. New ephemeral workers are fine: the mirror is refreshed before each new branch. Two fixes are possible: rebase the resident's branch onto `main` when a task is delivered (conflicts would then need a policy), or give every resident task its own branch.
+- Merging is a human step: `merge-gate.sh` runs per branch, then once on the merged tree. Automating it would mean a host-side integrator holding the same CAS discipline as the RSI landing.
+
 ## 8. Build order
 
 1. Observation tiers: rules first, Jev on ambiguity, extended observation payload with tier, evidence and escalation.
