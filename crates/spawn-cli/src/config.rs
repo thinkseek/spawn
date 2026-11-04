@@ -86,6 +86,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_chunk_store_is_configurable_and_defaults_under_the_root() {
+        assert_eq!(
+            resolve_chunk_store(Some("/srv/chunks".into()), "/ws"),
+            PathBuf::from("/srv/chunks")
+        );
+        assert_eq!(resolve_chunk_store(None, "/ws"), PathBuf::from("/ws/.chunks"));
+    }
+
+    #[test]
     fn spawn_program_prefers_the_environment() {
         assert_eq!(
             resolve_spawn_program(Some("/opt/spawn".into()), Some(PathBuf::from("/bin/x"))),
