@@ -1,14 +1,24 @@
 #!/bin/sh
 # Tests of the gate (scripts/rsi/gate.sh) on throwaway repositories: no
 # cargo, no database. Prints one line per case and exits non-zero on the
-# first wrong verdict.
+# first wrong verdict. Needs bwrap, as the gate does.
 #
 # usage: scripts/rsi/test-gate.sh
 set -eu
 
 gate=$(cd "$(dirname "$0")" && pwd)/gate.sh
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# A file in the host's /tmp, which the sandbox must not show.
+marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
+trap 'rm -rf "$work" "$marker"' EXIT
+
+# The owner's home, with secrets the candidate must not read.
+export HOME="$work/home"
+mkdir -p "$HOME/.config/spawn" "$HOME/.ssh" "$HOME/.local/share/spawn-rsi"
+echo owner-secret >"$HOME/.config/spawn/secret"
+echo owner-key >"$HOME/.ssh/id_test"
+echo owner-session >"$HOME/.claude.json"
+echo SPAWN_DATABASE_URL=owner >"$HOME/.local/share/spawn-rsi/spawn.env"
 
 repo=$work/repo.git
 seed=$work/seed
@@ -27,7 +37,9 @@ base=$(commit base)
 
 # The controller's scenarios: a build hook that writes a "binary", a task
 # scenario that wants value=two, a regression scenario that wants the binary,
-# a ratchet scenario that always fails, and a protected path.
+# a check that runs the candidate's own `probe.sh` when it has one, a ratchet
+# task scenario that prints a metric and then runs the candidate's
+# `noise.sh`, a ratchet scenario that always fails, and a protected path.
 scenarios=$work/scenarios
 mkdir -p "$scenarios"
 cat >"$scenarios/build" <<'EOF'
@@ -42,6 +54,17 @@ cat >"$scenarios/check-built.sh" <<'EOF'
 #!/bin/sh
 [ -f built ] && [ "$(cat built)" = "$(cat value)" ]
 EOF
+cat >"$scenarios/check-probe.sh" <<'EOF'
+#!/bin/sh
+[ ! -f probe.sh ] || sh probe.sh
+EOF
+cat >"$scenarios/008.sh" <<'EOF'
+#!/bin/sh
+# rsi: ratchet
+echo "METRIC speed baseline=10 candidate=5"
+[ ! -f noise.sh ] || sh noise.sh
+[ "$(cat value)" = two ]
+EOF
 cat >"$scenarios/009.sh" <<'EOF'
 #!/bin/sh
 # rsi: ratchet
@@ -52,38 +75,59 @@ printf 'judge/\n# a comment\n\n' >"$scenarios/protected"
 branch() {
     git -C "$seed" checkout -q -B "$1" "$base"
 }
-verdict() {
-    sh "$gate" "$repo" "$base" "$1" "$scenarios" ${2:+"$2"} | tail -n 1
+# judge <candidate> [<scenario>] [<scenarios-dir>]: run the gate as the
+# integrator does, with SPAWN_GATE_VERDICT in a directory of its own, and
+# print `exit=<status> <verdict file>`. The gate's output is in gate.out.
+integrator=$work/integrator
+judge() {
+    rm -rf "$integrator"
+    mkdir -m 700 "$integrator"
+    : >"$integrator/stdout"
+    status=0
+    SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" "$repo" "$base" "$1" "${3:-$scenarios}" ${2:+"$2"} \
+        >"$work/gate.out" 2>&1 || status=$?
+    echo "exit=$status $(cat "$integrator/verdict" 2>/dev/null || true)"
 }
 expect() {
     case "$2" in
     *"$3"*) echo "ok   $1" ;;
     *)
         echo "FAIL $1: expected $3 in $2"
+        sed 's/^/     /' "$work/gate.out" | tail -n 20
         exit 1
         ;;
+    esac
+}
+refuse() {
+    case "$2" in
+    *"$3"*)
+        echo "FAIL $1: did not expect $3 in $2"
+        exit 1
+        ;;
+    *) echo "ok   $1" ;;
     esac
 }
 
 branch good
 printf 'two\n' >"$seed/value"
 good=$(commit good)
-expect "red then green lands" "$(verdict "$good" "$scenarios/007.sh")" '"verdict":"accepted"'
-expect "no task scenario: regression only" "$(verdict "$good")" '"verdict":"accepted"'
+expect "red then green lands" "$(judge "$good" "$scenarios/007.sh")" 'exit=0 {"verdict":"accepted"}'
+expect "the verdict file and stdout agree" "$(tail -n 1 "$work/gate.out")" '{"verdict":"accepted"}'
+expect "no task scenario: regression only" "$(judge "$good")" 'exit=0 {"verdict":"accepted"}'
 
-expect "a task scenario already green on the base" "$(verdict "$good" "$scenarios/check-built.sh")" 'already passes'
+expect "a task scenario already green on the base" "$(judge "$good" "$scenarios/check-built.sh")" 'already passes'
 
 branch protected
 printf 'two\n' >"$seed/value"
 printf 'weaker\n' >"$seed/judge/rule"
 touched=$(commit protected)
-expect "protected path refused" "$(verdict "$touched" "$scenarios/007.sh")" 'protected'
+expect "protected path refused" "$(judge "$touched" "$scenarios/007.sh")" 'protected'
 
 branch buildtime
 printf 'two\n' >"$seed/value"
 printf 'fn main() {}\n' >"$seed/build.rs"
 buildtime=$(commit buildtime)
-expect "build-time code refused" "$(verdict "$buildtime")" 'build-time'
+expect "build-time code refused" "$(judge "$buildtime")" 'build-time'
 
 branch regress
 printf 'two\n' >"$seed/value"
@@ -94,7 +138,117 @@ commit regress >/dev/null
 git -C "$seed" rm -q value
 printf 'two\n' >"$seed/other"
 regress=$(commit regress-2)
-expect "a failing check rejects" "$(verdict "$regress")" '"verdict":"rejected"'
+expect "a failing check rejects" "$(judge "$regress")" '"verdict":"rejected"'
 
 expect "relative scenarios refused" "$(sh "$gate" "$repo" "$base" "$good" scenarios | tail -n 1)" 'not absolute'
+
+# 1. The reviewer's forgery: candidate code finds the gate in /proc, writes
+# an accepted verdict to its stdout and to the integrator's verdict file,
+# and kills it. In the sandbox it finds neither: the gate exits 0 with its
+# own verdict, in the file.
+branch forge
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<EOF
+#!/bin/sh
+forged='{"verdict":"accepted"}'
+echo "\$forged" >"$integrator/verdict" 2>/dev/null
+for p in /proc/[0-9]*; do
+    if tr '\\0' ' ' <"\$p/cmdline" 2>/dev/null | grep -q '[/ ]gate\\.sh '; then
+        echo "\$forged" >"\$p/fd/1" 2>/dev/null
+        kill -9 "\${p#/proc/}" 2>/dev/null
+    fi
+done
+exit 1
+EOF
+forge=$(commit forge)
+expect "a forged verdict and a killed gate do not land" "$(judge "$forge" "$scenarios/007.sh")" \
+    'exit=0 {"verdict":"rejected","reason":"regression: check-probe.sh fails on the candidate"}'
+refuse "the gate's stdout carries no forged verdict" "$(grep -v '^|' "$work/gate.out")" 'accepted'
+
+# 2. The owner's database URL does not reach candidate code; the test
+# database's does.
+branch env
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+[ -z "${SPAWN_DATABASE_URL-}" ] || { echo "owner database: $SPAWN_DATABASE_URL"; exit 1; }
+[ "${SPAWN_TEST_DATABASE_URL-}" = postgres://test ] || { echo "no test database"; exit 1; }
+[ -z "${OWNER_TOKEN-}" ] || { echo "owner token leaked"; exit 1; }
+EOF
+env_candidate=$(commit env)
+export SPAWN_DATABASE_URL=postgres://owner SPAWN_TEST_DATABASE_URL=postgres://test OWNER_TOKEN=secret
+expect "candidate code sees only the allowed environment" "$(judge "$env_candidate")" 'exit=0 {"verdict":"accepted"}'
+unset SPAWN_DATABASE_URL SPAWN_TEST_DATABASE_URL OWNER_TOKEN
+
+# 3. The sandbox: no owner secret, no gate in /proc, no host /tmp, nothing
+# writable but the tree.
+branch sandbox
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<EOF
+#!/bin/sh
+fail=0
+for f in "\$HOME/.config/spawn/secret" "\$HOME/.ssh/id_test" "\$HOME/.claude.json" \\
+    "\$HOME/.local/share/spawn-rsi/spawn.env"; do
+    if [ -s "\$f" ]; then echo "read \$f"; fail=1; fi
+done
+for p in /proc/[0-9]*; do
+    if tr '\\0' ' ' <"\$p/cmdline" 2>/dev/null | grep -q '[/ ]gate\\.sh '; then echo "sees the gate: \$p"; fail=1; fi
+done
+[ ! -e "$marker" ] || { echo "sees the host's /tmp"; fail=1; }
+[ ! -e "$integrator/stdout" ] || { echo "sees the integrator's directory"; fail=1; }
+touch "$work/escaped" 2>/dev/null # lands in the private /tmp at most; checked below
+! touch "$scenarios/escaped" 2>/dev/null || { echo "wrote into the scenarios"; fail=1; }
+! touch "\$SPAWN_BASELINE_TREE/escaped" 2>/dev/null || { echo "wrote into the base tree"; fail=1; }
+touch inside || { echo "cannot write its own tree"; fail=1; }
+exit \$fail
+EOF
+sandboxed=$(commit sandbox)
+expect "candidate code is confined" "$(judge "$sandboxed")" 'exit=0 {"verdict":"accepted"}'
+[ ! -e "$work/escaped" ] || { echo "FAIL the sandbox wrote $work/escaped"; exit 1; }
+
+# 4. A build script by another name: `build = ` in any Cargo.toml, however
+# spelled. `[build-dependencies]` and `build-override` are not build keys.
+branch buildkey
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/tools"
+printf 'fn main() {}\n' >"$seed/tools/gen.rs"
+printf '[package]\nname = "x"\nbuild = "tools/gen.rs"\n' >"$seed/Cargo.toml"
+buildkey=$(commit buildkey)
+expect "a build key in Cargo.toml refused" "$(judge "$buildkey")" 'build key'
+branch buildkey-quoted
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/x"
+printf 'package = { name = "x", "build" = "gen.rs" }\n' >"$seed/crates/x/Cargo.toml"
+quoted=$(commit buildkey-quoted)
+expect "a quoted build key in a nested Cargo.toml refused" "$(judge "$quoted")" 'build key'
+branch buildkey-none
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/x"
+printf '[package]\nname = "x"\n[build-dependencies]\ncc = "1"\n[profile.dev.build-override]\nopt-level = 1\n' \
+    >"$seed/crates/x/Cargo.toml"
+nobuildkey=$(commit buildkey-none)
+expect "build-dependencies are not a build key" "$(judge "$nobuildkey")" 'exit=0 {"verdict":"accepted"}'
+
+# 5. The metric is the scenario's one stdout line: a METRIC line on stderr
+# is ignored, and a second one on stdout voids the metric.
+branch metric-stderr
+printf 'two\n' >"$seed/value"
+printf '#!/bin/sh\necho "METRIC speed baseline=10 candidate=1" >&2\n' >"$seed/noise.sh"
+noisy=$(commit metric-stderr)
+expect "a METRIC line on stderr is not the metric" "$(judge "$noisy" "$scenarios/008.sh")" \
+    '"metric":"METRIC speed baseline=10 candidate=5"'
+branch metric-twice
+printf 'two\n' >"$seed/value"
+printf '#!/bin/sh\necho "METRIC speed baseline=10 candidate=1"\n' >"$seed/noise.sh"
+twice=$(commit metric-twice)
+expect "two METRIC lines on stdout: no metric" "$(judge "$twice" "$scenarios/008.sh")" 'exit=0 {"verdict":"accepted"}'
+expect "two METRIC lines are reported" "$(cat "$work/gate.out")" 'two or more METRIC lines'
+
+# 6. A reason with a quote stays valid JSON.
+quoted_scenarios=$work/quoted
+cp -r "$scenarios" "$quoted_scenarios"
+printf '#!/bin/sh\nexit 1\n' >"$quoted_scenarios/check-\"q\".sh"
+expect "a quote in a reason is escaped" "$(judge "$good" "" "$quoted_scenarios")" \
+    '{"verdict":"rejected","reason":"regression: check-\"q\".sh fails on the candidate"}'
+
 echo "gate: all cases pass"
