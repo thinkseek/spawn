@@ -520,6 +520,18 @@ impl GitWorkspace {
 
     /// Chunk the large files of a checkpoint into the store and store their
     /// manifest; its name, or `None` when there are no large files.
+    /// Whether the store still holds every chunk a stat-cache entry names,
+    /// each made young again (a collection must not take it before this
+    /// checkpoint's commit names it). False: chunk the file again.
+    fn still_held(&self, chunks: &[String]) -> Result<bool, WorkspaceError> {
+        for chunk in chunks {
+            if !self.chunks.touch(chunk).map_err(chunk_failure)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn store_large(
         &self,
         branch: &str,
@@ -536,7 +548,10 @@ impl GitWorkspace {
             };
             let chunks = match cached.get(path) {
                 Some(entry)
-                    if entry.size == size && entry.mtime_ns == mtime_ns && entry.mode == mode =>
+                    if entry.size == size
+                        && entry.mtime_ns == mtime_ns
+                        && entry.mode == mode
+                        && self.still_held(&entry.chunks)? =>
                 {
                     entry.chunks.clone()
                 }
