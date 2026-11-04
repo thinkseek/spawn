@@ -661,14 +661,36 @@ fn a_granted_principal_inserts_and_reads_only_its_agents() {
             .map(|row| row.get(0))
             .collect()
     };
-    assert!(readable(&mut client).is_empty(), "no grant reads nothing");
+    assert_eq!(
+        readable(&mut client),
+        vec!["session_one", "session_two"],
+        "the owner reads every agent"
+    );
 
+    // Another login reads only the agents it holds a grant for.
+    client
+        .batch_execute(
+            "grant execute on function spawn_read_freshness(), spawn_read_timeline(text) \
+             to spawn_reader",
+        )
+        .expect("the reader may call the readers");
+    let as_reader = |client: &mut Client| {
+        client
+            .batch_execute("set session authorization spawn_reader")
+            .expect("become the reader");
+    };
+    as_reader(&mut client);
+    assert!(readable(&mut client).is_empty(), "no grant reads nothing");
+    client
+        .batch_execute("reset session authorization")
+        .expect("back to the owner");
     client
         .execute(
-            "insert into spawn_grants (principal, agent_id) values (session_user, 'agent_one')",
+            "insert into spawn_grants (principal, agent_id) values ('spawn_reader', 'agent_one')",
             &[],
         )
         .expect("grant");
+    as_reader(&mut client);
     assert_eq!(readable(&mut client), vec!["session_one"]);
     let timeline: i64 = client
         .query_one(
@@ -678,6 +700,15 @@ fn a_granted_principal_inserts_and_reads_only_its_agents() {
         .expect("spawn_read_timeline answers")
         .get(0);
     assert_eq!(timeline, 0, "an ungranted agent's session reads empty");
+    client
+        .batch_execute("reset session authorization")
+        .expect("back to the owner");
+    client
+        .execute(
+            "insert into spawn_grants (principal, agent_id) values (session_user, 'agent_one')",
+            &[],
+        )
+        .expect("grant");
 
     let row = client
         .query_one(
