@@ -10,7 +10,9 @@ use spawn_host::GitWorkspace;
 use spawn_jev::{JevConfig, JevJudge};
 
 use crate::Flags;
-use crate::config::{env_or, env_value, open_store, required_env, spawn_program, workspace_root};
+use crate::config::{
+    chunk_store, env_or, env_value, open_store, required_env, spawn_program, workspace_root,
+};
 use crate::{context, sources, supervise};
 
 /// Build the Bridge and the Observer over one store.
@@ -35,9 +37,13 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     // mission owns use the default repository.
     let factory: sources::Factory = {
         let (root, docker, image) = (root.clone(), docker.clone(), image.clone());
-        Arc::new(move |repo: &std::path::Path| match image.as_ref() {
-            Some(image) => GitWorkspace::with_container(repo, &root, &docker, image),
-            None => GitWorkspace::new(repo, &root),
+        let chunks = chunk_store(&root);
+        Arc::new(move |repo: &std::path::Path| {
+            match image.as_ref() {
+                Some(image) => GitWorkspace::with_container(repo, &root, &docker, image),
+                None => GitWorkspace::new(repo, &root),
+            }
+            .with_chunks(Arc::clone(&chunks))
         })
     };
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(sources::MissionWorkspaces::new(
