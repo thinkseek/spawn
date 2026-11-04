@@ -8,13 +8,14 @@ import { MobileNav, Sidebar } from "./components/Sidebar";
 import { StateBadge } from "./components/StateDot";
 import { Timeline } from "./components/Timeline";
 import { FleetView } from "./components/fleet/FleetView";
+import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
 import { RSI_SESSION } from "./rsi";
 
-export type View = "fleet" | "rsi" | "sessions";
+export type View = "fleet" | "missions" | "rsi" | "sessions";
 
 interface Route {
   view: View;
@@ -26,6 +27,7 @@ function routeFromHash(): Route {
   const hash = window.location.hash;
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
+  if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
   const match = /^#\/fleet\/(.+)$/.exec(hash);
   let agent: string | null = null;
   if (match) {
@@ -44,6 +46,7 @@ function hashFor(route: Route): string {
       ? `#/fleet/${encodeURIComponent(route.agent)}`
       : "#/fleet";
   }
+  if (route.view === "missions") return "#/missions";
   return route.view === "rsi" ? "#/rsi" : "#/sessions";
 }
 
@@ -119,6 +122,7 @@ export default function App() {
         view={view}
         attention={fleet.data?.health.attention ?? 0}
         onShowFleet={() => setView("fleet")}
+        onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
         onShowSessions={() => setView("sessions")}
       />
@@ -130,6 +134,7 @@ export default function App() {
         error={overview.error}
         attention={fleet.data?.health.attention ?? 0}
         onShowFleet={() => setView("fleet")}
+        onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
         onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
@@ -145,6 +150,8 @@ export default function App() {
           onSelect={(agent) => setRoute({ view: "fleet", agent })}
           onOpenTimeline={openTimeline}
         />
+      ) : view === "missions" ? (
+        <MissionsView />
       ) : view === "rsi" ? (
         <RsiView onOpenSession={() => openTimeline(RSI_SESSION)} />
       ) : (

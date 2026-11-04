@@ -1,4 +1,4 @@
-import { Activity, LayoutGrid, Orbit, Rows3 } from "lucide-react";
+import { Activity, LayoutGrid, Orbit, Rows3, Target } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary } from "../api";
@@ -17,6 +17,7 @@ interface SidebarProps {
   /** Agents that need a human, from the fleet poll. */
   attention: number;
   onShowFleet: () => void;
+  onShowMissions: () => void;
   onShowRsi: () => void;
   onShowSessions: () => void;
   onSelect: (sessionId: string) => void;
@@ -43,6 +44,7 @@ export function Sidebar({
   error,
   attention,
   onShowFleet,
+  onShowMissions,
   onShowRsi,
   onSelect,
 }: SidebarProps) {
@@ -60,6 +62,12 @@ export function Sidebar({
           icon={<LayoutGrid size={15} />}
           label="Fleet"
           trailing={<AttentionCount count={attention} />}
+        />
+        <NavItem
+          active={view === "missions"}
+          onClick={onShowMissions}
+          icon={<Target size={15} />}
+          label="Missions"
         />
         <NavItem
           active={view === "rsi"}
@@ -210,11 +218,17 @@ export function MobileNav({
   view,
   attention,
   onShowFleet,
+  onShowMissions,
   onShowRsi,
   onShowSessions,
 }: Pick<
   SidebarProps,
-  "view" | "attention" | "onShowFleet" | "onShowRsi" | "onShowSessions"
+  | "view"
+  | "attention"
+  | "onShowFleet"
+  | "onShowMissions"
+  | "onShowRsi"
+  | "onShowSessions"
 >) {
   return (
     <div className="flex h-12 shrink-0 items-center gap-3 border-b border-sidebar-border bg-sidebar px-3 md:hidden">
@@ -223,6 +237,7 @@ export function MobileNav({
         {(
           [
             ["fleet", "Fleet", <LayoutGrid key="f" size={13} />, onShowFleet],
+            ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
             ["sessions", "Sessions", <Rows3 key="s" size={13} />, onShowSessions],
           ] as const
