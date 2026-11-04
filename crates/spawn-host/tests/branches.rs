@@ -235,6 +235,26 @@ fn a_conflict_changes_nothing() {
 }
 
 #[test]
+fn a_main_with_no_shared_history_is_nothing_to_merge() {
+    let fixture = Fixture::new("unrelated", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    let head = fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    // Main reseeded: an orphan commit with nothing in common with the branch.
+    git(&fixture.checkout, &["checkout", "-q", "--orphan", "fresh"]);
+    git(&fixture.checkout, &["rm", "-rqf", "."]);
+    fs::write(fixture.checkout.join("other.txt"), "x\n").expect("write");
+    git(&fixture.checkout, &["add", "-A"]);
+    git(&fixture.checkout, &["commit", "-qm", "reseeded"]);
+    git(&fixture.checkout, &["branch", "-f", "main", "fresh"]);
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("no error"),
+        BaseMerge::Current
+    );
+    assert!(!directory.join("other.txt").exists());
+    assert_eq!(fixture.head("agent_a"), head);
+}
+
+#[test]
 fn a_directory_that_differs_from_its_branch_refuses_the_merge() {
     let fixture = Fixture::new("dirty", &[("README.md", "base\n")]);
     let (_, workspace, directory) = fixture.mount("agent_a");

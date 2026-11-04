@@ -588,6 +588,11 @@ impl GitWorkspace {
         if self.is_ancestor(&main, &head)? {
             return Ok(BaseMerge::Current);
         }
+        // No shared history (a default repository reseeded under an older
+        // branch): there is nothing to merge, and git would refuse anyway.
+        if self.git_output(&["merge-base", &main, &head]).is_err() {
+            return Ok(BaseMerge::Current);
+        }
         // `main` first, as the integrator lands it: a union merge orders the
         // lines the same way the landing would.
         let output = self
