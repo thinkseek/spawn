@@ -87,6 +87,22 @@ fn report(output: std::io::Result<Output>, word: &str) -> Result<String, Workspa
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// First field of a pending merge's file.
+const PENDING_TAG: &str = "pending-merge";
+
+/// A merge of `main` whose conflict markers are not resolved yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pending {
+    /// `main`'s commit: the second parent of the checkpoint that resolves
+    /// the markers.
+    main: String,
+    /// The branch head the merge was written over; `None` in a file written
+    /// before the head was recorded.
+    written_over: Option<String>,
+    /// The conflicted paths.
+    files: Vec<String>,
+}
+
 /// Workspace store backed by a bare git repository.
 #[derive(Debug, Clone)]
 pub struct GitWorkspace {
@@ -778,8 +794,8 @@ impl WorkspaceStore for GitWorkspace {
             &format!("refs/heads/{branch}"),
         ])
         .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
-        // A pending merge lives only in the directory it was written into.
-        self.clear_pending(branch.as_str());
+        // A pending merge stays only when the branch carries its markers.
+        self.settle_pending(branch.as_str());
 
         let directory = self.root.join(branch.as_str());
         if directory.exists() {
@@ -885,8 +901,8 @@ impl WorkspaceStore for GitWorkspace {
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         let directory = self.checked_path(workspace)?;
-        // A pending merge lives only in the directory it was written into.
-        self.clear_pending(workspace.sandbox());
+        // A pending merge stays only when the branch carries its markers.
+        self.settle_pending(workspace.sandbox());
         if let Some(container) = self.container.as_ref() {
             let _ = Command::new(&container.docker)
                 .args(["rm", "-f", &container_name(workspace.sandbox())])
@@ -980,7 +996,7 @@ impl GitWorkspace {
         // The integrator commits this workspace too: no checkpoint reads the
         // directory halfway through a merge.
         let _lock = self.lock_branch(&branch)?;
-        if let Some((_, files)) = self.pending_merge(&branch) {
+        if let Some(Pending { files, .. }) = self.pending_merge(&branch) {
             if unresolved(&directory, &files) {
                 return Ok(BaseMerge::Conflicted {
                     files,
@@ -1030,7 +1046,7 @@ impl GitWorkspace {
                     && conflicts.all(|kind| kind == "CONFLICT (contents)");
                 if marked {
                     self.update_directory(&branch, &directory, &head_tree, &merged)?;
-                    if let Err(error) = self.write_pending(&branch, &main, &files) {
+                    if let Err(error) = self.write_pending(&branch, &main, &head, &files) {
                         // Without its pending parent the merge must not stay.
                         let _ = self.update_directory(&branch, &directory, &merged, &head_tree);
                         return Err(error);
@@ -1118,30 +1134,45 @@ impl GitWorkspace {
         result.map(|_| ())
     }
 
-    /// Where a merge of `main` whose conflicts are not resolved yet waits:
-    /// `main`'s commit, then the conflicted paths, NUL-separated.
+    /// Where a merge of `main` whose conflicts are not resolved yet waits
+    /// ([`Pending`]), NUL-separated: [`PENDING_TAG`], `main`'s commit, the
+    /// branch head the merge was written over, then the conflicted paths.
     fn pending_path(&self, branch: &str) -> PathBuf {
         self.root.join(".merge").join(branch)
     }
 
-    /// The pending merge of a branch: `main`'s commit and the conflicted
-    /// paths. An unreadable or malformed file counts as none.
-    fn pending_merge(&self, branch: &str) -> Option<(String, Vec<String>)> {
+    /// The pending merge of a branch. An unreadable or malformed file counts
+    /// as none; so does one without the head it was written over (the form
+    /// before the head was recorded is `main`, then the paths).
+    fn pending_merge(&self, branch: &str) -> Option<Pending> {
         let text = std::fs::read_to_string(self.pending_path(branch)).ok()?;
         let mut fields = text.split('\0').filter(|field| !field.is_empty());
-        let main = fields.next()?.to_string();
-        if !main.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let is_commit =
+            |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let first = fields.next()?;
+        let (main, written_over) = if first == PENDING_TAG {
+            let main = fields.next().filter(|text| is_commit(text))?;
+            let head = fields.next().filter(|text| is_commit(text))?;
+            (main.to_string(), Some(head.to_string()))
+        } else if is_commit(first) {
+            (first.to_string(), None)
+        } else {
             return None;
-        }
-        Some((main, fields.map(str::to_string).collect()))
+        };
+        Some(Pending {
+            main,
+            written_over,
+            files: fields.map(str::to_string).collect(),
+        })
     }
 
-    /// Record a pending merge, atomically: a write to a temporary file, then
-    /// a rename.
+    /// Record a pending merge of `main` written over the branch head `head`,
+    /// atomically: a write to a temporary file, then a rename.
     fn write_pending(
         &self,
         branch: &str,
         main: &str,
+        head: &str,
         files: &[String],
     ) -> Result<(), WorkspaceError> {
         let path = self.pending_path(branch);
@@ -1151,7 +1182,7 @@ impl GitWorkspace {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| unavailable("create", error))?;
         }
-        let mut text = format!("{main}\0");
+        let mut text = format!("{PENDING_TAG}\0{main}\0{head}\0");
         for file in files {
             text.push_str(file);
             text.push('\0');
@@ -1165,7 +1196,7 @@ impl GitWorkspace {
     /// `main`, once no conflicted file in `directory` holds a marker. A
     /// pending `main` the branch already contains is cleared.
     fn resolved_merge(&self, branch: &str, directory: &Path) -> Option<String> {
-        let (main, files) = self.pending_merge(branch)?;
+        let Pending { main, files, .. } = self.pending_merge(branch)?;
         let contained = self
             .commit_id_of(&format!("refs/heads/{branch}"))
             .and_then(|head| self.is_ancestor(&main, &head));
@@ -1178,6 +1209,36 @@ impl GitWorkspace {
 
     fn clear_pending(&self, branch: &str) {
         let _ = std::fs::remove_file(self.pending_path(branch));
+    }
+
+    /// When a workspace's directory goes (unmount) or is exported afresh
+    /// (mount): keep the pending merge only when the branch carries it. That
+    /// is when a checkpoint was taken since the merge was written (the
+    /// branch head moved on from the head the merge was written over), so
+    /// the committed tree holds the merge's markers and main's other changes
+    /// and the next export shows them; and when main is not yet an ancestor
+    /// of the branch. The checkpoint that resolves the markers then takes
+    /// main as its second parent, as it would have in the same directory.
+    ///
+    /// Otherwise it goes: the head is still the pre-merge one, so a fresh
+    /// export holds none of main's changes and main must never become a
+    /// parent of it (the next idle merge writes the merge again); or main is
+    /// already contained; or the file is unreadable or has no head.
+    fn settle_pending(&self, branch: &str) {
+        let carried = self.pending_merge(branch).is_some_and(|pending| {
+            let Some(written_over) = pending.written_over else {
+                return false;
+            };
+            let Ok(head) = self.commit_id_of(&format!("refs/heads/{branch}")) else {
+                return false;
+            };
+            head != written_over
+                && matches!(self.is_ancestor(&written_over, &head), Ok(true))
+                && matches!(self.is_ancestor(&pending.main, &head), Ok(false))
+        });
+        if !carried {
+            self.clear_pending(branch);
+        }
     }
 
     /// Hold the branch's `<index>.spawn-lock`, as a checkpoint does, until
