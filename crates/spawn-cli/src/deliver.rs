@@ -228,11 +228,12 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
                     orders.extend(delivery(task, found));
                 }
             }
-            "accepted" | "cancelled" if task.kind == "ephemeral" => {
-                if found.is_some_and(Facts::live_and_free) {
-                    let key = format!("retire-task-{}", task.id);
-                    orders.push(task.order(key, CommandAction::Stop));
-                }
+            // A finished ephemeral worker is stopped.
+            "accepted" | "cancelled"
+                if task.kind == "ephemeral" && found.is_some_and(Facts::live_and_free) =>
+            {
+                let key = format!("retire-task-{}", task.id);
+                orders.push(task.order(key, CommandAction::Stop));
             }
             _ => {}
         }
