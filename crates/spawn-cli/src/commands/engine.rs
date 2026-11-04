@@ -67,11 +67,9 @@ pub(crate) fn hook() -> Result<i32, String> {
             return Ok(0);
         }
     };
-    if let Err(error) = store.append(target.event(
-        Source::Claude,
-        normalized.source_event_id,
-        normalized.kind,
-    )) {
+    if let Err(error) =
+        store.append(target.event(Source::Claude, normalized.source_event_id, normalized.kind))
+    {
         eprintln!("spawn hook: {error}");
     }
     Ok(0)
