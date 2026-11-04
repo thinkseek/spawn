@@ -217,7 +217,17 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         .map_err(|error| format!("SPAWN_GATE: {error}"))?;
     // The gate gets an allowlist of this environment, never all of it: the
     // owner's SPAWN_DATABASE_URL must not reach candidate code.
-    let gate_env = gate::gate_env(|name| std::env::var(name).ok())?;
+    let gate_env = gate::gate_env(|name| std::env::var(name).ok());
+    if std::env::var_os("SPAWN_TEST_DATABASE_URL").is_some()
+        && !gate_env
+            .iter()
+            .any(|(name, _)| name == "SPAWN_TEST_DATABASE_URL")
+    {
+        eprintln!(
+            "integrate: SPAWN_TEST_DATABASE_URL names this integrator's own database; \
+             the gate does not get it"
+        );
+    }
     let integrator = Integrator {
         root,
         gate,
