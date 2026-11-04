@@ -6,5 +6,5 @@
 pub mod git;
 pub mod tmux;
 
-pub use git::{GitWorkspace, container_name, docker_prefix};
+pub use git::{GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix};
 pub use tmux::{PrefixBuilder, TmuxHost};
