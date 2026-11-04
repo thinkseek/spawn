@@ -20,23 +20,25 @@ export interface OverviewSession {
   observation: Observation | null;
 }
 
-export interface RsiOpenIteration {
-  iteration: number;
-  task_id: number;
-  phase: string;
-  agent_id: string;
-  session_id: string;
-  patch_bytes: number;
-  candidate: string | null;
-  note: string | null;
+/** The task in flight of the RSI objective mission. */
+export interface RsiOpenTask {
+  id: number;
+  state: string;
+  objective: number | null;
+  revisions: number;
+  session_id: string | null;
+  last_verdict: string | null;
 }
 
+/** The first open objective mission, as `/api/overview` summarises it. */
 export interface RsiSummary {
-  baseline: string;
-  iteration: number;
-  consecutive_rejected: number;
-  solved_tasks: number[];
-  open_iteration: RsiOpenIteration | null;
+  mission: number;
+  halted: string | null;
+  baseline: string | null;
+  resident_session: string | null;
+  next_objective: number | null;
+  open_task: RsiOpenTask | null;
+  objectives: { open: number; solved: number; met: number };
 }
 
 export interface Overview {
@@ -148,33 +150,35 @@ function normalizeObservation(value: unknown): Observation | null {
 function normalizeRsi(value: unknown): RsiSummary | null {
   if (value === null || typeof value !== "object") return null;
   const raw = object(value);
-  const baseline = text(raw.baseline);
-  const iteration = optionalNumber(raw.iteration);
-  if (!baseline || iteration === null) return null;
+  const mission = optionalNumber(raw.mission);
+  if (mission === null) return null;
 
-  const openRaw = object(raw.open_iteration);
-  const openIteration =
-    typeof openRaw.task_id === "number"
+  const taskRaw = object(raw.open_task);
+  const openTask =
+    typeof taskRaw.id === "number"
       ? {
-          iteration: number(openRaw.iteration),
-          task_id: number(openRaw.task_id),
-          phase: text(openRaw.phase, "unknown"),
-          agent_id: text(openRaw.agent_id),
-          session_id: text(openRaw.session_id),
-          patch_bytes: number(openRaw.patch_bytes),
-          candidate: optionalText(openRaw.candidate),
-          note: optionalText(openRaw.note),
+          id: number(taskRaw.id),
+          state: text(taskRaw.state, "unknown"),
+          objective: optionalNumber(taskRaw.objective),
+          revisions: number(taskRaw.revisions),
+          session_id: optionalText(taskRaw.session_id),
+          last_verdict: optionalText(taskRaw.last_verdict),
         }
       : null;
+  const counts = object(raw.objectives);
 
   return {
-    baseline,
-    iteration,
-    consecutive_rejected: number(raw.consecutive_rejected),
-    solved_tasks: list(raw.solved_tasks).filter(
-      (task): task is number => typeof task === "number",
-    ),
-    open_iteration: openIteration,
+    mission,
+    halted: optionalText(raw.halted),
+    baseline: optionalText(raw.baseline),
+    resident_session: optionalText(object(raw.resident).session_id),
+    next_objective: optionalNumber(raw.next_objective),
+    open_task: openTask,
+    objectives: {
+      open: number(counts.open),
+      solved: number(counts.solved),
+      met: number(counts.met),
+    },
   };
 }
 

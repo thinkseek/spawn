@@ -48,7 +48,12 @@ export function Sidebar({
   onShowRsi,
   onSelect,
 }: SidebarProps) {
-  const phase = rsi?.open_iteration?.phase ?? null;
+  // The RSI line: halted first, then the task in flight, else idle.
+  const phase = rsi
+    ? rsi.halted
+      ? "halted"
+      : (rsi.open_task?.state ?? "idle")
+    : null;
   return (
     <aside className="hidden w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar md:flex">
       <div className="flex h-12 shrink-0 items-center px-4">
@@ -73,14 +78,14 @@ export function Sidebar({
           active={view === "rsi"}
           onClick={onShowRsi}
           icon={<Activity size={15} />}
-          label="RSI loop"
+          label="RSI mission"
           trailing={
             phase && (
               <span className="flex items-center gap-1.5 text-micro text-faint-foreground">
                 <span
                   className={cx(
                     "size-1.5 rounded-full",
-                    phaseStyle(phase).dot,
+                    phase === "halted" ? "bg-destructive" : phaseStyle(phase).dot,
                     phaseStyle(phase).pulse && "animate-spawn-pulse",
                   )}
                 />
