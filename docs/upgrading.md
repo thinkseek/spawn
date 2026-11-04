@@ -47,12 +47,12 @@ These hold no state that is not rebuildable.
 
 These are not about process lifetime. They break when two versions meet.
 
-1. **`EventKind` is a closed enum.** A new event name written by an upgraded
-   Bridge or Observer, read by an older one, produces `StoreError::Corrupt`.
+1. **`EventKind` is a closed enum.** An event name written by one version of the
+   Bridge or Observer and read by a version without it produces `StoreError::Corrupt`.
    The next tick exits 1. Every process that reads the log must therefore
    carry the same enum.
 2. **The schema.** `migrate()` runs `create or replace` on every connect. An
-   additive column or view is safe for an older reader. A removed or renamed
+   additive column or view is safe for a reader built before it. A removed or renamed
    column is not. `spawn loop` holds one connection, so a migrated schema takes
    effect on its next connection, not on the running one.
 3. **The SQL functions.** `spawn_append`, `spawn_submit`, `spawn_claim` and
