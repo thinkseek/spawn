@@ -260,7 +260,10 @@ fn a_content_conflict_writes_markers_and_the_resolution_becomes_the_merge() {
     assert_eq!(read(&directory, "new.txt"), "theirs\n");
     assert_eq!(fixture.head("agent_a"), head, "the branch did not move");
     let waiting = fs::read_to_string(pending(&directory, "agent_a")).expect("a pending merge");
-    assert!(waiting.starts_with(&main), "{waiting:?}");
+    assert!(
+        waiting.starts_with(&format!("pending-merge\0{main}\0{head}\0")),
+        "{waiting:?}"
+    );
     // Asked again, nothing is written twice.
     assert_eq!(
         fixture.store.merge_base(&workspace).expect("again"),
@@ -642,6 +645,60 @@ fn a_pending_merge_lives_only_in_its_directory() {
     assert!(!pending(&directory, "agent_a").exists(), "mount clears it");
     let after = fixture.work(&workspace, &[("work.txt", "more\n")]);
     assert_eq!(parents(&fixture, &after), vec![head]);
+}
+
+#[test]
+fn a_pending_merge_whose_markers_were_committed_survives_the_unmount() {
+    let fixture = Fixture::new("pending-committed", &[("README.md", "base\n")]);
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    let head = fixture.work(&workspace, &[("README.md", "mine\n")]);
+    let main = fixture.land(&[("README.md", "theirs\n"), ("new.txt", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    // A checkpoint with the markers in, then the execution ends.
+    let Commit::Created(unresolved) = fixture.store.commit(&workspace, "wip").expect("commit")
+    else {
+        panic!("the merge changed the workspace");
+    };
+    assert_eq!(parents(&fixture, unresolved.as_str()), vec![head]);
+    let marked = read(&directory, "README.md");
+    fixture.store.unmount(&workspace).expect("unmount");
+    assert!(
+        pending(&directory, "agent_a").exists(),
+        "the branch carries the markers: main is still owed a parent"
+    );
+
+    // The next execution sees the same markers, not a merge of them.
+    let workspace = fixture.store.mount(&branch).expect("mount");
+    assert!(pending(&directory, "agent_a").exists());
+    assert_eq!(read(&directory, "README.md"), marked);
+    assert_eq!(read(&directory, "new.txt"), "theirs\n");
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec!["README.md".to_string()],
+            marked: true,
+        }
+    );
+    assert_eq!(read(&directory, "README.md"), marked, "no doubled markers");
+
+    // The resolution is the merge with main, and main is now contained.
+    let resolved = fixture.work(&workspace, &[("README.md", "mine and theirs\n")]);
+    assert_eq!(
+        parents(&fixture, &resolved),
+        vec![unresolved.as_str().to_string(), main.clone()]
+    );
+    assert!(!pending(&directory, "agent_a").exists());
+    git(
+        &fixture.checkout,
+        &["merge-base", "--is-ancestor", &main, &resolved],
+    );
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("current"),
+        BaseMerge::Current
+    );
 }
 
 #[test]
