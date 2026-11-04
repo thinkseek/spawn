@@ -21,7 +21,7 @@
 #      resumed, a resident stopped by the supervisor stays down.
 #
 # Usage: SPAWN_DATABASE_URL=postgres://... scripts/mvp-e2e.sh
-# Runs in its own schema (dropped afterwards) and its own tmux socket.
+# Runs in its own schema (dropped afterwards when psql is installed) and its own tmux socket.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -61,6 +61,9 @@ cleanup() {
   [ -n "$jev_pid" ] && kill "$jev_pid" 2>/dev/null || true
   "$tmux" -L "$socket" kill-server 2>/dev/null || true
   rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$socket"
+  if [ "${KEEP:-0}" != 1 ] && command -v psql >/dev/null; then
+    psql -q "$base_url" -c "drop schema if exists $schema cascade" >/dev/null 2>&1 || true
+  fi
   if [ "${KEEP:-0}" != 1 ]; then rm -rf "$work"; else echo "mvp-e2e: kept $work" >&2; fi
 }
 trap cleanup EXIT
