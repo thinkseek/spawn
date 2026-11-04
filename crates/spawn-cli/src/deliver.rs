@@ -285,7 +285,11 @@ pub(crate) fn collect_reports(
     root: &Path,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    for task in work.tasks.iter().filter(|task| task.state == TaskState::Delivered) {
+    for task in work
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Delivered)
+    {
         let idle = rows
             .iter()
             .find(|facts| facts.session_id == task.session_id)
