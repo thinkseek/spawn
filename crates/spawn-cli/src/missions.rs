@@ -15,7 +15,6 @@ const USAGE: &str = "usage:
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
                 [--backlog <dir> --resident <name>]   (owner only)
   spawn mission resume --id N
-  spawn mission import-rsi --id N
   spawn mission list [--limit N]
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
@@ -128,46 +127,6 @@ impl Settings {
     }
 }
 
-/// Bring the retired RSI controller's landed attempts into an objective
-/// mission, once, so objective status carries over.
-fn import_rsi(store: &spawn_postgres::PostgresStore, mission: i64) -> Result<Value, String> {
-    let attempts = store
-        .rsi_recent_attempts(100_000)
-        .map_err(|error| error.to_string())?;
-    let mut imported = 0;
-    for attempt in attempts.iter().filter(|attempt| attempt.accepted) {
-        let metric = crate::objectives::parse_metrics(&attempt.gate_log)
-            .first()
-            .map(|metric| {
-                let value = |number: Option<f64>| number.map_or("?".to_string(), |v| v.to_string());
-                format!(
-                    "METRIC {} baseline={} candidate={}",
-                    metric.name,
-                    value(metric.baseline),
-                    value(metric.candidate)
-                )
-            });
-        let objective = i32::try_from(attempt.task_id).map_err(|error| error.to_string())?;
-        let note = format!(
-            "RSI iteration {} (attempt {}), landed by the retired controller",
-            attempt.iteration, attempt.attempt
-        );
-        if store
-            .objective_import(
-                mission,
-                objective,
-                metric.as_deref(),
-                &note,
-                attempt.created_at_ms,
-            )
-            .map_err(|error| error.to_string())?
-        {
-            imported += 1;
-        }
-    }
-    Ok(json!({ "mission": mission, "imported": imported }))
-}
-
 /// `spawn mission ...`
 pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
     let (verb, flags) = split(rest)?;
@@ -201,7 +160,6 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             store.mission_resume(mission).map_err(err)?;
             print(&json!({ "mission": mission, "resumed": true }));
         }
-        "import-rsi" => print(&import_rsi(&store, id(&flags, "id")?)?),
         "list" => {
             let limit = flags
                 .get("limit")
