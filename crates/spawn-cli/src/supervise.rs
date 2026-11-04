@@ -116,7 +116,8 @@ again. A mission that accepts by gate alone (an objective mission, such as RSI) 
 from the controller's backlog and needs no review from you. A halted mission (three rejections in \
 a row, or its source moved outside the gate) waits for a human: tell them with HUMAN:.
 4. Close the mission when its goal is met: `{spawn} mission close --id N --state done --summary \
-...` (or `--state dropped`).
+...` (or `--state dropped`). Work you accepted in a gated mission still lands after `done`; \
+`dropped` lets it go.
 
 Tools (run them with Bash; they go through your restricted login):
 - `{spawn} mission list` — missions with their tasks, states and reports; the resident roster.
