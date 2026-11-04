@@ -42,6 +42,10 @@ use commands::{admin, engine, inspect, judging, loops, queue};
 
 const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|corpus|judge|evolve|rsi-loop|serve|status|fleet|tail|hook|run|version>";
 
+/// Usage of `spawn dispatch`, the one command that mixes a bare switch with
+/// valued flags.
+pub(crate) const DISPATCH_USAGE: &str = "usage: spawn dispatch [--dry-run] [--root <dir>]";
+
 fn main() {
     let code = match dispatch() {
         Ok(code) => code,

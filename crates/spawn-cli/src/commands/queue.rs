@@ -4,7 +4,7 @@ use spawn_core::command::{CommandAction, Submission};
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::port::CommandQueue;
 
-use crate::config::{env_value, open_store, spawn_program, supervised};
+use crate::config::{env_value, open_store, spawn_program, supervised, workspace_root};
 use crate::flags::Flags;
 use crate::{dispatch, trace};
 
@@ -40,10 +40,19 @@ pub(crate) fn submit(flags: &Flags) -> Result<i32, String> {
     Ok(0)
 }
 
-/// `spawn dispatch [--dry-run]`: one dispatcher step; `--dry-run` prints the
-/// plan and submits nothing.
+/// `spawn dispatch [--dry-run] [--root <dir>]`: one dispatcher step;
+/// `--dry-run` prints the plan and submits nothing; `--root` (default
+/// `SPAWN_WORKSPACE_ROOT`) is the workspace root, as for `spawn loop`.
 pub(crate) fn dispatch_once(rest: &[String]) -> Result<i32, String> {
     let dry = rest.iter().any(|word| word == "--dry-run");
+    let valued: Vec<String> = rest
+        .iter()
+        .filter(|word| *word != "--dry-run")
+        .cloned()
+        .collect();
+    let flags =
+        Flags::parse(&valued).map_err(|error| format!("{error}\n{}", crate::DISPATCH_USAGE))?;
+    let root = workspace_root(&flags).map(std::path::PathBuf::from);
     let store = open_store()?;
     let supervised = supervised();
     let spawn = spawn_program();
@@ -65,14 +74,7 @@ pub(crate) fn dispatch_once(rest: &[String]) -> Result<i32, String> {
         }
         return Ok(0);
     }
-    for line in dispatch::step(
-        &store,
-        supervised,
-        &spawn,
-        env_value("SPAWN_WORKSPACE_ROOT")
-            .map(std::path::PathBuf::from)
-            .as_deref(),
-    )? {
+    for line in dispatch::step(&store, supervised, &spawn, root.as_deref())? {
         println!("{line}");
     }
     Ok(0)
