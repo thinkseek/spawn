@@ -59,7 +59,7 @@
 
 ### 4.1 判定新鲜度
 
-Observer 只在结论变化时写 `observation.recorded`。因此 `agent_state.based_on_seq < max(session_seq)` 不表示判定落后：Observer 可能已经判定过后续事件，结论不变所以没写。
+规则的结论只在变化时写 `observation.recorded`（判定器的回答每次都写）。因此 `agent_state.based_on_seq < max(session_seq)` 不表示判定落后：Observer 可能已经判定过后续事件，结论不变所以没写。
 
 | 能回答 | 不能回答 |
 | --- | --- |
