@@ -305,3 +305,103 @@ fn no_merge_while_a_turn_runs() {
         ["commit", "commit", "commit", "merge_base"]
     );
 }
+
+/// A busy pane: a turn runs.
+const BUSY: &str = "✽ Effecting… (27m 12s · ↓ 92.3k tokens)\n❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+fn merges(store: &MemoryStore) -> usize {
+    store
+        .workspace_calls()
+        .iter()
+        .filter(|call| *call == "merge_base")
+        .count()
+}
+
+#[test]
+fn an_idle_execution_is_offered_main_every_thirty_seconds_and_never_in_a_turn() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, READY);
+    let mut bridge = bridge(&store).with_clock(clock.clone());
+    let wait = |seconds: u64| clock.advance(std::time::Duration::from_secs(seconds));
+    start(&store, None);
+    bridge.tick().expect("start");
+
+    // The turn ends: the merge right after its checkpoint.
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint the turn");
+    assert_eq!(merges(&store), 1);
+
+    // Idle: nothing within 30 s, one offer after.
+    wait(29);
+    bridge.tick().expect("idle");
+    assert_eq!(merges(&store), 1, "not within 30 s");
+    wait(1);
+    bridge.tick().expect("idle");
+    assert_eq!(merges(&store), 2, "after 30 s");
+    bridge.tick().expect("idle");
+    assert_eq!(merges(&store), 2);
+
+    // A conflict is reported once, however often it is offered again.
+    store.set_base_merge(BaseMerge::Conflicted {
+        files: vec!["README.md".to_string()],
+        marked: true,
+    });
+    let mut warnings = 0;
+    for _ in 0..3 {
+        wait(30);
+        warnings += bridge.tick().expect("idle").warnings.len();
+    }
+    assert_eq!(merges(&store), 5);
+    assert_eq!(warnings, 1, "one warning per conflict");
+    store.set_base_merge(BaseMerge::Conflicted {
+        files: vec!["README.md".to_string(), "x.rs".to_string()],
+        marked: true,
+    });
+    wait(30);
+    assert_eq!(
+        bridge.tick().expect("idle").warnings.len(),
+        1,
+        "a new conflict is reported"
+    );
+    store.set_base_merge(BaseMerge::Current);
+
+    // A turn the engine opened: no offer, however long it runs.
+    transcript(&store, &[prompt("2")]);
+    bridge.tick().expect("read the prompt");
+    let before = merges(&store);
+    wait(120);
+    bridge.tick().expect("in a turn");
+    assert_eq!(merges(&store), before, "never during a turn");
+    transcript(&store, &[turn_end("2")]);
+    bridge.tick().expect("read the turn end");
+    bridge.tick().expect("checkpoint the turn");
+    assert_eq!(merges(&store), before + 1, "the turn's own merge");
+
+    // A prompt the Bridge types: the turn is open at once.
+    wait(30);
+    submit(
+        &store,
+        "key_input",
+        CommandAction::Input {
+            text: "more".to_string(),
+        },
+    );
+    bridge.tick().expect("type");
+    assert_eq!(merges(&store), before + 1, "never while a command is typed");
+    transcript(&store, &[prompt("3"), turn_end("3")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint the turn");
+    assert_eq!(merges(&store), before + 2);
+
+    // A screen that does not read ready is not idle.
+    store.set_pane(&terminal, BUSY);
+    bridge.tick().expect("first reading");
+    bridge.tick().expect("confirmed busy");
+    let busy = merges(&store);
+    wait(60);
+    bridge.tick().expect("busy");
+    assert_eq!(merges(&store), busy, "only a ready screen is idle");
+}

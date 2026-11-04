@@ -128,7 +128,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
 
-合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。`Merged` 写 `artifact.committed`（reason `base_merged`）；`Conflicted` 与失败只进 tick 报告的警告（区分「目录里已有冲突标记」与「标记表达不了，未合并」），冲突由落地告诉 agent。
+合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。此外，空闲的活执行（没有进行中的回合、本 tick 没读到要求 checkpoint 的事件、屏幕最后读到 Ready）按 Bridge 自己的时钟每 30 秒（`IDLE_MERGE_MS`）至多调用一次 `merge_base`；Bridge 投递提示（`Start` 的首个提示、`Input`）时立即打开回合。`Merged` 写 `artifact.committed`（reason `base_merged`，折叠时不清掉仍待做的 checkpoint）；同一冲突或失败的警告只报一次，状态变了才再报；`Conflicted` 与失败只进 tick 报告的警告（区分「目录里已有冲突标记」与「标记表达不了，未合并」），冲突由落地告诉 agent。
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。
 

@@ -33,6 +33,12 @@ use crate::time::{Clock, SystemClock};
 /// read as its own.
 const CLOCK_SLACK_MS: i64 = 60_000;
 
+/// An idle execution's workspace is offered the source's main at most this
+/// often, by the Bridge's clock, besides right after each turn ends: an agent
+/// already idle when main moves gets the merge (or the conflict markers)
+/// without waiting for a turn.
+pub const IDLE_MERGE_MS: i64 = 30_000;
+
 /// Engine choice and prompt of one launch.
 ///
 /// Grouped so that [`Bridge::launch`] keeps a readable parameter list.
@@ -155,6 +161,14 @@ struct Follow {
     warned: bool,
     /// The runner's exit file is unreadable; warned once.
     exit_warned: bool,
+    /// When `merge_base` last ran for this execution, by the Bridge's clock.
+    merge_at: Option<i64>,
+    /// The last merge warning reported: the same conflict (or failure) is
+    /// reported once, not every [`IDLE_MERGE_MS`].
+    merge_warning: Option<String>,
+    /// This tick read an event that asks for a checkpoint, not folded yet:
+    /// the workspace may hold work not on its branch.
+    checkpoint_read: bool,
 }
 
 /// What the Bridge knows about one session.
@@ -329,7 +343,11 @@ impl Bridge {
             } => {
                 view.native = Some((*engine, native_session_id.clone()));
             }
-            EventKind::ArtifactCommitted { .. } => {
+            // A merge of main is no checkpoint of the agent's work: one
+            // still due stays due.
+            EventKind::ArtifactCommitted { reason, .. }
+                if *reason != CheckpointReason::BaseMerged =>
+            {
                 if let Some(active) = view.active.as_mut() {
                     active.checkpoint = None;
                 }
@@ -384,6 +402,7 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
+        active.follow.checkpoint_read = false;
         self.follow_output(agent_id, session, native, active, report)?;
         let end = match active
             .reported_end
@@ -416,22 +435,44 @@ impl Bridge {
             if committed && reason == CheckpointReason::TurnStopped && !active.turn_open {
                 self.merge_base(agent_id, session, active, report)?;
             }
+        } else if self.idle_merge_due(active) {
+            self.merge_base(agent_id, session, active, report)?;
         }
         Ok(false)
     }
 
+    /// Whether an execution with nothing to checkpoint is offered main now:
+    /// no turn open, nothing read this tick that asks for a checkpoint, the
+    /// screen last read ready, and the last offer at least [`IDLE_MERGE_MS`]
+    /// ago.
+    fn idle_merge_due(&self, active: &Active) -> bool {
+        let ready = active
+            .follow
+            .screen
+            .is_some_and(|(state, _)| state == ScreenState::Ready);
+        let now = self.clock.now().0;
+        !active.turn_open
+            && !active.follow.checkpoint_read
+            && ready
+            && active
+                .follow
+                .merge_at
+                .is_none_or(|at| now.saturating_sub(at) >= IDLE_MERGE_MS)
+    }
+
     /// Merge the source's main into the branch of an idle workspace, and
-    /// record the merge as a checkpoint. A conflict changes nothing and is
-    /// only reported: landing tells the agent.
+    /// record the merge as a checkpoint. A conflict is reported, once per
+    /// conflict: landing tells the agent, and its files carry the markers.
     fn merge_base(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
-        active: &Active,
+        active: &mut Active,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
-        match self.workspaces.merge_base(&active.workspace) {
-            Ok(BaseMerge::Current) => {}
+        active.follow.merge_at = Some(self.clock.now().0);
+        let warning = match self.workspaces.merge_base(&active.workspace) {
+            Ok(BaseMerge::Current) => None,
             Ok(BaseMerge::Merged { commit, .. }) => {
                 let artifact = ArtifactRef {
                     project: self.workspaces.project().to_string(),
@@ -449,8 +490,9 @@ impl Bridge {
                         artifact,
                     },
                 )?;
+                None
             }
-            Ok(BaseMerge::Conflicted { files, marked }) => report.warnings.push(if marked {
+            Ok(BaseMerge::Conflicted { files, marked }) => Some(if marked {
                 format!(
                     "{session}: main conflicts with the branch in {}; the workspace carries \
                      conflict markers there until they are resolved",
@@ -463,10 +505,14 @@ impl Bridge {
                     files.join(", ")
                 )
             }),
-            Err(error) => report
-                .warnings
-                .push(format!("{session}: merge main: {error}")),
+            Err(error) => Some(format!("{session}: merge main: {error}")),
+        };
+        if let Some(text) = &warning
+            && active.follow.merge_warning.as_ref() != Some(text)
+        {
+            report.warnings.push(text.clone());
         }
+        active.follow.merge_warning = warning;
         Ok(())
     }
 
@@ -583,6 +629,7 @@ impl Bridge {
                 if let Some(open) = opens_turn(&kind) {
                     active.turn_open = open;
                 }
+                active.follow.checkpoint_read |= kind.checkpoint_reason().is_some();
                 self.append(
                     agent_id,
                     session,
@@ -881,6 +928,9 @@ impl Bridge {
                 // whoever started it would wait on it forever.
                 return self.abandon(claimed, &active, why);
             }
+            // The prompt starts a turn before the transcript says so.
+            self.catch_up()?;
+            self.open_turn(&claimed.session_id);
             return Ok(outcome);
         }
         Ok(Outcome::Succeeded)
@@ -1124,16 +1174,22 @@ impl Bridge {
         {
             Ok(()) => {
                 // A turn starts now, before its transcript says so.
-                if let Some(held) = self
-                    .sessions
-                    .get_mut(&claimed.session_id)
-                    .and_then(|view| view.active.as_mut())
-                {
-                    held.turn_open = true;
-                }
+                self.open_turn(&claimed.session_id);
                 Ok(Outcome::Succeeded)
             }
             Err(error) => Ok(Outcome::Failed(format!("submit text: {error}"))),
+        }
+    }
+
+    /// The Bridge typed a prompt: the session's turn is open from now on, so
+    /// no merge touches the workspace until the turn ends.
+    fn open_turn(&mut self, session: &SessionId) {
+        if let Some(held) = self
+            .sessions
+            .get_mut(session)
+            .and_then(|view| view.active.as_mut())
+        {
+            held.turn_open = true;
         }
     }
 
