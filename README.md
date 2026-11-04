@@ -84,7 +84,7 @@ Actions for `--action`:
 
 | `type` | Fields |
 | --- | --- |
-| `start` | `engine` (`claude` or `codex`), `prompt` (Codex requires a non-empty one), optional `parent_session_id` |
+| `start` | `engine` (`claude` or `codex`), `prompt` (Codex requires a non-empty one), optional `parent_session_id`, optional `from` (another agent of the same mission source, meaning its branch head, or a full commit id: where a new branch starts instead of `main`) |
 | `input` | `text`; Claude only |
 | `resume` | optional `prompt`; Codex requires it |
 | `stop` | none |

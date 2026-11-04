@@ -11,15 +11,15 @@ use std::time::Duration;
 
 use crate::command::{Claimed, Outcome, Submission};
 use crate::event::{
-    Appended, EventKind, EventRecord, GlobalPosition, NewEvent, SessionSeq, Source,
+    Appended, EventKind, EventRecord, Fork, GlobalPosition, NewEvent, SessionSeq, Source,
 };
 use crate::id::{
     BranchName, CommandId, CommitId, IdempotencyKey, Principal, SessionId, TerminalName,
     WorkspaceId,
 };
 use crate::port::{
-    CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError, TerminalError, TerminalHost,
-    WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT, StoreError,
+    TerminalError, TerminalHost, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -45,6 +45,7 @@ struct Lease {
 #[derive(Debug, Clone)]
 struct MountState {
     dirty: bool,
+    branch: BranchName,
 }
 
 /// All in-memory state behind one lock.
@@ -55,9 +56,16 @@ struct State {
     next_position: u64,
     commands: Vec<CommandRow>,
     next_command: u64,
-    branches: HashSet<BranchName>,
+    /// Branch heads.
+    heads: HashMap<BranchName, CommitId>,
+    /// Every commit the store issued.
+    known: HashSet<CommitId>,
     mounts: HashMap<WorkspaceId, MountState>,
     commits: u64,
+    /// What `merge_base` answers.
+    base_merge: BaseMerge,
+    /// Workspace calls in order, for tests of the call order.
+    workspace_calls: Vec<String>,
     terminals: HashSet<TerminalName>,
     panes: HashMap<TerminalName, String>,
     files: HashMap<String, Vec<u8>>,
@@ -126,6 +134,19 @@ impl MemoryStore {
             .entry(path.to_string())
             .or_default()
             .extend_from_slice(bytes.as_bytes());
+    }
+
+    /// What `merge_base` answers from now on (a merge moves the branch to
+    /// its commit). Test helper.
+    pub fn set_base_merge(&self, merge: BaseMerge) {
+        self.lock().base_merge = merge;
+    }
+
+    /// The workspace calls so far, in order: `ensure_branch <branch>
+    /// <from or ->`, `mount <branch>`, `commit`, `merge_base`, `unmount`.
+    /// Test helper.
+    pub fn workspace_calls(&self) -> Vec<String> {
+        self.lock().workspace_calls.clone()
     }
 
     /// Mark a workspace as holding uncommitted changes. Test helper.
@@ -291,14 +312,49 @@ impl WorkspaceStore for MemoryStore {
         &self.project
     }
 
-    fn ensure_branch(&self, branch: &BranchName) -> Result<(), WorkspaceError> {
-        self.lock().branches.insert(branch.clone());
-        Ok(())
+    fn ensure_branch(
+        &self,
+        branch: &BranchName,
+        from: Option<&str>,
+    ) -> Result<Branch, WorkspaceError> {
+        let mut state = self.lock();
+        state
+            .workspace_calls
+            .push(format!("ensure_branch {branch} {}", from.unwrap_or("-")));
+        if state.heads.contains_key(branch) {
+            return Ok(Branch::Existing);
+        }
+        let commit = match from.map(ForkFrom::parse).transpose()? {
+            None => base_commit(),
+            Some(ForkFrom::Agent(agent)) => state
+                .heads
+                .get(&BranchName::for_agent(&agent))
+                .cloned()
+                .ok_or_else(|| WorkspaceError::Refused {
+                    code: "NoSuchFrom".to_string(),
+                    message: format!("{agent} has no branch"),
+                })?,
+            Some(ForkFrom::Commit(commit)) => {
+                if commit != base_commit() && !state.known.contains(&commit) {
+                    return Err(WorkspaceError::Refused {
+                        code: "NoSuchFrom".to_string(),
+                        message: format!("no commit {commit}"),
+                    });
+                }
+                commit
+            }
+        };
+        state.heads.insert(branch.clone(), commit.clone());
+        Ok(Branch::Created(Fork {
+            from: from.unwrap_or("main").to_string(),
+            commit,
+        }))
     }
 
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
         let mut state = self.lock();
-        if !state.branches.contains(branch) {
+        state.workspace_calls.push(format!("mount {branch}"));
+        if !state.heads.contains_key(branch) {
             return Err(WorkspaceError::Refused {
                 code: "NoSuchBranch".to_string(),
                 message: branch.to_string(),
@@ -307,14 +363,19 @@ impl WorkspaceStore for MemoryStore {
         let number = state.mounts.len() + 1;
         let workspace = WorkspaceId::new(format!("{number}:/workspaces/{number}"))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
-        state
-            .mounts
-            .insert(workspace.clone(), MountState { dirty: false });
+        state.mounts.insert(
+            workspace.clone(),
+            MountState {
+                dirty: false,
+                branch: branch.clone(),
+            },
+        );
         Ok(workspace)
     }
 
     fn commit(&self, workspace: &WorkspaceId, _message: &str) -> Result<Commit, WorkspaceError> {
         let mut state = self.lock();
+        state.workspace_calls.push("commit".to_string());
         let Some(mount) = state.mounts.get_mut(workspace) else {
             return Err(WorkspaceError::Refused {
                 code: "NoSuchWorkspace".to_string(),
@@ -325,17 +386,47 @@ impl WorkspaceStore for MemoryStore {
             return Ok(Commit::Unchanged);
         }
         mount.dirty = false;
+        let branch = mount.branch.clone();
         state.commits += 1;
-        Ok(Commit::Created(
-            CommitId::new(format!("c_{}", state.commits))
-                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
-        ))
+        let commit = CommitId::new(format!("{:040x}", state.commits))
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
+        state.known.insert(commit.clone());
+        state.heads.insert(branch, commit.clone());
+        Ok(Commit::Created(commit))
     }
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
-        self.lock().mounts.remove(workspace);
+        let mut state = self.lock();
+        state.workspace_calls.push("unmount".to_string());
+        state.mounts.remove(workspace);
         Ok(())
     }
+
+    fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+        let mut state = self.lock();
+        state.workspace_calls.push("merge_base".to_string());
+        let Some(branch) = state
+            .mounts
+            .get(workspace)
+            .map(|mount| mount.branch.clone())
+        else {
+            return Err(WorkspaceError::Refused {
+                code: "NoSuchWorkspace".to_string(),
+                message: workspace.to_string(),
+            });
+        };
+        let merge = state.base_merge.clone();
+        if let BaseMerge::Merged { commit, .. } = &merge {
+            state.known.insert(commit.clone());
+            state.heads.insert(branch, commit.clone());
+        }
+        Ok(merge)
+    }
+}
+
+/// The base commit of every memory branch.
+fn base_commit() -> CommitId {
+    CommitId::new("b".repeat(40)).unwrap_or_else(|_| unreachable!("a valid label"))
 }
 
 impl TerminalHost for MemoryStore {

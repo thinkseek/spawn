@@ -260,6 +260,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>) -> Option<Order> {
                 engine: Engine::Claude,
                 prompt: task_prompt(task),
                 parent_session_id: None,
+                from: None,
             },
         )),
     }
