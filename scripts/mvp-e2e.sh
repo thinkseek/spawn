@@ -442,6 +442,39 @@ fi
 board | jq -e --argjson id "$gm" '.missions[] | select(.id == $id) | .halted == null' >/dev/null || fail "resume did not clear the halt"
 pass "a push outside the gate halts the mission until a human resumes it"
 
+# RSI as a mission (§10.4): the integrator turns the backlog into tasks for
+# a resident, and the gate alone accepts them.
+improved=$work/improved.git
+git init -q --bare --initial-branch=main "$improved"
+git -C "$seed" push -q "$improved" main:main
+rsi_gate=$work/rsi-gate
+rsi_backlog=$work/rsi-backlog
+mkdir -p "$rsi_gate" "$rsi_backlog"
+printf '#!/bin/sh\n# Objective 1: the file exists.\n[ -e OBJECTIVE_DONE ]\n' >"$rsi_gate/001.sh"
+printf '#!/bin/sh\n# Check: no file named BAD.\n[ ! -e BAD ]\n' >"$rsi_gate/check-no-bad.sh"
+printf '{"id": 1, "title": "Mark it done", "prompt": "E2E:REPORT E2E:WRITE=OBJECTIVE_DONE"}\n' >"$rsi_backlog/001.json"
+sup resident propose --name improver --charter "Pursues the backlog's objectives" >/dev/null
+"$bin" resident approve --name improver >/dev/null
+om=$("$bin" mission add --text "E2E objectives" --source "$improved" --gate "$rsi_gate" --accept gate \
+  --backlog "$rsi_backlog" --resident improver | jq -r .mission)
+if sup mission configure --id "$om" --gate "$rsi_gate" --accept gate --backlog "$rsi_backlog" --resident improver >/dev/null 2>&1; then
+  fail "the supervisor configured objectives"
+fi
+SPAWN_GATE=$root/scripts/rsi/gate.sh "$bin" integrate --once --root "$work/ws" >>"$work/integrate.log" 2>&1
+objective_task() { board | jq -r --argjson id "$om" '[.missions[] | select(.id == $id) | .tasks[] | select(.objective == 1)] | first | .id // empty'; }
+t8=$(objective_task)
+[ -n "$t8" ] || fail "the integrator assigned no objective task: $(tail -n 5 "$work/integrate.log")"
+board | jq -e --argjson id "$t8" '.missions[].tasks[] | select(.id == $id) | .created_by == "spawn-integrate" and (.brief | test("Objective 1"))' >/dev/null ||
+  fail "the objective task does not come from the integrator"
+wait_for 60 "the objective's report" state_is "$t8" reported
+SPAWN_GATE=$root/scripts/rsi/gate.sh "$bin" integrate --once --root "$work/ws" >>"$work/integrate.log" 2>&1
+state_is "$t8" landed || fail "the gate did not land the objective: $(task_state "$t8"); $(tail -n 5 "$work/integrate.log")"
+git --git-dir="$improved" cat-file -e main:OBJECTIVE_DONE || fail "the objective's work is not on main"
+SPAWN_GATE=$root/scripts/rsi/gate.sh "$bin" integrate --once --root "$work/ws" >>"$work/integrate.log" 2>&1
+[ "$(board | jq --argjson id "$om" '[.missions[] | select(.id == $id) | .tasks[]] | length')" -eq 1 ] ||
+  fail "a solved objective was assigned again"
+pass "an objective becomes a resident's task, the gate alone lands it, and a solved one is not reassigned"
+
 "$bin" submit --principal human --agent agent_resident_core --session session_resident_core \
   --key "human-$(date +%s%N)" --action '{"type":"input","text":"hello from a human"}' >/dev/null
 human_noted() { pane session_supervisor | grep -q '\[spawn:esc session_resident_core human-'; }

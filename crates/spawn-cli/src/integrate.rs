@@ -16,7 +16,9 @@
 //!    by `scripts/rsi/gate.sh` with the mission's scenarios. A pass records
 //!    the verdict before git moves, then moves the source's main with a
 //!    compare-and-swap push and records the landing. A rejection sends the
-//!    task back to its worker with the gate's output as the note.
+//!    task back to its worker with the gate's output as the note;
+//! 5. an objective mission with no open task gets its next objective
+//!    ([`objectives`]).
 //!
 //! Like the dispatcher, it keeps no state of its own: the control stream
 //! says what was judged and landed. Passes are serialized by the same
@@ -36,8 +38,8 @@ use spawn_postgres::PostgresStore;
 
 use crate::config::{loop_interval, workspace_root};
 use crate::gate::{self, GateFailure};
-use crate::sources;
 use crate::{Flags, env_or, open_store};
+use crate::{objectives, sources};
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
@@ -76,7 +78,11 @@ pub(crate) struct Mission {
     #[serde(default)]
     pub(crate) gate_aborts: u32,
     #[serde(default)]
+    pub(crate) objectives: Option<Value>,
+    #[serde(default)]
     pub(crate) source: Option<String>,
+    /// Its open tasks (assigned, delivered, reported, revise, accepted,
+    /// landing).
     #[serde(default)]
     pub(crate) tasks: Vec<Task>,
 }
@@ -289,6 +295,8 @@ impl Integrator {
             );
         }
         let Some(task) = mission.ready() else {
+            // An objective mission with nothing open gets its next task.
+            objectives::assign_next(store, mission)?;
             return Ok(());
         };
         self.judge(store, &mirror, source, &main, &scenarios, count, task)

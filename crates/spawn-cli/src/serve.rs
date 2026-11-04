@@ -17,7 +17,7 @@ use spawn_core::port::TerminalHost;
 use spawn_host::{TmuxHost, docker_prefix};
 use spawn_postgres::{RSI_AGENT, RSI_SESSION, RsiIterationRow};
 
-use crate::evolve::{Task, landed_metric, load_backlog, parse_metrics};
+use crate::objectives::{Task, load_backlog, parse_metrics};
 use crate::{Flags, env_or, env_value};
 
 /// Prefix of an error that answers 400.
@@ -176,6 +176,28 @@ fn now_ms() -> i64 {
         .map_or(0, |time| {
             i64::try_from(time.as_millis()).unwrap_or(i64::MAX)
         })
+}
+
+/// The latest landed value of a recurring task's metric, from the retired
+/// RSI controller's attempts: the RSI page shows that frozen history until
+/// it moves to the objective mission (docs/fleet-architecture.md §10.4).
+fn landed_metric(
+    store: &spawn_postgres::PostgresStore,
+    task: &Task,
+) -> Result<Option<f64>, String> {
+    let Some(name) = &task.metric else {
+        return Ok(None);
+    };
+    let attempts = store.rsi_attempts_of(task.id, 200).map_err(err)?;
+    Ok(attempts
+        .iter()
+        .filter(|attempt| attempt.accepted)
+        .find_map(|attempt| {
+            parse_metrics(&attempt.gate_log)
+                .into_iter()
+                .find(|metric| &metric.name == name)?
+                .candidate
+        }))
 }
 
 /// The objective the loop pursues: the first recurring task in the

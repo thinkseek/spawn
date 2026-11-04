@@ -44,12 +44,62 @@ impl PostgresStore {
         gate: Option<&str>,
         accept: &str,
         budget: Option<&Value>,
+        objectives: Option<&Value>,
     ) -> Result<(), StoreError> {
         self.execute(
             missions::MISSION_CONFIGURE,
-            &[&mission, &gate, &accept, &budget],
+            &[&mission, &gate, &accept, &budget, &objectives],
         )?;
         Ok(())
+    }
+
+    /// Assign an objective mission's next task to its resident (owner only).
+    pub fn objective_assign(
+        &self,
+        mission: i64,
+        objective: i32,
+        scenario: Option<&str>,
+        brief: &str,
+    ) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(
+                missions::OBJECTIVE_ASSIGN,
+                &[&mission, &objective, &scenario, &brief],
+            )?
+            .get(0))
+    }
+
+    /// Import one landed attempt of the retired RSI controller; false when
+    /// it was imported before.
+    pub fn objective_import(
+        &self,
+        mission: i64,
+        objective: i32,
+        metric: Option<&str>,
+        note: &str,
+        at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .query_one(
+                missions::OBJECTIVE_IMPORT,
+                &[&mission, &objective, &metric, &note, &at_ms],
+            )?
+            .get(0))
+    }
+
+    /// An objective mission's landed tasks, newest first.
+    pub fn objective_landings(&self, mission: i64) -> Result<Value, StoreError> {
+        self.query_json(missions::OBJECTIVE_LANDINGS, &[&mission])
+    }
+
+    /// Gate verdicts on one objective's tasks, newest first.
+    pub fn objective_history(
+        &self,
+        mission: i64,
+        objective: i32,
+        limit: i64,
+    ) -> Result<Value, StoreError> {
+        self.query_json(missions::OBJECTIVE_HISTORY, &[&mission, &objective, &limit])
     }
 
     /// Clear a halted mission. A human's decision: owner only.

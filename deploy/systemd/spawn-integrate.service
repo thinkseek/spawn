@@ -1,5 +1,5 @@
 [Unit]
-Description=Spawn RSI controller (spawn rsi-loop): one workload of the fleet
+Description=Spawn integrator (spawn integrate): lands gated missions' work, assigns objectives (RSI)
 After=spawn-loop.service docker.service
 Wants=spawn-loop.service
 
@@ -10,11 +10,12 @@ Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin
 Environment=http_proxy=http://127.0.0.1:10801 https_proxy=http://127.0.0.1:10801 HTTP_PROXY=http://127.0.0.1:10801 HTTPS_PROXY=http://127.0.0.1:10801
 Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 Environment=SPAWN_PROGRAM=%h/.local/share/spawn-rsi/bin/spawn
-ExecStart=%h/.local/share/spawn-rsi/bin/spawn rsi-loop
-Restart=on-failure
+# The gate and the scenarios come from this checkout, never from a tree under test.
+Environment=SPAWN_GATE=%h/projects/Spawn/scripts/rsi/gate.sh
+ExecStart=%h/.local/share/spawn-rsi/bin/spawn integrate
+# A halt is per mission and recorded in the log; the process keeps running.
+Restart=always
 RestartSec=10
-# Exit 2 is the RSI halt: a decision for a human. It stops RSI only.
-RestartPreventExitStatus=2
 
 [Install]
 WantedBy=default.target

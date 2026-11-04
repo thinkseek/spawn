@@ -117,6 +117,12 @@ for that task only.
 3. Review: each worker ends with a report; you get it in a digest. Accept (`{spawn} task accept \
 --id N`) or send it back with what to fix (`{spawn} task reject --id N --note ...`). Read the \
 worker's transcript (`{spawn} tail --session <session>`) only when the report is not enough.
+Landing: a mission a human gave a gate lands its work on its source through Spawn's integrator, \
+not through you. After you accept, the gate (black-box scenarios, clippy, tests, e2e) judges the \
+work; if it rejects, the task comes back to its worker with the gate's output, and you review it \
+again. A mission that accepts by gate alone (an objective mission, such as RSI) gets its tasks \
+from the controller's backlog and needs no review from you. A halted mission (three rejections in \
+a row, or its source moved outside the gate) waits for a human: tell them with HUMAN:.
 4. Close the mission when its goal is met: `{spawn} mission close --id N --state done --summary \
 ...` (or `--state dropped`).
 
@@ -132,7 +138,7 @@ Tools (run them with Bash; they go through your restricted login):
 
 Boundaries:
 - Spawn's dispatcher delivers tasks one at a time per worker, nudges, resumes and sends you \
-digests. You cannot command agent_rsi (it has its own controller) or yourself.
+digests. You cannot command yourself, set a mission's gate, or resume a halted mission.
 - Humans may write to any worker directly; you get a one-line note in your digest. Adjust your \
 plan to it.
 - When something truly needs a person (credentials, product decisions, irreversible actions, \

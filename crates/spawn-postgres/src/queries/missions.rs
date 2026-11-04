@@ -82,7 +82,38 @@ pub(crate) const MISSION_ADD: &str = "select spawn_mission_add($1, $2, $3)";
 /// `$1` mission, `$2` final state, `$3` summary.
 pub(crate) const MISSION_CLOSE: &str = "select spawn_mission_close($1, $2, $3)";
 /// `$1` mission, `$2` gate (absolute path or null), `$3` accept, `$4` budget.
-pub(crate) const MISSION_CONFIGURE: &str = "select spawn_mission_configure($1, $2, $3, $4)";
+/// `$5` objectives (`{backlog, resident}` or null).
+pub(crate) const MISSION_CONFIGURE: &str = "select spawn_mission_configure($1, $2, $3, $4, $5)";
+/// `$1` mission, `$2` objective, `$3` scenario, `$4` brief; returns the task.
+pub(crate) const OBJECTIVE_ASSIGN: &str = "select spawn_objective_assign($1, $2, $3, $4)";
+/// `$1` mission, `$2` objective, `$3` metric line, `$4` note, `$5` time.
+pub(crate) const OBJECTIVE_IMPORT: &str = "select spawn_objective_import($1, $2, $3, $4, $5)";
+
+/// An objective mission's landed tasks: `[{objective, metric}]`, newest
+/// first. `$1` mission.
+pub(crate) const OBJECTIVE_LANDINGS: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric', k.metric)
+                          order by k.updated_at_ms desc, k.id desc), '[]'::jsonb)
+  from mission_tasks k
+ where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
+
+/// Gate verdicts on one objective's tasks, newest first, from the control
+/// stream: `[{task, verdict, reason, metric, at_ms}]`. `$1` mission,
+/// `$2` objective, `$3` limit.
+pub(crate) const OBJECTIVE_HISTORY: &str = r"
+select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
+  from (select e.session_seq as seq,
+               jsonb_build_object('task', (r ->> 'id')::bigint, 'verdict', r ->> 'verdict',
+                                  'reason', r ->> 'reason', 'metric', r ->> 'metric',
+                                  'at_ms', e.recorded_at_ms) as h
+          from spawn_events e
+         cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and r ->> 'type' = 'task.gated' and r ->> 'verdict' in ('accepted', 'rejected', 'aborted')
+           and (r ->> 'id')::bigint in (select id from mission_tasks
+                                         where mission_id = $1 and objective = $2)
+         order by e.session_seq desc
+         limit $3) z";
 /// `$1` mission.
 pub(crate) const MISSION_RESUME: &str = "select spawn_mission_resume($1)";
 /// `$1` the record; returns its event id.
@@ -94,7 +125,7 @@ pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
-         m.gate_rejections, m.gate_aborts, m.sources ->> 0 as source,
+         m.gate_rejections, m.gate_aborts, m.objectives, m.sources ->> 0 as source,
          coalesce((select jsonb_agg(jsonb_build_object(
                      'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
                      'session_id', k.session_id, 'state', k.state, 'base', k.base,
@@ -103,7 +134,8 @@ from (
                      order by k.id)
                    from mission_tasks k
                   where k.mission_id = m.id
-                    and k.state in ('delivered', 'reported', 'accepted', 'landing')), '[]'::jsonb) as tasks
+                    and k.state in ('assigned', 'delivered', 'reported', 'revise',
+                                    'accepted', 'landing')), '[]'::jsonb) as tasks
     from mission_missions m
    where m.gate is not null and m.state in ('open', 'active')
 ) x";

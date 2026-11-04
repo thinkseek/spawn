@@ -1,5 +1,5 @@
-//! `tick`, `loop` and `rsi-loop`: one pass, the resident loop, and the RSI
-//! controller's own loop.
+//! `tick` and `loop`: one pass, and the resident loop. Landing and RSI
+//! objectives run in `spawn integrate` (crate::integrate).
 
 use spawn_postgres::PostgresStore;
 
@@ -8,7 +8,7 @@ use crate::config::{
 };
 use crate::flags::Flags;
 use crate::runtime::runtime;
-use crate::{dispatch, evolve, supervise, trace};
+use crate::{dispatch, supervise, trace};
 
 /// Most intervals a failing loop waits before its next pass.
 const MAX_BACKOFF_INTERVALS: u32 = 30;
@@ -105,41 +105,6 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         }
         // ponytail: fixed backoff, cap at 30 intervals. A per-error-kind
         // schedule only matters once a failure class is slow to clear.
-        std::thread::sleep(backoff(interval, failures));
-    }
-}
-
-/// `spawn evolve`: one RSI step; idle counts as success.
-pub(crate) fn evolve_once(flags: &Flags) -> Result<i32, String> {
-    evolve::evolve(flags).map(|code| if code == evolve::IDLE { 0 } else { code })
-}
-
-/// Run the RSI controller until it halts.
-///
-/// RSI is one workload of the fleet, not the fleet: it runs in its own
-/// process, so a 20-minute gate does not stall the Bridge, and its halt (exit
-/// 2, a decision for a human) stops only the RSI loop, never the supervisor.
-pub(crate) fn rsi_loop(flags: &Flags) -> Result<i32, String> {
-    let interval = loop_interval();
-    let mut failures: u32 = 0;
-    loop {
-        match evolve::evolve(flags) {
-            Ok(2) => {
-                eprintln!("spawn rsi-loop: RSI halted; a person must clear it");
-                return Ok(2);
-            }
-            // Nothing to do until the backlog changes; look again in a minute.
-            Ok(evolve::IDLE) => {
-                failures = 0;
-                std::thread::sleep(std::time::Duration::from_mins(1));
-                continue;
-            }
-            Ok(_) => failures = 0,
-            Err(error) => {
-                failures = failures.saturating_add(1);
-                eprintln!("spawn rsi-loop: evolve: {error}");
-            }
-        }
         std::thread::sleep(backoff(interval, failures));
     }
 }
