@@ -54,8 +54,4 @@ pub(crate) const TAIL: &str = "select jsonb_build_object(
 /// `$1` agent, `$2` session, `$3` idempotency key, `$4` action.
 pub(crate) const SUBMIT: &str =
     "insert into agent_commands (agent_id, session_id, idempotency_key, action)
-                 values ($1, $2, $3, $4)";
-
-/// Newest command of a session the login may see. `$1` session.
-pub(crate) const NEWEST_COMMAND_ID: &str = "select command_id from spawn_read_tasks()
-                  where session_id = $1 order by command_id desc limit 1";
+                 values ($1, $2, $3, $4) returning id";
