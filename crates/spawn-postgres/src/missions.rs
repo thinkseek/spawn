@@ -109,7 +109,10 @@ impl PostgresStore {
     /// process, so a killed integrator never blocks the next one.
     pub fn integrator_try_lock(&self) -> Result<bool, StoreError> {
         Ok(self
-            .query_one(missions::INTEGRATOR_TRY_LOCK, &[&missions::INTEGRATOR_LOCK_KEY])?
+            .query_one(
+                missions::INTEGRATOR_TRY_LOCK,
+                &[&missions::INTEGRATOR_LOCK_KEY],
+            )?
             .get("held"))
     }
 
