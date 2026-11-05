@@ -20,7 +20,7 @@ use crate::event::{
     ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, EventRecord, Fork, GlobalPosition,
     ModelProfile, NewEvent, Source,
 };
-use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
+use crate::id::{AgentId, BranchName, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use crate::ingest::{MERGE_NOTICE_OPENING, claude_line};
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
@@ -241,6 +241,43 @@ struct SessionView {
     /// What merges of main changed under the agent and it has not been
     /// told: told with the next prompt the Bridge types.
     notice: Notice,
+    /// What the log last says the agent's branch points at: the commit of
+    /// its last `artifact.committed`, or the fork its branch was created at.
+    /// The agent's branch is shared by its sessions: recovery takes the
+    /// latest of these over all of them, by log position.
+    recorded_head: Option<(CommitId, GlobalPosition)>,
+    /// The session's latest execution, where it started in the log, and
+    /// whether it has ended.
+    latest: Option<(ExecutionId, GlobalPosition, bool)>,
+}
+
+impl SessionView {
+    /// Fold what recovery needs to compare the agent's branch with the log:
+    /// the commit last recorded for it and the latest execution.
+    fn fold_branch(&mut self, record: &EventRecord) {
+        let event = &record.event;
+        match &event.kind {
+            EventKind::ExecutionStarted { fork, .. } => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.latest = Some((execution, record.position, false));
+                }
+                if let Some(fork) = fork {
+                    self.recorded_head = Some((fork.commit.clone(), record.position));
+                }
+            }
+            EventKind::ExecutionEnded { .. } if event.source == Source::Bridge => {
+                if let Some((execution, _, ended)) = self.latest.as_mut()
+                    && event.execution_id.as_ref() == Some(execution)
+                {
+                    *ended = true;
+                }
+            }
+            EventKind::ArtifactCommitted { artifact, .. } => {
+                self.recorded_head = Some((artifact.commit.clone(), record.position));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Files merges of main changed in an agent's workspace that the agent has
@@ -412,7 +449,96 @@ impl Bridge {
     pub fn recover(&mut self) -> Result<(), StoreError> {
         self.cursor = GlobalPosition(0);
         self.sessions.clear();
-        self.catch_up()
+        self.catch_up()?;
+        self.rederive_unrecorded();
+        Ok(())
+    }
+
+    /// After a restart, the `artifact.committed` records that were waiting
+    /// in memory are gone. Re-derive them: an agent whose branch head is not
+    /// the commit the log last recorded for it (its last checkpoint or
+    /// merge, or the fork it was created at) took a commit whose record
+    /// never reached the log. It waits, as a failed append would, under the
+    /// agent's latest session and execution, and the next tick appends it
+    /// before anything else of that session.
+    ///
+    /// The record says what the branch holds, not how it got there: a merge
+    /// of main re-derived this way is recorded as a checkpoint, without the
+    /// files the merge changed.
+    fn rederive_unrecorded(&self) {
+        let mut latest: HashMap<&AgentId, (&SessionId, &SessionView, GlobalPosition)> =
+            HashMap::new();
+        let mut recorded: HashMap<&AgentId, (&CommitId, GlobalPosition)> = HashMap::new();
+        for (session, view) in &self.sessions {
+            if let Some((commit, at)) = view.recorded_head.as_ref()
+                && recorded
+                    .get(&view.agent_id)
+                    .is_none_or(|(_, known)| at > known)
+            {
+                recorded.insert(&view.agent_id, (commit, *at));
+            }
+            let Some((_, started, _)) = view.latest.as_ref() else {
+                continue;
+            };
+            let newer = latest
+                .get(&view.agent_id)
+                .is_none_or(|(_, _, known)| *started > *known);
+            if newer {
+                latest.insert(&view.agent_id, (session, view, *started));
+            }
+        }
+        for (agent_id, (session, view, _)) in latest {
+            let (Some((recorded, _)), Some((execution, _, ended))) =
+                (recorded.get(agent_id), view.latest.as_ref())
+            else {
+                continue;
+            };
+            let branch = BranchName::for_agent(agent_id);
+            let Ok(Some(head)) = self.workspaces.branch_head(&branch) else {
+                continue;
+            };
+            if &head == *recorded {
+                continue;
+            }
+            let reason = if *ended {
+                CheckpointReason::ExecutionEnded
+            } else {
+                CheckpointReason::TurnStopped
+            };
+            self.unrecorded_commits_lock()
+                .entry(session.clone())
+                .or_default()
+                .push(NewEvent {
+                    agent_id: agent_id.clone(),
+                    session_id: session.clone(),
+                    execution_id: Some(execution.clone()),
+                    source: Source::Bridge,
+                    source_event_id: Some(format!("commit:{head}")),
+                    kind: EventKind::ArtifactCommitted {
+                        reason,
+                        artifact: ArtifactRef {
+                            project: self.workspaces.project().to_string(),
+                            branch,
+                            commit: head,
+                        },
+                        files: Vec::new(),
+                    },
+                });
+        }
+    }
+
+    /// Append the waiting commit records of every session, each on its own:
+    /// one that the log keeps refusing is warned and stays waiting, and the
+    /// other sessions go on.
+    fn flush_unrecorded(&self, report: &mut TickReport) {
+        let waiting: Vec<SessionId> = self.unrecorded_commits_lock().keys().cloned().collect();
+        for session in waiting {
+            if let Err(error) = self.record_unrecorded_commit(&session) {
+                report.warnings.push(format!(
+                    "{session}: a commit record waits, its append failed: {error}"
+                ));
+            }
+        }
     }
 
     /// Handle queued commands and advance running executions.
@@ -470,8 +596,11 @@ impl Bridge {
                 model: ModelProfile::Default,
                 active: None,
                 notice: Notice::default(),
+                recorded_head: None,
+                latest: None,
             });
         view.notice.fold(record);
+        view.fold_branch(record);
         let current = view
             .active
             .as_ref()
@@ -552,6 +681,8 @@ impl Bridge {
     }
 
     fn act(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
+        // Sessions with no running execution have no `advance` to do it.
+        self.flush_unrecorded(report);
         let running: Vec<(SessionId, AgentId, Option<String>, Active)> = self
             .sessions
             .iter()
@@ -594,7 +725,14 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         active.follow.checkpoint_read = false;
-        self.record_unrecorded_commit(session)?;
+        // Nothing of this session goes into the log before its waiting
+        // commit records; one that keeps failing holds up only this session.
+        if let Err(error) = self.record_unrecorded_commit(session) {
+            report.warnings.push(format!(
+                "{session}: a commit record waits, its append failed: {error}"
+            ));
+            return Ok(false);
+        }
         self.follow_output(agent_id, session, native, active, report)?;
         let end = match active
             .reported_end
@@ -922,6 +1060,14 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         active.reported_end = Some((cause, exit_code));
+        // A checkpoint whose record waits is recorded before the end.
+        if let Err(error) = self.record_unrecorded_commit(session) {
+            report.warnings.push(format!(
+                "{session}: a commit record waits, its append failed: {error}; the end is \
+                 tried again"
+            ));
+            return Ok(false);
+        }
         let now = self.clock.now().0;
         let stalled = active.follow.end_failures >= END_ATTEMPTS;
         if stalled
@@ -1163,6 +1309,10 @@ impl Bridge {
         let Ok(action) = claimed.action() else {
             return Ok(Outcome::Failed("stored action is not valid".to_string()));
         };
+        // What a command appends comes after the session's waiting commit
+        // records. While the log refuses them the command is not handled
+        // (the error ends the tick; the lease brings the command back).
+        self.record_unrecorded_commit(&claimed.session_id)?;
         match action {
             CommandAction::Start {
                 engine: _,

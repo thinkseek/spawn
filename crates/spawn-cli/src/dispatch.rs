@@ -53,6 +53,9 @@ pub(crate) struct Sent {
     pub(crate) finished_at_ms: Option<i64>,
     #[serde(default)]
     pub(crate) succeeded: Option<bool>,
+    /// Why it failed, when it did.
+    #[serde(default)]
+    pub(crate) error: Option<String>,
 }
 
 /// Facts about one session, as `dispatch_facts` returns them.
@@ -84,6 +87,10 @@ pub(crate) struct Facts {
     pub(crate) open_command: bool,
     #[serde(default)]
     pub(crate) dispatched: Vec<Sent>,
+    /// Key of the latest delivery (`deliver-<task>-<revision>`) the
+    /// dispatcher sent into the session, however long ago.
+    #[serde(default)]
+    pub(crate) last_delivery: Option<String>,
     /// The model profile of the session's latest execution.
     #[serde(default)]
     pub(crate) model: ModelProfile,
@@ -256,6 +263,8 @@ pub(crate) fn decide_with(
         orders: deliver::orders(work, rows),
         pending: Vec::new(),
     };
+    plan.orders
+        .extend(deliver::start_retries(work, rows, now_ms));
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
         // A managed worker between tasks is not news: its report already
@@ -394,6 +403,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            last_delivery: None,
             model: ModelProfile::Default,
         }
     }
@@ -428,6 +438,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            last_delivery: None,
             model: ModelProfile::Default,
         }
     }
@@ -439,6 +450,7 @@ mod tests {
             created_at_ms: finished_at_ms - 500,
             finished_at_ms: Some(finished_at_ms),
             succeeded: Some(true),
+            error: None,
         }
     }
 
@@ -534,6 +546,7 @@ mod tests {
             created_at_ms: NOW,
             finished_at_ms: Some(NOW),
             succeeded: Some(true),
+            error: None,
         });
         let rows = [rows[0].clone(), supervisor];
         let plan = decide(&rows, true, NOW, "spawn");
@@ -564,6 +577,7 @@ mod tests {
             created_at_ms: NOW,
             finished_at_ms: Some(NOW),
             succeeded: Some(true),
+            error: None,
         });
         let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
         assert!(
@@ -602,6 +616,7 @@ mod tests {
             created_at_ms: NOW - 10,
             finished_at_ms: Some(NOW - 5),
             succeeded: Some(false),
+            error: None,
         });
         let plan = decide(&[lost], false, NOW, "spawn");
         assert!(plan.orders.is_empty());
@@ -628,6 +643,7 @@ mod tests {
                 created_at_ms: NOW - 60_000,
                 finished_at_ms: Some(NOW - 59_000),
                 succeeded: Some(true),
+                error: None,
             });
         }
         let plan = decide(&[facts], false, NOW, "spawn");
