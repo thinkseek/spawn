@@ -1271,3 +1271,16 @@ fn a_cluster_is_known_by_its_identity_not_its_spelling() {
         "an unreachable server has no identity"
     );
 }
+
+#[test]
+fn migrations_racing_on_one_server_all_succeed() {
+    // Roles and grants are shared by the whole server: parallel migrations of
+    // separate schemas used to fail with "tuple concurrently updated".
+    let workers: Vec<_> = (0..4)
+        .map(|index| std::thread::spawn(move || store(&format!("race{index}"))))
+        .collect();
+    for worker in workers {
+        let (store, _schema) = worker.join().expect("a migration thread");
+        store.migrate().expect("migrating again is idempotent");
+    }
+}

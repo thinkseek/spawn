@@ -111,10 +111,25 @@ impl PostgresStore {
     /// Install or refresh the schema, and set the logins' passwords.
     /// Idempotent: every process of one install derives the same ones.
     pub fn migrate(&self) -> Result<(), StoreError> {
+        // Roles and grants are cluster-wide, so migrations of two databases
+        // (or schemas) on one server race on them ("tuple concurrently
+        // updated"). Every statement of the schema is idempotent, so the
+        // whole migration is simply run again, a bounded number of times.
+        let mut attempt: u32 = 0;
+        loop {
+            match self.migrate_once() {
+                Err(error) if attempt < MIGRATE_ATTEMPTS && concurrent_catalog_update(&error) => {
+                    attempt += 1;
+                    std::thread::sleep(retry_pause(attempt));
+                }
+                result => return result.map_err(|error| backend(&error)),
+            }
+        }
+    }
+
+    fn migrate_once(&self) -> Result<(), postgres::Error> {
         let mut client = self.lock();
-        client
-            .batch_execute(SCHEMA)
-            .map_err(|error| backend(&error))?;
+        client.batch_execute(SCHEMA)?;
         // No owner password (peer or trust login, PGPASSWORD): a password
         // derived from "" would be a constant anyone can compute. Such a
         // migration leaves the logins as they are: created `nologin`, or as
@@ -124,15 +139,45 @@ impl PostgresStore {
             for role in LOGINS {
                 // Hex only, so the literal needs no quoting beyond the quotes.
                 let password = role_password(&self.password, role);
-                client
-                    .batch_execute(&format!(
-                        "alter role {role} with login password '{password}'"
-                    ))
-                    .map_err(|error| backend(&error))?;
+                client.batch_execute(&format!(
+                    "alter role {role} with login password '{password}'"
+                ))?;
             }
         }
         Ok(())
     }
+}
+
+/// How often a migration that lost a race on the cluster's catalogs is run
+/// again.
+const MIGRATE_ATTEMPTS: u32 = 12;
+
+/// Whether `error` is another session changing the same cluster-wide catalog
+/// row at the same moment: a lost race, not a broken migration.
+fn concurrent_catalog_update(error: &postgres::Error) -> bool {
+    use postgres::error::SqlState;
+    let Some(database) = error.as_db_error() else {
+        return false;
+    };
+    let code = database.code();
+    *code == SqlState::T_R_SERIALIZATION_FAILURE
+        || *code == SqlState::T_R_DEADLOCK_DETECTED
+        || (*code == SqlState::INTERNAL_ERROR
+            && database.message().contains("tuple concurrently"))
+        // Two `create role` / `create type` at once: the loser hits the
+        // catalog's unique index.
+        || (*code == SqlState::UNIQUE_VIOLATION
+            && database.constraint().is_some_and(|name| name.starts_with("pg_")))
+}
+
+/// A pause that grows with the attempt and differs between processes, so
+/// racing migrations fall out of step: 20 ms * attempt, plus up to 50 ms.
+fn retry_pause(attempt: u32) -> std::time::Duration {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos() ^ std::process::id())
+        % 50;
+    std::time::Duration::from_millis(u64::from(20 * attempt + jitter))
 }
 
 /// The password part of a `scheme://user:password@host/...` URL, decoded
