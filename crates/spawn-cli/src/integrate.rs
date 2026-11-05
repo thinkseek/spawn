@@ -2283,6 +2283,16 @@ mod database_tests {
         )
     }
 
+    /// Releases the holding gates when a test ends, a failed one too, so no
+    /// stub gate outlives it.
+    struct Release(PathBuf);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), "");
+        }
+    }
+
     fn started(marks: &Path) -> Vec<String> {
         std::fs::read_to_string(marks.join("started"))
             .unwrap_or_default()
@@ -2328,6 +2338,7 @@ mod database_tests {
             std::env::temp_dir().join(format!("spawn-db-gate-marks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&marks);
         std::fs::create_dir_all(&marks).expect("marks");
+        let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) =
             world("concurrent-a", &holding_gate(&marks));
         integrator.gates = 3;
@@ -2408,6 +2419,7 @@ mod database_tests {
         let marks = std::env::temp_dir().join(format!("spawn-db-gate-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&marks);
         std::fs::create_dir_all(&marks).expect("marks");
+        let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) =
             world("cap-one-a", &holding_gate(&marks));
         integrator.gates = 1;
