@@ -18,7 +18,7 @@ The log is the only state. Each `spawn tick` is a new process that rebuilds its 
 | Rust | 1.95 or later | Build |
 | PostgreSQL | 16 or later | Event log, command queue, views |
 | tmux | 3.x | Terminals |
-| git | 2.40 or later (`git --attr-source`, checked at start) | Branches and workspaces |
+| git | 2.43 or later (`git --attr-source`, checked at start) | Branches and workspaces |
 | Claude Code | current | Engine |
 
 ## Install

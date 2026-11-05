@@ -805,18 +805,26 @@ fn landing_candidate(
     // Main moved since the worker started: land the merge of both, by
     // main's merge rules (a bare repository reads no in-tree
     // .gitattributes otherwise), as main is merged into agents' branches.
-    let Ok(tree) = git(&[
-        "--git-dir",
-        mirror_path,
-        &format!("--attr-source={main}"),
-        "merge-tree",
-        "--write-tree",
-        main,
-        branch,
-    ]) else {
+    let output = sources::controller_git()
+        .args([
+            "--git-dir",
+            mirror_path,
+            &format!("--attr-source={main}"),
+            "merge-tree",
+            "--write-tree",
+            main,
+            branch,
+        ])
+        .output()
+        .map_err(|error| format!("run git merge-tree: {error}"))?;
+    let Some(tree) = merged_tree(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )?
+    else {
         return Ok(None);
     };
-    let tree = tree.lines().next().unwrap_or_default().to_string();
     commit_landing(
         mirror_path,
         &[
@@ -830,6 +838,35 @@ fn landing_candidate(
         ],
     )
     .map(Some)
+}
+
+/// What `git merge-tree --write-tree` said, from its exit code (`None`: no
+/// code, killed by a signal) and output: `Ok(Some(tree))` for a clean merge,
+/// `Ok(None)` for a conflict (exit 1, the only code git gives one), and any
+/// other failure an error with git's own message. A git that cannot run the
+/// merge (an unknown option, a crash) says nothing about the work: it must
+/// reach the operator, never send the worker after conflicts that do not
+/// exist.
+fn merged_tree(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Option<String>, String> {
+    match code {
+        Some(0) => Ok(Some(
+            stdout.lines().next().unwrap_or_default().trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        failure => {
+            let how = failure.map_or_else(
+                || "was killed by a signal".to_string(),
+                |code| format!("exited {code}"),
+            );
+            Err(format!(
+                "git merge-tree {how}, so the landing could not be merged (this is not a \
+                 conflict; Spawn needs git {}.{} or later): {}",
+                crate::config::MIN_GIT.0,
+                crate::config::MIN_GIT.1,
+                stderr.trim()
+            ))
+        }
+    }
 }
 
 /// Name and email of the author and committer of every landing commit.
@@ -1040,11 +1077,41 @@ fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
+<<<<<<< 3339192930b2dbf62a470093409eed486003bb4d
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, over_budget,
+=======
         Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget,
         report_freshness,
+>>>>>>> 153fa031d209862432b795dddd8e84da777be385
     };
     use crate::gate::GateFailure;
     use serde_json::json;
+
+    /// Only exit 1 is a conflict: a merge-tree git cannot run (an unknown
+    /// option, a crash, a signal) is an error carrying git's message.
+    #[test]
+    fn a_merge_git_cannot_run_is_an_error_not_a_conflict() {
+        assert_eq!(
+            merged_tree(Some(0), "abc123\n", ""),
+            Ok(Some("abc123".to_string()))
+        );
+        assert_eq!(merged_tree(Some(1), "def456\nCONFLICT", ""), Ok(None));
+        let unknown = merged_tree(
+            Some(129),
+            "",
+            "error: unknown option `attr-source=abc'\nusage: git [-v | --version]",
+        )
+        .expect_err("exit 129 is no conflict");
+        assert!(unknown.contains("unknown option"), "{unknown}");
+        assert!(unknown.contains("exited 129"), "{unknown}");
+        assert!(unknown.contains("not a conflict"), "{unknown}");
+        assert!(unknown.contains("2.43"), "{unknown}");
+        let crash = merged_tree(None, "", "").expect_err("a signal is no conflict");
+        assert!(crash.contains("killed by a signal"), "{crash}");
+        assert!(merged_tree(Some(139), "", "Segmentation fault").is_err());
+        assert!(merged_tree(Some(128), "", "fatal: bad object").is_err());
+        assert!(merged_tree(Some(2), "", "").is_err());
+    }
 
     /// Commit everything in the checkout `directory`.
     pub(super) fn commit_in(directory: &str, message: &str) {
