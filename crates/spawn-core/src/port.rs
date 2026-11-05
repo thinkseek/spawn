@@ -91,6 +91,13 @@ pub enum WorkspaceError {
     Unavailable(String),
 }
 
+/// The [`WorkspaceError::Refused`] code of a checkpoint of a workspace that
+/// can no longer follow its branch (another writer moved the branch under a
+/// merge, and the directory differs from both sides). The store has kept the
+/// directory's state off the branch before refusing, so nothing is lost by
+/// unmounting it; the execution cannot checkpoint again and is ended.
+pub const WORKSPACE_STALE: &str = "WorkspaceStale";
+
 /// Result of a workspace commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Commit {
@@ -203,6 +210,14 @@ pub trait WorkspaceStore: Send + Sync {
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let _ = workspace;
         Ok(BaseMerge::Current)
+    }
+
+    /// The commit `branch` points at, `None` when the branch does not exist
+    /// (or the store cannot tell). The Bridge compares it at recovery with
+    /// the last commit the log recorded for the branch.
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        let _ = branch;
+        Ok(None)
     }
 }
 

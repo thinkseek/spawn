@@ -740,6 +740,11 @@ fn a_dropped_mission_lands_nothing_even_with_a_push_in_flight() {
         .integrator_record(&json!({"type": "task.landed", "id": task, "from": "b1", "to": "c1"}))
         .expect("landed");
     drop(hold);
+    // The bound above showed the wait; this drop may still wait briefly
+    // behind other tests' store locks on the shared server.
+    client
+        .batch_execute("set lock_timeout = 0")
+        .expect("unbound the wait");
     client
         .execute(
             "select spawn_mission_close($1, 'dropped', 'gone')",

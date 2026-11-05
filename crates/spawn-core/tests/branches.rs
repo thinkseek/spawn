@@ -1041,3 +1041,190 @@ fn the_earlier_executions_lines_read_again_on_resume_leave_the_turn_open() {
     quiet(&bridge.tick().expect("checkpoint and merge"));
     assert_eq!(merges(&store), 2);
 }
+
+/// A checkpoint of the first execution whose `artifact.committed` the log
+/// refused: the branch holds it, the log does not.
+fn checkpoint_unrecorded(store: &MemoryStore, bridge: &mut Bridge) {
+    start(store, None);
+    quiet(&bridge.tick().expect("start"));
+    transcript(store, &tool_call("toolu_1"));
+    quiet(&bridge.tick().expect("read the tool call"));
+    let workspace = spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid");
+    store.mark_dirty(&workspace);
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    assert!(checkpoints(store).is_empty());
+}
+
+fn kinds(store: &MemoryStore) -> Vec<&'static str> {
+    events(store)
+        .into_iter()
+        .map(|event| event.kind.name())
+        .filter(|name| matches!(*name, "artifact.committed" | "execution.ended"))
+        .collect()
+}
+
+#[test]
+fn a_stop_records_a_waiting_checkpoint_before_the_end() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    checkpoint_unrecorded(&store, &mut bridge);
+    // The stop runs before the session's advance, which used to append it.
+    submit(&store, "key_stop", CommandAction::Stop);
+    quiet(&bridge.tick().expect("stop"));
+    assert_eq!(
+        kinds(&store),
+        ["artifact.committed", "execution.ended"],
+        "the checkpoint comes before the end"
+    );
+    quiet(&bridge.tick().expect("idle"));
+    assert_eq!(checkpoints(&store).len(), 1, "recorded once");
+}
+
+#[test]
+fn a_checkpoint_whose_record_waited_is_recorded_after_a_restart() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    checkpoint_unrecorded(&store, &mut bridge);
+    let head = format!("{:040x}", 1);
+    // The waiting record lived in the Bridge's memory only.
+    drop(bridge);
+    let mut restarted = self::bridge(&store);
+    restarted.recover().expect("recover");
+    quiet(&restarted.tick().expect("after the restart"));
+    assert_eq!(
+        checkpoints(&store),
+        [(CheckpointReason::TurnStopped, head.clone())],
+        "the branch head is recorded"
+    );
+    // A branch whose head the log records gets nothing more.
+    let mut again = self::bridge(&store);
+    again.recover().expect("recover");
+    quiet(&again.tick().expect("after a second restart"));
+    assert_eq!(checkpoints(&store).len(), 1);
+}
+
+#[test]
+fn a_record_the_log_keeps_refusing_holds_up_only_its_session() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start one");
+    let two = SessionId::new("session_two").expect("valid session");
+    store
+        .submit(
+            &Principal::new("tester").expect("valid principal"),
+            &Submission {
+                agent_id: AgentId::new("agent_two").expect("valid agent"),
+                session_id: two.clone(),
+                idempotency_key: IdempotencyKey::new("key_start_two").expect("valid key"),
+                action: CommandAction::Start {
+                    engine: ENGINE.to_string(),
+                    prompt: "work".to_string(),
+                    parent_session_id: None,
+                    from: None,
+                    model: None,
+                },
+            },
+        )
+        .expect("submit succeeds");
+    bridge.tick().expect("start two");
+
+    // Session one's checkpoint is taken; the log never takes its record.
+    let one = SessionId::new("session_one").expect("valid session");
+    store.refuse_branch_records_of(&one, true);
+    transcript(&store, &tool_call("toolu_1"));
+    bridge.tick().expect("read the tool call");
+    store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
+    let _ = bridge.tick();
+
+    // Session two still checkpoints, tick after tick.
+    let execution = ExecutionId::for_command(CommandId(2));
+    let path = spawn_core::bridge::transcript_path(
+        &BridgeConfig::new("tester").claude_projects,
+        &spawn_core::id::WorkspaceId::new("2:/workspaces/2").expect("valid workspace"),
+        &claude_session_id(&execution),
+    );
+    store.append_file(&path, &(tool_call("toolu_2").join("\n") + "\n"));
+    let report = bridge.tick().expect("one refused record fails no tick");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("session_one")),
+        "{:?}",
+        report.warnings
+    );
+    store.mark_dirty(&spawn_core::id::WorkspaceId::new("2:/workspaces/2").expect("valid"));
+    bridge.tick().expect("one refused record fails no tick");
+    let recorded: Vec<SessionId> = events(&store)
+        .into_iter()
+        .filter(|event| matches!(event.kind, EventKind::ArtifactCommitted { .. }))
+        .map(|event| event.session_id)
+        .collect();
+    assert_eq!(recorded, [two], "session two's checkpoint is recorded");
+
+    // Once the log takes it, session one's record follows.
+    store.refuse_branch_records_of(&one, false);
+    bridge.tick().expect("the log takes it");
+    assert_eq!(checkpoints(&store).len(), 2);
+}
+
+#[test]
+fn a_stale_workspace_ends_its_execution_instead_of_retrying_its_checkpoint() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.make_stale(true);
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    let mut warnings = bridge.tick().expect("read the turn").warnings;
+    warnings.extend(
+        bridge
+            .tick()
+            .expect("the checkpoint is kept off the branch")
+            .warnings,
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("WorkspaceStale") && warning.contains("execution ends")),
+        "{warnings:?}"
+    );
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1, "the store kept its state: unmounted");
+    assert!(stalls(&store).is_empty(), "no stalled end");
+    assert!(
+        !store
+            .workspace_calls()
+            .iter()
+            .any(|call| call == "merge_base"),
+        "no merge into a stale workspace"
+    );
+    bridge.tick().expect("ended");
+    assert_eq!(ended(&store).len(), 1, "ended once");
+}
+
+#[test]
+fn an_idle_stale_workspace_ends_its_execution_when_main_is_offered() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, READY);
+    let mut bridge = bridge(&store).with_clock(clock.clone());
+    start(&store, None);
+    bridge.tick().expect("start");
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint the turn, and merge");
+    let merges_before = merges(&store);
+    store.make_stale(true);
+    for _ in 0..4 {
+        clock.advance(std::time::Duration::from_secs(30));
+        bridge.tick().expect("idle");
+    }
+    assert_eq!(merges(&store), merges_before + 1, "main was offered once");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1);
+    assert!(stalls(&store).is_empty());
+}
