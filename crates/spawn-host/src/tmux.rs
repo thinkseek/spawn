@@ -100,23 +100,6 @@ impl TmuxHost {
         run_words(prefix, &self.words(arguments))
     }
 
-    /// [`Self::run`] under `timeout seconds` (exit 124 when it ran out):
-    /// here, around tmux; in a container, around the `docker exec`.
-    fn run_within(
-        &self,
-        seconds: u32,
-        prefix: Vec<String>,
-        arguments: &[String],
-    ) -> Result<Run, TerminalError> {
-        let timeout = ["timeout".to_string(), seconds.to_string()];
-        if prefix.is_empty() {
-            let words: Vec<String> = timeout.into_iter().chain(self.words(arguments)).collect();
-            return run_words(&[], &words);
-        }
-        let bounded: Vec<String> = timeout.into_iter().chain(prefix).collect();
-        run_words(&bounded, &self.words(arguments))
-    }
-
     /// Session target with exact-name matching.
     fn target(terminal: &TerminalName) -> String {
         format!("={}", terminal.as_str())
@@ -134,9 +117,6 @@ impl TmuxHost {
 }
 
 /// Run `words`, inside the workspace when `prefix` is not empty.
-/// How long a `capture-pane` may take.
-const CAPTURE_SECONDS: u32 = 5;
-
 fn run_words(prefix: &[String], words: &[String]) -> Result<Run, TerminalError> {
     run_words_with_input(prefix, words, None)
 }
@@ -352,11 +332,8 @@ impl TerminalHost for TmuxHost {
         lines: usize,
     ) -> Result<String, TerminalError> {
         let prefix = self.prefix(workspace);
-        // Bounded in time like the file probes: a wedged tmux server (or
-        // container) must not hold the Bridge's tick.
-        let run = self.run_within(
-            CAPTURE_SECONDS,
-            prefix,
+        let run = self.run(
+            &prefix,
             &[
                 "capture-pane".to_string(),
                 "-p".to_string(),
@@ -366,16 +343,13 @@ impl TerminalHost for TmuxHost {
                 format!("-{lines}"),
             ],
         )?;
-        match run.code {
-            Some(0) => Ok(run.stdout),
-            Some(124) => Err(TerminalError(format!(
-                "capture-pane did not answer within {CAPTURE_SECONDS} s"
-            ))),
-            _ => Err(TerminalError(format!(
-                "capture-pane failed: {}",
-                run.stderr.trim()
-            ))),
+        if run.code == Some(0) {
+            return Ok(run.stdout);
         }
+        Err(TerminalError(format!(
+            "capture-pane failed: {}",
+            run.stderr.trim()
+        )))
     }
 
     fn terminate(

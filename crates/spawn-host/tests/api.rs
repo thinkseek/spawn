@@ -13,10 +13,7 @@ use std::process::Command;
 use spawn_core::contract;
 use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
 use spawn_core::port::{Commit, Launch, TerminalError, TerminalHost, WorkspaceStore};
-use spawn_host::{
-    GitWorkspace, PrefixBuilder, TmuxHost, container_name, docker_prefix, fleet_of,
-    fleet_of_workspace,
-};
+use spawn_host::{GitWorkspace, PrefixBuilder, TmuxHost, container_name, docker_prefix};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -562,40 +559,12 @@ fn a_commit_records_the_branch_from_the_identifier() {
 #[test]
 fn the_container_prefix_runs_a_shell_in_the_named_container() {
     let _exclusive = exclusive();
-    let prefix = docker_prefix("docker", &agent_workspace());
-    let fleet = fleet_of(Path::new("/srv/fleet"));
-    assert_eq!(
-        prefix,
-        [
-            "docker",
-            "exec",
-            "-i",
-            &container_name(&fleet, "agent_test"),
-            "sh",
-            "-c"
-        ],
-        "no -t: the terminal host has no terminal on stdin"
-    );
-    assert_eq!(fleet_of_workspace(&agent_workspace()), fleet);
-}
-
-/// Two fleets (two workspace roots) on one host name their `agent_001`
-/// containers apart; one root, however it is spelled, is one fleet.
-#[test]
-fn two_fleets_name_their_containers_apart() {
-    let one = fleet_of(Path::new("/srv/fleet-one"));
-    let other = fleet_of(Path::new("/srv/fleet-two"));
-    assert_ne!(
-        container_name(&one, "agent_001"),
-        container_name(&other, "agent_001")
-    );
-    assert_eq!(one, fleet_of(Path::new("/srv/fleet-one/")));
-    assert_eq!(one, fleet_of(Path::new("/srv/./fleet-one")));
-}
-
-/// A workspace of the fleet rooted at `/srv/fleet`.
-fn agent_workspace() -> WorkspaceId {
-    WorkspaceId::new("agent_test:/srv/fleet/agent_test").expect("valid workspace")
+    let prefix = docker_prefix("docker", "agent_test");
+    assert_eq!(prefix[0], "docker");
+    assert_eq!(prefix[1], "exec");
+    assert_eq!(prefix[4], container_name("agent_test"));
+    assert_eq!(prefix[6], "-c");
+    assert_eq!(prefix.len(), 7, "{prefix:?}");
 }
 
 /// A tmux program pinned to a private server, which goes when the test does,
@@ -755,7 +724,7 @@ fn files_are_written_new_on_the_host_and_through_the_prefix() {
         "#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
     );
     let builder: std::sync::Arc<PrefixBuilder> = {
-        let words = docker_prefix(&prefix_program, &agent_workspace());
+        let words = docker_prefix(&prefix_program, "agent_test");
         std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
     };
     let inside = TmuxHost::in_workspaces("tmux", builder, None);
@@ -802,7 +771,7 @@ fn tmux_calls_go_through_the_container_prefix() {
         ),
     );
     let builder: std::sync::Arc<PrefixBuilder> = {
-        let words = docker_prefix(&prefix_program, &agent_workspace());
+        let words = docker_prefix(&prefix_program, "agent_test");
         std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
     };
     let host = TmuxHost::in_workspaces(&inner, builder.clone(), None);
@@ -819,10 +788,7 @@ fn tmux_calls_go_through_the_container_prefix() {
         .expect("terminate through the prefix");
     let log = fs::read_to_string(&calls).expect("read the call log");
     assert!(
-        log.contains(&format!(
-            "exec -i {} sh -c",
-            container_name(&fleet_of(Path::new("/srv/fleet")), "agent_test")
-        )),
+        log.contains("exec -i -t spawn-exec-agent_test sh -c"),
         "{log}"
     );
     assert!(log.contains("new-session"), "{log}");

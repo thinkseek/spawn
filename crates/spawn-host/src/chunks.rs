@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustix::fs::{AtFlags, CWD, Mode, OFlags};
@@ -153,21 +153,6 @@ pub struct LocalChunkStore {
     /// Objects this process found sound: each is read back once, not on
     /// every `put` of the same content.
     verified: Arc<Mutex<HashSet<String>>>,
-    /// Set while this store's [`ChunkStore::collecting`] guard lives: its
-    /// removals are already under the exclusive lock.
-    collecting: Arc<AtomicBool>,
-}
-
-/// The [`ChunkStore::collecting`] guard of a [`LocalChunkStore`].
-struct Collecting {
-    _lock: File,
-    flag: Arc<AtomicBool>,
-}
-
-impl Drop for Collecting {
-    fn drop(&mut self) {
-        self.flag.store(false, Ordering::SeqCst);
-    }
 }
 
 impl LocalChunkStore {
@@ -176,7 +161,6 @@ impl LocalChunkStore {
         Self {
             directory: directory.as_ref().to_path_buf(),
             verified: Arc::new(Mutex::new(HashSet::new())),
-            collecting: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -191,11 +175,8 @@ impl LocalChunkStore {
 
     /// Hold the store's lock (a `flock` on the store directory itself,
     /// made when missing) until the returned handle is dropped: shared by a
-    /// `put` or a `touch` (they make objects young) and by a commit in
-    /// flight ([`ChunkStore::writing`]), exclusive by a collection
-    /// ([`ChunkStore::collecting`]) or a removal. So a collection reads the
-    /// refs only when no commit is between its first object and its ref,
-    /// and a removal's last age check and its unlink see no refresh in
+    /// `put` or a `touch` (they make objects young), exclusive by a removal.
+    /// So a removal's last age check and its unlink see no refresh in
     /// between: an object a writer refreshed after a collection listed it
     /// stays.
     fn hold(&self, exclusive: bool) -> Result<File, ChunkError> {
@@ -276,19 +257,6 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 }
 
 impl ChunkStore for LocalChunkStore {
-    fn writing(&self) -> Result<spawn_core::port::ChunkGuard, ChunkError> {
-        Ok(Box::new(self.hold(false)?))
-    }
-
-    fn collecting(&self) -> Result<spawn_core::port::ChunkGuard, ChunkError> {
-        let lock = self.hold(true)?;
-        self.collecting.store(true, Ordering::SeqCst);
-        Ok(Box::new(Collecting {
-            _lock: lock,
-            flag: Arc::clone(&self.collecting),
-        }))
-    }
-
     /// Store `bytes`. An object already there is verified first: a sound one
     /// is never rewritten, a corrupt one (a torn write, a disk error, a copy
     /// that died) is replaced atomically by a rename over it, which repairs
@@ -463,13 +431,7 @@ impl ChunkStore for LocalChunkStore {
         // young, and it stays; one that waits for the lock finds it gone and
         // writes it again (a touch answers false, and its caller chunks the
         // file again).
-        // A collection of this store holds it already (a second exclusive
-        // `flock` would wait for the first).
-        let _held = if self.collecting.load(Ordering::SeqCst) {
-            None
-        } else {
-            Some(self.hold(true)?)
-        };
+        let _held = self.hold(true)?;
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => return Ok(None),
@@ -659,16 +621,10 @@ pub fn trailer_of(message: &str) -> Option<String> {
         .next_back()
 }
 
-/// Chunk what `file` reads into `store`; the chunk names in order and the
-/// number of bytes read. `shown` names it in errors. It takes an open file,
-/// never a path: a file of a workspace is opened only through
-/// [`crate::agent_files::open_regular`], and read up to its size.
-pub fn store_file(
-    store: &dyn ChunkStore,
-    file: impl Read,
-    shown: &Path,
-) -> Result<(Vec<String>, u64), ChunkError> {
-    let path = shown;
+/// Chunk the file at `path` into `store`; the chunk names in order and the
+/// number of bytes read.
+pub fn store_file(store: &dyn ChunkStore, path: &Path) -> Result<(Vec<String>, u64), ChunkError> {
+    let file = File::open(path).map_err(|error| unavailable("open", path, &error))?;
     let mut chunks = Vec::new();
     let mut size = 0u64;
     chunk_stream(
@@ -683,10 +639,10 @@ pub fn store_file(
     Ok((chunks, size))
 }
 
-/// The names of the chunks what `file` reads cuts into, and the number of
+/// The names of the chunks the file at `path` cuts into, and the number of
 /// bytes read: what [`store_file`] would store, with nothing written.
-pub fn chunk_names_of(file: impl Read, shown: &Path) -> Result<(Vec<String>, u64), ChunkError> {
-    let path = shown;
+pub fn chunk_names_of(path: &Path) -> Result<(Vec<String>, u64), ChunkError> {
+    let file = File::open(path).map_err(|error| unavailable("open", path, &error))?;
     let mut chunks = Vec::new();
     let mut size = 0u64;
     chunk_stream(
@@ -729,49 +685,6 @@ impl HeldDirectory {
             descriptor,
             shown: path.to_path_buf(),
         })
-    }
-
-    /// The child directory `name` when it exists (`None` when it does not).
-    /// A symlink, a file or anything else that is not a directory is refused.
-    pub(crate) fn existing_child(&self, name: &[u8]) -> Result<Option<Self>, String> {
-        let shown = self.shown.join(OsStr::from_bytes(name));
-        match rustix::fs::openat(&self.descriptor, name, directory_flags(), Mode::empty()) {
-            Ok(descriptor) => Ok(Some(Self { descriptor, shown })),
-            Err(Errno::NOENT) => Ok(None),
-            Err(error) => Err(format!(
-                "{}: not a directory of the workspace (a symlink or a file is in the way): \
-                 {error}",
-                shown.display()
-            )),
-        }
-    }
-
-    /// The directory that holds `relative` when every parent of it exists,
-    /// each walked without following a symlink; nothing is made.
-    pub(crate) fn existing_parent_of(
-        top: &Path,
-        relative: &TreePath,
-    ) -> Result<Option<Self>, String> {
-        let mut parent = Self::open(top)?;
-        let mut components: Vec<&[u8]> = relative.components().collect();
-        components.pop();
-        for component in components {
-            match parent.existing_child(component)? {
-                Some(child) => parent = child,
-                None => return Ok(None),
-            }
-        }
-        Ok(Some(parent))
-    }
-
-    /// The held descriptor, for calls relative to it.
-    pub(crate) fn descriptor(&self) -> &OwnedFd {
-        &self.descriptor
-    }
-
-    /// The directory's path, for messages only.
-    pub(crate) fn shown(&self) -> &Path {
-        &self.shown
     }
 
     /// The child directory `name`, made when missing. A symlink, a file or
