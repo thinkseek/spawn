@@ -1883,7 +1883,11 @@ mod tests {
     #[test]
     fn the_gate_waits_out_its_backoff_from_the_recorded_no_room() {
         let mut waiting = mission(0, 0, 0);
-        assert_eq!(room_wait(&waiting, 4, 0), None, "no run of no_room: judge now");
+        assert_eq!(
+            room_wait(&waiting, 4, 0),
+            None,
+            "no run of no_room: judge now"
+        );
         waiting.gate_room_task = Some(4);
         waiting.gate_room_since_ms = Some(100 * MINUTE);
         waiting.gate_room_last_ms = Some(110 * MINUTE);
@@ -1903,7 +1907,15 @@ mod tests {
     #[test]
     fn no_room_names_the_reason_and_the_free_space_and_escalates_once_after_two_hours() {
         let mut waiting = mission(0, 2, 0);
-        let first = no_room(&waiting, 4, 3 * 1_048_576 + 104_858, 10, "/data/tmp", "log", 0);
+        let first = no_room(
+            &waiting,
+            4,
+            3 * 1_048_576 + 104_858,
+            10,
+            "/data/tmp",
+            "log",
+            0,
+        );
         assert_eq!(
             first["reason"],
             "no room to judge now: 3.1 GiB free in /data/tmp (TMPDIR), under \
@@ -2422,13 +2434,21 @@ mod database_tests {
         };
         digest("dispatch-digest-failed", false);
         assert_eq!(
-            db.store.gate_room_escalations().expect("escalations").as_array().map(Vec::len),
+            db.store
+                .gate_room_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
             Some(1),
             "a digest that failed told nothing"
         );
         digest("dispatch-digest-told", true);
         assert_eq!(
-            db.store.gate_room_escalations().expect("escalations").as_array().map(Vec::len),
+            db.store
+                .gate_room_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
             Some(0),
             "told once, by its record"
         );
@@ -2474,27 +2494,39 @@ mod database_tests {
         }
         let before = gated(&db, mission);
         assert_eq!(
-            (before.gate_room_task, before.gate_room_waits, before.gate_room_escalated),
+            (
+                before.gate_room_task,
+                before.gate_room_waits,
+                before.gate_room_escalated
+            ),
             (Some(first), 3, true)
         );
         db.store.task_cancel(first).expect("cancel");
         let after = gated(&db, mission);
         assert_eq!(
-            (after.gate_room_task, after.gate_room_waits, after.gate_room_escalated),
+            (
+                after.gate_room_task,
+                after.gate_room_waits,
+                after.gate_room_escalated
+            ),
             (None, 0, false),
             "cancelled: the run ends"
         );
         assert!(after.gate_room_since_ms.is_none() && after.gate_room_last_ms.is_none());
 
-        // A run left behind without a record of its task leaving (a task
-        // dropped by a fold) does not reach the next task either.
+        // A no_room on another task, while the run's task still waits (or
+        // left without a record), starts a new run too.
         let second = db.reported_task(mission, "b");
         db.record(&no_room(second, true));
         let third = db.reported_task(mission, "c");
         db.record(&no_room(third, false));
         let after = gated(&db, mission);
         assert_eq!(
-            (after.gate_room_task, after.gate_room_waits, after.gate_room_escalated),
+            (
+                after.gate_room_task,
+                after.gate_room_waits,
+                after.gate_room_escalated
+            ),
             (Some(third), 1, false),
             "another task's no_room starts a new run"
         );
