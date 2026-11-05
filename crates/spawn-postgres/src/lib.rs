@@ -77,9 +77,34 @@ const LOGINS: [&str; 2] = ["spawn_supervisor", "spawn_reader"];
 impl PostgresStore {
     /// Connect to the database in the URL.
     pub fn connect(url: &str) -> Result<Self, StoreError> {
+        let config: postgres::Config = url
+            .parse()
+            .map_err(|error: postgres::Error| backend(&error))?;
+        Self::connect_config(config, url)
+    }
+
+    /// [`Self::connect`] for a reader that must never wait on the server
+    /// for long (the dashboard): every statement of the session gives up
+    /// after `timeout` (`statement_timeout`), and connecting after 5 s.
+    pub fn connect_with_statement_timeout(
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self, StoreError> {
         let mut config: postgres::Config = url
             .parse()
             .map_err(|error: postgres::Error| backend(&error))?;
+        let limit = format!("-c statement_timeout={}", timeout.as_millis().max(1));
+        let options = match config.get_options() {
+            Some(options) if !options.trim().is_empty() => format!("{options} {limit}"),
+            _ => limit,
+        };
+        config
+            .options(&options)
+            .connect_timeout(std::time::Duration::from_secs(5));
+        Self::connect_config(config, url)
+    }
+
+    fn connect_config(mut config: postgres::Config, url: &str) -> Result<Self, StoreError> {
         // The schema warns (`raise warning`) about what a migration left for
         // a human, such as tables it kept. The many notices of an idempotent
         // migration ("already exists, skipping") stay quiet.
@@ -478,6 +503,39 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::{login_url, role_password, role_url, url_password};
+
+    /// A dashboard reader gives up on a slow statement (audit M2): the
+    /// timeout is its connection's, not the server's. Needs
+    /// `SPAWN_TEST_DATABASE_URL`, like the integration tests.
+    #[test]
+    fn a_readers_statement_gives_up_after_its_timeout() {
+        use std::time::{Duration, Instant};
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL")
+            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
+        let reader =
+            super::PostgresStore::connect_with_statement_timeout(&url, Duration::from_millis(200))
+                .expect("connect");
+        let started = Instant::now();
+        let slow = reader.lock().query_one("select pg_sleep(5)::text", &[]);
+        let error = slow.expect_err("a five-second statement ran to the end");
+        assert_eq!(
+            error.code(),
+            Some(&postgres::error::SqlState::QUERY_CANCELED),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let plain = super::PostgresStore::connect(&url).expect("connect");
+        assert!(
+            plain
+                .lock()
+                .query_one("select pg_sleep(0.5)::text", &[])
+                .is_ok()
+        );
+    }
 
     #[test]
     fn the_migration_lock_lives_in_the_servers_maintenance_database() {
