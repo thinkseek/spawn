@@ -436,7 +436,7 @@ integrate_once() {
     return 0
 }
 
-# The latest record of task `$1` of type `$2`: field `$3`.
+# Field `$2` of the control record of event `$1`.
 record_of() { # <event id> <field>
     q "select kind -> 'detail' -> 'record' ->> '$2' from spawn_events where id = $1"
 }
@@ -458,7 +458,7 @@ first_verdict() {
         order by e.id limit 1"
 }
 # The pass line (passes.log) that recorded control event `$1`.
-pass_of() { grep -F " $1 " "$WORK/passes.log" | head -1 || true; }
+pass_of() { grep -E "[ ;]$1 [0-9]+ [a-z]+(;|\$)" "$WORK/passes.log" | head -1 || true; }
 # The gate_rejections before and after the pass that recorded event `$1`,
 # when that pass recorded exactly one verdict: `<before> <after>`.
 counted() {
@@ -648,7 +648,8 @@ revision() {
     q "select id from spawn_commands
         where session_id = 'session_resident_beta' and principal = 'spawn-dispatch'
           and action ->> 'type' = 'input' and state = 'finished' and succeeded
-          and created_at_ms >= $verdict_ms order by id limit 1"
+          and created_at_ms >= $verdict_ms and action ->> 'text' like '%Task #$task_beta%'
+        order by id limit 1"
 }
 deadline=$(($(now) + 150))
 until [ -n "$(revision)" ]; do
