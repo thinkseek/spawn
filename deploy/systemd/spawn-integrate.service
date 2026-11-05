@@ -12,9 +12,6 @@ Environment=no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 Environment=SPAWN_PROGRAM=%h/.local/share/spawn-rsi/bin/spawn
 # The gate and the scenarios come from this checkout, never from a tree under test.
 Environment=SPAWN_GATE=%h/projects/Spawn/scripts/rsi/gate.sh
-# One gate per mission, at most SPAWN_INTEGRATE_GATES (default 2) at once.
-# KillMode stays control-group: a restart kills every gate under it, and the
-# next integrator judges those tasks again.
 ExecStart=%h/.local/share/spawn-rsi/bin/spawn integrate
 # A halt is per mission and recorded in the log; the process keeps running.
 Restart=always
