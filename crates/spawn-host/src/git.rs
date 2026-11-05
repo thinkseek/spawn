@@ -731,68 +731,53 @@ impl GitWorkspace {
     /// file cannot be materialized without replacing a tracked file or
     /// writing through a symlink, so a merge that makes one is refused and a
     /// mount of one fails.
+    ///
+    /// Every path and each of its leading directories is asked of `git
+    /// ls-tree -t -z` as a literal pathspec, so a name of any bytes (a
+    /// newline too) is asked as it is.
     fn large_clashes(
         &self,
         manifest: &Manifest,
         tree: &str,
     ) -> Result<Vec<TreePath>, WorkspaceError> {
-        // `<tree>:<path>` per line, then the object type or `missing`.
-        let mut asked = Vec::new();
-        let mut clashes = Vec::new();
-        for file in &manifest.files {
-            if file.path.as_bytes().contains(&b'\n') {
-                clashes.push(file.path.clone());
-                continue;
-            }
-            for prefix in file.path.prefixes() {
-                let whole = prefix == file.path;
-                asked.push((file.path.clone(), prefix, whole));
-            }
-        }
+        let asked: std::collections::BTreeSet<TreePath> = manifest
+            .files
+            .iter()
+            .flat_map(|file| file.path.prefixes())
+            .collect();
         if asked.is_empty() {
-            return Ok(clashes);
+            return Ok(Vec::new());
         }
-        let mut child = self
-            .command()
-            .args(["cat-file", "--batch-check=%(objecttype)"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
-        let mut input = Vec::new();
-        for (_, path, _) in &asked {
-            use std::os::unix::ffi::OsStrExt;
-            input.extend_from_slice(path.in_tree(tree).as_bytes());
-            input.push(b'\n');
-        }
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin.write_all(&input).map_err(|error| {
-                WorkspaceError::Unavailable(format!("write to git cat-file: {error}"))
-            })?;
-        }
-        let output = report(child.wait_with_output(), "cat-file --batch-check")?;
-        let answers: Vec<&str> = output.lines().collect();
-        if answers.len() != asked.len() {
-            return Err(WorkspaceError::Unavailable(format!(
-                "git cat-file answered {} of {} paths",
-                answers.len(),
-                asked.len()
-            )));
-        }
-        for ((file, _, whole), answer) in asked.iter().zip(answers) {
-            let missing = answer.ends_with(" missing");
-            let clash = if *whole {
-                !missing
-            } else {
-                !missing && answer != "tree"
-            };
-            if clash && !clashes.contains(file) {
-                clashes.push(file.clone());
-            }
-        }
-        Ok(clashes)
+        let mut arguments: Vec<OsString> = ["ls-tree", "-t", "-z", "--full-tree", tree, "--"]
+            .map(OsString::from)
+            .into();
+        arguments.extend(asked.iter().map(|path| path.pathspec("literal")));
+        let listed = self.git_listing(&arguments)?;
+        // The type of each entry asked for; a directory's other children
+        // the listing shows on the way are not asked for.
+        let kinds: BTreeMap<TreePath, String> = nul_fields(&listed)
+            .filter_map(|entry| {
+                // `<mode> <type> <id>\t<path>`
+                let (meta, path) = tree_entry(entry)?;
+                let kind = meta.split_whitespace().nth(1)?.to_string();
+                asked.contains(&path).then_some((path, kind))
+            })
+            .collect();
+        Ok(manifest
+            .files
+            .iter()
+            .filter(|file| {
+                file.path.prefixes().any(|prefix| {
+                    let kind = kinds.get(&prefix);
+                    if prefix == file.path {
+                        kind.is_some()
+                    } else {
+                        kind.is_some_and(|kind| kind != "tree")
+                    }
+                })
+            })
+            .map(|file| file.path.clone())
+            .collect())
     }
 
     /// The manifest `head` names, which a merge commit over `tree` keeps,

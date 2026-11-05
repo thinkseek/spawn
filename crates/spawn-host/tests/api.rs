@@ -378,8 +378,13 @@ fn a_large_file_named_like_a_pattern_drops_nothing_else() {
 }
 
 /// Names of large files that are not plain: bytes that are not UTF-8, in a
-/// file and in a directory.
-const ODD_LARGE_NAMES: [&[u8]; 2] = [b"bad\xffname.bin", b"dir\xfe/model.bin"];
+/// file and in a directory, and newlines.
+const ODD_LARGE_NAMES: [&[u8]; 4] = [
+    b"bad\xffname.bin",
+    b"dir\xfe/model.bin",
+    b"line\nbreak.bin",
+    b"new\nline/model.bin",
+];
 
 #[test]
 fn a_large_file_of_any_name_round_trips_through_a_mount() {
