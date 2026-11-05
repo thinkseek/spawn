@@ -633,20 +633,33 @@ record of what was judged (§14 of design.md).
      agent's latest checkpoint is gated `stale` after a short wait: no gate
      run, no rejection, the task stays ready and is judged again later
      ([storage.md](storage.md), "Landing");
-  2. builds the candidate: the pushed branch itself, or a merge of it with `main`
-     when `main` has moved. A conflict first merges `main` into the agent's
+  2. builds the candidate, the landing commit C: one merge commit whose
+     first parent is `main` (the base) and second the pushed head, with the
+     head's tree when `main` is in it and the merge by `main`'s merge rules
+     when `main` has moved, never a fast-forward to a worker's commit. Its
+     message says what landed: the objective's title, the objective and the
+     task on the first line (for a task without an objective, the brief's
+     first line and the task), then the report's `## What changed` (the
+     whole report without one, bounded, a line that could read as a
+     `Spawn-` trailer indented), then `Spawn-Task`, `Spawn-Objective` and
+     `Spawn-Head` trailers. So `git log --first-parent main` is one line
+     per landed task, `git bisect start --first-parent` visits only gated
+     landings, `git revert -m 1 <C>` undoes one task, and every checkpoint
+     stays reachable through the second parents ([storage.md](storage.md),
+     "Landing"). A conflict first merges `main` into the agent's
      idle workspace, with conflict markers, then sends the task back with a
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate, with a 45-minute wall clock;
-  4. records `task.gated` (verdict, log, metric) before git moves;
+  3. runs the gate on C, with a 45-minute wall clock;
+  4. records `task.gated` (verdict, log, metric, C as `candidate`) before
+     git moves;
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
      record was lost), which is a landing;
-  6. records `task.landed` (`from`, `to`).
+  6. records `task.landed` (`from`, `to` = C).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
 - **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
