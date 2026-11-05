@@ -15,7 +15,7 @@
 | 门禁自测 | `scripts/rsi/test-gate.sh` | 门禁本身的测试 |
 | 积分器 | `spawn integrate`（`crates/spawn-cli/src/integrate.rs`、`objectives.rs`） | 派目标、跑门禁、落地、停机 |
 
-backlog、场景和门禁都从控制器的 checkout 按绝对路径读取，agent 改不到。
+backlog、场景和门禁都从控制器按绝对路径读取，agent 改不到。控制器是部署的提交的树（`~/.local/share/spawn-rsi/controllers/spawn`，`deploy/deploy.sh` 部署时原子切换），不是所有者的工作检出：所有者改门禁、场景或 backlog，部署后才生效（deploy/systemd/README.md「The controller」）。
 
 ## 2. 一个目标怎样落地
 
