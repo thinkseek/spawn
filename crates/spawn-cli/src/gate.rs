@@ -512,7 +512,8 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GateFailure, PrivateDirectory, gate_env, judge, run_bounded, withhold_owners_cluster,
+        GateFailure, PrivateDirectory, gate_env, judge, judge_in, run_bounded,
+        withhold_owners_cluster,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -577,6 +578,31 @@ mod tests {
         fn judge(&self, env: &[(String, String)]) -> Result<super::Verdict, GateFailure> {
             let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
             judge(
+                &path("gate.sh"),
+                Path::new("/nonexistent/repo.git"),
+                "base",
+                "candidate",
+                &path("scenarios"),
+                None,
+                env,
+                Duration::from_secs(20),
+            )
+        }
+    }
+
+    impl FakeGate {
+        /// [`FakeGate::judge`] with the private directory under `parent` and
+        /// free space measured as `free_kb` says, wherever.
+        fn judge_room(
+            &self,
+            env: &[(String, String)],
+            parent: &Path,
+            free_kb: Option<u64>,
+        ) -> Result<super::Verdict, GateFailure> {
+            let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
+            judge_in(
+                parent,
+                &|_| free_kb,
                 &path("gate.sh"),
                 Path::new("/nonexistent/repo.git"),
                 "base",
@@ -693,6 +719,77 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// A TMPDIR at 0 bytes free: this process cannot even make its private
+    /// directory. It measures the directory itself, and records no room only
+    /// when the measure is under the floor.
+    #[test]
+    fn no_private_directory_on_a_full_disk_is_no_room_by_measure() {
+        let gate = FakeGate::new("exit 0\n");
+        let full = Path::new("/nonexistent/full-tmp");
+        let Err(GateFailure::NoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log,
+        }) = gate.judge_room(&path_only(), full, Some(0))
+        else {
+            panic!("a full disk is no room");
+        };
+        assert_eq!((free_kb, min_gb), (0, 10), "the default floor");
+        assert_eq!(tmpdir, "/nonexistent/full-tmp");
+        assert!(log.contains("cannot create the gate's private directory"), "{log}");
+        // The same failure with room to spare, or unmeasurable: an abort.
+        for measured in [Some(11 * 1_048_576), None] {
+            assert!(
+                matches!(
+                    gate.judge_room(&path_only(), full, measured),
+                    Err(GateFailure::Failed(_))
+                ),
+                "{measured:?}"
+            );
+        }
+    }
+
+    /// The gate exits 5 but could not write its fact (a full disk): the
+    /// integrator measures the gate's TMPDIR against the gate's floor.
+    #[test]
+    fn exit_5_without_a_fact_is_no_room_only_by_measure() {
+        let gate = FakeGate::new("exit 5\n");
+        let parent = std::env::temp_dir();
+        let env = |floor: &str| {
+            let mut env = path_only();
+            env.push(("TMPDIR".to_string(), "/data/full".to_string()));
+            env.push(("SPAWN_GATE_MIN_FREE_GB".to_string(), floor.to_string()));
+            env
+        };
+        let Err(GateFailure::NoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log,
+        }) = gate.judge_room(&env("4"), &parent, Some(0))
+        else {
+            panic!("exit 5 on a full TMPDIR is no room");
+        };
+        assert_eq!((free_kb, min_gb, tmpdir.as_str()), (0, 4, "/data/full"));
+        assert!(log.contains("no readable no-room fact"), "{log}");
+        for (floor, measured) in [("4", Some(4 * 1_048_576)), ("4", None), ("lots", Some(0))] {
+            assert!(
+                matches!(
+                    gate.judge_room(&env(floor), &parent, measured),
+                    Err(GateFailure::Aborted { .. })
+                ),
+                "floor {floor}, measured {measured:?}: an abort"
+            );
+        }
+        // Any other exit, on the same full disk, still counts.
+        let other = FakeGate::new("exit 3\n");
+        assert!(matches!(
+            other.judge_room(&env("4"), &parent, Some(0)),
+            Err(GateFailure::Aborted { .. })
+        ));
     }
 
     #[test]
