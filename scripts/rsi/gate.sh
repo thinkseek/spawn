@@ -65,12 +65,14 @@
 # and the controller's `scripts` and `web/node_modules` (the controller is
 # the directory two levels above the scenarios). The network namespace is
 # new: loopback only, so no host service (the live database, serve, the Jev
-# relay) is reachable. The checks reach the test database through its Unix
-# socket: when SPAWN_TEST_DATABASE_URL's host is a percent-encoded path, that
-# directory is bound in; a TCP test URL does not work inside. The
-# environment is cleared down to the list below. Cargo gets a private
-# CARGO_HOME whose registry and git caches are the real ones, read-only, and
-# runs offline: a candidate cannot fetch a new crate or rewrite a cached one.
+# relay) is reachable. The checks reach the test database through one Unix
+# socket: its own socket file when SPAWN_TEST_DATABASE_URL names a socket
+# directory, or, for a TCP URL (127.0.0.1, localhost, [::1], a name), a
+# socket the gate forwards to that host and port; inside, the URL names
+# that socket. The environment is cleared down to the list below. Cargo
+# gets a private CARGO_HOME whose registry and git caches are the real
+# ones, read-only, and runs offline: a candidate cannot fetch a new crate or
+# rewrite a cached one.
 # Git reads the gate's own config (an identity, no signing), not the
 # owner's.
 #
@@ -94,8 +96,10 @@
 # Environment (the integrator passes these and nothing else, gate.rs):
 #   PATH, HOME, LANG, TMPDIR   as usual
 #   CARGO_HOME, RUSTUP_HOME    when the toolchain is not under $HOME
-#   SPAWN_TEST_DATABASE_URL    the throwaway database the checks may use, as
-#                              a socket URL (postgres://u:p@%2Fdir/db)
+#   SPAWN_TEST_DATABASE_URL    the throwaway database the checks may use: a
+#                              socket URL (postgres://u:p@%2Fdir/db, or
+#                              ?host=/dir) or a TCP one, read by
+#                              scripts/pg-url.sh
 #   SPAWN_GATE_VERDICT         a file in a directory the integrator owns; the
 #                              verdict is written there too, and the
 #                              integrator believes that file only, and only
@@ -285,26 +289,121 @@ cache_exposed() {
     return 1
 }
 
-# The test database, reached over its Unix socket: the sandbox has no
-# network but its own loopback. A URL whose host is a percent-encoded path
-# (postgres://user:pw@%2Fpath%2Fto%2Fdir/db) names the socket directory.
+# The test database, reached over one Unix socket file: the sandbox has no
+# network but its own loopback. The URL is read as libpq reads it
+# (scripts/pg-url.sh, percent-decoded):
+# - a socket directory (postgres://u:p@%2Fdir:5432/db, or ?host=/dir): the
+#   one file <dir>/.s.PGSQL.<port> is bound in, not the directory, so a
+#   neighbour in it (another cluster's socket) stays out;
+# - a TCP host (127.0.0.1, localhost, [::1], any name): the gate forwards a
+#   socket of its own, $work/test-db/.s.PGSQL.<port>, to that host and port,
+#   outside the sandbox (python3), and the sandbox reaches that server and
+#   nothing else of the network. The forwarded connection is plain: a
+#   server that requires TLS (hostssl) refuses it.
+# Inside, SPAWN_TEST_DATABASE_URL names that socket
+# (postgres://u:p@%2Fdir:<port>/db?<other parameters>), whatever form the
+# owner gave. An unreadable URL or a missing socket is an infrastructure
+# error (exit 3), not a verdict.
+# shellcheck source=scripts/pg-url.sh
+. "$(dirname "$0")/../pg-url.sh"
 db_socket=""
-case "${SPAWN_TEST_DATABASE_URL-}" in
-*://*)
-    db_host=${SPAWN_TEST_DATABASE_URL#*://}
-    db_host=${db_host##*@}
-    db_host=${db_host%%/*}
-    db_host=${db_host%%\?*}
-    case "$db_host" in
-    %2[Ff]*)
-        db_host=${db_host%:[0-9]*}
-        db_socket=$(printf '%s' "$db_host" | sed 's/%2[Ff]/\//g')
-        case "$db_socket" in *%*) db_socket="" ;; esac
-        [ -d "$db_socket" ] || db_socket=""
+db_forward=""
+sandbox_db_url=""
+if [ -n "${SPAWN_TEST_DATABASE_URL-}" ]; then
+    if ! pg_url_parse "$SPAWN_TEST_DATABASE_URL"; then
+        echo "gate: SPAWN_TEST_DATABASE_URL is not a single-host postgres:// URL" >&2
+        exit 3
+    fi
+    case "$pg_url_host" in
+    /*)
+        db_socket=$pg_url_host/.s.PGSQL.$pg_url_port
+        if [ ! -S "$db_socket" ]; then
+            echo "gate: no test database socket at $db_socket" >&2
+            exit 3
+        fi
+        db_socket=$(cd "$pg_url_host" && pwd -P)/.s.PGSQL.$pg_url_port
+        ;;
+    "")
+        echo "gate: SPAWN_TEST_DATABASE_URL names no host; name the socket directory or the address" >&2
+        exit 3
+        ;;
+    *)
+        command -v python3 >/dev/null 2>&1 || {
+            echo "gate: a TCP test database URL needs python3 to forward it into the sandbox" >&2
+            exit 3
+        }
+        mkdir -m 700 "$work/test-db"
+        db_socket=$work/test-db/.s.PGSQL.$pg_url_port
+        db_forward="$pg_url_host $pg_url_port"
         ;;
     esac
-    ;;
-esac
+    sandbox_db_url="$pg_url_scheme://${pg_url_userinfo:+$pg_url_userinfo@}$(pg_url_encode_host \
+        "$(dirname "$db_socket")"):$pg_url_port/$(pg_url_encode_component "$pg_url_database")"
+    [ -z "$pg_url_options" ] || sandbox_db_url="$sandbox_db_url?$pg_url_options"
+fi
+
+# The forwarder of a TCP test database: a Unix socket in $work/test-db that
+# relays each connection to the test server's host and port. It dies with
+# the gate (the EXIT trap, and the parent-death signal if the gate is
+# killed).
+db_forwarder=""
+if [ -n "$db_forward" ]; then
+    cat >"$work/test-db-forward.py" <<'EOF'
+import ctypes, os, socket, sys, threading
+ctypes.CDLL(None).prctl(1, 15)  # PR_SET_PDEATHSIG: SIGTERM when the gate dies
+path, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(path)
+listener.listen(64)
+
+def pump(source, sink):
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            sink.sendall(data)
+    except OSError:
+        pass
+    for end in (source, sink):
+        try:
+            end.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+def relay(client):
+    try:
+        upstream = socket.create_connection((host, port), 10)
+    except OSError:
+        client.close()
+        return
+    upstream.settimeout(None)
+    back = threading.Thread(target=pump, args=(upstream, client), daemon=True)
+    back.start()
+    pump(client, upstream)
+    back.join()
+    client.close()
+    upstream.close()
+
+while True:
+    client, _ = listener.accept()
+    threading.Thread(target=relay, args=(client,), daemon=True).start()
+EOF
+    # shellcheck disable=SC2086 # host and port
+    python3 "$work/test-db-forward.py" "$db_socket" $db_forward </dev/null >/dev/null 2>"$work/test-db-forward.log" &
+    db_forwarder=$!
+    trap 'stage_close aborted; kill "$db_forwarder" 2>/dev/null; rm -rf "$work"' EXIT
+    waited=0
+    while [ ! -S "$db_socket" ]; do
+        if ! kill -0 "$db_forwarder" 2>/dev/null || [ "$waited" -ge 100 ]; then
+            echo "gate: the test database forwarder did not start:" >&2
+            cat "$work/test-db-forward.log" >&2
+            exit 3
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+fi
 
 old_ifs=$IFS
 IFS='
@@ -371,10 +470,11 @@ sandbox() {
         --setenv CARGO_HOME /tmp/cargo-home --setenv CARGO_NET_OFFLINE true \
         --setenv npm_config_cache /tmp/npm-cache \
         --setenv GIT_CONFIG_GLOBAL /tmp/gitconfig
-    for name in LANG RUSTUP_HOME SPAWN_TEST_DATABASE_URL; do
+    for name in LANG RUSTUP_HOME; do
         eval "value=\${$name-}"
         [ -n "$value" ] && set -- "$@" --setenv "$name" "$value"
     done
+    [ -n "$sandbox_db_url" ] && set -- "$@" --setenv SPAWN_TEST_DATABASE_URL "$sandbox_db_url"
     set -- "$@" --chdir "$tree" --
     # The command was given first: move it after the options.
     while [ "$count" -gt 0 ]; do
@@ -553,11 +653,13 @@ if [ -d "$controller/scripts/blackbox" ]; then
 else
     helpers_sha=none
 fi
-# The stage helper is sourced by the black-box runner too.
-if [ -f "$controller/scripts/stage.sh" ]; then
-    helpers_sha=$(printf '%s %s\n' "$helpers_sha" "$(sha "$controller/scripts/stage.sh")" |
-        sha256sum | cut -d' ' -f1)
-fi
+# The stage helper is sourced by the black-box runner too, the URL parser
+# by the scenarios (and by this gate, whose own copy is keyed as well).
+for helper in "$controller/scripts/stage.sh" "$controller/scripts/pg-url.sh" \
+    "$(dirname "$0")/../pg-url.sh"; do
+    [ -f "$helper" ] || continue
+    helpers_sha=$(printf '%s %s\n' "$helpers_sha" "$(sha "$helper")" | sha256sum | cut -d' ' -f1)
+done
 : >"$work/base-results"
 for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     [ -f "$objective" ] || continue

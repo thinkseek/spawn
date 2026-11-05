@@ -1147,16 +1147,50 @@ fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
     }
 }
 
-/// The same server spelled another way: a socket directory moved to the
-/// `host` parameter, or 127.0.0.1 as `localhost`.
+/// The same server spelled another way: the authority's host and port
+/// moved to the `host` and `port` parameters. Any host works: a socket
+/// directory, 127.0.0.1, `localhost`, `[::1]` (the brackets dropped), a
+/// name.
 fn respelled(url: &str) -> String {
     let (head, tail) = url.rsplit_once('@').expect("a host");
-    let (host, path) = tail.split_once('/').expect("a database");
-    if host.starts_with("%2F") || host.starts_with("%2f") {
-        let separator = if path.contains('?') { '&' } else { '?' };
-        format!("{head}@/{path}{separator}host={host}")
-    } else {
-        format!("{head}@{}/{path}", host.replace("127.0.0.1", "localhost"))
+    let (authority, path) = tail.split_once('/').expect("a database");
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && (!host.starts_with('[') || host.ends_with(']')) =>
+        {
+            (host, format!("&port={port}"))
+        }
+        _ => (authority, String::new()),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{head}@/{path}{separator}host={host}{port}")
+}
+
+#[test]
+fn respelling_moves_any_host_to_the_parameters() {
+    for (url, expected) in [
+        (
+            "postgres://u:p@%2Frun%2Fpg/db",
+            "postgres://u:p@/db?host=%2Frun%2Fpg",
+        ),
+        (
+            "postgres://u:p@127.0.0.1:15434/db",
+            "postgres://u:p@/db?host=127.0.0.1&port=15434",
+        ),
+        (
+            "postgres://u:p@localhost/db?sslmode=disable",
+            "postgres://u:p@/db?sslmode=disable&host=localhost",
+        ),
+        (
+            "postgres://u:p@[::1]:5432/db",
+            "postgres://u:p@/db?host=::1&port=5432",
+        ),
+    ] {
+        assert_eq!(respelled(url), expected);
+        assert_ne!(respelled(url), url);
     }
 }
 
