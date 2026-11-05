@@ -149,7 +149,7 @@ from (
                'session_id', k.session_id, 'state', k.state, 'base', k.base,
                'candidate', k.candidate, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
-               'revisions', k.revisions)
+               'revisions', k.revisions, 'brief', k.brief, 'report', k.report)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
