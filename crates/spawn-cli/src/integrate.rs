@@ -3076,8 +3076,9 @@ mod database_tests {
     /// else through any number of passes although a gate is free: A's second
     /// waits for A's first (a mission's tasks stay serial, each judged
     /// against the main the one before left), and D for A's (they share the
-    /// mirror and main). Then A's second runs, merged with the main A's first
-    /// left, D still waiting; then D's.
+    /// mirror and main). Then D's runs, judged against the main A's first
+    /// left: it has waited since it was reported, A's second only since A's
+    /// first ended (the longest wait gets the gate). Then A's second.
     #[test]
     fn gates_run_per_mission_concurrently() {
         let marks =
@@ -3152,7 +3153,11 @@ mod database_tests {
 
         integrator.pass_on(&db.store).expect("the next pass");
         let second = wait_started(&marks, 3);
-        assert_eq!(parent(&repos, &second[2], 2), pushed_a_two, "A's second");
+        assert_eq!(
+            parent(&repos, &second[2], 2),
+            pushed_d,
+            "D's, the longest wait"
+        );
         assert_eq!(
             parent(&repos, &second[2], 1),
             a_first_main,
@@ -3160,6 +3165,19 @@ mod database_tests {
         );
         hold(3);
         release();
+        assert_eq!(db.mission(d)["tasks"][0]["state"], "landed");
+        let d_main = source_main(&source_a);
+
+        integrator.pass_on(&db.store).expect("the pass after");
+        let third = wait_started(&marks, 4);
+        assert_eq!(parent(&repos, &third[3], 2), pushed_a_two, "A's second");
+        assert_eq!(
+            parent(&repos, &third[3], 1),
+            d_main,
+            "judged against the main D's left"
+        );
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
         assert!(
             db.mission(a)["tasks"]
                 .as_array()
@@ -3169,13 +3187,6 @@ mod database_tests {
             "{}",
             db.mission(a)
         );
-
-        integrator.pass_on(&db.store).expect("the pass after");
-        let third = wait_started(&marks, 4);
-        assert_eq!(parent(&repos, &third[3], 2), pushed_d, "D's, after A's");
-        std::fs::write(marks.join("release"), "").expect("release");
-        integrator.settle();
-        assert_eq!(db.mission(d)["tasks"][0]["state"], "landed");
         for base in [base_a, base_b, marks] {
             let _ = std::fs::remove_dir_all(&base);
         }
