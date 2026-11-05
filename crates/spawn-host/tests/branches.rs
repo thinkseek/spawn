@@ -10,7 +10,7 @@ use spawn_core::id::{BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Branch, ChunkStore, Commit, WorkspaceStore};
 use spawn_host::chunks::{LargeFile, Manifest};
 use spawn_host::git::DEFAULT_CHUNK_DIRECTORY;
-use spawn_host::{GitWorkspace, LocalChunkStore, has_conflict_block};
+use spawn_host::{GitWorkspace, LocalChunkStore, has_conflict_block, has_conflict_block_sized};
 
 /// Output of git in `directory`, which must succeed.
 fn git(directory: &Path, arguments: &[&str]) -> String {
@@ -693,6 +693,177 @@ fn only_a_whole_marker_block_is_a_conflict() {
         !has_conflict_block(b"  <<<<<<< a\n=======\n>>>>>>> b\n"),
         "not at line start"
     );
+    assert!(
+        has_conflict_block(b"<<<<<<<<<< a\nx\n==========\ny\n>>>>>>>>>> b\n"),
+        "conflict-marker-size=10"
+    );
+    assert!(
+        has_conflict_block(b"<<<<<<<\nx\n=======\ny\n>>>>>>>\n"),
+        "markers without labels"
+    );
+    assert!(
+        !has_conflict_block(b"<<<<<<<<<< a\nx\n=======\ny\n>>>>>>>>>> b\n"),
+        "one length per block"
+    );
+    assert!(
+        !has_conflict_block(b"<<<<<<<< a\nx\n=======\ny\n>>>>>>> b\n"),
+        "one length per block"
+    );
+    assert!(
+        has_conflict_block(b"<<<<<<<<< a\n<<<<<<< b\nx\n=======\ny\n>>>>>>> c\n"),
+        "a block inside an unfinished one"
+    );
+    assert!(!has_conflict_block(b"<<< a\nx\n===\ny\n>>> b\n"));
+    assert!(
+        has_conflict_block_sized(b"<<< a\nx\n===\ny\n>>> b\n", 3),
+        "conflict-marker-size=3"
+    );
+}
+
+#[test]
+fn markers_of_the_attributes_size_are_conflicts_until_resolved() {
+    let fixture = Fixture::new(
+        "marker-size",
+        &[
+            (
+                ".gitattributes",
+                "*.txt conflict-marker-size=10\n*.md conflict-marker-size=3\n",
+            ),
+            ("long.txt", "base\n"),
+            ("short.md", "base\n"),
+        ],
+    );
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    let head = fixture.work(
+        &workspace,
+        &[("long.txt", "mine\n"), ("short.md", "mine\n")],
+    );
+    let main = fixture.land(&[("long.txt", "theirs\n"), ("short.md", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    assert!(
+        read(&directory, "long.txt").starts_with("<<<<<<<<<< "),
+        "{}",
+        read(&directory, "long.txt")
+    );
+    assert!(
+        read(&directory, "short.md").starts_with("<<< "),
+        "{}",
+        read(&directory, "short.md")
+    );
+
+    let long_marked = read(&directory, "long.txt");
+    let short_marked = read(&directory, "short.md");
+    let Commit::Created(wip) = fixture
+        .store
+        .commit(&workspace, "wip")
+        .expect("commit the markers")
+    else {
+        panic!("the merge changed the workspace");
+    };
+    assert_eq!(parents(&fixture, wip.as_str()), vec![head.clone()]);
+
+    // Either file's markers left, the other resolved: no resolution yet,
+    // and the integrator sees the one left.
+    for (long, short, left) in [
+        ("both\n", short_marked.as_str(), "short.md"),
+        (long_marked.as_str(), "both\n", "long.txt"),
+    ] {
+        fs::write(directory.join("long.txt"), long).expect("write");
+        fs::write(directory.join("short.md"), short).expect("write");
+        assert!(matches!(
+            fixture.store.merge_base(&workspace).expect("still marked"),
+            BaseMerge::Conflicted { marked: true, .. }
+        ));
+        let Commit::Created(half) = fixture.store.commit(&workspace, "half").expect("commit")
+        else {
+            panic!("a change");
+        };
+        assert_eq!(
+            parents(&fixture, half.as_str()).len(),
+            1,
+            "{left} is marked"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .conflict_markers(&main, half.as_str())
+                .expect("scan"),
+            vec![left]
+        );
+    }
+    let resolved = fixture.work(
+        &workspace,
+        &[("long.txt", "both\n"), ("short.md", "both\n")],
+    );
+    let parents = parents(&fixture, &resolved);
+    assert_eq!(parents[1], main);
+    git(
+        &fixture.checkout,
+        &["merge-base", "--is-ancestor", &head, &resolved],
+    );
+}
+
+#[test]
+fn a_conflict_nested_in_a_merge_base_is_one_on_its_own() {
+    // A criss-cross history whose two merge bases conflict: in diff3 style
+    // the base section shows their merge, with markers two longer.
+    let fixture = Fixture::new("nested", &[("f.txt", "1\nx\n2\n")]);
+    let checkout = &fixture.checkout;
+    let commit = |file: &str| {
+        fs::write(checkout.join("f.txt"), file).expect("write");
+        git(checkout, &["commit", "-qam", file]);
+    };
+    git(checkout, &["checkout", "-qb", "a"]);
+    commit("1\na\n2\n");
+    git(checkout, &["checkout", "-qb", "c", "main"]);
+    commit("1\nc\n2\n");
+    for (name, from, other) in [("m1", "a", "c"), ("m2", "c", "a")] {
+        git(checkout, &["checkout", "-qb", name, from]);
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "rerere.enabled=false",
+            ])
+            .args(["merge", "-q", other])
+            .output();
+        fs::write(checkout.join("f.txt"), format!("1\n{name}\n2\n")).expect("resolve");
+        git(checkout, &["commit", "-qam", name]);
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["-c", "merge.conflictStyle=diff3"])
+        .args(["merge-tree", "--write-tree", "m1", "m2"])
+        .output()
+        .expect("merge-tree");
+    let tree = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .expect("a tree")
+        .to_string();
+    let merged = git(checkout, &["cat-file", "-p", &format!("{tree}:f.txt")]);
+    assert!(merged.contains("\n<<<<<<<<< "), "nested markers: {merged}");
+    assert!(has_conflict_block(merged.as_bytes()));
+    // The outer markers resolved, the nested block left in: still marked.
+    let outer = |line: &&str| {
+        line.starts_with("<<<<<<< ")
+            || line.starts_with("||||||| ")
+            || *line == "======="
+            || line.starts_with(">>>>>>> ")
+    };
+    let inner: Vec<&str> = merged.lines().filter(|line| !outer(line)).collect();
+    let inner = inner.join("\n");
+    assert!(!inner.contains("\n<<<<<<< "), "{inner}");
+    assert!(has_conflict_block(inner.as_bytes()), "{inner}");
 }
 
 #[test]
