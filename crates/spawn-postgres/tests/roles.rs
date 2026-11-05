@@ -366,15 +366,15 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
     }
 }
 
-/// Audit L8: a migration sends each login's derived password as the text of
-/// `alter role ... password '<hex>'`. Held behind another transaction's
-/// update of the role's row, the statement sits in `pg_stat_activity` with
-/// the password in it (readable by superusers and `pg_read_all_stats`), and
-/// the "tuple concurrently updated" error it then hits is logged with its
-/// statement under the default `log_min_error_statement = error`.
+/// Audit L8: a migration's `alter role ... password` carries a SCRAM
+/// verifier computed by the client, never the login's password. Held
+/// behind another transaction's update of the role's row, the statement
+/// sits in `pg_stat_activity` (readable by superusers and
+/// `pg_read_all_stats`), and the "tuple concurrently updated" error it then
+/// hits is logged with its statement under the default
+/// `log_min_error_statement = error`: what both show is the verifier.
 #[test]
-#[ignore = "audit L8 repro"]
-fn a_login_password_never_appears_in_statement_text_repro() {
+fn a_login_password_never_appears_in_statement_text() {
     let database = Database::new("roles_l8", None);
     PostgresStore::connect(&database.url())
         .expect("connect")
@@ -436,8 +436,15 @@ fn a_login_password_never_appears_in_statement_text_repro() {
         .expect("the login URL's password");
     // Compare without printing either.
     assert!(
-        leaked != real_password,
-        "pg_stat_activity showed the supervisor login's real password ({} hex chars)",
+        !leaked.contains(&real_password),
+        "pg_stat_activity showed the supervisor login's real password ({} chars)",
         leaked.len()
     );
+    assert!(
+        leaked.starts_with("SCRAM-SHA-256$"),
+        "the statement carries a SCRAM verifier"
+    );
+    // And the login still logs in with its password.
+    let mut supervisor = Client::connect(&real, NoTls).expect("the supervisor logs in");
+    supervisor.batch_execute("select 1").expect("a query");
 }

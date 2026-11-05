@@ -198,10 +198,15 @@ impl PostgresStore {
                 let Some((role, salt)) = login_row(&mut transaction, base)? else {
                     continue;
                 };
-                // Hex only, and the role [a-z0-9_]: nothing needs quoting.
+                // The server gets a SCRAM verifier computed here, never the
+                // password: `alter role` takes no bind parameter, so its text
+                // reaches pg_stat_activity and, on an error, the server log.
+                // The verifier is base64, `$` and `:`, and the role
+                // [a-z0-9_]: nothing needs quoting.
                 let password = role_password(&self.password, &salt, &role);
+                let verifier = postgres_protocol::password::scram_sha_256(password.as_bytes());
                 transaction.batch_execute(&format!(
-                    "alter role \"{role}\" with login password '{password}'"
+                    "alter role \"{role}\" with login password '{verifier}'"
                 ))?;
             }
         }
@@ -215,35 +220,21 @@ const MIGRATION_LOCK_KEY: i64 = 1_399_957_400;
 /// The migration lock, held in the server's `postgres` database until the
 /// returned connection drops; `None` where that database cannot be reached.
 fn server_migration_lock(url: &str) -> Option<Client> {
-    let mut client = Client::connect(&maintenance_url(url), NoTls).ok()?;
+    let mut client = maintenance_config(url)?.connect(NoTls).ok()?;
     client
         .execute("select pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
         .ok()?;
     Some(client)
 }
 
-/// `url` with its database replaced by the server's maintenance database
-/// `postgres`, keeping host, port, credentials and query parameters.
-fn maintenance_url(url: &str) -> String {
-    let (base, query) = url
-        .split_once('?')
-        .map_or((url, None), |(b, q)| (b, Some(q)));
-    let authority_start = base.find("://").map_or(0, |index| index + 3);
-    let base = match base[authority_start..].find('/') {
-        Some(slash) => &base[..authority_start + slash],
-        None => base,
-    };
-    let query = query.map(|query| {
-        query
-            .split('&')
-            .filter(|pair| !pair.starts_with("dbname="))
-            .collect::<Vec<_>>()
-            .join("&")
-    });
-    match query {
-        Some(query) if !query.is_empty() => format!("{base}/postgres?{query}"),
-        _ => format!("{base}/postgres"),
-    }
+/// `url`'s connection with its database replaced by the server's
+/// maintenance database `postgres`, keeping host, port, credentials and
+/// every other parameter, as the driver reads them; `None` when the URL
+/// does not parse.
+fn maintenance_config(url: &str) -> Option<postgres::Config> {
+    let mut config: postgres::Config = url.parse().ok()?;
+    config.dbname("postgres");
+    Some(config)
 }
 
 /// One restricted login of the database `client` is in: its role name
@@ -304,32 +295,15 @@ fn retry_pause(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(u64::from(20 * attempt + jitter))
 }
 
-/// The password part of a `scheme://user:password@host/...` URL, decoded
-/// (`%40` is `@`), or "": every spelling of one password derives the same
-/// login passwords.
+/// The password `url` connects with, as the driver reads it (the user
+/// info, decoded, or a `password=` parameter), or "": every spelling of one
+/// password derives the same login passwords.
 fn url_password(url: &str) -> String {
-    let raw = url
-        .split_once("://")
-        .and_then(|(_, rest)| rest.rsplit_once('@'))
-        .and_then(|(userinfo, _)| userinfo.split_once(':'))
-        .map_or("", |(_, password)| password);
-    let mut bytes = Vec::with_capacity(raw.len());
-    let mut rest = raw.as_bytes();
-    while let Some((&byte, tail)) = rest.split_first() {
-        let escaped = (byte == b'%')
-            .then(|| tail.get(..2))
-            .flatten()
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        if let Some(decoded) = escaped {
-            bytes.push(decoded);
-            rest = &tail[2..];
-        } else {
-            bytes.push(byte);
-            rest = tail;
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
+    url.parse::<postgres::Config>()
+        .ok()
+        .and_then(|config| config.get_password().map(<[u8]>::to_vec))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
 }
 
 /// PBKDF2-HMAC-SHA256 rounds of a login password: a guess at the owner's
@@ -422,19 +396,55 @@ pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
     let (name, salt) = login_row(&mut client, role)
         .map_err(|error| format!("{role}: {}", backend(&error)))?
         .ok_or_else(|| no_login(role).to_string())?;
-    Ok(login_url(
-        scheme,
-        rest,
-        &name,
-        &role_password(&password, &salt, &name),
-    ))
+    login_url(scheme, rest, &name, &role_password(&password, &salt, &name))
+        .map_err(|error| format!("{role}: {error}"))
 }
 
-/// `scheme://role:password@` and the host part of `rest` (what follows the
-/// owner's `user:password@`).
-fn login_url(scheme: &str, rest: &str, role: &str, password: &str) -> String {
-    let host = rest.rsplit_once('@').map_or(rest, |(_, tail)| tail);
-    format!("{scheme}://{role}:{password}@{host}")
+/// `scheme://role:password@` and the rest of the owner's URL (`rest`, what
+/// follows `scheme://`): its host, port, database and parameters, without
+/// its user info and without a `user=` or `password=` parameter. The result
+/// is read back with the driver's `Config`: it must name `role` and
+/// `password` and the owner's hosts, ports and database, or it is an error,
+/// never a URL that would log in as someone else or somewhere else.
+fn login_url(scheme: &str, rest: &str, role: &str, password: &str) -> Result<String, String> {
+    let owner: postgres::Config = format!("{scheme}://{rest}")
+        .parse()
+        .map_err(|error: postgres::Error| error.to_string())?;
+    // The user info ends the authority's last `@`; the authority ends at the
+    // first `/` or `?`.
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let tail = match tail.split_once('?') {
+        Some((path, query)) => {
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|pair| !pair.starts_with("user=") && !pair.starts_with("password="))
+                .collect();
+            if kept.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path}?{}", kept.join("&"))
+            }
+        }
+        None => tail.to_string(),
+    };
+    let url = format!("{scheme}://{role}:{password}@{host}{tail}");
+    let login: postgres::Config = url
+        .parse()
+        .map_err(|error: postgres::Error| error.to_string())?;
+    let same = login.get_user() == Some(role)
+        && login.get_password() == Some(password.as_bytes())
+        && login.get_hosts() == owner.get_hosts()
+        && login.get_ports() == owner.get_ports()
+        && login.get_dbname() == owner.get_dbname();
+    if same {
+        Ok(url)
+    } else {
+        Err("the owner's URL does not give a login URL that reaches the same database".to_string())
+    }
 }
 
 /// The identity of the server `url` reaches: its `system_identifier`, set
@@ -539,34 +549,34 @@ mod tests {
 
     #[test]
     fn the_migration_lock_lives_in_the_servers_maintenance_database() {
-        use super::maintenance_url;
+        use super::maintenance_config;
+        let config = maintenance_config("postgres://u:p%40ss@db.local:5433/spawn?sslmode=disable")
+            .expect("parses");
+        assert_eq!(config.get_dbname(), Some("postgres"));
+        assert_eq!(config.get_user(), Some("u"));
+        assert_eq!(config.get_password(), Some(&b"p@ss"[..]));
+        assert_eq!(config.get_ports(), [5433]);
+        let socket = maintenance_config("postgres://u@%2Frun%2Fpostgresql/spawn").expect("parses");
+        assert_eq!(socket.get_dbname(), Some("postgres"));
         assert_eq!(
-            maintenance_url("postgres://u:p%40ss@db.local:5433/spawn"),
-            "postgres://u:p%40ss@db.local:5433/postgres"
+            socket.get_hosts(),
+            [postgres::config::Host::Unix("/run/postgresql".into())]
         );
-        assert_eq!(
-            maintenance_url("postgresql://u@localhost/spawn?sslmode=disable&dbname=x"),
-            "postgresql://u@localhost/postgres?sslmode=disable"
-        );
-        assert_eq!(
-            maintenance_url("postgres://u@%2Frun%2Fpostgresql/spawn"),
-            "postgres://u@%2Frun%2Fpostgresql/postgres"
-        );
-        assert_eq!(
-            maintenance_url("postgres://u@host"),
-            "postgres://u@host/postgres"
-        );
+        assert!(maintenance_config("not a url").is_none());
     }
 
     #[test]
     fn every_spelling_of_the_owner_password_is_one_password() {
+        // As the driver reads it, the one that connects: decoded user info,
+        // or a `password=` parameter.
         assert_eq!(url_password("postgres://o:p%40ss@h/db"), "p@ss");
-        assert_eq!(url_password("postgres://o:p@ss@h/db"), "p@ss");
+        assert_eq!(url_password("postgres://o@h/db?password=p%40ss"), "p@ss");
         assert_eq!(
-            url_password("postgres://o:100%@h/db"),
-            "100%",
-            "a stray % stays"
+            url_password("host=h user=o password=p@ss dbname=db"),
+            "p@ss"
         );
+        assert_eq!(url_password("postgres://o@h/db"), "");
+        assert_eq!(url_password("not a url"), "");
     }
 
     #[test]
@@ -604,7 +614,22 @@ mod tests {
                 "spawn_reader_db",
                 "secret"
             ),
-            "postgres://spawn_reader_db:secret@h:1/db?sslmode=disable"
+            Ok("postgres://spawn_reader_db:secret@h:1/db?sslmode=disable".to_string())
+        );
+        // A password given as a parameter, or an `@` in a parameter, never
+        // moves the login elsewhere or keeps the owner's credentials.
+        assert_eq!(
+            login_url(
+                "postgres",
+                "o@h:1/db?password=owner&application_name=a@b&user=o",
+                "spawn_reader_db",
+                "secret"
+            ),
+            Ok("postgres://spawn_reader_db:secret@h:1/db?application_name=a@b".to_string())
+        );
+        assert_eq!(
+            login_url("postgres", "o:p%40ss@h/db", "spawn_reader_db", "secret"),
+            Ok("postgres://spawn_reader_db:secret@h/db".to_string())
         );
     }
 }
