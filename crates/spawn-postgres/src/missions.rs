@@ -11,6 +11,8 @@ use spawn_core::port::StoreError;
 use crate::PostgresStore;
 
 /// One task the dispatcher has to look at, with what it needs to deliver it.
+/// A closed ephemeral task stays for a day, and for as long as its worker
+/// still runs: its worker is stopped, and it is managed until then.
 pub(crate) const DELIVERY_TASKS: &str = r"
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
@@ -25,12 +27,26 @@ from (
    where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
       or (k.state = 'accepted' and m.gate is not null)
       or (k.state in ('accepted', 'cancelled', 'landed') and k.kind = 'ephemeral'
-          and k.updated_at_ms > spawn_now_ms() - 86400000)
+          and (k.updated_at_ms > spawn_now_ms() - 86400000
+               or exists (select 1 from agent_status s
+                           where s.session_id = k.session_id and s.live)))
 ) t";
 
 /// What the supervisor should hear about, beyond worker states: open
-/// missions, reports, residents approved, and human messages to workers.
+/// missions, reports, residents approved, and human commands to workers,
+/// once finished, with their outcome. An approval or a human command stays
+/// news until a digest that carried it reached the supervisor (its tag,
+/// [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `told`), however long
+/// that takes; the dispatcher filters what was told by the same tags.
 pub(crate) const MISSION_NEWS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
                  'id', m.id, 'text', left(m.text, 400), 'origin', m.origin) order by m.id)
@@ -43,15 +59,20 @@ select jsonb_build_object(
   'approved', coalesce((select jsonb_agg(jsonb_build_object('name', r.name) order by r.name)
                from mission_residents r
               where r.state = 'approved'
-                and r.updated_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb),
+                and not exists (select 1 from told
+                                 where tag = r.session_id || ' approved-' || r.name)), '[]'::jsonb),
   'human', coalesce((select jsonb_agg(jsonb_build_object(
                  'command_id', c.id, 'session_id', c.session_id,
-                 'text', left(coalesce(c.action ->> 'text', c.action ->> 'prompt', c.action ->> 'type'), 200))
+                 'action', c.action ->> 'type',
+                 'text', left(coalesce(c.action ->> 'text', c.action ->> 'prompt', c.action ->> 'type'), 200),
+                 'succeeded', c.succeeded, 'error', left(c.error, 300))
                  order by c.id)
                from spawn_commands c
               where c.principal = 'human'
                 and (c.agent_id like 'agent\_worker\_%' or c.agent_id like 'agent\_resident\_%')
-                and c.created_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb)
+                and c.state = 'finished'
+                and not exists (select 1 from told
+                                 where tag = c.session_id || ' human-' || c.id)), '[]'::jsonb)
 )";
 
 /// The board of missions with their tasks, newest first; each task carries
