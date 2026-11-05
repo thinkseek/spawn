@@ -100,6 +100,20 @@ export interface FleetHealth {
   ladder_extra: Array<[string, number]>;
   agent_hours_24h: number | null;
   human_per_agent_hour: number | null;
+  /** Free disk on the paths the fleet writes to, read when the page loaded. */
+  disk: DiskPlace[];
+}
+
+export interface DiskPlace {
+  /** `workspace` or `tmpdir`. */
+  label: string;
+  path: string;
+  /** Null when the server could not read it. */
+  free_bytes: number | null;
+  /** Under this the loop records a warning. */
+  warn_bytes: number;
+  /** Under this no new execution starts. */
+  floor_bytes: number;
 }
 
 export interface Fleet {
@@ -357,6 +371,16 @@ function normalizeHealth(value: unknown, agents: FleetAgent[]): FleetHealth {
     ladder_extra: ladderExtra,
     agent_hours_24h: optionalNumber(health.agent_hours_24h),
     human_per_agent_hour: optionalNumber(health.human_per_agent_hour),
+    disk: list(health.disk).map((raw) => {
+      const place = object(raw);
+      return {
+        label: text(place.label),
+        path: text(place.path),
+        free_bytes: optionalNumber(place.free_bytes),
+        warn_bytes: number(place.warn_bytes),
+        floor_bytes: number(place.floor_bytes),
+      };
+    }),
   };
 }
 
