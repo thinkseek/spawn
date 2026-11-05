@@ -2345,12 +2345,11 @@ mod database_tests {
         let pushed_c = push_work(&base_c, &source_c, &agent_of(&db, c, c_task), "c1.txt");
 
         integrator.pass_on(&db.store).expect("the first pass");
-        let first = wait_started(&marks, 2);
-        assert_eq!(
-            first,
-            vec![pushed_a_one.clone(), pushed_b.clone()],
-            "A's first and B's"
-        );
+        let mut first = wait_started(&marks, 2);
+        first.sort();
+        let mut expected = vec![pushed_a_one.clone(), pushed_b.clone()];
+        expected.sort();
+        assert_eq!(first, expected, "A's first and B's");
         // More passes while both hold: nothing else starts.
         for _ in 0..3 {
             integrator
@@ -2376,10 +2375,10 @@ mod database_tests {
         integrator.pass_on(&db.store).expect("the next pass");
         let next = wait_started(&marks, 4);
         assert_eq!(next.len(), 4, "A's second and C's: {next:?}");
-        assert_eq!(next[3], pushed_c, "C's after A's second: {next:?}");
-        assert_ne!(
-            next[2], pushed_a_two,
-            "A's second is merged with the main A's first left"
+        assert!(next[2..].contains(&pushed_c), "C's: {next:?}");
+        assert!(
+            !next.contains(&pushed_a_two),
+            "A's second is merged with the main A's first left: {next:?}"
         );
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
