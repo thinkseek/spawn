@@ -138,8 +138,9 @@ select jsonb_build_object(
 /// What the dispatcher decides from: every worker session and the
 /// supervisor, with the latest judgement, the episode (latest command from
 /// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
-/// model profile of its latest execution, and what the dispatcher already
-/// sent there in the last day.
+/// model profile of its latest execution, what the dispatcher already
+/// sent there in the last day, and the tags of every input it delivered
+/// there (`told`: the escalations its digests carried, however long ago).
 pub(crate) const DISPATCH_FACTS: &str = r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
 from (
@@ -172,6 +173,10 @@ from (
        from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.created_at_ms > spawn_now_ms() - 86400000) as dispatched,
+    (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
+       from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
+      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array') as told,
     (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'

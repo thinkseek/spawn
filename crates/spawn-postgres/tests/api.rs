@@ -1304,6 +1304,7 @@ fn a_delivered_task_starts_a_new_episode_and_a_nudge_does_not() {
             idempotency_key: IdempotencyKey::new(key).expect("valid key"),
             action: CommandAction::Input {
                 text: key.to_string(),
+                tags: Vec::new(),
             },
             ..start(session.clone(), key)
         };
@@ -1348,6 +1349,7 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
             idempotency_key: IdempotencyKey::new(key).expect("valid key"),
             action: CommandAction::Input {
                 text: key.to_string(),
+                tags: Vec::new(),
             },
             ..start(session.clone(), key)
         };
