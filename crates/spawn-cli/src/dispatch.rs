@@ -146,6 +146,21 @@ impl Facts {
             })
     }
 
+    /// Whether the worker's latest judgement, current or not, has it idle at
+    /// its prompt, with nothing in flight. For a command that failed having
+    /// changed nothing on the worker, whose own records made that judgement
+    /// stale ([`Self::current_observation`]).
+    pub(crate) fn last_judged_idle(&self) -> bool {
+        self.live_and_free()
+            && self.observation.as_ref().is_some_and(|observation| {
+                observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
+                    && matches!(
+                        observation.state,
+                        SemanticState::Waiting | SemanticState::Completed
+                    )
+            })
+    }
+
     pub(crate) fn idle_at_prompt(&self) -> bool {
         self.live_and_free()
             && self.current_observation().is_some_and(|observation| {
