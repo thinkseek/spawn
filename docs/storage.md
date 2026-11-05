@@ -126,6 +126,29 @@ head alone is the whole workspace, so everything below is a git operation.
   `main`'s version (or delete it where `main` has none); recorded as
   `merge.conflicted {files, marked: false}`. An agent with no workspace on
   the integrator's host gets no merge, and its note says so.
+- **Work set aside**: a resident keeps its branch from task to task, so the
+  work of a task cancelled while it was delivered (by `spawn task cancel`,
+  the supervisor, the integrator's abort over budget, or the closure rule)
+  would otherwise stay in its workspace, the next task would start on top
+  of it, and in a gated mission the next task's candidate would carry it
+  into a landing under another objective's name. Before the resident gets
+  anything else, the dispatcher (spawn-cli's `set_aside`) puts a new commit
+  on top of its branch whose tree is the checkpoint the task started from:
+  the agent's latest `artifact.committed` before the task's first delivery
+  was accepted, the merge of `main` typed just before it included (and a
+  start's or resume's `base_merged`, recorded before `task.delivered`). It
+  runs only while nothing of the agent writes the branch, after the
+  dispatcher's Stop took the final checkpoint, under the branch's lock
+  (`set_aside`, routed like `merge_base`): a mounted directory holding
+  what no checkpoint took is committed first, the directory moves to the
+  start's tree the two-tree way, then the branch moves by compare-and-swap.
+  Nothing is rewound (pushes are never forced, and the integrator requires
+  the published branch to descend from the latest checkpoint), and nothing
+  is lost: the work is the set-aside commit's parent, and the worker's
+  notice names both commits. The set-aside is recorded as
+  `artifact.committed` (`set_aside`, key `set-aside:<task>`, so it is made
+  once) and pushed like any checkpoint. A merge pending its markers is set
+  aside with the work.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won by the same two-tree update
