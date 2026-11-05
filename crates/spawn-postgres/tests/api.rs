@@ -1518,6 +1518,94 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
     );
 }
 
+/// A delivery refused before anything was typed (a pane not ready) is not
+/// the worker's last delivery, nor an episode: it told the worker nothing.
+/// One that may have typed is, and so is one not finished yet.
+#[test]
+fn a_delivery_that_never_reached_the_worker_is_not_its_last() {
+    let (store, _schema) = store("facts_unreached");
+    let worker = AgentId::new("agent_resident_core").expect("valid agent");
+    let session = SessionId::new("session_resident_core").expect("valid session");
+    store
+        .append(NewEvent {
+            agent_id: worker.clone(),
+            session_id: session.clone(),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    // Submit `key` as the dispatcher and finish it with `outcome` (none:
+    // left open).
+    let deliver = |key: &str, outcome: Option<Outcome>| {
+        let submission = Submission {
+            agent_id: worker.clone(),
+            idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+            action: CommandAction::Input {
+                text: key.to_string(),
+                tags: Vec::new(),
+            },
+            ..start(session.clone(), key)
+        };
+        let id = store
+            .submit(
+                &Principal::new("spawn-dispatch").expect("valid principal"),
+                &submission,
+            )
+            .expect("submit succeeds");
+        if let Some(outcome) = outcome {
+            let claimed = store
+                .claim("w1", Duration::from_mins(1))
+                .expect("claim succeeds")
+                .expect("the command waits");
+            assert_eq!(claimed.command_id, id, "{key} is the one waiting");
+            store.finish(&claimed, &outcome).expect("finish succeeds");
+        }
+        i64::try_from(id.0).expect("small id")
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    let reached = deliver("deliver-24-0", Some(Outcome::Succeeded));
+    deliver(
+        "deliver-25-0",
+        Some(Outcome::Failed(
+            "pane state Busy does not accept input".to_string(),
+        )),
+    );
+    let facts = row();
+    assert_eq!(
+        facts["last_delivery"].as_str(),
+        Some("deliver-24-0"),
+        "the refused delivery of task 25 is not the worker's"
+    );
+    assert_eq!(facts["episode"].as_i64(), Some(reached), "nor an episode");
+    assert!(
+        facts["dispatched"]
+            .as_array()
+            .expect("dispatched")
+            .iter()
+            .any(|sent| sent["key"] == "deliver-25-0" && sent["succeeded"] == false),
+        "the refusal stays among the attempts, for the retry"
+    );
+    deliver(
+        "deliver-25-0-retry-1",
+        Some(Outcome::Failed(format!(
+            "the text {}",
+            spawn_core::bridge::MAY_HAVE_TYPED
+        ))),
+    );
+    assert_eq!(
+        row()["last_delivery"].as_str(),
+        Some("deliver-25-0-retry-1"),
+        "one that may have typed may have reached the worker"
+    );
+    let open = deliver("deliver-26-0", None);
+    let facts = row();
+    assert_eq!(
+        facts["last_delivery"].as_str(),
+        Some("deliver-26-0"),
+        "in flight"
+    );
+    assert_eq!(facts["episode"].as_i64(), Some(open));
+}
+
 #[test]
 fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
     let (store, _schema) = store("facts_model");
