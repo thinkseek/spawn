@@ -9,12 +9,17 @@
 //! are stored once.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rustix::fs::{AtFlags, CWD, Mode, OFlags};
+use rustix::io::Errno;
 use serde_json::{Value, json};
 use spawn_core::port::{ChunkError, ChunkStore, StoredObject};
 
@@ -626,145 +631,157 @@ pub fn chunk_names_of(path: &Path) -> Result<(Vec<String>, u64), ChunkError> {
     Ok((chunks, size))
 }
 
-/// A directory held open, reached without following any symlink, and the
-/// path that names its entries: through the open descriptor
-/// (`/proc/self/fd/<n>/<entry>`) where /proc shows it, so a component
-/// swapped for a symlink after it was opened is never followed.
-struct Held {
-    file: File,
-    path: PathBuf,
+/// A directory of a workspace held open by its descriptor. Every entry
+/// below it is reached through the descriptor (`openat`, `mkdirat`,
+/// `renameat`, `unlinkat`), never by a path from the top, so a component
+/// swapped for a symlink after it was opened is never followed: the calls
+/// keep working in the directory that was opened, wherever it now is.
+/// These calls exist on every Unix this builds for (Linux and macOS alike);
+/// nothing depends on `/proc`.
+pub(crate) struct HeldDirectory {
+    descriptor: OwnedFd,
+    /// The directory's path, for messages only.
+    shown: PathBuf,
 }
 
-impl Held {
-    /// Open the directory `path` itself, refusing a symlink or anything that
-    /// is not a directory.
-    fn open(path: PathBuf) -> std::io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)?;
-        Ok(Self { file, path })
-    }
+/// Flags for opening a directory that must not be a symlink.
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
 
-    /// The path of `name` inside this directory.
-    fn entry(&self, name: &std::ffi::OsStr) -> PathBuf {
-        use std::os::fd::AsRawFd;
-        let through = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
-        if through.is_dir() {
-            through.join(name)
-        } else {
-            self.path.join(name)
-        }
+impl HeldDirectory {
+    /// Open the directory `path` itself, refusing a symlink or anything that
+    /// is not a directory at its last component.
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+        let descriptor = rustix::fs::openat(CWD, path, directory_flags(), Mode::empty())
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        Ok(Self {
+            descriptor,
+            shown: path.to_path_buf(),
+        })
     }
 
     /// The child directory `name`, made when missing. A symlink, a file or
     /// anything else that is not a directory is refused.
-    fn child(&self, name: &std::ffi::OsStr) -> Result<Self, String> {
-        let entry = self.entry(name);
-        let shown = self.path.join(name);
-        let refused = |error: std::io::Error| {
-            format!(
-                "{}: not a directory of the workspace (a symlink or a file is in the way): {error}",
-                shown.display()
-            )
-        };
-        match std::fs::symlink_metadata(&entry) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // mkdir never follows a symlink in its last component.
-                match std::fs::create_dir(&entry) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(format!("create {}: {error}", shown.display())),
-                }
-            }
-            Err(error) => return Err(format!("stat {}: {error}", shown.display())),
+    fn child(&self, name: &[u8]) -> Result<Self, String> {
+        let shown = self.shown.join(OsStr::from_bytes(name));
+        // mkdir never follows a symlink in its last component.
+        match rustix::fs::mkdirat(&self.descriptor, name, Mode::from_raw_mode(0o777)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(error) => return Err(format!("create {}: {error}", shown.display())),
         }
-        let held = Self::open(entry).map_err(refused)?;
-        Ok(Self {
-            path: shown,
-            ..held
-        })
+        let descriptor =
+            rustix::fs::openat(&self.descriptor, name, directory_flags(), Mode::empty()).map_err(
+                |error| {
+                    format!(
+                        "{}: not a directory of the workspace (a symlink or a file is in the way): \
+                     {error}",
+                        shown.display()
+                    )
+                },
+            )?;
+        Ok(Self { descriptor, shown })
+    }
+
+    /// The directory that holds `relative` (a safe path), each component
+    /// below `top` walked through the one above it ([`Self::child`]).
+    pub(crate) fn parent_of(top: &Path, relative: &TreePath) -> Result<Self, String> {
+        let mut parent = Self::open(top)?;
+        let mut components: Vec<&[u8]> = relative.components().collect();
+        components.pop();
+        for component in components {
+            parent = parent.child(component)?;
+        }
+        Ok(parent)
+    }
+
+    /// Write `file` from `store` as the entry `name` of this directory,
+    /// atomically: every chunk is verified and the size checked into a
+    /// temporary entry beside it, created exclusively and without following
+    /// a symlink, which is renamed over `name` only when all of it is right.
+    /// On any error `name` is left untouched.
+    pub(crate) fn write(
+        &self,
+        name: &[u8],
+        store: &dyn ChunkStore,
+        file: &LargeFile,
+    ) -> Result<(), String> {
+        let mut temporary_name = b".".to_vec();
+        temporary_name.extend_from_slice(name);
+        temporary_name.extend_from_slice(
+            format!(
+                ".spawn-{}-{}",
+                std::process::id(),
+                TEMPORARY.fetch_add(1, Ordering::Relaxed)
+            )
+            .as_bytes(),
+        );
+        let temporary_name = temporary_name.as_slice();
+        let shown = self.shown.join(OsStr::from_bytes(temporary_name));
+        let descriptor = rustix::fs::openat(
+            &self.descriptor,
+            temporary_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| format!("create {}: {error}", shown.display()))?;
+        let mut output = File::from(descriptor);
+        let written = (|| -> Result<(), String> {
+            let mut size = 0u64;
+            for chunk in &file.chunks {
+                let bytes = store.get(chunk).map_err(|error| error.to_string())?;
+                size += bytes.len() as u64;
+                output
+                    .write_all(&bytes)
+                    .map_err(|error| format!("write {}: {error}", shown.display()))?;
+            }
+            if size != file.size {
+                return Err(format!(
+                    "{}: chunks hold {size} bytes, the manifest says {}",
+                    file.path, file.size
+                ));
+            }
+            set_mode(&output, file.mode)
+                .map_err(|error| format!("chmod {}: {error}", shown.display()))?;
+            output
+                .sync_all()
+                .map_err(|error| format!("sync {}: {error}", shown.display()))?;
+            // rename replaces a symlink at the target, never what it points to.
+            rustix::fs::renameat(&self.descriptor, temporary_name, &self.descriptor, name)
+                .map_err(|error| {
+                    format!(
+                        "rename to {}: {error}",
+                        self.shown.join(OsStr::from_bytes(name)).display()
+                    )
+                })?;
+            let _ = rustix::fs::fsync(&self.descriptor);
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = rustix::fs::unlinkat(&self.descriptor, temporary_name, AtFlags::empty());
+        }
+        written
     }
 }
 
 /// Write `file` under `directory` from `store`, atomically and inside the
-/// workspace only: every chunk is verified and the size checked into a
-/// temporary file beside the target, which is renamed into place only when
-/// all of it is right. On any error the target is left untouched.
+/// workspace only ([`HeldDirectory::write`]): on any error the target is
+/// left untouched.
 ///
-/// The parent directories are walked one component at a time, each opened
-/// with `O_NOFOLLOW` and made with `mkdir` when missing, so a symlink (or a
-/// file) where the manifest has a directory fails the write instead of
-/// leading it out of the workspace. The temporary file is created
-/// exclusively and without following a symlink, and renamed inside the
-/// directory that was verified.
+/// The parent directories are walked one component at a time through
+/// descriptors ([`HeldDirectory`]), each opened with `O_NOFOLLOW` and made
+/// with `mkdirat` when missing, so a symlink (or a file) where the manifest
+/// has a directory fails the write instead of leading it out of the
+/// workspace, and so does one swapped in while the write runs.
 pub fn materialize(
     store: &dyn ChunkStore,
     directory: &Path,
     file: &LargeFile,
 ) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
     if !file.path.is_safe() {
         return Err(format!("unsafe path {}", file.path));
     }
-    let relative = file.path.as_path();
-    let name = relative
-        .file_name()
-        .ok_or_else(|| format!("{} has no file name", file.path))?;
-    let mut parent = Held::open(directory.to_path_buf())
-        .map_err(|error| format!("open {}: {error}", directory.display()))?;
-    if let Some(parents) = relative.parent() {
-        for component in parents.components() {
-            parent = parent.child(component.as_os_str())?;
-        }
-    }
-    let temporary_name = format!(
-        ".{}.spawn-{}-{}",
-        name.to_string_lossy(),
-        std::process::id(),
-        TEMPORARY.fetch_add(1, Ordering::Relaxed)
-    );
-    let temporary = parent.entry(std::ffi::OsStr::new(&temporary_name));
-    let shown = parent.path.join(&temporary_name);
-    let target = parent.entry(name);
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&temporary)
-        .map_err(|error| format!("create {}: {error}", shown.display()))?;
-    let written = (|| -> Result<(), String> {
-        let mut size = 0u64;
-        for chunk in &file.chunks {
-            let bytes = store.get(chunk).map_err(|error| error.to_string())?;
-            size += bytes.len() as u64;
-            output
-                .write_all(&bytes)
-                .map_err(|error| format!("write {}: {error}", shown.display()))?;
-        }
-        if size != file.size {
-            return Err(format!(
-                "{}: chunks hold {size} bytes, the manifest says {}",
-                file.path, file.size
-            ));
-        }
-        set_mode(&output, file.mode)
-            .map_err(|error| format!("chmod {}: {error}", shown.display()))?;
-        output
-            .sync_all()
-            .map_err(|error| format!("sync {}: {error}", shown.display()))?;
-        // rename replaces a symlink at the target, never what it points to.
-        std::fs::rename(&temporary, &target)
-            .map_err(|error| format!("rename to {}: {error}", parent.path.join(name).display()))?;
-        let _ = parent.file.sync_all();
-        Ok(())
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written
+    HeldDirectory::parent_of(directory, &file.path)?.write(file.path.file_name(), store, file)
 }
 
 fn set_mode(file: &File, mode: u32) -> std::io::Result<()> {
@@ -1031,6 +1048,37 @@ mod tests {
         assert_eq!(
             std::fs::read(workspace.join("new/dir/model.bin")).expect("read"),
             bytes
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_symlink_after_it_was_opened_is_not_followed() {
+        let directory = scratch("swap");
+        let store = LocalChunkStore::new(directory.join("store"));
+        let bytes = noise(8, 100_000);
+        let file = LargeFile {
+            path: "assets/model.bin".into(),
+            mode: 0o100_644,
+            size: bytes.len() as u64,
+            chunks: vec![store.put(&bytes).expect("put")],
+        };
+        let workspace = directory.join("ws");
+        let outside = directory.join("outside");
+        std::fs::create_dir_all(workspace.join("assets")).expect("workspace");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let parent = HeldDirectory::parent_of(&workspace, &file.path).expect("walk the parents");
+        // The race: once the walk holds `assets`, it becomes a symlink out.
+        std::fs::rename(workspace.join("assets"), workspace.join("moved")).expect("move");
+        std::os::unix::fs::symlink(&outside, workspace.join("assets")).expect("symlink");
+        parent
+            .write(file.path.file_name(), &store, &file)
+            .expect("write through the held directory");
+        assert_eq!(walk(&outside).len(), 0, "nothing written outside");
+        assert_eq!(
+            std::fs::read(workspace.join("moved/model.bin")).expect("read"),
+            bytes,
+            "written in the directory that was opened"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

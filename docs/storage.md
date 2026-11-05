@@ -220,10 +220,11 @@ files, a chunk fetch.
   tracked entry at its path, a file or a symlink at a parent directory)
   fails the mount. Parent directories are walked one component at a time,
   each opened with `O_NOFOLLOW` through the open descriptor of the one above
-  (`/proc/self/fd`) and made with `mkdir` when missing, so a symlink or a
-  file where the manifest has a directory fails the write; the temporary
-  file is created exclusively without following a symlink and renamed
-  inside the directory that was verified.
+  (`openat`, made with `mkdirat` when missing; no `/proc`, the same on Linux
+  and macOS), so a symlink or a file where the manifest has a directory
+  fails the write, and one swapped in after the walk is never followed; the
+  temporary file is created exclusively without following a symlink and
+  renamed (`renameat`) inside the directory that was opened.
 - **Where.** The store is the directory `SPAWN_CHUNK_STORE` names, else
   `<root>/.chunks`. It is host-local: a branch with large files resumed on a
   host without its chunks fails to mount rather than lose them.
