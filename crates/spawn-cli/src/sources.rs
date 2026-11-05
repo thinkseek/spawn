@@ -888,6 +888,32 @@ mod tests {
         );
     }
 
+    /// Audit H5: a source is handed to the controller's git with no scheme
+    /// allowlist of Spawn's own. Here git 2.56's default (`ext` never)
+    /// refuses the transport, but the refusal is git's, so on a git or a
+    /// host config that allows `ext` the command runs as the owner. Spawn
+    /// should refuse a transport command itself, before git sees it.
+    #[test]
+    #[ignore = "audit H5 repro"]
+    fn a_source_that_names_a_transport_command_is_refused_by_spawn_repro() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-h5-repro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let marker = base.join("ran");
+        let source = format!("ext::sh -c touch% {}", marker.display());
+        let refused = ensure_mirror(&base, Some(&source)).expect_err("not a source");
+        let text = refused.to_string();
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&base);
+        // `git clone: …` is git's refusal (its text is localized); Spawn's
+        // own refusal names the source before any git runs.
+        assert!(
+            !text.contains("git clone:"),
+            "only git's own default stood between the source and a command: {text}"
+        );
+    }
+
     #[test]
     fn mirrors_are_named_by_source_and_unique() {
         let a = mirror_name("https://github.com/acme/widget.git");
