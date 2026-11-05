@@ -38,3 +38,16 @@ export function formatBytes(bytes: number | null | undefined): string {
   if (kilobytes < 1_024) return `${kilobytes.toFixed(1)} KB`;
   return `${(kilobytes / 1_024).toFixed(1)} MB`;
 }
+
+/** Format the time a stage took, as "+8m 16s": seconds below ten minutes,
+ * whole minutes below an hour, then hours and minutes. */
+export function stageDuration(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "";
+  const seconds = Math.round(ms / 1_000);
+  if (seconds < 60) return `+${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 10) return seconds % 60 === 0 ? `+${minutes}m` : `+${minutes}m ${seconds % 60}s`;
+  if (minutes < 60) return `+${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return minutes % 60 === 0 ? `+${hours}h` : `+${hours}h ${minutes % 60}m`;
+}

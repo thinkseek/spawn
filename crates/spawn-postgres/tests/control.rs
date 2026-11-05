@@ -668,3 +668,130 @@ fn the_rsi_page_reads_it(store: &PostgresStore, mission: i64, task: i64) {
     let gates = store.last_gates().expect("last gates");
     assert_eq!(gates[task.to_string()]["verdict"], "rejected");
 }
+
+/// Move a task's control records, oldest first, to `base` plus `seconds`.
+fn set_record_times(client: &mut Client, task: i64, base: i64, seconds: &[i64]) {
+    let seqs: Vec<i64> = client
+        .query(
+            "select session_seq from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'id' = $1
+                and kind -> 'detail' -> 'record' ->> 'type' like 'task.%'
+              order by session_seq",
+            &[&task.to_string()],
+        )
+        .expect("the task's records")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(seqs.len(), seconds.len());
+    for (seq, after) in seqs.iter().zip(seconds) {
+        client
+            .execute(
+                "update spawn_events set recorded_at_ms = $1
+                  where session_id = 'session_control' and session_seq = $2",
+                &[&(base + after * 1000), seq],
+            )
+            .expect("set the record's time");
+    }
+}
+
+#[test]
+fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
+    let (store, schema) = store("control_stages");
+    let mission = store
+        .mission_add("Timed", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "review",
+            None,
+            None,
+        )
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    let other = store
+        .task_assign(mission, "ephemeral", "w", "other", "default")
+        .expect("assign another");
+    assert_eq!(
+        task, mission,
+        "the mission's records carry the task's id and are not its stages"
+    );
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    store.task_review(task, false, "again").expect("send back");
+    store.task_delivered(task, 2).expect("delivered again");
+    assert!(store.task_reported(task, "fixed").expect("reported again"));
+    store.task_review(task, true, "").expect("accept");
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                   "base": "b1", "candidate": "c1"}),
+        )
+        .expect("the gate accepts");
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": task, "from": "b1", "to": "c1"}))
+        .expect("landed");
+    store.task_cancel(other).expect("cancel the other");
+
+    // The task's records at known times, in seconds after the assignment.
+    let base: i64 = 1_800_000_000_000;
+    let mut client = admin(&schema);
+    set_record_times(
+        &mut client,
+        task,
+        base,
+        &[0, 3385, 3881, 3900, 3960, 4560, 4570, 4748, 4748],
+    );
+
+    let expected = json!([
+        {"stage": "assigned", "at_ms": base},
+        {"stage": "delivered", "at_ms": base + 3_385_000, "took_ms": 3_385_000},
+        {"stage": "reported", "at_ms": base + 3_881_000, "took_ms": 496_000},
+        {"stage": "reviewed", "verdict": "rejected", "at_ms": base + 3_900_000, "took_ms": 19_000},
+        {"stage": "delivered", "at_ms": base + 3_960_000, "took_ms": 60_000},
+        {"stage": "reported", "at_ms": base + 4_560_000, "took_ms": 600_000},
+        {"stage": "reviewed", "verdict": "accepted", "at_ms": base + 4_570_000, "took_ms": 10_000},
+        {"stage": "gated", "verdict": "accepted", "at_ms": base + 4_748_000, "took_ms": 178_000},
+        {"stage": "landed", "at_ms": base + 4_748_000, "took_ms": 0},
+    ]);
+    assert_eq!(store.task_stages(task).expect("stages"), expected);
+    let cancelled = store.task_stages(other).expect("the other's stages");
+    let names: Vec<&str> = cancelled
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(|stage| stage["stage"].as_str())
+        .collect();
+    assert_eq!(names, ["assigned", "cancelled"]);
+    assert_eq!(store.task_stages(task + 1000).expect("no task"), json!([]));
+
+    // The board carries them, and every login that reads the board may.
+    let board = store.mission_board(10).expect("board");
+    assert_eq!(board["missions"][0]["tasks"][0]["stages"], expected);
+    for login in ["spawn_supervisor", "spawn_reader"] {
+        client
+            .batch_execute(&format!("set session authorization {login}"))
+            .expect("become the login");
+        let stages: serde_json::Value = client
+            .query_one("select spawn_task_stages($1)", &[&task])
+            .expect("the login reads the stages")
+            .get(0);
+        assert_eq!(stages, expected, "{login}");
+        if login == "spawn_supervisor" {
+            assert!(
+                client
+                    .query_one("select count(*) from spawn_events", &[])
+                    .is_err(),
+                "the supervisor still reads no events"
+            );
+        }
+        client
+            .batch_execute("reset session authorization")
+            .expect("back to the owner");
+    }
+}

@@ -236,8 +236,10 @@ fn now_ms() -> i64 {
         })
 }
 
-/// `/api/missions`: the board, each task with its last gate verdict
-/// (`last_gate`: `{verdict, reason, metric, candidate, at_ms}` or null).
+/// `/api/missions`: the board, each task with its stages from the store
+/// (`stages`: `[{stage, verdict?, at_ms, took_ms?}]`, oldest first) and its
+/// last gate verdict (`last_gate`: `{verdict, reason, metric, candidate,
+/// at_ms}` or null).
 fn missions() -> Result<Value, String> {
     let store = open_store()?;
     let mut board = store.mission_board(50).map_err(err)?;
@@ -837,13 +839,16 @@ mod tests {
     }
 
     #[test]
-    fn the_board_gets_each_tasks_last_gate() {
-        let mut board = json!({"missions": [{"tasks": [{"id": 7}, {"id": 8}]}]});
+    fn the_board_gets_each_tasks_last_gate_and_keeps_its_stages() {
+        let stages = json!([{"stage": "assigned", "at_ms": 1},
+                            {"stage": "delivered", "at_ms": 3_385_001, "took_ms": 3_385_000}]);
+        let mut board = json!({"missions": [{"tasks": [{"id": 7, "stages": stages}, {"id": 8}]}]});
         with_last_gates(&mut board, &json!({"7": {"verdict": "accepted"}}));
         assert_eq!(
             board["missions"][0]["tasks"][0]["last_gate"]["verdict"],
             "accepted"
         );
+        assert_eq!(board["missions"][0]["tasks"][0]["stages"], stages);
         assert!(board["missions"][0]["tasks"][1]["last_gate"].is_null());
     }
 
