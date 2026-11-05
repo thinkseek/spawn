@@ -252,6 +252,47 @@ fn the_base_is_merged_right_after_a_turns_checkpoint() {
 }
 
 #[test]
+fn a_merge_or_checkpoint_whose_record_failed_is_recorded_at_the_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+
+    // The branch took main, and the log refused the record.
+    let merged = CommitId::new("e".repeat(40)).expect("valid commit");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: merged.clone(),
+        files: vec!["README.md".to_string()],
+    });
+    transcript(&store, &[turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn end"));
+    store.fail_next_commit_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    assert!(checkpoints(&store).is_empty());
+    // The next tick records it, though the branch already holds the merge.
+    quiet(&bridge.tick().expect("the log is back"));
+    assert_eq!(
+        checkpoints(&store),
+        [(CheckpointReason::BaseMerged, merged.as_str().to_string())]
+    );
+
+    // A checkpoint's record is kept the same way.
+    store.set_base_merge(BaseMerge::Current);
+    let workspace = spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid");
+    transcript(&store, &tool_call("toolu_1"));
+    quiet(&bridge.tick().expect("read the tool call"));
+    store.mark_dirty(&workspace);
+    store.fail_next_commit_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    quiet(&bridge.tick().expect("the log is back"));
+    let recorded = checkpoints(&store);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(recorded[1].0, CheckpointReason::ToolCompleted);
+    quiet(&bridge.tick().expect("idle"));
+    assert_eq!(checkpoints(&store).len(), 2, "recorded once");
+}
+
+#[test]
 fn a_conflict_is_a_warning_and_records_nothing() {
     let store = store();
     let mut bridge = bridge(&store);
