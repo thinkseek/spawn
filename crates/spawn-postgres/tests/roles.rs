@@ -330,3 +330,38 @@ fn the_logins_of_earlier_installs_lose_everything_here() {
         .get(0);
     assert_eq!(left, 0, "nothing on the database is left");
 }
+
+#[test]
+fn many_migrations_at_once_on_one_cluster_all_succeed() {
+    // Fresh databases (each makes its logins) and fresh schemas of the
+    // shared test database (they share its logins), all started together.
+    const DATABASES: usize = 8;
+    const SCHEMAS: usize = 8;
+    let databases: Vec<Database> = (0..DATABASES)
+        .map(|number| Database::new(&format!("roles_burst_{number}"), None))
+        .collect();
+    let mut urls: Vec<String> = databases.iter().map(Database::url).collect();
+    urls.extend(
+        (0..SCHEMAS).map(|number| common::schema_url(&schema_name(&format!("burst_{number}")))),
+    );
+    let start = std::sync::Arc::new(std::sync::Barrier::new(urls.len()));
+    let migrations: Vec<_> = urls
+        .into_iter()
+        .map(|url| {
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                let store = PostgresStore::connect(&url).map_err(|error| error.to_string())?;
+                start.wait();
+                store.migrate().map_err(|error| error.to_string())?;
+                role_url(&url, "spawn_supervisor").map(|login| can_log_in(&login))
+            })
+        })
+        .collect();
+    for migration in migrations {
+        assert_eq!(
+            migration.join().expect("the migration returns"),
+            Ok(true),
+            "every migration succeeds and its supervisor logs in"
+        );
+    }
+}

@@ -220,24 +220,31 @@ const ROLE_PASSWORD_ROUNDS: u32 = 600_000;
 /// and a login that knows its own password and salt still needs the rounds
 /// for every guess at the owner's. Computed once per process.
 fn role_password(owner_password: &str, salt: &str, role: &str) -> String {
-    use hmac::{Hmac, KeyInit, Mac};
     use std::collections::HashMap;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, OnceLock};
     type Key = (String, String, String);
-    static DERIVED: OnceLock<Mutex<HashMap<Key, String>>> = OnceLock::new();
+    static DERIVED: OnceLock<Mutex<HashMap<Key, Arc<OnceLock<String>>>>> = OnceLock::new();
     let key = (
         owner_password.to_string(),
         salt.to_string(),
         role.to_string(),
     );
-    // Held while deriving, so threads asking at once derive it once.
-    let mut derived = DERIVED
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(password) = derived.get(&key) {
-        return password.clone();
-    }
+    // One cell per login: threads asking for one login at once derive it
+    // once, and different logins derive side by side.
+    let cell = Arc::clone(
+        DERIVED
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default(),
+    );
+    cell.get_or_init(|| pbkdf2_hex(owner_password, salt, role))
+        .clone()
+}
+
+fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
     let keyed = Hmac::<sha2::Sha256>::new_from_slice(owner_password.as_bytes())
         .expect("HMAC takes a key of any length");
     let mut round = keyed.clone();
@@ -253,13 +260,11 @@ fn role_password(owner_password: &str, salt: &str, role: &str) -> String {
             *out ^= byte;
         }
     }
-    let password = output.iter().fold(String::new(), |mut hex, byte| {
+    output.iter().fold(String::new(), |mut hex, byte| {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
         hex
-    });
-    derived.insert(key, password.clone());
-    password
+    })
 }
 
 /// The owner's URL with its credentials replaced by one of the database's
