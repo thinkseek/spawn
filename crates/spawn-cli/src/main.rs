@@ -24,7 +24,6 @@
 mod commands;
 mod config;
 mod context;
-mod corpus;
 mod deliver;
 mod dispatch;
 mod gate;
@@ -42,7 +41,7 @@ pub(crate) use config::{Flags, env_or, env_value, open_store};
 
 use commands::{chunks, engine, inspect, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|chunks|corpus|judge|serve|status|fleet|tail|hook|run|version>";
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|chunks|serve|status|fleet|tail|hook|run|version>";
 
 /// Usage of `spawn dispatch`, the one command that mixes a bare switch with
 /// valued flags.
@@ -78,7 +77,6 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "dispatch" => queue::dispatch_once(&rest),
         "integrate" => integrate::integrate(&rest),
         "chunks" => chunks::command(&rest),
-        "corpus" => corpus::command(&rest),
         "mission" => missions::mission(&rest),
         "charter" => {
             println!("{}", supervise::current_charter());
@@ -86,7 +84,6 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         }
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),
-        "judge" => corpus::judge(&Flags::parse(&rest)?),
         "status" => inspect::status(&Flags::parse(&rest)?),
         "fleet" => inspect::fleet(),
         "tail" => inspect::tail(&Flags::parse(&rest)?),

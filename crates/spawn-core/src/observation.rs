@@ -188,7 +188,7 @@ pub struct Observation {
     /// look. Acting on it is the control layer's decision, not this one's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attention: bool,
-    /// The input the model judge saw, for audit and replay.
+    /// The input the model judge saw, for audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<serde_json::Value>,
     /// Why `attention` is set, in one word: `permission`, `blocked`,

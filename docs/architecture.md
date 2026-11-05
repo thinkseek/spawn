@@ -137,7 +137,7 @@ spawn status
 | `serve` | 常驻：只读看板与 HTTP 查询 |
 | `dispatch` | 跑一轮派发：把消息、任务、新闻送给对应会话 |
 | `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
-| `judge` / `fleet` / `tail` / `corpus` | 判定、舰队概览、事件尾随、导出判定语料 |
+| `fleet` / `tail` | 舰队概览（每个会话及其判定）、单个会话的判定与事件尾随 |
 | `version` | 打印 `spawn <版本>` |
 
 | 环境变量 | 默认值 | 说明 |
