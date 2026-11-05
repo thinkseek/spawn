@@ -547,6 +547,118 @@ mod tests {
         );
     }
 
+    /// With no owner password (a peer or trust login: nothing in the URL,
+    /// so nothing the logins could derive from), a migration turns the
+    /// logins off, says so, and removes a password an earlier install set;
+    /// a migration with the password turns them on again. Needs
+    /// `SPAWN_TEST_DATABASE_URL`; the case gets a database of its own.
+    #[test]
+    fn a_migration_without_the_owner_password_turns_the_logins_off() {
+        use postgres::{Client, NoTls};
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL")
+            .expect("SPAWN_TEST_DATABASE_URL must point at a disposable database");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let name = format!("spawn_test_{}_{nanos:x}_logins_off", std::process::id());
+        let mut admin = Client::connect(&url, NoTls).expect("admin");
+        admin
+            .batch_execute(&format!("create database {name}"))
+            .expect("a database of its own");
+        let mut config: postgres::Config = url.parse().expect("parses");
+        config.dbname(&name);
+        let ours = url
+            .rsplit_once('/')
+            .map_or(url.clone(), |(base, _)| format!("{base}/{name}"));
+        let login = format!("spawn_supervisor_{name}");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let store = super::PostgresStore::connect(&ours).expect("connect");
+            store.migrate().expect("migrate with the owner's password");
+            let supervisor = role_url(&ours, "spawn_supervisor").expect("the login's URL");
+            assert!(Client::connect(&supervisor, NoTls).is_ok());
+            // As an earlier install left it: a fixed password anyone can guess.
+            Client::connect(&url, NoTls)
+                .expect("admin")
+                .batch_execute(&format!("alter role {login} login password '{login}'"))
+                .expect("an earlier install's password");
+            let mut fixed = config.clone();
+            fixed.user(&login).password(&login);
+            assert!(fixed.connect(NoTls).is_ok());
+
+            let mut passwordless = super::PostgresStore::connect(&ours).expect("connect");
+            passwordless.password = String::new();
+            passwordless
+                .migrate()
+                .expect("migrate without the owner's password");
+            assert!(
+                fixed.connect(NoTls).is_err(),
+                "the earlier password is gone"
+            );
+            assert!(
+                Client::connect(&supervisor, NoTls).is_err(),
+                "the derived one too"
+            );
+            let off: Vec<(String, bool, bool)> = Client::connect(&url, NoTls)
+                .expect("admin")
+                .query(
+                    "select rolname::text, rolcanlogin, rolpassword is null from pg_authid
+                      where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1)
+                      order by 1",
+                    &[&name],
+                )
+                .expect("the logins")
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect();
+            assert_eq!(
+                off,
+                [
+                    (format!("spawn_reader_{name}"), false, true),
+                    (format!("spawn_supervisor_{name}"), false, true),
+                ]
+            );
+            // It says so.
+            let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let sink = std::sync::Arc::clone(&warnings);
+            let mut owner = config.clone();
+            owner.notice_callback(move |notice| {
+                if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
+                    sink.lock()
+                        .expect("warnings")
+                        .push(notice.message().to_string());
+                }
+            });
+            owner
+                .connect(NoTls)
+                .expect("connect")
+                .batch_execute("select spawn_logins_off()")
+                .expect("turn them off again");
+            let warnings = warnings.lock().expect("warnings").clone();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains("no owner password") && warnings[0].contains(&login),
+                "{warnings:?}"
+            );
+            // A migration with the password turns them on again.
+            super::PostgresStore::connect(&ours)
+                .expect("connect")
+                .migrate()
+                .expect("migrate with the owner's password");
+            assert!(Client::connect(&supervisor, NoTls).is_ok());
+            assert!(fixed.connect(NoTls).is_err());
+        }));
+        let _ = admin.batch_execute(&format!("drop database if exists {name} with (force)"));
+        for role in [
+            format!("spawn_supervisor_{name}"),
+            format!("spawn_reader_{name}"),
+        ] {
+            let _ = admin.batch_execute(&format!("drop role if exists {role}"));
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[test]
     fn the_migration_lock_lives_in_the_servers_maintenance_database() {
         use super::maintenance_config;
