@@ -27,6 +27,7 @@ mod command_queue;
 mod event_log;
 mod fleet;
 mod gateway;
+mod host;
 mod missions;
 mod row;
 mod sessions;

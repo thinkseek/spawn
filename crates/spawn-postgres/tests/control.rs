@@ -795,3 +795,68 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
             .expect("back to the owner");
     }
 }
+
+#[test]
+fn host_disk_records_are_owner_only_facts_the_fold_ignores() {
+    let (store, schema) = store("control_host_disk");
+    let mut client = admin(&schema);
+    let record = |path: &str, state: &str, free: u64| {
+        json!({"type": "host.disk", "label": "workspace", "path": path,
+               "state": state, "free_bytes": free, "warn_bytes": 20, "floor_bytes": 2})
+    };
+    assert_eq!(store.host_disk().expect("none yet"), json!([]));
+    store
+        .host_record(&record("/ws", "low", 10))
+        .expect("record low");
+    store
+        .host_record(&record("/tmp", "low", 5))
+        .expect("another path");
+    let recovered = store
+        .host_record(&record("/ws", "recovered", 30))
+        .expect("record recovered");
+    let latest = store.host_disk().expect("latest per path");
+    let summary: Vec<(String, String, u64)> = latest
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|record| {
+            (
+                record["path"].as_str().unwrap_or_default().to_string(),
+                record["state"].as_str().unwrap_or_default().to_string(),
+                record["free_bytes"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("/tmp".to_string(), "low".to_string(), 5),
+            ("/ws".to_string(), "recovered".to_string(), 30)
+        ]
+    );
+    assert_eq!(latest[1]["event_id"], json!(recovered));
+    assert!(latest[1]["at_ms"].as_i64().is_some());
+
+    for bad in [
+        json!({"type": "task.landed", "id": 1}),
+        record("/ws", "full", 1),
+        json!({"type": "host.disk", "path": "/ws", "state": "low"}),
+    ] {
+        assert!(store.host_record(&bad).is_err(), "refused: {bad}");
+    }
+    // The fold has nothing to do with them, and refolding replays them.
+    let before = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), before);
+    assert_eq!(control_types(&mut client), ["host.disk"; 3]);
+
+    client
+        .batch_execute("set session authorization spawn_supervisor")
+        .expect("become the supervisor");
+    assert!(
+        client
+            .query_one("select spawn_host_record($1)", &[&record("/ws", "low", 1)])
+            .is_err(),
+        "the supervisor records no host facts"
+    );
+}
