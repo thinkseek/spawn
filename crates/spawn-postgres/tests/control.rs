@@ -1684,10 +1684,8 @@ fn three_tasks(store: &PostgresStore, mission: i64, kind: &str, worker: &str) ->
             .task_assign(mission, kind, worker, brief, "default")
             .expect("assign")
     });
-    for (n, &task) in tasks[1..].iter().enumerate() {
-        store
-            .task_delivered(task, 70 + n as i64)
-            .expect("delivered");
+    for (&task, command) in tasks[1..].iter().zip([70, 71]) {
+        store.task_delivered(task, command).expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));
     }
     store.task_review(tasks[2], true, "").expect("accept");
