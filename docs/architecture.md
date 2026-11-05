@@ -151,7 +151,7 @@ spawn fleet
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |
 | `SPAWN_GATE` | `scripts/rsi/gate.sh` | `spawn integrate` 的门禁脚本，输出一行 JSON 判定；线上指向控制器（部署的提交树）`~/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/gate.sh`，从不指向所有者的检出：所有者的改动部署后才生效 |
-| `SPAWN_INTEGRATE_GATES` | `1` | `spawn integrate` 同时跑的门禁数（跨任务组；每个任务组至多一个；`--gates` 优先；1 到 8） |
+| `SPAWN_INTEGRATE_GATES` | `1` | `spawn integrate` 同时跑的门禁数（跨任务组；每个任务组至多一个；`--gates` 优先）。大于 1（至多 8）须设 `SPAWN_TEST_DATABASE_PER_GATE=1`：门禁目前共用一个测试数据库服务器 |
 
 ## 8. 验证
 

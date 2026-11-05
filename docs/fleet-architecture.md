@@ -581,13 +581,19 @@ the tree's own:
 - objective results on the base (solved, or unsolved after two runs that
   agree) are cached outside the sandbox, keyed by everything that decides
   them: the base commit, the blobs of the scenario and of the gate, the
-  toolchain the base builds with (`rustc -vV`, `cargo -V`, `node
-  --version` in the base tree), the scenarios directory's build hook and
-  helpers, and the files the scenario names (`scripts/...` of the
-  controller, transitively). A controller file no scenario names (the
-  black-box runner) changes no key. Only the gate writes an entry, after a
-  completed base run; an entry it cannot read is a miss; candidate runs are
-  never cached; the log lists which base results came from the cache.
+  tools the scenarios run (`rustc -vV`, `cargo -V`, `node --version`,
+  `psql -V`, `git --version`, `tmux -V`, `python3 -V`, `jq --version`, in
+  the sandbox inside the base tree) and the test server's
+  `server_version_num`, the scenarios directory's build hook and helpers,
+  and the files the scenario names on its code lines (`scripts/...` of the
+  controller, transitively; a scenario that reaches into `scripts/`
+  through a variable or a `cd` keys all of it). A controller file no
+  scenario names (the black-box runner) changes no key. Only the gate
+  writes an entry, after a completed base run; an entry it cannot read is
+  a miss; candidate runs are never cached; the log lists which base
+  results came from the cache, and the time spent on the base, the
+  candidate and the setup. A hit touches its entry; spawn-maintenance
+  removes entries no gate used for 14 days.
   Candidate code cannot see or write the cache, but any process of the
   same uid outside the sandbox can (the same-uid limit).
 
@@ -753,15 +759,22 @@ record of what was judged (§14 of design.md).
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
   `/api/rsi/task/<id>` answers one task; `/api/rsi/pane` shows the
   resident's terminal.
-- **One gate per mission, a few at once.** A judging (fetch, gate,
-  landing) runs on a thread of its own, so a mission's 20-minute gate does
-  not hold another's. A mission has at most one in flight, and so does a
-  source (missions on one source share its mirror and its main); while it
-  runs, the integrator's passes skip that mission and its source. At most
-  `--gates N` (`SPAWN_INTEGRATE_GATES`, default 2, at most 8) run at once
-  across missions, since gates share the CPU and the test database. Each
-  judging records its own verdict and landing, which the next pass reads;
-  finished judgings are reaped before a pass reads the missions. A restart
-  mid-gate kills the gates with the process (no record), and the next
-  integrator judges those tasks again. One integrator per database: its
+- **One gate at a time, for now.** A judging (fetch, gate, landing) runs
+  on a thread of its own. A mission has at most one in flight, and so does
+  a source (missions on one source share its mirror and its main); while
+  it runs, the integrator's passes skip that mission and its source. At
+  most `--gates N` (`SPAWN_INTEGRATE_GATES`) run at once across missions,
+  and **N is 1**: more than one gate is unsafe until each gate has a test
+  database server of its own (a later task). Today every gate reaches the
+  same test PostgreSQL server, and its gate login is a superuser, so one
+  gate's candidate code can disturb another gate's base runs (an
+  "unsolved" is cached, and a regression then lands) or flake another
+  mission's candidate toward its halt. The integrator refuses N > 1 (up to
+  8) unless `SPAWN_TEST_DATABASE_PER_GATE=1` states that the server is per
+  gate. Each judging records its own verdict and landing, which the next
+  pass reads; finished judgings are reaped before a pass reads the
+  missions. A judging that errs or panics before any record of its own is
+  recorded `aborted` with the reason, so the three-aborts halt bounds it.
+  A restart mid-gate kills the gate with the process (no record), and the
+  next integrator judges the task again. One integrator per database: its
   advisory lock belongs to the connection, kept while any gate runs.
