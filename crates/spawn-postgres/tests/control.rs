@@ -614,6 +614,62 @@ fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
 }
 
 #[test]
+fn a_halted_mission_keeps_its_baseline_when_the_owner_moves_its_source() {
+    let (store, schema) = store("control_moved_halted");
+    let source = "/tmp/moved.git";
+    let mission = || {
+        let mission = store
+            .mission_add("On the source", &json!([source]), "human")
+            .expect("add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+            .expect("configure");
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+                                       "base": "b0", "note": "no"}),
+            )
+            .expect("a first verdict sets the baseline");
+        mission
+    };
+    let (running, halted) = (mission(), mission());
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": halted, "reason": "stop"}))
+        .expect("halt");
+    assert_eq!(store.source_moved(source, "b0", "d1").expect("moved"), 1);
+    let mut client = admin(&schema);
+    let baselines = |client: &mut Client| -> Vec<String> {
+        client
+            .query(
+                "select baseline from mission_missions where id = any($1) order by id",
+                &[&vec![running, halted]],
+            )
+            .expect("baselines")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    assert_eq!(baselines(&mut client), ["d1", "b0"], "the halted one stays");
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live);
+
+    // A record from before the record named its missions folds as it did.
+    client
+        .batch_execute(&format!(
+            "select spawn_control_record(jsonb_build_object(
+                 'type', 'source.moved', 'source', '{source}', 'from', 'b0', 'to', 'e1'))"
+        ))
+        .expect("an earlier record");
+    assert_eq!(baselines(&mut client), ["d1", "e1"]);
+}
+
+#[test]
 fn a_dropped_mission_lands_nothing_even_with_a_push_in_flight() {
     let (store, schema) = store("control_dropped_landing");
     // A gated mission whose task the gate passed: landing.

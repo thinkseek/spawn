@@ -1176,8 +1176,13 @@ begin
         -- The owner moved a source's main on purpose (a deploy), forward from
         -- where the last landing left it: the missions on that source take
         -- the new main as their baseline instead of halting at the next pass.
+        -- The record names them (never a halted one); a record from before
+        -- it did moved every mission on the source at that baseline.
         update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
-         where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from';
+         where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
+           and (p_record -> 'missions' is null
+                or id in (select m::bigint
+                            from jsonb_array_elements_text(p_record -> 'missions') m));
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
                                  delivered_at_ms = p_at, updated_at_ms = p_at
@@ -1626,16 +1631,21 @@ create or replace function spawn_source_moved(p_source text, p_from text, p_to t
 returns integer language plpgsql security definer as $$
 declare
     v_count integer;
+    v_missions jsonb;
 begin
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception 'only the owner moves a source outside the gate' using errcode = '42501';
     end if;
-    select count(*) into v_count from mission_missions
-     where sources ->> 0 = p_source and baseline = p_from;
+    -- A halted mission keeps its baseline: the human who resumes it sees
+    -- the source as it is, and the resume re-anchors it.
+    select count(*), coalesce(jsonb_agg(id order by id), '[]'::jsonb) into v_count, v_missions
+      from mission_missions
+     where sources ->> 0 = p_source and baseline = p_from and halted is null;
     if v_count > 0 then
         perform spawn_control_record(jsonb_build_object(
-            'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to));
+            'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
+            'missions', v_missions));
     end if;
     return v_count;
 end $$;
