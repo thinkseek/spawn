@@ -3060,6 +3060,14 @@ mod database_tests {
             .to_string()
     }
 
+    /// The integrator's mirror of `source`.
+    fn mirror_of(integrator: &Integrator, source: &str) -> String {
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
+            .expect("mirror")
+            .to_string_lossy()
+            .to_string()
+    }
+
     /// A landing commit's parent `n` (1: the main it lands on, 2: the agent's
     /// head), read from the first of `repos` that has the commit: a gate is
     /// given the landing commit, one new merge per landing.
@@ -3120,13 +3128,10 @@ mod database_tests {
         };
 
         integrator.pass_on(&db.store).expect("the first pass");
-        let mirror = |source: &str| {
-            crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
-                .expect("mirror")
-                .to_string_lossy()
-                .to_string()
-        };
-        let (mirror_a, mirror_b) = (mirror(&source_a), mirror(&source_b));
+        let (mirror_a, mirror_b) = (
+            mirror_of(&integrator, &source_a),
+            mirror_of(&integrator, &source_b),
+        );
         let repos = [mirror_a.as_str(), mirror_b.as_str()];
         let mut first: Vec<String> = wait_started(&marks, 2)
             .iter()
@@ -3240,13 +3245,10 @@ mod database_tests {
             integrator.settle();
             std::fs::remove_file(marks.join("release")).expect("hold again");
         }
-        let mirror = |source: &str| {
-            crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
-                .expect("mirror")
-                .to_string_lossy()
-                .to_string()
-        };
-        let (mirror_a, mirror_b) = (mirror(&source_a), mirror(&source_b));
+        let (mirror_a, mirror_b) = (
+            mirror_of(&integrator, &source_a),
+            mirror_of(&integrator, &source_b),
+        );
         let repos = [mirror_a.as_str(), mirror_b.as_str()];
         let judged: Vec<String> = started(&marks)
             .iter()
@@ -3367,13 +3369,10 @@ mod database_tests {
         let pushed_b = push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
 
         integrator.pass_on(&db.store).expect("a pass");
-        let mirror = |source: &str| {
-            crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
-                .expect("mirror")
-                .to_string_lossy()
-                .to_string()
-        };
-        let (mirror_a, mirror_b) = (mirror(&source_a), mirror(&source_b));
+        let (mirror_a, mirror_b) = (
+            mirror_of(&integrator, &source_a),
+            mirror_of(&integrator, &source_b),
+        );
         let repos = [mirror_a.as_str(), mirror_b.as_str()];
         let heads = || -> Vec<String> {
             started(&marks)
