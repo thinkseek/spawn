@@ -354,6 +354,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
                 command_id: CommandId(1),
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         ))
         .expect("append succeeds");
@@ -408,6 +409,7 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
                 command_id: CommandId(1),
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         )
     };
@@ -560,6 +562,7 @@ fn a_task_lists_its_command_and_execution_events() {
                 command_id: command,
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         ))
         .expect("append succeeds");
@@ -1029,6 +1032,7 @@ fn status_joins_the_judgement_and_the_latest_execution() {
                 command_id: CommandId(1),
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         ))
         .expect("append succeeds");
@@ -1435,6 +1439,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                         command_id: CommandId(number),
                         fork: None,
                         model: profile,
+                        transcript_from: None,
                     },
                 )
             })
@@ -1591,6 +1596,7 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure_repro() {
                     command_id: command,
                     fork: None,
                     model: ModelProfile::Default,
+                    transcript_from: None,
                 },
             ))
             .expect("started");
