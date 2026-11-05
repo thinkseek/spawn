@@ -959,6 +959,37 @@ printf '<!doctype html>\n' >"$seed/web/index.html"
 web_src=$(commit web-src)
 expect "web/src/ and web/index.html may change" "$(judge "$web_src")" 'exit=0 {"verdict":"accepted"}'
 
+# 14. A proc-macro crate outside the workspace (a path dependency the
+# workspace does not include) runs at compile time too: refused when new or
+# changed; one the base already had, untouched, is not.
+macro_crate() {
+    mkdir -p "$seed/evil/src"
+    printf '[package]\nname = "evil"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nproc-macro = true\n' \
+        >"$seed/evil/Cargo.toml"
+    printf 'extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n/// Echo.\n#[proc_macro]\npub fn echo(input: TokenStream) -> TokenStream {\n    input\n}\n' \
+        >"$seed/evil/src/lib.rs"
+    printf '\n[dependencies]\nevil = { path = "evil" }\n' >>"$seed/Cargo.toml"
+    (cd "$seed" && CARGO_NET_OFFLINE=true cargo generate-lockfile -q)
+}
+rust_branch rust-macro
+macro_crate
+macro=$(commit rust-macro)
+expect "a new proc-macro crate outside the workspace is refused" "$(judge_rust "$macro")" \
+    'candidate adds build-time code (a local proc-macro or build script outside the workspace: evil)'
+saved_rust_base=$rust_base
+rust_base=$macro
+rust_branch rust-macro-kept
+printf 'a change outside the macro crate\n' >"$seed/notes.txt"
+macro_kept=$(commit rust-macro-kept)
+expect "one the base had, untouched, is not" "$(judge_rust "$macro_kept")" 'exit=0 {"verdict":"accepted"}'
+rust_branch rust-macro-edited
+printf '\n/// Another.\n#[proc_macro]\npub fn other(input: TokenStream) -> TokenStream {\n    input\n}\n' \
+    >>"$seed/evil/src/lib.rs"
+macro_edited=$(commit rust-macro-edited)
+expect "one the candidate edits is refused" "$(judge_rust "$macro_edited")" \
+    'a local proc-macro or build script outside the workspace: evil'
+rust_base=$saved_rust_base
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"

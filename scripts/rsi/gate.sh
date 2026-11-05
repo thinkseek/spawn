@@ -18,7 +18,9 @@
 #   directory, nor anything under `web/` but `web/src/` and `web/index.html`.
 # - It may not add build-time code: a changed `build.rs` or `.cargo/`, a
 #   `build =` key in any Cargo.toml of the tree (cargo would run the file it
-#   names as a build script).
+#   names as a build script), a workspace member with a build script or a
+#   proc-macro target, or a local crate outside the workspace with either
+#   that is new or whose directory the diff touches.
 # - `<scenarios-dir>/build`, when present, builds each tree (run inside it).
 # - With a task scenario: it must fail on the base (exit exactly 1) and pass
 #   on the candidate.
@@ -724,6 +726,56 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     if grep -q '"proc-macro"' "$work/metadata.json"; then
         echo "| a workspace member of the candidate is a proc-macro crate"
         verdict rejected "candidate adds build-time code (a proc-macro crate)"
+        exit 0
+    fi
+    # A local crate outside the workspace (a path dependency the workspace
+    # excludes, or does not include) is compiled too, and `--no-deps` does
+    # not list it. The whole dependency graph, offline, in the sandbox: a
+    # package with no source (a local path) and a proc-macro or build-script
+    # target is refused when the base has none at that path, or when the
+    # diff touches its directory. Registry crates are the lockfile's, which
+    # a reviewer reads; they are not this check's.
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "gate: jq is required to read cargo metadata" >&2
+        exit 3
+    fi
+    # local_build_time <writable dir> <tree>: `<directory>\t<name>` of each
+    # local package with a build-time target, the directory relative to the
+    # tree.
+    local_build_time() {
+        sandbox "$1" cargo metadata --offline --format-version 1 --manifest-path "$2/Cargo.toml" \
+            >"$work/metadata-full.json" 2>>"$work/metadata.log" || return 1
+        jq -r --arg tree "$2/" '
+            .packages[] | select(.source == null)
+            | select([.targets[].kind[]] | any(. == "proc-macro" or . == "custom-build"))
+            | "\(.manifest_path | ltrimstr($tree) | sub("/?Cargo.toml$"; ""))\t\(.name)"' \
+            "$work/metadata-full.json" | LC_ALL=C sort
+    }
+    : >"$work/build-time.base"
+    if ! local_build_time "$work/candidate" "$work/candidate" >"$work/build-time.candidate"; then
+        sed 's/^/| metadata: /' "$work/metadata.log" | tail -n 20
+        verdict rejected "candidate's dependency graph does not resolve offline"
+        exit 0
+    fi
+    # The base's: from its read-only tree, cargo writing nowhere but a
+    # directory of its own. A base cargo cannot read counts as having none.
+    if [ -s "$work/build-time.candidate" ] && [ -f "$work/baseline/Cargo.toml" ]; then
+        mkdir -p "$work/base-metadata"
+        local_build_time "$work/base-metadata" "$work/baseline" >"$work/build-time.base" ||
+            : >"$work/build-time.base"
+    fi
+    new_build_time=$(LC_ALL=C comm -23 "$work/build-time.candidate" "$work/build-time.base" | cut -f2)
+    # One the base had, at the same path, is new to the candidate when the
+    # diff touches its directory.
+    edited_build_time=$(LC_ALL=C comm -12 "$work/build-time.candidate" "$work/build-time.base" |
+        while IFS='	' read -r crate_dir crate_name; do
+            printf '%s\n' "$changed" | awk -v dir="$crate_dir/" 'dir == "/" || index($0, dir) == 1 { found = 1 } END { exit !found }' &&
+                printf '%s\n' "$crate_name"
+        done || true)
+    new_build_time=$(printf '%s\n%s\n' "$new_build_time" "$edited_build_time" | grep . || true)
+    if [ -n "$new_build_time" ]; then
+        echo "| local crates with build-time code, new or changed: $(echo "$new_build_time" | tr '\n' ' ')"
+        verdict rejected "candidate adds build-time code (a local proc-macro or build script outside the workspace: $(echo "$new_build_time" | tr '\n' ' ' | sed 's/ $//'))"
         exit 0
     fi
 fi
