@@ -290,15 +290,7 @@ fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
 
 /// How a waiting task reaches its worker, given the worker's facts.
 /// `settled`: the worker's last task is closed (see [`last_delivery_closed`]).
-/// `switch`: the key a model-switch Stop goes under now, or `None` when none
-/// may go now (one is in flight, its retry is not due, or it was given up).
-fn delivery(
-    task: &TaskRow,
-    found: Option<&Facts>,
-    settled: bool,
-    key: String,
-    switch: Option<Switch>,
-) -> Option<Order> {
+fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -> Option<Order> {
     let model = Some(task.model);
     match found {
         Some(facts) if facts.open_command => None,
@@ -307,14 +299,7 @@ fn delivery(
         // waits for a worker that is not blocked, unless what it asked about
         // is a task that has closed since.
         Some(facts) if facts.live => {
-            let switching = facts.model != task.model;
-            let ready = if switching && switch.as_ref().is_some_and(|switch| switch.retry) {
-                // A failed Stop changed nothing on the worker, but its own
-                // records are newer than the worker's judgement, which an
-                // Observer without a model judge does not write again while
-                // nothing changes: the retry goes on that judgement.
-                facts.last_judged_idle()
-            } else if task.is_revision() {
+            let ready = if task.is_revision() {
                 facts.turn_stopped_idle()
             } else {
                 facts.idle_at_prompt() || (settled && facts.turn_stopped_idle())
@@ -322,15 +307,14 @@ fn delivery(
             if !ready {
                 return None;
             }
-            if switching {
+            if facts.model != task.model {
                 // Stopped at the same moment typing would be safe. The stop
                 // does not carry the task, which stays waiting: once the
                 // stop has finished the worker is no longer live, and a
                 // later pass resumes it, context kept, on the task's models,
-                // with the resume that delivers the task. A Stop that fails
-                // is tried again, then given up and escalated
-                // ([`switch_attempts`]).
-                return switch.map(|switch| task.command(switch.key, CommandAction::Stop));
+                // with the resume that delivers the task.
+                let key = format!("switch-model-{}-{}", task.id, task.revisions);
+                return Some(task.command(key, CommandAction::Stop));
             }
             Some(task.delivery(
                 key,
@@ -364,27 +348,13 @@ fn delivery(
 /// The attempts at a task's current delivery into its session: the
 /// delivery's own command, then its retries (`<key>-retry-<n>`), in order.
 fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dispatch::Sent> {
-    attempts_under(&task.delivery_key(), facts)
-}
-
-/// The commands sent into `facts`' session under `key` or one of its retries
-/// (`<key>-retry-<n>`), in order.
-fn attempts_under<'a>(key: &str, facts: &'a Facts) -> Vec<&'a crate::dispatch::Sent> {
+    let key = task.delivery_key();
     let retry = format!("{key}-retry-");
     facts
         .dispatched
         .iter()
         .filter(|sent| sent.key == key || sent.key.starts_with(&retry))
         .collect()
-}
-
-/// A model-switch Stop that may go now ([`switch_attempts`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Switch {
-    /// Its idempotency key: `switch-model-<task>-<revision>`, or a retry's.
-    key: String,
-    /// It retries a Stop that failed.
-    retry: bool,
 }
 
 /// Where a waiting task's current delivery stands, from its attempts.
@@ -410,36 +380,7 @@ enum Attempts {
 /// that doubles each time, [`DELIVERY_RETRIES`] times. One that may have
 /// typed the task ([`MAY_HAVE_TYPED`]) is not.
 fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
-    retried(
-        &delivery_attempts(task, facts),
-        true,
-        "never reached its worker; cancel it and assign it again",
-    )
-}
-
-/// Idempotency key of the Stop that switches a task's worker to the task's
-/// model profile (for its current revision).
-fn switch_key(task: &TaskRow) -> String {
-    format!("switch-model-{}-{}", task.id, task.revisions)
-}
-
-/// Where the Stop that switches `task`'s worker to the task's model profile
-/// stands. A failed one is tried again like a failed delivery (same keys,
-/// wait and count), then given up: the task stays waiting, and the
-/// supervisor hears of it ([`news_items`]).
-fn switch_attempts(task: &TaskRow, facts: &Facts) -> Attempts {
-    retried(
-        &attempts_under(&switch_key(task), facts),
-        false,
-        "is still waiting: its worker could not be stopped to switch its model profile; \
-         stop the worker (or cancel the task and assign it again)",
-    )
-}
-
-/// Where a series of attempts (`sent`, oldest first) stands. `typing`: the
-/// attempts type text, and one that may have typed it is not tried again.
-/// `given_up`: why, when the last retry failed too.
-fn retried(sent: &[&crate::dispatch::Sent], typing: bool, given_up: &'static str) -> Attempts {
+    let sent = delivery_attempts(task, facts);
     let Some(last) = sent.last() else {
         return Attempts::None;
     };
@@ -448,14 +389,14 @@ fn retried(sent: &[&crate::dispatch::Sent], typing: bool, given_up: &'static str
         Some(true) => last.id.map_or(Attempts::Open, Attempts::Delivered),
         Some(false) => {
             let error = last.error.as_deref().unwrap_or_default();
-            if typing && error.contains(MAY_HAVE_TYPED) {
+            if error.contains(MAY_HAVE_TYPED) {
                 return Attempts::Failed(
                     "may or may not have reached its worker; ask the worker before assigning it \
                      again",
                 );
             }
             if sent.len() > DELIVERY_RETRIES {
-                return Attempts::Failed(given_up);
+                return Attempts::Failed("never reached its worker; cancel it and assign it again");
             }
             let doublings = u32::try_from(sent.len() - 1).unwrap_or(u32::MAX).min(20);
             let wait = RETRY_MS
@@ -527,23 +468,8 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                     | Attempts::Delivered(_)
                     | Attempts::Failed(_) => continue,
                 };
-                let switch =
-                    match found.map_or(Attempts::None, |facts| switch_attempts(task, facts)) {
-                        Attempts::None => Some(Switch {
-                            key: switch_key(task),
-                            retry: false,
-                        }),
-                        Attempts::Retry { number, due_ms } if now_ms >= due_ms => Some(Switch {
-                            key: format!("{}-retry-{number}", switch_key(task)),
-                            retry: true,
-                        }),
-                        Attempts::Retry { .. }
-                        | Attempts::Open
-                        | Attempts::Delivered(_)
-                        | Attempts::Failed(_) => None,
-                    };
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
-                orders.extend(delivery(task, found, settled, key, switch));
+                orders.extend(delivery(task, found, settled, key));
             }
             // A finished ephemeral worker is stopped.
             _ if task.is_finished()
@@ -724,28 +650,6 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             items.push(Escalation {
                 session_id: task.session_id.clone(),
                 id: task.delivery_key(),
-                why: Why::DeliveryFailed,
-                line: format!("task #{} {why}", task.id),
-            });
-        }
-    }
-    // A model switch given up: the worker stays live on the other profile
-    // and the task waits for it, so someone must act.
-    for task in work
-        .tasks
-        .iter()
-        .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
-    {
-        let Some(facts) = rows
-            .iter()
-            .find(|facts| facts.session_id == task.session_id)
-        else {
-            continue;
-        };
-        if let Attempts::Failed(why) = switch_attempts(task, facts) {
-            items.push(Escalation {
-                session_id: task.session_id.clone(),
-                id: switch_key(task),
                 why: Why::DeliveryFailed,
                 line: format!("task #{} {why}", task.id),
             });
@@ -1100,127 +1004,6 @@ mod tests {
         };
         let plan = orders(&work(vec![cheap]), &[on_cheap]);
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
-    }
-
-    /// A worker idle at its prompt on the default profile, whose judgement a
-    /// failed Stop's own records have made stale, and the cheap task it
-    /// should be switched for.
-    fn refused_switch() -> (Work, Facts) {
-        let cheap = TaskRow {
-            model: ModelProfile::Cheap,
-            ..task(4, TaskState::Assigned, "resident")
-        };
-        let mut facts = worker(true, true);
-        facts.evidence_seq = Some(9);
-        facts.dispatched.push(sent(
-            10,
-            "switch-model-4-0",
-            1_000,
-            Some("kill-session refused"),
-        ));
-        (work(vec![cheap]), facts)
-    }
-
-    #[test]
-    fn a_failed_switch_stop_is_retried_under_a_new_key_once_due() {
-        let (tasks, facts) = refused_switch();
-        let rows = |facts: &Facts| vec![facts.clone()];
-        assert!(!facts.idle_at_prompt(), "the judgement is stale");
-        assert!(delivered(&tasks, &rows(&facts)).is_empty(), "still waiting");
-        assert!(
-            news_items(&tasks, &rows(&facts)).is_empty(),
-            "a retry is coming: no one is asked yet"
-        );
-        assert!(
-            super::orders(&tasks, &rows(&facts), 1_000 + 59_999).is_empty(),
-            "not due yet"
-        );
-        let retry = super::orders(&tasks, &rows(&facts), 1_000 + 60_000);
-        assert_eq!(retry.len(), 1);
-        assert_eq!(retry[0].key, "switch-model-4-0-retry-1");
-        assert_eq!(retry[0].action, CommandAction::Stop);
-        assert_eq!(retry[0].task, None, "a stop delivers nothing");
-
-        // A worker judged busy since is not stopped, retry due or not.
-        let busy = Facts {
-            observation: worker(true, false).observation,
-            ..facts.clone()
-        };
-        assert!(super::orders(&tasks, &rows(&busy), 1_000 + 60_000).is_empty());
-        // Nor while the retry runs.
-        let mut stopping = facts.clone();
-        stopping.open_command = true;
-        stopping.dispatched.push(Sent {
-            finished_at_ms: None,
-            succeeded: None,
-            ..sent(11, "switch-model-4-0-retry-1", 70_000, None)
-        });
-        assert!(super::orders(&tasks, &rows(&stopping), 10_000_000).is_empty());
-
-        // The wait doubles after the second failure.
-        let mut again = facts;
-        again.dispatched.push(sent(
-            11,
-            "switch-model-4-0-retry-1",
-            70_000,
-            Some("kill-session refused"),
-        ));
-        assert!(super::orders(&tasks, &rows(&again), 70_000 + 119_999).is_empty());
-        let retry = super::orders(&tasks, &rows(&again), 70_000 + 120_000);
-        assert_eq!(retry[0].key, "switch-model-4-0-retry-2");
-    }
-
-    #[test]
-    fn a_switch_stop_given_up_is_escalated_and_never_sent_again() {
-        let (tasks, mut facts) = refused_switch();
-        for retry in 1..=DELIVERY_RETRIES {
-            facts.dispatched.push(sent(
-                10 + i64::try_from(retry).expect("small"),
-                &format!("switch-model-4-0-retry-{retry}"),
-                2_000,
-                Some("kill-session refused"),
-            ));
-        }
-        let rows = vec![facts];
-        const { assert!(DELIVERY_RETRIES < 5, "at most 5 Stops in all") };
-        assert!(
-            super::orders(&tasks, &rows, i64::MAX / 2).is_empty(),
-            "no Stop after the last retry"
-        );
-        assert!(delivered(&tasks, &rows).is_empty(), "never delivered");
-        let items = news_items(&tasks, &rows);
-        assert_eq!(items.len(), 1, "{items:?}");
-        assert_eq!(items[0].why, Why::DeliveryFailed);
-        assert_eq!(items[0].tag(), "session_resident_core switch-model-4-0");
-        assert!(
-            items[0].line.starts_with("task #4 ") && items[0].line.contains("could not be stopped"),
-            "{}",
-            items[0].line
-        );
-    }
-
-    #[test]
-    fn a_switch_stop_retried_successfully_leads_to_the_resume_that_delivers() {
-        let (tasks, facts) = refused_switch();
-        let mut stopped = Facts {
-            live: false,
-            ..facts
-        };
-        stopped
-            .dispatched
-            .push(sent(11, "switch-model-4-0-retry-1", 70_000, None));
-        let plan = super::orders(&tasks, std::slice::from_ref(&stopped), 80_000);
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].key, "deliver-4-0");
-        assert_eq!(plan[0].task, Some(4));
-        assert!(matches!(
-            plan[0].action,
-            CommandAction::Resume {
-                model: Some(ModelProfile::Cheap),
-                ..
-            }
-        ));
-        assert!(news_items(&tasks, std::slice::from_ref(&stopped)).is_empty());
     }
 
     #[test]
