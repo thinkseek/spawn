@@ -6,6 +6,8 @@ import type { TimelineEvent } from "../api";
 import { eventTone, fullText, pairs } from "../eventFormat";
 import { clockTime } from "../format";
 import { EmptyState, cx } from "./ui";
+import { ViewToggle, useStoredChoice } from "./ViewToggle";
+import type { ViewOption } from "./ViewToggle";
 
 // The trace carries Motion and d3: loaded when first shown, so the first
 // page stays light.
@@ -14,28 +16,16 @@ const TraceView = lazy(() =>
 );
 
 type Mode = "trace" | "list";
-const MODE_KEY = "spawn.timeline.mode";
-
-function savedMode(): Mode {
-  try {
-    return window.localStorage.getItem(MODE_KEY) === "list" ? "list" : "trace";
-  } catch {
-    return "trace";
-  }
-}
+const MODES = ["trace", "list"] as const;
+const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
+  { id: "trace", label: "Trace", icon: <GanttChart size={13} /> },
+  { id: "list", label: "List", icon: <List size={13} /> },
+];
 
 /** A session's events as a trace (spans on a time axis) or as the plain
  * list, for searching and copying. The choice is remembered. */
 export function Timeline({ events }: { events: TimelineEvent[] }) {
-  const [mode, setMode] = useState<Mode>(savedMode);
-  const choose = (next: Mode) => {
-    setMode(next);
-    try {
-      window.localStorage.setItem(MODE_KEY, next);
-    } catch {
-      // Private mode: the choice lasts for this page only.
-    }
-  };
+  const [mode, choose] = useStoredChoice<Mode>("spawn.timeline.mode", MODES, "trace");
 
   if (events.length === 0) {
     return (
@@ -48,46 +38,15 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
     );
   }
 
-  const toggle = <ModeToggle mode={mode} onChange={choose} />;
+  const toggle = (
+    <ViewToggle label="Timeline view" options={MODE_OPTIONS} value={mode} onChange={choose} />
+  );
   return mode === "trace" ? (
     <Suspense fallback={<div className="min-h-0 flex-1" />}>
       <TraceView events={events} header={toggle} />
     </Suspense>
   ) : (
     <EventList events={events} header={toggle} />
-  );
-}
-
-function ModeToggle({ mode, onChange }: { mode: Mode; onChange: (mode: Mode) => void }) {
-  const options: Array<{ id: Mode; label: string; icon: ReactNode }> = [
-    { id: "trace", label: "Trace", icon: <GanttChart size={13} /> },
-    { id: "list", label: "List", icon: <List size={13} /> },
-  ];
-  return (
-    <div
-      role="radiogroup"
-      aria-label="Timeline view"
-      className="inline-flex shrink-0 items-center rounded-md bg-muted p-0.5"
-    >
-      {options.map((option) => (
-        <button
-          key={option.id}
-          type="button"
-          role="radio"
-          aria-checked={mode === option.id}
-          onClick={() => onChange(option.id)}
-          className={cx(
-            "inline-flex h-6 items-center gap-1.5 rounded-[5px] px-2 text-caption font-medium transition-colors",
-            mode === option.id
-              ? "bg-surface-selected text-foreground shadow-[var(--surface-shadow)]"
-              : "text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {option.icon}
-          {option.label}
-        </button>
-      ))}
-    </div>
   );
 }
 
