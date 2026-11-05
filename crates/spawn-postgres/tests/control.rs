@@ -2015,7 +2015,7 @@ fn three_tasks(store: &PostgresStore, mission: i64, kind: &str, worker: &str) ->
         store.task_delivered(task, command).expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));
     }
-    store.task_review(tasks[2], true, "").expect("accept");
+    store.task_review(tasks[2], true, "", None).expect("accept");
     tasks
 }
 
