@@ -905,6 +905,12 @@ begin
             execute format('revoke all on all functions in schema %I from %I',
                            current_schema(), v_role);
             execute format('revoke all on schema %I from %I', current_schema(), v_role);
+            -- The database's row is the cluster's: written only to take one.
+            if exists (select 1 from pg_database d cross join lateral aclexplode(d.datacl) a
+                        where d.datname = current_database()
+                          and a.grantee = (select oid from pg_roles where rolname = v_role)) then
+                execute format('revoke all on database %I from %I', current_database(), v_role);
+            end if;
             if exists (select 1 from pg_roles where rolname = v_role and rolcanlogin) then
                 raise warning 'role % from an earlier install can still log in; it has no access '
                               'here any more (this database''s logins are %): drop it once no '

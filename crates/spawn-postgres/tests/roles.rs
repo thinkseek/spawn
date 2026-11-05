@@ -305,4 +305,28 @@ fn the_logins_of_earlier_installs_lose_everything_here() {
             "reset session authorization; revoke usage on schema {schema} from spawn_supervisor"
         ))
         .expect("back to the owner");
+
+    // Its grant on the database goes too (in a database of its own: other
+    // installs on the shared test cluster grant it on theirs).
+    let database = Database::new("roles_earlier_db", None);
+    admin("public")
+        .batch_execute(&format!(
+            "grant connect, temporary on database {} to spawn_supervisor",
+            database.name
+        ))
+        .expect("an earlier install's database grant");
+    PostgresStore::connect(&database.url())
+        .expect("connect")
+        .migrate()
+        .expect("migrate");
+    let left: i64 = admin("public")
+        .query_one(
+            "select count(*) from pg_database d cross join lateral aclexplode(d.datacl) a
+              where d.datname = $1
+                and a.grantee = (select oid from pg_roles where rolname = 'spawn_supervisor')",
+            &[&database.name],
+        )
+        .expect("the database's grants")
+        .get(0);
+    assert_eq!(left, 0, "nothing on the database is left");
 }
