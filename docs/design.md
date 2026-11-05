@@ -367,4 +367,6 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
 
+停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
+
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。
