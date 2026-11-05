@@ -162,7 +162,9 @@ pub struct Observation {
     pub based_on_seq: SessionSeq,
     /// Judge confidence.
     pub confidence: Confidence,
-    /// Who decided: `rules`, or the model judge's name (`jev`, `heuristic`).
+    /// Who decided: `rules`, the model judge's name (`jev`), or `none` when
+    /// no model judge is configured. The log also holds names of judges
+    /// since removed (`heuristic`); they read like any other.
     pub judge: String,
     /// Why the rules could not decide. `None` when the rules decided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,7 +188,7 @@ pub struct Observation {
     /// look. Acting on it is the control layer's decision, not this one's.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attention: bool,
-    /// The input the model judge saw, for audit and replay.
+    /// The input the model judge saw, for audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<serde_json::Value>,
     /// Why `attention` is set, in one word: `permission`, `blocked`,

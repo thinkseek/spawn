@@ -2,6 +2,11 @@
 //! identifier and position is decoded one way.
 //!
 //! A value the domain type rejects is a corrupt row, not a backend failure.
+//! An event whose writer this build does not know (a source since removed)
+//! is no corruption: [`event_record`] skips it, with one warning per name.
+
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 
 use postgres::Row;
 use spawn_core::event::{EventKind, EventRecord, GlobalPosition, NewEvent, SessionSeq, Source};
@@ -46,17 +51,32 @@ pub(crate) fn execution_id(row: &Row) -> Result<Option<ExecutionId>, StoreError>
         .map_err(corrupt)
 }
 
-/// The `source` column.
-pub(crate) fn source(row: &Row) -> Result<Source, StoreError> {
-    let text: String = row.get("source");
-    Source::parse(&text).ok_or_else(|| corrupt(format!("unknown source {text}")))
-}
+/// Source names this process has warned it skips.
+static SKIPPED_SOURCES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// One `spawn_events` row selected with `event_record_columns!`.
-pub(crate) fn event_record(row: &Row) -> Result<EventRecord, StoreError> {
+/// One `spawn_events` row selected with `event_record_columns!`, or `None`
+/// for an event whose source this build does not know: the history may hold
+/// writers since removed, and one of their records must not stop every
+/// reader of the log. The source is read first, so such a record's kind is
+/// never decoded.
+pub(crate) fn event_record(row: &Row) -> Result<Option<EventRecord>, StoreError> {
+    let text: String = row.get("source");
+    let Some(source) = Source::parse(&text) else {
+        let first = SKIPPED_SOURCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(text.clone());
+        if first {
+            eprintln!(
+                "spawn: skipping events from source {text}, which this build does not read \
+                 (the first at position {})",
+                row.get::<_, i64>("id")
+            );
+        }
+        return Ok(None);
+    };
     let kind: EventKind = serde_json::from_value(row.get("kind")).map_err(corrupt)?;
-    let source = source(row)?;
-    Ok(EventRecord {
+    Ok(Some(EventRecord {
         position: global_position(row, "id"),
         session_seq: session_seq(row, "session_seq"),
         recorded_at: Timestamp(row.get("recorded_at_ms")),
@@ -68,5 +88,5 @@ pub(crate) fn event_record(row: &Row) -> Result<EventRecord, StoreError> {
             source_event_id: row.get("source_event_id"),
             kind,
         },
-    })
+    }))
 }

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use super::SCREEN_STALE;
 use super::judge::{JudgeInput, TurnFact};
-use crate::event::{EndCause, Engine, EventKind, EventRecord, SessionSeq};
+use crate::event::{EndCause, EventKind, EventRecord, SessionSeq};
 use crate::id::{AgentId, ExecutionId, SessionId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
@@ -12,7 +12,7 @@ use crate::time::Timestamp;
 /// Facts the Observer keeps for one session.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Snapshot {
-    engine: Option<Engine>,
+    engine: Option<String>,
     /// The newest execution started.
     execution: Option<ExecutionId>,
     pub(super) execution_active: bool,
@@ -53,7 +53,7 @@ impl Snapshot {
         }
         match &record.event.kind {
             EventKind::ExecutionStarted { engine, .. } => {
-                self.engine = Some(*engine);
+                self.engine = Some(engine.clone());
                 self.execution.clone_from(&record.event.execution_id);
                 self.execution_active = true;
                 self.stalled_end = None;
@@ -91,7 +91,7 @@ impl Snapshot {
                 self.permission_pending = false;
             }
             EventKind::NativeSessionStarted { engine, .. } => {
-                self.engine = Some(*engine);
+                self.engine = Some(engine.clone());
             }
             EventKind::ToolStarted {
                 tool_name,
@@ -164,7 +164,7 @@ impl Snapshot {
         JudgeInput {
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
-            engine: self.engine,
+            engine: self.engine.clone(),
             execution_active: self.execution_active,
             stalled_end: self.stalled_end,
             last_end: self.last_end,

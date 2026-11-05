@@ -282,12 +282,6 @@ fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     Ok((rows, Work::load(store)?))
 }
 
-/// The plan for the current facts, without submitting anything.
-pub(crate) fn plan(store: &PostgresStore, supervised: bool, spawn: &str) -> Result<Plan, String> {
-    let (rows, work) = load(store)?;
-    Ok(decide_with(&rows, &work, supervised, now_ms(), spawn))
-}
-
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }

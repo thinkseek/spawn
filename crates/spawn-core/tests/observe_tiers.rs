@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spawn_core::event::EndCause;
-use spawn_core::event::{Engine, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
+use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
@@ -77,7 +77,8 @@ fn fixture(judge: Arc<Scripted>) -> Fixture {
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
-    let observer = Observer::new(log, judge)
+    let observer = Observer::new(log)
+        .with_judge(judge)
         .with_clock(clock.clone())
         .with_context(Arc::new(Context));
     Fixture {
@@ -113,7 +114,7 @@ fn started(store: &MemoryStore) {
         store,
         Source::Bridge,
         EventKind::ExecutionStarted {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             terminal: TerminalName::new("spawn-exec_1").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(1),
@@ -331,7 +332,8 @@ fn a_restarted_observer_does_not_ask_about_judged_evidence() {
 
     // A one-shot `spawn tick` builds a new Observer every run.
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut again = Observer::new(log, judge.clone())
+    let mut again = Observer::new(log)
+        .with_judge(judge.clone())
         .with_clock(fixture.clock.clone())
         .with_context(Arc::new(Context));
     fixture.clock.advance(Duration::from_secs(31));
@@ -593,7 +595,9 @@ fn a_restarted_observer_corrects_a_stale_row() {
         },
     );
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut fresh = Observer::new(log, judge.clone()).with_clock(fixture.clock.clone());
+    let mut fresh = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(fixture.clock.clone());
     assert_eq!(fresh.tick().expect("tick"), 1);
     let last = observations(&fixture.store).pop().expect("an observation");
     assert_eq!(last.state, SemanticState::Completed);
@@ -602,7 +606,9 @@ fn a_restarted_observer_corrects_a_stale_row() {
 
     // And a second restart writes nothing.
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut again = Observer::new(log, judge).with_clock(fixture.clock.clone());
+    let mut again = Observer::new(log)
+        .with_judge(judge)
+        .with_clock(fixture.clock.clone());
     assert_eq!(again.tick().expect("tick"), 0);
 }
 
@@ -639,7 +645,8 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
-    let mut observer = Observer::new(log, judge)
+    let mut observer = Observer::new(log)
+        .with_judge(judge)
         .with_clock(clock)
         .with_context(Arc::new(Supervisor));
     started(&store);
@@ -758,7 +765,7 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
     in_execution(
         2,
         EventKind::ExecutionStarted {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             terminal: TerminalName::new("spawn-exec_2").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(2),

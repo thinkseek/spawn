@@ -8,7 +8,7 @@ use std::sync::Arc;
 use spawn_core::bridge::{Bridge, BridgeConfig, TickReport, claude_session_id};
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{
-    CheckpointReason, EndCause, Engine, EventKind, Fork, GlobalPosition, NewEvent,
+    CheckpointReason, ENGINE, EndCause, EventKind, Fork, GlobalPosition, NewEvent,
 };
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
@@ -62,7 +62,7 @@ fn start(store: &MemoryStore, from: Option<&str>) {
         store,
         "key_start",
         CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "work".to_string(),
             parent_session_id: None,
             from: from.map(str::to_string),
@@ -249,6 +249,84 @@ fn the_base_is_merged_right_after_a_turns_checkpoint() {
     // Recorded once: the next ticks have nothing to commit or merge.
     quiet(&bridge.tick().expect("idle"));
     assert_eq!(calls_after_start(&store).len(), 3);
+}
+
+#[test]
+fn a_merge_or_checkpoint_whose_record_failed_is_recorded_at_the_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+
+    // The branch took main, and the log refused the record.
+    let merged = CommitId::new("e".repeat(40)).expect("valid commit");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: merged.clone(),
+        files: vec!["README.md".to_string()],
+    });
+    transcript(&store, &[turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn end"));
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    assert!(checkpoints(&store).is_empty());
+    // The next tick records it, though the branch already holds the merge.
+    quiet(&bridge.tick().expect("the log is back"));
+    assert_eq!(
+        checkpoints(&store),
+        [(CheckpointReason::BaseMerged, merged.as_str().to_string())]
+    );
+
+    // A checkpoint's record is kept the same way.
+    store.set_base_merge(BaseMerge::Current);
+    let workspace = spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid");
+    transcript(&store, &tool_call("toolu_1"));
+    quiet(&bridge.tick().expect("read the tool call"));
+    store.mark_dirty(&workspace);
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    quiet(&bridge.tick().expect("the log is back"));
+    let recorded = checkpoints(&store);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(recorded[1].0, CheckpointReason::ToolCompleted);
+    quiet(&bridge.tick().expect("idle"));
+    assert_eq!(checkpoints(&store).len(), 2, "recorded once");
+}
+
+#[test]
+fn a_conflict_whose_record_failed_is_recorded_at_the_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Conflicted {
+        files: vec!["README.md".to_string()],
+        marked: true,
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    let conflicts = |store: &MemoryStore| {
+        events(store)
+            .into_iter()
+            .filter(|event| matches!(event.kind, EventKind::MergeConflicted { .. }))
+            .count()
+    };
+    assert_eq!(conflicts(&store), 0);
+    // Nothing of the failed tick was kept: the next one merges, reports and
+    // records again.
+    let report = bridge.tick().expect("the log is back");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("README.md")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(conflicts(&store), 1);
+    bridge.tick().expect("idle");
+    assert_eq!(conflicts(&store), 1, "recorded once");
 }
 
 #[test]

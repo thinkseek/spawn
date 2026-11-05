@@ -220,6 +220,44 @@ fn a_clean_merge_moves_the_directory_then_the_branch_and_leaves_build_output() {
     );
 }
 
+#[test]
+fn a_repeated_merge_of_the_same_main_never_moves_the_branch_back() {
+    let fixture = Fixture::new("repeat", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "one\n")]);
+    fixture.land(&[("new.txt", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Merged { .. }
+    ));
+    let after = fixture.work(&workspace, &[("work.txt", "two\n")]);
+    // Main has not moved: the branch contains it, whatever came after.
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("again"),
+        BaseMerge::Current
+    );
+    assert_eq!(fixture.head("agent_a"), after);
+    assert_eq!(read(&directory, "work.txt"), "two\n");
+
+    // The same holds after a merge that a resolved checkpoint recorded.
+    let fixture = Fixture::new("repeat-resolved", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("README.md", "mine\n")]);
+    fixture.land(&[("README.md", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    fixture.work(&workspace, &[("README.md", "both\n")]);
+    let after = fixture.work(&workspace, &[("README.md", "both, then more\n")]);
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("again"),
+        BaseMerge::Current
+    );
+    assert_eq!(fixture.head("agent_a"), after);
+    assert_eq!(read(&directory, "README.md"), "both, then more\n");
+}
+
 /// Where the store keeps a branch's pending merge.
 fn pending(directory: &Path, branch: &str) -> PathBuf {
     directory
@@ -444,6 +482,59 @@ fn the_merge_rules_come_from_mains_gitattributes() {
         fixture.store.merge_base(&workspace).expect("merge"),
         BaseMerge::Conflicted { .. }
     ));
+}
+
+#[test]
+fn a_large_blob_from_main_stays_a_blob_and_survives_the_landing() {
+    let fixture = Fixture::new("large-from-main", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    // Main takes a 9 MiB file as a plain blob, from outside Spawn.
+    let large = vec![7_u8; 9 << 20];
+    fs::write(fixture.checkout.join("weights.bin"), &large).expect("write on main");
+    let main = fixture.land(&[]);
+    let blob = git(&fixture.checkout, &["rev-parse", "main:weights.bin"]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Merged { .. }
+    ));
+    assert_eq!(
+        fs::read(directory.join("weights.bin")).expect("merged"),
+        large
+    );
+
+    // A checkpoint keeps it a blob in the branch's tree.
+    let head = fixture.work(&workspace, &[("work.txt", "more\n")]);
+    assert_eq!(
+        git(
+            &fixture.checkout,
+            &["rev-parse", &format!("{head}:weights.bin")]
+        ),
+        blob
+    );
+    let message = git(&fixture.checkout, &["show", "-s", "--format=%B", &head]);
+    assert!(!message.contains("Spawn-Large"), "{message}");
+
+    // Landed (main moves to the branch head), main still has it.
+    git(&fixture.checkout, &["merge", "-q", "--ff-only", &head]);
+    assert_ne!(fixture.head("main"), main);
+    assert_eq!(
+        git(&fixture.checkout, &["rev-parse", "main:weights.bin"]),
+        blob
+    );
+
+    // A large file the agent made itself still goes to the chunk store.
+    fs::write(directory.join("own.bin"), &large).expect("write a large file");
+    let own = fixture.work(&workspace, &[]);
+    let message = git(&fixture.checkout, &["show", "-s", "--format=%B", &own]);
+    assert!(message.contains("Spawn-Large"), "{message}");
+    assert_eq!(
+        git(
+            &fixture.checkout,
+            &["ls-tree", "--name-only", &own, "own.bin"]
+        ),
+        ""
+    );
 }
 
 /// Put a manifest of one large file at `path` (a few bytes of content) in
@@ -729,4 +820,55 @@ fn committed_markers_are_found_against_main() {
         vec!["README.md"]
     );
     assert!(!fixture.store.has_pending_merge("agent_a"));
+}
+
+/// A path that begins with a space: listings are read NUL-split, never
+/// trimmed, so the first path of one keeps its leading space.
+const SPACED: &str = " leading space.txt";
+
+#[test]
+fn a_path_with_a_leading_space_survives_a_clean_merge() {
+    let fixture = Fixture::new("spaced-clean", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    fixture.land(&[(SPACED, "theirs\n")]);
+    let BaseMerge::Merged { files, .. } = fixture.store.merge_base(&workspace).expect("merge")
+    else {
+        panic!("main moved: a merge");
+    };
+    assert_eq!(files, vec![SPACED]);
+    assert_eq!(read(&directory, SPACED), "theirs\n");
+    assert_eq!(
+        fixture.store.commit(&workspace, "after").expect("commit"),
+        Commit::Unchanged
+    );
+}
+
+#[test]
+fn a_path_with_a_leading_space_survives_a_conflicted_merge() {
+    let fixture = Fixture::new("spaced-conflict", &[(SPACED, "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[(SPACED, "mine\n")]);
+    let main = fixture.land(&[(SPACED, "theirs\n")]);
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec![SPACED.to_string()],
+            marked: true
+        }
+    );
+    assert!(has_conflict_block(read(&directory, SPACED).as_bytes()));
+    // The markers, committed, are found under the path's own name.
+    let Commit::Created(marked) = fixture.store.commit(&workspace, "wip").expect("commit") else {
+        panic!("the merge changed the workspace");
+    };
+    assert_eq!(
+        fixture
+            .store
+            .conflict_markers(&main, marked.as_str())
+            .expect("scan"),
+        vec![SPACED]
+    );
+    let resolved = fixture.work(&workspace, &[(SPACED, "both\n")]);
+    assert_eq!(parents(&fixture, &resolved)[1], main);
 }

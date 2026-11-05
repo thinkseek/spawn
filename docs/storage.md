@@ -51,7 +51,11 @@ files, a chunk fetch.
   text against the kept index (a stat cache: only changed files are hashed)
   and chunks only the large files whose size or mtime changed. A checkpoint
   where only a large file changed is a commit with the same tree and a new
-  trailer. Cost is proportional to what changed.
+  trailer. Cost is proportional to what changed. A large file git already
+  holds as a blob in the branch head, in `main` or in a pending merge's
+  `main` (main may get one from outside Spawn, and a merge brings it in)
+  stays a blob: leaving it out of the tree would delete it from the branch,
+  and from `main` when the branch lands.
 - **Branch**: `refs/heads/<agent>`, moved by compare-and-swap on the old
   commit.
 - **Fork from any commit**: a new branch at an existing commit. No data is
@@ -104,8 +108,7 @@ files, a chunk fetch.
   carries it, it records `notice.typed {through}` (the last merge event the
   notice told of); the notice clears only when that prompt reaches the
   engine: the transcript line of a prompt that opens with the notice's
-  fixed opening gives `notice.received` (for Codex, whose prompt is its
-  argument, the resumed execution's first prompt). Only the files told of
+  fixed opening gives `notice.received`. Only the files told of
   are cleared, so a merge that lands between the typing and the receipt is
   told next time. A prompt the Bridge did not type (someone at the pane, the
   engine going on by itself) clears nothing, and neither does a restart: a
@@ -186,7 +189,8 @@ files, a chunk fetch.
   the integrator's host, and its markers, once checkpointed and pushed, are
   caught by the marker check wherever the integrator runs. The gate judges
   the candidate; the integrator moves `main` by a compare-and-swap push.
-  Large files are workspace state, not source, and never land.
+  Large files are workspace state, not source, and never land (one main
+  already holds as a blob is source: it stays a blob and lands as one).
 
 ## The chunk store
 

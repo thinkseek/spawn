@@ -3,21 +3,17 @@
 //! The Bridge follows the files an engine writes anyway, through the
 //! terminal host, so nothing depends on the engine reporting to Spawn:
 //!
-//! - Claude Code's session transcript, one JSON object per line
-//!   ([`claude_line`]);
-//! - Codex `exec --json` output, which the runner copies to a file
-//!   ([`codex_line`]).
+//! Claude Code's session transcript, one JSON object per line
+//! ([`claude_line`]).
 //!
 //! Lines that carry no Spawn meaning give nothing, so a new engine release
-//! adds no failure mode. Claude events carry a key the engine made unique
-//! (the line's `uuid`, the `tool_use_id`), so reading a file again appends
-//! nothing twice; Codex lines are keyed by their line number in a file that
-//! belongs to one execution.
+//! adds no failure mode. Events carry a key the engine made unique (the
+//! line's `uuid`, the `tool_use_id`), so reading a file again appends
+//! nothing twice.
 
-use serde::Deserialize;
 use serde_json::Value;
 
-use crate::event::{Engine, EventKind};
+use crate::event::EventKind;
 
 /// How every merge notice the Bridge types opens (docs/storage.md, "Main into
 /// branches automatically"). A prompt that opens with it is the Bridge's
@@ -248,103 +244,9 @@ pub fn claude_line(line: &str, since_ms: i64) -> Vec<Normalized> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct CodexLine {
-    #[serde(rename = "type")]
-    line_type: String,
-    thread_id: Option<String>,
-    usage: Option<CodexUsage>,
-    error: Option<Value>,
-    message: Option<String>,
-    item: Option<CodexItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexUsage {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexItem {
-    id: String,
-    #[serde(rename = "type")]
-    item_type: String,
-    status: Option<String>,
-    error: Option<Value>,
-}
-
-/// Codex item types that are tool calls. Messages, reasoning and plan
-/// updates are not tools.
-const CODEX_TOOL_ITEMS: [&str; 4] = [
-    "command_execution",
-    "file_change",
-    "mcp_tool_call",
-    "web_search",
-];
-
-fn codex_error(error: Option<&Value>, message: Option<&str>) -> String {
-    match (error, message) {
-        (Some(Value::Object(object)), _) => {
-            object.get("message").and_then(Value::as_str).map_or_else(
-                || truncate(&Value::Object(object.clone()).to_string()),
-                truncate,
-            )
-        }
-        (Some(other), _) => text_of(other),
-        (None, Some(text)) => truncate(text),
-        (None, None) => String::new(),
-    }
-}
-
-fn codex_item(line_type: &str, item: CodexItem) -> Option<EventKind> {
-    if !CODEX_TOOL_ITEMS.contains(&item.item_type.as_str()) {
-        return None;
-    }
-    match line_type {
-        "item.started" => Some(EventKind::ToolStarted {
-            tool_name: item.item_type,
-            tool_use_id: item.id,
-        }),
-        "item.completed" if item.status.as_deref() == Some("failed") => {
-            Some(EventKind::ToolFailed {
-                error: codex_error(item.error.as_ref(), None),
-                tool_use_id: item.id,
-            })
-        }
-        "item.completed" => Some(EventKind::ToolCompleted {
-            tool_use_id: item.id,
-            duration_ms: None,
-        }),
-        _ => None,
-    }
-}
-
-/// The event in one Codex `exec --json` line, if it carries one.
-pub fn codex_line(line: &str) -> Option<EventKind> {
-    let parsed: CodexLine = serde_json::from_str(line.trim()).ok()?;
-    match parsed.line_type.as_str() {
-        "thread.started" => Some(EventKind::NativeSessionStarted {
-            engine: Engine::Codex,
-            native_session_id: parsed.thread_id?,
-            transcript_path: None,
-        }),
-        "turn.started" => Some(EventKind::MessageReceived),
-        "turn.completed" => Some(EventKind::TurnStopped {
-            input_tokens: parsed.usage.as_ref().and_then(|usage| usage.input_tokens),
-            output_tokens: parsed.usage.as_ref().and_then(|usage| usage.output_tokens),
-        }),
-        "turn.failed" | "error" => Some(EventKind::TurnFailed {
-            error: codex_error(parsed.error.as_ref(), parsed.message.as_deref()),
-        }),
-        name @ ("item.started" | "item.completed") => codex_item(name, parsed.item?),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{claude_line, codex_line, utc_ms};
+    use super::{claude_line, utc_ms};
     use crate::event::EventKind;
 
     #[test]
@@ -495,22 +397,5 @@ mod tests {
             kinds(&interrupted),
             vec![("turn.stopped".into(), Some("u9".into()))]
         );
-    }
-
-    #[test]
-    fn codex_lines_map_to_events() {
-        let line = r#"{"type":"item.started","item":{"id":"i1","type":"command_execution"}}"#;
-        assert!(matches!(
-            codex_line(line),
-            Some(EventKind::ToolStarted { .. })
-        ));
-        assert!(
-            codex_line(r#"{"type":"item.started","item":{"id":"i2","type":"message"}}"#).is_none()
-        );
-        assert!(codex_line("  ").is_none());
-        assert!(matches!(
-            codex_line(r#"{"type":"thread.started","thread_id":"t1"}"#),
-            Some(EventKind::NativeSessionStarted { .. })
-        ));
     }
 }
