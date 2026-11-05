@@ -567,12 +567,39 @@ fn the_container_prefix_runs_a_shell_in_the_named_container() {
     assert_eq!(prefix.len(), 7, "{prefix:?}");
 }
 
-fn isolated_tmux(tag: &str) -> String {
+/// A tmux program pinned to a private server, which goes when the test does,
+/// even when it panics: no server or socket outlives a test run.
+struct IsolatedTmux {
+    program: String,
+    socket: String,
+}
+
+impl Drop for IsolatedTmux {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("tmux")
+            .args(["-L", &self.socket, "kill-server"])
+            .stderr(std::process::Stdio::null())
+            .status();
+        // tmux leaves the socket file behind; it is this test's own.
+        if let Ok(meta) = fs::metadata("/proc/self") {
+            use std::os::unix::fs::MetadataExt;
+            let dir = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+            let _ = fs::remove_file(
+                std::path::Path::new(&dir)
+                    .join(format!("tmux-{}", meta.uid()))
+                    .join(&self.socket),
+            );
+        }
+    }
+}
+
+fn isolated_tmux(tag: &str) -> IsolatedTmux {
     let socket = format!("spawn-host-test-{tag}-{}", std::process::id());
-    script(
+    let program = script(
         &format!("fake-tmux-{tag}"),
         &format!("#!/bin/sh\nexec tmux -L {socket} \"$@\"\n"),
-    )
+    );
+    IsolatedTmux { program, socket }
 }
 
 fn terminal(name: &str) -> TerminalName {
@@ -597,7 +624,8 @@ fn launch(name: &TerminalName) -> Launch {
 #[test]
 fn tmux_types_into_a_terminal_and_sees_the_echo() {
     let _exclusive = exclusive();
-    let host = TmuxHost::local(&isolated_tmux("echo"));
+    let tmux = isolated_tmux("echo");
+    let host = TmuxHost::local(&tmux.program);
     let name = terminal("echo");
     start_session(&host, &launch(&name)).expect("start succeeds");
 
@@ -625,7 +653,8 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
 #[test]
 fn tmux_rejects_a_duplicate_terminal() {
     let _exclusive = exclusive();
-    let host = TmuxHost::local(&isolated_tmux("dup"));
+    let tmux = isolated_tmux("dup");
+    let host = TmuxHost::local(&tmux.program);
     let name = terminal("dup");
     start_session(&host, &launch(&name)).expect("start succeeds");
     let error = host
@@ -638,7 +667,8 @@ fn tmux_rejects_a_duplicate_terminal() {
 #[test]
 fn tmux_matches_the_session_name_exactly() {
     let _exclusive = exclusive();
-    let host = TmuxHost::local(&isolated_tmux("exact"));
+    let tmux = isolated_tmux("exact");
+    let host = TmuxHost::local(&tmux.program);
     let first = terminal("a");
     let second = terminal("ab");
     for name in [&first, &second] {
@@ -657,7 +687,8 @@ fn tmux_matches_the_session_name_exactly() {
 #[test]
 fn tmux_starts_in_the_launch_directory() {
     let _exclusive = exclusive();
-    let host = TmuxHost::local(&isolated_tmux("cwd"));
+    let tmux = isolated_tmux("cwd");
+    let host = TmuxHost::local(&tmux.program);
     let name = terminal("cwd");
     let mut started = launch(&name);
     started.program = "/bin/sh".to_string();
@@ -685,6 +716,10 @@ fn tmux_calls_go_through_the_container_prefix() {
     let calls = scratch().join("tmux-calls.log");
     let _ = fs::remove_file(&calls);
     let socket = format!("spawn-host-test-prefix-{}", std::process::id());
+    let _server = IsolatedTmux {
+        program: String::new(),
+        socket: socket.clone(),
+    };
     let inner = script(
         "fake-tmux-prefix",
         &format!(
@@ -731,7 +766,8 @@ fn the_adapters_pass_the_shared_contract() {
     let _exclusive = exclusive();
     let (repo, root) = repository("contract");
     contract::workspace_store("host_ws", &GitWorkspace::new(&repo, &root));
-    let host = TmuxHost::local(&isolated_tmux("contract"));
+    let tmux = isolated_tmux("contract");
+    let host = TmuxHost::local(&tmux.program);
     // A second session keeps the private server up: killing its last session
     // shuts it down, and a `has-session` racing that shutdown fails with
     // "server exited unexpectedly" instead of reporting the terminal gone.
