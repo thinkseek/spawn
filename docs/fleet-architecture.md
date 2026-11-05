@@ -569,9 +569,15 @@ the tree's own:
   no room to judge now: `TMPDIR` has less than `SPAWN_GATE_MIN_FREE_GB`
   free (`scripts/disk.sh` `gate_room`). In that case it first writes the
   fact `{"no_room":true,"free_kb","min_gb","tmpdir"}` to the verdict file,
-  before any scratch is made or any candidate code runs. The integrator
-  reads `no_room` only from both together (`gate.rs`). Any other status is
-  an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
+  before any scratch is made or any candidate code runs. On a disk with no
+  room at all, that write may fail, and the gate still exits 5. The
+  integrator reads `no_room` from exit 5 together with the fact (`gate.rs`).
+  Without a readable fact, it measures the free space itself (`df`), and it
+  records `no_room` with its own measurement only when that is under the
+  floor. It does this in two cases: the gate exited 5 (it measures the
+  gate's `TMPDIR`), or the integrator could not create or use its private
+  directory for the gate (it measures that directory's parent). Any other
+  status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
   a timeout or a signal.
 
@@ -627,13 +633,19 @@ the tree's own:
      names the reason, `free_kb`, `min_gb` and `tmpdir`. It moves neither
      `gate_aborts` nor `gate_rejections`, so a disk that another project
      filled halts no mission. The fold keeps the mission's current run of
-     them (`gate_room_since_ms`, `gate_room_last_ms`, `gate_room_waits`,
-     `gate_room_escalated`). A gate that judges, conflicts or aborts ends
-     the run; a `stale` leaves it. The integrator tries again only after a
-     backoff from the latest one: 5 minutes, doubled each time, at most 40.
-     The first `no_room` more than 2 hours into a run carries `escalate`,
-     and the dispatcher's digest takes that record to the supervisor once,
-     with the free space and `TMPDIR` ("no room for the gate on this host").
+     them, which belongs to one task (`gate_room_task`, `gate_room_since_ms`,
+     `gate_room_last_ms`, `gate_room_waits`, `gate_room_escalated`). These
+     end the run: a gate that judges, conflicts or aborts, the task leaving
+     the gate (`task.cancelled`, `task.aborted`), or `mission.resumed`. A
+     `stale` leaves it. A `no_room` on another task starts a new run, with
+     no inherited age, backoff or escalation. The integrator tries that task
+     again only after a backoff from the latest `no_room`: 5 minutes,
+     doubled each time, at most 40. The first `no_room` more than 2 hours
+     into a run carries `escalate`. The dispatcher's digest takes that
+     record to the supervisor, with the free space and `TMPDIR` ("no room
+     for the gate on this host"). It stays pending until a delivered digest
+     carries its tag (`host gate-room-<event>`), however long that takes, so
+     it is told once.
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
