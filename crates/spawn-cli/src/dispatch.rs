@@ -462,6 +462,18 @@ pub(crate) fn step(
     }
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for mut order in plan.orders {
+        // A cancelled task's work is set aside before its resident is told
+        // ([`crate::set_aside`]); a set-aside that fails holds the notice,
+        // and so the resident's next task, until a later pass.
+        if let Some(task) = deliver::notice_task(&order.key) {
+            match set_aside_before(store, root, &work, task, &mut order) {
+                Ok(line) => lines.extend(line),
+                Err(error) => {
+                    lines.push(format!("deliver: {error}"));
+                    continue;
+                }
+            }
+        }
         // A task typed into a live worker starts from the source's main:
         // merged into its idle workspace first, and the brief says what the
         // merge did ([`crate::main_merge`]).
@@ -480,6 +492,45 @@ pub(crate) fn step(
         lines.push(line);
     }
     Ok(lines)
+}
+
+/// Set aside the work of the cancelled task `task` before `order`, its
+/// notice, is sent, and add to the notice where the work went. Without a
+/// workspace root there is no branch here to set aside: the notice goes as
+/// it is. Returns a log line when the set-aside did something.
+fn set_aside_before(
+    store: &std::sync::Arc<PostgresStore>,
+    root: Option<&Path>,
+    work: &Work,
+    task: i64,
+    order: &mut Order,
+) -> Result<Option<String>, String> {
+    let Some(cancelled) = work.cancelled.iter().find(|cancelled| cancelled.id == task) else {
+        return Err(format!(
+            "task #{task}'s cancel notice: the task is not a cancelled delivery"
+        ));
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let done = crate::set_aside::set_aside(store, root, cancelled)?;
+    let note = crate::set_aside::note(task, &done);
+    if let CommandAction::Resume {
+        prompt: Some(text), ..
+    } = &mut order.action
+        && !note.is_empty()
+    {
+        text.push_str("\n\n");
+        text.push_str(&note);
+    }
+    Ok(match done {
+        crate::set_aside::Done::SetAside { commit, kept } if cancelled.set_aside.is_none() => {
+            Some(format!(
+                "deliver: task #{task} cancelled: its work set aside in {kept}, the branch at {commit}"
+            ))
+        }
+        _ => None,
+    })
 }
 
 /// Merge main into the workspace of the live worker `order` types a task

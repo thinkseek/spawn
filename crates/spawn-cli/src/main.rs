@@ -37,6 +37,7 @@ mod objectives;
 mod push;
 mod runtime;
 mod serve;
+mod set_aside;
 mod sources;
 mod supervise;
 

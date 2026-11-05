@@ -317,6 +317,35 @@ accept` /
 close`. Every one is a checked SQL function that appends to the control
 stream (§10.1).
 
+**When a task closes.** A task closes by landing (or, without a gate,
+acceptance), or by a cancel: `spawn task cancel`, the supervisor's, the
+integrator's abort over budget (`task.aborted`), a gate rejection the
+closure rule turns into a cancel, or a mission closed or a resident retired
+under it (§10). A cancelled task's live work ends with it, at the source:
+
+- *Stopped.* When a delivered task is cancelled and it was its worker's
+  latest delivery, the dispatcher stops the worker at once, in the middle of
+  a turn or idle (a Stop takes a final checkpoint, which keeps what it did;
+  its turn for the task is never left to finish). An ephemeral worker is
+  stopped and nothing more; a retired resident is stopped and not told.
+- *Set aside.* Before a resident gets anything else, the task's work leaves
+  its branch's tree: a new commit on top of the branch head, whose tree is
+  the checkpoint the task started from ([storage.md](storage.md), "Work set
+  aside"). Nothing is rewound or lost, and the next task's candidate holds
+  none of it, so nothing rides into another objective's landing.
+- *Told.* The resident is then resumed with a notice that names the task,
+  says it is cancelled, and says where its work is (the commit that holds
+  it). Its next task waits until the notice reached it.
+- *Never collected.* A cancelled task's report is not collected, recorded
+  or judged; a report file it leaves is not the next task's (the delivery
+  mark rule).
+
+A task never delivered changes nothing for its worker, and a resident whose
+cancelled task is not its latest delivery is left alone. The dispatcher
+keeps no state for this either: `spawn_events`, `spawn_commands` and their
+keys (`cancel-stop-<task>-<execution>`, `cancel-notice-<task>-<n>`,
+`set-aside:<task>`) say what was done.
+
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
@@ -684,7 +713,10 @@ record of what was judged (§14 of design.md).
   neither `task.cancelled` nor `task.aborted`. The
   integrator's selection uses the same rule, and no transition moves a task
   into a state the rule drops: a send-back is refused, a gate rejection
-  cancels the task, and deliveries and reports are not recorded.
+  cancels the task, and deliveries and reports are not recorded. A worker
+  still working on a task the rule cancels is stopped, and a resident gets
+  the task's work set aside and is told before anything else (§3.2, "When a
+  task closes").
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
   - three gate aborts in a row;
