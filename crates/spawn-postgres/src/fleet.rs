@@ -160,7 +160,8 @@ from (
     p.observation_event_id,
     p.observation_at_ms,
     (select max(e.session_seq) from spawn_events e
-      where e.session_id = s.session_id and e.source <> 'observer') as evidence_seq,
+      where e.session_id = s.session_id and e.source <> 'observer'
+        and e.event_name not in ('artifact.committed', 'merge.conflicted')) as evidence_seq,
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c

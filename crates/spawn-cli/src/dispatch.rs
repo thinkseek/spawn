@@ -81,7 +81,11 @@ pub(crate) struct Facts {
     pub(crate) observation_event_id: Option<i64>,
     #[serde(default)]
     pub(crate) observation_at_ms: Option<i64>,
-    /// Session position of the latest fact (not an observation).
+    /// Session position of the latest fact about the engine: not an
+    /// observation, nor a storage record (`artifact.committed`,
+    /// `merge.conflicted`), which says nothing about the engine's state and
+    /// may be written between turns by the integrator or the dispatcher
+    /// ([`crate::main_merge`]); a judgement older than one still holds.
     #[serde(default)]
     pub(crate) evidence_seq: Option<u64>,
     #[serde(default)]
@@ -358,7 +362,7 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
 /// workers under `root`, then submit the plan, without its new executions
 /// while the disk is under its floor ([`crate::disk`]). Returns log lines.
 pub(crate) fn step(
-    store: &PostgresStore,
+    store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
     spawn: &str,
     root: Option<&Path>,
@@ -391,7 +395,13 @@ pub(crate) fn step(
         ));
     }
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
-    for order in plan.orders {
+    for mut order in plan.orders {
+        // A task typed into a live worker starts from the source's main:
+        // merged into its idle workspace first, and the brief says what the
+        // merge did ([`crate::main_merge`]).
+        if let Some(root) = root {
+            lines.extend(merge_main_before(store, root, &mut order));
+        }
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
         // Before the command exists, so the worker's report for it comes
         // after the mark (the mark decides which report is new).
@@ -404,6 +414,32 @@ pub(crate) fn step(
         lines.push(line);
     }
     Ok(lines)
+}
+
+/// Merge main into the workspace of the live worker `order` types a task
+/// into, and add what the merge did to the typed text. A start or resume
+/// mounts its workspace later; the Bridge merges main then, when it merges
+/// cleanly. Returns a log line when the merge did something.
+fn merge_main_before(
+    store: &std::sync::Arc<PostgresStore>,
+    root: &Path,
+    order: &mut Order,
+) -> Option<String> {
+    let CommandAction::Input { text, .. } = &mut order.action else {
+        return None;
+    };
+    let task = order.task?;
+    let merge = crate::main_merge::merge_main(store, root, &order.agent_id, &order.session_id);
+    if let Some(note) = crate::main_merge::delivery_note(&merge) {
+        text.push_str("\n\n");
+        text.push_str(&note);
+    }
+    match merge {
+        crate::main_merge::Merge::Current | crate::main_merge::Merge::NotMounted => None,
+        other => Some(format!(
+            "deliver: task #{task}: main into its workspace: {other:?}"
+        )),
+    }
 }
 
 #[cfg(test)]

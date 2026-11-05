@@ -1,7 +1,9 @@
 //! The Bridge's part in branching and merging (docs/storage.md): a start's
 //! `from` reaches the workspace store and the fork point the log; the base is
-//! merged into an idle workspace right after a turn's checkpoint, and never
-//! while a turn runs.
+//! merged into a branch when an execution starts or resumes, only cleanly,
+//! and the Bridge never merges into a running execution (the integrator's
+//! conflict verdict and a task's delivery do, between turns: spawn-cli's
+//! `main_merge`).
 
 use std::sync::Arc;
 

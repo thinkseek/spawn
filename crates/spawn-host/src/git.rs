@@ -1582,7 +1582,7 @@ impl GitWorkspace {
     ///
     /// Otherwise it goes: the head is still the pre-merge one, so a fresh
     /// export holds none of main's changes and main must never become a
-    /// parent of it (the next idle merge writes the merge again); or main is
+    /// parent of it (the next merge of main writes the merge again); or main is
     /// already contained; or the file is unreadable or has no head.
     fn settle_pending(&self, branch: &str) {
         let carried = self.pending_merge(branch).is_some_and(|pending| {
