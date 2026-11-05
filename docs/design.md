@@ -55,23 +55,23 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 
 信封 `NewEvent { agent_id, session_id, execution_id, source, source_event_id, kind }`，写入返回 `EventRecord { position, session_seq, recorded_at, event }` 与 `Appended { record, inserted }`。
 
-`Source`：Claude、Codex、Bridge、Observer、Gateway、Control。
+`Source`：Claude、Bridge、Observer、Gateway、Control。读日志时，来源是本版本不认识的名字（已删除的写入方，例如 `layerfs`、`codex`）的记录被跳过，每个名字警告一次，读取不中断；`timeline` 照原样显示来源。
 
 | 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |
-| `session.native_started` | Bridge（新会话由它命名）、Codex（`thread.started`） | engine、native_session_id、transcript_path |
+| `session.native_started` | Bridge（新会话由它命名） | engine、native_session_id、transcript_path |
 | `session.native_ended` | 无；保留它以读取日志里已有的行 | reason |
 | `session.linked` | Bridge | parent_session_id |
 | `message.received` | 会话记录（transcript） | 无 |
 | `notice.typed` | Bridge（键入的提示以合并通知开头时） | through（通知覆盖到的最后一个合并事件的位置） |
 | `notice.received` | 会话记录（以合并通知固定开头的提示行） | 无 |
 | `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |
-| `tool.started` | 会话记录、Codex | tool_name、tool_use_id |
-| `tool.completed` | 会话记录、Codex | tool_use_id、duration_ms |
-| `tool.failed` | 会话记录、Codex | tool_use_id、error |
-| `turn.stopped` | 会话记录（`turn_duration`、中断）、Codex | input_tokens、output_tokens |
-| `turn.failed` | 会话记录（API 错误行）、Codex | error |
-| `execution.started` | Bridge | engine、terminal、workspace、command_id；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
+| `tool.started` | 会话记录 | tool_name、tool_use_id |
+| `tool.completed` | 会话记录 | tool_use_id、duration_ms |
+| `tool.failed` | 会话记录 | tool_use_id、error |
+| `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
+| `turn.failed` | 会话记录（API 错误行） | error |
+| `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code |
 | `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
 | `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
@@ -124,22 +124,21 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 | `Discard` | 同 `Stop`，但最后一次 checkpoint 失败也卸载工作区，未提交的内容丢失；只由人或 supervisor 在 `execution.end_stalled` 之后发出 |
 | `Resume{prompt,model}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
 
-一次启动的参数由 `claude_arguments` 与 `codex_arguments` 生成：
+Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` 与 `session.native_started` 仍带 `engine` 字段，供 `agent_executions` 视图展示，代码不按它分支；记录里写着别的引擎名照样能读。`Start` 的 `engine` 可省略，写了就只能是 `claude`，否则命令解析失败。一次启动的参数由 `claude_arguments` 生成：
 
 | 引擎 | 参数 |
 | --- | --- |
 | Claude | `--ax-screen-reader --allow-dangerously-skip-permissions --settings <内联 JSON> (--session-id <uuid> \| --resume <uuid>)` |
-| Codex | `exec --json [resume <id>] -- <prompt>` |
 
-引擎模型（[fleet-architecture.md §3.3](fleet-architecture.md#33-engine-models)）：`Start`/`Resume` 的可选 `model` 是模型档位，`default` 或 `cheap`；不写就沿用该会话上一次执行的档位（从 `execution.started` 的 `model` 折叠，默认档位不写进记录），从没跑过的会话用 `default`。内联 `--settings` 由 `claude_settings(relay, profile)` 生成：Claude Code 把它合并在用户 settings 之上，键以内联为准，`env` 按名字逐个合并（2.1.318 实测：内联 `env` 只写基址和 haiku 槽位时，主模型和 `ANTHROPIC_AUTH_TOKEN` 仍来自 `~/.claude/settings.json`），所以网关 token 不经过 Spawn。配置了模型中继（`SPAWN_MODEL_RELAY`，跑 `spawn-model-relay` 的主机设为 `http://127.0.0.1:8791`；不设或 `off` 即不用中继，两档都不写 `env`，`cheap` 启动失败）时 `env` 写 `ANTHROPIC_BASE_URL` 指向中继、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 为小模型（`SPAWN_SMALL_MODEL`，默认 `deepseek-flash`）；`cheap` 另把 `ANTHROPIC_MODEL` 与 opus、sonnet 槽位设为 `SPAWN_CHEAP_MODEL`（默认 `deepseek-v4-pro`）。每次启动前 Bridge 先连一下中继：连不上时 `default` 不写 `env`、照 Claude Code 自己的设置跑并在 tick 报告里警告，`cheap` 直接失败；Codex 不支持 `cheap`。
+引擎模型（[fleet-architecture.md §3.3](fleet-architecture.md#33-engine-models)）：`Start`/`Resume` 的可选 `model` 是模型档位，`default` 或 `cheap`；不写就沿用该会话上一次执行的档位（从 `execution.started` 的 `model` 折叠，默认档位不写进记录），从没跑过的会话用 `default`。内联 `--settings` 由 `claude_settings(relay, profile)` 生成：Claude Code 把它合并在用户 settings 之上，键以内联为准，`env` 按名字逐个合并（2.1.318 实测：内联 `env` 只写基址和 haiku 槽位时，主模型和 `ANTHROPIC_AUTH_TOKEN` 仍来自 `~/.claude/settings.json`），所以网关 token 不经过 Spawn。配置了模型中继（`SPAWN_MODEL_RELAY`，跑 `spawn-model-relay` 的主机设为 `http://127.0.0.1:8791`；不设或 `off` 即不用中继，两档都不写 `env`，`cheap` 启动失败）时 `env` 写 `ANTHROPIC_BASE_URL` 指向中继、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 为小模型（`SPAWN_SMALL_MODEL`，默认 `deepseek-flash`）；`cheap` 另把 `ANTHROPIC_MODEL` 与 opus、sonnet 槽位设为 `SPAWN_CHEAP_MODEL`（默认 `deepseek-v4-pro`）。每次启动前 Bridge 先连一下中继：连不上时 `default` 不写 `env`、照 Claude Code 自己的设置跑并在 tick 报告里警告，`cheap` 直接失败。
 
-不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`，Codex 输出另存到 `SPAWN_ENGINE_OUTPUT`；终端里没有数据库登录。
+不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
 checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
 
-合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。此外，空闲的活执行（没有进行中的回合、本 tick 没读到要求 checkpoint 的事件、屏幕最后读到 Ready）按 Bridge 自己的时钟每 30 秒（`IDLE_MERGE_MS`）至多调用一次 `merge_base`；Bridge 投递提示（`Start` 的首个提示、`Input`）时立即打开回合。`Merged` 写 `artifact.committed`（reason `base_merged`，带合并改动的 `files`，折叠时不清掉仍待做的 checkpoint）；冲突按状态记一次 `merge.conflicted{files,marked}`，同一冲突或失败的警告只报一次，状态变了才再报。每个会话有一份由这两种事件折叠出的提示，每个文件记着最后提到它的合并事件的位置：Bridge 下一次为该会话键入 `Input` 或 `Resume` 提示时把它放在最前（「Spawn merged main into your workspace since your last turn: <files>. Re-read them before editing.」；冲突时说明这些文件带冲突标记、编辑标记区域、不要凭记忆重写），从不主动键入。键入成功后写 `notice.typed{through}`；只有这条提示到达引擎时才清空：会话记录里以通知固定开头的提示行产生 `notice.received`（Codex 的提示是启动参数，恢复执行的第一条提示即是它），只清掉 `through` 及之前的文件。别人键入的回合、引擎自己继续的回合、重启都不清空；已键入未到达的通知随下一条提示再键入。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载；`Conflicted` 与失败只进 tick 报告的警告（区分「目录里已有冲突标记」与「标记表达不了，未合并」），冲突由落地告诉 agent。
+合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。此外，空闲的活执行（没有进行中的回合、本 tick 没读到要求 checkpoint 的事件、屏幕最后读到 Ready）按 Bridge 自己的时钟每 30 秒（`IDLE_MERGE_MS`）至多调用一次 `merge_base`；Bridge 投递提示（`Start` 的首个提示、`Input`）时立即打开回合。`Merged` 写 `artifact.committed`（reason `base_merged`，带合并改动的 `files`，折叠时不清掉仍待做的 checkpoint）；冲突按状态记一次 `merge.conflicted{files,marked}`，同一冲突或失败的警告只报一次，状态变了才再报。每个会话有一份由这两种事件折叠出的提示，每个文件记着最后提到它的合并事件的位置：Bridge 下一次为该会话键入 `Input` 或 `Resume` 提示时把它放在最前（「Spawn merged main into your workspace since your last turn: <files>. Re-read them before editing.」；冲突时说明这些文件带冲突标记、编辑标记区域、不要凭记忆重写），从不主动键入。键入成功后写 `notice.typed{through}`；只有这条提示到达引擎时才清空：会话记录里以通知固定开头的提示行产生 `notice.received`，只清掉 `through` 及之前的文件。别人键入的回合、引擎自己继续的回合、重启都不清空；已键入未到达的通知随下一条提示再键入。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载；`Conflicted` 与失败只进 tick 报告的警告（区分「目录里已有冲突标记」与「标记表达不了，未合并」），冲突由落地告诉 agent。
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
 
@@ -200,10 +199,9 @@ Observer 每次 tick：
 
 | 实现 | 用途 |
 | --- | --- |
-| `HeuristicJudge` | 没有 Jev 地址（`SPAWN_JUDGE_URL`、`--judge-url`）时回答歧义情形的确定性判定器，离线可用，测试也用它；它不是规则层。`name()` 返回 `heuristic` |
 | `JevJudge` | HTTP，见第 8 节。`name()` 返回 `jev` |
 
-判定错误时写规则的猜测，原因 `JudgeUnavailable`、置信度 0、要求关注；不标记 Agent 死亡，按退避重试。
+判定错误时写规则的猜测，原因 `JudgeUnavailable`、置信度 0、要求关注；不标记 Agent 死亡，按退避重试。没有 Jev 地址（`SPAWN_JUDGE_URL`、`--judge-url`）时 Observer 只用规则（`Observer::new` 不带 `with_judge`）：规则定不了的情形照判定器不可用处理，记下歧义与规则的猜测，`judge` 为 `none`（`NO_JUDGE`），要求关注，由 dispatcher 上报而不是催促。日志里 `judge` 为 `heuristic`（已删除的判定器）的判定照常读取和显示。
 
 ## 8. Jev HTTP 契约
 

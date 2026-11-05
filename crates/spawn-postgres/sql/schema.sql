@@ -595,7 +595,8 @@ select
     s.agent_id,
     s.execution_id,
     s.kind -> 'detail' ->> 'engine'    as engine,
-    s.kind -> 'detail' ->> 'terminal'  as terminal,
+    -- Always the execution's own terminal; records no longer name it.
+    'spawn-' || s.execution_id         as terminal,
     s.kind -> 'detail' ->> 'workspace' as workspace,
     s.recorded_at_ms as started_at_ms,
     x.kind -> 'detail' ->> 'cause'     as cause,

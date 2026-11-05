@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spawn_core::event::EndCause;
-use spawn_core::event::{Engine, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
-use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, TerminalName, WorkspaceId};
+use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
+use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
 use spawn_core::observe::{
@@ -77,7 +77,8 @@ fn fixture(judge: Arc<Scripted>) -> Fixture {
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
-    let observer = Observer::new(log, judge)
+    let observer = Observer::new(log)
+        .with_judge(judge)
         .with_clock(clock.clone())
         .with_context(Arc::new(Context));
     Fixture {
@@ -113,8 +114,7 @@ fn started(store: &MemoryStore) {
         store,
         Source::Bridge,
         EventKind::ExecutionStarted {
-            engine: Engine::Claude,
-            terminal: TerminalName::new("spawn-exec_1").expect("valid"),
+            engine: ENGINE.to_string(),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(1),
             fork: None,
@@ -331,7 +331,8 @@ fn a_restarted_observer_does_not_ask_about_judged_evidence() {
 
     // A one-shot `spawn tick` builds a new Observer every run.
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut again = Observer::new(log, judge.clone())
+    let mut again = Observer::new(log)
+        .with_judge(judge.clone())
         .with_clock(fixture.clock.clone())
         .with_context(Arc::new(Context));
     fixture.clock.advance(Duration::from_secs(31));
@@ -431,6 +432,72 @@ fn a_tool_open_for_long_is_ambiguous() {
     fixture.clock.advance(Duration::from_mins(6));
     fixture.observer.tick().expect("tick");
     assert_eq!(judge.calls(), 1, "an eleven-minute silent tool may hang");
+}
+
+#[test]
+fn a_hung_tool_under_a_busy_spinner_still_asks_for_attention() {
+    let judge = Scripted::new(Err("no judge today".to_string()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Claude,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "t1".to_string(),
+        },
+    );
+    // The pane keeps showing the spinner, so the Bridge records the busy
+    // screen again every 30 s; the transcript says nothing more.
+    let busy = |store: &MemoryStore| {
+        append(
+            store,
+            Source::Bridge,
+            EventKind::ScreenObserved {
+                state: ScreenState::Busy,
+                evidence: "esc to interrupt".to_string(),
+            },
+        );
+    };
+    for _ in 0..19 {
+        busy(&fixture.store);
+        fixture.observer.tick().expect("tick");
+        fixture.clock.advance(Duration::from_secs(30));
+    }
+    assert_eq!(judge.calls(), 0, "nine and a half minutes: a long build");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert!(!last.attention);
+
+    for _ in 0..3 {
+        busy(&fixture.store);
+        fixture.observer.tick().expect("tick");
+        fixture.clock.advance(Duration::from_secs(30));
+    }
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(
+        last.ambiguity,
+        Some(Ambiguity::QuietLive),
+        "eleven minutes of one tool and no progress may hang, busy screen or not"
+    );
+    assert!(last.attention, "{last:?}");
+    assert!(judge.calls() >= 1, "the case went to the judge");
+
+    // The tool finishes: progress again, and work again.
+    append(
+        &fixture.store,
+        Source::Claude,
+        EventKind::ToolCompleted {
+            tool_use_id: "t1".to_string(),
+            duration_ms: None,
+        },
+    );
+    busy(&fixture.store);
+    fixture.clock.advance(Duration::from_secs(1));
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert_eq!(last.ambiguity, None);
 }
 
 #[test]
@@ -593,7 +660,9 @@ fn a_restarted_observer_corrects_a_stale_row() {
         },
     );
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut fresh = Observer::new(log, judge.clone()).with_clock(fixture.clock.clone());
+    let mut fresh = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(fixture.clock.clone());
     assert_eq!(fresh.tick().expect("tick"), 1);
     let last = observations(&fixture.store).pop().expect("an observation");
     assert_eq!(last.state, SemanticState::Completed);
@@ -602,7 +671,9 @@ fn a_restarted_observer_corrects_a_stale_row() {
 
     // And a second restart writes nothing.
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut again = Observer::new(log, judge).with_clock(fixture.clock.clone());
+    let mut again = Observer::new(log)
+        .with_judge(judge)
+        .with_clock(fixture.clock.clone());
     assert_eq!(again.tick().expect("tick"), 0);
 }
 
@@ -639,7 +710,8 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
-    let mut observer = Observer::new(log, judge)
+    let mut observer = Observer::new(log)
+        .with_judge(judge)
         .with_clock(clock)
         .with_context(Arc::new(Supervisor));
     started(&store);
@@ -758,8 +830,7 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
     in_execution(
         2,
         EventKind::ExecutionStarted {
-            engine: Engine::Claude,
-            terminal: TerminalName::new("spawn-exec_2").expect("valid"),
+            engine: ENGINE.to_string(),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(2),
             fork: None,

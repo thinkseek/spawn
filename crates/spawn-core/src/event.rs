@@ -1,37 +1,29 @@
 //! Unified event vocabulary and stored event records.
 //!
-//! Every producer (engine hooks, Codex stream, Bridge, Observer,
-//! SQL gateway) writes the same [`EventKind`] values. The store assigns the
+//! Every producer (the engine's transcript, Bridge, Observer, SQL gateway)
+//! writes the same [`EventKind`] values. The store assigns the
 //! per-session sequence, the global position and the record time; producer
 //! clocks never decide order.
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::{
-    AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
-};
+use crate::id::{AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, WorkspaceId};
 use crate::observation::Observation;
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
 
-/// Native agent CLI behind an execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Engine {
-    /// Claude Code, interactive in a terminal, events through hooks.
-    Claude,
-    /// Codex `exec --json`, events through its JSONL standard output.
-    Codex,
-}
+/// Wire name of the engine every execution runs: Claude Code, interactive
+/// in a terminal. Executions and native sessions record it in their
+/// `engine` field, which the `agent_executions` view shows; nothing
+/// branches on it, and a record naming another engine still reads.
+pub const ENGINE: &str = "claude";
 
 /// System that produced a fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
-    /// Claude Code hooks.
+    /// The Claude Code transcript, and the runner's exit report.
     Claude,
-    /// Codex JSONL stream.
-    Codex,
     /// Agent Bridge lifecycle facts.
     Bridge,
     /// Observer judgements.
@@ -48,7 +40,6 @@ impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
-            Self::Codex => "codex",
             Self::Bridge => "bridge",
             Self::Observer => "observer",
             Self::Gateway => "gateway",
@@ -60,7 +51,6 @@ impl Source {
     pub fn parse(text: &str) -> Option<Self> {
         [
             Self::Claude,
-            Self::Codex,
             Self::Bridge,
             Self::Observer,
             Self::Gateway,
@@ -68,23 +58,6 @@ impl Source {
         ]
         .into_iter()
         .find(|source| source.as_str() == text)
-    }
-}
-
-impl Engine {
-    /// Wire name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
-
-    /// Parse a wire name.
-    pub fn parse(text: &str) -> Option<Self> {
-        [Self::Claude, Self::Codex]
-            .into_iter()
-            .find(|engine| engine.as_str() == text)
     }
 }
 
@@ -182,8 +155,8 @@ pub enum EventKind {
     /// A native engine session started or resumed.
     #[serde(rename = "session.native_started")]
     NativeSessionStarted {
-        /// Engine that owns the native session.
-        engine: Engine,
+        /// Engine that owns the native session: [`ENGINE`].
+        engine: String,
         /// Native session identifier, used for resume.
         native_session_id: String,
         /// Transcript path when the engine reports one.
@@ -262,13 +235,14 @@ pub enum EventKind {
         /// Engine error text, truncated.
         error: String,
     },
-    /// An execution started in a terminal against a workspace.
+    /// An execution started in a terminal against a workspace. The
+    /// terminal is [`crate::id::TerminalName::for_execution`] of the event's
+    /// execution, so it is not recorded; a record that still names it reads
+    /// as before.
     #[serde(rename = "execution.started")]
     ExecutionStarted {
-        /// Engine of the execution.
-        engine: Engine,
-        /// Terminal session that hosts the process.
-        terminal: TerminalName,
+        /// Engine of the execution: [`ENGINE`].
+        engine: String,
         /// Mounted workspace.
         workspace: WorkspaceId,
         /// Command that created the execution.

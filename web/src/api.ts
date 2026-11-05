@@ -281,23 +281,35 @@ const TOKEN_KEY = "spawn.serve.token";
 /** The token `spawn serve` wants (`SPAWN_SERVE_TOKEN`): read from the page
  * URL's `?token=` once, then kept in this browser's localStorage, so new
  * tabs, reloads and restarts of the server need no token in the URL. The
- * token only reads; a wrong one is replaced by the next `?token=`. */
+ * token only reads; a wrong one is replaced by the next `?token=`.
+ *
+ * The token leaves the address bar (and so history and screenshots) before
+ * storage is touched: a browser whose storage throws keeps it in memory
+ * only, never in the URL. */
 const serveToken: string | null = (() => {
   const fromUrl = new URLSearchParams(window.location.search).get("token");
-  try {
-    if (fromUrl) {
-      localStorage.setItem(TOKEN_KEY, fromUrl);
-      // Keep the token out of the address bar, history and screenshots.
-      const url = new URL(window.location.href);
-      url.searchParams.delete("token");
-      window.history.replaceState(null, "", url.toString());
+  if (fromUrl) {
+    try {
+      window.history.replaceState(null, "", withoutToken(window.location.href));
+    } catch {
+      // No history API: nothing more can be done about the address bar.
     }
-    return localStorage.getItem(TOKEN_KEY);
+  }
+  try {
+    if (fromUrl) localStorage.setItem(TOKEN_KEY, fromUrl);
+    return localStorage.getItem(TOKEN_KEY) ?? fromUrl;
   } catch {
-    // Storage disabled: the URL is all there is.
+    // Storage disabled: the token from the URL lives in this page only.
     return fromUrl;
   }
 })();
+
+/** `href` without its `?token=` parameter; every other part is kept. */
+export function withoutToken(href: string): string {
+  const url = new URL(href);
+  url.searchParams.delete("token");
+  return url.toString();
+}
 
 /** The error of a failed API read. A 401 says how to give the token. */
 export function apiError(status: number, detail = ""): Error {

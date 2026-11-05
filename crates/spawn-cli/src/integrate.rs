@@ -282,6 +282,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         .cloned()
         .collect();
     let flags = Flags::parse(&valued).map_err(|error| format!("{error}\n{USAGE}"))?;
+    crate::config::require_git()?;
     let root = workspace_root(&flags)
         .map(PathBuf::from)
         .ok_or_else(|| format!("--root or SPAWN_WORKSPACE_ROOT is required\n{USAGE}"))?;
@@ -561,64 +562,10 @@ impl Integrator {
         if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
             return gated("conflict", json!({ "note": note }));
         }
-        let candidate = if git(&[
-            "--git-dir",
-            &mirror_path,
-            "merge-base",
-            "--is-ancestor",
-            main,
-            &branch,
-        ])
-        .is_ok()
-        {
-            // Large files are workspace state, never source: a branch head
-            // that names a large-file manifest lands as a commit of the same
-            // tree without it, so nothing forked from main inherits them.
-            let message = git(&[
-                "--git-dir",
-                &mirror_path,
-                "show",
-                "-s",
-                "--format=%B",
-                &branch,
-            ])?;
-            if spawn_host::chunks::trailer_of(&message).is_some() {
-                let tree = git(&[
-                    "--git-dir",
-                    &mirror_path,
-                    "rev-parse",
-                    &format!("{branch}^{{tree}}"),
-                ])?;
-                git(&[
-                    "--git-dir",
-                    &mirror_path,
-                    "commit-tree",
-                    &tree,
-                    "-p",
-                    &branch,
-                    "-m",
-                    &format!("Land task {}", task.id),
-                ])?
-            } else {
-                branch
-            }
-        } else {
-            // Main moved since the worker started: land the merge of both,
-            // by main's merge rules (a bare repository reads no in-tree
-            // .gitattributes otherwise), as the Bridge merges main into
-            // idle branches.
-            let Ok(tree) = git(&[
-                "--git-dir",
-                &mirror_path,
-                &format!("--attr-source={main}"),
-                "merge-tree",
-                "--write-tree",
-                main,
-                &branch,
-            ]) else {
-                return gated(
-                    "conflict",
-                    json!({"note": format!(
+        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, task.id)? else {
+            return gated(
+                "conflict",
+                json!({"note": format!(
                         "Your work conflicts with the source's current main ({main}). \
                          Main is merged into your workspace when a turn of yours ends and \
                          while you are idle (within about 30 s), so the conflicting files \
@@ -626,21 +573,7 @@ impl Integrator {
                          none show yet, they will once this turn ends). Resolve them, keeping both sides' intent and removing every \
                          marker, then report again: the checkpoint after the last marker \
                          is gone records the merge.")}),
-                );
-            };
-            let tree = tree.lines().next().unwrap_or_default().to_string();
-            git(&[
-                "--git-dir",
-                &mirror_path,
-                "commit-tree",
-                &tree,
-                "-p",
-                main,
-                "-p",
-                &branch,
-                "-m",
-                &format!("Land task {} (merged with main)", task.id),
-            ])?
+            );
         };
         let tree_of = |commit: &str| {
             git(&[
@@ -700,6 +633,90 @@ impl Integrator {
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
+}
+
+/// The commit that would land `branch` (the agent's pushed head, in the
+/// mirror) on `main`, or `None` when the two conflict. Only objects are
+/// written, never a ref: the agent's `refs/heads/<agent>` stays the Bridge's,
+/// and `spawn/<agent>` catches up with a landing through the Bridge's next
+/// merge of main, which its pusher pushes like any checkpoint.
+fn landing_candidate(
+    mirror_path: &str,
+    main: &str,
+    branch: &str,
+    task: i64,
+) -> Result<Option<String>, String> {
+    let main_is_in = git(&[
+        "--git-dir",
+        mirror_path,
+        "merge-base",
+        "--is-ancestor",
+        main,
+        branch,
+    ])
+    .is_ok();
+    if main_is_in {
+        // Large files are workspace state, never source: a branch head
+        // that names a large-file manifest lands as a commit of the same
+        // tree without it, so nothing forked from main inherits them.
+        let message = git(&[
+            "--git-dir",
+            mirror_path,
+            "show",
+            "-s",
+            "--format=%B",
+            branch,
+        ])?;
+        if spawn_host::chunks::trailer_of(&message).is_none() {
+            return Ok(Some(branch.to_string()));
+        }
+        let tree = git(&[
+            "--git-dir",
+            mirror_path,
+            "rev-parse",
+            &format!("{branch}^{{tree}}"),
+        ])?;
+        return git(&[
+            "--git-dir",
+            mirror_path,
+            "commit-tree",
+            &tree,
+            "-p",
+            branch,
+            "-m",
+            &format!("Land task {task}"),
+        ])
+        .map(Some);
+    }
+    // Main moved since the worker started: land the merge of both, by
+    // main's merge rules (a bare repository reads no in-tree
+    // .gitattributes otherwise), as the Bridge merges main into idle
+    // branches.
+    let Ok(tree) = git(&[
+        "--git-dir",
+        mirror_path,
+        &format!("--attr-source={main}"),
+        "merge-tree",
+        "--write-tree",
+        main,
+        branch,
+    ]) else {
+        return Ok(None);
+    };
+    let tree = tree.lines().next().unwrap_or_default().to_string();
+    git(&[
+        "--git-dir",
+        mirror_path,
+        "commit-tree",
+        &tree,
+        "-p",
+        main,
+        "-p",
+        branch,
+        "-m",
+        &format!("Land task {task} (merged with main)"),
+    ])
+    .map(Some)
 }
 
 /// The note that sends work back before it is judged, when a merge of main
@@ -830,6 +847,143 @@ mod tests {
     use super::{Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget};
     use crate::gate::GateFailure;
     use serde_json::json;
+
+    /// Commit everything in the checkout `directory`.
+    fn commit_in(directory: &str, message: &str) {
+        let git = crate::sources::git;
+        git(&["-C", directory, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            directory,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            message,
+        ])
+        .expect("commit");
+    }
+
+    /// What the integrator does with an agent's push that passed: fetch it
+    /// into its own ref, build the landing ([`super::landing_candidate`]),
+    /// move the source's main and the mirror's as `land` does.
+    fn land_as_the_integrator(mirror: &std::path::Path, source: &str, agent: &str, task: i64) {
+        let git = crate::sources::git;
+        let mirror_path = mirror.to_string_lossy().to_string();
+        let tracking = format!("refs/spawn-integrate/{agent}");
+        let pushed = crate::sources::fetch_pushed_into(mirror, source, agent, &tracking)
+            .expect("fetch")
+            .expect("pushed");
+        let main = git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"]).expect("main");
+        let candidate = super::landing_candidate(&mirror_path, &main, &pushed, task)
+            .expect("candidate")
+            .expect("no conflict");
+        assert_ne!(candidate, pushed, "a landing of its own");
+        let to_main = format!("{candidate}:refs/heads/main");
+        git(&["--git-dir", &mirror_path, "push", "-q", source, &to_main]).expect("land");
+        git(&[
+            "--git-dir",
+            &mirror_path,
+            "update-ref",
+            "refs/heads/main",
+            &candidate,
+        ])
+        .expect("mirror main");
+    }
+
+    /// After a landing, the agent's pushed branch is not left behind: the
+    /// integrator writes no ref of the agent, and the Bridge's next merge of
+    /// main is a new commit (which `MissionWorkspaces` marks for the
+    /// pusher), so `spawn/<agent>` contains main again once pushed. Both
+    /// landing shapes that are not the branch head itself: a commit without
+    /// the large-file trailer, and a merge with a main that moved.
+    #[test]
+    fn a_landing_reaches_the_agents_pushed_branch_through_the_next_merge() {
+        use crate::push::{Pushed, push_branch};
+        use crate::sources::{ensure_mirror, git};
+        use spawn_core::id::BranchName;
+        use spawn_core::port::{BaseMerge, Commit, WorkspaceStore};
+        use spawn_host::GitWorkspace;
+
+        let base = std::env::temp_dir().join(format!("spawn-land-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let root = base.join("host");
+        let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
+        let mirror_path = mirror.to_string_lossy().to_string();
+        let store = GitWorkspace::new(&mirror, &root);
+        let rev = |reference: &str| {
+            git(&["--git-dir", &mirror_path, "rev-parse", reference]).expect("rev-parse")
+        };
+        let source_rev = |reference: &str| {
+            git(&["--git-dir", &source, "rev-parse", reference]).expect("rev-parse on source")
+        };
+
+        for (task, agent, main_moves) in [(1, "agent_large", false), (2, "agent_late", true)] {
+            let branch = BranchName::new(agent).expect("valid branch");
+            store.ensure_branch(&branch, None).expect("branch");
+            let workspace = store.mount(&branch).expect("mount");
+            let directory = std::path::Path::new(workspace.path());
+            std::fs::write(directory.join(format!("{agent}.txt")), "work\n").expect("write");
+            if !main_moves {
+                // A large file: the head carries the trailer, so the landing
+                // is a commit of its own.
+                std::fs::write(directory.join("weights.bin"), vec![1_u8; 9 << 20]).expect("large");
+            }
+            assert!(matches!(
+                store.commit(&workspace, "work").expect("commit"),
+                Commit::Created(_)
+            ));
+            assert_eq!(push_branch(&mirror, &source, agent), Pushed::Done);
+            if main_moves {
+                // Main moved since the worker started.
+                let clone = base.join(format!("clone-{agent}"));
+                let clone_path = clone.to_string_lossy().to_string();
+                git(&["clone", "-q", &source, &clone_path]).expect("clone");
+                std::fs::write(clone.join("other.txt"), "theirs\n").expect("write");
+                commit_in(&clone_path, "elsewhere");
+                git(&["-C", &clone_path, "push", "-q", "origin", "main"]).expect("push main");
+                crate::sources::refresh(&mirror, &source);
+            }
+
+            let agent_head = rev(&format!("refs/heads/{agent}"));
+            land_as_the_integrator(&mirror, &source, agent, task);
+            assert_eq!(
+                rev(&format!("refs/heads/{agent}")),
+                agent_head,
+                "the integrator moves no ref of the agent"
+            );
+
+            // The Bridge's next merge of main is a new commit, and once
+            // pushed the agent's branch on the source holds the landing.
+            let BaseMerge::Merged { commit, .. } = store.merge_base(&workspace).expect("merge")
+            else {
+                panic!("the landing is new to the branch");
+            };
+            assert_eq!(push_branch(&mirror, &source, agent), Pushed::Done);
+            let pushed_now = source_rev(&format!("refs/heads/spawn/{agent}"));
+            assert_eq!(pushed_now, commit.as_str());
+            git(&[
+                "--git-dir",
+                &source,
+                "merge-base",
+                "--is-ancestor",
+                &source_rev("refs/heads/main"),
+                &pushed_now,
+            ])
+            .expect("spawn/<agent> contains main");
+            store.unmount(&workspace).expect("unmount");
+        }
+    }
 
     /// History c1 <- c2 <- c3, and d2 forked from c1: `contains(a, b)` when
     /// `a` is reachable from `b`.

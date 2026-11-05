@@ -9,14 +9,14 @@ use spawn_core::bridge::{
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
-    EndCause, Engine, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq, Source,
+    ENGINE, EndCause, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq, Source,
 };
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
 };
 use spawn_core::memory::MemoryStore;
-use spawn_core::observation::SemanticState;
-use spawn_core::observe::{HeuristicJudge, Observer};
+use spawn_core::observation::{SemanticState, WaitReason};
+use spawn_core::observe::{NO_JUDGE, Observer};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_core::screen::{ScreenState, read_claude_screen};
 use spawn_core::time::{ManualClock, Timestamp};
@@ -103,7 +103,51 @@ fn events_round_trip_through_json() {
     assert_eq!(Source::parse("claude"), Some(Source::Claude));
     assert_eq!(Source::Gateway.as_str(), "gateway");
     assert!(Source::parse("nope").is_none());
-    assert_eq!(Engine::parse("codex"), Some(Engine::Codex));
+    // A record naming an engine this build does not run still reads; a
+    // command naming one does not parse, and its sender sees why.
+    let started = serde_json::json!({
+        "name": "execution.started",
+        "detail": {"engine": "codex", "terminal": "spawn-exec_1",
+                   "workspace": "1:/w", "command_id": 1},
+    });
+    assert!(matches!(
+        serde_json::from_value::<EventKind>(started),
+        Ok(EventKind::ExecutionStarted { engine, .. }) if engine == "codex"
+    ));
+    // The terminal is the execution's own: a new record does not name it,
+    // and an old one that does reads the same.
+    let old = serde_json::json!({
+        "name": "execution.started",
+        "detail": {"engine": ENGINE, "terminal": "spawn-exec_1",
+                   "workspace": "1:/w", "command_id": 1},
+    });
+    let read: EventKind = serde_json::from_value(old).expect("an old record reads");
+    let written = serde_json::to_value(&read).expect("serialize");
+    assert!(written["detail"].get("terminal").is_none(), "{written}");
+    assert_eq!(
+        serde_json::from_value::<EventKind>(written).expect("reads back"),
+        read
+    );
+    assert_eq!(
+        TerminalName::for_execution(&ExecutionId::new("exec_1").expect("valid")).as_str(),
+        "spawn-exec_1"
+    );
+    let start = |engine: &str| {
+        serde_json::from_value::<CommandAction>(
+            serde_json::json!({"type": "start", "engine": engine, "prompt": "x"}),
+        )
+    };
+    assert!(start(ENGINE).is_ok());
+    let refused = start("codex").expect_err("codex is not an engine");
+    assert!(
+        refused.to_string().contains("unknown engine codex"),
+        "{refused}"
+    );
+    let unnamed = serde_json::json!({"type": "start", "prompt": "x"});
+    assert!(matches!(
+        serde_json::from_value::<CommandAction>(unnamed),
+        Ok(CommandAction::Start { engine, .. }) if engine == ENGINE
+    ));
 }
 
 #[test]
@@ -228,7 +272,7 @@ fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
                 session_id: session(),
                 idempotency_key: IdempotencyKey::new("key_start").expect("valid key"),
                 action: CommandAction::Start {
-                    engine: Engine::Claude,
+                    engine: ENGINE.to_string(),
                     prompt: prompt.to_string(),
                     parent_session_id: None,
                     from: None,
@@ -301,7 +345,7 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
         &store,
         "key_again",
         CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "second".to_string(),
             parent_session_id: None,
             from: None,
@@ -662,7 +706,7 @@ fn bridge_resumes_the_stored_native_session() {
             source: Source::Claude,
             source_event_id: None,
             kind: EventKind::NativeSessionStarted {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 native_session_id: "native-7".to_string(),
                 transcript_path: None,
             },
@@ -719,7 +763,7 @@ fn bridge_resumes_the_stored_native_session() {
 fn observer_writes_only_on_change() {
     let store = store();
     let log: Arc<dyn EventLog> = store.clone();
-    let mut observer = Observer::new(log, Arc::new(HeuristicJudge));
+    let mut observer = Observer::new(log);
 
     store
         .append(NewEvent {
@@ -729,8 +773,7 @@ fn observer_writes_only_on_change() {
             source: Source::Bridge,
             source_event_id: None,
             kind: EventKind::ExecutionStarted {
-                engine: Engine::Claude,
-                terminal: TerminalName::new("spawn-exec_1").expect("valid"),
+                engine: ENGINE.to_string(),
                 workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"),
                 command_id: CommandId(1),
                 fork: None,
@@ -769,7 +812,7 @@ fn observer_writes_only_on_change() {
         0,
         "no change, no write"
     );
-    let mut next = Observer::new(store.clone(), Arc::new(HeuristicJudge));
+    let mut next = Observer::new(store.clone());
     next.recover().expect("recover succeeds");
     assert_eq!(
         next.tick().expect("tick succeeds"),
@@ -793,9 +836,20 @@ fn observer_writes_only_on_change() {
     assert_eq!(observer.tick().expect("tick succeeds"), 1);
     let last = events(&store).pop().expect("an event");
     match last.kind {
+        // The rules cannot settle a stopped turn and no judge is
+        // configured: their guess stands, as ambiguous, and asks for
+        // attention, as when the judge is down.
         EventKind::ObservationRecorded { observation } => {
             assert_eq!(observation.state, SemanticState::Waiting);
             assert!(observation.based_on_seq >= SessionSeq(1));
+            assert_eq!(observation.judge, NO_JUDGE);
+            assert!(observation.ambiguity.is_some());
+            assert_eq!(observation.reason, Some(WaitReason::JudgeUnavailable));
+            assert!(observation.attention);
+            assert_eq!(
+                observation.attention_reason.as_deref(),
+                Some("judge_unavailable")
+            );
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -811,7 +865,7 @@ fn lease_ttl_expires_and_takes_the_command_again() {
         session_id: session(),
         idempotency_key: IdempotencyKey::new("key_1").expect("valid key"),
         action: CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "x".to_string(),
             parent_session_id: None,
             from: None,

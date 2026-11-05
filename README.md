@@ -2,11 +2,11 @@
 
 English · [简体中文](./README.zh-CN.md)
 
-Spawn runs Claude Code and Codex CLI agents in isolated workspaces and records everything they do in one PostgreSQL event log.
+Spawn runs Claude Code agents in isolated workspaces and records everything they do in one PostgreSQL event log.
 
 - A caller submits a command (start, input, resume, stop) to a queue in PostgreSQL.
 - `spawn tick` claims the command, forks a git branch, exports it into a working tree and starts the engine in a tmux session.
-- Claude Code's transcript, Codex JSON output, the terminal screen and the engine's exit status become typed events in the log. The engine's terminal holds no database login.
+- Claude Code's transcript, the terminal screen and the engine's exit status become typed events in the log. The engine's terminal holds no database login.
 - An Observer judges each session (ready, working, blocked, failed) and writes the result back as an event.
 
 The log is the only state. Each `spawn tick` is a new process that rebuilds its view from the log, so a crash loses no state.
@@ -18,8 +18,8 @@ The log is the only state. Each `spawn tick` is a new process that rebuilds its 
 | Rust | 1.95 or later | Build |
 | PostgreSQL | 16 or later | Event log, command queue, views |
 | tmux | 3.x | Terminals |
-| git | 2.30 or later | Branches and workspaces |
-| Claude Code and/or Codex CLI | current | Engines |
+| git | 2.40 or later (`git --attr-source`, checked at start) | Branches and workspaces |
+| Claude Code | current | Engine |
 | docker | optional | Runs the engine in a container when `SPAWN_EXEC_IMAGE` is set |
 
 ## Install
@@ -53,10 +53,11 @@ Run one pass of the Bridge and the Observer:
 spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws
 ```
 
-Print the latest observation for each session:
+Print every session with its latest judgement, and one session's events:
 
 ```bash
-spawn status
+spawn fleet
+spawn tail --session session_demo
 ```
 
 Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `spawn loop` running: it ticks the Bridge and the Observer and keeps the supervisor alive. Landing and RSI run separately as `spawn integrate` (docs/fleet-architecture.md §10): it lands gated missions' work through the gate, and RSI is an objective mission whose tasks come from `rsi/backlog`.
@@ -68,18 +69,13 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `init-db` | Installs or updates the SQL schema. Safe to run again. |
 | `submit` | Writes one command to the queue. Flags: `--agent`, `--session`, `--key`, `--action`, `--principal` (default `spawn`). |
 | `tick` | Claims and runs queued commands, advances live executions, records observations. Flags: `--repo`, `--root`, `--judge-url`. |
-| `status` | Prints the latest observation for each session. |
 | `loop` | Runs the fleet until killed: Bridge, Observer, dispatcher, and (with `SPAWN_SUPERVISOR=1`) the supervisor's liveness rule. |
 | `integrate [--once] [--root <dir>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh`, lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog task. |
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
-| `dispatch [--dry-run] [--root <dir>]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. `--root` is the workspace root (default `SPAWN_WORKSPACE_ROOT`), as for `loop` and `tick`. |
-| `corpus export [--since-hours N]` | Model judgements with their evidence and outcome labels, one JSON line each. |
-| `judge --replay <file>` | Runs the current rules over a corpus: which tier decides each episode, coverage, agreement. |
 | `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
 | `mission`, `task`, `resident` | The mission layer: add, configure, close and resume missions; assign, accept and reject tasks; propose, approve and retire residents. Every command prints JSON. |
 | `task stages --id N` | A task's stages from the control stream, oldest first: `[{stage, verdict, at_ms, took_ms}]`, `took_ms` the time since the task's previous stage. `mission list` and the dashboard's missions page carry the same list on every task. |
-| `hook` | Accepts and ignores standard input. Spawn configures no hooks; it exists for engines whose settings call it. |
 | `run` | Runs the engine inside the terminal and writes its exit status to a file the Bridge reads. Spawn configures this; you do not call it. |
 | `version` | Prints `spawn <version>`. |
 
@@ -87,9 +83,9 @@ Actions for `--action`:
 
 | `type` | Fields |
 | --- | --- |
-| `start` | `engine` (`claude` or `codex`), `prompt` (Codex requires a non-empty one), optional `parent_session_id`, optional `from` (another agent of the same mission source, meaning its branch head, or a full commit id: where a new branch starts instead of `main`) |
-| `input` | `text`; Claude only |
-| `resume` | optional `prompt`; Codex requires it |
+| `start` | `prompt`, optional `engine` (`claude`, the only engine), optional `parent_session_id`, optional `from` (another agent of the same mission source, meaning its branch head, or a full commit id: where a new branch starts instead of `main`) |
+| `input` | `text` |
+| `resume` | optional `prompt` |
 | `stop` | none |
 
 Missions: `spawn mission add --text ... [--source <repo>]` (a human), then the supervisor plans
@@ -114,17 +110,17 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | required | PostgreSQL connection string |
 | `SPAWN_GIT_REPO` | required | Bare repository for agents no mission owns (the supervisor, ad hoc workers) |
-| `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick`, `loop` and `dispatch` |
+| `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick` and `loop` |
 | `SPAWN_WORKER` | `spawn-worker` | Worker name on claimed commands |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux path |
 | `SPAWN_TMUX_SOCKET` | default socket | tmux `-L` socket name |
 | `SPAWN_EXEC_IMAGE` | unset | When set, the engine and its tmux run in one container per branch |
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker path |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
-| `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI path |
-| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts, as the Bridge sees that directory |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`; with `SPAWN_EXEC_IMAGE`, `$SPAWN_EXEC_HOME/.claude/projects` | Where Claude Code writes its transcripts, as the engine sees that directory (the Bridge reads it inside the container in container mode) |
+| `SPAWN_EXEC_HOME` | `/root` | The engine's home inside the container (`docker exec` passes none of the host's `HOME` or `CLAUDE_CONFIG_DIR`) |
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
-| `SPAWN_JUDGE_URL` | unset | Jev judge service; without it a local heuristic judges |
+| `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
 | `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | Address `spawn serve` binds (`--address` overrides it) |
 | `SPAWN_SERVE_TOKEN` | unset | Token every `spawn serve` API request must carry; required off loopback |

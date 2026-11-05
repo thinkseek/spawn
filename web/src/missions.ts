@@ -3,6 +3,7 @@
 // crashing. Read-only: this module only ever issues GET requests.
 
 import { apiError, apiHeaders } from "./api";
+import type { RsiSummary } from "./api";
 
 export const TASK_STATES = [
   "assigned",
@@ -337,6 +338,91 @@ export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
   });
   if (!response.ok) throw apiError(response.status);
   return normalizeMissions(await response.json());
+}
+
+/** How a task's record shows as a step: what it moved the task to.
+ * `back`: sent back for another round; `closed`: the task ended there. */
+export interface StageStep {
+  label: string;
+  tone: "forward" | "back" | "closed";
+}
+
+export function stageStep(stage: TaskStage): StageStep {
+  switch (stage.stage) {
+    case "reviewed":
+      return stage.verdict === "accepted"
+        ? { label: "accepted", tone: "forward" }
+        : { label: "sent back", tone: "back" };
+    case "gated":
+      if (stage.verdict === "accepted") return { label: "landing", tone: "forward" };
+      return {
+        label: `gate ${stage.verdict ?? "verdict"}`,
+        tone:
+          stage.verdict === "rejected" || stage.verdict === "conflict"
+            ? "back"
+            : "forward",
+      };
+    case "aborted":
+    case "cancelled":
+      return { label: stage.stage, tone: "closed" };
+    default:
+      return { label: stage.stage, tone: "forward" };
+  }
+}
+
+/** The records a task's stepper shows. A task cancelled without a record of
+ * its own (a resident's retirement, or its mission's cancellation, cancels
+ * its open tasks) gets a closing `cancelled` step at its last update, so its
+ * last record never reads as where it got to. */
+export function shownStages(
+  task: Pick<MissionTask, "state" | "stages" | "updated_at_ms">,
+): TaskStage[] {
+  const last = task.stages[task.stages.length - 1];
+  const closed = last !== undefined && stageStep(last).tone === "closed";
+  if (task.state !== "cancelled" || closed) return task.stages;
+  const at = task.updated_at_ms;
+  return [
+    ...task.stages,
+    {
+      stage: "cancelled",
+      verdict: null,
+      at_ms: at,
+      took_ms:
+        at !== null && last?.at_ms != null ? Math.max(0, at - last.at_ms) : null,
+    },
+  ];
+}
+
+/** Whether the task's current step shows as a success: it landed, or was
+ * accepted. A cancelled task never does. */
+export function endedWell(state: TaskState): boolean {
+  return state === "landed" || state === "accepted";
+}
+
+/** States of a task in a gated mission whose worker idles while its work is
+ * judged or lands: the worker is not idle, the task is not done. */
+const AT_THE_GATE: ReadonlyArray<string> = ["accepted", "landing"];
+
+/** The sidebar's RSI line: halted first, then the state of the task in
+ * flight (accepted and landing included), else idle. */
+export function rsiPhase(
+  rsi: Pick<RsiSummary, "halted" | "open_task"> | null,
+): string | null {
+  if (!rsi) return null;
+  if (rsi.halted) return "halted";
+  return rsi.open_task?.state ?? "idle";
+}
+
+/** What a session row says instead of its engine's state, when the
+ * session's task waits for the gate or lands: `task accepted`, `task
+ * landing`. Null when the row shows the observed state. */
+export function sessionTaskLabel(
+  sessionId: string,
+  rsi: Pick<RsiSummary, "open_task"> | null,
+): string | null {
+  const task = rsi?.open_task;
+  if (!task || task.session_id !== sessionId) return null;
+  return AT_THE_GATE.includes(task.state) ? `task ${task.state}` : null;
 }
 
 /** The exact CLI command a human runs to approve a proposed resident. */

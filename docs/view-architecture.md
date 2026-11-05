@@ -14,7 +14,7 @@
 | 投影与视图 | 同上，`spawn_session_state`、`agent_*`、`spawn_read_*` | 读模型 |
 | 端口定义 | [port.rs](../crates/spawn-core/src/port.rs) | `EventLog`、`CommandQueue`、`WorkspaceStore`、`ChunkStore`、`TerminalHost` |
 | 一致性套件 | [contract.rs](../crates/spawn-core/src/contract.rs) | 四个端口（日志、队列、工作区、终端）的共用断言，内存实现与 PG 实现都跑 |
-| 查询子命令 | [inspect.rs](../crates/spawn-cli/src/commands/inspect.rs) | `status` 调 `states()` 读 `agent_state` |
+| 查询子命令 | [inspect.rs](../crates/spawn-cli/src/commands/inspect.rs) | `fleet`、`tail` 经 grant 过滤的 `spawn_read_*` 读舰队与单个会话 |
 | 门禁 | [gate.sh](../scripts/rsi/gate.sh) 与 [rsi/scenarios](../rsi/scenarios) | 构建、clippy、测试、e2e、黑盒、web |
 | 测试 | [spawn-postgres/tests/api.rs](../crates/spawn-postgres/tests/api.rs)、[spawn-core/tests/api.rs](../crates/spawn-core/tests/api.rs) | 断言落点 |
 | 事件与 SQL 口径 | [design.md 第 9 节](./design.md) | 表、函数、视图的描述 |
@@ -90,14 +90,14 @@
 
 | 方法 | 对应视图 | 用途 |
 | --- | --- | --- |
-| `states()` | `agent_state` | 全部会话当前状态，供 `spawn status` |
+| `states()` | `agent_state` | 全部会话当前状态，供 `spawn serve` 的 `/api/overview` |
 | `state(&SessionId)` | `agent_state` | 单会话当前状态 |
 | `timeline(&SessionId, after, limit)` | `agent_timeline` | keyset 分页读事件 |
 | `executions(&SessionId)` | `agent_executions` | 执行历史与时长 |
 | `open_tools(&SessionId)` | `agent_open_tools` | 未闭合工具 |
 | `freshness(&SessionId)` | `agent_freshness` | 判断是否落后 |
 
-读方法的查询走视图，错误用 `StoreError`；[spawn-postgres/tests/api.rs](../crates/spawn-postgres/tests/api.rs) 对每个方法有断言；`spawn status` 调 `states()`。
+读方法的查询走视图，错误用 `StoreError`；[spawn-postgres/tests/api.rs](../crates/spawn-postgres/tests/api.rs) 对每个方法有断言；`spawn serve` 的总览调 `states()`。
 
 出现第二个读实现（例如不经 PostgreSQL 的读存储）时，再把这些方法提成 trait。
 
@@ -138,8 +138,8 @@
 | 事件名 | `spawn_events.event_name` 生成列，取 `kind->>'name'` |
 | 序号 | `session_seq` 单会话稠密，从 1 开始；`id` 全局 |
 | 时间 | `bigint` 毫秒，统一取 `spawn_now_ms()` |
-| 来源 | `spawn_events.source` 为小写：`claude`、`codex`、`bridge`、`observer`、`gateway`、`control` |
-| 执行结束 | 以 `source = 'bridge'` 的 `execution.ended` 为准；`claude`、`codex` 来源的同名事件是退出报告 |
+| 来源 | `spawn_events.source` 为小写：`claude`、`bridge`、`observer`、`gateway`、`control`；来源是本版本不认识的名字（已删除的写入方）时，`read_global` 跳过该记录、每个名字警告一次并继续往后读，时间线照原样显示 |
+| 执行结束 | 以 `source = 'bridge'` 的 `execution.ended` 为准；`claude` 来源的同名事件是退出报告 |
 | 去重 | `(session_id, source, source_event_id)` 唯一；`execution.started` 键为 `<exec>:started`，同一执行不会出现两条 |
 | 分页 | keyset，按视图排序键，不用 offset |
 | 视图角色 | 只读；写入口是 `agent_commands` 触发器与四个函数 |
