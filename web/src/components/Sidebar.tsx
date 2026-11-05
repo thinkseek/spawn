@@ -1,4 +1,4 @@
-import { Activity, LayoutGrid, Orbit, Rows3, Target } from "lucide-react";
+import { Activity, LayoutGrid, Orbit, Rows3, Target, Waypoints } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary } from "../api";
@@ -20,6 +20,7 @@ interface SidebarProps {
   onShowFleet: () => void;
   onShowMissions: () => void;
   onShowRsi: () => void;
+  onShowShow: () => void;
   onShowSessions: () => void;
   onSelect: (sessionId: string) => void;
 }
@@ -47,6 +48,7 @@ export function Sidebar({
   onShowFleet,
   onShowMissions,
   onShowRsi,
+  onShowShow,
   onSelect,
 }: SidebarProps) {
   const phase = rsiPhase(rsi);
@@ -89,6 +91,12 @@ export function Sidebar({
               </span>
             )
           }
+        />
+        <NavItem
+          active={view === "show"}
+          onClick={onShowShow}
+          icon={<Waypoints size={15} />}
+          label="Show"
         />
       </div>
 
@@ -226,6 +234,7 @@ export function MobileNav({
   onShowFleet,
   onShowMissions,
   onShowRsi,
+  onShowShow,
   onShowSessions,
 }: Pick<
   SidebarProps,
@@ -234,6 +243,7 @@ export function MobileNav({
   | "onShowFleet"
   | "onShowMissions"
   | "onShowRsi"
+  | "onShowShow"
   | "onShowSessions"
 >) {
   return (
@@ -245,6 +255,7 @@ export function MobileNav({
             ["fleet", "Fleet", <LayoutGrid key="f" size={13} />, onShowFleet],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
+            ["show", "Show", <Waypoints key="w" size={13} />, onShowShow],
             ["sessions", "Sessions", <Rows3 key="s" size={13} />, onShowSessions],
           ] as const
         ).map(([id, label, icon, onClick]) => (
