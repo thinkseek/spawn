@@ -666,14 +666,12 @@ impl PostgresStore {
         self.query_json(DELIVERY_TASKS, &[])
     }
 
-    /// Missions, reports, approvals and human messages for the digest.
-/// What the dispatcher measures stalls from ([`STALL_FACTS`]).
+    /// What the dispatcher measures stalls from ([`STALL_FACTS`]).
     pub fn stall_facts(&self) -> Result<Value, StoreError> {
         self.query_json(STALL_FACTS, &[])
     }
 
-    /// What the supervisor should hear about besides worker states
-    /// ([`MISSION_NEWS`]).
+    /// Missions, reports, approvals and human messages for the digest.
     pub fn mission_news(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_NEWS, &[])
     }
