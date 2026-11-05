@@ -11,6 +11,8 @@ use spawn_core::port::StoreError;
 use crate::PostgresStore;
 
 /// One task the dispatcher has to look at, with what it needs to deliver it.
+/// A closed ephemeral task stays for a day, and for as long as its worker
+/// still runs: its worker is stopped, and it is managed until then.
 pub(crate) const DELIVERY_TASKS: &str = r"
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
@@ -25,12 +27,29 @@ from (
    where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
       or (k.state = 'accepted' and m.gate is not null)
       or (k.state in ('accepted', 'cancelled', 'landed') and k.kind = 'ephemeral'
-          and k.updated_at_ms > spawn_now_ms() - 86400000)
+          and (k.updated_at_ms > spawn_now_ms() - 86400000
+               or exists (select 1 from agent_status s
+                           where s.session_id = k.session_id and s.live)))
 ) t";
 
 /// What the supervisor should hear about, beyond worker states: open
-/// missions, reports, residents approved, and human messages to workers.
+/// missions, reports it reviews (not those of a mission its gate alone
+/// accepts: the gate judges them, and `spawn_task_review` refuses them; a
+/// report carries its `revisions`, which the review names), residents
+/// approved, and human commands to workers, once finished, with their
+/// outcome. An approval or a human command stays news until a digest that
+/// carried it reached the supervisor (its tag,
+/// [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `told`), however long
+/// that takes; the dispatcher filters what was told by the same tags.
 pub(crate) const MISSION_NEWS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
                  'id', m.id, 'text', left(m.text, 400), 'origin', m.origin) order by m.id)
@@ -39,19 +58,26 @@ select jsonb_build_object(
                  'id', k.id, 'mission_id', k.mission_id, 'kind', k.kind,
                  'session_id', k.session_id, 'revisions', k.revisions,
                  'report', left(k.report, 600)) order by k.id)
-               from mission_tasks k where k.state = 'reported'), '[]'::jsonb),
+               from mission_tasks k join mission_missions m on m.id = k.mission_id
+              where k.state = 'reported'
+                and not (m.gate is not null and m.accept = 'gate')), '[]'::jsonb),
   'approved', coalesce((select jsonb_agg(jsonb_build_object('name', r.name) order by r.name)
                from mission_residents r
               where r.state = 'approved'
-                and r.updated_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb),
+                and not exists (select 1 from told
+                                 where tag = r.session_id || ' approved-' || r.name)), '[]'::jsonb),
   'human', coalesce((select jsonb_agg(jsonb_build_object(
                  'command_id', c.id, 'session_id', c.session_id,
-                 'text', left(coalesce(c.action ->> 'text', c.action ->> 'prompt', c.action ->> 'type'), 200))
+                 'action', c.action ->> 'type',
+                 'text', left(coalesce(c.action ->> 'text', c.action ->> 'prompt', c.action ->> 'type'), 200),
+                 'succeeded', c.succeeded, 'error', left(c.error, 300))
                  order by c.id)
                from spawn_commands c
               where c.principal = 'human'
                 and (c.agent_id like 'agent\_worker\_%' or c.agent_id like 'agent\_resident\_%')
-                and c.created_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb)
+                and c.state = 'finished'
+                and not exists (select 1 from told
+                                 where tag = c.session_id || ' human-' || c.id)), '[]'::jsonb)
 )";
 
 /// The board of missions with their tasks, newest first; each task carries
@@ -122,7 +148,8 @@ from (
                'id', k.id, 'agent_id', k.agent_id,
                'session_id', k.session_id, 'state', k.state, 'base', k.base,
                'candidate', k.candidate, 'scenario', k.scenario,
-               'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective)
+               'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
+               'revisions', k.revisions)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -248,6 +275,19 @@ pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
                    from mission_tasks k join mission_missions m on m.id = k.mission_id
                   where k.agent_id = $1
                   order by k.id limit 1";
+
+/// Agents with a task still open (not cancelled, not landed) and the
+/// source their workspace comes from, by [`AGENT_SOURCE`]'s rule (the
+/// agent's first task decides): the branches a restarted Bridge publishes
+/// again, since its pusher's queue lived in memory.
+pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
+                        (select m.sources ->> 0
+                           from mission_tasks k join mission_missions m on m.id = k.mission_id
+                          where k.agent_id = a.agent_id
+                          order by k.id limit 1)
+                   from (select distinct agent_id from mission_tasks
+                          where state not in ('cancelled', 'landed')) a
+                  order by a.agent_id";
 
 // Delivery bookkeeping, run by the dispatcher as the owner.
 
@@ -430,11 +470,18 @@ impl PostgresStore {
         Ok(row.get(0))
     }
 
-    /// Accept a report, or send the task back with a note.
-    pub fn task_review(&self, task: i64, accept: bool, note: &str) -> Result<(), StoreError> {
+    /// Accept a report, or send the task back with a note. `revision` names
+    /// the revision of the report the reviewer read; `None`, the current one.
+    pub fn task_review(
+        &self,
+        task: i64,
+        accept: bool,
+        note: &str,
+        revision: Option<i32>,
+    ) -> Result<(), StoreError> {
         self.execute(
-            "select spawn_task_review($1, $2, $3)",
-            &[&task, &accept, &note],
+            "select spawn_task_review($1, $2, $3, $4)",
+            &[&task, &accept, &note, &revision],
         )?;
         Ok(())
     }
@@ -530,6 +577,16 @@ impl PostgresStore {
     pub fn agent_source(&self, agent: &str) -> Result<Option<Option<String>>, StoreError> {
         let rows = self.query(AGENT_SOURCE, &[&agent])?;
         Ok(rows.first().map(|row| row.get::<_, Option<String>>(0)))
+    }
+
+    /// Agents with an open task, each with its workspace's source (`None`
+    /// for a mission without one), as [`Self::agent_source`] decides it.
+    pub fn publishing_agents(&self) -> Result<Vec<(String, Option<String>)>, StoreError> {
+        Ok(self
+            .query(PUBLISHING_AGENTS, &[])?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 }
 

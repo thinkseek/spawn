@@ -1518,6 +1518,440 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
     );
 }
 
+/// A delivery refused before anything was typed (a pane not ready) is not
+/// the worker's last delivery, nor an episode: it told the worker nothing.
+/// One that may have typed is, and so is one not finished yet.
+#[test]
+fn a_delivery_that_never_reached_the_worker_is_not_its_last() {
+    let (store, _schema) = store("facts_unreached");
+    let worker = AgentId::new("agent_resident_core").expect("valid agent");
+    let session = SessionId::new("session_resident_core").expect("valid session");
+    store
+        .append(NewEvent {
+            agent_id: worker.clone(),
+            session_id: session.clone(),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    // Submit `key` as the dispatcher and finish it with `outcome` (none:
+    // left open).
+    let deliver = |key: &str, outcome: Option<Outcome>| {
+        let submission = Submission {
+            agent_id: worker.clone(),
+            idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+            action: CommandAction::Input {
+                text: key.to_string(),
+                tags: Vec::new(),
+            },
+            ..start(session.clone(), key)
+        };
+        let id = store
+            .submit(
+                &Principal::new("spawn-dispatch").expect("valid principal"),
+                &submission,
+            )
+            .expect("submit succeeds");
+        if let Some(outcome) = outcome {
+            let claimed = store
+                .claim("w1", Duration::from_mins(1))
+                .expect("claim succeeds")
+                .expect("the command waits");
+            assert_eq!(claimed.command_id, id, "{key} is the one waiting");
+            store.finish(&claimed, &outcome).expect("finish succeeds");
+        }
+        i64::try_from(id.0).expect("small id")
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    let reached = deliver("deliver-24-0", Some(Outcome::Succeeded));
+    deliver(
+        "deliver-25-0",
+        Some(Outcome::Failed(
+            "pane state Busy does not accept input".to_string(),
+        )),
+    );
+    let facts = row();
+    assert_eq!(
+        facts["last_delivery"].as_str(),
+        Some("deliver-24-0"),
+        "the refused delivery of task 25 is not the worker's"
+    );
+    assert_eq!(facts["episode"].as_i64(), Some(reached), "nor an episode");
+    assert!(
+        facts["dispatched"]
+            .as_array()
+            .expect("dispatched")
+            .iter()
+            .any(|sent| sent["key"] == "deliver-25-0" && sent["succeeded"] == false),
+        "the refusal stays among the attempts, for the retry"
+    );
+    deliver(
+        "deliver-25-0-retry-1",
+        Some(Outcome::Failed(format!(
+            "the text {}",
+            spawn_core::bridge::MAY_HAVE_TYPED
+        ))),
+    );
+    assert_eq!(
+        row()["last_delivery"].as_str(),
+        Some("deliver-25-0-retry-1"),
+        "one that may have typed may have reached the worker"
+    );
+    let open = deliver("deliver-26-0", None);
+    let facts = row();
+    assert_eq!(
+        facts["last_delivery"].as_str(),
+        Some("deliver-26-0"),
+        "in flight"
+    );
+    assert_eq!(facts["episode"].as_i64(), Some(open));
+}
+
+/// A worker's session with a command helper: `send(principal, key,
+/// action, outcome)` submits and, given an outcome, claims and finishes it.
+struct Worker<'a> {
+    store: &'a spawn_postgres::PostgresStore,
+    agent: AgentId,
+    session: SessionId,
+}
+
+impl Worker<'_> {
+    fn send(
+        &self,
+        principal: &str,
+        key: &str,
+        action: CommandAction,
+        outcome: Option<Outcome>,
+    ) -> i64 {
+        let submission = Submission {
+            agent_id: self.agent.clone(),
+            session_id: self.session.clone(),
+            idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+            action,
+        };
+        let id = self
+            .store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &submission,
+            )
+            .expect("submit succeeds");
+        if let Some(outcome) = outcome {
+            let claimed = self
+                .store
+                .claim("w1", Duration::from_mins(1))
+                .expect("claim succeeds")
+                .expect("the command waits");
+            assert_eq!(claimed.command_id, id, "{key} is the one waiting");
+            self.store
+                .finish(&claimed, &outcome)
+                .expect("finish succeeds");
+        }
+        i64::try_from(id.0).expect("small id")
+    }
+
+    fn input(&self, principal: &str, key: &str, outcome: Option<Outcome>) -> i64 {
+        let action = CommandAction::Input {
+            text: key.to_string(),
+            tags: Vec::new(),
+        };
+        self.send(principal, key, action, outcome)
+    }
+
+    fn event(&self, execution: &str, key: &str, kind: EventKind) {
+        self.store
+            .append(NewEvent {
+                agent_id: self.agent.clone(),
+                session_id: self.session.clone(),
+                execution_id: Some(ExecutionId::new(execution).expect("valid execution")),
+                source: Source::Bridge,
+                source_event_id: Some(key.to_string()),
+                kind,
+            })
+            .expect("append succeeds");
+    }
+
+    fn started(&self, execution: &str, command: i64) {
+        self.event(
+            execution,
+            &format!("{execution}:started"),
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                command_id: CommandId(u64::try_from(command).expect("positive")),
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        );
+    }
+
+    fn ended(&self, execution: &str) {
+        self.event(
+            execution,
+            &format!("{execution}:ended"),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Stopped,
+                exit_code: None,
+            },
+        );
+    }
+}
+
+/// Audit #2 and #3: every Stop and Discard sent during the live execution,
+/// by anyone, is a fact with its outcome, read from the command queue (so
+/// the dispatcher's pursuit of a failed one survives any restart); one from
+/// before the execution started, or of an execution that ended, is not.
+#[test]
+fn dispatch_facts_list_the_stops_of_the_live_execution() {
+    let (store, _schema) = store("facts_stops");
+    let worker = Worker {
+        store: &store,
+        agent: AgentId::new("agent_worker_a").expect("valid agent"),
+        session: SessionId::new("session_worker_a").expect("valid session"),
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    worker.send(
+        "human",
+        "old-stop",
+        CommandAction::Stop,
+        Some(Outcome::Succeeded),
+    );
+    let start = worker.send(
+        "spawn-dispatch",
+        "deliver-4-0",
+        start(worker.session.clone(), "deliver-4-0").action,
+        Some(Outcome::Succeeded),
+    );
+    worker.started("exec_1", start);
+    assert_eq!(row()["stops"], serde_json::json!([]));
+    let switch = worker.send(
+        "spawn-dispatch",
+        "switch-model-4-0",
+        CommandAction::Stop,
+        Some(Outcome::Failed("kill-session refused".to_string())),
+    );
+    worker.input("human", "hello", Some(Outcome::Succeeded));
+    let discard = worker.send(
+        "spawn-integrate",
+        "integrate-abort-4",
+        CommandAction::Discard,
+        None,
+    );
+    let stops = row()["stops"].clone();
+    let listed: Vec<(i64, &str, &str, &str)> = stops
+        .as_array()
+        .expect("stops")
+        .iter()
+        .map(|stop| {
+            (
+                stop["id"].as_i64().expect("id"),
+                stop["key"].as_str().expect("key"),
+                stop["principal"].as_str().expect("principal"),
+                stop["action"].as_str().expect("action"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (switch, "switch-model-4-0", "spawn-dispatch", "stop"),
+            (discard, "integrate-abort-4", "spawn-integrate", "discard"),
+        ]
+    );
+    assert_eq!(stops[0]["succeeded"], false);
+    assert_eq!(stops[0]["error"], "kill-session refused");
+    assert!(stops[0]["finished_at_ms"].is_i64());
+    assert!(stops[1]["succeeded"].is_null(), "in flight");
+    worker.ended("exec_1");
+    assert_eq!(row()["stops"], serde_json::json!([]), "nothing is live");
+}
+
+/// Audit #16: what a decision rests on is kept however old: the nudges of
+/// the current episode and the resume of the current execution. Out of the
+/// day's window they read as "not sent", and the dispatcher would plan them
+/// again (deduplicated to nothing) instead of escalating.
+#[test]
+fn dispatch_facts_keep_the_current_episodes_nudges_however_old() {
+    let (store, schema) = store("facts_window");
+    let worker = Worker {
+        store: &store,
+        agent: AgentId::new("agent_worker_a").expect("valid agent"),
+        session: SessionId::new("session_worker_a").expect("valid session"),
+    };
+    let start = worker.send(
+        "human",
+        "start",
+        start(worker.session.clone(), "start").action,
+        Some(Outcome::Succeeded),
+    );
+    worker.started("exec_1", start);
+    let episode = worker.input("human", "go on", Some(Outcome::Succeeded));
+    for key in [
+        format!("dispatch-nudge-session_worker_a-{episode}"),
+        format!("dispatch-nudge-session_worker_a-{episode}-retry-1"),
+        format!("dispatch-nudge-session_worker_a-{episode}0"),
+        "dispatch-nudge-session_worker_a-1".to_string(),
+        "dispatch-resume-exec_1".to_string(),
+        "dispatch-resume-exec_0".to_string(),
+    ] {
+        worker.input("spawn-dispatch", &key, Some(Outcome::Succeeded));
+    }
+    admin(&schema)
+        .execute(
+            "update spawn_commands set created_at_ms = created_at_ms - 2 * 86400000",
+            &[],
+        )
+        .expect("age the commands");
+    let facts = store.dispatch_facts().expect("facts")[0].clone();
+    assert_eq!(facts["episode"].as_i64(), Some(episode));
+    let kept: Vec<&str> = facts["dispatched"]
+        .as_array()
+        .expect("dispatched")
+        .iter()
+        .filter_map(|sent| sent["key"].as_str())
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            format!("dispatch-nudge-session_worker_a-{episode}").as_str(),
+            &format!("dispatch-nudge-session_worker_a-{episode}-retry-1"),
+            "dispatch-resume-exec_1",
+        ]
+    );
+}
+
+/// Audit #16: a closed ephemeral task stays among the delivery rows for as
+/// long as its worker runs, not only for a day: until then its worker is
+/// stopped (and its stop pursued), and its session stays managed.
+#[test]
+fn a_closed_ephemeral_task_stays_a_delivery_row_while_its_worker_runs() {
+    let (store, schema) = store("rows_live");
+    let mission = store
+        .mission_add("One", &serde_json::json!([]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_cancel(task).expect("cancel");
+    let worker = Worker {
+        store: &store,
+        agent: AgentId::new(format!("agent_worker_w_{task}")).expect("valid agent"),
+        session: SessionId::new(format!("session_worker_w_{task}")).expect("valid session"),
+    };
+    let start = worker.send(
+        "spawn-dispatch",
+        &format!("deliver-{task}-0"),
+        start(worker.session.clone(), "s").action,
+        Some(Outcome::Succeeded),
+    );
+    worker.started("exec_1", start);
+    admin(&schema)
+        .execute(
+            "update mission_tasks set updated_at_ms = updated_at_ms - 2 * 86400000",
+            &[],
+        )
+        .expect("age the task");
+    let rows = || -> Vec<i64> {
+        store
+            .delivery_rows()
+            .expect("rows")
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter_map(|row| row["id"].as_i64())
+            .collect()
+    };
+    assert_eq!(rows(), [task], "its worker still runs");
+    worker.ended("exec_1");
+    assert!(rows().is_empty(), "stopped, and closed for more than a day");
+}
+
+/// Audit #9 and #16: a human command is news once it finished, with its
+/// outcome, and stays news (as an approval does) until a digest that
+/// carried it reached the supervisor, however long that takes.
+#[test]
+fn mission_news_reports_human_commands_with_their_outcome_until_told() {
+    let (store, schema) = store("news_told");
+    let worker = Worker {
+        store: &store,
+        agent: AgentId::new("agent_worker_a").expect("valid agent"),
+        session: SessionId::new("session_worker_a").expect("valid session"),
+    };
+    let supervisor = Worker {
+        store: &store,
+        agent: AgentId::new("agent_supervisor").expect("valid agent"),
+        session: SessionId::new("session_supervisor").expect("valid session"),
+    };
+    let human = || store.mission_news().expect("news")["human"].clone();
+    let refused = worker.input("human", "use eu", None);
+    assert_eq!(human(), serde_json::json!([]), "not finished yet");
+    let claimed = store
+        .claim("w1", Duration::from_mins(1))
+        .expect("claim")
+        .expect("waits");
+    store
+        .finish(
+            &claimed,
+            &Outcome::Failed("pane state Busy does not accept input".to_string()),
+        )
+        .expect("finish");
+    let said = worker.input("human", "use us", Some(Outcome::Succeeded));
+    store.resident_propose("core", "Owns it").expect("propose");
+    store.resident_approve("core").expect("approve");
+    let mut admin = admin(&schema);
+    admin
+        .batch_execute(
+            "update spawn_commands set created_at_ms = created_at_ms - 2 * 86400000;
+             update mission_residents set updated_at_ms = updated_at_ms - 2 * 86400000",
+        )
+        .expect("age everything");
+    let news = human();
+    assert_eq!(news[0]["command_id"].as_i64(), Some(refused));
+    assert_eq!(news[0]["succeeded"], false);
+    assert_eq!(news[0]["action"], "input");
+    assert_eq!(news[0]["error"], "pane state Busy does not accept input");
+    assert_eq!(news[1]["command_id"].as_i64(), Some(said));
+    assert_eq!(news[1]["succeeded"], true);
+    assert_eq!(
+        store.mission_news().expect("news")["approved"],
+        serde_json::json!([{"name": "core"}]),
+        "an approval two days old not told yet"
+    );
+    // A digest that carried the refusal and the approval reached the
+    // supervisor; one that failed told nothing.
+    let digest = |key: &str, tags: Vec<String>, outcome: Outcome| {
+        supervisor.send(
+            "spawn-dispatch",
+            key,
+            CommandAction::Input {
+                text: "digest".to_string(),
+                tags,
+            },
+            Some(outcome),
+        );
+    };
+    digest(
+        "digest-1",
+        vec![format!("session_worker_a human-{said}")],
+        Outcome::Failed("pane state Busy does not accept input".to_string()),
+    );
+    digest(
+        "digest-2",
+        vec![
+            format!("session_worker_a human-{refused}"),
+            "session_resident_core approved-core".to_string(),
+        ],
+        Outcome::Succeeded,
+    );
+    let news = human();
+    assert_eq!(news.as_array().map(Vec::len), Some(1), "{news}");
+    assert_eq!(news[0]["command_id"].as_i64(), Some(said));
+    assert_eq!(
+        store.mission_news().expect("news")["approved"],
+        serde_json::json!([])
+    );
+}
+
 #[test]
 fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
     let (store, _schema) = store("facts_model");

@@ -1,6 +1,10 @@
 //! `tick` and `loop`: one pass, and the resident loop. Landing and RSI
 //! objectives run in `spawn integrate` (crate::integrate).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use spawn_postgres::PostgresStore;
 
 use crate::Flags;
@@ -36,12 +40,38 @@ pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
     Ok(0)
 }
 
+/// A flag SIGTERM and SIGINT set instead of killing the process: the loop
+/// ends after its pass, and dropping the Bridge makes the pushes still
+/// queued in memory (`MissionWorkspaces`' drop flushes its pusher). Without
+/// it a deploy's restart lost them (causality audit #4).
+fn stop_on_signal() -> Result<Arc<AtomicBool>, String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(signal, Arc::clone(&stop))
+            .map_err(|error| format!("handle signal {signal}: {error}"))?;
+    }
+    Ok(stop)
+}
+
+/// Sleep for `pause`, or less once `stop` is set. True when it is.
+fn pause_unless_stopped(pause: Duration, stop: &AtomicBool) -> bool {
+    let until = std::time::Instant::now() + pause;
+    while !stop.load(Ordering::SeqCst) {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+    true
+}
+
 /// Consecutive failed passes after which the loop exits, so its unit
 /// restarts it with fresh connections (the store does not reconnect).
 const MAX_FAILURES: u32 = 10;
 
 /// Run the Bridge, the Observer, the disk watch, the dispatcher and the
-/// liveness rule.
+/// liveness rule, until SIGTERM or SIGINT ends it after its pass.
 ///
 /// The loop holds its connections and one in-memory cursor, so its cost does
 /// not grow with the event log. A failed pass is logged and retried with a
@@ -49,6 +79,7 @@ const MAX_FAILURES: u32 = 10;
 /// [`MAX_FAILURES`] failed passes in a row the loop exits with an error and
 /// systemd starts it again.
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
+    let stopping = stop_on_signal()?;
     let interval = loop_interval();
     let (mut bridge, mut observer) = runtime(flags)?;
     let supervised = supervised();
@@ -128,15 +159,32 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         }
         // ponytail: fixed backoff, cap at 30 intervals. A per-error-kind
         // schedule only matters once a failure class is slow to clear.
-        std::thread::sleep(backoff(interval, failures));
+        if pause_unless_stopped(backoff(interval, failures), &stopping) {
+            eprintln!("spawn loop: stopping; pending pushes are made first");
+            return Ok(0);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    use super::backoff;
+    use super::{backoff, pause_unless_stopped, stop_on_signal};
+
+    /// A deploy's SIGTERM ends the loop's pause instead of the process, so
+    /// the loop returns and its pending pushes are made.
+    #[test]
+    fn sigterm_ends_the_pause_not_the_process() {
+        let stop = stop_on_signal().expect("handlers");
+        let started = Instant::now();
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).expect("raise");
+        assert!(pause_unless_stopped(Duration::from_secs(30), &stop));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        stop.store(false, Ordering::SeqCst);
+        assert!(!pause_unless_stopped(Duration::from_millis(10), &stop));
+    }
 
     #[test]
     fn backoff_waits_one_interval_per_failure_between_one_and_thirty() {

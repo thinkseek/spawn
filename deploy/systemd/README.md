@@ -15,7 +15,11 @@ The units this host runs, with `%h` for the home directory.
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
 server alive. That only works because `ExecStart` is `spawn loop` itself: with
 a wrapper script as the main process, systemd would kill the wrapper and leave
-the old loop running beside the new one.
+the old loop running beside the new one. SIGTERM (a stop or a deploy's
+restart) ends `spawn loop` after its current pass, once the branch pushes
+still queued in its memory are made; `TimeoutStopSec` leaves room for that.
+A loop killed outright loses none either: the next one publishes again the
+branch of every agent with an open task.
 
 Install: copy to `~/.config/systemd/user/`, then
 `systemctl --user daemon-reload && systemctl --user enable --now spawn-loop spawn-integrate spawn-serve spawn-jev-relay spawn-model-relay`.

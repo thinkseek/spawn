@@ -71,13 +71,13 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行） | error |
-| `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
+| `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main` 或启动的 `from`，跨主机删除之前的旧记录里还可能是 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code |
 | `execution.unmounting` | Bridge（结束流程过了最后一次 checkpoint 与 terminate、卸载之前；键 `<exec>:unmounting`） | — |
 | `command.step` | Bridge（命令处理的一步，键 `cmd_<id>:<step>`） | command_id、step（`mounted`、`mount_released`、`typing`、`typed`）、workspace（`mounted`/`mount_released` 带） |
 | `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
-| `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
-| `merge.conflicted` | Bridge（启动或恢复时合入 `main` 冲突） | files、marked（现在总是 false；为 true 的只在主线合入运行中工作区时写下的旧记录里） |
+| `artifact.committed` | Bridge；`spawn-cli` 的 `main_merge.rs`（集成器的冲突裁决与投递前把 `main` 合入闲置工作区，source 记为 bridge） | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
+| `merge.conflicted` | Bridge（启动或恢复时合入 `main` 冲突，marked 为 false：分支不动）；`main_merge.rs`（把 `main` 合入闲置工作区冲突，内容冲突处写下冲突标记时 marked 为 true） | files、marked |
 | `command.accepted` | Gateway 事务 | command_id |
 | `command.finished` | Worker | command_id、succeeded、error |
 | `screen.observed` | Bridge | state、evidence |
@@ -141,13 +141,13 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
-checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
+checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。commit 失败（`Unavailable`、`Refused`）时告警，这次 checkpoint 仍然待做，下一个 tick 重试，直到提交成功（或得到 `Unchanged`）；闲着的 worker 不会再产生新的 checkpoint 事件，清掉它就等于丢掉这一轮的工作。
 
-合入基线：只在执行启动或恢复时、挂载之前，Bridge 调用 `merge_main_clean`：`main` 能干净合入时分支按比较交换移到合并提交，写 `artifact.committed`（reason `base_merged`，带改动的 `files`）；有任何冲突时分支不动，执行照常在原分支上启动，写一次 `merge.conflicted{files, marked: false}`（键由分支头与文件决定，重试的启动只记一次），并在 tick 报告里告警。运行中的执行从不被合入，也不再给 agent 键入合并通知。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载。
+合入基线：只在执行启动或恢复时、挂载之前，Bridge 调用 `merge_main_clean`：`main` 能干净合入时分支按比较交换移到合并提交，写 `artifact.committed`（reason `base_merged`，带改动的 `files`）；有任何冲突时分支不动，执行照常在原分支上启动，写一次 `merge.conflicted{files, marked: false}`（键由分支头与文件决定，重试的启动只记一次），并在 tick 报告里告警。Bridge 从不合入运行中的执行；闲置在提示符的工作区由 `main_merge.rs` 在集成器的冲突裁决和投递任务之前合入，投递的任务文本说明合并做了什么（storage.md，“Main into a workspace”）。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载。
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 之后、`unmount` 之前写 `execution.unmounting`；恢复出的结束若已有这条记录，就跳过 checkpoint，只再 terminate、unmount（工作区不在不算失败）并写 `execution.ended`。
 
-命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在则失败（下个 tick 按 `Lost` 结束），提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次）。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
+命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在则失败（下个 tick 按 `Lost` 结束），提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败（提示词可能已到引擎，所以不按 discard 结束：最后一次 checkpoint 失败时工作区不卸载，结束像 `Stop` 一样留待下个 tick 重试；键入失败时同理，只有日志表明从未开始键入的启动才按 discard 卸载）；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次）。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
 
 结束的三个来源：
 
@@ -157,7 +157,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 | `spawn run` | 引擎退出，runner 把退出码写进 `SPAWN_EXIT_FILE`，Bridge 下一个 tick 读到后走结束流程 | `Exited`，带退出码 |
 | tick 发现终端不在 | 进程崩溃或终端被外部杀掉 | `Lost` |
 
-折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行；其他来源的同名事件只是退出报告（`agent_executions.exit_reported`）。
+折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行。其他来源的同名事件只是退出报告（`agent_executions.exit_reported`），现在已无人写：runner 把退出码写进 `SPAWN_EXIT_FILE`，所以只有那之前的旧执行可能为真。
 
 每会话一个活跃执行由日志保证，不只靠 Bridge 的内存：`Start`/`Resume` 先追上日志再查内存，日志的追加再查一次（`spawn_append_trusted`，内存实现同样）：会话最近一次执行还没有 Bridge 写的结束时拒绝 `execution.started`。被拒的启动以日志给的原因失败，卸载自己刚挂的工作区（那正是另一个执行的工作区时不卸载），不启动终端。runner 的退出报告不算结束；丢失的执行由下一个 tick 写 `execution.ended`（cause `lost`）后，会话即可再启动或恢复。
 
@@ -261,7 +261,7 @@ Observer 每次 tick：
 
 投影：`spawn_session_state` 每会话一行（最后序号、最后 id、事件数、最新 observation），由 `spawn_append` 在同一事务内更新，`session_seq` 守卫：行恰好落后一个事件时步进，否则从日志重折；迁移持 append 锁重折不一致的会话。会话归属取首个事件的 agent。
 
-视图：`agent_state`（读投影，每会话最新 observation，带 `event_id`）、`agent_status`（判定加最近一次执行，`live` 标记未结束）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`（带 `prompt`）、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记 runner 已报告退出，带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。不用物化视图与 CDC：状态类视图读投影表，其余视图读时折叠。
+视图：`agent_state`（读投影，每会话最新 observation，带 `event_id`）、`agent_status`（判定加最近一次执行，`live` 标记未结束）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`（带 `prompt`）、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记旧 runner 以事件报告过退出（现在不再写，新执行总为假），带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。不用物化视图与 CDC：状态类视图读投影表，其余视图读时折叠。
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
 
@@ -284,7 +284,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | --- | --- |
 | `ensure_branch` | 无 `refs/heads/main` 时用 `mktree` + `commit-tree` 建根提交；分支已存在返回 `Existing`；否则把 `from`（`refs/heads/<agent>` 或完整 commit id，`rev-parse --verify <x>^{commit}`）或 `main` 解析成 commit，`update-ref refs/heads/<b> <commit> ""`（只建不改） |
 | `mount` | 分支头的提交说明带 `Spawn-Large` trailer（旧版本把大文件放在块存储里，本版本没有块存储）时拒绝（`FilesOutsideGit`）；否则 `git archive refs/heads/<b> \| tar -x -C <dir>`，先解到 `<root>/.mount/` 再改名换上 |
-| `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A`（超过 `SPAWN_MAX_FILE_MB` 的文件排除在外、不哈希，`main` 里已有的 blob 除外）→ `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref`。被排除的文件记在 `<root>/.oversized/<b>`，`take_notices` 每个只交出一次，Bridge 记进日志并放在下一个 prompt 前 |
+| `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A`（超过 `SPAWN_MAX_FILE_MB` 的文件排除在外、不哈希，`main` 里已有的 blob 除外）→ `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref`。被排除的文件记在 `<root>/.oversized/<b>`，`notices` 只读出尚未告知的（不改记录），Bridge 记进日志并放在下一个 prompt 前，这次键入记下 `typed` 之后才用 `notices_told` 标为已告知；记录在磁盘上，Bridge 重启不丢（至多告知两次） |
 | `unmount` | 删工作树目录 |
 | `merge_base` | `main` 是分支头的祖先则 `Current`；否则 `git --attr-source=<main> merge-tree --write-tree --name-only -z <main> <head>`（合并规则取自 `main` 的 `.gitattributes`，只有 gate 能动它；裸仓库不加 `--attr-source` 不读树内属性）。退出码 1 为 `Conflicted`：消息种类（`-z` 输出里的稳定字符串）只有 `CONFLICT (contents)` 时，按下述同一安全流程把带冲突标记的合并树写进目录，分支不动，`main` 作为待定的第二父提交原子地写进 `<root>/.merge/<b>`（`main` 与冲突路径，NUL 分隔）；有别的冲突种类（modify/delete、改名、二进制）时什么都不改。待定合并存在时不合并更晚的 `main`：标记未解决返回 `Conflicted{marked: true}`，已解决返回 `Current`。`merge_base` 全程持有与 `commit` 相同的 `<index>.spawn-lock`；`mount`、`unmount` 只在分支已带着标记（合并写入后又有 checkpoint）时保留待定文件，否则删掉。`commit` 在待定合并列出的冲突文件里都没有完整的标记块（行首 `<<<<<<< `，其后一行恰为 `=======`，再其后行首 `>>>>>>> `；单独的 `=======` 不算）时以 `-p <head> -p <待定 main>` 提交（树未变也提交）并删掉待定文件，否则照常单父提交；干净时先动目录：临时索引 `read-tree <head 树>`、`update-index -q --refresh`、`read-tree -m -u <head 树> <合并树>`（目录里要改的文件与分支不符、或未跟踪文件挡路时拒绝，返回错误、什么都不改），再 `commit-tree -p <head> -p <main>` 和带旧值的 `update-ref`。顺序不能反：先动 ref 会让下一次 checkpoint 把旧文件提交回去，抹掉 `main` 的改动 |
 
@@ -313,7 +313,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | crate | 覆盖 |
 | --- | --- |
 | `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
-| `spawn-host` | git 分支创建、archive 导出、无变更判定、分支前移、容器前缀、tmux 精确名匹配与跨进程调用、真实 tmux 生命周期 |
+| `spawn-host` | git 分支创建、archive 导出、无变更判定、分支前移、tmux 精确名匹配与跨进程调用、真实 tmux 生命周期 |
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
 | `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（列集快照、投影等于日志折叠、状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、非 owner 直查视图被拒、有授权写入与读函数过滤、共享一致性套件 |
 
@@ -346,3 +346,23 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 大文件 | 超过 `SPAWN_MAX_FILE_MB`（默认 100）的文件不进 checkpoint，卸载即丢 | 需要时再加外部存储（见 [storage.md](./storage.md)） |
 | tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 | `paste-buffer` |
 | mount 泄漏 | mount 与 `execution.started` 之间崩溃会遗留一个 mount | 启动时清扫未记录的 mount |
+
+## 14. 跨循环的因果不变式
+
+Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`integrate.rs`）与 supervisor 各自按节拍运行，只经同一个 PostgreSQL 日志协作。它们之间只有一条规则：
+
+**一个循环不凭时间、缺席或“最新状态”推断另一个循环的进度；它只依据一条写明自己覆盖了什么的记录行动（一个 commit、一个会话位置、一个命令 id）。每个副作用（命令、合并、checkpoint、投递、停止、推送）都有自己记下的结果，消费方检查结果：打算做不等于做了。**
+
+违反它的五种形状，以及审计（2026-11-05，`REPORT.md` 在分支 `causality-audit`）找到的例子：
+
+| 形状 | 例子 |
+| --- | --- |
+| 打算当作做了 | `last_delivery` 把失败的投递算作工人收到的最后一个任务，挡住它自己的重试；失败的 `continue` 被当成“催了也没用”；取消的任务，工人从未被告知；集成器的预算中止只提交 Stop 不看结果；推送意图只在进程内存里，进程重启即丢，集成器之后一直判 `stale` |
+| 最新状态当作另一件事的证据 | 报告在它那一轮的 checkpoint 之前被收取，于是对着更早的 commit 判成“没有改动”；门禁结论落到任务当前的报告上，而不是它评判的那一版；`task.landed` 不看 `from` 就移动其他任务的基线；镜像拉取失败时把旧的 `main` 当成源的 `main` |
+| 缺席当作状态 | Observer 只在结论变化时写，后来的事实让调度器没有当前判定；超限文件提示在打进任何提示词之前就记成“已告知” |
+| 循环之间假设先后 | 所有者推送与它的 `mission moved` 之间跑了一趟集成器，误判停摆；落地推送成功而 `task.landed` 未记时，同源的其他任务据 `main` 行动 |
+| 生产者已删，消费者还在等 | 注释承诺“轮次结束时合入 main”，而闲置自动合入早已删除（冲突死锁）；跨主机推送删掉后，远程源上带门禁的任务永远 `stale` |
+
+审计第 1、2、3、9、16、23 条已修复（分支 `audit-stops`）：失败的 Stop，不论谁发的，调度器都从命令队列读出当前执行的 Stop 及其结果，换新键重发、等待加倍，三次后升级给 supervisor（`dispatch/stops.rs`）；集成器先提交中止的 Stop 再记 `task.aborted`；没打进去的 nudge 不算催过；人发的命令完成后才算消息，失败的照实说；`done-<episode>` 看记下的 `end_cause`；`dispatched` 保留当前回合的 nudge 与当前执行的 resume，关闭的临时任务在工人仍在跑时留在投递行里，批准与人的消息直到告知为止都算消息：不再凭 24 小时窗口判断“没发过”或“不是消息”。
+
+写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。

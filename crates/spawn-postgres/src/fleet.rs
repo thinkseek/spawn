@@ -139,12 +139,24 @@ select jsonb_build_object(
 /// supervisor, with the latest judgement, the episode (latest command from
 /// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
 /// model profile of its latest execution, what the dispatcher already sent
-/// there in the last day (its deliveries, however old: a delivery is
-/// confirmed from its command), the tags of every input it delivered there
+/// there in the last day, and however old what a decision still rests on:
+/// its deliveries (a delivery is confirmed from its command), the nudges of
+/// the current episode and the resume of the current execution (an old one
+/// is not "not sent"); the tags of every input it delivered there
 /// (`told`: the escalations its digests carried, however long ago);
 /// `resumed_young` counts the executions its
 /// resumes started that died young (`died_young!`) since the session's last
-/// execution that did not.
+/// execution that did not; `stops` are the Stops and Discards anyone sent
+/// during the live execution (after the command that started it, so the
+/// Bridge ran them on it), with their outcomes: a failed one is pursued.
+///
+/// A delivery counts as the worker's (its `last_delivery`, and the episode)
+/// only when it reached the worker or may have: it succeeded, has not
+/// finished, or failed after typing may have begun (its error names `$1`,
+/// [`spawn_core::bridge::MAY_HAVE_TYPED`]). A delivery refused before
+/// anything was typed (a pane not ready, no execution, a source that did not
+/// answer) told the worker nothing: the worker's last delivery is still the
+/// one before it, and its own retry is not judged against itself.
 pub(crate) const DISPATCH_FACTS: &str = concat!(
     r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
@@ -180,7 +192,27 @@ from (
        from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and (c.created_at_ms > spawn_now_ms() - 86400000
-             or c.idempotency_key like 'deliver-%')) as dispatched,
+             or c.idempotency_key like 'deliver-%'
+             or c.idempotency_key = 'dispatch-resume-' || coalesce(s.execution_id, 'none')
+             or c.idempotency_key = 'dispatch-nudge-' || s.session_id || '-' || coalesce(ep.id, 0)
+             or starts_with(c.idempotency_key,
+                            'dispatch-nudge-' || s.session_id || '-' || coalesce(ep.id, 0)
+                            || '-retry-'))) as dispatched,
+    (select coalesce(jsonb_agg(jsonb_build_object(
+              'id', c.id,
+              'key', c.idempotency_key,
+              'principal', c.principal,
+              'action', c.action ->> 'type',
+              'created_at_ms', c.created_at_ms,
+              'finished_at_ms', c.finished_at_ms,
+              'succeeded', c.succeeded,
+              'error', c.error) order by c.id), '[]'::jsonb)
+       from spawn_commands c
+      where s.live and c.session_id = s.session_id
+        and c.action ->> 'type' in ('stop', 'discard')
+        and c.id > (select x.command_id from agent_executions x
+                     where x.session_id = s.session_id
+                       and x.execution_id = s.execution_id)) as stops,
     (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
        from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
@@ -188,6 +220,7 @@ from (
     (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'
+        and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
       order by c.id desc limit 1) as last_delivery,
     (select count(*) from agent_executions x
        join spawn_commands c on c.id = x.command_id
@@ -205,7 +238,10 @@ from (
   join spawn_session_state p using (session_id)
   left join lateral (select c.id, c.action from spawn_commands c
      where c.session_id = s.session_id
-       and (c.principal <> 'spawn-dispatch' or c.idempotency_key like 'deliver-%')
+       and (c.principal <> 'spawn-dispatch'
+            or (c.idempotency_key like 'deliver-%'
+                and (c.succeeded is distinct from false
+                     or position($1 in coalesce(c.error, '')) > 0)))
      order by c.id desc limit 1) ep on true
   where s.agent_id like 'agent\_worker\_%' or s.agent_id like 'agent\_resident\_%'
      or s.session_id = 'session_supervisor'
@@ -230,10 +266,38 @@ pub(crate) const SESSION_COMMANDS: &str =
                            from spawn_commands where session_id = $1
                           order by id desc limit $2) c";
 
+/// The files main's merges into a session's branch changed that no
+/// delivery has told the worker of yet: those of every `base_merged`
+/// `artifact.committed` recorded after the latest `typed` step of a
+/// dispatcher delivery (`deliver-%`) in the session. A delivery refused
+/// before typing told nothing, so its retry still tells them. `$1` session.
+pub(crate) const UNTOLD_MERGES: &str = "
+select coalesce(jsonb_agg(m.file order by m.file), '[]'::jsonb)
+  from (select distinct f.file
+          from spawn_events e,
+               jsonb_array_elements_text(coalesce(e.kind -> 'detail' -> 'files', '[]'::jsonb)) f(file)
+         where e.session_id = $1 and e.event_name = 'artifact.committed'
+           and e.kind -> 'detail' ->> 'reason' = 'base_merged'
+           and e.session_seq > coalesce(
+                 (select max(t.session_seq)
+                    from spawn_events t
+                    join spawn_commands c on c.id = (t.kind -> 'detail' ->> 'command_id')::bigint
+                   where t.session_id = $1 and t.event_name = 'command.step'
+                     and t.kind -> 'detail' ->> 'step' = 'typed'
+                     and c.principal = 'spawn-dispatch'
+                     and c.idempotency_key like 'deliver-%'), 0)) m";
+
 impl PostgresStore {
+    /// Files main's merges changed in `session`'s branch since the last
+    /// delivery the worker was typed ([`UNTOLD_MERGES`]).
+    pub fn untold_merges(&self, session: &str) -> Result<Vec<String>, StoreError> {
+        let files = self.query_json(UNTOLD_MERGES, &[&session])?;
+        Ok(serde_json::from_value(files).unwrap_or_default())
+    }
+
     /// Facts for the dispatcher, as JSON rows.
     pub fn dispatch_facts(&self) -> Result<Value, StoreError> {
-        self.query_json(DISPATCH_FACTS, &[])
+        self.query_json(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])
     }
 
     /// Every session with its judgement, task and activity, supervisor first.

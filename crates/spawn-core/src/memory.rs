@@ -75,6 +75,9 @@ struct State {
     workspace_calls: Vec<String>,
     /// Commits fail while set.
     commit_fails: bool,
+    /// How many of the next `submit_text` calls fail, after their text may
+    /// have reached the engine.
+    submit_failures: u32,
     /// Commits and merges answer `WorkspaceStale` while set.
     stale: bool,
     /// The next append of an `artifact.committed` event fails.
@@ -233,6 +236,12 @@ impl MemoryStore {
     /// Every terminal start so far, in order. Test helper.
     pub fn launches(&self) -> Vec<Launch> {
         self.lock().launches.clone()
+    }
+
+    /// Make the next text submitted to a terminal fail, as a send whose
+    /// keys may have gone before it broke. Test helper.
+    pub fn fail_next_submit(&self) {
+        self.lock().submit_failures = 1;
     }
 
     /// Make every commit fail (`true`) or work again. Test helper.
@@ -619,6 +628,13 @@ impl WorkspaceStore for MemoryStore {
         }
     }
 
+    /// The memory store leaves no file out of a checkpoint.
+    fn notices(&self, _workspace: &WorkspaceId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn notices_told(&self, _workspace: &WorkspaceId, _notices: &[String]) {}
+
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         Ok(self.lock().heads.get(branch).cloned())
     }
@@ -653,6 +669,10 @@ impl TerminalHost for MemoryStore {
         let mut state = self.lock();
         if !state.terminals.contains(terminal) {
             return Err(TerminalError(format!("terminal {terminal} is gone")));
+        }
+        if state.submit_failures > 0 {
+            state.submit_failures -= 1;
+            return Err(TerminalError("send-keys broke midway".to_string()));
         }
         let pane = state.panes.entry(terminal.clone()).or_default();
         pane.push_str(text);

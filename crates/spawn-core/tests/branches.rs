@@ -869,6 +869,8 @@ fn a_forged_turn_end_mid_turn_does_not_merge_main() {
 struct Telling {
     inner: Arc<MemoryStore>,
     notice: std::sync::Mutex<Option<String>>,
+    /// Set by the first checkpoint: the notice exists from then on.
+    checkpointed: std::sync::atomic::AtomicBool,
 }
 
 impl WorkspaceStore for Telling {
@@ -893,6 +895,8 @@ impl WorkspaceStore for Telling {
         workspace: &spawn_core::id::WorkspaceId,
         message: &str,
     ) -> Result<spawn_core::port::Commit, spawn_core::port::WorkspaceError> {
+        self.checkpointed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.inner.commit(workspace, message)
     }
     fn unmount(
@@ -907,13 +911,22 @@ impl WorkspaceStore for Telling {
     ) -> Result<BaseMerge, spawn_core::port::WorkspaceError> {
         self.inner.merge_base(workspace)
     }
-    fn take_notices(&self, _workspace: &spawn_core::id::WorkspaceId) -> Vec<String> {
+    fn notices(&self, _workspace: &spawn_core::id::WorkspaceId) -> Vec<String> {
+        if !self.checkpointed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Vec::new();
+        }
         self.notice
             .lock()
             .expect("the notice")
-            .take()
+            .clone()
             .into_iter()
             .collect()
+    }
+    fn notices_told(&self, _workspace: &spawn_core::id::WorkspaceId, notices: &[String]) {
+        let mut notice = self.notice.lock().expect("the notice");
+        if notice.as_ref().is_some_and(|text| notices.contains(text)) {
+            *notice = None;
+        }
     }
 }
 
@@ -961,6 +974,7 @@ fn a_notice_of_the_workspace_store_is_logged_and_told_with_the_next_prompt_once(
     let telling = Arc::new(Telling {
         inner: store.clone(),
         notice: std::sync::Mutex::new(Some(LEFT_OUT.to_string())),
+        checkpointed: std::sync::atomic::AtomicBool::new(false),
     });
     let mut bridge = Bridge::new(
         store.clone(),
@@ -1004,4 +1018,117 @@ fn a_notice_of_the_workspace_store_is_logged_and_told_with_the_next_prompt_once(
         typed.contains("again") && !typed.contains(LEFT_OUT),
         "{typed}"
     );
+}
+
+/// A notice the store handed over at a checkpoint is still told after a
+/// restart of the Bridge before any prompt carried it (causality audit #6):
+/// the store marks it told only once a prompt carried it.
+#[test]
+fn a_notice_not_typed_yet_survives_a_restart_of_the_bridge() {
+    let store = store();
+    let telling = Arc::new(Telling {
+        inner: store.clone(),
+        notice: std::sync::Mutex::new(Some(LEFT_OUT.to_string())),
+        checkpointed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let build = |telling: &Arc<Telling>| {
+        Bridge::new(
+            store.clone(),
+            store.clone(),
+            telling.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_transcript_archive(store.clone())
+    };
+    let mut bridge = build(&telling);
+    start(&store, None);
+    bridge.tick().expect("start");
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    for _ in 0..2 {
+        bridge.tick().expect("checkpoint");
+    }
+    drop(bridge);
+    let mut restarted = build(&telling);
+    restarted.recover().expect("recover");
+    reset_pane(&store, 1);
+    input(&store, "key_input_1", "next");
+    restarted.tick().expect("type");
+    assert!(
+        typed_last(&store).contains(LEFT_OUT),
+        "{}",
+        typed_last(&store)
+    );
+}
+
+/// A turn's checkpoint whose commit failed (a full disk, a store that is
+/// down) stays due: the idle worker asks for no other, so the next tick
+/// commits it (causality audit #5).
+#[test]
+fn a_checkpoint_whose_commit_failed_stays_due_and_is_committed_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn end"));
+    store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
+    store.fail_commits(true);
+    let report = bridge.tick().expect("the commit fails");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("commit unavailable")),
+        "{:?}",
+        report.warnings
+    );
+    assert!(checkpoints(&store).is_empty());
+    store.fail_commits(false);
+    quiet(&bridge.tick().expect("the commit works again"));
+    assert_eq!(
+        checkpoints(&store)
+            .into_iter()
+            .map(|(reason, _)| reason)
+            .collect::<Vec<_>>(),
+        [CheckpointReason::TurnStopped],
+        "the turn's work reached its branch"
+    );
+}
+
+/// A start whose prompt's typing began and then failed may have reached the
+/// engine: it is ended, but not discarded. Its final checkpoint failing
+/// keeps the workspace and the end stays due, until the commit works
+/// (causality audit #15).
+#[test]
+fn a_start_whose_prompt_may_have_been_typed_is_not_discarded() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    store.fail_next_submit();
+    store.fail_commits(true);
+    start(&store, None);
+    bridge.tick().expect("the start fails");
+    assert_eq!(unmounts(&store), 0, "the workspace and its work stay");
+    assert!(ended(&store).is_empty());
+    bridge.tick().expect("the end is tried again");
+    assert_eq!(unmounts(&store), 0);
+    store.fail_commits(false);
+    bridge.tick().expect("the final checkpoint works");
+    assert_eq!(ended(&store), vec![EndCause::Lost]);
+    assert_eq!(unmounts(&store), 1);
+}
+
+/// A start whose pane never got its prompt (nothing typed) is discarded at
+/// once, even when its checkpoint fails: nothing ran in it.
+#[test]
+fn a_start_that_typed_nothing_is_discarded() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    let execution = ExecutionId::for_command(CommandId(1));
+    store.set_pane(&TerminalName::for_execution(&execution), "loading…");
+    store.fail_commits(true);
+    start(&store, None);
+    bridge.tick().expect("the start fails");
+    assert_eq!(ended(&store), vec![EndCause::Lost]);
+    assert_eq!(unmounts(&store), 1);
 }
