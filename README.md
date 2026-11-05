@@ -69,7 +69,7 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `submit` | Writes one command to the queue. Flags: `--agent`, `--session`, `--key`, `--action`, `--principal` (default `spawn`). |
 | `tick` | Claims and runs queued commands, advances live executions, records observations. Flags: `--repo`, `--root`, `--judge-url`. |
 | `loop` | Runs the fleet until killed: Bridge, Observer, dispatcher, and (with `SPAWN_SUPERVISOR=1`) the supervisor's liveness rule. |
-| `integrate [--once] [--root <dir>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh`, lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog task. |
+| `integrate [--once] [--root <dir>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh`, lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog tasks, up to the mission's worker limit (`--workers`, default 1) in flight at once. |
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
 | `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
