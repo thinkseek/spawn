@@ -183,6 +183,22 @@ printf 'weaker\n' >"$seed/judge/rule"
 touched=$(commit protected)
 expect "protected path refused" "$(judge "$touched" "$scenarios/007.sh")" 'protected'
 
+# The controller's own protected list covers what picks or configures the
+# toolchain that builds the candidate as the owner at deploy.
+listed=$work/listed-scenarios
+mkdir -p "$listed"
+cp "$scenarios/007.sh" "$listed/"
+cp "$(dirname "$gate")/../../rsi/scenarios/protected" "$listed/protected"
+for path in rust-toolchain rust-toolchain.toml .cargo/config.toml; do
+    branch "toolchain-$(echo "$path" | tr -c 'a-z\n' -)"
+    printf 'two\n' >"$seed/value"
+    mkdir -p "$seed/$(dirname "$path")"
+    printf '[toolchain]\npath = "/opt/elsewhere"\n' >"$seed/$path"
+    toolchain=$(commit "toolchain-$(echo "$path" | tr -c 'a-z\n' -)")
+    expect "the protected list covers $path" \
+        "$(judge "$toolchain" "$listed/007.sh" "$listed")" 'candidate touches protected paths'
+done
+
 branch buildtime
 printf 'two\n' >"$seed/value"
 printf 'fn main() {}\n' >"$seed/build.rs"

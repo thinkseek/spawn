@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -110,6 +111,42 @@ fn shown_arguments<S: AsRef<OsStr>>(arguments: &[S]) -> String {
         .map(|argument| argument.as_ref().to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Bytes of pathspecs one `git ls-tree` call carries on its command line:
+/// far under Linux's 2 MiB for arguments and environment together, and
+/// over any single path, so every batch holds at least one.
+const PATHSPEC_BATCH_BYTES: usize = 128 << 10;
+
+/// `specs` in order, cut into runs of at most [`PATHSPEC_BATCH_BYTES`]
+/// (a longer spec gets a run of its own).
+fn pathspec_batches(specs: Vec<OsString>) -> Vec<Vec<OsString>> {
+    let mut batches: Vec<Vec<OsString>> = Vec::new();
+    let mut bytes = 0;
+    for spec in specs {
+        let length = spec.len() + 1;
+        match batches.last_mut() {
+            Some(batch) if bytes + length <= PATHSPEC_BATCH_BYTES => {
+                bytes += length;
+                batch.push(spec);
+            }
+            _ => {
+                bytes = length;
+                batches.push(vec![spec]);
+            }
+        }
+    }
+    batches
+}
+
+/// `specs` NUL-terminated, for `--pathspec-from-file=- --pathspec-file-nul`.
+fn nul_terminated(specs: &[OsString]) -> Vec<u8> {
+    let mut input = Vec::new();
+    for spec in specs {
+        input.extend_from_slice(spec.as_bytes());
+        input.push(0);
+    }
+    input
 }
 
 /// The paths of a NUL-separated listing of paths.
@@ -328,6 +365,38 @@ impl GitWorkspace {
         report_listing(output, &shown_arguments(arguments))
     }
 
+    /// [`Self::listing_in`] for a command that reads its pathspecs from
+    /// standard input (`--pathspec-from-file=- --pathspec-file-nul`): any
+    /// number of paths, none of them on the command line.
+    fn listing_in_with_pathspecs<S: AsRef<OsStr>>(
+        &self,
+        directory: &Path,
+        index: &Path,
+        arguments: &[S],
+        specs: &[OsString],
+    ) -> Result<Vec<u8>, WorkspaceError> {
+        let word = shown_arguments(arguments);
+        let mut child = self
+            .command_in(directory, index)
+            .args(arguments)
+            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
+        let stdin = child.stdin.take();
+        let input = nul_terminated(specs);
+        // Written beside the read: a long answer must not block the input.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                use std::io::Write;
+                stdin.map(|mut stdin| stdin.write_all(&input))
+            });
+            report_listing(child.wait_with_output(), &word)
+        })
+    }
+
     fn has_base(&self) -> bool {
         self.git_output(&[
             "rev-parse",
@@ -469,13 +538,7 @@ impl GitWorkspace {
         let mut large = self.large_files(directory, index)?;
         let blobs = self.blobs_in(kept_in, &large)?;
         large.retain(|(path, _)| !blobs.contains(path));
-        let mut add: Vec<OsString> = ["add", "-A", "--", "."].map(OsString::from).into();
-        add.extend(
-            large
-                .iter()
-                .map(|(path, _)| path.pathspec("exclude,literal")),
-        );
-        self.output_in(directory, index, &add)?;
+        self.stage_all_but(directory, index, &large)?;
         self.unstage(directory, index, &large)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the limit between the size check and `add`
@@ -495,6 +558,25 @@ impl GitWorkspace {
         Ok((tree, large))
     }
 
+    /// `git add -A` of the work tree in `directory` except `large`, which is
+    /// never hashed. The paths go to git on standard input, so any number
+    /// of large files fits.
+    fn stage_all_but(
+        &self,
+        directory: &Path,
+        index: &Path,
+        large: &[(TreePath, u64)],
+    ) -> Result<(), WorkspaceError> {
+        let mut add = vec![OsString::from(".")];
+        add.extend(
+            large
+                .iter()
+                .map(|(path, _)| path.pathspec("exclude,literal")),
+        );
+        self.listing_in_with_pathspecs(directory, index, &["add", "-A"], &add)
+            .map(|_| ())
+    }
+
     /// Take build output and `paths` out of the index. Paths go to git as
     /// literals: a file named `*` or `:/` must not match others.
     fn unstage(
@@ -503,13 +585,15 @@ impl GitWorkspace {
         index: &Path,
         paths: &[(TreePath, u64)],
     ) -> Result<(), WorkspaceError> {
-        let mut remove: Vec<OsString> = ["rm", "-r", "--cached", "--ignore-unmatch", "--"]
-            .into_iter()
-            .chain(BUILD_OUTPUT)
-            .map(OsString::from)
-            .collect();
+        let mut remove: Vec<OsString> = BUILD_OUTPUT.into_iter().map(OsString::from).collect();
         remove.extend(paths.iter().map(|(path, _)| path.pathspec("literal")));
-        self.output_in(directory, index, &remove).map(|_| ())
+        self.listing_in_with_pathspecs(
+            directory,
+            index,
+            &["rm", "-r", "--cached", "--ignore-unmatch", "--quiet"],
+            &remove,
+        )
+        .map(|_| ())
     }
 
     /// Which of `paths` are a blob in at least one of `commits`.
@@ -522,20 +606,29 @@ impl GitWorkspace {
         if paths.is_empty() {
             return Ok(found);
         }
+        let asked: HashSet<&TreePath> = paths.iter().map(|(path, _)| path).collect();
+        let batches = pathspec_batches(
+            paths
+                .iter()
+                .map(|(path, _)| path.pathspec("literal"))
+                .collect(),
+        );
         for commit in commits {
-            let mut arguments: Vec<OsString> =
-                ["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"]
-                    .map(OsString::from)
-                    .into();
-            arguments.extend(paths.iter().map(|(path, _)| path.pathspec("literal")));
-            let listed = self.git_listing(&arguments)?;
-            for entry in nul_fields(&listed) {
-                // `<mode> blob <id>\t<path>`
-                if let Some((meta, path)) = tree_entry(entry)
-                    && meta.split_whitespace().nth(1) == Some("blob")
-                    && paths.iter().any(|(large, _)| *large == path)
-                {
-                    found.insert(path);
+            for batch in &batches {
+                let mut arguments: Vec<OsString> =
+                    ["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"]
+                        .map(OsString::from)
+                        .into();
+                arguments.extend(batch.iter().cloned());
+                let listed = self.git_listing(&arguments)?;
+                for entry in nul_fields(&listed) {
+                    // `<mode> blob <id>\t<path>`
+                    if let Some((meta, path)) = tree_entry(entry)
+                        && meta.split_whitespace().nth(1) == Some("blob")
+                        && asked.contains(&path)
+                    {
+                        found.insert(path);
+                    }
                 }
             }
         }
@@ -810,21 +903,22 @@ impl GitWorkspace {
         if asked.is_empty() {
             return Ok(Vec::new());
         }
-        let mut arguments: Vec<OsString> = ["ls-tree", "-t", "-z", "--full-tree", tree, "--"]
-            .map(OsString::from)
-            .into();
-        arguments.extend(asked.iter().map(|path| path.pathspec("literal")));
-        let listed = self.git_listing(&arguments)?;
         // The type of each entry asked for; a directory's other children
         // the listing shows on the way are not asked for.
-        let kinds: BTreeMap<TreePath, String> = nul_fields(&listed)
-            .filter_map(|entry| {
+        let mut kinds: BTreeMap<TreePath, String> = BTreeMap::new();
+        for batch in pathspec_batches(asked.iter().map(|path| path.pathspec("literal")).collect()) {
+            let mut arguments: Vec<OsString> = ["ls-tree", "-t", "-z", "--full-tree", tree, "--"]
+                .map(OsString::from)
+                .into();
+            arguments.extend(batch);
+            let listed = self.git_listing(&arguments)?;
+            kinds.extend(nul_fields(&listed).filter_map(|entry| {
                 // `<mode> <type> <id>\t<path>`
                 let (meta, path) = tree_entry(entry)?;
                 let kind = meta.split_whitespace().nth(1)?.to_string();
                 asked.contains(&path).then_some((path, kind))
-            })
-            .collect();
+            }));
+        }
         Ok(manifest
             .files
             .iter()
@@ -1876,6 +1970,103 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Far more large paths than one command line holds (Linux: 2 MiB of
+    /// arguments) still go through every git call that names them: the
+    /// checkpoint's `add`, `rm --cached`, the blob lookup and the clash check.
+    #[test]
+    fn many_large_paths_never_overflow_a_command_line() {
+        use super::{LargeFile, Manifest, TreePath};
+        let base =
+            std::env::temp_dir().join(format!("spawn-git-many-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        std::fs::create_dir_all(checkout.join("big")).expect("create the repository");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        let long = "x".repeat(200);
+        let names: Vec<String> = (0..20_000).map(|n| format!("big/{long}-{n}")).collect();
+        // Two of them are blobs on main, and one more file is not asked for.
+        for name in &names[..2] {
+            std::fs::write(checkout.join(name), "held\n").expect("write");
+        }
+        std::fs::write(checkout.join("other.txt"), "other\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let paths: Vec<(TreePath, u64)> = names
+            .iter()
+            .map(|name| (TreePath::from(name.as_str()), 1))
+            .collect();
+        let bytes: usize = names.iter().map(|name| name.len() + 12).sum();
+        assert!(bytes > 2 << 20, "the paths alone exceed ARG_MAX: {bytes}");
+
+        let held = store
+            .blobs_in(&["main".to_string()], &paths)
+            .expect("blob lookup");
+        let mut held: Vec<String> = held.iter().map(ToString::to_string).collect();
+        held.sort();
+        let mut expected = names[..2].to_vec();
+        expected.sort();
+        assert_eq!(held, expected);
+
+        let manifest = Manifest {
+            files: names
+                .iter()
+                .map(|name| LargeFile {
+                    path: TreePath::from(name.as_str()),
+                    mode: 0o100_644,
+                    size: 1,
+                    chunks: Vec::new(),
+                })
+                .collect(),
+        };
+        let tree = git(&checkout, &["rev-parse", "main^{tree}"]);
+        let mut clashes: Vec<String> = store
+            .large_clashes(&manifest, &tree)
+            .expect("clash check")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        clashes.sort();
+        assert_eq!(clashes, expected, "a blob where a large file goes clashes");
+
+        let staged = |index: &Path| {
+            let listed = Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .arg("ls-files")
+                .env("GIT_INDEX_FILE", index)
+                .output()
+                .expect("ls-files");
+            String::from_utf8_lossy(&listed.stdout).to_string()
+        };
+        std::fs::write(checkout.join("added.txt"), "added\n").expect("write");
+        let index = base.join("index");
+        store
+            .stage_all_but(&checkout, &index, &paths)
+            .expect("add with every large path excluded");
+        assert_eq!(
+            staged(&index),
+            "added.txt\nother.txt\n",
+            "no large path is staged"
+        );
+        // An index that holds two of them loses both.
+        let full = base.join("full-index");
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["add", "-A"])
+            .env("GIT_INDEX_FILE", &full)
+            .status()
+            .expect("add");
+        assert!(added.success());
+        assert_eq!(staged(&full).lines().count(), 4);
+        store
+            .unstage(&checkout, &full, &paths)
+            .expect("rm --cached of every large path");
+        assert_eq!(staged(&full), "added.txt\nother.txt\n");
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 
     /// A repository with `main` checked out, an agent branch with one
