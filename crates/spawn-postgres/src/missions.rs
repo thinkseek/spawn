@@ -32,6 +32,85 @@ from (
                            where s.session_id = k.session_id and s.live)))
 ) t";
 
+<<<<<<< 67c5b1bba25ebe9d3af830a13ccfd01c7a9b5fb0
+/// Residents (not retired) whose latest delivered task is cancelled: the
+/// dispatcher stops such a worker, sets the task's work aside and tells it
+/// (docs/fleet-architecture.md, "When a task closes"). The latest delivery
+/// is the session's task delivered last (`delivered_at_ms`, then the id); a
+/// task never delivered, or one delivered before another, is not here. Each
+/// row carries:
+///
+/// - `start`: the checkpoint the task started from, the agent's latest
+///   `artifact.committed` before the task's first delivery was accepted
+///   (`command.accepted` of the command its first `task.delivered` names),
+///   or a merge of main recorded before that `task.delivered` (the one a
+///   start or resume makes); `null` when the agent has none;
+/// - `set_aside`: the commit of the set-aside already recorded for the task
+///   (`source_event_id` `set-aside:<task>`), if any;
+/// - `told`: a notice of the cancel (`cancel-notice-<task>-<n>`) reached the
+///   worker, however long ago;
+/// - `closed_by` and `reason`: the task's last control record (`task.aborted`
+///   carries the integrator's reason).
+pub(crate) const CANCELLED_DELIVERIES: &str = r"
+with latest as materialized (
+  -- At most one per resident: its latest delivery, when that is cancelled.
+  -- The log is read below for these alone.
+  select k.id, k.mission_id, k.agent_id, k.session_id, r.name
+    from mission_tasks k
+    join mission_residents r on r.agent_id = k.agent_id and r.state <> 'retired'
+   where k.state = 'cancelled' and k.kind = 'resident' and k.delivered_at_ms is not null
+     and not exists (select 1 from mission_tasks later
+                      where later.session_id = k.session_id and later.id <> k.id
+                        and later.delivered_at_ms is not null
+                        and (later.delivered_at_ms, later.id) > (k.delivered_at_ms, k.id))
+)
+select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
+from (
+  select k.id, k.mission_id, k.agent_id, k.session_id, k.name as resident,
+         start.commit as start, aside.commit as set_aside,
+         exists (select 1 from spawn_commands c
+                  where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
+                    and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
+                    and c.succeeded) as told,
+         last.type as closed_by, last.reason
+    from latest k
+    left join lateral (
+      select e.id, (e.kind -> 'detail' -> 'record' ->> 'command_id')::bigint as command_id
+        from spawn_events e
+       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.delivered'
+         and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+       order by e.session_seq limit 1) first on true
+    left join lateral (
+      select e.id from spawn_events e
+       where e.session_id = k.session_id and e.event_name = 'command.accepted'
+         and (e.kind -> 'detail' ->> 'command_id')::bigint = first.command_id
+       order by e.id limit 1) accepted on true
+    left join lateral (
+      select e.kind -> 'detail' -> 'artifact' ->> 'commit' as commit
+        from spawn_events e
+       where e.session_id = k.session_id and e.event_name = 'artifact.committed'
+         and coalesce(e.kind -> 'detail' ->> 'reason', '') <> 'set_aside'
+         and (e.id < coalesce(accepted.id, first.id)
+              or (e.kind -> 'detail' ->> 'reason' = 'base_merged' and e.id < first.id))
+       order by e.id desc limit 1) start on true
+    left join lateral (
+      select e.kind -> 'detail' -> 'artifact' ->> 'commit' as commit
+        from spawn_events e
+       where e.session_id = k.session_id and e.event_name = 'artifact.committed'
+         and e.source_event_id = 'set-aside:' || k.id
+       order by e.id desc limit 1) aside on true
+    left join lateral (
+      select e.kind -> 'detail' -> 'record' ->> 'type' as type,
+             e.kind -> 'detail' -> 'record' ->> 'reason' as reason
+        from spawn_events e
+       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+         and e.kind -> 'detail' -> 'record' ->> 'type' like 'task.%'
+       order by e.session_seq desc limit 1) last on true
+   where first.id is not null
+) t";
+=======
 /// What the dispatcher measures stalls from (`dispatch/stall.rs`,
 /// docs/fleet-architecture.md §3), all from the log and on the database's
 /// clock: `now_ms` is `spawn_now_ms()`, and every `age_ms` is it minus the
@@ -148,6 +227,7 @@ select jsonb_build_object(
        order by e.session_seq desc limit 1) h on true
    where m.halted is not null), '[]'::jsonb)
 )";
+>>>>>>> 6a5853b0d48600ddb720e011e9e75cf21b2a4d04
 
 /// What the supervisor should hear about, beyond worker states: open
 /// missions, reports it reviews (not those of a mission its gate alone
@@ -252,7 +332,8 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
 
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
-/// the integrator may judge, land, or hold to its budget.
+/// the integrator may judge, land, or hold to its budget, with the brief and
+/// the report a landing's message is written from.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
@@ -266,7 +347,7 @@ from (
                'session_id', k.session_id, 'state', k.state, 'base', k.base,
                'candidate', k.candidate, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
-               'revisions', k.revisions)
+               'revisions', k.revisions, 'brief', k.brief, 'report', k.report)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -691,9 +772,16 @@ impl PostgresStore {
         self.query_json(DELIVERY_TASKS, &[])
     }
 
+<<<<<<< 67c5b1bba25ebe9d3af830a13ccfd01c7a9b5fb0
+    /// Residents whose latest delivered task is cancelled, with the
+    /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
+    pub fn cancelled_deliveries(&self) -> Result<Value, StoreError> {
+        self.query_json(CANCELLED_DELIVERIES, &[])
+=======
     /// What the dispatcher measures stalls from ([`STALL_FACTS`]).
     pub fn stall_facts(&self) -> Result<Value, StoreError> {
         self.query_json(STALL_FACTS, &[])
+>>>>>>> 6a5853b0d48600ddb720e011e9e75cf21b2a4d04
     }
 
     /// Missions, reports, approvals and human messages for the digest.
