@@ -2803,11 +2803,15 @@ mod database_tests {
             vec!["aborted", "aborted", "stale", "rejected"]
         );
 
-        // The third abort in a row halts the mission.
+        // The rejection reset the count: three aborts in a row from here
+        // halt the mission.
         let other = db.reported_task(mission, "x");
-        super::judged_or_aborted(&db.store, &ready_task(&db, other), &main, mission, || {
-            Err("again".to_string())
-        });
+        for _ in 0..3 {
+            super::judged_or_aborted(&db.store, &ready_task(&db, other), &main, mission, || {
+                Err("again".to_string())
+            });
+        }
+        assert_eq!(verdicts(&db, other), vec!["aborted"; 3]);
         integrator.pass_on(&db.store).expect("a pass");
         let halted = db.mission(mission)["halted"].clone();
         assert!(
