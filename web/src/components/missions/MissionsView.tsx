@@ -28,7 +28,6 @@ import {
   endedWell,
   fetchMissions,
   pipelineOf,
-  shownStages,
   slowStages,
   stageStep,
 } from "../../missions";
@@ -733,7 +732,7 @@ function StageSteps({
   steps: ReadonlyArray<TaskState>;
 }) {
   const ahead = remainingSteps(task.state, steps);
-  const stages = shownStages(task);
+  const stages = task.stages;
   const last = stages[stages.length - 1];
   const waiting =
     ahead.length > 0 && last.at_ms !== null

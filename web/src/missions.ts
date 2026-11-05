@@ -370,29 +370,6 @@ export function stageStep(stage: TaskStage): StageStep {
   }
 }
 
-/** The records a task's stepper shows. A task cancelled without a record of
- * its own (a resident's retirement, or its mission's cancellation, cancels
- * its open tasks) gets a closing `cancelled` step at its last update, so its
- * last record never reads as where it got to. */
-export function shownStages(
-  task: Pick<MissionTask, "state" | "stages" | "updated_at_ms">,
-): TaskStage[] {
-  const last = task.stages[task.stages.length - 1];
-  const closed = last !== undefined && stageStep(last).tone === "closed";
-  if (task.state !== "cancelled" || closed) return task.stages;
-  const at = task.updated_at_ms;
-  return [
-    ...task.stages,
-    {
-      stage: "cancelled",
-      verdict: null,
-      at_ms: at,
-      took_ms:
-        at !== null && last?.at_ms != null ? Math.max(0, at - last.at_ms) : null,
-    },
-  ];
-}
-
 /** Whether the task's current step shows as a success: it landed, or was
  * accepted. A cancelled task never does. */
 export function endedWell(state: TaskState): boolean {
