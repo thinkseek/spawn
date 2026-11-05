@@ -138,7 +138,7 @@
 | 事件名 | `spawn_events.event_name` 生成列，取 `kind->>'name'` |
 | 序号 | `session_seq` 单会话稠密，从 1 开始；`id` 全局 |
 | 时间 | `bigint` 毫秒，统一取 `spawn_now_ms()` |
-| 来源 | `spawn_events.source` 为小写：`claude`、`bridge`、`observer`、`gateway`、`control` |
+| 来源 | `spawn_events.source` 为小写：`claude`、`bridge`、`observer`、`gateway`、`control`；来源是本版本不认识的名字（已删除的写入方）时，`read_global` 跳过该记录、每个名字警告一次并继续往后读，时间线照原样显示 |
 | 执行结束 | 以 `source = 'bridge'` 的 `execution.ended` 为准；`claude` 来源的同名事件是退出报告 |
 | 去重 | `(session_id, source, source_event_id)` 唯一；`execution.started` 键为 `<exec>:started`，同一执行不会出现两条 |
 | 分页 | keyset，按视图排序键，不用 offset |
