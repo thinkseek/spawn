@@ -145,6 +145,14 @@ select jsonb_build_object(
 /// `resumed_young` counts the executions its
 /// resumes started that died young (`died_young!`) since the session's last
 /// execution that did not.
+///
+/// A delivery counts as the worker's (its `last_delivery`, and the episode)
+/// only when it reached the worker or may have: it succeeded, has not
+/// finished, or failed after typing may have begun (its error names `$1`,
+/// [`spawn_core::bridge::MAY_HAVE_TYPED`]). A delivery refused before
+/// anything was typed (a pane not ready, no execution, a source that did not
+/// answer) told the worker nothing: the worker's last delivery is still the
+/// one before it, and its own retry is not judged against itself.
 pub(crate) const DISPATCH_FACTS: &str = concat!(
     r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
@@ -188,6 +196,7 @@ from (
     (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'
+        and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
       order by c.id desc limit 1) as last_delivery,
     (select count(*) from agent_executions x
        join spawn_commands c on c.id = x.command_id
@@ -205,7 +214,10 @@ from (
   join spawn_session_state p using (session_id)
   left join lateral (select c.id, c.action from spawn_commands c
      where c.session_id = s.session_id
-       and (c.principal <> 'spawn-dispatch' or c.idempotency_key like 'deliver-%')
+       and (c.principal <> 'spawn-dispatch'
+            or (c.idempotency_key like 'deliver-%'
+                and (c.succeeded is distinct from false
+                     or position($1 in coalesce(c.error, '')) > 0)))
      order by c.id desc limit 1) ep on true
   where s.agent_id like 'agent\_worker\_%' or s.agent_id like 'agent\_resident\_%'
      or s.session_id = 'session_supervisor'
@@ -233,7 +245,7 @@ pub(crate) const SESSION_COMMANDS: &str =
 impl PostgresStore {
     /// Facts for the dispatcher, as JSON rows.
     pub fn dispatch_facts(&self) -> Result<Value, StoreError> {
-        self.query_json(DISPATCH_FACTS, &[])
+        self.query_json(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])
     }
 
     /// Every session with its judgement, task and activity, supervisor first.

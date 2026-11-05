@@ -2176,7 +2176,7 @@ impl Bridge {
         )?;
         if !reading.state.accepts_input() {
             return Ok(Outcome::Failed(format!(
-                "pane state {:?} does not accept input",
+                "pane state {:?} {PANE_NOT_READY}",
                 reading.state
             )));
         }
@@ -2274,6 +2274,13 @@ impl Bridge {
         )
     }
 }
+
+/// How an input fails when the pane does not show a prompt that takes
+/// text (`pane state <state> does not accept input`): refused before
+/// anything was typed, so nothing reached the engine. The pane may be a
+/// moment from ready: a turn's end reaches the transcript before the screen
+/// settles at the prompt.
+pub const PANE_NOT_READY: &str = "does not accept input";
 
 /// How a command that may or may not have typed its text fails (the log
 /// shows typing began and nothing shows it arrived): it is not typed again,

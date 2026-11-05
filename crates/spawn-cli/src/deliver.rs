@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Deserialize;
-use spawn_core::bridge::MAY_HAVE_TYPED;
+use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
 use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, ModelProfile};
 use spawn_core::mission::TaskState;
@@ -59,6 +59,16 @@ const DELIVERY_RETRIES: usize = 3;
 /// Wait before the first retry; it doubles with every retry, up to
 /// [`RETRY_MAX_MS`].
 const RETRY_MS: i64 = 60_000;
+
+/// Wait before a delivery refused because the pane was not ready
+/// ([`PANE_NOT_READY`]) is tried again: nothing was typed, and the pane is
+/// usually a moment from ready.
+const NOT_READY_RETRY_MS: i64 = 5_000;
+
+/// Refusals for a pane not ready that are not counted as failed attempts;
+/// past them each counts like any failure, so a pane that never shows its
+/// prompt still ends in an escalation.
+const NOT_READY_FREE: usize = 10;
 
 /// Longest wait between two retries.
 const RETRY_MAX_MS: i64 = 30 * 60_000;
@@ -273,7 +283,11 @@ impl<'a> Turns<'a> {
 
 /// Whether the last task typed into `facts`' session is closed. A question
 /// the worker asked at the end of it (judged BLOCKED) is then settled by
-/// the close, and new work may be typed in.
+/// the close, and new work may be typed in. The last task typed in is the
+/// last delivery that reached the worker or may have
+/// ([`Facts::last_delivery`]): a delivery refused before typing, such as a
+/// waiting task's own first attempt, told the worker nothing, so it neither
+/// is the question nor holds back its own retry.
 fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
     // Not `dispatched`, which holds only the last day: a worker blocked
     // over a quiet weekend would never take new work.
@@ -380,12 +394,26 @@ enum Attempts {
 /// Where `task`'s current delivery into `facts`' session stands. A failure
 /// that typed nothing is tried again under a key of its own, with a wait
 /// that doubles each time, [`DELIVERY_RETRIES`] times. One that may have
-/// typed the task ([`MAY_HAVE_TYPED`]) is not.
+/// typed the task ([`MAY_HAVE_TYPED`]) is not. A refusal because the pane
+/// was not ready ([`PANE_NOT_READY`]) is no failed attempt: nothing was
+/// tried on the worker, so it goes again after [`NOT_READY_RETRY_MS`], once
+/// the worker is ready by the delivery rules, and counts only past
+/// [`NOT_READY_FREE`] of them.
 fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
     let sent = delivery_attempts(task, facts);
     let Some(last) = sent.last() else {
         return Attempts::None;
     };
+    let not_ready = |sent: &&crate::dispatch::Sent| {
+        sent.succeeded == Some(false)
+            && sent
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(PANE_NOT_READY))
+    };
+    let refusals = sent.iter().filter(|sent| not_ready(sent)).count();
+    // Failed attempts: every failure but the refusals still free.
+    let failures = sent.len() - refusals.min(NOT_READY_FREE);
     match last.succeeded {
         None => Attempts::Open,
         Some(true) => last.id.map_or(Attempts::Open, Attempts::Delivered),
@@ -397,19 +425,25 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
                      again",
                 );
             }
-            if sent.len() > DELIVERY_RETRIES {
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            if not_ready(last) && refusals <= NOT_READY_FREE {
+                return Attempts::Retry {
+                    number: sent.len(),
+                    due_ms: finished.saturating_add(NOT_READY_RETRY_MS),
+                };
+            }
+            if failures > DELIVERY_RETRIES {
                 return Attempts::Failed("never reached its worker; cancel it and assign it again");
             }
-            let doublings = u32::try_from(sent.len() - 1).unwrap_or(u32::MAX).min(20);
+            let doublings = u32::try_from(failures.saturating_sub(1))
+                .unwrap_or(u32::MAX)
+                .min(20);
             let wait = RETRY_MS
                 .saturating_mul(1_i64 << doublings)
                 .min(RETRY_MAX_MS);
             Attempts::Retry {
                 number: sent.len(),
-                due_ms: last
-                    .finished_at_ms
-                    .unwrap_or(last.created_at_ms)
-                    .saturating_add(wait),
+                due_ms: finished.saturating_add(wait),
             }
         }
     }
@@ -1202,7 +1236,7 @@ mod tests {
         let mut facts = worker(true, true);
         facts
             .dispatched
-            .push(sent(10, "deliver-4-0", 1_000, Some("pane state Busy")));
+            .push(sent(10, "deliver-4-0", 1_000, Some("terminal disappeared")));
         let rows = |facts: &Facts| vec![facts.clone()];
         assert!(delivered(&tasks, &rows(&facts)).is_empty(), "not delivered");
         assert!(
@@ -1221,7 +1255,7 @@ mod tests {
             11,
             "deliver-4-0-retry-1",
             70_000,
-            Some("pane state Busy"),
+            Some("terminal disappeared"),
         ));
         let mut down = facts.clone();
         down.live = false;
@@ -1243,7 +1277,7 @@ mod tests {
                 20,
                 &format!("deliver-4-0-retry-{retry}"),
                 100_000,
-                Some("pane state Busy"),
+                Some("terminal disappeared"),
             ));
         }
         assert!(super::orders(&tasks, &rows(&facts), i64::MAX / 2).is_empty());
@@ -1251,6 +1285,115 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
         assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
+    }
+
+    /// The live sequence of task 25: the worker's turn on task 24 ended,
+    /// task 25 was typed in at that instant and refused (the pane still
+    /// showed the turn: `pane state Busy does not accept input`), and then
+    /// the model judge read the idle worker's report on task 24, which asked
+    /// a question, as BLOCKED. The retry must still go out: the refused
+    /// delivery told the worker nothing, so its last delivery is task 24's,
+    /// which is closed, and a stopped turn is enough.
+    #[test]
+    fn a_delivery_refused_by_a_busy_pane_is_retried_to_a_blocked_worker_at_its_prompt() {
+        let tasks = work(vec![
+            task(24, TaskState::Accepted, "resident"),
+            task(25, TaskState::Assigned, "resident"),
+        ]);
+        let mut facts = worker(true, true);
+        if let Some(observation) = facts.observation.as_mut() {
+            observation.state = SemanticState::Blocked;
+        }
+        facts.dispatched = vec![
+            sent(30, "deliver-24-0", 500, None),
+            sent(
+                31,
+                "deliver-25-0",
+                1_000,
+                Some("pane state Busy does not accept input"),
+            ),
+        ];
+        // What `dispatch_facts` names now: the refused delivery is not the
+        // worker's.
+        facts.last_delivery = Some("deliver-24-0".to_string());
+        let rows = vec![facts.clone()];
+        assert!(delivered(&tasks, &rows).is_empty(), "task 25 never arrived");
+        assert!(
+            news_items(&tasks, &rows).is_empty(),
+            "a retry is coming: no one is asked"
+        );
+        assert!(super::orders(&tasks, &rows, 1_000 + 4_999).is_empty());
+        let retry = super::orders(&tasks, &rows, 1_000 + 5_000);
+        assert_eq!(retry.len(), 1, "the retry goes out: {retry:?}");
+        assert_eq!(retry[0].key, "deliver-25-0-retry-1");
+        assert_eq!(retry[0].task, Some(25));
+        let CommandAction::Input { text, .. } = &retry[0].action else {
+            panic!("typed into the live worker");
+        };
+        assert!(text.contains("New task #25"), "{text}");
+
+        // As the facts named it before the fix: the refused delivery as the
+        // worker's last, so task 25 itself was "the open task it asked
+        // about", and the BLOCKED worker never got its retry.
+        let mut before = facts.clone();
+        before.last_delivery = Some("deliver-25-0".to_string());
+        assert!(super::orders(&tasks, &[before], 1_000 + 600_000).is_empty());
+
+        // The retry succeeds: task 25 is delivered by it.
+        facts
+            .dispatched
+            .push(sent(32, "deliver-25-0-retry-1", 6_500, None));
+        assert_eq!(delivered(&tasks, &[facts]), vec![(25, 32)]);
+    }
+
+    /// A pane not ready refuses before anything is typed: tried again soon,
+    /// without spending the retries a real failure gets, and escalated only
+    /// once refusals keep coming.
+    #[test]
+    fn a_pane_not_ready_is_not_a_failed_attempt() {
+        let tasks = work(vec![task(4, TaskState::Assigned, "resident")]);
+        let busy = "pane state Busy does not accept input";
+        let mut facts = worker(true, true);
+        let mut at = 1_000;
+        for n in 0..5 {
+            let key = if n == 0 {
+                "deliver-4-0".to_string()
+            } else {
+                format!("deliver-4-0-retry-{n}")
+            };
+            facts.dispatched.push(sent(10 + n, &key, at, Some(busy)));
+            let retry = super::orders(&tasks, &[facts.clone()], at + 5_000);
+            assert_eq!(retry.len(), 1, "refusal {n} is retried after 5 s");
+            assert_eq!(retry[0].key, format!("deliver-4-0-retry-{}", n + 1));
+            at += 6_000;
+        }
+        // A real failure after them is the first failed attempt: one minute.
+        facts.dispatched.push(sent(
+            20,
+            "deliver-4-0-retry-5",
+            at,
+            Some("terminal disappeared"),
+        ));
+        assert!(super::orders(&tasks, &[facts.clone()], at + 59_999).is_empty());
+        assert_eq!(
+            super::orders(&tasks, &[facts.clone()], at + 60_000)[0].key,
+            "deliver-4-0-retry-6"
+        );
+
+        // Refusals without end count once past the free ones: escalated.
+        let mut stuck = worker(true, true);
+        for n in 0..=(super::NOT_READY_FREE + DELIVERY_RETRIES) {
+            let key = if n == 0 {
+                "deliver-4-0".to_string()
+            } else {
+                format!("deliver-4-0-retry-{n}")
+            };
+            stuck.dispatched.push(sent(40, &key, 1_000, Some(busy)));
+        }
+        assert!(super::orders(&tasks, &[stuck.clone()], i64::MAX / 2).is_empty());
+        let items = news_items(&tasks, &[stuck]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::DeliveryFailed);
     }
 
     /// A delivery that may have typed the task is not sent again: the
