@@ -385,6 +385,130 @@ fn judged_next(stalls: &Stalls) -> BTreeSet<i64> {
     next.into_values().collect()
 }
 
+/// A delivered task's `activity` step: from the later of its delivery
+/// record and its session's latest fact; none while its screen shows
+/// background shells running.
+fn activity(
+    task: &OpenTask,
+    record: &Record,
+    context: &Context<'_>,
+    facts: Option<&Facts>,
+    bound_ms: i64,
+) -> Option<Measured> {
+    let now = context.stalls.now_ms;
+    let latest = context
+        .stalls
+        .sessions
+        .iter()
+        .find(|latest| latest.session_id == task.session_id);
+    if latest
+        .and_then(|latest| latest.screen.as_deref())
+        .is_some_and(shows_background_shells)
+    {
+        // At its prompt with background shells running: active.
+        return None;
+    }
+    let fact =
+        latest.and_then(|latest| Some((latest.seq?, latest.event_name.clone()?, latest.at_ms?)));
+    let fact_line = fact.as_ref().map_or_else(
+        || "the session has no fact".to_string(),
+        |(seq, name, at)| {
+            format!(
+                "the session's latest fact: {name} (seq {seq}, {} ago)",
+                took(now - at)
+            )
+        },
+    );
+    let line = format!(
+        "delivered by {}; {fact_line}; {}; {}; tried: {}",
+        named(record, now),
+        judgement(facts),
+        liveness(facts),
+        tried_on_worker(facts, context.told, task)
+    );
+    Some(match fact {
+        Some((seq, _, at)) if at >= record.at_ms => Measured {
+            step: Step::Activity,
+            n: seq,
+            since_ms: at,
+            bound_ms,
+            line,
+        },
+        _ => Measured {
+            step: Step::Activity,
+            n: record.id,
+            since_ms: record.at_ms,
+            bound_ms,
+            line,
+        },
+    })
+}
+
+/// A gated task's `judgement` step, if the gate judges it next: from
+/// the later of the record that made it ready and the mission's latest
+/// verdict that is not `stale`.
+fn gate(
+    task: &OpenTask,
+    record: &Record,
+    context: &Context<'_>,
+    bound_ms: i64,
+) -> Option<Measured> {
+    let now = context.stalls.now_ms;
+    if task.halted || !context.judged_next.contains(&task.id) {
+        // The halt's, or queued behind the task the gate judges next.
+        return None;
+    }
+    let verdict = context
+        .stalls
+        .verdicts
+        .iter()
+        .find(|verdict| verdict.mission_id == task.mission_id);
+    let verdict_line = verdict.map_or_else(
+        || "no verdict in the mission yet".to_string(),
+        |verdict| {
+            format!(
+                "the mission's latest verdict: {} on task #{} (record {}, {} ago)",
+                verdict.outcome,
+                verdict.task.as_deref().unwrap_or("?"),
+                verdict.id,
+                took(now - verdict.at_ms)
+            )
+        },
+    );
+    let stale_line = task.stale.as_ref().map_or_else(
+        || "no stale verdict on it".to_string(),
+        |stale| {
+            format!(
+                "its latest stale verdict ({} ago): {}; the integrator judges it again \
+                 on its next pass",
+                took(now - stale.at_ms),
+                one_line(stale.reason.as_deref().unwrap_or("no reason"), 200)
+            )
+        },
+    );
+    let line = format!(
+        "the gate of mission #{} judges it next; ready since {}; {verdict_line}; \
+         {stale_line}",
+        task.mission_id,
+        named(record, now)
+    );
+    Some(match verdict {
+        Some(verdict) if verdict.at_ms > record.at_ms => Measured {
+            step: Step::Judgement,
+            n: verdict.id,
+            since_ms: verdict.at_ms,
+            bound_ms,
+            line,
+        },
+        _ => Measured {
+            step: Step::Judgement,
+            n: record.id,
+            since_ms: record.at_ms,
+            bound_ms,
+            line,
+        },
+    })
+}
 /// The step `task` waits on, measured, or none: it is queued, closed with
 /// no worker left, the halt's, or its delivery was given up.
 fn measure(
@@ -425,48 +549,7 @@ fn measure(
                 ),
             ))
         }
-        TaskState::Delivered => {
-            let latest = context
-                .stalls
-                .sessions
-                .iter()
-                .find(|latest| latest.session_id == task.session_id);
-            if latest
-                .and_then(|latest| latest.screen.as_deref())
-                .is_some_and(shows_background_shells)
-            {
-                // At its prompt with background shells running: active.
-                return None;
-            }
-            let fact = latest
-                .and_then(|latest| Some((latest.seq?, latest.event_name.clone()?, latest.at_ms?)));
-            let fact_line = fact.as_ref().map_or_else(
-                || "the session has no fact".to_string(),
-                |(seq, name, at)| {
-                    format!(
-                        "the session's latest fact: {name} (seq {seq}, {} ago)",
-                        took(now - at)
-                    )
-                },
-            );
-            let line = format!(
-                "delivered by {}; {fact_line}; {}; {}; tried: {}",
-                named(record, now),
-                judgement(facts),
-                liveness(facts),
-                tried_on_worker(facts, context.told, task)
-            );
-            Some(match fact {
-                Some((seq, _, at)) if at >= record.at_ms => Measured {
-                    step: Step::Activity,
-                    n: seq,
-                    since_ms: at,
-                    bound_ms: bounds.activity,
-                    line,
-                },
-                _ => since_record(Step::Activity, bounds.activity, line),
-            })
-        }
+        TaskState::Delivered => activity(task, record, context, facts, bounds.activity),
         TaskState::Reported if !(task.gated && task.accept == "gate") => {
             let told = context.told.contains(&format!(
                 "{} report-{}-{}",
@@ -485,54 +568,7 @@ fn measure(
             ))
         }
         TaskState::Reported | TaskState::Accepted if task.gated => {
-            if task.halted || !context.judged_next.contains(&task.id) {
-                // The halt's, or queued behind the task the gate judges next.
-                return None;
-            }
-            let verdict = context
-                .stalls
-                .verdicts
-                .iter()
-                .find(|verdict| verdict.mission_id == task.mission_id);
-            let verdict_line = verdict.map_or_else(
-                || "no verdict in the mission yet".to_string(),
-                |verdict| {
-                    format!(
-                        "the mission's latest verdict: {} on task #{} (record {}, {} ago)",
-                        verdict.outcome,
-                        verdict.task.as_deref().unwrap_or("?"),
-                        verdict.id,
-                        took(now - verdict.at_ms)
-                    )
-                },
-            );
-            let stale_line = task.stale.as_ref().map_or_else(
-                || "no stale verdict on it".to_string(),
-                |stale| {
-                    format!(
-                        "its latest stale verdict ({} ago): {}; the integrator judges it again \
-                         on its next pass",
-                        took(now - stale.at_ms),
-                        one_line(stale.reason.as_deref().unwrap_or("no reason"), 200)
-                    )
-                },
-            );
-            let line = format!(
-                "the gate of mission #{} judges it next; ready since {}; {verdict_line}; \
-                 {stale_line}",
-                task.mission_id,
-                named(record, now)
-            );
-            Some(match verdict {
-                Some(verdict) if verdict.at_ms > record.at_ms => Measured {
-                    step: Step::Judgement,
-                    n: verdict.id,
-                    since_ms: verdict.at_ms,
-                    bound_ms: bounds.gate,
-                    line,
-                },
-                _ => since_record(Step::Judgement, bounds.gate, line),
-            })
+            gate(task, record, context, bounds.gate)
         }
         TaskState::Landing if !task.halted => Some(since_record(
             Step::Landing,
