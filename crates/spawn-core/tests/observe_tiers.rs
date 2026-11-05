@@ -830,28 +830,73 @@ fn input_typed_into_a_ready_pane_is_work_not_an_idle_prompt() {
     let judge = Scripted::new(Ok(blocked_answer()));
     let mut fixture = fixture(judge.clone());
     started(&fixture.store);
+    ready(&fixture.store);
+    typed(&fixture.store, 1);
+    finished(&fixture.store, 1);
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 0);
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert_eq!(last.judge, "rules");
+}
+
+fn ready(store: &MemoryStore) {
     append(
-        &fixture.store,
+        store,
         Source::Bridge,
         EventKind::ScreenObserved {
             state: ScreenState::Ready,
             evidence: ">".to_string(),
         },
     );
+}
+
+fn typed(store: &MemoryStore, command: u64) {
     append(
-        &fixture.store,
+        store,
+        Source::Bridge,
+        EventKind::CommandStepped {
+            command_id: CommandId(command),
+            step: spawn_core::event::CommandStep::Typed,
+            workspace: None,
+        },
+    );
+}
+
+fn finished(store: &MemoryStore, command: u64) {
+    append(
+        store,
         Source::Gateway,
         EventKind::CommandFinished {
-            command_id: CommandId(1),
+            command_id: CommandId(command),
             succeeded: true,
             error: None,
         },
     );
+}
+
+/// The input was typed and its turn ended before the command's finish was
+/// recorded (the first `finish` failed; the retried command succeeds at
+/// once, its text already typed). The late `command.finished` comes after
+/// the turn's end and a ready screen: it starts no turn, and the idle
+/// worker is still seen idle (causality audit #12).
+#[test]
+fn a_late_finish_of_an_input_typed_before_the_turn_ended_starts_no_turn() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    ready(&fixture.store);
+    typed(&fixture.store, 1);
+    turn_stopped(&fixture.store);
+    ready(&fixture.store);
+    finished(&fixture.store, 1);
     fixture.observer.tick().expect("tick");
-    assert_eq!(judge.calls(), 0);
     let last = observations(&fixture.store).pop().expect("an observation");
-    assert_eq!(last.state, SemanticState::Working);
-    assert_eq!(last.judge, "rules");
+    assert_ne!(
+        last.state,
+        SemanticState::Working,
+        "an idle worker read as working is never served: {last:?}"
+    );
 }
 
 #[test]

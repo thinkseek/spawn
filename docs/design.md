@@ -141,13 +141,13 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
-checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
+checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。commit 失败（`Unavailable`、`Refused`）时告警，这次 checkpoint 仍然待做，下一个 tick 重试，直到提交成功（或得到 `Unchanged`）；闲着的 worker 不会再产生新的 checkpoint 事件，清掉它就等于丢掉这一轮的工作。
 
 合入基线：只在执行启动或恢复时、挂载之前，Bridge 调用 `merge_main_clean`：`main` 能干净合入时分支按比较交换移到合并提交，写 `artifact.committed`（reason `base_merged`，带改动的 `files`）；有任何冲突时分支不动，执行照常在原分支上启动，写一次 `merge.conflicted{files, marked: false}`（键由分支头与文件决定，重试的启动只记一次），并在 tick 报告里告警。Bridge 从不合入运行中的执行；闲置在提示符的工作区由 `main_merge.rs` 在集成器的冲突裁决和投递任务之前合入，投递的任务文本说明合并做了什么（storage.md，“Main into a workspace”）。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载。
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 之后、`unmount` 之前写 `execution.unmounting`；恢复出的结束若已有这条记录，就跳过 checkpoint，只再 terminate、unmount（工作区不在不算失败）并写 `execution.ended`。
 
-命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在则失败（下个 tick 按 `Lost` 结束），提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次）。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
+命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在则失败（下个 tick 按 `Lost` 结束），提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败（提示词可能已到引擎，所以不按 discard 结束：最后一次 checkpoint 失败时工作区不卸载，结束像 `Stop` 一样留待下个 tick 重试；键入失败时同理，只有日志表明从未开始键入的启动才按 discard 卸载）；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次）。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
 
 结束的三个来源：
 
@@ -284,7 +284,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | --- | --- |
 | `ensure_branch` | 无 `refs/heads/main` 时用 `mktree` + `commit-tree` 建根提交；分支已存在返回 `Existing`；否则把 `from`（`refs/heads/<agent>` 或完整 commit id，`rev-parse --verify <x>^{commit}`）或 `main` 解析成 commit，`update-ref refs/heads/<b> <commit> ""`（只建不改） |
 | `mount` | 分支头的提交说明带 `Spawn-Large` trailer（旧版本把大文件放在块存储里，本版本没有块存储）时拒绝（`FilesOutsideGit`）；否则 `git archive refs/heads/<b> \| tar -x -C <dir>`，先解到 `<root>/.mount/` 再改名换上 |
-| `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A`（超过 `SPAWN_MAX_FILE_MB` 的文件排除在外、不哈希，`main` 里已有的 blob 除外）→ `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref`。被排除的文件记在 `<root>/.oversized/<b>`，`take_notices` 每个只交出一次，Bridge 记进日志并放在下一个 prompt 前 |
+| `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A`（超过 `SPAWN_MAX_FILE_MB` 的文件排除在外、不哈希，`main` 里已有的 blob 除外）→ `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref`。被排除的文件记在 `<root>/.oversized/<b>`，`notices` 只读出尚未告知的（不改记录），Bridge 记进日志并放在下一个 prompt 前，这次键入记下 `typed` 之后才用 `notices_told` 标为已告知；记录在磁盘上，Bridge 重启不丢（至多告知两次） |
 | `unmount` | 删工作树目录 |
 | `merge_base` | `main` 是分支头的祖先则 `Current`；否则 `git --attr-source=<main> merge-tree --write-tree --name-only -z <main> <head>`（合并规则取自 `main` 的 `.gitattributes`，只有 gate 能动它；裸仓库不加 `--attr-source` 不读树内属性）。退出码 1 为 `Conflicted`：消息种类（`-z` 输出里的稳定字符串）只有 `CONFLICT (contents)` 时，按下述同一安全流程把带冲突标记的合并树写进目录，分支不动，`main` 作为待定的第二父提交原子地写进 `<root>/.merge/<b>`（`main` 与冲突路径，NUL 分隔）；有别的冲突种类（modify/delete、改名、二进制）时什么都不改。待定合并存在时不合并更晚的 `main`：标记未解决返回 `Conflicted{marked: true}`，已解决返回 `Current`。`merge_base` 全程持有与 `commit` 相同的 `<index>.spawn-lock`；`mount`、`unmount` 只在分支已带着标记（合并写入后又有 checkpoint）时保留待定文件，否则删掉。`commit` 在待定合并列出的冲突文件里都没有完整的标记块（行首 `<<<<<<< `，其后一行恰为 `=======`，再其后行首 `>>>>>>> `；单独的 `=======` 不算）时以 `-p <head> -p <待定 main>` 提交（树未变也提交）并删掉待定文件，否则照常单父提交；干净时先动目录：临时索引 `read-tree <head 树>`、`update-index -q --refresh`、`read-tree -m -u <head 树> <合并树>`（目录里要改的文件与分支不符、或未跟踪文件挡路时拒绝，返回错误、什么都不改），再 `commit-tree -p <head> -p <main>` 和带旧值的 `update-ref`。顺序不能反：先动 ref 会让下一次 checkpoint 把旧文件提交回去，抹掉 `main` 的改动 |
 
