@@ -17,9 +17,8 @@ pub enum JudgeError {
 
 /// Facts one judgement uses. The shape is the judge's input contract.
 ///
-/// It is stored as the evidence of every model judgement and read back for
-/// replay, so every field defaults: a row written before a field existed
-/// still replays.
+/// It is stored as the evidence of every model judgement, and every field
+/// defaults, so a row written before a field existed still reads.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JudgeInput {

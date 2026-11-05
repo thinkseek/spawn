@@ -74,8 +74,6 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
 | `dispatch [--dry-run] [--root <dir>]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. `--root` is the workspace root (default `SPAWN_WORKSPACE_ROOT`), as for `loop` and `tick`. |
-| `corpus export [--since-hours N]` | Model judgements with their evidence and outcome labels, one JSON line each. |
-| `judge --replay <file>` | Runs the current rules over a corpus: which tier decides each episode, coverage, agreement. |
 | `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
 | `mission`, `task`, `resident` | The mission layer: add, configure, close and resume missions; assign, accept and reject tasks; propose, approve and retire residents. Every command prints JSON. |
 | `task stages --id N` | A task's stages from the control stream, oldest first: `[{stage, verdict, at_ms, took_ms}]`, `took_ms` the time since the task's previous stage. `mission list` and the dashboard's missions page carry the same list on every task. |
