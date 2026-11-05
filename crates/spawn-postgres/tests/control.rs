@@ -1619,6 +1619,14 @@ fn a_done_missions_running_task_is_still_held_to_its_budget() {
     );
 }
 
+/// The state of `task` in the tables.
+fn task_state(client: &mut Client, task: i64) -> String {
+    client
+        .query_one("select state from mission_tasks where id = $1", &[&task])
+        .expect("read the task")
+        .get(0)
+}
+
 /// How many `task.cancelled` records the control stream holds for `task`.
 fn cancelled_records(client: &mut Client, task: i64) -> i64 {
     client
@@ -1655,13 +1663,25 @@ fn assert_cancelled_once(
     when: &str,
 ) {
     for &task in cancelled {
-        assert_eq!(state(client, task), "cancelled", "task {task} {when}");
-        assert_eq!(last_stage(store, task), "cancelled", "task {task}'s stages {when}");
-        assert_eq!(cancelled_records(client, task), 1, "task {task}'s records {when}");
+        assert_eq!(task_state(client, task), "cancelled", "task {task} {when}");
+        assert_eq!(
+            last_stage(store, task),
+            "cancelled",
+            "task {task}'s stages {when}"
+        );
+        assert_eq!(
+            cancelled_records(client, task),
+            1,
+            "task {task}'s records {when}"
+        );
     }
     for &(task, expected) in kept {
-        assert_eq!(state(client, task), expected, "task {task} {when}");
-        assert_eq!(cancelled_records(client, task), 0, "task {task}'s records {when}");
+        assert_eq!(task_state(client, task), expected, "task {task} {when}");
+        assert_eq!(
+            cancelled_records(client, task),
+            0,
+            "task {task}'s records {when}"
+        );
     }
 }
 
@@ -1673,7 +1693,9 @@ fn three_tasks(store: &PostgresStore, mission: i64, kind: &str, worker: &str) ->
             .expect("assign")
     });
     for (n, &task) in tasks[1..].iter().enumerate() {
-        store.task_delivered(task, 70 + n as i64).expect("delivered");
+        store
+            .task_delivered(task, 70 + n as i64)
+            .expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));
     }
     store.task_review(tasks[2], true, "").expect("accept");
@@ -1683,8 +1705,12 @@ fn three_tasks(store: &PostgresStore, mission: i64, kind: &str, worker: &str) ->
 #[test]
 fn a_retirement_records_task_cancelled_for_each_task_it_cancels() {
     let (store, schema) = store("control_retire_records");
-    let mission = store.mission_add("Core work", &json!([]), "human").expect("add");
-    store.resident_propose("core", "Owns the core").expect("propose");
+    let mission = store
+        .mission_add("Core work", &json!([]), "human")
+        .expect("add");
+    store
+        .resident_propose("core", "Owns the core")
+        .expect("propose");
     store.resident_approve("core").expect("approve");
     let [assigned, reported, accepted] = three_tasks(&store, mission, "resident", "core");
     store.resident_retire("core").expect("retire");
@@ -1692,7 +1718,13 @@ fn a_retirement_records_task_cancelled_for_each_task_it_cancels() {
     let mut client = admin(&schema);
     // An accepted task of a mission without a gate goes on.
     let kept = [(accepted, "accepted")];
-    assert_cancelled_once(&store, &mut client, &[assigned, reported], &kept, "after the retirement");
+    assert_cancelled_once(
+        &store,
+        &mut client,
+        &[assigned, reported],
+        &kept,
+        "after the retirement",
+    );
     let types = control_types(&mut client);
     assert_eq!(
         types[types.len() - 3..],
@@ -1702,36 +1734,77 @@ fn a_retirement_records_task_cancelled_for_each_task_it_cancels() {
 
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
-    assert_eq!(control_types(&mut client), types, "a refold appends nothing");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+    assert_eq!(
+        control_types(&mut client),
+        types,
+        "a refold appends nothing"
+    );
     store.migrate().expect("migrate again");
-    assert_eq!(control_types(&mut client), types, "migrating again appends nothing");
-    assert_cancelled_once(&store, &mut client, &[assigned, reported], &kept, "after the replays");
+    assert_eq!(
+        control_types(&mut client),
+        types,
+        "migrating again appends nothing"
+    );
+    assert_cancelled_once(
+        &store,
+        &mut client,
+        &[assigned, reported],
+        &kept,
+        "after the replays",
+    );
 }
 
 #[test]
 fn a_mission_close_records_task_cancelled_for_each_task_it_cancels() {
     let (store, schema) = store("control_close_records");
     let done = store.mission_add("Done", &json!([]), "human").expect("add");
-    let dropped = store.mission_add("Dropped", &json!([]), "human").expect("add");
+    let dropped = store
+        .mission_add("Dropped", &json!([]), "human")
+        .expect("add");
     let [done_assigned, done_reported, done_accepted] = three_tasks(&store, done, "ephemeral", "a");
     let [dropped_assigned, dropped_reported, dropped_accepted] =
         three_tasks(&store, dropped, "ephemeral", "b");
-    store.mission_close(done, "done", "shipped").expect("close as done");
-    store.mission_close(dropped, "dropped", "gone").expect("drop");
+    store
+        .mission_close(done, "done", "shipped")
+        .expect("close as done");
+    store
+        .mission_close(dropped, "dropped", "gone")
+        .expect("drop");
 
     let mut client = admin(&schema);
-    let cancelled = [done_assigned, done_reported, dropped_assigned, dropped_reported];
+    let cancelled = [
+        done_assigned,
+        done_reported,
+        dropped_assigned,
+        dropped_reported,
+    ];
     let kept = [(done_accepted, "accepted"), (dropped_accepted, "accepted")];
     assert_cancelled_once(&store, &mut client, &cancelled, &kept, "after the closes");
 
     let types = control_types(&mut client);
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
-    assert_eq!(control_types(&mut client), types, "a refold appends nothing");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+    assert_eq!(
+        control_types(&mut client),
+        types,
+        "a refold appends nothing"
+    );
     store.migrate().expect("migrate again");
-    assert_eq!(control_types(&mut client), types, "migrating again appends nothing");
+    assert_eq!(
+        control_types(&mut client),
+        types,
+        "migrating again appends nothing"
+    );
     assert_cancelled_once(&store, &mut client, &cancelled, &kept, "after the replays");
 }
 
@@ -1752,7 +1825,9 @@ fn a_task_cancelled_before_the_records_gets_its_record_once_on_migration() {
             &[&budget],
         )
         .expect("abort");
-    store.mission_close(mission, "dropped", "gone").expect("drop");
+    store
+        .mission_close(mission, "dropped", "gone")
+        .expect("drop");
     // A close from before the fix: the fold cancelled, no record followed.
     client
         .execute(
@@ -1766,15 +1841,33 @@ fn a_task_cancelled_before_the_records_gets_its_record_once_on_migration() {
 
     store.migrate().expect("migrate");
     // A dropped mission keeps nothing: all three are cancelled.
-    assert_cancelled_once(&store, &mut client, &[assigned, reported, accepted], &[], "after migrating");
-    assert_eq!(cancelled_records(&mut client, budget), 0, "an aborted task gets none");
+    assert_cancelled_once(
+        &store,
+        &mut client,
+        &[assigned, reported, accepted],
+        &[],
+        "after migrating",
+    );
+    assert_eq!(
+        cancelled_records(&mut client, budget),
+        0,
+        "an aborted task gets none"
+    );
     assert_eq!(last_stage(&store, budget), "aborted");
 
     let types = control_types(&mut client);
     store.migrate().expect("migrate again");
-    assert_eq!(control_types(&mut client), types, "a task that has its record gets no second");
+    assert_eq!(
+        control_types(&mut client),
+        types,
+        "a task that has its record gets no second"
+    );
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
     assert_eq!(control_types(&mut client), types);
 }
