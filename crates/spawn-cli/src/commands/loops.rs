@@ -54,7 +54,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let supervised = supervised();
     let dispatching = env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0");
     let spawn = spawn_program();
-    let mut store: Option<PostgresStore> = None;
+    let mut store: Option<std::sync::Arc<PostgresStore>> = None;
     let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
     let mut disk = disk::Monitor::new(workspace_root.as_deref());
     let mut failures: u32 = 0;
@@ -76,7 +76,10 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
             fail("observer", &error.to_string());
         }
         if store.is_none() {
-            store = open_store().map_err(|error| fail("store", &error)).ok();
+            store = open_store()
+                .map(std::sync::Arc::new)
+                .map_err(|error| fail("store", &error))
+                .ok();
         }
         if let Some(open) = &store {
             let mut lines = Vec::new();

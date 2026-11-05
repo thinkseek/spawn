@@ -31,6 +31,7 @@ mod disk;
 mod dispatch;
 mod gate;
 mod integrate;
+mod main_merge;
 mod missions;
 mod objectives;
 mod push;
