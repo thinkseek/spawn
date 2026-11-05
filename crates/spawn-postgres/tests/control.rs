@@ -1619,14 +1619,6 @@ fn a_done_missions_running_task_is_still_held_to_its_budget() {
     );
 }
 
-/// The state of `task` in the tables.
-fn task_state(client: &mut Client, task: i64) -> String {
-    client
-        .query_one("select state from mission_tasks where id = $1", &[&task])
-        .expect("read the task")
-        .get(0)
-}
-
 /// How many `task.cancelled` records the control stream holds for `task`.
 fn cancelled_records(client: &mut Client, task: i64) -> i64 {
     client
