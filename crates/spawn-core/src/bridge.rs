@@ -927,14 +927,33 @@ impl Bridge {
             }
             return Ok(());
         };
+        let mut read = 0_usize;
         for line in bytes[..end].split(|byte| *byte == b'\n') {
+            let start = read;
+            read += line.len() + 1;
             let line = String::from_utf8_lossy(line);
+            let events = claude_line(&line);
+            // A turn's checkpoint is part of the turn's end: the workspace
+            // is committed (and its `artifact.committed` recorded) before
+            // the `turn.stopped` or `turn.failed` that ends it, so whoever
+            // reads the turn's end from the log also finds the checkpoint
+            // of what it wrote. A commit that fails holds the line back: it
+            // is read (and committed) again next tick.
+            let ends_turn = events.iter().any(|event| {
+                event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped)
+            });
+            if ends_turn
+                && !self.checkpoint(agent_id, session, active, CheckpointReason::TurnStopped, report)?
+            {
+                active.follow.offset += u64::try_from(start).unwrap_or(u64::MAX);
+                return Ok(());
+            }
             if active.follow.version.is_none()
                 && let Some(version) = claude_version(&line)
             {
                 self.record_version(agent_id, session, native, active, &path, version)?;
             }
-            for event in claude_line(&line) {
+            for event in events {
                 self.log.append(NewEvent {
                     agent_id: agent_id.clone(),
                     session_id: session.clone(),
