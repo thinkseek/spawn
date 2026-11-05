@@ -11,8 +11,10 @@
 //! - a task runs on its own model profile: a start or resume names it, and a
 //!   live worker on another profile is stopped first, then resumed on the
 //!   task's (a running engine keeps the models it started with);
-//! - a report (`.spawn/report.md`) is collected once its worker is idle, and
-//!   moved aside so the next task starts clean;
+//! - a report (`.spawn/report.md`) is collected once its worker is idle, if
+//!   it was written after the delivery's mark in the workspace (one clock,
+//!   the filesystem's, sets both times), and moved aside so the next task
+//!   starts clean;
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
@@ -43,6 +45,10 @@ pub(crate) const REPORT: &str = ".spawn/report.md";
 /// Where collected reports are kept, relative to the workspace.
 const KEPT_REPORTS: &str = ".spawn/reports";
 
+/// Where delivery leaves one empty file per delivery it sends, named by the
+/// delivery's key, relative to the workspace ([`mark_delivery`]).
+const DELIVERY_MARKS: &str = ".spawn/deliveries";
+
 /// One task row from `delivery_rows`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TaskRow {
@@ -66,10 +72,6 @@ pub(crate) struct TaskRow {
     /// The mission has a gate: its accepted work still has to land.
     #[serde(default)]
     pub(crate) gated: bool,
-    /// When the current delivery was recorded; a report older than it is
-    /// left over from before.
-    #[serde(default)]
-    pub(crate) delivered_at_ms: Option<i64>,
     /// The models the task's worker runs on.
     #[serde(default)]
     pub(crate) model: ModelProfile,
@@ -93,14 +95,24 @@ impl TaskRow {
         format!("deliver-{}-{}", self.id, self.revisions)
     }
 
-    /// A command to this task's session that delivers or retires it.
-    fn order(&self, key: String, action: CommandAction) -> Order {
+    /// A command to this task's session that carries the task to its
+    /// worker: submitting it marks the task delivered.
+    fn delivery(&self, key: String, action: CommandAction) -> Order {
+        Order {
+            task: Some(self.id),
+            ..self.command(key, action)
+        }
+    }
+
+    /// A command to this task's session that does not carry the task (a
+    /// stop before a model switch, a retirement): the task's state stays.
+    fn command(&self, key: String, action: CommandAction) -> Order {
         Order {
             agent_id: self.agent_id.clone(),
             session_id: self.session_id.clone(),
             key,
             action,
-            task: Some(self.id),
+            task: None,
         }
     }
 }
@@ -285,22 +297,25 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
                 return None;
             }
             if facts.model != task.model {
-                // Stopped at the same moment typing would be safe; the next
-                // pass resumes it, context kept, on the task's models.
+                // Stopped at the same moment typing would be safe. The stop
+                // does not carry the task, which stays waiting: once the
+                // stop has finished the worker is no longer live, and a
+                // later pass resumes it, context kept, on the task's models,
+                // with the resume that delivers the task.
                 let key = format!("switch-model-{}-{}", task.id, task.revisions);
-                return Some(task.order(key, CommandAction::Stop));
+                return Some(task.command(key, CommandAction::Stop));
             }
-            Some(task.order(key, CommandAction::Input { text: typed(task) }))
+            Some(task.delivery(key, CommandAction::Input { text: typed(task) }))
         }
         // Ran before: resume, so a resident keeps its context.
-        Some(facts) if facts.execution_id.is_some() => Some(task.order(
+        Some(facts) if facts.execution_id.is_some() => Some(task.delivery(
             key,
             CommandAction::Resume {
                 prompt: Some(resume_prompt(task)),
                 model,
             },
         )),
-        _ => Some(task.order(
+        _ => Some(task.delivery(
             key,
             CommandAction::Start {
                 engine: ENGINE.to_string(),
@@ -339,7 +354,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
                 && found.is_some_and(Facts::live_and_free) =>
             {
                 let key = format!("retire-task-{}", task.id);
-                orders.push(task.order(key, CommandAction::Stop));
+                orders.push(task.command(key, CommandAction::Stop));
             }
             TaskState::Accepted
             | TaskState::Cancelled
@@ -546,18 +561,53 @@ fn put_aside(path: &Path, workspace: &Path, task: i64) {
     }
 }
 
-/// Whether the file at `path` was written at or after `since_ms`; a report
-/// older than the delivery belongs to something else.
-fn written_since(path: &Path, since_ms: Option<i64>) -> bool {
-    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+/// The mark of the delivery `key` in `workspace`.
+fn delivery_mark(workspace: &Path, key: &str) -> std::path::PathBuf {
+    workspace.join(DELIVERY_MARKS).join(key)
+}
+
+/// Mark in the worker's workspace under `root` that `order`, which carries
+/// a task, is about to be sent: an empty file named by the delivery's key,
+/// written once (a delivery planned again keeps its first mark). Its
+/// modification time is set by the clock of the filesystem the worker writes
+/// its report on, so [`report_is_new`] compares two times of one clock and
+/// never a file's time with the database's.
+///
+/// A worker with no workspace yet gets no mark: the start or resume that
+/// delivers the task mounts a fresh one, with no report in it.
+pub(crate) fn mark_delivery(root: &Path, order: &Order) -> Result<(), String> {
+    let workspace = root.join(&order.agent_id);
+    if order.task.is_none() || !workspace.is_dir() {
+        return Ok(());
+    }
+    let mark = delivery_mark(&workspace, &order.key);
+    let created = mark
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&mark)
+        });
+    match created {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("mark {}: {error}", mark.display())),
+    }
+}
+
+/// Whether the report at `report` was written for the delivery whose mark
+/// is `mark`: at or after the mark, by the same filesystem clock. Without a
+/// mark the workspace was mounted after the delivery was sent (a start or
+/// resume mounts a fresh one), so everything in it is newer. A report that
+/// cannot be read is never new.
+fn report_is_new(report: &Path, mark: &Path) -> bool {
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified());
+    let Ok(written) = modified(report) else {
         return false;
     };
-    let modified_ms = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-        });
-    since_ms.is_none_or(|since| modified_ms >= since)
+    modified(mark).map_or(true, |sent| written >= sent)
 }
 
 /// Collect the reports of delivered tasks whose worker's turn stopped at an
@@ -585,7 +635,8 @@ pub(crate) fn collect_reports(
         }
         let workspace = root.join(&task.agent_id);
         let path = workspace.join(REPORT);
-        if !written_since(&path, task.delivered_at_ms) {
+        let mark = delivery_mark(&workspace, &task.delivery_key());
+        if !report_is_new(&path, &mark) {
             continue;
         }
         let Ok(report) = std::fs::read_to_string(&path) else {
@@ -597,6 +648,7 @@ pub(crate) fn collect_reports(
         match store.task_reported(task.id, report.trim()) {
             Ok(true) => {
                 put_aside(&path, &workspace, task.id);
+                let _ = std::fs::remove_file(&mark);
                 lines.push(format!("deliver: task #{} reported", task.id));
             }
             Ok(false) => {}
@@ -609,9 +661,10 @@ pub(crate) fn collect_reports(
 #[cfg(test)]
 mod tests {
     use super::{
-        News, TaskRow, Work, news_items, orders, report_contract, task_prompt, written_since,
+        News, REPORT, TaskRow, Work, delivery_mark, mark_delivery, news_items, orders,
+        report_contract, report_is_new, task_prompt,
     };
-    use crate::dispatch::{Facts, Sent, Why};
+    use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
@@ -633,7 +686,6 @@ mod tests {
             charter: Some("Owns spawn-core".to_string()),
             resident: Some("core".to_string()),
             gated: false,
-            delivered_at_ms: None,
             model: ModelProfile::Default,
         }
     }
@@ -822,6 +874,65 @@ mod tests {
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
     }
 
+    /// What submitting `plan` does to the task rows: an order that carries
+    /// a task marks it delivered (`spawn_task_delivered` takes an assigned
+    /// or revised task only).
+    fn submitted(mut work: Work, plan: &[crate::dispatch::Order]) -> Work {
+        for order in plan {
+            if let Some(id) = order.task
+                && let Some(task) = work.tasks.iter_mut().find(|task| task.id == id)
+                && matches!(task.state, TaskState::Assigned | TaskState::Revise)
+            {
+                task.state = TaskState::Delivered;
+            }
+        }
+        work
+    }
+
+    #[test]
+    fn a_model_switch_stops_the_worker_then_resumes_it_with_the_task() {
+        let cheap = TaskRow {
+            model: ModelProfile::Cheap,
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        let mut work = work(vec![cheap]);
+
+        // Idle on the other profile: the stop, which carries no task.
+        let plan = orders(&work, &[worker(true, true)]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, CommandAction::Stop);
+        assert_eq!(plan[0].task, None, "a stop delivers nothing");
+        work = submitted(work, &plan);
+        assert_eq!(work.tasks[0].state, TaskState::Assigned, "still waiting");
+
+        // The stop runs: nothing else goes to the session meanwhile.
+        let stopping = Facts {
+            open_command: true,
+            ..worker(true, true)
+        };
+        assert!(orders(&work, &[stopping]).is_empty());
+
+        // The stop finished: the resume on the task's profile delivers it.
+        let stopped = worker(false, false);
+        let plan = orders(&work, std::slice::from_ref(&stopped));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].task, Some(4));
+        assert_eq!(plan[0].key, "deliver-4-0");
+        assert!(matches!(
+            plan[0].action,
+            CommandAction::Resume {
+                model: Some(ModelProfile::Cheap),
+                ..
+            }
+        ));
+        work = submitted(work, &plan);
+        assert_eq!(work.tasks[0].state, TaskState::Delivered);
+        assert!(
+            orders(&work, &[stopped]).is_empty(),
+            "delivered once, nothing more"
+        );
+    }
+
     #[test]
     fn a_live_worker_gets_the_task_only_when_idle() {
         let tasks = vec![task(4, TaskState::Assigned, "resident")];
@@ -968,21 +1079,75 @@ mod tests {
         );
     }
 
+    /// A root with one worker's workspace in it, its report written, and
+    /// the delivery `deliver-4-0` to that worker marked.
+    fn marked_workspace(name: &str) -> (std::path::PathBuf, std::path::PathBuf, Order) {
+        let root = std::env::temp_dir().join(format!("spawn-report-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("agent_resident_core");
+        std::fs::create_dir_all(workspace.join(".spawn")).expect("workspace");
+        let order = Order {
+            agent_id: "agent_resident_core".to_string(),
+            session_id: "session_resident_core".to_string(),
+            key: "deliver-4-0".to_string(),
+            action: CommandAction::Stop,
+            task: Some(4),
+        };
+        mark_delivery(&root, &order).expect("marked");
+        std::fs::write(workspace.join(REPORT), "## Outcome\ndone").expect("report");
+        (root, workspace, order)
+    }
+
+    fn set_modified(path: &std::path::Path, at: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(at))
+            .expect("set the modification time");
+    }
+
     #[test]
-    fn a_report_older_than_the_delivery_is_not_collected() {
-        let dir = std::env::temp_dir().join(format!("spawn-report-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("report.md");
-        std::fs::write(&path, "## Outcome\ndone").expect("write");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or_default();
-        assert!(written_since(&path, None));
-        assert!(written_since(&path, Some(now - 60_000)));
-        assert!(!written_since(&path, Some(now + 60_000)), "left over");
-        assert!(!written_since(&dir.join("missing.md"), None));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_report_older_than_its_delivery_is_not_collected() {
+        let (root, workspace, _) = marked_workspace("older");
+        let report = workspace.join(REPORT);
+        let mark = delivery_mark(&workspace, "deliver-4-0");
+        let sent = std::time::SystemTime::now();
+        set_modified(&mark, sent);
+        set_modified(&report, sent - std::time::Duration::from_secs(10));
+        assert!(!report_is_new(&report, &mark), "left over from before");
+        set_modified(&report, sent + std::time::Duration::from_secs(10));
+        assert!(report_is_new(&report, &mark));
+        assert!(!report_is_new(&workspace.join("missing.md"), &mark));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_report_is_judged_by_its_filesystems_clock_never_the_databases() {
+        let (root, workspace, order) = marked_workspace("skewed");
+        let report = workspace.join(REPORT);
+        let mark = delivery_mark(&workspace, &order.key);
+        // The host's clock is a day behind the database's (or ahead: the
+        // database is never asked): the mark and the report share it.
+        let host = std::time::SystemTime::now() - std::time::Duration::from_hours(24);
+        set_modified(&mark, host);
+        set_modified(&report, host + std::time::Duration::from_secs(5));
+        assert!(report_is_new(&report, &mark));
+        // A delivery planned again keeps its first mark.
+        mark_delivery(&root, &order).expect("marked again");
+        let kept = std::fs::metadata(&mark).and_then(|meta| meta.modified());
+        assert_eq!(kept.ok(), Some(host));
+        assert!(report_is_new(&report, &mark));
+        // No mark: the workspace was mounted after the delivery.
+        std::fs::remove_file(&mark).expect("remove the mark");
+        assert!(report_is_new(&report, &mark));
+        // A worker with no workspace yet gets none, and no error.
+        let unmounted = Order {
+            agent_id: "agent_worker_new".to_string(),
+            ..order
+        };
+        mark_delivery(&root, &unmounted).expect("nothing to mark");
+        assert!(!root.join("agent_worker_new").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

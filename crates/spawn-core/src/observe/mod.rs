@@ -36,7 +36,8 @@ pub const QUIET_AFTER: Duration = Duration::from_mins(2);
 /// silent hang is noticed.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(30);
 
-/// A tool open this long with no other fact is ambiguous: it may hang.
+/// A tool open this long with no progress of the engine (no transcript
+/// fact; a busy screen read again is none) is ambiguous: it may hang.
 pub const LONG_TOOL: Duration = Duration::from_mins(10);
 
 /// A busy screen reading older than this no longer proves work: the screen is

@@ -326,6 +326,13 @@ pub(crate) fn step(
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for order in plan.orders {
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
+        // Before the command exists, so the worker's report for it comes
+        // after the mark (the mark decides which report is new).
+        if let Some(root) = root
+            && let Err(error) = deliver::mark_delivery(root, &order)
+        {
+            lines.push(format!("deliver: {error}"));
+        }
         submit(store, &principal, order)?;
         lines.push(line);
     }

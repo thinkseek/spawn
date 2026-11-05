@@ -21,6 +21,8 @@ use crate::{context, sources, supervise};
 /// them once. Rebuilding them per step would replay the whole log on every
 /// tick, and that cost grows with the log.
 pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
+    // The Bridge merges main into idle branches with `git --attr-source`.
+    crate::config::require_git()?;
     let store = Arc::new(open_store()?);
     let repo = flags
         .get("repo")
@@ -122,13 +124,36 @@ fn model_relay() -> Option<ModelRelay> {
     })
 }
 
-/// Claude Code's transcript directory as the engine sees it:
-/// `SPAWN_CLAUDE_PROJECTS`, else `$CLAUDE_CONFIG_DIR/projects`, else
-/// `$HOME/.claude/projects`.
+/// Claude Code's transcript directory as the engine sees it, which is where
+/// the Bridge reads it (through the terminal host: inside the container in
+/// container mode).
 fn claude_projects() -> String {
-    env_value("SPAWN_CLAUDE_PROJECTS")
-        .or_else(|| env_value("CLAUDE_CONFIG_DIR").map(|dir| format!("{dir}/projects")))
-        .unwrap_or_else(|| format!("{}/.claude/projects", env_or("HOME", "/root")))
+    resolve_claude_projects(env_value("SPAWN_EXEC_IMAGE").is_some(), env_value)
+}
+
+/// [`claude_projects`] over the environment `lookup` reads:
+/// `SPAWN_CLAUDE_PROJECTS` always wins. In container mode the engine runs
+/// in `docker exec`, which passes none of this process's environment: its
+/// home is the container's, `SPAWN_EXEC_HOME` (`/root`, the home of an
+/// image's root user, by default), and the directory is
+/// `<that home>/.claude/projects`; the host's `HOME` and
+/// `CLAUDE_CONFIG_DIR` say nothing about it. On the host it is
+/// `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`.
+fn resolve_claude_projects(container: bool, lookup: impl Fn(&str) -> Option<String>) -> String {
+    if let Some(projects) = lookup("SPAWN_CLAUDE_PROJECTS") {
+        return projects;
+    }
+    if container {
+        let home = lookup("SPAWN_EXEC_HOME").unwrap_or_else(|| "/root".to_string());
+        return format!("{}/.claude/projects", home.trim_end_matches('/'));
+    }
+    lookup("CLAUDE_CONFIG_DIR").map_or_else(
+        || {
+            let home = lookup("HOME").unwrap_or_else(|| "/root".to_string());
+            format!("{home}/.claude/projects")
+        },
+        |dir| format!("{dir}/projects"),
+    )
 }
 
 /// The model judge at `--judge-url` or `SPAWN_JUDGE_URL`. Without one the
@@ -143,4 +168,62 @@ fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
         config.model = model;
     }
     Some(Arc::new(JevJudge::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_claude_projects;
+
+    fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(known, _)| known == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn on_the_host_the_transcripts_are_under_the_hosts_home() {
+        let host = environment(&[("HOME", "/home/owner")]);
+        assert_eq!(
+            resolve_claude_projects(false, &host),
+            "/home/owner/.claude/projects"
+        );
+        let configured = environment(&[("HOME", "/home/owner"), ("CLAUDE_CONFIG_DIR", "/cc")]);
+        assert_eq!(resolve_claude_projects(false, configured), "/cc/projects");
+    }
+
+    #[test]
+    fn in_a_container_the_transcripts_are_under_the_containers_home() {
+        // The host's home and Claude config never reach `docker exec`.
+        let host = environment(&[("HOME", "/home/owner"), ("CLAUDE_CONFIG_DIR", "/cc")]);
+        assert_eq!(
+            resolve_claude_projects(true, &host),
+            "/root/.claude/projects"
+        );
+        let image = environment(&[("HOME", "/home/owner"), ("SPAWN_EXEC_HOME", "/home/agent/")]);
+        assert_eq!(
+            resolve_claude_projects(true, image),
+            "/home/agent/.claude/projects"
+        );
+    }
+
+    #[test]
+    fn an_explicit_transcript_directory_wins_in_both_modes() {
+        let explicit = environment(&[
+            ("HOME", "/home/owner"),
+            ("SPAWN_EXEC_HOME", "/home/agent"),
+            ("SPAWN_CLAUDE_PROJECTS", "/mnt/transcripts"),
+        ]);
+        assert_eq!(resolve_claude_projects(true, &explicit), "/mnt/transcripts");
+        assert_eq!(
+            resolve_claude_projects(false, &explicit),
+            "/mnt/transcripts"
+        );
+    }
 }

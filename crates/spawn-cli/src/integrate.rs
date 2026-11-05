@@ -282,6 +282,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         .cloned()
         .collect();
     let flags = Flags::parse(&valued).map_err(|error| format!("{error}\n{USAGE}"))?;
+    crate::config::require_git()?;
     let root = workspace_root(&flags)
         .map(PathBuf::from)
         .ok_or_else(|| format!("--root or SPAWN_WORKSPACE_ROOT is required\n{USAGE}"))?;

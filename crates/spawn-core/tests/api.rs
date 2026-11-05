@@ -114,6 +114,24 @@ fn events_round_trip_through_json() {
         serde_json::from_value::<EventKind>(started),
         Ok(EventKind::ExecutionStarted { engine, .. }) if engine == "codex"
     ));
+    // The terminal is the execution's own: a new record does not name it,
+    // and an old one that does reads the same.
+    let old = serde_json::json!({
+        "name": "execution.started",
+        "detail": {"engine": ENGINE, "terminal": "spawn-exec_1",
+                   "workspace": "1:/w", "command_id": 1},
+    });
+    let read: EventKind = serde_json::from_value(old).expect("an old record reads");
+    let written = serde_json::to_value(&read).expect("serialize");
+    assert!(written["detail"].get("terminal").is_none(), "{written}");
+    assert_eq!(
+        serde_json::from_value::<EventKind>(written).expect("reads back"),
+        read
+    );
+    assert_eq!(
+        TerminalName::for_execution(&ExecutionId::new("exec_1").expect("valid")).as_str(),
+        "spawn-exec_1"
+    );
     let start = |engine: &str| {
         serde_json::from_value::<CommandAction>(
             serde_json::json!({"type": "start", "engine": engine, "prompt": "x"}),
@@ -756,7 +774,6 @@ fn observer_writes_only_on_change() {
             source_event_id: None,
             kind: EventKind::ExecutionStarted {
                 engine: ENGINE.to_string(),
-                terminal: TerminalName::new("spawn-exec_1").expect("valid"),
                 workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"),
                 command_id: CommandId(1),
                 fork: None,

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use spawn_core::event::EndCause;
 use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
-use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, TerminalName, WorkspaceId};
+use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, WorkspaceId};
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
 use spawn_core::observe::{
@@ -115,7 +115,6 @@ fn started(store: &MemoryStore) {
         Source::Bridge,
         EventKind::ExecutionStarted {
             engine: ENGINE.to_string(),
-            terminal: TerminalName::new("spawn-exec_1").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(1),
             fork: None,
@@ -433,6 +432,72 @@ fn a_tool_open_for_long_is_ambiguous() {
     fixture.clock.advance(Duration::from_mins(6));
     fixture.observer.tick().expect("tick");
     assert_eq!(judge.calls(), 1, "an eleven-minute silent tool may hang");
+}
+
+#[test]
+fn a_hung_tool_under_a_busy_spinner_still_asks_for_attention() {
+    let judge = Scripted::new(Err("no judge today".to_string()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    append(
+        &fixture.store,
+        Source::Claude,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "t1".to_string(),
+        },
+    );
+    // The pane keeps showing the spinner, so the Bridge records the busy
+    // screen again every 30 s; the transcript says nothing more.
+    let busy = |store: &MemoryStore| {
+        append(
+            store,
+            Source::Bridge,
+            EventKind::ScreenObserved {
+                state: ScreenState::Busy,
+                evidence: "esc to interrupt".to_string(),
+            },
+        );
+    };
+    for _ in 0..19 {
+        busy(&fixture.store);
+        fixture.observer.tick().expect("tick");
+        fixture.clock.advance(Duration::from_secs(30));
+    }
+    assert_eq!(judge.calls(), 0, "nine and a half minutes: a long build");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert!(!last.attention);
+
+    for _ in 0..3 {
+        busy(&fixture.store);
+        fixture.observer.tick().expect("tick");
+        fixture.clock.advance(Duration::from_secs(30));
+    }
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(
+        last.ambiguity,
+        Some(Ambiguity::QuietLive),
+        "eleven minutes of one tool and no progress may hang, busy screen or not"
+    );
+    assert!(last.attention, "{last:?}");
+    assert!(judge.calls() >= 1, "the case went to the judge");
+
+    // The tool finishes: progress again, and work again.
+    append(
+        &fixture.store,
+        Source::Claude,
+        EventKind::ToolCompleted {
+            tool_use_id: "t1".to_string(),
+            duration_ms: None,
+        },
+    );
+    busy(&fixture.store);
+    fixture.clock.advance(Duration::from_secs(1));
+    fixture.observer.tick().expect("tick");
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert_eq!(last.ambiguity, None);
 }
 
 #[test]
@@ -766,7 +831,6 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
         2,
         EventKind::ExecutionStarted {
             engine: ENGINE.to_string(),
-            terminal: TerminalName::new("spawn-exec_2").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(2),
             fork: None,
