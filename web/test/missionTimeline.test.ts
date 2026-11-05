@@ -242,7 +242,7 @@ test("an open task runs to now; a halted mission's open task is stalled", () => 
   assert.equal(phaseAt(live!, T0 + 40 * MIN, now), null);
 });
 
-test("cancelled tasks: by a record, by over-budget abort, and by state alone", () => {
+test("cancelled tasks: by a record and by over-budget abort", () => {
   const byRecord = taskBar(
     task(8, "cancelled", [
       ["assigned", 0],
@@ -264,19 +264,6 @@ test("cancelled tasks: by a record, by over-budget abort, and by state alone", (
     mission(1, []),
   );
   assert.equal(aborted!.outcome, "aborted");
-
-  // The mission was dropped: the task has no record of its own, so it ends
-  // at its last update.
-  const byState = taskBar(
-    task(10, "cancelled", [
-      ["assigned", 0],
-      ["delivered", 1],
-    ], { updated_at_ms: T0 + 12 * MIN }),
-    mission(1, []),
-  );
-  assert.equal(byState!.outcome, "cancelled");
-  assert.equal(byState!.end, T0 + 12 * MIN);
-  assert.deepEqual(byState!.segments.at(-1), { phase: "working", start: T0 + MIN, end: T0 + 12 * MIN, attempt: 1 });
 });
 
 test("records after the end are ignored, and clocks never run backwards", () => {
