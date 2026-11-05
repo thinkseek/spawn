@@ -16,8 +16,8 @@
 //! blob, so a checkpoint never drops it from the tree.
 //!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
-//! part before the colon, and the container of an execution is named from it,
-//! so every call rebuilds the mapping from the identifier alone.
+//! part before the colon, so every call rebuilds the mapping from the
+//! identifier alone.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -54,36 +54,6 @@ const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
 /// rewritten 200 MiB binary costs seconds per checkpoint on the Bridge's loop
 /// and its full size again in the repository each time.
 pub const LARGE_FILE_BYTES: u64 = 8 << 20;
-
-/// Docker settings for a workspace that hosts the engine.
-#[derive(Debug, Clone)]
-pub struct Container {
-    /// Program that talks to the daemon.
-    pub docker: String,
-    /// Image the engine runs in.
-    pub image: String,
-}
-
-/// Name of the container that hosts one branch's workspace.
-pub fn container_name(branch: &str) -> String {
-    format!("spawn-exec-{branch}")
-}
-
-/// argv prefix that runs one shell command inside a workspace container.
-///
-/// The container mounts the workspace at its host path, so no path
-/// translation is needed anywhere.
-pub fn docker_prefix(docker: &str, branch: &str) -> Vec<String> {
-    vec![
-        docker.to_string(),
-        "exec".to_string(),
-        "-i".to_string(),
-        "-t".to_string(),
-        container_name(branch),
-        "sh".to_string(),
-        "-c".to_string(),
-    ]
-}
 
 /// Stdout of a git command exactly as written, bytes and all, or the
 /// failure as an error. A `-z` listing is read this way: a path may begin
@@ -185,7 +155,6 @@ pub struct GitWorkspace {
     repo: PathBuf,
     root: PathBuf,
     git: String,
-    container: Option<Container>,
     /// Where large files are kept, as content-defined chunks.
     chunks: Arc<dyn ChunkStore>,
 }
@@ -266,7 +235,6 @@ impl GitWorkspace {
             repo: repo.as_ref().to_path_buf(),
             root: root.as_ref().to_path_buf(),
             git: "git".to_string(),
-            container: None,
             chunks: Arc::new(LocalChunkStore::new(
                 root.as_ref().join(DEFAULT_CHUNK_DIRECTORY),
             )),
@@ -279,22 +247,6 @@ impl GitWorkspace {
     pub fn with_chunks(mut self, chunks: Arc<dyn ChunkStore>) -> Self {
         self.chunks = chunks;
         self
-    }
-
-    /// Store whose working trees are mounted into one disposable container.
-    pub fn with_container(
-        repo: impl AsRef<Path>,
-        root: impl AsRef<Path>,
-        docker: &str,
-        image: &str,
-    ) -> Self {
-        Self {
-            container: Some(Container {
-                docker: docker.to_string(),
-                image: image.to_string(),
-            }),
-            ..Self::new(repo, root)
-        }
     }
 
     fn command(&self) -> Command {
@@ -416,44 +368,6 @@ impl GitWorkspace {
         let commit = self.git_output(&["commit-tree", &tree, "-m", "spawn: base"])?;
         self.git_output(&["update-ref", &format!("refs/heads/{BASE}"), &commit])?;
         Ok(())
-    }
-
-    fn start_container(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
-        let Some(container) = self.container.as_ref() else {
-            return Ok(());
-        };
-        let name = container_name(branch);
-        let _ = Command::new(&container.docker)
-            .args(["rm", "-f", &name])
-            .stdin(Stdio::null())
-            .output();
-        let mount = format!("{}:{}", directory.display(), directory.display());
-        let output = Command::new(&container.docker)
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &name,
-                "-v",
-                &mount,
-                "-w",
-                &directory.display().to_string(),
-                &container.image,
-                "sleep",
-                "infinity",
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| {
-                WorkspaceError::Unavailable(format!("run {}: {error}", container.docker))
-            })?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(WorkspaceError::Unavailable(format!(
-            "container {name}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
     }
 
     /// Exclude build output and the controller's marker from every commit.
@@ -1216,8 +1130,6 @@ impl WorkspaceStore for GitWorkspace {
         // A fresh export is the branch head: nothing stale is left.
         self.clear_stale(branch.as_str());
 
-        self.start_container(branch.as_str(), &directory)?;
-
         WorkspaceId::new(format!("{branch}:{}", directory.display()))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
     }
@@ -1286,12 +1198,6 @@ impl WorkspaceStore for GitWorkspace {
         self.keep_stale_directory(workspace.sandbox(), &directory)?;
         // A pending merge stays only when the branch carries its markers.
         self.settle_pending(workspace.sandbox());
-        if let Some(container) = self.container.as_ref() {
-            let _ = Command::new(&container.docker)
-                .args(["rm", "-f", &container_name(workspace.sandbox())])
-                .stdin(Stdio::null())
-                .output();
-        }
         match std::fs::remove_dir_all(&directory) {
             Ok(()) => {
                 self.clear_stale(workspace.sandbox());

@@ -4,21 +4,14 @@
 //! the last lines of the pane. `send-keys -l` types bytes literally, so a
 //! prompt reaches the engine unchanged.
 //!
-//! Two deployment shapes:
-//!
-//! - local: tmux runs on the same machine, and the engine starts in that
-//!   terminal.
-//! - in workspace: tmux runs inside the execution's container, so every tmux
-//!   call is wrapped by a `docker exec` prefix. Every port call names the
-//!   workspace, so the host keeps no state and works the same in a new
-//!   process.
+//! tmux runs on the same machine as Spawn, and the engine starts in that
+//! terminal. The host keeps no state, so it works the same in a new
+//! process.
 
 use std::process::Command;
-use std::sync::Arc;
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{Launch, READ_LIMIT, TerminalError, TerminalHost};
-use spawn_core::shell::shell_join;
 
 /// Variables kept out of the tmux server's environment, besides every
 /// `SPAWN_*` one (see [`scrub`]).
@@ -34,9 +27,6 @@ fn scrub(name: &std::ffi::OsStr) -> bool {
         .is_some_and(|name| name.starts_with("SPAWN_") || SCRUBBED.contains(&name))
 }
 
-/// Builds the argv prefix that runs one command inside a workspace.
-pub type PrefixBuilder = dyn Fn(&WorkspaceId) -> Vec<String> + Send + Sync;
-
 /// Size of a new terminal. Claude needs width for a prompt box and height
 /// for the tail window.
 const WIDTH: &str = "200";
@@ -46,7 +36,6 @@ const HEIGHT: &str = "50";
 pub struct TmuxHost {
     program: String,
     socket: Option<String>,
-    builder: Option<Arc<PrefixBuilder>>,
 }
 
 /// One finished tmux call.
@@ -54,36 +43,21 @@ struct Run {
     code: Option<i32>,
     stdout: String,
     stderr: String,
-    stdout_bytes: Vec<u8>,
 }
 
 impl TmuxHost {
-    /// Host whose tmux shares this machine with Spawn.
+    /// Host whose tmux shares this machine with Spawn, on tmux's default
+    /// server.
     pub fn local(program: &str) -> Self {
-        Self {
-            program: program.to_string(),
-            socket: None,
-            builder: None,
-        }
+        Self::on_socket(program, None)
     }
 
-    /// Host whose tmux lives inside the workspace sandbox.
-    pub fn in_workspaces(
-        program: &str,
-        builder: Arc<PrefixBuilder>,
-        socket: Option<String>,
-    ) -> Self {
+    /// Host on the tmux server of `socket` (`tmux -L`), or the default one.
+    pub fn on_socket(program: &str, socket: Option<String>) -> Self {
         Self {
             program: program.to_string(),
             socket,
-            builder: Some(builder),
         }
-    }
-
-    fn prefix(&self, workspace: &WorkspaceId) -> Vec<String> {
-        self.builder
-            .as_ref()
-            .map_or_else(Vec::new, |builder| builder(workspace))
     }
 
     fn words(&self, arguments: &[String]) -> Vec<String> {
@@ -96,8 +70,8 @@ impl TmuxHost {
         words
     }
 
-    fn run(&self, prefix: &[String], arguments: &[String]) -> Result<Run, TerminalError> {
-        run_words(prefix, &self.words(arguments))
+    fn run(&self, arguments: &[String]) -> Result<Run, TerminalError> {
+        run_words(&self.words(arguments))
     }
 
     /// Session target with exact-name matching.
@@ -116,29 +90,10 @@ impl TmuxHost {
     }
 }
 
-/// Run `words`, inside the workspace when `prefix` is not empty.
-fn run_words(prefix: &[String], words: &[String]) -> Result<Run, TerminalError> {
-    run_words_with_input(prefix, words, None)
-}
-
-/// [`run_words`], with `input` on the command's standard input.
-fn run_words_with_input(
-    prefix: &[String],
-    words: &[String],
-    input: Option<&[u8]>,
-) -> Result<Run, TerminalError> {
-    let mut command = match prefix.split_first() {
-        None => {
-            let mut command = Command::new(&words[0]);
-            command.args(&words[1..]);
-            command
-        }
-        Some((program, rest)) => {
-            let mut command = Command::new(program);
-            command.args(rest).arg(shell_join(words));
-            command
-        }
-    };
+/// Run `words`: the program, then its arguments.
+fn run_words(words: &[String]) -> Result<Run, TerminalError> {
+    let mut command = Command::new(&words[0]);
+    command.args(&words[1..]);
     // The first command starts the tmux server, whose global environment
     // every pane inherits and can read with `tmux show-environment -g`.
     for (name, _) in std::env::vars_os() {
@@ -147,37 +102,16 @@ fn run_words_with_input(
         }
     }
     let failed = |error: std::io::Error| TerminalError(format!("run {}: {error}", words[0]));
-    let output = match input {
-        None => command.output().map_err(failed)?,
-        Some(input) => {
-            use std::io::Write;
-            let mut child = command
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(failed)?;
-            let written = child
-                .stdin
-                .take()
-                .map_or(Ok(()), |mut stdin| stdin.write_all(input));
-            let output = child.wait_with_output().map_err(failed)?;
-            written.map_err(failed)?;
-            output
-        }
-    };
+    let output = command.output().map_err(failed)?;
     Ok(Run {
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        stdout_bytes: output.stdout,
     })
 }
 
 impl TerminalHost for TmuxHost {
     fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
-        let prefix = self.prefix(&launch.workspace);
-
         let mut arguments = vec![
             "new-session".to_string(),
             "-d".to_string(),
@@ -198,7 +132,7 @@ impl TerminalHost for TmuxHost {
         arguments.push(launch.program.clone());
         arguments.extend(launch.arguments.iter().cloned());
 
-        let run = self.run(&prefix, &arguments)?;
+        let run = self.run(&arguments)?;
         if run.code == Some(0) {
             return Ok(());
         }
@@ -215,10 +149,9 @@ impl TerminalHost for TmuxHost {
     fn submit_text(
         &self,
         terminal: &TerminalName,
-        workspace: &WorkspaceId,
+        _workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError> {
-        let prefix = self.prefix(workspace);
         let target = Self::pane(terminal);
         // One bracketed paste, then one Enter. Typing a line and pressing
         // Enter per line would submit a multi-paragraph prompt in pieces.
@@ -230,7 +163,7 @@ impl TerminalHost for TmuxHost {
             "--".to_string(),
             text.to_string(),
         ];
-        let run = self.run(&prefix, &set)?;
+        let run = self.run(&set)?;
         if run.code != Some(0) {
             return Err(TerminalError(format!(
                 "set-buffer failed: {}",
@@ -246,7 +179,7 @@ impl TerminalHost for TmuxHost {
             "-t".to_string(),
             target.clone(),
         ];
-        let run = self.run(&prefix, &paste)?;
+        let run = self.run(&paste)?;
         if run.code != Some(0) {
             return Err(TerminalError(format!(
                 "paste-buffer failed: {}",
@@ -259,7 +192,7 @@ impl TerminalHost for TmuxHost {
             target,
             "Enter".to_string(),
         ];
-        let run = self.run(&prefix, &enter)?;
+        let run = self.run(&enter)?;
         if run.code != Some(0) {
             return Err(TerminalError(format!(
                 "send-keys Enter failed: {}",
@@ -272,10 +205,9 @@ impl TerminalHost for TmuxHost {
     fn send_keys(
         &self,
         terminal: &TerminalName,
-        workspace: &WorkspaceId,
+        _workspace: &WorkspaceId,
         keys: &[&str],
     ) -> Result<(), TerminalError> {
-        let prefix = self.prefix(workspace);
         let target = Self::pane(terminal);
         // One key per call. A dialog reads the first key and redraws; keys
         // sent in the same burst can arrive before it listens again.
@@ -286,7 +218,7 @@ impl TerminalHost for TmuxHost {
                 target.clone(),
                 (*key).to_string(),
             ];
-            let run = self.run(&prefix, &send)?;
+            let run = self.run(&send)?;
             if run.code != Some(0) {
                 return Err(TerminalError(format!(
                     "send-keys {key} failed: {}",
@@ -301,17 +233,13 @@ impl TerminalHost for TmuxHost {
     fn is_alive(
         &self,
         terminal: &TerminalName,
-        workspace: &WorkspaceId,
+        _workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError> {
-        let prefix = self.prefix(workspace);
-        let run = self.run(
-            &prefix,
-            &[
-                "has-session".to_string(),
-                "-t".to_string(),
-                Self::target(terminal),
-            ],
-        )?;
+        let run = self.run(&[
+            "has-session".to_string(),
+            "-t".to_string(),
+            Self::target(terminal),
+        ])?;
         match run.code {
             Some(0) => Ok(true),
             Some(1) if gone(&run.stderr) => Ok(false),
@@ -328,21 +256,17 @@ impl TerminalHost for TmuxHost {
     fn capture_tail(
         &self,
         terminal: &TerminalName,
-        workspace: &WorkspaceId,
+        _workspace: &WorkspaceId,
         lines: usize,
     ) -> Result<String, TerminalError> {
-        let prefix = self.prefix(workspace);
-        let run = self.run(
-            &prefix,
-            &[
-                "capture-pane".to_string(),
-                "-p".to_string(),
-                "-t".to_string(),
-                Self::pane(terminal),
-                "-S".to_string(),
-                format!("-{lines}"),
-            ],
-        )?;
+        let run = self.run(&[
+            "capture-pane".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            Self::pane(terminal),
+            "-S".to_string(),
+            format!("-{lines}"),
+        ])?;
         if run.code == Some(0) {
             return Ok(run.stdout);
         }
@@ -355,17 +279,13 @@ impl TerminalHost for TmuxHost {
     fn terminate(
         &self,
         terminal: &TerminalName,
-        workspace: &WorkspaceId,
+        _workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
-        let prefix = self.prefix(workspace);
-        let run = self.run(
-            &prefix,
-            &[
-                "kill-session".to_string(),
-                "-t".to_string(),
-                Self::target(terminal),
-            ],
-        )?;
+        let run = self.run(&[
+            "kill-session".to_string(),
+            "-t".to_string(),
+            Self::target(terminal),
+        ])?;
         if run.code == Some(0) {
             return Ok(());
         }
@@ -381,79 +301,20 @@ impl TerminalHost for TmuxHost {
 
     fn read_from(
         &self,
-        workspace: &WorkspaceId,
+        _workspace: &WorkspaceId,
         path: &str,
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError> {
-        let prefix = self.prefix(workspace);
-        if prefix.is_empty() {
-            return read_local(path, offset);
-        }
-        // Inside the workspace's container: `tail -c +N` prints from byte N
-        // (1-based); a missing file exits 3 so it is told apart from failure.
-        // Anything but a regular file exits 4. The read opens the file the
-        // way `read_local` does (no symlink, never blocking), so a file
-        // swapped for a FIFO after the check reads as nothing rather than
-        // hanging; it is bounded in size (`count`) and time (`timeout`).
-        let script = format!(
-            "test -e {path} || test -L {path} || exit 3; \
-             test -f {path} && ! test -L {path} || exit 4; \
-             dd if={path} iflag=nofollow,nonblock,skip_bytes,count_bytes \
-             skip={offset} count={READ_LIMIT} bs=1M status=none",
-            path = spawn_core::shell::shell_quote(path)
-        );
-        let words = vec!["sh".to_string(), "-c".to_string(), script];
-        let bounded: Vec<String> = ["timeout", "5"]
-            .into_iter()
-            .map(String::from)
-            .chain(prefix)
-            .collect();
-        let run = run_words(&bounded, &words)?;
-        match run.code {
-            Some(0) => Ok(Some(run.stdout_bytes)),
-            Some(3) => Ok(None),
-            Some(4) => Err(TerminalError(format!("{path} is not a regular file"))),
-            other => Err(TerminalError(format!(
-                "read {path} returned {other:?}: {}",
-                run.stderr.trim()
-            ))),
-        }
+        read_local(path, offset)
     }
 
     fn write_new(
         &self,
-        workspace: &WorkspaceId,
+        _workspace: &WorkspaceId,
         path: &str,
         bytes: &[u8],
     ) -> Result<bool, TerminalError> {
-        let prefix = self.prefix(workspace);
-        if prefix.is_empty() {
-            return write_local(path, bytes);
-        }
-        // Inside the workspace's container, as `write_local` does it: a
-        // file already there exits 3; the bytes come on standard input.
-        let script = format!(
-            "test -e {path} || test -L {path} && exit 3; \
-             d=$(dirname {path}) && mkdir -p \"$d\" || exit 1; \
-             t=\"$d/.spawn-write-$$\"; rm -f \"$t\"; \
-             cat >\"$t\" && ln \"$t\" {path}; s=$?; rm -f \"$t\"; exit $s",
-            path = spawn_core::shell::shell_quote(path)
-        );
-        let words = vec!["sh".to_string(), "-c".to_string(), script];
-        let bounded: Vec<String> = ["timeout", "60"]
-            .into_iter()
-            .map(String::from)
-            .chain(prefix)
-            .collect();
-        let run = run_words_with_input(&bounded, &words, Some(bytes))?;
-        match run.code {
-            Some(0) => Ok(true),
-            Some(3) => Ok(false),
-            other => Err(TerminalError(format!(
-                "write {path} returned {other:?}: {}",
-                run.stderr.trim()
-            ))),
-        }
+        write_local(path, bytes)
     }
 }
 

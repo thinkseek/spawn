@@ -313,8 +313,7 @@ projects directory) is the agent's history: `--resume` reads it, and the
 Bridge derives the session's events from it. It is not Spawn's to keep.
 Claude Code deletes old transcripts (its `cleanupPeriodDays` sweep runs at
 every engine start, over the projects directory the owner's own sessions
-share), a container's copy goes with the container at unmount, and the
-format is the engine's. So Spawn keeps its own copy
+share), and the format is the engine's. So Spawn keeps its own copy
 (`spawn_core::transcripts`, the `TranscriptArchive` port, a local directory
 adapter in `spawn_host::transcripts`):
 
@@ -322,8 +321,8 @@ adapter in `spawn_host::transcripts`):
   the workspaces and the chunk store, on the host that ran the engine.
 - **When.** After the checkpoint of each turn end, and at the end of each
   execution, after its terminal is killed and before its workspace is
-  unmounted: the Bridge reads (through the terminal host, so inside a
-  container too) what the file gained since the latest copy and appends it,
+  unmounted: the Bridge reads (through the terminal host) what the file
+  gained since the latest copy and appends it,
   each append made durable (`fdatasync`, and the directory for a new file).
   A failure is a tick warning; the next copy takes what was missed.
 - **Never overwritten.** The file is append-only. The Bridge compares the
@@ -332,7 +331,7 @@ adapter in `spawn_host::transcripts`):
   next copy, `<native session>.<n>.jsonl`, and the earlier copies stay as
   they were. An append to a copy at any length but its own is refused.
 - **Restore on resume.** Before a `resume` starts the engine (after the
-  mount, so a container exists), a missing transcript is put back from the
+  mount), a missing transcript is put back from the
   latest copy, created whole or not at all (a temporary file linked into
   place; never over a file that is there), and the tick warns that it was
   restored. A transcript that is gone with no copy, for a session whose

@@ -17,8 +17,8 @@ mod audit_repro;
 
 pub use chunks::LocalChunkStore;
 pub use git::{
-    DEFAULT_CHUNK_DIRECTORY, GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix,
-    has_conflict_block, has_conflict_block_sized,
+    DEFAULT_CHUNK_DIRECTORY, GitWorkspace, LARGE_FILE_BYTES, has_conflict_block,
+    has_conflict_block_sized,
 };
-pub use tmux::{PrefixBuilder, TmuxHost};
+pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};

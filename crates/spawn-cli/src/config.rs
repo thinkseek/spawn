@@ -251,20 +251,11 @@ impl Flags {
     }
 }
 
-/// The terminal host the environment describes: tmux on this machine, or
-/// inside each workspace's container when `SPAWN_EXEC_IMAGE` is set.
+/// The terminal host the environment describes: tmux on this machine, on
+/// the server of `SPAWN_TMUX_SOCKET` when it is set.
 pub(crate) fn terminal_host() -> spawn_host::TmuxHost {
-    use spawn_core::id::WorkspaceId;
-    let program = env_or("SPAWN_TMUX_PROGRAM", "tmux");
-    let socket = env_value("SPAWN_TMUX_SOCKET");
-    let prefix: std::sync::Arc<spawn_host::PrefixBuilder> = match env_value("SPAWN_EXEC_IMAGE") {
-        Some(_) => {
-            let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
-            std::sync::Arc::new(move |workspace: &WorkspaceId| {
-                spawn_host::docker_prefix(&docker, workspace.sandbox())
-            })
-        }
-        None => std::sync::Arc::new(|_: &WorkspaceId| Vec::new()),
-    };
-    spawn_host::TmuxHost::in_workspaces(&program, prefix, socket)
+    spawn_host::TmuxHost::on_socket(
+        &env_or("SPAWN_TMUX_PROGRAM", "tmux"),
+        env_value("SPAWN_TMUX_SOCKET"),
+    )
 }
