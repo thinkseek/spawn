@@ -62,13 +62,20 @@ fn numeric_zone(text: &str) -> Option<(&str, i64)> {
         _ => return None,
     };
     let (hours, minutes) = zone.get(1..)?.split_once(':')?;
-    let minutes = hours.parse::<i64>().ok()? * 60 + minutes.parse::<i64>().ok()?;
-    Some((text, sign * minutes * 60_000))
+    let (hours, minutes) = (hours.parse::<i64>().ok()?, minutes.parse::<i64>().ok()?);
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some((text, sign * (hours * 60 + minutes) * 60_000))
 }
 
 /// Milliseconds since the epoch of an RFC 3339 time such as
 /// `2026-11-04T05:46:12.345Z` (the form Claude Code writes) or one with a
 /// numeric offset, `2026-11-04T13:46:12.345+08:00`.
+///
+/// Total: any text that is not such a time, a field out of its range
+/// (years 1 to 9999), gives `None`, never a panic or a wrapped value; the
+/// text may come from a file an engine writes.
 pub fn utc_ms(text: &str) -> Option<i64> {
     let (text, offset_ms) = match text.strip_suffix('Z') {
         Some(text) => (text, 0),
@@ -85,7 +92,13 @@ pub fn utc_ms(text: &str) -> Option<i64> {
         clock.next()?.ok()?,
     );
     let millis: i64 = format!("{fraction:0<3}").get(..3)?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
         return None;
     }
     // Days from the civil date (Howard Hinnant's algorithm).
@@ -167,9 +180,10 @@ fn user_text(content: &Value, uuid: &str) -> Vec<Normalized> {
     }
 }
 
-/// The events in one Claude Code transcript line written at or after
-/// `since_ms` (the start of the execution being followed): a resumed
-/// session's transcript holds the earlier executions' lines too.
+/// The events in one Claude Code transcript line. Which lines are an
+/// execution's is decided by where they are in the file (the Bridge reads
+/// from the transcript's length when the execution started), never by the
+/// time a line claims: that time is written by the engine.
 ///
 /// - a prompt (a user line that is not a tool result) starts a turn;
 /// - each `tool_use` block of an assistant line starts a tool, and each
@@ -178,18 +192,12 @@ fn user_text(content: &Value, uuid: &str) -> Vec<Normalized> {
 ///   stop the turn; an API error line fails it.
 ///
 /// Sub-agent (`isSidechain`) lines are the sub-agent's, not the session's.
-pub fn claude_line(line: &str, since_ms: i64) -> Vec<Normalized> {
+pub fn claude_line(line: &str) -> Vec<Normalized> {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return Vec::new();
     };
     let field = |name: &str| value.get(name).and_then(Value::as_str);
-    // A line older than the execution is an earlier execution's (a resumed
-    // session appends to the same file). A line whose time cannot be read is
-    // kept, not dropped: its `uuid` key stops a second append if it was.
-    let written = field("timestamp").and_then(utc_ms);
-    if written.is_some_and(|at| at < since_ms)
-        || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
-    {
+    if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
     }
     let Some(uuid) = field("uuid") else {
@@ -245,17 +253,10 @@ pub fn claude_line(line: &str, since_ms: i64) -> Vec<Normalized> {
 }
 
 /// The engine version a Claude Code transcript line names (its `version`
-/// field), for a line written at or after `since_ms` (a resumed session's
-/// transcript holds lines an earlier engine wrote).
-pub fn claude_version(line: &str, since_ms: i64) -> Option<String> {
+/// field). Like [`claude_line`], the caller reads only the execution's part
+/// of the file.
+pub fn claude_version(line: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(line).ok()?;
-    let written = value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(utc_ms);
-    if written.is_some_and(|at| at < since_ms) {
-        return None;
-    }
     let version = value.get("version").and_then(Value::as_str)?.trim();
     (!version.is_empty() && version.len() <= 64).then(|| version.to_string())
 }
@@ -267,15 +268,10 @@ mod tests {
     #[test]
     fn a_line_names_the_engine_version_it_was_written_by() {
         let line = r#"{"type":"user","uuid":"u1","timestamp":"2026-11-04T05:46:12.345Z","version":"2.1.318","message":{"content":"x"}}"#;
-        assert_eq!(claude_version(line, 0).as_deref(), Some("2.1.318"));
-        assert_eq!(
-            claude_version(line, 1_793_771_172_346),
-            None,
-            "an earlier execution's line"
-        );
-        assert_eq!(claude_version(r#"{"type":"mode","version":""}"#, 0), None);
-        assert_eq!(claude_version(r#"{"type":"mode"}"#, 0), None);
-        assert_eq!(claude_version("not json", 0), None);
+        assert_eq!(claude_version(line).as_deref(), Some("2.1.318"));
+        assert_eq!(claude_version(r#"{"type":"mode","version":""}"#), None);
+        assert_eq!(claude_version(r#"{"type":"mode"}"#), None);
+        assert_eq!(claude_version("not json"), None);
     }
     use crate::event::EventKind;
 
@@ -301,20 +297,65 @@ mod tests {
     }
 
     #[test]
-    fn a_line_whose_time_cannot_be_read_is_kept() {
-        let untimed = r#"{"type":"user","uuid":"u9","message":{"content":"fix it"}}"#;
+    fn a_line_is_kept_whatever_time_it_claims() {
+        for timestamp in [
+            None,
+            Some("yesterday"),
+            Some("1970-01-01T00:00:00.000Z"),
+            Some("99999999999999999-11-04T05:46:12.000Z"),
+            Some("2026-11-04T99999999999999999:46:12.000Z"),
+        ] {
+            let at = timestamp.map_or(String::new(), |at| format!(r#""timestamp":"{at}","#));
+            let line = format!(r#"{{"type":"user","uuid":"u9",{at}"message":{{"content":"x"}}}}"#);
+            assert_eq!(claude_line(&line).len(), 1, "{timestamp:?}");
+        }
+    }
+
+    #[test]
+    fn utc_ms_is_total() {
+        for text in [
+            "99999999999999999-11-04T05:46:12.000Z",
+            "2026-11-04T99999999999999999:46:12.000Z",
+            "2026-11-04T05:99999999999999999:12.000Z",
+            "2026-11-04T05:46:99999999999999999.000Z",
+            "-99999999999999999-11-04T05:46:12.000Z",
+            "10000-01-01T00:00:00.000Z",
+            "0-01-01T00:00:00.000Z",
+            "2026-11-04T24:00:00.000Z",
+            "2026-11-04T05:60:00.000Z",
+            "2026-11-04T05:46:12.000+99999999999999999:00",
+            "2026-11-04T05:46:12.000+24:00",
+        ] {
+            assert_eq!(utc_ms(text), None, "{text}");
+        }
+        // Every byte string of a few shapes: never a panic.
+        let pieces = [
+            "9",
+            "99999999999999999999",
+            "-",
+            "T",
+            ":",
+            ".",
+            "Z",
+            "+",
+            "0",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let _ = utc_ms(&format!("{a}-{b}-{c}T{a}:{b}:{c}.{a}Z"));
+                    let _ = utc_ms(&format!("2026-01-01T00:00:00{a}{b}:{c}"));
+                }
+            }
+        }
         assert_eq!(
-            claude_line(untimed, 1_793_771_172_346).len(),
-            1,
-            "kept, not judged older than the execution"
+            utc_ms("9999-12-31T23:59:60.999Z"),
+            Some(253_402_300_800_999)
         );
-        let odd =
-            r#"{"type":"user","uuid":"u9","timestamp":"yesterday","message":{"content":"x"}}"#;
-        assert_eq!(claude_line(odd, 1_793_771_172_346).len(), 1);
     }
 
     fn kinds(line: &str) -> Vec<(String, Option<String>)> {
-        claude_line(line, 0)
+        claude_line(line)
             .into_iter()
             .map(|event| (event.kind.name().to_string(), event.source_event_id))
             .collect()
@@ -372,7 +413,7 @@ mod tests {
         let failed = format!(
             r#"{{"type":"user","uuid":"u3",{AT},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_2","is_error":true,"content":[{{"type":"text","text":"exit 1"}}]}}]}}}}"#
         );
-        let event = claude_line(&failed, 0).remove(0);
+        let event = claude_line(&failed).remove(0);
         assert_eq!(
             event.kind,
             EventKind::ToolFailed {
@@ -391,7 +432,7 @@ mod tests {
             r#"{{"type":"assistant","uuid":"a2",{AT},"isApiErrorMessage":true,"message":{{"content":[{{"type":"text","text":"API Error: 529 overloaded"}}]}}}}"#
         );
         assert_eq!(
-            claude_line(&error, 0)[0].kind,
+            claude_line(&error)[0].kind,
             EventKind::TurnFailed {
                 error: "API Error: 529 overloaded".into()
             }
@@ -400,12 +441,6 @@ mod tests {
 
     #[test]
     fn old_side_meta_and_unknown_lines_give_nothing() {
-        let prompt =
-            format!(r#"{{"type":"user","uuid":"u1",{AT},"message":{{"content":"fix it"}}}}"#);
-        assert!(
-            claude_line(&prompt, 1_793_771_172_346).is_empty(),
-            "before the execution"
-        );
         let side = format!(
             r#"{{"type":"user","uuid":"u1",{AT},"isSidechain":true,"message":{{"content":"x"}}}}"#
         );

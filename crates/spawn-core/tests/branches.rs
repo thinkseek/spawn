@@ -1056,6 +1056,82 @@ fn the_earlier_executions_lines_read_again_on_resume_leave_the_turn_open() {
     assert_eq!(merges(&store), 2);
 }
 
+#[test]
+fn a_resumed_execution_reads_its_own_lines_by_position_whatever_time_they_claim() {
+    // A host clock in 2026; the engine's lines claim 1970, the year 99999…
+    // and no time at all. None of that decides whose lines they are.
+    let clock = Arc::new(ManualClock::new(Timestamp(1_793_771_172_345)));
+    let (store, mut bridge) = resumed(&clock);
+    let path = spawn_core::bridge::transcript_path(
+        &BridgeConfig::new("tester").claude_projects,
+        &spawn_core::id::WorkspaceId::new("2:/workspaces/2").expect("valid workspace"),
+        &claude_session_id(&ExecutionId::for_command(CommandId(1))),
+    );
+    let length = store
+        .read_from(
+            &spawn_core::id::WorkspaceId::new("2:/workspaces/2").expect("valid"),
+            &path,
+            0,
+        )
+        .expect("read")
+        .expect("the restored transcript")
+        .len();
+    let from = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::ExecutionStarted {
+                transcript_from, ..
+            } => Some(transcript_from),
+            _ => None,
+        })
+        .next_back()
+        .expect("the resumed execution");
+    assert_eq!(
+        from,
+        Some(u64::try_from(length).expect("small")),
+        "the resumed execution starts after the earlier executions' lines"
+    );
+    let line = |kind: &str, id: &str, at: &str| {
+        let at = if at.is_empty() {
+            String::new()
+        } else {
+            format!(r#""timestamp":"{at}","#)
+        };
+        match kind {
+            "prompt" => {
+                format!(r#"{{"type":"user","uuid":"p-{id}",{at}"message":{{"content":"next"}}}}"#)
+            }
+            _ => format!(
+                r#"{{"type":"system","subtype":"turn_duration","uuid":"t-{id}",{at}"x":1}}"#
+            ),
+        }
+    };
+    transcript_in(
+        &store,
+        2,
+        &[
+            line("prompt", "2", "1970-01-01T00:00:00.000Z"),
+            line("prompt", "3", "99999999999999999-11-04T05:46:12.000Z"),
+            line("turn", "2", ""),
+        ],
+    );
+    quiet(&bridge.tick().expect("read the turn"));
+    let received: Vec<Option<String>> = events(&store)
+        .into_iter()
+        // start, stop, resume: the resumed execution is the third command's.
+        .filter(|event| event.execution_id == Some(ExecutionId::for_command(CommandId(3))))
+        .filter(|event| matches!(event.kind, EventKind::MessageReceived))
+        .map(|event| event.source_event_id)
+        .collect();
+    assert_eq!(
+        received,
+        [Some("p-2".to_string()), Some("p-3".to_string())],
+        "both prompts are the resumed execution's"
+    );
+    quiet(&bridge.tick().expect("checkpoint and merge"));
+    assert_eq!(merges(&store), 2, "its untimed turn end closed the turn");
+}
+
 /// A checkpoint of the first execution whose `artifact.committed` the log
 /// refused: the branch holds it, the log does not.
 fn checkpoint_unrecorded(store: &MemoryStore, bridge: &mut Bridge) {

@@ -1108,6 +1108,7 @@ fn observer_writes_only_on_change() {
                 command_id: CommandId(1),
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         })
         .expect("append succeeds");

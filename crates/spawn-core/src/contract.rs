@@ -136,6 +136,7 @@ pub fn one_execution(tag: &str, log: &dyn EventLog) {
                 command_id: crate::id::CommandId(1),
                 fork: None,
                 model: crate::event::ModelProfile::Default,
+                transcript_from: None,
             },
         )
     };

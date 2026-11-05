@@ -380,8 +380,7 @@ fn m7_a_crash_between_unmount_and_ended_wedges_the_execution_repro() {
 /// M8: a transcript timestamp out of range overflows the date arithmetic
 /// (a panic in debug builds, a wrapped time in release ones).
 #[test]
-#[ignore = "audit M8 repro"]
-fn m8_utc_ms_overflows_on_an_out_of_range_year_repro() {
+fn m8_utc_ms_overflows_on_an_out_of_range_year() {
     for text in [
         "99999999999999999-11-04T05:46:12.000Z",
         "2026-11-04T99999999999999999:46:12.000Z",

@@ -261,6 +261,13 @@ pub enum EventKind {
         /// Models the engine runs on; left out for the default profile.
         #[serde(default, skip_serializing_if = "ModelProfile::is_default")]
         model: ModelProfile,
+        /// The length of the engine's transcript when the execution started
+        /// (a resumed session's file holds the earlier executions' lines):
+        /// the execution's lines are the ones after it. Left out for a
+        /// transcript that did not exist yet, and by records made before it
+        /// was kept (read from the start of the file).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript_from: Option<u64>,
     },
     /// The execution ended.
     #[serde(rename = "execution.ended")]

@@ -31,10 +31,6 @@ use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_c
 use crate::time::{Clock, SystemClock};
 use crate::transcripts;
 
-/// Transcript lines this much older than the execution's start are still
-/// read as its own.
-const CLOCK_SLACK_MS: i64 = 60_000;
-
 /// An idle execution's workspace is offered the source's main at most this
 /// often, by the Bridge's clock, besides right after each turn ends: an agent
 /// already idle when main moves gets the merge (or the conflict markers)
@@ -178,9 +174,6 @@ struct Active {
     turn_open: bool,
     /// The runner reported the engine exit; cleanup is still due.
     reported_end: Option<(EndCause, Option<i32>)>,
-    /// When the execution started: transcript lines before it belong to
-    /// earlier executions of the session.
-    started_ms: i64,
     /// What the Bridge has read of the engine's files and screen.
     follow: Follow,
 }
@@ -633,7 +626,10 @@ impl Bridge {
             .is_some_and(|active| event.execution_id.as_ref() == Some(&active.execution_id));
         match &event.kind {
             EventKind::ExecutionStarted {
-                workspace, model, ..
+                workspace,
+                model,
+                transcript_from,
+                ..
             } => {
                 view.model = *model;
                 if let Some(execution_id) = event.execution_id.clone() {
@@ -643,8 +639,12 @@ impl Bridge {
                         checkpoint: None,
                         turn_open: false,
                         reported_end: None,
-                        started_ms: record.recorded_at.0,
-                        follow: Follow::default(),
+                        // The execution's lines are the ones after where the
+                        // transcript ended when it started, after a restart too.
+                        follow: Follow {
+                            offset: transcript_from.unwrap_or(0),
+                            ..Follow::default()
+                        },
                     });
                 }
             }
@@ -1013,15 +1013,12 @@ impl Bridge {
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             let line = String::from_utf8_lossy(line);
-            let since = active.started_ms - CLOCK_SLACK_MS;
             if active.follow.version.is_none()
-                && let Some(version) = claude_version(&line, since)
+                && let Some(version) = claude_version(&line)
             {
                 self.record_version(agent_id, session, native, active, &path, version)?;
             }
-            // A minute of slack for a log clock ahead of this host's: lines
-            // already recorded are dropped by their keys anyway.
-            for event in claude_line(&line, since) {
+            for event in claude_line(&line) {
                 let opens = opens_turn(&event.kind);
                 let checkpoint = event.kind.checkpoint_reason().is_some();
                 let stored = self.log.append(NewEvent {
@@ -1480,17 +1477,19 @@ impl Bridge {
             Ok(fork) => fork,
             Err(why) => return Ok(Outcome::Failed(why)),
         };
-        // ponytail: a crash between mount and `execution.started` leaks one
-        // mount; a startup sweep of unrecorded mounts fixes it if it shows up.
         let workspace = match self.workspaces.mount(&branch) {
             Ok(workspace) => workspace,
             Err(error) => return Ok(Outcome::Failed(format!("mount {branch}: {error}"))),
         };
-        if let Some(native) = native
-            && let Err(why) = self.ready_transcript(claimed, &workspace, native, report)
+        // A resumed session's transcript holds the earlier executions' lines:
+        // this execution's are the ones after its length now.
+        let transcript_from = match native
+            .map(|native| self.resumed_transcript(claimed, &workspace, native, report))
+            .transpose()
         {
-            return Ok(self.give_up_mount(&workspace, why));
-        }
+            Ok(length) => length.flatten(),
+            Err(why) => return Ok(self.give_up_mount(&workspace, why)),
+        };
         if let Some(parent_session) = parent {
             self.append(
                 &claimed.agent_id,
@@ -1509,7 +1508,6 @@ impl Bridge {
             checkpoint: None,
             turn_open: false,
             reported_end: None,
-            started_ms: self.clock.now().0,
             follow: Follow::default(),
         };
         // The event goes first: a crash after it leaves a recorded execution
@@ -1526,31 +1524,45 @@ impl Bridge {
                 command_id: claimed.command_id,
                 fork,
                 model,
+                transcript_from,
             },
         );
         if let Err(StoreError::Rejected(why)) = recorded {
             return self.refused_start(claimed, &active.workspace, why);
         }
         recorded?;
-        let fresh = self.name_session(claimed, native, &active)?;
+        self.launch_and_prompt(claimed, &active, native, &settings, prompt)
+    }
+
+    /// The engine of a recorded execution started in its terminal, then its
+    /// prompt typed (an engine that never got its prompt is abandoned).
+    fn launch_and_prompt(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        native: Option<&str>,
+        settings: &str,
+        prompt: &str,
+    ) -> Result<Outcome, StoreError> {
+        let fresh = self.name_session(claimed, native, active)?;
         let launch = self.launch(
             claimed,
-            &active,
+            active,
             &Run {
                 native: fresh.as_deref().or(native),
                 resume: native.is_some(),
-                settings: &settings,
+                settings,
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
-            return self.abandon(claimed, &active, format!("start terminal: {error}"));
+            return self.abandon(claimed, active, format!("start terminal: {error}"));
         }
         if !prompt.is_empty() {
-            let outcome = self.type_prompt(claimed, &active, prompt)?;
+            let outcome = self.type_prompt(claimed, active, prompt)?;
             if let Outcome::Failed(why) = outcome {
                 // An engine that never got its prompt must not look alive:
                 // whoever started it would wait on it forever.
-                return self.abandon(claimed, &active, why);
+                return self.abandon(claimed, active, why);
             }
             // The prompt starts a turn before the transcript says so.
             self.catch_up()?;
@@ -1641,6 +1653,41 @@ impl Bridge {
             return Ok(Outcome::Failed(why));
         }
         Ok(self.give_up_mount(workspace, why))
+    }
+
+    /// Before a resume of `native`: its transcript ready
+    /// ([`Self::ready_transcript`]), and its length, which the execution's
+    /// own lines come after.
+    fn resumed_transcript(
+        &self,
+        claimed: &Claimed,
+        workspace: &WorkspaceId,
+        native: &str,
+        report: &mut TickReport,
+    ) -> Result<Option<u64>, String> {
+        self.ready_transcript(claimed, workspace, native, report)?;
+        self.transcript_length(workspace, native)
+    }
+
+    /// How long the transcript of `native` is, as the engine will see it;
+    /// `None` when it does not exist (yet).
+    fn transcript_length(
+        &self,
+        workspace: &WorkspaceId,
+        native: &str,
+    ) -> Result<Option<u64>, String> {
+        let path = transcript_path(&self.config.claude_projects, workspace, native);
+        let mut length = 0u64;
+        loop {
+            match self.terminals.read_from(workspace, &path, length) {
+                Ok(None) => return Ok((length > 0).then_some(length)),
+                Ok(Some(bytes)) if bytes.is_empty() => return Ok(Some(length)),
+                Ok(Some(bytes)) => {
+                    length = length.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                }
+                Err(error) => return Err(format!("read {path}: {error}")),
+            }
+        }
     }
 
     /// A start that fails after its mount, before anything ran in it: the
