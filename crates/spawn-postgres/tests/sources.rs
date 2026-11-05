@@ -146,30 +146,30 @@ fn an_agent_that_ran_before_its_first_task_stays_on_the_default_repository() {
             ))
             .expect("record an execution");
     };
+    for name in ["early", "late"] {
+        store.resident_propose(name, "a concern").expect("propose");
+        store.resident_approve(name).expect("approve");
+    }
     // `early` ran before its task; `late` only after.
-    started(&mut client, "agent_worker_early", "1");
-    let early = store
-        .task_assign(mission, "ephemeral", "early", "brief", "default")
+    started(&mut client, "agent_resident_early", "1");
+    store
+        .task_assign(mission, "resident", "early", "brief", "default")
         .expect("assign");
-    let late = store
-        .task_assign(mission, "ephemeral", "late", "brief", "default")
+    store
+        .task_assign(mission, "resident", "late", "brief", "default")
         .expect("assign");
-    started(&mut client, "agent_worker_late", "spawn_now_ms() + 1000");
-    let agent = |client: &mut postgres::Client, task: i64| -> String {
-        client
-            .query_one("select agent_id from mission_tasks where id = $1", &[&task])
-            .expect("the task")
-            .get(0)
-    };
-    assert_eq!(agent(&mut client, early), "agent_worker_early");
-    assert_eq!(store.agent_source("agent_worker_early").expect("source"), None);
+    started(&mut client, "agent_resident_late", "spawn_now_ms() + 1000");
     assert_eq!(
-        store.agent_source(&agent(&mut client, late)).expect("source"),
+        store.agent_source("agent_resident_early").expect("source"),
+        None
+    );
+    assert_eq!(
+        store.agent_source("agent_resident_late").expect("source"),
         Some(None),
         "a scratch mission's agent"
     );
     assert_eq!(
         store.publishing_agents().expect("agents"),
-        vec![(agent(&mut client, late), None)]
+        vec![("agent_resident_late".to_string(), None)]
     );
 }
