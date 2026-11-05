@@ -1203,6 +1203,19 @@ mod tests {
     /// Only exit 1 is a conflict: a merge-tree git cannot run (an unknown
     /// option, a crash, a signal) is an error carrying git's message.
     #[test]
+    fn the_gate_cap_defaults_to_two_and_is_bounded() {
+        use super::{DEFAULT_GATES, MAX_GATES, gate_slots};
+        assert_eq!(gate_slots(None, None), Ok(DEFAULT_GATES));
+        assert_eq!(DEFAULT_GATES, 2);
+        assert_eq!(gate_slots(None, Some("3".into())), Ok(3));
+        assert_eq!(gate_slots(Some("1".into()), Some("3".into())), Ok(1), "the flag first");
+        for wrong in ["0", "-1", "two", ""] {
+            assert!(gate_slots(Some(wrong.into()), None).is_err(), "{wrong}");
+        }
+        assert!(gate_slots(None, Some((MAX_GATES + 1).to_string())).is_err());
+    }
+
+    #[test]
     fn a_merge_git_cannot_run_is_an_error_not_a_conflict() {
         assert_eq!(
             merged_tree(Some(0), "abc123\n", ""),
@@ -2201,6 +2214,174 @@ mod database_tests {
 
     fn source_main(source: &str) -> String {
         git(&["--git-dir", source, "rev-parse", "refs/heads/main"]).expect("main")
+    }
+
+    /// The stub gates' environment: PATH only, for `sleep` and `cat`.
+    fn test_gate_env() -> Vec<(String, String)> {
+        std::env::var("PATH")
+            .map(|path| vec![("PATH".to_string(), path)])
+            .unwrap_or_default()
+    }
+
+    /// `agent`'s work on `source`'s main, pushed as `spawn/<agent>`: one new
+    /// file. The pushed commit.
+    fn push_work(base: &Path, source: &str, agent: &str, file: &str) -> String {
+        let clone = base.join(format!("agent-{file}"));
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", source, &clone_path]).expect("clone");
+        std::fs::write(clone.join(file), "work\n").expect("write");
+        super::tests::commit_in(&clone_path, "work");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/spawn/{agent}"),
+        ])
+        .expect("push the agent's branch");
+        git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work")
+    }
+
+    /// A gate that notes the candidate it judges in `<marks>/started`, then
+    /// holds until `<marks>/release` exists, and accepts.
+    fn holding_gate(marks: &Path) -> String {
+        let marks = marks.to_string_lossy();
+        format!(
+            "echo \"$3\" >>'{marks}/started'\n\
+             while [ ! -e '{marks}/release' ]; do sleep 0.05; done\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n"
+        )
+    }
+
+    fn started(marks: &Path) -> Vec<String> {
+        std::fs::read_to_string(marks.join("started"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Wait until `count` gates started (a gate starts on its own thread).
+    fn wait_started(marks: &Path, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let started = started(marks);
+            if started.len() >= count || std::time::Instant::now() > deadline {
+                return started;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn agent_of(db: &Db, mission: i64, task: i64) -> String {
+        db.mission(mission)["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == task)
+            .and_then(|row| row["agent_id"].as_str())
+            .expect("the task's agent")
+            .to_string()
+    }
+
+    /// Gates run per mission, concurrently, under the cap: mission A has two
+    /// ready tasks, B and C one each, all on sources of their own, and the
+    /// cap is 2. The first pass starts A's first task and B's; A's second
+    /// waits for A's first (a mission's tasks stay serial), and C waits for
+    /// a free gate, through any number of passes. Once both land, the next
+    /// pass starts A's second task, judged against the main A's first left,
+    /// and C's.
+    #[test]
+    fn gates_run_per_mission_concurrently_up_to_the_cap() {
+        let marks = std::env::temp_dir().join(format!("spawn-db-gate-marks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        let gate = holding_gate(&marks);
+        let (base_a, source_a, scenarios, integrator) = world("concurrent-a", &gate);
+        let (base_b, source_b, _, _) = world("concurrent-b", "exit 1\n");
+        let (base_c, source_c, _, _) = world("concurrent-c", "exit 1\n");
+        let db = Db::new("concurrent_gates");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let c = db.gated_mission(&source_c, &scenarios);
+        let a1 = db.reported_task(a, "a1");
+        let a2 = db.reported_task(a, "a2");
+        let b1 = db.reported_task(b, "b1");
+        let c1 = db.reported_task(c, "c1");
+        let work_a1 = push_work(&base_a, &source_a, &agent_of(&db, a, a1), "a1.txt");
+        let work_a2 = push_work(&base_a, &source_a, &agent_of(&db, a, a2), "a2.txt");
+        let work_b1 = push_work(&base_b, &source_b, &agent_of(&db, b, b1), "b1.txt");
+        let work_c1 = push_work(&base_c, &source_c, &agent_of(&db, c, c1), "c1.txt");
+
+        integrator.pass_on(&db.store).expect("the first pass");
+        let first = wait_started(&marks, 2);
+        assert_eq!(first, vec![work_a1.clone(), work_b1.clone()], "A's first and B's");
+        // More passes while both hold: nothing else starts.
+        for _ in 0..3 {
+            integrator.pass_on(&db.store).expect("a pass while two gates run");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(started(&marks).len(), 2, "the cap holds: {:?}", started(&marks));
+        assert_eq!(db.mission(c)["tasks"][0]["state"], "reported");
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert_eq!(source_main(&source_a), work_a1, "A's first landed");
+        assert_eq!(source_main(&source_b), work_b1, "B's landed");
+        std::fs::remove_file(marks.join("release")).expect("hold again");
+
+        integrator.reap();
+        integrator.pass_on(&db.store).expect("the next pass");
+        let next = wait_started(&marks, 4);
+        assert_eq!(next.len(), 4, "A's second and C's: {next:?}");
+        assert_eq!(next[3], work_c1, "C's after A's second: {next:?}");
+        assert_ne!(next[2], work_a2, "A's second is merged with the main A's first left");
+        assert!(
+            git(&["--git-dir", &integrator.judge.root.join(".sources").to_string_lossy(), "--version"]).is_ok()
+        );
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        let after = db.mission(a);
+        let states: Vec<&Value> = after["tasks"].as_array().expect("tasks").iter().map(|row| &row["state"]).collect();
+        assert!(states.iter().all(|state| *state == "landed"), "{after}");
+        assert_eq!(db.mission(c)["tasks"][0]["state"], "landed");
+        for base in [base_a, base_b, base_c, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// A cap of one is one gate at a time across missions, as before.
+    #[test]
+    fn a_cap_of_one_gates_one_mission_at_a_time() {
+        let marks = std::env::temp_dir().join(format!("spawn-db-gate-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        let (base_a, source_a, scenarios, mut integrator) = world("cap-one-a", &holding_gate(&marks));
+        integrator.gates = 1;
+        let (base_b, source_b, _, _) = world("cap-one-b", "exit 1\n");
+        let db = Db::new("cap_one");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let a1 = db.reported_task(a, "a1");
+        let b1 = db.reported_task(b, "b1");
+        let work_a1 = push_work(&base_a, &source_a, &agent_of(&db, a, a1), "a1.txt");
+        let work_b1 = push_work(&base_b, &source_b, &agent_of(&db, b, b1), "b1.txt");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.pass_on(&db.store).expect("another pass");
+        assert_eq!(wait_started(&marks, 1), vec![work_a1.clone()]);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(started(&marks), vec![work_a1], "B waits for the one gate");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        integrator.pass_on(&db.store).expect("the pass after");
+        integrator.settle();
+        assert_eq!(started(&marks).last(), Some(&work_b1));
+        assert_eq!(db.mission(b)["tasks"][0]["state"], "landed");
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     /// Audit #17: a landing's push moved main, and the integrator stopped
