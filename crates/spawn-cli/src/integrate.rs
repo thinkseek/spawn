@@ -39,7 +39,18 @@
 //!    the task goes back to `reported` (`accepted` under review), no
 //!    rejection is counted, nothing reaches the worker, and a later pass
 //!    judges again. An agent with neither a checkpoint nor a pushed branch
-//!    has no branch to land;
+//!    has no branch to land.
+//!
+//!    **A report is judged against the checkpoint of the turn that produced
+//!    it.** The dispatcher collects a report only after the turn that wrote
+//!    it ended in the log, and the Bridge records a turn's checkpoint before
+//!    its end; the `task.reported` record names that checkpoint in `commit`.
+//!    The pushed head must also be that commit or a descendant of it
+//!    ([`report_freshness`]); otherwise the verdict is `stale`, as above. A
+//!    report that names a commit is never judged for lack of a checkpoint
+//!    (the branch pushed when the workspace was mounted is only the task's
+//!    base). A report with a null commit (a record from before reports named
+//!    one) is judged by the rule above alone;
 //! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
@@ -262,6 +273,46 @@ pub(crate) fn freshness(
             }
         }
     }
+}
+
+/// The stale rule for a reported task: the pushed head must be the
+/// report's commit (`reported`, the agent's checkpoint the report's turn
+/// ended with) or a descendant of it, and pass [`freshness`] against the
+/// agent's latest checkpoint as well. A report that names a commit is never
+/// judged for lack of a checkpoint: with no pushed branch, or one that lacks
+/// the commit, it is stale. A report that names none (a record from before
+/// reports named their checkpoint) is judged by [`freshness`] alone.
+pub(crate) fn report_freshness(
+    reported: Option<&str>,
+    checkpoint: Option<&str>,
+    pushed: Option<&str>,
+    contains: impl Fn(&str, &str) -> bool,
+) -> Freshness {
+    if let Some(reported) = reported {
+        match pushed {
+            None => {
+                return Freshness::Stale(format!(
+                    "the source has no spawn/<agent> yet, and the report's checkpoint is \
+                     {reported}"
+                ));
+            }
+            Some(pushed) if pushed != reported && !contains(reported, pushed) => {
+                return Freshness::Stale(if contains(pushed, reported) {
+                    format!(
+                        "the pushed branch ({pushed}) is behind the report's checkpoint \
+                         ({reported})"
+                    )
+                } else {
+                    format!(
+                        "the pushed branch ({pushed}) does not contain the report's checkpoint \
+                         ({reported})"
+                    )
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    freshness(checkpoint, pushed, contains)
 }
 
 /// The mirror's own copy of an agent's pushed branch: never
@@ -495,16 +546,21 @@ impl Integrator {
     }
 
     /// The agent's pushed branch, fetched into the mirror, checked against
-    /// its latest checkpoint. A lagging push is fetched again for up to
-    /// [`PUSH_WAIT`] before it counts as stale.
+    /// the checkpoint the task's report names and the agent's latest
+    /// checkpoint ([`report_freshness`]). A lagging push is fetched again for
+    /// up to [`PUSH_WAIT`] before it counts as stale.
     fn pushed_candidate(
         store: &PostgresStore,
         mirror: &Path,
         source: &str,
-        agent: &str,
+        task: &Task,
     ) -> Result<Freshness, String> {
+        let agent = task.agent_id.as_str();
         let checkpoint = store
             .latest_checkpoint(agent)
+            .map_err(|error| error.to_string())?;
+        let reported = store
+            .reported_commit(task.id)
             .map_err(|error| error.to_string())?;
         let mirror_path = mirror.to_string_lossy().to_string();
         let contains = |ancestor: &str, commit: &str| {
@@ -522,7 +578,12 @@ impl Integrator {
         loop {
             let pushed = sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
                 .map_err(|error| error.to_string())?;
-            let verdict = freshness(checkpoint.as_deref(), pushed.as_deref(), contains);
+            let verdict = report_freshness(
+                reported.as_deref(),
+                checkpoint.as_deref(),
+                pushed.as_deref(),
+                contains,
+            );
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
                 return Ok(verdict);
             }
@@ -544,7 +605,7 @@ impl Integrator {
         count: u32,
         task: &Task,
     ) -> Result<bool, String> {
-        let branch = match Self::pushed_candidate(store, mirror, source, &task.agent_id)? {
+        let branch = match Self::pushed_candidate(store, mirror, source, task)? {
             Freshness::Fresh(branch) => Some(branch),
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
@@ -978,7 +1039,10 @@ fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget};
+    use super::{
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget,
+        report_freshness,
+    };
     use crate::gate::GateFailure;
     use serde_json::json;
 
@@ -1612,6 +1676,53 @@ mod tests {
         assert!(
             matches!(&absent, Freshness::Stale(reason) if reason.contains("no spawn/<agent>")),
             "{absent:?}"
+        );
+    }
+
+    #[test]
+    fn a_report_is_judged_against_its_own_checkpoint() {
+        assert_eq!(
+            report_freshness(Some("c2"), Some("c2"), Some("c2"), history),
+            Freshness::Fresh("c2".to_string()),
+            "equal"
+        );
+        assert_eq!(
+            report_freshness(Some("c2"), Some("c2"), Some("c3"), history),
+            Freshness::Fresh("c3".to_string()),
+            "descendant"
+        );
+        let behind = report_freshness(Some("c2"), None, Some("c1"), history);
+        assert!(
+            matches!(&behind, Freshness::Stale(reason)
+                if reason.contains("behind the report's checkpoint")),
+            "the base pushed at the mount, with no checkpoint recorded: {behind:?}"
+        );
+        let diverged = report_freshness(Some("c2"), Some("c2"), Some("d2"), history);
+        assert!(
+            matches!(&diverged, Freshness::Stale(reason)
+                if reason.contains("does not contain the report's checkpoint")),
+            "{diverged:?}"
+        );
+        let absent = report_freshness(Some("c2"), None, None, history);
+        assert!(
+            matches!(&absent, Freshness::Stale(reason) if reason.contains("no spawn/<agent>")),
+            "no pushed branch: {absent:?}"
+        );
+        // Past the report's checkpoint but behind a later one: the latest
+        // checkpoint still rules.
+        let lagging = report_freshness(Some("c1"), Some("c3"), Some("c2"), history);
+        assert!(
+            matches!(&lagging, Freshness::Stale(reason) if reason.contains("behind")),
+            "{lagging:?}"
+        );
+        // A report that names no commit is judged as before.
+        assert_eq!(
+            report_freshness(None, None, Some("c1"), history),
+            Freshness::Fresh("c1".to_string())
+        );
+        assert_eq!(
+            report_freshness(None, None, None, history),
+            Freshness::Nothing
         );
     }
 

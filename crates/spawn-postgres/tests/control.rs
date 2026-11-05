@@ -1957,7 +1957,11 @@ fn a_report_names_the_checkpoint_of_its_turn() {
     let task = store
         .task_assign(mission, "ephemeral", "w", "brief", "default")
         .expect("assign");
-    assert_eq!(store.reported_commit(task).expect("read"), None, "no report");
+    assert_eq!(
+        store.reported_commit(task).expect("read"),
+        None,
+        "no report"
+    );
     store.task_delivered(task, 1).expect("delivered");
     let commit = "c".repeat(40);
     assert!(
@@ -1970,7 +1974,11 @@ fn a_report_names_the_checkpoint_of_its_turn() {
         .task_review(task, false, "again", None)
         .expect("send back");
     store.task_delivered(task, 2).expect("delivered again");
-    assert!(store.task_reported(task, "fixed").expect("reported, no commit"));
+    assert!(
+        store
+            .task_reported(task, "fixed")
+            .expect("reported, no commit")
+    );
     assert_eq!(
         store.reported_commit(task).expect("read"),
         None,
