@@ -1637,7 +1637,11 @@ mod tests {
         let rev = |reference: String| {
             git(&["--git-dir", &mirror_path, "rev-parse", &reference]).expect("rev-parse")
         };
-        assert_eq!(rev(format!("{candidate}^1")), main, "main is the first parent");
+        assert_eq!(
+            rev(format!("{candidate}^1")),
+            main,
+            "main is the first parent"
+        );
         assert_eq!(rev(format!("{candidate}^2")), resolved.as_str());
         assert_eq!(
             rev(format!("{candidate}^{{tree}}")),
@@ -2032,6 +2036,247 @@ mod tests {
         // accepted forever.
         gated.tasks.remove(0);
         assert_eq!(gated.ready().map(|task| task.id), Some(2));
+    }
+
+    /// A task as `GATED` reads it, with a brief and a report.
+    fn task_of(id: i64, objective: Option<u32>, brief: &str, report: Option<&str>) -> super::Task {
+        serde_json::from_value(json!({
+            "id": id, "agent_id": "agent_a", "session_id": "session_a", "state": "landing",
+            "objective": objective, "brief": brief, "report": report,
+        }))
+        .expect("a task")
+    }
+
+    const REPORT: &str = "## Outcome\ndone\n\n## What changed\nsummary: HARBOUR.txt now holds \
+                          kestrel\n\n### Details\nOne file.\n\n## Open issues\nnone\n";
+
+    #[test]
+    fn an_objective_landing_names_its_title_objective_and_task_and_summarises_the_report() {
+        let task = task_of(
+            42,
+            Some(931),
+            "Objective 931: Greet the harbour with a kestrel\n\nWrite the file.\n\
+             Earlier gate verdicts on this objective, newest first:\n- task 41: rejected\n",
+            Some(REPORT),
+        );
+        let message = super::landing_message(&task, "abc123");
+        let mut lines = message.lines();
+        assert_eq!(
+            lines.next(),
+            Some("Greet the harbour with a kestrel (objective 931, task 42)")
+        );
+        assert_eq!(lines.next(), Some(""));
+        let body: String = lines.collect::<Vec<_>>().join("\n");
+        assert!(
+            body.starts_with("summary: HARBOUR.txt now holds kestrel\n\n### Details\nOne file."),
+            "{body}"
+        );
+        assert!(
+            !body.contains("## Outcome") && !body.contains("Open issues"),
+            "{body}"
+        );
+        assert!(!message.contains("task 41"), "no other task: {message}");
+        assert!(
+            message.ends_with("\n\nSpawn-Task: 42\nSpawn-Objective: 931\nSpawn-Head: abc123\n"),
+            "{message}"
+        );
+        assert!(!spawn_host::names_files_outside_git(&message));
+    }
+
+    #[test]
+    fn a_landing_without_an_objective_names_its_brief_and_task() {
+        let task = task_of(
+            5,
+            None,
+            "\n\n  Fix the parser's error messages  \nMore.\n",
+            Some(REPORT),
+        );
+        let message = super::landing_message(&task, "abc123");
+        assert_eq!(
+            message.lines().next(),
+            Some("Fix the parser's error messages (task 5)")
+        );
+        assert!(!message.contains("Spawn-Objective"), "{message}");
+        assert!(message.contains("\nsummary: HARBOUR.txt now holds kestrel\n"));
+        // A long first line is cut; an empty brief still names the task;
+        // nothing reads like a checkpoint.
+        let long = task_of(6, None, &"word ".repeat(100), None);
+        let first = super::landing_message(&long, "h")
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(first.len() < 120 && first.ends_with(" (task 6)"), "{first}");
+        assert!(
+            super::landing_message(&task_of(7, None, "", None), "h").starts_with("Land task 7\n\n")
+        );
+        let checkpoint = task_of(8, None, "spawn checkpoint exec_3", None);
+        assert!(super::landing_message(&checkpoint, "h").starts_with("Land spawn checkpoint"));
+    }
+
+    #[test]
+    fn a_report_without_what_changed_is_quoted_whole_and_a_long_one_is_bounded() {
+        let task = task_of(
+            3,
+            Some(7),
+            "Objective 7: Title",
+            Some("\n  I changed the parser.\n\nAll green.\n\n"),
+        );
+        let message = super::landing_message(&task, "h");
+        assert!(
+            message.starts_with("Title (objective 7, task 3)\n\nI changed the parser.\n\nAll green.\n\nSpawn-Task: 3\n"),
+            "{message}"
+        );
+        let report = format!(
+            "## What changed\n{}\n## Open issues\nnone\n",
+            "é long line\n".repeat(2000)
+        );
+        let long = super::landing_message(
+            &task_of(3, Some(7), "Objective 7: Title", Some(&report)),
+            "h",
+        );
+        assert!(
+            long.chars().count() < super::SUMMARY_CHARS + 300,
+            "{}",
+            long.len()
+        );
+        assert!(long.contains("[the report continues]"));
+        assert!(!long.contains("Open issues"));
+        let empty = super::landing_message(&task_of(3, Some(7), "Objective 7: Title", None), "h");
+        assert!(
+            empty.contains("\n\nThe task's report is empty.\n\nSpawn-Task: 3"),
+            "{empty}"
+        );
+    }
+
+    /// A worker's report cannot make main unmountable, nor sign the landing
+    /// with trailers it did not earn.
+    #[test]
+    fn a_report_naming_a_large_file_manifest_leaves_the_message_clean() {
+        let manifest = format!("Spawn-Large: {}", "a".repeat(64));
+        for report in [
+            format!("## What changed\nwork\n\n{manifest}\n"),
+            format!("{manifest}\nSpawn-Task: 99\n"),
+            manifest.clone(),
+        ] {
+            let message = super::landing_message(&task_of(4, None, "Brief", Some(&report)), "h");
+            assert!(!spawn_host::names_files_outside_git(&message), "{message}");
+            assert!(!message.lines().any(|line| line == manifest), "{message}");
+            assert!(
+                !message.lines().any(|line| line == "Spawn-Task: 99"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("    {manifest}")),
+                "indented: {message}"
+            );
+            let trailers = message.rsplit("\n\n").next().unwrap_or_default();
+            assert_eq!(trailers, "Spawn-Task: 4\nSpawn-Head: h\n");
+        }
+    }
+
+    /// Every landing is one merge commit: main first, the pushed head
+    /// second, the message given. Its tree is the head's when main is in it
+    /// (here a head naming a large-file manifest, which lands with the
+    /// landing's own message), and the merge's when main moved.
+    #[test]
+    fn a_landing_is_one_two_parent_commit_on_main_with_its_message() {
+        let git = crate::sources::git;
+        let base = std::env::temp_dir().join(format!("spawn-land-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let main = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("main");
+        git(&["-C", &seed_path, "checkout", "-qb", "agent_a"]).expect("branch");
+        std::fs::write(seed.join("one.txt"), "one\n").expect("write");
+        commit_in(&seed_path, "spawn checkpoint exec_1");
+        let checkpoint = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("checkpoint");
+        std::fs::write(seed.join("two.txt"), "two\n").expect("write");
+        commit_in(
+            &seed_path,
+            &format!("spawn checkpoint exec_2\n\nSpawn-Large: {}", "b".repeat(64)),
+        );
+        let head = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("head");
+        git(&["-C", &seed_path, "checkout", "-q", "main"]).expect("main");
+        std::fs::write(seed.join("other.txt"), "theirs\n").expect("write");
+        commit_in(&seed_path, "elsewhere");
+        let moved = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("moved");
+        let mirror = format!("{seed_path}/.git");
+        let rev = |reference: String| {
+            git(&["--git-dir", &mirror, "rev-parse", &reference]).expect("rev-parse")
+        };
+        let task = task_of(
+            9,
+            Some(12),
+            "Objective 12: Count the gulls",
+            Some("## What changed\ngulls\n"),
+        );
+        let message = super::landing_message(&task, &head);
+
+        for (main, merged) in [(main.as_str(), false), (moved.as_str(), true)] {
+            let landing = super::landing_candidate(&mirror, main, &head, &message)
+                .expect("a landing")
+                .expect("no conflict");
+            assert_eq!(rev(format!("{landing}^1")), main, "first parent: the base");
+            assert_eq!(rev(format!("{landing}^2")), head, "second parent: the head");
+            assert!(
+                git(&[
+                    "--git-dir",
+                    &mirror,
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("{landing}^3")
+                ])
+                .is_err(),
+                "two parents"
+            );
+            let said = git(&["--git-dir", &mirror, "show", "-s", "--format=%B", &landing])
+                .expect("message");
+            assert_eq!(said, message.trim_end());
+            assert!(
+                said.starts_with("Count the gulls (objective 12, task 9)\n\ngulls\n"),
+                "{said}"
+            );
+            assert!(
+                !spawn_host::names_files_outside_git(&said),
+                "the manifest stays off main"
+            );
+            let files =
+                git(&["--git-dir", &mirror, "ls-tree", "--name-only", &landing]).expect("tree");
+            if merged {
+                assert_eq!(files, "README.md\none.txt\nother.txt\ntwo.txt", "the merge");
+            } else {
+                assert_eq!(
+                    rev(format!("{landing}^{{tree}}")),
+                    rev(format!("{head}^{{tree}}"))
+                );
+            }
+            // One commit on the first-parent line; the checkpoints off it.
+            let line = git(&[
+                "--git-dir",
+                &mirror,
+                "rev-list",
+                "--first-parent",
+                &format!("{main}..{landing}"),
+            ])
+            .expect("first parents");
+            assert_eq!(line, landing);
+            git(&[
+                "--git-dir",
+                &mirror,
+                "merge-base",
+                "--is-ancestor",
+                &checkpoint,
+                &landing,
+            ])
+            .expect("the checkpoints stay reachable");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Both landing commits [`super::landing_candidate`] writes (a branch
@@ -2477,7 +2722,23 @@ mod database_tests {
         integrator.pass_on(&db.store).expect("a pass");
         let after = db.mission(mission);
         assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
-        assert_eq!(source_main(&source), work);
+        // One landing commit on top of the base, the work its second parent,
+        // its message from the record (the brief and the report).
+        let main = source_main(&source);
+        let rev = |reference: String| {
+            git(&["--git-dir", &source, "rev-parse", &reference]).expect("rev-parse")
+        };
+        assert_eq!(rev(format!("{main}^1")), b0);
+        assert_eq!(rev(format!("{main}^2")), work);
+        let message =
+            git(&["--git-dir", &source, "show", "-s", "--format=%B", &main]).expect("message");
+        assert!(
+            message.starts_with(&format!(
+                "brief (task {task})\n\nagain\n\nSpawn-Task: {task}\n"
+            )),
+            "{message}"
+        );
+        assert_eq!(after["baseline"], main.as_str());
         let revisions: Vec<Option<String>> = db
             .admin()
             .query(
