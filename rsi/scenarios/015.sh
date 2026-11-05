@@ -381,7 +381,7 @@ open_turn() {
     turn=$(say human "$1" "BB:BUSY $2 $3")
     wait_until 60 succeeded "$turn" ||
         harness "the input that opens turn $3 did not succeed at a ready pane ($(state_of "$turn") $(error_of "$turn"))"
-    wait_until 30 logged busy-start " $3\$" || harness "turn $3 never started"
+    wait_until 30 logged busy-start "$3\$" || harness "turn $3 never started"
     wait_until 30 busy_seen "$mark" || harness "the Bridge never read the pane as Busy during turn $3"
 }
 
@@ -406,7 +406,7 @@ one=$(say human bb-note-one "BB:NOTE one")
 sleep 1
 two=$(say spawn_supervisor bb-note-two "BB:NOTE two")
 sleep 12
-logged busy-end " first\$" && harness "the first turn ended before the inputs could be checked"
+logged busy-end "first\$" && harness "the first turn ended before the inputs could be checked"
 for id in "$one" "$two"; do
     if finished "$id"; then
         fail "(1) input $id, sent while the session's turn ran, finished $(state_of "$id") ($(error_of "$id")) instead of waiting for the turn to end"
@@ -423,7 +423,7 @@ no_typing_into_busy "(1)"
 # The waiting is a record, not the Bridge's memory: a restarted loop keeps it.
 stop_loop
 start_loop
-wait_until 60 logged busy-end " first\$" || harness "the first turn never ended"
+wait_until 60 logged busy-end "first\$" || harness "the first turn never ended"
 both_finished() { finished "$one" && finished "$two"; }
 wait_until 180 both_finished ||
     fail "(2) the waiting inputs did not finish within 180 s of the turn's end (one: $(state_of "$one"), two: $(state_of "$two"))"
@@ -431,14 +431,14 @@ for id in "$one" "$two"; do
     succeeded "$id" || fail "(2) waiting input $id finished $(state_of "$id"): $(error_of "$id")"
     assert_eq "$(steps "$id" typed)" 1 "(2) the 'typed' records of input $id"
 done
-wait_until 30 logged note-end " two\$" || harness "the second note's turn never ended"
+wait_until 30 logged note-end "two\$" || harness "the second note's turn never ended"
 assert_eq "$(read_count got 'BB:NOTE one')" 1 "(2) times the engine read the first input"
 assert_eq "$(read_count got 'BB:NOTE two')" 1 "(2) times the engine read the second input"
 [ "$(line_of got 'BB:NOTE one')" -lt "$(line_of got 'BB:NOTE two')" ] ||
     fail "(2) the second input reached the engine before the first"
-before "$(read_at busy-end ' first$')" "$(read_at got 'BB:NOTE one')" ||
+before "$(read_at busy-end 'first$')" "$(read_at got 'BB:NOTE one')" ||
     fail "(2) the first input reached the engine before the long turn ended"
-before "$(read_at note-end ' one$')" "$(read_at got 'BB:NOTE two')" ||
+before "$(read_at note-end 'one$')" "$(read_at got 'BB:NOTE two')" ||
     fail "(2) the second input reached the engine before the first one's turn ended"
 no_typing_into_busy "(2)"
 
@@ -454,11 +454,11 @@ capture "$SPAWN_BIN" task assign --mission "$mission" --kind resident --worker e
 task=$(jq -r .task "$WORK/out.txt")
 [ -n "$task" ] && [ "$task" != null ] || harness "task assign printed no id"
 delivered() { [ "$(q "select state from mission_tasks where id = $task")" = delivered ]; }
-wait_until 60 logged busy-end " second\$" || harness "turn second never ended"
+wait_until 60 logged busy-end "second\$" || harness "turn second never ended"
 wait_until 240 delivered ||
     fail "(3) task #$task was not delivered within 240 s of the turn's end (state $(q "select state from mission_tasks where id = $task"); input four $(state_of "$four"))"
 succeeded "$four" || fail "(3) waiting input $four finished $(state_of "$four"): $(error_of "$four")"
-wait_until 30 logged note-end " task\$" || harness "the task's turn never ended"
+wait_until 30 logged note-end "task\$" || harness "the task's turn never ended"
 assert_eq "$(read_count got 'BB:NOTE four')" 1 "(3) times the engine read input four"
 assert_eq "$(read_count got 'BB:NOTE task')" 1 "(3) times the engine read the task"
 [ "$(line_of got 'BB:NOTE four')" -lt "$(line_of got 'BB:NOTE task')" ] ||
@@ -489,7 +489,7 @@ stop=$(send human bb-stop '{"type":"stop"}')
 wait_until 60 finished "$stop" ||
     fail "(4) the stop was not handled within 60 s while an input waited ($(state_of "$stop"))"
 succeeded "$stop" || fail "(4) the stop finished $(state_of "$stop"): $(error_of "$stop")"
-logged busy-end " third\$" && harness "turn third ended before the stop: the stop proves nothing"
+logged busy-end "third\$" && harness "turn third ended before the stop: the stop proves nothing"
 wait_until 30 finished "$three" ||
     fail "(4) input $three still waits ($(state_of "$three")) after its session was stopped"
 succeeded "$three" && fail "(4) input $three succeeded though its session was stopped before its turn"
