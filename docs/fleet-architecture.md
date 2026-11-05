@@ -580,6 +580,19 @@ the tree's own:
   6. records `task.landed`.
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
+- **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
+  mission is closed, or a task's resident retired, work goes on only where
+  it asks nothing new of a worker:
+  - a done mission with a gate keeps its delivered, reported, accepted and
+    landing tasks: reports still come in, are judged or reviewed, and land,
+    and a delivered task is still held to the budget;
+  - a retired resident's accepted and landing tasks still land;
+  - a dropped mission keeps nothing.
+
+  Every other open task is cancelled by the close or the retirement. The
+  integrator's selection uses the same rule, and no transition moves a task
+  into a state the rule drops: a send-back is refused, a gate rejection
+  cancels the task, and deliveries and reports are not recorded.
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
   - three gate aborts in a row;

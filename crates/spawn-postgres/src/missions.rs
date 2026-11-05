@@ -107,28 +107,30 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
          order by e.session_seq desc
          limit $3) z";
 
-/// Missions with a gate that are open, or done with accepted work still to
-/// land, with the tasks the integrator may have to act on.
+/// Missions with a gate that are open, or closed with work the closure rule
+/// (`spawn_task_may_continue`) still lets go on, with that work: every task
+/// the integrator may judge, land, or hold to its budget.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
          m.gate_rejections, m.gate_aborts, m.objectives, m.sources ->> 0 as source,
-         coalesce((select jsonb_agg(jsonb_build_object(
-                     'id', k.id, 'agent_id', k.agent_id,
-                     'session_id', k.session_id, 'state', k.state, 'base', k.base,
-                     'candidate', k.candidate, 'scenario', k.scenario,
-                     'delivered_at_ms', k.delivered_at_ms)
-                     order by k.id)
-                   from mission_tasks k
-                  where k.mission_id = m.id
-                    and k.state in ('assigned', 'delivered', 'reported', 'revise',
-                                    'accepted', 'landing')), '[]'::jsonb) as tasks
+         coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
+    left join lateral (
+      select jsonb_agg(jsonb_build_object(
+               'id', k.id, 'agent_id', k.agent_id,
+               'session_id', k.session_id, 'state', k.state, 'base', k.base,
+               'candidate', k.candidate, 'scenario', k.scenario,
+               'delivered_at_ms', k.delivered_at_ms)
+               order by k.id) as tasks
+        from mission_tasks k
+        left join mission_residents r on r.agent_id = k.agent_id
+       where k.mission_id = m.id
+         and k.state not in ('cancelled', 'landed')
+         and spawn_task_may_continue(k.state, m.state, true, r.state)) t on true
    where m.gate is not null
-     and (m.state in ('open', 'active')
-          or (m.state = 'done' and exists (select 1 from mission_tasks k
-                where k.mission_id = m.id and k.state in ('accepted', 'landing'))))
+     and (m.state in ('open', 'active') or t.tasks is not null)
 ) x";
 
 /// The last `task.gated` record of every task, keyed by task id:
@@ -391,7 +393,8 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// Open missions with a gate and the tasks the integrator may act on.
+    /// Missions with a gate and the tasks the integrator may act on: open
+    /// ones, and closed ones while the closure rule lets their work go on.
     pub fn gated_missions(&self) -> Result<Value, StoreError> {
         self.query_json(GATED, &[])
     }
@@ -454,7 +457,7 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// Retire a resident; its queued tasks are cancelled.
+    /// Retire a resident; its work the closure rule drops is cancelled.
     pub fn resident_retire(&self, name: &str) -> Result<(), StoreError> {
         self.execute("select spawn_resident_retire($1)", &[&name])?;
         Ok(())
