@@ -122,3 +122,54 @@ fn agents_with_an_open_task_are_published_again_from_their_first_source() {
     expected.sort();
     assert_eq!(store.publishing_agents().expect("agents"), expected);
 }
+
+/// A resident started before it had any task was mounted from the default
+/// repository, where its branch lives: its first task's mission does not
+/// move it (its checkpoints, and so its turns' ends, would find no branch),
+/// and no mission publishes it. One whose first execution came after its
+/// first task is the mission's, as before. Read from the records.
+#[test]
+fn an_agent_that_ran_before_its_first_task_stays_on_the_default_repository() {
+    let (store, schema) = store("source_first_mount");
+    let mission = store
+        .mission_add("scratch", &json!([]), "human")
+        .expect("add");
+    let mut client = admin(&schema);
+    let started = |client: &mut postgres::Client, agent: &str, at: &str| {
+        client
+            .batch_execute(&format!(
+                "select spawn_append_trusted('{agent}', '{}', 'exec_{agent}', 'bridge', null,
+                    '{{\"name\": \"execution.started\", \"detail\": {{\"engine\": \"claude\"}}}}'::jsonb);
+                 update spawn_events set recorded_at_ms = {at}
+                  where agent_id = '{agent}' and event_name = 'execution.started'",
+                agent.replace("agent_", "session_")
+            ))
+            .expect("record an execution");
+    };
+    // `early` ran before its task; `late` only after.
+    started(&mut client, "agent_worker_early", "1");
+    let early = store
+        .task_assign(mission, "ephemeral", "early", "brief", "default")
+        .expect("assign");
+    let late = store
+        .task_assign(mission, "ephemeral", "late", "brief", "default")
+        .expect("assign");
+    started(&mut client, "agent_worker_late", "spawn_now_ms() + 1000");
+    let agent = |client: &mut postgres::Client, task: i64| -> String {
+        client
+            .query_one("select agent_id from mission_tasks where id = $1", &[&task])
+            .expect("the task")
+            .get(0)
+    };
+    assert_eq!(agent(&mut client, early), "agent_worker_early");
+    assert_eq!(store.agent_source("agent_worker_early").expect("source"), None);
+    assert_eq!(
+        store.agent_source(&agent(&mut client, late)).expect("source"),
+        Some(None),
+        "a scratch mission's agent"
+    );
+    assert_eq!(
+        store.publishing_agents().expect("agents"),
+        vec![(agent(&mut client, late), None)]
+    );
+}
