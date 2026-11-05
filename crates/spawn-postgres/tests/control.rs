@@ -1139,8 +1139,7 @@ fn task_state(client: &mut Client, task: i64) -> String {
 /// a `reported` task of a `gate` mission, so it is never judged, landed or
 /// cancelled.
 #[test]
-#[ignore = "audit L7 repro"]
-fn a_gate_missions_report_that_arrives_after_done_is_judged_repro() {
+fn a_gate_missions_report_that_arrives_after_done_is_judged() {
     let (store, schema) = store("control_l7_gate");
     let mission = store
         .mission_add("Gate", &json!(["/tmp/source.git"]), "human")
@@ -1173,8 +1172,7 @@ fn a_gate_missions_report_that_arrives_after_done_is_judged_repro() {
 /// the task, which then goes on through report, review and revise, and is
 /// delivered to its worker again, for a mission that no longer exists.
 #[test]
-#[ignore = "audit L7 repro"]
-fn a_dropped_missions_delivered_task_is_cancelled_repro() {
+fn a_dropped_missions_delivered_task_is_cancelled() {
     let (store, schema) = store("control_l7_drop");
     let mission = store
         .mission_add("Drop", &json!(["/tmp/source.git"]), "human")
@@ -1201,5 +1199,288 @@ fn a_dropped_missions_delivered_task_is_cancelled_repro() {
         "after the drop the task is {after_drop}; reported {reported}, sent back {sent_back}, \
          delivered again {}",
         redelivered && delivered_again
+    );
+}
+
+/// Every task state, in the order the walk below reaches them.
+const TASK_STATES: [&str; 8] = [
+    "assigned",
+    "delivered",
+    "reported",
+    "revise",
+    "accepted",
+    "cancelled",
+    "landing",
+    "landed",
+];
+
+/// Walk a new task of `mission` (assigned to `worker`, a resident's name
+/// for `kind` = resident) to `state`, through the checked functions.
+fn task_in(store: &PostgresStore, mission: i64, kind: &str, worker: &str, state: &str) -> i64 {
+    let task = store
+        .task_assign(mission, kind, worker, "brief", "default")
+        .expect("assign");
+    if state == "assigned" {
+        return task;
+    }
+    if state == "cancelled" {
+        store.task_cancel(task).expect("cancel");
+        return task;
+    }
+    store.task_delivered(task, 1).expect("delivered");
+    if state == "delivered" {
+        return task;
+    }
+    assert!(store.task_reported(task, "done").expect("reported"));
+    match state {
+        "reported" => {}
+        "revise" => store.task_review(task, false, "again").expect("send back"),
+        "accepted" => store.task_review(task, true, "").expect("accept"),
+        "landing" | "landed" => {
+            store
+                .integrator_record(
+                    &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                           "base": "b", "candidate": format!("c{task}")}),
+                )
+                .expect("gate passed");
+            if state == "landed" {
+                store
+                    .integrator_record(&json!({"type": "task.landed", "id": task,
+                                               "from": "b", "to": format!("c{task}")}))
+                    .expect("landed");
+            }
+        }
+        other => panic!("no walk to {other}"),
+    }
+    task
+}
+
+/// The ids of the tasks the integrator is handed, by mission.
+fn gated_task_ids(store: &PostgresStore, mission: i64) -> Vec<i64> {
+    store
+        .gated_missions()
+        .expect("gated")
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter(|row| row["id"].as_i64() == Some(mission))
+        .flat_map(|row| row["tasks"].as_array().cloned().unwrap_or_default())
+        .filter_map(|task| task["id"].as_i64())
+        .collect()
+}
+
+/// Audit L7, the sweep: a mission closed done or dropped, accepting by the
+/// gate or by review, or without a gate, with one task in every state. After
+/// the close every task is closed, or the integrator is handed it; what goes
+/// on is exactly what the closure rule names.
+#[test]
+fn a_closed_missions_tasks_are_all_closed_or_handed_to_the_integrator() {
+    let (store, schema) = store("control_closure_sweep");
+    let mut client = admin(&schema);
+    for close in ["done", "dropped"] {
+        for accept in ["gate", "review", "none"] {
+            let gated = accept != "none";
+            let mission = store
+                .mission_add(
+                    &format!("{close} {accept}"),
+                    &json!(["/tmp/source.git"]),
+                    "human",
+                )
+                .expect("add");
+            if gated {
+                store
+                    .mission_configure(mission, Some("/scenarios"), accept, None, None)
+                    .expect("configure");
+            }
+            let tasks: Vec<(&str, i64)> = TASK_STATES
+                .iter()
+                .filter(|state| gated || !["landing", "landed"].contains(state))
+                .map(|state| (*state, task_in(&store, mission, "ephemeral", "w", state)))
+                .collect();
+            store
+                .mission_close(mission, close, "closed")
+                .expect("close");
+            let handed = gated_task_ids(&store, mission);
+            for (before, task) in &tasks {
+                let after = task_state(&mut client, *task);
+                let goes_on = match (close, gated) {
+                    ("done", true) => {
+                        ["delivered", "reported", "accepted", "landing"].contains(before)
+                    }
+                    _ => false,
+                };
+                let closed = ["cancelled", "landed"].contains(&after.as_str())
+                    || (after == "accepted" && !gated);
+                let case = format!("{close}, {accept}: a task {before} is {after}");
+                assert!(closed || handed.contains(task), "{case}, and not handed on");
+                if goes_on {
+                    assert_eq!(after, *before, "{case}");
+                    assert!(handed.contains(task), "{case}, and not handed on");
+                } else if ["cancelled", "landed"].contains(before)
+                    || (*before == "accepted" && !gated)
+                {
+                    assert_eq!(after, *before, "{case}: a closed task stays");
+                } else {
+                    assert_eq!(after, "cancelled", "{case}");
+                }
+            }
+            if close == "done" && gated {
+                // A report still comes in, and is handed on.
+                let delivered = tasks[1].1;
+                assert!(store.task_reported(delivered, "late").expect("report"));
+                assert!(gated_task_ids(&store, mission).contains(&delivered));
+                // Nothing new is asked of a worker: a send-back is refused,
+                // a gate rejection ends the task.
+                let reported = tasks[2].1;
+                assert!(store.task_review(reported, false, "again").is_err());
+                store
+                    .integrator_record(&json!({"type": "task.gated", "id": reported,
+                                               "verdict": "rejected", "note": "no"}))
+                    .expect("rejected");
+                assert_eq!(task_state(&mut client, reported), "cancelled");
+                // A report may still be accepted, and lands.
+                store.task_review(delivered, true, "").expect("accept");
+                assert_eq!(task_state(&mut client, delivered), "accepted");
+            }
+        }
+    }
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
+
+/// A retired resident's work that needs it again (queued, running,
+/// reported) is cancelled; work that needs nothing more from it (accepted,
+/// passed the gate) still lands. Nothing sends work back to it.
+#[test]
+fn a_retired_residents_work_is_cancelled_unless_it_only_has_to_land() {
+    let (store, schema) = store("control_closure_retired");
+    let mut client = admin(&schema);
+    store
+        .resident_propose("core", "Owns the core")
+        .expect("propose");
+    store.resident_approve("core").expect("approve");
+    let mission = store
+        .mission_add("Core work", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "review", None, None)
+        .expect("configure");
+    let tasks: Vec<(&str, i64)> = ["assigned", "delivered", "reported", "accepted", "landing"]
+        .iter()
+        .map(|state| (*state, task_in(&store, mission, "resident", "core", state)))
+        .collect();
+    store.resident_retire("core").expect("retire");
+    let handed = gated_task_ids(&store, mission);
+    for (before, task) in &tasks {
+        let after = task_state(&mut client, *task);
+        if ["accepted", "landing"].contains(before) {
+            assert_eq!(after, *before, "a task {before} still lands");
+            assert!(handed.contains(task), "a task {before} is handed on");
+        } else {
+            assert_eq!(after, "cancelled", "a task {before} of a retired resident");
+            assert!(!handed.contains(task));
+        }
+    }
+    // A gate rejection of its accepted work ends it instead of sending it back.
+    let accepted = tasks[3].1;
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": accepted,
+                                   "verdict": "rejected", "note": "no"}))
+        .expect("rejected");
+    assert_eq!(task_state(&mut client, accepted), "cancelled");
+
+    // A fold from before the rule left a report open (as an earlier
+    // retirement did): no transition moves it, and the next migration
+    // records it cancelled.
+    let reported = tasks[2].1;
+    let left_as = |client: &mut Client, state: &str| {
+        client
+            .execute(
+                "update mission_tasks set state = $2 where id = $1",
+                &[&reported, &state],
+            )
+            .expect("a task an earlier retirement left open");
+    };
+    left_as(&mut client, "revise");
+    store.task_delivered(reported, 2).expect("deliver");
+    assert_eq!(
+        task_state(&mut client, reported),
+        "revise",
+        "not delivered again"
+    );
+    left_as(&mut client, "delivered");
+    assert!(!store.task_reported(reported, "late").expect("report"));
+    assert_eq!(
+        task_state(&mut client, reported),
+        "delivered",
+        "no report taken"
+    );
+    store.migrate().expect("migrate again");
+    assert_eq!(task_state(&mut client, reported), "cancelled");
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
+
+/// A done gated mission's delivered task stays with the integrator, so its
+/// budget still holds: the integrator sees it with the mission's budget and
+/// may abort it. A dropped mission's delivered task is cancelled instead,
+/// and no budget is left to check.
+#[test]
+fn a_done_missions_running_task_is_still_held_to_its_budget() {
+    let (store, schema) = store("control_closure_budget");
+    let mut client = admin(&schema);
+    let running = |close: &str| {
+        let mission = store
+            .mission_add(close, &json!(["/tmp/source.git"]), "human")
+            .expect("add");
+        store
+            .mission_configure(
+                mission,
+                Some("/scenarios"),
+                "review",
+                Some(&json!({"minutes": 1})),
+                None,
+            )
+            .expect("configure");
+        let task = task_in(&store, mission, "ephemeral", "w", "delivered");
+        store
+            .mission_close(mission, close, "closed")
+            .expect("close");
+        (mission, task)
+    };
+    let (done, done_task) = running("done");
+    let (dropped, dropped_task) = running("dropped");
+
+    let gated = store.gated_missions().expect("gated");
+    let rows = gated.as_array().expect("rows");
+    let row = rows
+        .iter()
+        .find(|row| row["id"].as_i64() == Some(done))
+        .expect("the done mission is handed on");
+    assert_eq!(row["budget"], json!({"minutes": 1}));
+    assert_eq!(row["tasks"][0]["id"], done_task);
+    assert_eq!(row["tasks"][0]["state"], "delivered");
+    assert!(row["tasks"][0]["delivered_at_ms"].is_i64());
+    store
+        .integrator_record(&json!({"type": "task.aborted", "id": done_task,
+                                   "reason": "the task ran past its 1-minute budget"}))
+        .expect("abort over budget");
+    assert_eq!(task_state(&mut client, done_task), "cancelled");
+
+    assert!(rows.iter().all(|row| row["id"].as_i64() != Some(dropped)));
+    assert_eq!(task_state(&mut client, dropped_task), "cancelled");
+    assert!(
+        gated_mission_ids(&store).is_empty(),
+        "nothing is left to land or to hold to a budget"
     );
 }

@@ -1,7 +1,8 @@
 //! `spawn integrate`: the one landing path (docs/fleet-architecture.md
 //! §10.3).
 //!
-//! For every open mission with a gate, one pass:
+//! For every open mission with a gate, and every done one while the closure
+//! rule (`spawn_task_may_continue`) lets its work go on, one pass:
 //!
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row, the
@@ -11,9 +12,9 @@
 //!    stopped;
 //! 3. a task whose gate passed is landed (again, after a crash);
 //! 4. otherwise the next ready task is judged: accepted by the supervisor
-//!    (`accept` = review) or just reported (`gate`). The candidate is what
-//!    the agent published: the source's `refs/heads/spawn/<agent>` (pushed
-//!    by the Bridge's pusher, [`crate::push`]), fetched into this mirror's
+//!    (`accept` = review), or also just reported (`gate`). The candidate is
+//!    what the agent published: the source's `refs/heads/spawn/<agent>`
+//!    (pushed by the Bridge's pusher, [`crate::push`]), fetched into this mirror's
 //!    own `refs/spawn-integrate/<agent>`. The integrator never commits a
 //!    mounted workspace and never moves the agent's `refs/heads/<agent>`,
 //!    so it works the same on a host that never ran the agent, and a file
@@ -84,11 +85,12 @@ const PRINCIPAL: &str = "spawn-integrate";
 
 const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>]";
 
-/// One open mission with a gate, from `gated_missions`.
+/// One mission with a gate the integrator visits, from `gated_missions`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Mission {
     pub(crate) id: i64,
-    /// `open` or `active`; `done` while accepted work still lands.
+    /// `open` or `active`; `done` while the closure rule lets its work go
+    /// on (`spawn_task_may_continue`).
     #[serde(default)]
     pub(crate) state: String,
     pub(crate) gate: String,
@@ -109,8 +111,8 @@ pub(crate) struct Mission {
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
     pub(crate) source: Option<String>,
-    /// Its open tasks (assigned, delivered, reported, revise, accepted,
-    /// landing).
+    /// Its tasks the closure rule lets go on: every open task of an open
+    /// mission; of a done one, delivered, reported, accepted and landing.
     #[serde(default)]
     pub(crate) tasks: Vec<Task>,
 }
@@ -133,14 +135,13 @@ pub(crate) struct Task {
 }
 
 impl Mission {
-    /// The task the gate judges next.
+    /// The task the gate judges next: one the supervisor accepted, or, when
+    /// the gate alone accepts, also one just reported.
     fn ready(&self) -> Option<&Task> {
-        let wanted = if self.accept == "gate" {
-            TaskState::Reported
-        } else {
-            TaskState::Accepted
-        };
-        self.tasks.iter().find(|task| task.state == wanted)
+        self.tasks.iter().find(|task| {
+            task.state == TaskState::Accepted
+                || (self.accept == "gate" && task.state == TaskState::Reported)
+        })
     }
 
     /// A task whose gate passed and whose landing is not recorded yet.
@@ -1153,6 +1154,10 @@ mod tests {
         assert_eq!(gated.ready().map(|task| task.id), Some(2));
         gated.accept = "gate".to_string();
         assert_eq!(gated.ready().map(|task| task.id), Some(1));
+        // A report the supervisor accepted anyway is judged too, not left
+        // accepted forever.
+        gated.tasks.remove(0);
+        assert_eq!(gated.ready().map(|task| task.id), Some(2));
     }
 
     /// Both landing commits [`super::landing_candidate`] writes (a branch
