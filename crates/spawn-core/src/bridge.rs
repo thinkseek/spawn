@@ -681,6 +681,8 @@ impl Bridge {
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
                 view.active = None;
             }
+            // An exit report of an old runner (engine-sourced; runners now
+            // write SPAWN_EXIT_FILE): only old logs hold one.
             EventKind::ExecutionEnded { cause, exit_code } if current => {
                 if let Some(active) = view.active.as_mut() {
                     active.reported_end = Some((*cause, *exit_code));

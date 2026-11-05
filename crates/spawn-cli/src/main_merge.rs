@@ -299,8 +299,9 @@ pub(crate) fn conflict_note(main: &str, merge: &Merge) -> String {
         ),
         Merge::NotMounted => format!(
             "{opening} Your workspace is not mounted on the integrator's host, so main could not \
-             be merged into it. When your worker is resumed, main is merged if it merges cleanly; \
-             otherwise a person has to resolve this conflict."
+             be merged into it. Once it is mounted again (your worker resumed), main is merged \
+             into it if it merges cleanly; if not, your next report is sent back again with main \
+             merged in and the conflicting regions marked, for you to resolve."
         ),
         Merge::Failed(error) => format!(
             "{opening} Merging main into your workspace failed ({error}). Report again: the next \
@@ -336,5 +337,20 @@ fn shown(files: &[String]) -> String {
         "no file".to_string()
     } else {
         files.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Merge, conflict_note};
+
+    /// Audit #22: a conflict judged while the workspace is not mounted is
+    /// not left to a person: once mounted, the next report's `conflict`
+    /// verdict merges main with markers, and the worker resolves them.
+    #[test]
+    fn a_conflict_while_not_mounted_comes_back_marked_for_the_worker() {
+        let note = conflict_note("abc123", &Merge::NotMounted);
+        assert!(!note.contains("a person"), "{note}");
+        assert!(note.contains("marked, for you to resolve"), "{note}");
     }
 }
