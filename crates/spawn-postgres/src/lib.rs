@@ -23,6 +23,26 @@ use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row};
 use spawn_core::port::StoreError;
 
+/// SQL: whether the `agent_executions` row aliased `$x` died young: it
+/// ended lost or with a non-zero exit within a minute of its start. An
+/// engine that launches and dies at once is a failed revival, whatever its
+/// command's outcome says.
+macro_rules! died_young {
+    ($x:literal) => {
+        concat!(
+            "(",
+            $x,
+            ".ended_at_ms is not null and ",
+            $x,
+            ".duration_ms < 60000 and (",
+            $x,
+            ".cause = 'lost' or coalesce(",
+            $x,
+            ".exit_code, 0) <> 0))"
+        )
+    };
+}
+
 mod command_queue;
 mod event_log;
 mod fleet;

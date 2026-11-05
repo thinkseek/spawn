@@ -94,6 +94,11 @@ pub(crate) struct Facts {
     /// The model profile of the session's latest execution.
     #[serde(default)]
     pub(crate) model: ModelProfile,
+    /// Executions the dispatcher's resumes started that were lost (or
+    /// exited non-zero) within a minute, since the session's last execution
+    /// that stayed up.
+    #[serde(default)]
+    pub(crate) resumed_young: u32,
 }
 
 impl Facts {
@@ -405,6 +410,7 @@ mod tests {
             dispatched: Vec::new(),
             last_delivery: None,
             model: ModelProfile::Default,
+            resumed_young: 0,
         }
     }
 
@@ -440,6 +446,7 @@ mod tests {
             dispatched: Vec::new(),
             last_delivery: None,
             model: ModelProfile::Default,
+            resumed_young: 0,
         }
     }
 
@@ -621,6 +628,26 @@ mod tests {
         let plan = decide(&[lost], false, NOW, "spawn");
         assert!(plan.orders.is_empty());
         assert_eq!(plan.pending[0].why, Why::ResumeFailed);
+    }
+
+    #[test]
+    fn a_worker_lost_again_right_after_its_resume_is_escalated_not_resumed_again() {
+        let mut lost = worker(judged(SemanticState::Unknown, 0.5));
+        lost.live = false;
+        lost.end_cause = Some("lost".to_string());
+        // The resumed execution has its own id, so its resume key is new;
+        // what it did with the last resume decides.
+        lost.execution_id = Some("exec_6".to_string());
+        lost.resumed_young = 1;
+        let plan = decide(&[lost.clone()], false, NOW, "spawn");
+        assert!(plan.orders.is_empty(), "no second resume");
+        assert_eq!(plan.pending[0].why, Why::ResumeFailed);
+        lost.resumed_young = 0;
+        let plan = decide(&[lost], false, NOW, "spawn");
+        assert_eq!(
+            plan.orders[0].key, "dispatch-resume-exec_6",
+            "an execution that stayed up is resumed again"
+        );
     }
 
     #[test]
