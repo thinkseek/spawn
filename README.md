@@ -115,6 +115,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_TMUX_SOCKET` | default socket | tmux `-L` socket name |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts |
+| `SPAWN_MAX_FILE_MB` | `100` | Largest file a checkpoint commits, in MiB; a larger one is left out of the checkpoint and the agent is told once |
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |

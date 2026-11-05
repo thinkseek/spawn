@@ -422,6 +422,9 @@ pub struct Bridge {
     /// took whose append failed: appended again first at the next tick
     /// ([`Bridge::record_commit`]).
     unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
+    /// Per session, what the workspace store had to tell the agent
+    /// ([`WorkspaceStore::take_notices`]) and no prompt carried yet.
+    untold: std::sync::Mutex<HashMap<SessionId, Vec<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
 }
@@ -445,6 +448,7 @@ impl Bridge {
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
             unrecorded_commits: std::sync::Mutex::default(),
+            untold: std::sync::Mutex::default(),
             transcripts: None,
         }
     }
@@ -1318,6 +1322,16 @@ impl Bridge {
                 return Ok(false);
             }
         }
+        // Logged, and carried by the next prompt the Bridge types.
+        let notices = self.workspaces.take_notices(&active.workspace);
+        if !notices.is_empty() {
+            for notice in &notices {
+                report.warnings.push(format!("{session}: {notice}"));
+            }
+            if let Ok(mut untold) = self.untold.lock() {
+                untold.entry(session.clone()).or_default().extend(notices);
+            }
+        }
         Ok(true)
     }
 
@@ -2039,13 +2053,22 @@ impl Bridge {
     /// was not told yet, if anything did; and the position of the last merge
     /// event the notice tells of.
     fn with_notice(&self, session: &SessionId, prompt: &str) -> (String, Option<GlobalPosition>) {
+        let untold = self
+            .untold
+            .lock()
+            .ok()
+            .and_then(|untold| untold.get(session).map(|notices| notices.join("\n\n")))
+            .map_or_else(
+                || prompt.to_string(),
+                |notices| format!("{notices}\n\n{prompt}"),
+            );
         match self
             .sessions
             .get(session)
             .and_then(|view| view.notice.text())
         {
-            Some((notice, through)) => (format!("{notice}\n\n{prompt}"), Some(through)),
-            None => (prompt.to_string(), None),
+            Some((notice, through)) => (format!("{notice}\n\n{untold}"), Some(through)),
+            None => (untold, None),
         }
     }
 
@@ -2058,6 +2081,10 @@ impl Bridge {
         active: &Active,
         through: Option<GlobalPosition>,
     ) -> Result<(), StoreError> {
+        // The store's notices went with the prompt: told.
+        if let Ok(mut untold) = self.untold.lock() {
+            untold.remove(&claimed.session_id);
+        }
         let Some(through) = through else {
             return Ok(());
         };
