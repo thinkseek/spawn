@@ -1106,8 +1106,8 @@ impl GitWorkspace {
         // directory halfway through a merge.
         let _lock = self.lock_branch(&branch)?;
         self.refuse_stale(&branch)?;
-        if let Some(Pending { files, .. }) = self.pending_merge(&branch) {
-            if unresolved(&directory, &files) {
+        if let Some(Pending { main, files, .. }) = self.pending_merge(&branch) {
+            if unresolved(&directory, &self.shortest_markers(&[&main], &files)?) {
                 return Ok(BaseMerge::Conflicted {
                     files: shown_paths(&files),
                     marked: true,
@@ -1376,7 +1376,9 @@ impl GitWorkspace {
 
     /// The second parent of the next checkpoint of `branch`: the pending
     /// `main`, once no conflicted file in `directory` holds a marker. A
-    /// pending `main` the branch already contains is cleared.
+    /// pending `main` the branch already contains is cleared. Markers whose
+    /// length cannot be read count as still there: this checkpoint is no
+    /// resolution, a later one may be.
     fn resolved_merge(&self, branch: &str, directory: &Path) -> Option<String> {
         let Pending { main, files, .. } = self.pending_merge(branch)?;
         let contained = self
@@ -1386,7 +1388,67 @@ impl GitWorkspace {
             self.clear_pending(branch);
             return None;
         }
-        (!unresolved(directory, &files)).then_some(main)
+        let sized = self.shortest_markers(&[&main], &files).ok()?;
+        (!unresolved(directory, &sized)).then_some(main)
+    }
+
+    /// Each of `paths` with the shortest conflict markers a merge could have
+    /// written in it: git's default ([`CONFLICT_MARKER_SIZE`]), or less when
+    /// the `.gitattributes` of one of `sources` (the commits whose merge
+    /// rules apply, read with `--attr-source` as the merge reads them) sets
+    /// `conflict-marker-size` lower for the path. Longer markers are always
+    /// found ([`has_conflict_block_sized`]).
+    fn shortest_markers(
+        &self,
+        sources: &[&str],
+        paths: &[TreePath],
+    ) -> Result<Vec<(TreePath, usize)>, WorkspaceError> {
+        let mut sized: Vec<(TreePath, usize)> = paths
+            .iter()
+            .map(|path| (path.clone(), CONFLICT_MARKER_SIZE))
+            .collect();
+        if paths.is_empty() {
+            return Ok(sized);
+        }
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        for source in sources {
+            let mut child = self
+                .command()
+                .arg(format!("--attr-source={source}"))
+                .args(["check-attr", "-z", "--stdin", "conflict-marker-size"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| {
+                    WorkspaceError::Unavailable(format!("run {}: {error}", self.git))
+                })?;
+            let stdin = child.stdin.take();
+            // Written beside the read: a long answer must not block the
+            // question.
+            let listed = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    use std::io::Write;
+                    stdin.map(|mut stdin| stdin.write_all(&input))
+                });
+                report_listing(child.wait_with_output(), "check-attr conflict-marker-size")
+            })?;
+            // `<path> NUL conflict-marker-size NUL <value> NUL` per path.
+            let fields: Vec<&[u8]> = listed.split(|byte| *byte == 0).collect();
+            for answer in fields.chunks_exact(3) {
+                let size = marker_size_of(answer[2]);
+                for (path, shortest) in &mut sized {
+                    if path.as_bytes() == answer[0] {
+                        *shortest = (*shortest).min(size);
+                    }
+                }
+            }
+        }
+        Ok(sized)
     }
 
     fn clear_pending(&self, branch: &str) {
@@ -1480,7 +1542,7 @@ impl GitWorkspace {
             }
         }
         let mut marked = Vec::new();
-        for path in files {
+        for (path, shortest) in self.shortest_markers(&[base, commit], &files)? {
             let output = self
                 .command()
                 .arg("cat-file")
@@ -1499,7 +1561,7 @@ impl GitWorkspace {
                     String::from_utf8_lossy(&output.stderr).trim()
                 )));
             }
-            if has_conflict_block(&output.stdout) {
+            if has_conflict_block_sized(&output.stdout, shortest) {
                 marked.push(path.shown());
             }
         }
@@ -1546,29 +1608,69 @@ fn merge_tree_output(stdout: &[u8]) -> (String, Vec<TreePath>, Vec<String>) {
 }
 
 /// Whether any of `files` (the ones the merge listed) in `directory` still
-/// holds a whole conflict marker block. A deleted file holds none.
-fn unresolved(directory: &Path, files: &[TreePath]) -> bool {
-    files.iter().any(|file| {
-        std::fs::read(directory.join(file.as_path())).is_ok_and(|bytes| has_conflict_block(&bytes))
+/// holds a whole conflict marker block whose markers are at least as long
+/// as the path's shortest ([`GitWorkspace::shortest_markers`]). A deleted
+/// file holds none.
+fn unresolved(directory: &Path, files: &[(TreePath, usize)]) -> bool {
+    files.iter().any(|(file, shortest)| {
+        std::fs::read(directory.join(file.as_path()))
+            .is_ok_and(|bytes| has_conflict_block_sized(&bytes, *shortest))
     })
 }
 
-/// Whether `bytes` hold a whole conflict marker block: a line that starts
-/// with `<<<<<<< `, later a line that is exactly `=======`, later a line
-/// that starts with `>>>>>>> `. A lone `=======` (a Markdown heading's
-/// underline) is not one.
+/// The length of the conflict markers git writes by default.
+pub const CONFLICT_MARKER_SIZE: usize = 7;
+
+/// Whether `bytes` hold a whole conflict marker block of git's default
+/// marker size or longer ([`has_conflict_block_sized`]).
 pub fn has_conflict_block(bytes: &[u8]) -> bool {
-    let mut stage = 0;
+    has_conflict_block_sized(bytes, CONFLICT_MARKER_SIZE)
+}
+
+/// Whether `bytes` hold a whole conflict marker block whose markers are
+/// `shortest` characters long or longer: a line of `n` `<` (alone or before
+/// a space and a label), later a line that is exactly `n` `=`, later a line
+/// of `n` `>` (alone or before a space), one `n` for the whole block. git
+/// writes markers of `conflict-marker-size` (7 unless `.gitattributes` sets
+/// it), and longer ones (by two per level) for a conflict inside a merge
+/// base, which a diff3 base section shows; a block inside another counts on
+/// its own. A lone `=======` (a Markdown heading's underline) is not one,
+/// nor is a block whose three markers differ in length.
+pub fn has_conflict_block_sized(bytes: &[u8], shortest: usize) -> bool {
+    let shortest = shortest.max(1);
+    // The stage each marker length has reached: 1 after its `<` line, 2
+    // after its `=` line.
+    let mut stages: BTreeMap<usize, u8> = BTreeMap::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        stage = match stage {
-            0 if line.starts_with(b"<<<<<<< ") => 1,
-            1 if line == b"=======" => 2,
-            2 if line.starts_with(b">>>>>>> ") => return true,
-            other => other,
+        let Some(&first) = line.first() else {
+            continue;
         };
+        let run = line.iter().take_while(|byte| **byte == first).count();
+        if run < shortest {
+            continue;
+        }
+        let labelled = matches!(line.get(run), None | Some(b' '));
+        let stage = stages.entry(run).or_insert(0);
+        match (first, *stage) {
+            (b'<', 0) if labelled => *stage = 1,
+            (b'=', 1) if run == line.len() => *stage = 2,
+            (b'>', 2) if labelled => return true,
+            _ => {}
+        }
     }
     false
+}
+
+/// The marker size a `conflict-marker-size` attribute value sets: a
+/// positive number; anything else (`unspecified`, `set`, ...) leaves git's
+/// default.
+fn marker_size_of(value: &[u8]) -> usize {
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(CONFLICT_MARKER_SIZE)
 }
 
 #[cfg(test)]
