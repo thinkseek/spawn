@@ -101,8 +101,10 @@ pub(crate) struct Facts {
     /// carried ([`Escalation::tag`]).
     #[serde(default)]
     pub(crate) told: BTreeSet<String>,
-    /// Key of the latest delivery (`deliver-<task>-<revision>`) the
-    /// dispatcher sent into the session, however long ago.
+    /// Key of the latest delivery (`deliver-<task>-<revision>`, or one of
+    /// its retries) the dispatcher sent into the session that reached the
+    /// worker or may have, however long ago. One refused before anything was
+    /// typed is not the worker's: it told the worker nothing.
     #[serde(default)]
     pub(crate) last_delivery: Option<String>,
     /// The model profile of the session's latest execution.
@@ -466,6 +468,60 @@ mod tests {
             model: ModelProfile::Default,
             resumed_young: 0,
         }
+    }
+
+    /// The whole pass for the live sequence of task 25 (a resident's
+    /// delivery refused by a pane still busy at its turn's end, then the
+    /// idle worker judged BLOCKED): the plan holds the retry that delivers
+    /// task 25, and the worker is not escalated as blocked or idle meanwhile,
+    /// since it is between tasks the mission layer manages.
+    #[test]
+    fn a_refused_delivery_is_retried_by_the_whole_pass_to_a_blocked_idle_worker() {
+        let mut resident = worker(judged(SemanticState::Blocked, 0.9));
+        resident.session_id = "session_resident_core".to_string();
+        resident.agent_id = "agent_resident_core".to_string();
+        let sent = |id: i64, key: &str, finished: i64, error: Option<&str>| Sent {
+            id: Some(id),
+            key: key.to_string(),
+            text: None,
+            created_at_ms: finished - 1,
+            finished_at_ms: Some(finished),
+            succeeded: Some(error.is_none()),
+            error: error.map(str::to_string),
+        };
+        resident.dispatched = vec![
+            sent(30, "deliver-24-0", NOW - 600_000, None),
+            sent(
+                31,
+                "deliver-25-0",
+                NOW - 10_000,
+                Some("pane state Busy does not accept input"),
+            ),
+        ];
+        resident.last_delivery = Some("deliver-24-0".to_string());
+        let row = |id: i64, state: &str| {
+            serde_json::json!({
+                "id": id, "mission_id": 1, "kind": "resident",
+                "agent_id": "agent_resident_core", "session_id": "session_resident_core",
+                "brief": format!("brief {id}"), "state": state, "revisions": 0,
+                "mission_text": "m", "resident": "core", "charter": "c",
+            })
+        };
+        let work = Work {
+            tasks: serde_json::from_value(serde_json::json!([
+                row(24, "accepted"),
+                row(25, "assigned")
+            ]))
+            .expect("task rows"),
+            ..Work::default()
+        };
+        let plan = decide_with(&[resident], &work, &[], false, NOW, "spawn");
+        assert!(plan.delivered.is_empty());
+        assert_eq!(plan.orders.len(), 1, "{:?}", plan.orders);
+        assert_eq!(plan.orders[0].key, "deliver-25-0-retry-1");
+        assert_eq!(plan.orders[0].task, Some(25));
+        assert!(matches!(plan.orders[0].action, CommandAction::Input { .. }));
+        assert!(plan.pending.is_empty(), "{:?}", plan.pending);
     }
 
     /// The digest `order` reached the supervisor: the tags it filed are
