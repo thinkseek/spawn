@@ -40,6 +40,18 @@
 //!    rejection is counted, nothing reaches the worker, and a later pass
 //!    judges again. An agent with neither a checkpoint nor a pushed branch
 //!    has no branch to land;
+//!
+//!    **No room is not a verdict.** A gate that finds TMPDIR short of room
+//!    (exit [`gate::NO_ROOM_EXIT`] with its no-room fact,
+//!    [`GateFailure::NoRoom`]) is gated `no_room`: the task stays where it
+//!    was, the verdict names the free space and TMPDIR, and neither the
+//!    abort nor the rejection count moves. The store folds the mission's
+//!    run of them (`gate_room_*`); the next try waits [`room_backoff`] after
+//!    the latest, and the first `no_room` more than [`ROOM_ESCALATE_AFTER`]
+//!    into a run carries `escalate`, which the dispatcher's digest takes to
+//!    the supervisor once ([`crate::disk::gate_room_escalations`]). Every
+//!    other gate failure, the gate's own exit 3 included (a missing bind
+//!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
 //! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
@@ -72,6 +84,17 @@ use crate::{main_merge, objectives, sources};
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
+
+/// The wait before the first retry of a gate that had no room; it doubles
+/// with each `no_room` in a row, up to [`ROOM_BACKOFF_MAX`].
+const ROOM_BACKOFF: Duration = Duration::from_mins(5);
+
+/// The longest wait between two tries of a gate that had no room.
+const ROOM_BACKOFF_MAX: Duration = Duration::from_mins(40);
+
+/// How long a mission's gate may go without room before the supervisor is
+/// told, once per run.
+const ROOM_ESCALATE_AFTER: Duration = Duration::from_hours(2);
 
 /// Wall clock of one gate run: two builds, clippy, the tests, the e2e and
 /// the black-box scenarios fit well inside it.
@@ -118,6 +141,17 @@ pub(crate) struct Mission {
     pub(crate) gate_rejections: u32,
     #[serde(default)]
     pub(crate) gate_aborts: u32,
+    /// The mission's current run of `no_room` gate outcomes, folded by the
+    /// store: when it began, when the latest was recorded, how many, and
+    /// whether one carried `escalate`.
+    #[serde(default)]
+    pub(crate) gate_room_since_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_last_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_waits: u32,
+    #[serde(default)]
+    pub(crate) gate_room_escalated: bool,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
@@ -191,6 +225,59 @@ pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
         ));
     }
     None
+}
+
+/// The wait after the `waits`-th `no_room` in a row: [`ROOM_BACKOFF`],
+/// doubled each time, at most [`ROOM_BACKOFF_MAX`]. None before the first.
+pub(crate) fn room_backoff(waits: u32) -> Duration {
+    if waits == 0 {
+        return Duration::ZERO;
+    }
+    ROOM_BACKOFF
+        .saturating_mul(2u32.saturating_pow(waits - 1))
+        .min(ROOM_BACKOFF_MAX)
+}
+
+/// How long the mission's gate still waits for room at `now_ms`, read from
+/// the store's record of its latest `no_room` (never from memory). None when
+/// the gate may run.
+pub(crate) fn room_wait(mission: &Mission, now_ms: i64) -> Option<Duration> {
+    let last = mission.gate_room_last_ms?;
+    let backoff = i64::try_from(room_backoff(mission.gate_room_waits).as_millis()).ok()?;
+    let left = last.saturating_add(backoff).saturating_sub(now_ms);
+    (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
+}
+
+/// The record of a gate that had no room to judge, at `now_ms`: the reason
+/// with the free space and TMPDIR, the facts themselves, and `escalate`
+/// when the mission's run of them began more than [`ROOM_ESCALATE_AFTER`]
+/// ago and none escalated yet.
+pub(crate) fn no_room(
+    mission: &Mission,
+    free_kb: u64,
+    min_gb: u64,
+    tmpdir: &str,
+    log: &str,
+    now_ms: i64,
+) -> Value {
+    let after = i64::try_from(ROOM_ESCALATE_AFTER.as_millis()).unwrap_or(i64::MAX);
+    let escalate = !mission.gate_room_escalated
+        && mission
+            .gate_room_since_ms
+            .is_some_and(|since| now_ms.saturating_sub(since) > after);
+    #[allow(clippy::cast_precision_loss)]
+    let free_gib = free_kb as f64 / 1_048_576.0;
+    json!({
+        "reason": format!(
+            "no room to judge now: {free_gib:.1} GiB free in {tmpdir} (TMPDIR), under \
+             SPAWN_GATE_MIN_FREE_GB={min_gb}; not a verdict, judged again later"
+        ),
+        "free_kb": free_kb,
+        "min_gb": min_gb,
+        "tmpdir": tmpdir,
+        "log": log,
+        "escalate": escalate,
+    })
 }
 
 /// Whether a delivered task ran past its mission's budget
@@ -460,7 +547,17 @@ impl Integrator {
         let Some(task) = mission.ready() else {
             return Ok(assigned);
         };
-        let judged = self.judge(store, &mirror, source, &main, &scenarios, count, task)?;
+        // The gate had no room last time: wait out the backoff, then try.
+        if let Some(wait) = room_wait(mission, now_ms()) {
+            println!(
+                "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
+                mission.id,
+                task.id,
+                wait.as_secs()
+            );
+            return Ok(assigned);
+        }
+        let judged = self.judge(store, &mirror, source, &main, mission, count, task)?;
         Ok(judged || assigned)
     }
 
@@ -540,7 +637,7 @@ impl Integrator {
         mirror: &Path,
         source: &str,
         main: &str,
-        scenarios: &Path,
+        mission: &Mission,
         count: u32,
         task: &Task,
     ) -> Result<bool, String> {
@@ -563,7 +660,7 @@ impl Integrator {
             mirror,
             source,
             main,
-            scenarios,
+            mission,
             count,
             task,
             branch.as_deref(),
@@ -580,11 +677,12 @@ impl Integrator {
         mirror: &Path,
         source: &str,
         main: &str,
-        scenarios: &Path,
+        mission: &Mission,
         count: u32,
         task: &Task,
         branch: Option<&str>,
     ) -> Result<(), String> {
+        let scenarios = Path::new(&mission.gate);
         // Read only: the integrator never commits a workspace.
         let repo = GitWorkspace::new(mirror, &self.root);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
@@ -689,6 +787,16 @@ impl Integrator {
                 land(store, mirror, source, &landing)
             }
             Ok(verdict) => rejected(&verdict.reason, &verdict.output),
+            // No room in TMPDIR: a fact about the host, never a count.
+            Err(GateFailure::NoRoom {
+                free_kb,
+                min_gb,
+                tmpdir,
+                log,
+            }) => gated(
+                "no_room",
+                no_room(mission, free_kb, min_gb, &tmpdir, &log, now_ms()),
+            ),
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
@@ -865,7 +973,16 @@ fn aborted(failure: &GateFailure) -> Value {
         GateFailure::Aborted { reason, log } => {
             json!({"reason": format!("the gate failed: {reason}"), "log": log})
         }
+        // Recorded as `no_room` by the caller; counted here only if a
+        // caller forgets that.
+        GateFailure::NoRoom { tmpdir, log, .. } => {
+            json!({"reason": format!("the gate had no room in {tmpdir}"), "log": log})
+        }
     }
+}
+
+fn now_ms() -> i64 {
+    spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
 /// Move the source's default branch from the task's base to its candidate,
