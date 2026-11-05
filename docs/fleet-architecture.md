@@ -58,7 +58,7 @@ No layer calls another layer's process directly; they meet in the log.
 | --- | --- |
 | 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, the chunk store, transcripts and exit files |
 | 2 Event log | `spawn_events` (with the control stream), `spawn_commands`, grants, projections, views |
-| 3 Observation | Observer: rules first, then the model judge on ambiguity (Jev, or the local heuristic judge when no Jev URL is set) |
+| 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
 | 5 Interface | `spawn serve` (read-only API and web UI), the `spawn` CLI |
 
@@ -91,10 +91,12 @@ facts. It answers in one request:
 - `needs_human` (yes/no): probability that a human must answer or decide;
 - `stuck` (yes/no): probability that the agent loops or makes no progress.
 
-Without a Jev URL (`SPAWN_JUDGE_URL` or `--judge-url`), the heuristic judge
-(`HeuristicJudge`, `judge: "heuristic"`) answers the ambiguous cases with
-fixed rules over the same input. It keeps the system running without a model
-and is what the tests use.
+Without a Jev URL (`SPAWN_JUDGE_URL` or `--judge-url`), the Observer judges
+by the rules alone. A case they cannot settle goes the way of a judge that is
+down (below): the rules' guess with its ambiguity, `reason =
+JudgeUnavailable`, `judge: "none"`, and attention, so the dispatcher
+escalates it rather than nudging. Observations in the log that name
+`judge: "heuristic"`, a judge since removed, read and show like any other.
 
 Every observation records who decided and why:
 

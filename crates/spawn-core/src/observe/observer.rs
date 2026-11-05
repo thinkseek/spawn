@@ -143,10 +143,16 @@ struct Classified {
     failures: u32,
 }
 
+/// What an observation names as its judge when no model judge is
+/// configured: the rules' guess stands, as when the judge is down.
+pub const NO_JUDGE: &str = "none";
+
 /// State observer: rules first, the model judge on ambiguity.
 pub struct Observer {
     log: Arc<dyn EventLog>,
-    judge: Arc<dyn StateJudge>,
+    /// The model judge; without one an ambiguous case keeps the rules'
+    /// guess and asks for attention.
+    judge: Option<Arc<dyn StateJudge>>,
     context: Option<Arc<dyn ObservationContext>>,
     clock: Arc<dyn Clock>,
     cursor: GlobalPosition,
@@ -154,16 +160,25 @@ pub struct Observer {
 }
 
 impl Observer {
-    /// Observer over one log, with `judge` answering ambiguous cases.
-    pub fn new(log: Arc<dyn EventLog>, judge: Arc<dyn StateJudge>) -> Self {
+    /// Observer over one log that judges by the rules alone: a case they
+    /// cannot settle is recorded as ambiguous, with their guess, and asks
+    /// for attention ([`WaitReason::JudgeUnavailable`]).
+    pub fn new(log: Arc<dyn EventLog>) -> Self {
         Self {
             log,
-            judge,
+            judge: None,
             context: None,
             clock: Arc::new(SystemClock),
             cursor: GlobalPosition(0),
             sessions: HashMap::new(),
         }
+    }
+
+    /// Let `judge` answer the cases the rules cannot settle.
+    #[must_use]
+    pub fn with_judge(mut self, judge: Arc<dyn StateJudge>) -> Self {
+        self.judge = Some(judge);
+        self
     }
 
     /// Give the model judge the terminal tail and the task.
@@ -356,6 +371,8 @@ impl Observer {
     }
 
     /// Ask the model judge about an ambiguous case and narrow its answer.
+    /// With no judge configured the case goes the way of a judge that is
+    /// down: the rules' guess, `JudgeUnavailable`, attention.
     ///
     /// Returns the observation and whether the next tick must retry.
     fn ask_model(
@@ -366,18 +383,21 @@ impl Observer {
         seq: SessionSeq,
     ) -> (Observation, bool) {
         let started = Instant::now();
-        let answer = self.judge.judge(input);
+        let answer = self
+            .judge
+            .as_ref()
+            .and_then(|judge| judge.judge(input).ok());
         let latency = elapsed_ms(started);
+        let name = self.judge.as_ref().map_or(NO_JUDGE, |judge| judge.name());
         let model_observation = |state, reason, confidence| {
-            let mut observation =
-                Observation::basic(state, reason, seq, confidence, self.judge.name());
+            let mut observation = Observation::basic(state, reason, seq, confidence, name);
             observation.ambiguity = Some(ambiguity);
             observation.rules_state = Some(guess);
             observation.latency_ms = Some(latency);
             observation.evidence = serde_json::to_value(input).ok();
             observation
         };
-        let Ok(raw) = answer else {
+        let Some(raw) = answer else {
             let mut observation =
                 model_observation(guess, Some(WaitReason::JudgeUnavailable), Confidence::ZERO);
             observation.attention = true;

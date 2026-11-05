@@ -1,5 +1,4 @@
-//! The judge contract: what a judge is shown, what it answers, and the
-//! deterministic stand-in used when no model is configured.
+//! The judge contract: what a judge is shown and what it answers.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -115,44 +114,4 @@ pub trait StateJudge: Send + Sync {
 
     /// Classify one snapshot.
     fn judge(&self, input: &JudgeInput) -> Result<Judgement, JudgeError>;
-}
-
-/// Deterministic stand-in for the model judge.
-///
-/// It answers ambiguous cases when no Jev endpoint is configured, and keeps
-/// the Observer testable without a model. It is not the rules tier: see
-/// [`rules`](super::rules).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HeuristicJudge;
-
-impl StateJudge for HeuristicJudge {
-    fn name(&self) -> &'static str {
-        "heuristic"
-    }
-
-    fn judge(&self, input: &JudgeInput) -> Result<Judgement, JudgeError> {
-        let confidence = |value: f64| Confidence::new(value).unwrap_or(Confidence::ZERO);
-        if input.permission_pending || input.screen == Some(ScreenState::Permission) {
-            return Ok(Judgement::of(SemanticState::Blocked, confidence(0.9)));
-        }
-        if input.execution_active {
-            let state = if input.open_tools > 0 || input.screen == Some(ScreenState::Busy) {
-                SemanticState::Working
-            } else if input.turn == Some(TurnFact::Stopped)
-                || input.screen == Some(ScreenState::Ready)
-            {
-                SemanticState::Waiting
-            } else {
-                SemanticState::Working
-            };
-            return Ok(Judgement::of(state, confidence(0.8)));
-        }
-        match input.last_end {
-            Some(EndCause::Exited | EndCause::Stopped) => {
-                Ok(Judgement::of(SemanticState::Completed, confidence(0.6)))
-            }
-            Some(EndCause::Lost) => Ok(Judgement::of(SemanticState::Unknown, confidence(0.3))),
-            None => Ok(Judgement::of(SemanticState::Waiting, confidence(0.5))),
-        }
-    }
 }

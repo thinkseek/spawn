@@ -16,7 +16,7 @@ export const FLEET_STATES = [
 ] as const;
 export type FleetState = (typeof FLEET_STATES)[number];
 export type Role = "supervisor" | "worker" | "rsi";
-export type JudgeKind = "rules" | "jev" | "heuristic" | "other";
+export type JudgeKind = "rules" | "jev" | "other";
 export type Probabilities = Record<FleetState, number>;
 
 export interface Evidence {
@@ -184,7 +184,7 @@ const ROLE_RANK: Record<Role, number> = { supervisor: 0, worker: 1, rsi: 2 };
 
 export function judgeKind(judge: string | null | undefined): JudgeKind {
   const key = (judge ?? "").toLowerCase();
-  if (key === "rules" || key === "jev" || key === "heuristic") return key;
+  if (key === "rules" || key === "jev") return key;
   return "other";
 }
 
@@ -513,7 +513,7 @@ export function ambiguityQuestion(ambiguity: string | null): string | null {
 }
 
 const REASON_TEXT: Record<string, string> = {
-  JUDGE_UNAVAILABLE: "Jev unreachable, showing the rules' guess",
+  JUDGE_UNAVAILABLE: "No judge answered (Jev unreachable or not configured), showing the rules' guess",
   WAITING_FOR_USER_INPUT: "Waiting for user input",
 };
 

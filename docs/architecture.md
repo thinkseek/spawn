@@ -11,7 +11,7 @@
 | 计算 | Claude Code | 启动进程、投递提示、读取 transcript、屏幕与退出文件 |
 | 工作区 | git | 裸仓库加每分支一份工作树，`git archive` 导出、`commit-tree` 收口 |
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
-| 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时用内置启发式判定） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
+| 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时只用规则） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
 | 终端 | tmux | 建会话、输入文本、抓取屏尾 |
 

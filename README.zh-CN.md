@@ -96,7 +96,7 @@ spawn status
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录（Bridge 所见路径） |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
-| `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时用本地启发式判定 |
+| `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时只用规则判定，规则定不了的情形要求关注 |
 
 ## 开发
 

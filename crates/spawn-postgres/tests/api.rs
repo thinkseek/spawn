@@ -25,7 +25,7 @@ use spawn_core::id::{
 };
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Confidence, Observation, SemanticState};
-use spawn_core::observe::{JudgeError, JudgeInput, Judgement, Observer, StateJudge};
+use spawn_core::observe::Observer;
 use spawn_core::port::{CommandQueue, EventLog};
 use spawn_core::time::SystemClock;
 
@@ -757,19 +757,6 @@ fn a_global_read_returns_session_records_in_order() {
     );
 }
 
-/// A judge that never answers: reading the log needs none.
-struct SilentJudge;
-
-impl StateJudge for SilentJudge {
-    fn name(&self) -> &'static str {
-        "silent"
-    }
-
-    fn judge(&self, _input: &JudgeInput) -> Result<Judgement, JudgeError> {
-        Err(JudgeError::Unavailable("silent".to_string()))
-    }
-}
-
 #[test]
 fn a_source_this_build_does_not_know_stops_no_reader() {
     let (store, schema) = store("unknown_source");
@@ -847,7 +834,7 @@ fn a_source_this_build_does_not_know_stops_no_reader() {
     bridge.recover().expect("the Bridge recovers");
     assert_eq!(bridge.session_count(), 2, "the Bridge reads past the run");
     bridge.tick().expect("the Bridge ticks");
-    let mut observer = Observer::new(store.clone(), Arc::new(SilentJudge));
+    let mut observer = Observer::new(store.clone());
     observer.recover().expect("the Observer recovers");
     assert_eq!(
         observer.session_count(),
