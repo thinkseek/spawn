@@ -1541,9 +1541,12 @@ impl Bridge {
         }
         match self.typing_of(claimed, &active.execution_id) {
             Typing::Done => Ok(Outcome::Succeeded),
-            Typing::Unknown => {
-                self.abandon(claimed, active, format!("the prompt {MAY_HAVE_TYPED}"), false)
-            }
+            Typing::Unknown => self.abandon(
+                claimed,
+                active,
+                format!("the prompt {MAY_HAVE_TYPED}"),
+                false,
+            ),
             Typing::Due => self.prompt_engine(claimed, active, prompt, fresh),
         }
     }
