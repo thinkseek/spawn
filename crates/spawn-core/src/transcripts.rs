@@ -155,6 +155,10 @@ pub fn read_from_transcript(event: &NewEvent) -> bool {
                 | EventKind::ToolFailed { .. }
                 | EventKind::TurnStopped { .. }
                 | EventKind::TurnFailed { .. }
+                | EventKind::NativeSessionStarted {
+                    engine_version: Some(_),
+                    ..
+                }
         )
 }
 
