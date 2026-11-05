@@ -1,15 +1,17 @@
-//! Reproductions of audit findings about the execution lifecycle and its
-//! crash windows (PR #2, re-checked against this branch). Each test states
-//! the behaviour the audit asks for and fails today; they are ignored so the
-//! suite stays green. Run them with `cargo test -p spawn-core --test
-//! audit_lifecycle -- --ignored`.
+//! The audit findings about the execution lifecycle and its crash windows
+//! (PR #2): each test states the behaviour the audit asks for. The matrix
+//! tests fail every append of a handler in turn, and its finish, with a
+//! lease expiry and optionally a restart after.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spawn_core::bridge::{Bridge, BridgeConfig, claude_session_id};
 use spawn_core::command::{Claimed, CommandAction, Outcome, Submission};
-use spawn_core::event::{Appended, ENGINE, EventKind, EventRecord, GlobalPosition, NewEvent};
+use spawn_core::event::{
+    Appended, CommandStep, ENGINE, EventKind, EventRecord, GlobalPosition, NewEvent, Source,
+};
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
     WorkspaceId,
@@ -35,6 +37,7 @@ struct Rig {
     failing_appends: Mutex<Vec<Rule>>,
     failing_finishes: Mutex<usize>,
     typed: Mutex<Vec<String>>,
+    outcomes: Mutex<Vec<(CommandId, Outcome)>>,
 }
 
 impl Rig {
@@ -50,6 +53,7 @@ impl Rig {
             failing_appends: Mutex::default(),
             failing_finishes: Mutex::default(),
             typed: Mutex::default(),
+            outcomes: Mutex::default(),
         })
     }
 
@@ -149,6 +153,42 @@ impl Rig {
         self.store.append_file(&path, &(lines.join("\n") + "\n"));
     }
 
+    /// Fail the `n`th append from now (counting from 0), once. The returned
+    /// flag tells whether it came.
+    fn fail_nth_append(&self, n: usize) -> Arc<AtomicUsize> {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        self.fail_append_once(move |_| counter.fetch_add(1, Ordering::SeqCst) == n);
+        seen
+    }
+
+    /// Drop a failure rule that never matched.
+    fn clear_failures(&self) {
+        self.failing_appends.lock().expect("rules").clear();
+        *self.failing_finishes.lock().expect("finishes") = 0;
+    }
+
+    fn outcome(&self, command: u64) -> Option<Outcome> {
+        self.outcomes
+            .lock()
+            .expect("outcomes")
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == CommandId(command))
+            .map(|(_, outcome)| outcome.clone())
+    }
+
+    /// Mounts not unmounted again.
+    fn mounted(&self) -> usize {
+        let calls = self.store.workspace_calls();
+        let mounts = calls
+            .iter()
+            .filter(|call| call.starts_with("mount "))
+            .count();
+        let unmounts = calls.iter().filter(|call| *call == "unmount").count();
+        mounts.saturating_sub(unmounts)
+    }
+
     fn merges(&self) -> usize {
         self.store
             .workspace_calls()
@@ -210,7 +250,12 @@ impl CommandQueue for Rig {
             return Err(StoreError::Backend("the database is down".to_string()));
         }
         drop(failing);
-        self.store.finish(claimed, outcome)
+        self.store.finish(claimed, outcome)?;
+        self.outcomes
+            .lock()
+            .expect("outcomes")
+            .push((claimed.command_id, outcome.clone()));
+        Ok(())
     }
 }
 
@@ -286,8 +331,7 @@ impl TerminalHost for Rig {
 /// before the prompt is typed. The retried Start finds the execution and
 /// fails; the engine is left live at an empty prompt, with no end coming.
 #[test]
-#[ignore = "audit M5 repro"]
-fn m5_a_store_error_before_the_start_prompt_leaves_a_promptless_engine_repro() {
+fn m5_a_store_error_before_the_start_prompt_leaves_a_promptless_engine() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("do the task");
@@ -314,8 +358,7 @@ fn m5_a_store_error_before_the_start_prompt_leaves_a_promptless_engine_repro() {
 /// paste, or a host call outlived the lease) is claimed again and typed
 /// again once the pane reads ready.
 #[test]
-#[ignore = "audit M6 repro"]
-fn m6_an_input_whose_lease_expires_is_typed_twice_repro() {
+fn m6_an_input_whose_lease_expires_is_typed_twice() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
@@ -345,8 +388,7 @@ fn m6_an_input_whose_lease_expires_is_typed_twice_repro() {
 /// final checkpoint runs against the absent workspace, fails, and the end
 /// stalls; the execution never ends.
 #[test]
-#[ignore = "audit M7 repro"]
-fn m7_a_crash_between_unmount_and_ended_wedges_the_execution_repro() {
+fn m7_a_crash_between_unmount_and_ended_wedges_the_execution() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
@@ -460,4 +502,156 @@ fn l1_the_same_conflict_is_recorded_again_after_a_restart() {
     rig.clock.advance(Duration::from_secs(31));
     bridge.tick().expect("idle");
     assert_eq!(rig.count("merge.conflicted"), 1, "one conflict, one record");
+}
+
+/// One failure at a handler: its `n`th append (`Some(n)`) or its finish
+/// (`None`); then the lease expires and, with `restart`, the Bridge starts
+/// over from the log. Returns the rig after the retries, or `None` when the
+/// handler made fewer than `n + 1` appends.
+fn fail_once(
+    rig: &Arc<Rig>,
+    bridge: Bridge,
+    failure: Option<usize>,
+    restart: bool,
+    retries: usize,
+) -> Option<()> {
+    let mut bridge = bridge;
+    let seen = failure.map(|n| (n, rig.fail_nth_append(n)));
+    if failure.is_none() {
+        rig.fail_finish_once();
+    }
+    let _ = bridge.tick();
+    if let Some((n, seen)) = seen
+        && seen.load(Ordering::SeqCst) <= n
+    {
+        rig.clear_failures();
+        return None;
+    }
+    rig.lease_expires();
+    if restart {
+        drop(bridge);
+        bridge = rig.restarted();
+    }
+    for _ in 0..retries {
+        rig.store.set_pane(&terminal(1), READY);
+        let _ = bridge.tick();
+        rig.clock.advance(Duration::from_secs(31));
+    }
+    Some(())
+}
+
+/// Every failure point of a Start with a prompt: the engine gets its
+/// prompt at most once; an execution that is not ended got it and its
+/// command succeeded; nothing stays mounted that no execution uses.
+#[test]
+fn every_start_ends_prompted_or_ended() {
+    for restart in [false, true] {
+        for failure in std::iter::once(None).chain((0..).map(Some)) {
+            let rig = Rig::new();
+            rig.start("do the task");
+            if fail_once(&rig, rig.bridge(), failure, restart, 3).is_none() {
+                break;
+            }
+            let at = format!("failure {failure:?}, restart {restart}");
+            let typed = rig.typed("do the task");
+            let running = rig.count("execution.started") - rig.count("execution.ended");
+            assert!(typed <= 1, "{at}: typed {typed} times");
+            if running > 0 {
+                assert_eq!(typed, 1, "{at}: a live engine got its prompt");
+                assert_eq!(
+                    rig.outcome(1),
+                    Some(Outcome::Succeeded),
+                    "{at}: a prompted start succeeded"
+                );
+            }
+            assert_eq!(rig.mounted(), running, "{at}: mounts left");
+        }
+    }
+}
+
+/// Every failure point of an Input: typed at most once, and a finished
+/// command that succeeded did type it.
+#[test]
+fn every_input_is_typed_at_most_once() {
+    for restart in [false, true] {
+        for failure in std::iter::once(None).chain((0..).map(Some)) {
+            let rig = Rig::new();
+            let mut bridge = rig.bridge();
+            rig.start("");
+            bridge.tick().expect("start");
+            rig.submit(
+                "key_input",
+                CommandAction::Input {
+                    text: "delete the old table".to_string(),
+                },
+            );
+            if fail_once(&rig, bridge, failure, restart, 3).is_none() {
+                break;
+            }
+            let at = format!("failure {failure:?}, restart {restart}");
+            let typed = rig.typed("delete the old table");
+            assert!(typed <= 1, "{at}: typed {typed} times");
+            let outcome = rig.outcome(2);
+            assert!(outcome.is_some(), "{at}: the input finished");
+            if outcome == Some(Outcome::Succeeded) {
+                assert_eq!(typed, 1, "{at}: a succeeded input was typed");
+            }
+        }
+    }
+}
+
+/// Every failure point of a Stop: the end completes once, without a stall,
+/// and the workspace is unmounted.
+#[test]
+fn every_end_completes() {
+    for restart in [false, true] {
+        for failure in std::iter::once(None).chain((0..).map(Some)) {
+            let rig = Rig::new();
+            let mut bridge = rig.bridge();
+            rig.start("");
+            bridge.tick().expect("start");
+            rig.submit("key_stop", CommandAction::Stop);
+            if fail_once(&rig, bridge, failure, restart, 25).is_none() {
+                break;
+            }
+            let at = format!("failure {failure:?}, restart {restart}");
+            assert_eq!(rig.count("execution.end_stalled"), 0, "{at}: stalled");
+            assert_eq!(rig.count("execution.ended"), 1, "{at}: ended once");
+            assert_eq!(rig.mounted(), 0, "{at}: mounts left");
+        }
+    }
+}
+
+/// L2: a start that died after recording its mount and before its
+/// execution left a mount no execution owns. A restart unmounts it and
+/// records the release, once.
+#[test]
+fn a_restart_unmounts_a_mount_whose_start_died() {
+    let rig = Rig::new();
+    let workspace = WorkspaceId::new("9:/workspaces/9").expect("valid workspace");
+    rig.store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("valid agent"),
+            session_id: SessionId::new("session_one").expect("valid session"),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some("cmd_9:mounted".to_string()),
+            kind: EventKind::CommandStepped {
+                command_id: CommandId(9),
+                step: CommandStep::Mounted,
+                workspace: Some(workspace),
+            },
+        })
+        .expect("append");
+    let unmounts = || {
+        rig.store
+            .workspace_calls()
+            .iter()
+            .filter(|call| *call == "unmount")
+            .count()
+    };
+    drop(rig.restarted());
+    assert_eq!(unmounts(), 1, "the orphan mount goes");
+    drop(rig.restarted());
+    assert_eq!(unmounts(), 1, "its release is recorded: once");
 }

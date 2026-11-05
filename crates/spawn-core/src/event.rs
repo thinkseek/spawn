@@ -99,6 +99,24 @@ impl ModelProfile {
     }
 }
 
+/// A step of a command's handling the Bridge records, so that a retried
+/// command (its lease expired, its tick failed) or a restarted Bridge knows
+/// which irreversible effects already happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStep {
+    /// The start mounted its workspace (`workspace` on the record). A mount
+    /// with no `execution.started` of the command and no
+    /// [`CommandStep::MountReleased`] is unmounted when the Bridge recovers.
+    Mounted,
+    /// That mount went again before an execution used it.
+    MountReleased,
+    /// The Bridge is about to type the command's prompt or input.
+    Typing,
+    /// The typing succeeded.
+    Typed,
+}
+
 /// Why a checkpoint commit was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -279,6 +297,26 @@ pub enum EventKind {
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
     },
+    /// An ending execution's final checkpoint committed and its terminal is
+    /// gone; the unmount comes next. An end recovered after this record
+    /// does not checkpoint again (the workspace may be gone already): it
+    /// unmounts and records `execution.ended`.
+    #[serde(rename = "execution.unmounting")]
+    ExecutionUnmounting,
+    /// A step of a command's handling ([`CommandStep`]), keyed
+    /// `cmd_<id>:<step>`: written before the effect for an intent
+    /// (`typing`), after it for a completion.
+    #[serde(rename = "command.step")]
+    CommandStepped {
+        /// The command.
+        command_id: CommandId,
+        /// The step.
+        step: CommandStep,
+        /// For [`CommandStep::Mounted`] and [`CommandStep::MountReleased`]:
+        /// the workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceId>,
+    },
     /// The final checkpoint of an ending execution kept failing: the
     /// terminal is down, the workspace stays mounted with everything it
     /// holds, and the Bridge retries the checkpoint at a slow interval until
@@ -377,6 +415,8 @@ impl EventKind {
             Self::ExecutionStarted { .. } => "execution.started",
             Self::ExecutionEnded { .. } => "execution.ended",
             Self::ExecutionEndStalled { .. } => "execution.end_stalled",
+            Self::ExecutionUnmounting => "execution.unmounting",
+            Self::CommandStepped { .. } => "command.step",
             Self::ArtifactCommitted { .. } => "artifact.committed",
             Self::MergeConflicted { .. } => "merge.conflicted",
             Self::CommandAccepted { .. } => "command.accepted",
