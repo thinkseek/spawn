@@ -2726,6 +2726,99 @@ mod database_tests {
         }
     }
 
+    /// The task as the integrator reads it.
+    fn ready_task(db: &Db, task: i64) -> super::Task {
+        let missions: Vec<super::Mission> =
+            serde_json::from_value(db.store.gated_missions().expect("gated")).expect("missions");
+        missions
+            .into_iter()
+            .flat_map(|mission| mission.tasks)
+            .find(|row| row.id == task)
+            .expect("the task")
+    }
+
+    fn verdicts(db: &Db, task: i64) -> Vec<String> {
+        db.admin()
+            .query(
+                "select kind -> 'detail' -> 'record' ->> 'verdict' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                    and kind -> 'detail' -> 'record' ->> 'id' = $1
+                  order by session_seq",
+                &[&task.to_string()],
+            )
+            .expect("verdicts")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// A judging that errs or panics before any record of its own records
+    /// an abort, so the three-aborts halt bounds it instead of a judging
+    /// again on every pass; one that recorded something gets no abort on
+    /// top of it.
+    #[test]
+    fn a_judging_that_fails_before_its_verdict_is_recorded_aborted() {
+        let (base, source, scenarios, integrator) = world("judging-fails", "exit 1\n");
+        let db = Db::new("judging_fails");
+        let main = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+
+        super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
+            Err("fetch the pushed branch: no such repository".to_string())
+        });
+        assert_eq!(verdicts(&db, task), vec!["aborted"]);
+        super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
+            panic!("a bug in the judging")
+        });
+        assert_eq!(verdicts(&db, task), vec!["aborted", "aborted"]);
+        let reasons: Vec<String> = db
+            .admin()
+            .query(
+                "select kind -> 'detail' -> 'record' ->> 'reason' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'verdict' = 'aborted'
+                  order by session_seq",
+                &[],
+            )
+            .expect("reasons")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert!(reasons[0].contains("no such repository"), "{reasons:?}");
+        assert!(reasons[1].contains("a bug in the judging"), "{reasons:?}");
+
+        // One that recorded its verdict, then failed: no abort on top.
+        let judged = ready_task(&db, task);
+        super::judged_or_aborted(&db.store, &judged, &main, mission, || {
+            db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                              "verdict": "stale", "reason": "behind"}));
+            db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                              "verdict": "rejected", "base": main, "note": "no"}));
+            Err("then the landing failed".to_string())
+        });
+        assert_eq!(
+            verdicts(&db, task),
+            vec!["aborted", "aborted", "stale", "rejected"]
+        );
+
+        // The third abort in a row halts the mission.
+        let other = db.reported_task(mission, "x");
+        super::judged_or_aborted(&db.store, &ready_task(&db, other), &main, mission, || {
+            Err("again".to_string())
+        });
+        integrator.pass_on(&db.store).expect("a pass");
+        let halted = db.mission(mission)["halted"].clone();
+        assert!(
+            halted
+                .as_str()
+                .is_some_and(|reason| reason.contains("gate aborts in a row")),
+            "halted: {halted}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Audit #17: a landing's push moved main, and the integrator stopped
     /// before it recorded `task.landed`. A lower-id mission on the same
     /// source runs first in the next pass: it must not read the moved main
