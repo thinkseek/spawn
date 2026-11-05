@@ -173,6 +173,15 @@ fn serve_requests(server: &Server, shared: &Arc<Shared>, limit: usize) {
 /// The token every API request must carry, if any: whatever
 /// `SPAWN_SERVE_TOKEN` holds. An address that is not loopback needs one.
 fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, String> {
+    if let Some(token) = &token
+        && !is_header_safe_token(token)
+    {
+        return Err(format!(
+            "refusing to serve with this SPAWN_SERVE_TOKEN: a token is 1 to {MAX_TOKEN_LEN} \
+             visible ASCII characters (no space, newline or other byte), so a browser can send \
+             it as a header (web/src/token.ts holds the same rule)"
+        ));
+    }
     if token.is_none() && !is_loopback(address) {
         return Err(format!(
             "refusing to serve on {address} without SPAWN_SERVE_TOKEN; \
@@ -296,6 +305,16 @@ fn owners_own_request(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
         .zip(port)
         .and_then(|(peer, port)| peer_uid(peer, port, &tables));
     local_exemption(true, peer, uid, owner_uid())
+}
+
+/// Longest token `serve` accepts, and the UI sends.
+const MAX_TOKEN_LEN: usize = 512;
+
+/// Whether `token` is one the UI can send as `Authorization: Bearer`:
+/// 1 to [`MAX_TOKEN_LEN`] visible ASCII characters (`web/src/token.ts`,
+/// `TOKEN_PATTERN`, is the same rule).
+fn is_header_safe_token(token: &str) -> bool {
+    (1..=MAX_TOKEN_LEN).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 /// Whether every address `address` resolves to is a loopback one. An
@@ -1293,6 +1312,38 @@ mod tests {
             access_token("0.0.0.0:8787", Some("t".to_string())),
             Ok(Some("t".to_string()))
         );
+    }
+
+    /// Audit L11: a token the browser could never send as a header is
+    /// refused at start, the same rule as the UI's (web/src/token.ts).
+    #[test]
+    fn serve_refuses_a_token_no_browser_can_send() {
+        for good in [
+            "t",
+            "bb-serve-token-1",
+            &"a".repeat(512),
+            "!~#%&*+-./:=?@^_|",
+        ] {
+            assert!(
+                access_token("0.0.0.0:8787", Some(good.to_string())).is_ok(),
+                "{good}"
+            );
+        }
+        for bad in [
+            "",
+            "a b",
+            "a\nb",
+            "a\rb",
+            "a\u{0}b",
+            "a\tb",
+            "令牌",
+            "café",
+            &"a".repeat(513),
+        ] {
+            let refused =
+                access_token("127.0.0.1:8787", Some(bad.to_string())).expect_err("not a token");
+            assert!(refused.contains("visible ASCII"), "{bad:?}: {refused}");
+        }
     }
 
     #[test]
