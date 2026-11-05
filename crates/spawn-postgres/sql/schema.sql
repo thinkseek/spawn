@@ -1540,6 +1540,9 @@ end $$;
 -- landings, aborts over budget, and halts.
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
+declare
+    v_mission bigint;
+    v_stale bigint;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -1563,6 +1566,33 @@ begin
                               when 'task.aborted' then array['delivered']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
+    end if;
+    -- A done mission's work still lands, but nothing new comes for it: a
+    -- landing that keeps going stale (its worker never pushes again, main
+    -- moved past its base) would be judged again on every pass, forever.
+    -- The third stale verdict since the mission closed aborts it instead.
+    select k.mission_id into v_mission
+      from mission_tasks k join mission_missions m on m.id = k.mission_id
+     where k.id = (p_record ->> 'id')::bigint and m.state = 'done'
+       and p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'stale';
+    if v_mission is not null then
+        select count(*) into v_stale
+          from spawn_events e
+         cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and x.r ->> 'id' = p_record ->> 'id' and x.r ->> 'type' = 'task.gated'
+           and x.r ->> 'verdict' = 'stale'
+           and e.session_seq > (
+               select max(c.session_seq) from spawn_events c
+                where c.session_id = 'session_control' and c.event_name = 'control.recorded'
+                  and c.kind -> 'detail' -> 'record' ->> 'id' = v_mission::text
+                  and c.kind -> 'detail' -> 'record' ->> 'type' = 'mission.closed');
+        if v_stale >= 2 then
+            return spawn_control_record(jsonb_build_object(
+                'type', 'task.aborted', 'id', (p_record ->> 'id')::bigint,
+                'reason', format('the landing went stale %s times after mission %s was done',
+                                 v_stale + 1, v_mission)));
+        end if;
     end if;
     return spawn_control_record(p_record);
 end $$;
