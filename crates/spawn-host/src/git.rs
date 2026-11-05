@@ -2320,6 +2320,7 @@ mod tests {
         );
         store.unmount(&workspace).expect("kept, then removed");
         assert!(!directory.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A commit on `agent_a` made by a second workspace (its own root, the
@@ -2404,6 +2405,7 @@ mod tests {
             std::fs::read(Path::new(workspace.path()).join("big.bin")).expect("remounted"),
             large_noise(7)
         );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2454,6 +2456,7 @@ mod tests {
             other,
             "on top of the head that won"
         );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Deterministic incompressible bytes (xorshift), just over the large
