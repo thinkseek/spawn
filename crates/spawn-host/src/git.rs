@@ -151,27 +151,65 @@ pub struct GitWorkspace {
 /// unmount never clear it, and it is never inside a workspace.
 pub const DEFAULT_CHUNK_DIRECTORY: &str = ".chunks";
 
-/// What a checkpoint knew of one large file: its stat and its chunks.
+/// What a checkpoint knew of one large file: its stat, when that stat was
+/// taken, and its chunks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Known {
-    size: u64,
-    mtime_ns: i128,
-    mode: u32,
+    stat: FileStat,
+    /// Wall-clock time (ns since the epoch) just before the stat was taken.
+    cached_at_ns: i128,
     chunks: Vec<String>,
 }
 
-/// Size and modification time of a file, `None` when it is not a regular
-/// file.
-fn stat_of(path: &Path) -> Option<(u64, i128, u32)> {
+/// How close a file's modification or change time may come to the time its
+/// stat was cached before the entry is "racily clean" (git's term): a file
+/// rewritten in the same timestamp tick as the stat, after it, keeps the
+/// same stat, so such an entry is hashed again instead of trusted. Wide
+/// enough for a coarse file system clock (2 s on FAT, 1 s on some network
+/// file systems) and a little skew.
+const RACY_WINDOW_NS: i128 = 3_000_000_000;
+
+impl Known {
+    /// Whether the stat alone cannot vouch for the content ([`RACY_WINDOW_NS`]).
+    fn is_racy(&self) -> bool {
+        self.stat.mtime_ns.max(self.stat.ctime_ns) + RACY_WINDOW_NS >= self.cached_at_ns
+    }
+}
+
+/// What the stat cache compares: a rewrite changes the change time and
+/// usually the modification time; a restored modification time (`touch -d`)
+/// still moves the change time; a file replaced by another has a new inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStat {
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    inode: u64,
+    mode: u32,
+}
+
+/// The stat of a file, `None` when it is not a regular file.
+fn stat_of(path: &Path) -> Option<FileStat> {
+    use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path)
         .ok()
         .filter(std::fs::Metadata::is_file)?;
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| i128::try_from(since.as_nanos()).unwrap_or(0));
-    Some((metadata.len(), mtime, mode_of(&metadata)))
+    let nanoseconds =
+        |seconds: i64, nanos: i64| i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
+    Some(FileStat {
+        size: metadata.len(),
+        mtime_ns: nanoseconds(metadata.mtime(), metadata.mtime_nsec()),
+        ctime_ns: nanoseconds(metadata.ctime(), metadata.ctime_nsec()),
+        inode: metadata.ino(),
+        mode: mode_of(&metadata),
+    })
+}
+
+/// Wall-clock time now, in nanoseconds since the epoch.
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i128::try_from(since.as_nanos()).unwrap_or(0))
 }
 
 fn chunk_failure(error: impl std::fmt::Display) -> WorkspaceError {
@@ -566,14 +604,16 @@ impl GitWorkspace {
     }
 
     /// The stat cache of one branch's large files, beside its kept index:
-    /// only files whose size, mtime or mode changed are chunked again.
+    /// a file whose stat ([`FileStat`]) is unchanged and was not racily
+    /// clean ([`Known::is_racy`]) is not chunked again.
     fn large_cache(&self, branch: &str) -> PathBuf {
         self.root.join(".large").join(branch)
     }
 
     /// The stat cache: a JSON array of entries, each path in the form of a
-    /// manifest's ([`crate::chunks::put_path`]). A cache in another form
-    /// (the object keyed by path of earlier builds) counts as empty.
+    /// manifest's ([`crate::chunks::put_path`]). An entry without every
+    /// field (one of an earlier build) is dropped, and the file chunked
+    /// again; a cache in another form counts as empty.
     fn read_cache(&self, branch: &str) -> BTreeMap<TreePath, Known> {
         let Ok(bytes) = std::fs::read(self.large_cache(branch)) else {
             return BTreeMap::new();
@@ -581,13 +621,20 @@ impl GitWorkspace {
         let Ok(Value::Array(files)) = serde_json::from_slice::<Value>(&bytes) else {
             return BTreeMap::new();
         };
+        let number =
+            |entry: &Value, key: &str| -> Option<i128> { entry.get(key)?.as_str()?.parse().ok() };
         files
             .iter()
             .filter_map(|entry| {
                 let known = Known {
-                    size: entry.get("size")?.as_u64()?,
-                    mtime_ns: entry.get("mtime_ns")?.as_str()?.parse().ok()?,
-                    mode: u32::try_from(entry.get("mode")?.as_u64()?).ok()?,
+                    stat: FileStat {
+                        size: entry.get("size")?.as_u64()?,
+                        mtime_ns: number(entry, "mtime_ns")?,
+                        ctime_ns: number(entry, "ctime_ns")?,
+                        inode: entry.get("inode")?.as_u64()?,
+                        mode: u32::try_from(entry.get("mode")?.as_u64()?).ok()?,
+                    },
+                    cached_at_ns: number(entry, "cached_at_ns")?,
                     chunks: entry
                         .get("chunks")?
                         .as_array()?
@@ -610,8 +657,18 @@ impl GitWorkspace {
         let files: Vec<Value> = known
             .iter()
             .map(|(file, known)| {
-                let mut entry = json!({"size": known.size, "mtime_ns": known.mtime_ns.to_string(),
-                                       "mode": known.mode, "chunks": known.chunks});
+                let FileStat {
+                    size,
+                    mtime_ns,
+                    ctime_ns,
+                    inode,
+                    mode,
+                } = known.stat;
+                let mut entry = json!({
+                    "size": size, "mtime_ns": mtime_ns.to_string(),
+                    "ctime_ns": ctime_ns.to_string(), "inode": inode, "mode": mode,
+                    "cached_at_ns": known.cached_at_ns.to_string(), "chunks": known.chunks,
+                });
                 crate::chunks::put_path(&mut entry, file);
                 entry
             })
@@ -637,6 +694,30 @@ impl GitWorkspace {
         Ok(true)
     }
 
+    /// The chunks of the stat-cache entry `cached` when they are still the
+    /// file's at `full` with stat `stat`: the stat is the entry's, the store
+    /// holds the chunks, and a racily clean entry hashes to the same chunks
+    /// again. `None`: chunk the file again.
+    fn cached_chunks(
+        &self,
+        cached: Option<&Known>,
+        full: &Path,
+        stat: FileStat,
+    ) -> Result<Option<Vec<String>>, WorkspaceError> {
+        let Some(entry) = cached.filter(|entry| entry.stat == stat) else {
+            return Ok(None);
+        };
+        if !self.still_held(&entry.chunks)? {
+            return Ok(None);
+        }
+        if !entry.is_racy() {
+            return Ok(Some(entry.chunks.clone()));
+        }
+        let (chunks, read) = crate::chunks::chunk_names_of(full).map_err(chunk_failure)?;
+        let same = chunks == entry.chunks && read == stat.size && stat_of(full) == Some(stat);
+        Ok(same.then_some(chunks))
+    }
+
     /// Chunk the large files of a checkpoint into the store and store their
     /// manifest; its name, or `None` when there are no large files.
     fn store_large(
@@ -650,59 +731,38 @@ impl GitWorkspace {
         let mut files = Vec::with_capacity(large.len());
         for (path, _) in large {
             let full = directory.join(path.as_path());
-            let Some((size, mtime_ns, mode)) = stat_of(&full) else {
+            // Before the stat: a rewrite after it falls in the racy window.
+            let cached_at_ns = now_ns();
+            let Some(stat) = stat_of(&full) else {
                 continue;
             };
-            let chunks = match cached.get(path) {
-                Some(entry)
-                    if entry.size == size
-                        && entry.mtime_ns == mtime_ns
-                        && entry.mode == mode
-                        && self.still_held(&entry.chunks)? =>
-                {
-                    entry.chunks.clone()
-                }
-                _ => {
+            let (chunks, size, stable) =
+                if let Some(chunks) = self.cached_chunks(cached.get(path), &full, stat)? {
+                    (chunks, stat.size, true)
+                } else {
                     let (chunks, read) =
                         store_file(self.chunks.as_ref(), &full).map_err(chunk_failure)?;
                     // A file that changed while it was read is recorded as
                     // read and chunked again at the next checkpoint.
-                    let stable = stat_of(&full) == Some((size, mtime_ns, mode)) && read == size;
-                    files.push(LargeFile {
-                        path: path.clone(),
-                        mode,
-                        size: read,
-                        chunks: chunks.clone(),
-                    });
-                    if stable {
-                        known.insert(
-                            path.clone(),
-                            Known {
-                                size,
-                                mtime_ns,
-                                mode,
-                                chunks,
-                            },
-                        );
-                    }
-                    continue;
-                }
-            };
+                    let stable = stat_of(&full) == Some(stat) && read == stat.size;
+                    (chunks, read, stable)
+                };
             files.push(LargeFile {
                 path: path.clone(),
-                mode,
+                mode: stat.mode,
                 size,
                 chunks: chunks.clone(),
             });
-            known.insert(
-                path.clone(),
-                Known {
-                    size,
-                    mtime_ns,
-                    mode,
-                    chunks,
-                },
-            );
+            if stable {
+                known.insert(
+                    path.clone(),
+                    Known {
+                        stat,
+                        cached_at_ns,
+                        chunks,
+                    },
+                );
+            }
         }
         self.write_cache(branch, &known);
         if files.is_empty() {
@@ -712,7 +772,6 @@ impl GitWorkspace {
         let manifest = Manifest { files }.to_bytes();
         self.chunks.put(&manifest).map(Some).map_err(chunk_failure)
     }
-
     /// The large-file manifest a commit names in its `Spawn-Large` trailer.
     fn manifest_of(&self, commit: &str) -> Result<Option<String>, WorkspaceError> {
         let message = self.git_output(&["show", "-s", "--format=%B", commit, "--"])?;
@@ -822,13 +881,15 @@ impl GitWorkspace {
             materialize(self.chunks.as_ref(), directory, file).map_err(|error| {
                 WorkspaceError::Unavailable(format!("large file {}: {error}", file.path))
             })?;
-            if let Some((size, mtime_ns, mode)) = stat_of(&directory.join(file.path.as_path())) {
+            // Just written, so racily clean: the first checkpoint hashes it
+            // once more, then trusts its stat.
+            let cached_at_ns = now_ns();
+            if let Some(stat) = stat_of(&directory.join(file.path.as_path())) {
                 known.insert(
                     file.path.clone(),
                     Known {
-                        size,
-                        mtime_ns,
-                        mode,
+                        stat,
+                        cached_at_ns,
                         chunks: file.chunks.clone(),
                     },
                 );
@@ -1867,5 +1928,122 @@ mod tests {
             store.commit(&workspace, "fresh").expect("commit"),
             Commit::Unchanged
         );
+    }
+
+    /// Deterministic incompressible bytes (xorshift), just over the large
+    /// file limit.
+    fn large_noise(seed: u64) -> Vec<u8> {
+        let length = usize::try_from(super::LARGE_FILE_BYTES).expect("fits") + 4096;
+        let mut state = seed | 1;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// A mounted workspace of `agent_a` with a checkpoint of a large
+    /// `model.bin` holding `large_noise(1)`.
+    fn large_checkpoint(tag: &str) -> (GitWorkspace, WorkspaceId, PathBuf) {
+        let base = std::env::temp_dir().join(format!("spawn-git-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        std::fs::create_dir_all(&checkout).expect("create the repository");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        store.ensure_branch(&branch, None).expect("branch");
+        let workspace = store.mount(&branch).expect("mount");
+        let model = PathBuf::from(workspace.path()).join("model.bin");
+        std::fs::write(&model, large_noise(1)).expect("write the large file");
+        assert!(matches!(
+            store.commit(&workspace, "large").expect("commit"),
+            Commit::Created(_)
+        ));
+        (store, workspace, model)
+    }
+
+    /// The chunks the branch head's manifest lists for `model.bin`.
+    fn committed_chunks(store: &GitWorkspace) -> Vec<String> {
+        let name = store
+            .manifest_of("refs/heads/agent_a")
+            .expect("read the head")
+            .expect("a manifest");
+        let manifest = store.manifest(&name).expect("the manifest");
+        manifest.files[0].chunks.clone()
+    }
+
+    /// Make every stat-cache entry of `agent_a` old: cached well after its
+    /// file last changed, so its stat is trusted without a hash.
+    fn age_cache(store: &GitWorkspace) {
+        let mut cache = store.read_cache("agent_a");
+        assert!(!cache.is_empty(), "a cache to age");
+        for known in cache.values_mut() {
+            known.cached_at_ns =
+                known.stat.mtime_ns.max(known.stat.ctime_ns) + 2 * super::RACY_WINDOW_NS;
+        }
+        store.write_cache("agent_a", &cache);
+    }
+
+    #[test]
+    fn a_same_size_rewrite_with_its_mtime_restored_is_committed() {
+        let (store, workspace, model) = large_checkpoint("cache-mtime");
+        age_cache(&store);
+        let modified = std::fs::metadata(&model)
+            .and_then(|metadata| metadata.modified())
+            .expect("mtime");
+        // Same size, same mode, the old modification time put back.
+        std::fs::write(&model, large_noise(2)).expect("rewrite");
+        std::fs::File::options()
+            .write(true)
+            .open(&model)
+            .and_then(|file| file.set_modified(modified))
+            .expect("restore the mtime");
+        assert!(matches!(
+            store.commit(&workspace, "rewrite").expect("commit"),
+            Commit::Created(_)
+        ));
+        let (expected, _) = crate::chunks::chunk_names_of(&model).expect("hash");
+        assert_eq!(committed_chunks(&store), expected, "the new content");
+    }
+
+    #[test]
+    fn a_racily_clean_cache_entry_is_hashed_again() {
+        let (store, workspace, model) = large_checkpoint("cache-racy");
+        let old = committed_chunks(&store);
+        std::fs::write(&model, large_noise(3)).expect("rewrite");
+        // As if the last stat had been taken just after this rewrite, in
+        // the same timestamp tick: the stat matches, the chunks are old.
+        let forge = |cached_at_ns: Option<i128>| {
+            let mut cache = store.read_cache("agent_a");
+            let known = cache.values_mut().next().expect("an entry");
+            known.stat = super::stat_of(&model).expect("stat");
+            known.chunks.clone_from(&old);
+            known.cached_at_ns = cached_at_ns.unwrap_or_else(super::now_ns);
+            store.write_cache("agent_a", &cache);
+        };
+        forge(None);
+        assert!(matches!(
+            store.commit(&workspace, "rewrite").expect("commit"),
+            Commit::Created(_)
+        ));
+        let (expected, _) = crate::chunks::chunk_names_of(&model).expect("hash");
+        assert_ne!(expected, old);
+        assert_eq!(committed_chunks(&store), expected, "hashed again");
+
+        // The same entry cached long after the file changed is trusted: the
+        // window is what found the rewrite.
+        let stat = super::stat_of(&model).expect("stat");
+        forge(Some(
+            stat.mtime_ns.max(stat.ctime_ns) + 2 * super::RACY_WINDOW_NS,
+        ));
+        store.commit(&workspace, "trusted").expect("commit");
+        assert_eq!(committed_chunks(&store), old);
     }
 }
