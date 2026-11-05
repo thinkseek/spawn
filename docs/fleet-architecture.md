@@ -183,15 +183,30 @@ it, on the same ladder.
   It acts only on a judgement that covers the session's latest fact; a lost
   execution is resumed once; the nudge needs Jev's WAITING at an idle prompt
   with confidence ≥ 0.7, `needs_human` ≤ 0.2 and `stuck` < 0.5, once per
-  episode (the latest non-dispatcher command) and three per agent-hour; a
-  worker idle at its prompt and not nudged, a nudge that did not help, a
+  episode (the latest non-dispatcher command) and three per agent-hour. Only
+  a nudge that reached the worker counts: one refused before typing (a pane
+  not ready) is sent again under `<key>-retry-<n>` on a judgement made after
+  it, twice, then escalated as never typed. A worker idle at its prompt and
+  not nudged, a nudge that did not help, a
   failed resume (or one whose engine was lost again within a minute),
-  attention, and a finished execution nobody stopped all
-  escalate. Escalations coalesce into one digest typed into the supervisor
-  while it is idle. The dispatcher keeps no state: idempotency keys mark its
-  nudges and resumes, and the tags a delivered digest files on its command
-  (`<session> <id>` per item, never in the text, which quotes workers'
-  reports) mark what the supervisor was told.
+  attention, and a finished execution nobody stopped (its recorded end
+  cause is not `stopped`) all escalate. A Stop or Discard that failed,
+  whoever sent it (a model switch, a closed task's worker, a retired
+  resident, the integrator's budget abort, the supervisor, a person),
+  leaves the worker running: the dispatcher reads the Stops of the live
+  execution from the command queue, sends the action again under
+  `stop-<execution>-retry-<n>` with a wait of a minute doubling, 3 times,
+  without waiting for a new judgement (a failed Stop changed nothing), then
+  escalates `stop failed` naming the task, and sends no more. Meanwhile
+  nothing is typed into that worker and it is not nudged. Escalations
+  coalesce into one digest typed into the supervisor
+  while it is idle. The dispatcher keeps no state: idempotency keys and
+  their commands' outcomes mark its nudges, resumes and stops, and the tags
+  a delivered digest files on its command (`<session> <id>` per item, never
+  in the text, which quotes workers' reports) mark what the supervisor was
+  told. An approval or a human command (once finished, with its outcome: one
+  that failed is reported as failed) is news until it was told, however
+  long that takes.
 - **Supervisor**: one perpetual Claude Code session (`agent_supervisor`).
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
@@ -338,7 +353,9 @@ How the profile travels:
 - A running engine keeps the models it started with. A task for a live
   worker on another profile stops it at the moment typing would be safe
   (`switch-model-<task>-<revision>`); the next pass resumes it, context
-  kept, on the task's profile.
+  kept, on the task's profile. A switch Stop that fails is retried and then
+  escalated like every failed Stop (§3, the dispatcher); the task stays
+  `assigned` and is never marked delivered by it.
 - The Bridge passes the relay and the slots in the inline `--settings`
   `env` (`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`,
   `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`). Claude Code merges inline
@@ -559,8 +576,10 @@ the tree's own:
   - `review`: the supervisor accepts, then the gate runs;
   - `gate`: the gate alone decides;
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
-    aborted (`task.aborted`) and its worker stopped; an abort counts toward
-    the abort halt, not as a rejection.
+    aborted (`task.aborted`) and its worker stopped (the Stop is submitted
+    before the record, so a failed record is retried with it; a Stop that
+    fails is pursued and escalated by the dispatcher); an abort counts
+    toward the abort halt, not as a rejection.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). For each
   task that is ready, it:
   1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into

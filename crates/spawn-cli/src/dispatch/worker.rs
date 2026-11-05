@@ -1,10 +1,11 @@
 //! The decision ladder for one worker (docs/fleet-architecture.md §3):
 //! rules over facts, then the one guarded nudge, then escalation.
 
+use spawn_core::bridge::MAY_HAVE_TYPED;
 use spawn_core::command::CommandAction;
 use spawn_core::observation::{Ambiguity, Observation, SemanticState, WaitReason};
 
-use super::{Escalation, Facts, Order, Why};
+use super::{Escalation, Facts, Order, Sent, Why};
 
 /// Nudges per worker per hour, across episodes.
 pub(super) const NUDGES_PER_HOUR: usize = 3;
@@ -20,6 +21,9 @@ const NUDGE_STUCK: f64 = 0.5;
 
 /// Idempotency-key prefix of every nudge, used to count them per hour.
 const NUDGE_KEY_PREFIX: &str = "dispatch-nudge-";
+
+/// Retries of a nudge that typed nothing, in one episode.
+const NUDGE_RETRIES: usize = 2;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -109,13 +113,25 @@ fn resume_lost(facts: &Facts) -> Decision {
     }
 }
 
-/// Nudges sent to this worker within the last hour, across episodes.
+/// Whether a nudge reached the worker, or may have: it succeeded, is still
+/// in flight, or failed after typing may have begun. One that failed before
+/// typing (a pane not ready, a terminal gone) told the worker nothing.
+fn reached(sent: &Sent) -> bool {
+    sent.succeeded != Some(false)
+        || sent
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(MAY_HAVE_TYPED))
+}
+
+/// Nudges that reached this worker within the last hour, across episodes.
 fn nudges_this_hour(facts: &Facts, now_ms: i64) -> usize {
     facts
         .dispatched
         .iter()
         .filter(|sent| {
             sent.key.starts_with(NUDGE_KEY_PREFIX)
+                && reached(sent)
                 && now_ms.saturating_sub(sent.created_at_ms) < HOUR_MS
         })
         .count()
@@ -123,12 +139,22 @@ fn nudges_this_hour(facts: &Facts, now_ms: i64) -> usize {
 
 /// The guarded nudge, for a worker Jev judged idle and fine: `continue`
 /// once per episode within the hourly limit; a nudge that did not help, or
-/// the limit, escalates.
+/// the limit, escalates. Only a nudge that reached the worker ([`reached`])
+/// can have failed to help: one that typed nothing is sent again under a
+/// key of its own (`<key>-retry-<n>`) on a judgement made after it, up to
+/// [`NUDGE_RETRIES`] times, and then escalated as never typed.
 fn nudge(facts: &Facts, observation: &Observation, now_ms: i64) -> Decision {
     let episode = facts.episode.unwrap_or(0);
     let judged_at = facts.observation_at_ms.unwrap_or(0);
     let key = format!("{NUDGE_KEY_PREFIX}{}-{episode}", facts.session_id);
-    match facts.sent(&key) {
+    let retry = format!("{key}-retry-");
+    let attempts: Vec<&Sent> = facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key == key || sent.key.starts_with(&retry))
+        .collect();
+    let judged_after = |sent: &Sent| sent.finished_at_ms.is_some_and(|done| judged_at > done);
+    match attempts.last().copied() {
         None if nudges_this_hour(facts, now_ms) < NUDGES_PER_HOUR => Decision::Act(Order::to(
             facts,
             key,
@@ -147,12 +173,36 @@ fn nudge(facts: &Facts, observation: &Observation, now_ms: i64) -> Decision {
             ),
         )),
         // Judged idle again after the nudge landed: it did not help.
-        Some(sent) if sent.finished_at_ms.is_some_and(|done| judged_at > done) => {
-            Decision::Escalate(Escalation::about(
+        Some(sent) if reached(sent) && judged_after(sent) => Decision::Escalate(Escalation::about(
+            facts,
+            format!("nudge-{episode}"),
+            Why::NudgeFailed,
+            format!("stopped again after `continue` ({})", describe(observation)),
+        )),
+        // Typed nothing, and still judged idle after it: again, or, once
+        // the retries are spent, someone has to look.
+        Some(sent) if !reached(sent) && judged_after(sent) => {
+            if attempts.len() > NUDGE_RETRIES {
+                return Decision::Escalate(Escalation::about(
+                    facts,
+                    format!("nudge-{episode}"),
+                    Why::NudgeFailed,
+                    format!(
+                        "`continue` could not be typed in {} attempts (the last: {}); it is \
+                         still idle ({})",
+                        attempts.len(),
+                        crate::deliver::one_line(sent.error.as_deref().unwrap_or("no error"), 200),
+                        describe(observation)
+                    ),
+                ));
+            }
+            Decision::Act(Order::to(
                 facts,
-                format!("nudge-{episode}"),
-                Why::NudgeFailed,
-                format!("stopped again after `continue` ({})", describe(observation)),
+                format!("{retry}{}", attempts.len()),
+                CommandAction::Input {
+                    text: "continue".to_string(),
+                    tags: Vec::new(),
+                },
             ))
         }
         Some(_) => Decision::Nothing,
@@ -211,10 +261,12 @@ pub(super) fn decide_worker(facts: &Facts, now_ms: i64) -> Decision {
         ));
     }
     // An execution someone stopped ended by their decision; telling them
-    // again is noise.
+    // again is noise. Read from how it ended, never from a Stop having been
+    // sent: one that failed stopped nothing, and the engine may have exited
+    // by itself afterwards.
     if !facts.live
         && observation.state == SemanticState::Completed
-        && facts.episode_action.as_deref() != Some("stop")
+        && facts.end_cause.as_deref() != Some("stopped")
     {
         return Decision::Escalate(Escalation::about(
             facts,

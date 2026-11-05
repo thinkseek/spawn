@@ -423,11 +423,14 @@ impl Integrator {
                 .tool_calls_since(&task.session_id, at)
                 .map_err(|error| error.to_string())?;
             if let Some(reason) = over_budget(budget, now - at, calls) {
+                // The Stop first, under its fixed key: if the record then
+                // fails, the next pass finds the task still delivered and
+                // over budget, and submits (a no-op) and records again.
+                stop(store, task)?;
                 record(
                     store,
                     &json!({"type": "task.aborted", "id": task.id, "reason": reason}),
                 )?;
-                stop(store, task);
                 println!("integrate: task {} aborted: {reason}", task.id);
                 aborted = true;
             }
@@ -853,19 +856,23 @@ fn halt(store: &PostgresStore, mission: &Mission, reason: &str) -> Result<(), St
     Ok(())
 }
 
-/// Stop an aborted task's worker; best effort.
-fn stop(store: &PostgresStore, task: &Task) {
-    let submission = (|| {
-        Some(Submission {
-            agent_id: AgentId::new(task.agent_id.clone()).ok()?,
-            session_id: SessionId::new(task.session_id.clone()).ok()?,
-            idempotency_key: IdempotencyKey::new(format!("integrate-abort-{}", task.id)).ok()?,
-            action: CommandAction::Stop,
-        })
-    })();
-    if let (Some(submission), Ok(principal)) = (submission, Principal::new(PRINCIPAL)) {
-        let _ = store.submit(&principal, &submission);
-    }
+/// Submit the Stop of an aborted task's worker. Its outcome is the
+/// command's: one that fails is pursued and escalated by the dispatcher
+/// (`dispatch::stops`), like every Stop.
+fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
+    let error = |error: &dyn std::fmt::Display| format!("stop task {}'s worker: {error}", task.id);
+    let submission = Submission {
+        agent_id: AgentId::new(task.agent_id.clone()).map_err(|e| error(&e))?,
+        session_id: SessionId::new(task.session_id.clone()).map_err(|e| error(&e))?,
+        idempotency_key: IdempotencyKey::new(format!("integrate-abort-{}", task.id))
+            .map_err(|e| error(&e))?,
+        action: CommandAction::Stop,
+    };
+    let principal = Principal::new(PRINCIPAL).map_err(|e| error(&e))?;
+    store
+        .submit(&principal, &submission)
+        .map(|_| ())
+        .map_err(|e| error(&e))
 }
 
 #[cfg(test)]
