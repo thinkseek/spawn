@@ -1,7 +1,8 @@
 //! `spawn integrate`: the one landing path (docs/fleet-architecture.md
 //! §10.3).
 //!
-//! For every open mission with a gate, one pass:
+//! For every open mission with a gate, and every done one while the closure
+//! rule (`spawn_task_may_continue`) lets its work go on, one pass:
 //!
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row, the
@@ -11,9 +12,9 @@
 //!    stopped;
 //! 3. a task whose gate passed is landed (again, after a crash);
 //! 4. otherwise the next ready task is judged: accepted by the supervisor
-//!    (`accept` = review) or just reported (`gate`). The candidate is what
-//!    the agent published: the source's `refs/heads/spawn/<agent>` (pushed
-//!    by the Bridge's pusher, [`crate::push`]), fetched into this mirror's
+//!    (`accept` = review), or also just reported (`gate`). The candidate is
+//!    what the agent published: the source's `refs/heads/spawn/<agent>`
+//!    (pushed by the Bridge's pusher, [`crate::push`]), fetched into this mirror's
 //!    own `refs/spawn-integrate/<agent>`. The integrator never commits a
 //!    mounted workspace and never moves the agent's `refs/heads/<agent>`,
 //!    so it works the same on a host that never ran the agent, and a file
@@ -84,11 +85,12 @@ const PRINCIPAL: &str = "spawn-integrate";
 
 const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>]";
 
-/// One open mission with a gate, from `gated_missions`.
+/// One mission with a gate the integrator visits, from `gated_missions`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Mission {
     pub(crate) id: i64,
-    /// `open` or `active`; `done` while accepted work still lands.
+    /// `open` or `active`; `done` while the closure rule lets its work go
+    /// on (`spawn_task_may_continue`).
     #[serde(default)]
     pub(crate) state: String,
     pub(crate) gate: String,
@@ -109,8 +111,8 @@ pub(crate) struct Mission {
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
     pub(crate) source: Option<String>,
-    /// Its open tasks (assigned, delivered, reported, revise, accepted,
-    /// landing).
+    /// Its tasks the closure rule lets go on: every open task of an open
+    /// mission; of a done one, delivered, reported, accepted and landing.
     #[serde(default)]
     pub(crate) tasks: Vec<Task>,
 }
@@ -133,14 +135,13 @@ pub(crate) struct Task {
 }
 
 impl Mission {
-    /// The task the gate judges next.
+    /// The task the gate judges next: one the supervisor accepted, or, when
+    /// the gate alone accepts, also one just reported.
     fn ready(&self) -> Option<&Task> {
-        let wanted = if self.accept == "gate" {
-            TaskState::Reported
-        } else {
-            TaskState::Accepted
-        };
-        self.tasks.iter().find(|task| task.state == wanted)
+        self.tasks.iter().find(|task| {
+            task.state == TaskState::Accepted
+                || (self.accept == "gate" && task.state == TaskState::Reported)
+        })
     }
 
     /// A task whose gate passed and whose landing is not recorded yet.
@@ -236,7 +237,8 @@ pub(crate) fn freshness(
                 ))
             } else {
                 Freshness::Stale(format!(
-                    "the pushed branch ({pushed}) does not contain the latest checkpoint                      ({checkpoint})"
+                    "the pushed branch ({pushed}) does not contain the latest checkpoint \
+                     ({checkpoint})"
                 ))
             }
         }
@@ -255,7 +257,8 @@ fn git(arguments: &[&str]) -> Result<String, String> {
 
 /// The source's default branch and its commit, as `git ls-remote` sees it.
 fn source_head(source: &str) -> Result<(String, String), String> {
-    let listing = git(&["ls-remote", "--symref", "--", source, "HEAD"])?;
+    let source = sources::MissionSource::parse(source)?;
+    let listing = git(&["ls-remote", "--symref", "--", source.as_str(), "HEAD"])?;
     let mut branch = "refs/heads/main".to_string();
     let mut commit = String::new();
     for line in listing.lines() {
@@ -268,7 +271,7 @@ fn source_head(source: &str) -> Result<(String, String), String> {
         }
     }
     if commit.is_empty() {
-        return Err(format!("{source} has no HEAD"));
+        return Err(format!("{} has no HEAD", source.as_str()));
     }
     Ok((branch, commit))
 }
@@ -486,10 +489,10 @@ impl Integrator {
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
                 // Not a verdict on the work: the pusher has not caught up.
-                if !sources::shares_branches(source, &sources::push_sources()) {
+                if !sources::receives_branches(source) {
                     eprintln!(
-                        "integrate: {source} does not receive agents' branches; list it in \
-                         SPAWN_PUSH_SOURCES for its work to land"
+                        "integrate: {source} receives no agents' branches (only a directory \
+                         on this host does), so its work never lands"
                     );
                 }
                 record(
@@ -667,7 +670,7 @@ fn landing_candidate(
             "--format=%B",
             branch,
         ])?;
-        if spawn_host::chunks::trailer_of(&message).is_none() {
+        if !spawn_host::names_files_outside_git(&message) {
             return Ok(Some(branch.to_string()));
         }
         let tree = git(&[
@@ -723,14 +726,13 @@ const LANDING_IDENTITY: (&str, &str) = ("spawn-integrate", "integrate@localhost"
 /// which git takes over any configuration.
 fn commit_landing(mirror_path: &str, arguments: &[&str]) -> Result<String, String> {
     let (name, email) = LANDING_IDENTITY;
-    let output = std::process::Command::new("git")
+    let output = sources::controller_git()
         .args(["--git-dir", mirror_path, "commit-tree", "--no-gpg-sign"])
         .args(arguments)
         .env("GIT_AUTHOR_NAME", name)
         .env("GIT_AUTHOR_EMAIL", email)
         .env("GIT_COMMITTER_NAME", name)
         .env("GIT_COMMITTER_EMAIL", email)
-        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("run git: {error}"))?;
     if !output.status.success() {
@@ -958,15 +960,42 @@ mod tests {
             let workspace = store.mount(&branch).expect("mount");
             let directory = std::path::Path::new(workspace.path());
             std::fs::write(directory.join(format!("{agent}.txt")), "work\n").expect("write");
-            if !main_moves {
-                // A large file: the head carries the trailer, so the landing
-                // is a commit of its own.
-                std::fs::write(directory.join("weights.bin"), vec![1_u8; 9 << 20]).expect("large");
-            }
             assert!(matches!(
                 store.commit(&workspace, "work").expect("commit"),
                 Commit::Created(_)
             ));
+            if !main_moves {
+                // A head an earlier version wrote, naming large files kept
+                // outside git: the landing is a commit of its own, without
+                // the trailer.
+                let head = rev(&format!("refs/heads/{agent}"));
+                let message = format!("work\n\nSpawn-Large: {}", "a".repeat(64));
+                let named = git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit-tree",
+                    &format!("{head}^{{tree}}"),
+                    "-p",
+                    &head,
+                    "-m",
+                    &message,
+                ])
+                .expect("a head with the trailer");
+                let reference = format!("refs/heads/{agent}");
+                git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "update-ref",
+                    &reference,
+                    &named,
+                    &head,
+                ])
+                .expect("move the branch");
+            }
             assert_eq!(push_branch(&mirror, &source, agent), Pushed::Done);
             if main_moves {
                 // Main moved since the worker started.
@@ -1055,7 +1084,8 @@ mod tests {
         );
         let diverged = freshness(Some("c2"), Some("d2"), history);
         assert!(
-            matches!(&diverged, Freshness::Stale(reason) if reason.contains("does not contain")),
+            matches!(&diverged, Freshness::Stale(reason)
+                if reason == "the pushed branch (d2) does not contain the latest checkpoint (c2)"),
             "{diverged:?}"
         );
         let unknown = freshness(Some("elsewhere"), Some("c3"), history);
@@ -1151,6 +1181,10 @@ mod tests {
         assert_eq!(gated.ready().map(|task| task.id), Some(2));
         gated.accept = "gate".to_string();
         assert_eq!(gated.ready().map(|task| task.id), Some(1));
+        // A report the supervisor accepted anyway is judged too, not left
+        // accepted forever.
+        gated.tasks.remove(0);
+        assert_eq!(gated.ready().map(|task| task.id), Some(2));
     }
 
     /// Both landing commits [`super::landing_candidate`] writes (a branch

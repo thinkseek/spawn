@@ -27,6 +27,9 @@ pub(crate) const GATE_ENV: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
     "SPAWN_TEST_DATABASE_URL",
+    // The free space the gate wants in TMPDIR before it starts
+    // (scripts/disk.sh); read outside the sandbox only.
+    "SPAWN_GATE_MIN_FREE_GB",
 ];
 
 /// One gate verdict.
@@ -536,6 +539,7 @@ mod tests {
                 Some(format!("{name}-value"))
             }
             "SPAWN_TEST_DATABASE_URL" => Some("postgres://t:p@127.0.0.1:15434/spawn_test".into()),
+            "SPAWN_GATE_MIN_FREE_GB" => Some("10".into()),
             "SPAWN_DATABASE_URL" => Some("postgres://o:p@127.0.0.1:15433/spawn".into()),
             "SPAWN_JUDGE_URL" | "http_proxy" | "SSH_AUTH_SOCK" => Some("secret".into()),
             _ => None,
@@ -551,7 +555,8 @@ mod tests {
                 "TMPDIR",
                 "CARGO_HOME",
                 "RUSTUP_HOME",
-                "SPAWN_TEST_DATABASE_URL"
+                "SPAWN_TEST_DATABASE_URL",
+                "SPAWN_GATE_MIN_FREE_GB"
             ]
         );
         let unset = |name: &str| (name == "PATH").then(|| "/usr/bin".to_string());

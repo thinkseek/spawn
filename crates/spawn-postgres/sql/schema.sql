@@ -220,6 +220,8 @@ declare
     v_id  bigint;
     v_at  bigint;
     v_owned text;
+    v_open text;
+    v_open_id bigint;
     -- Only the Observer's judgement is the projected state.
     v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded' and p_source = 'observer';
 begin
@@ -255,6 +257,27 @@ begin
         if v_owned is distinct from p_agent then
             raise exception 'session % belongs to agent %, not %', p_session, v_owned, p_agent
                 using errcode = '42501';
+        end if;
+    end if;
+
+    -- One active execution per session, held here and not only in a
+    -- Bridge's memory: a start is refused while the session's latest
+    -- execution has no end the Bridge wrote (a runner's exit report is no
+    -- end; a lost execution gets its end from the next tick).
+    if p_kind ->> 'name' = 'execution.started' then
+        select e.id, e.execution_id into v_open_id, v_open
+          from spawn_events e
+         where e.session_id = p_session and e.event_name = 'execution.started'
+           and e.execution_id is not null
+         order by e.id desc
+         limit 1;
+        if v_open is not null and not exists (
+            select 1 from spawn_events x
+             where x.session_id = p_session and x.event_name = 'execution.ended'
+               and x.execution_id = v_open and x.source = 'bridge' and x.id > v_open_id
+        ) then
+            raise exception 'session % already runs execution %', p_session, v_open
+                using errcode = '23P01';
         end if;
     end if;
 
@@ -376,6 +399,9 @@ create or replace function spawn_submit(
 declare
     v_id bigint;
 begin
+    -- The id is taken under the append lock, which is held to commit:
+    -- commands commit in id order, the order `spawn_claim` relies on.
+    perform pg_advisory_xact_lock(1399957335);
     insert into spawn_commands
         (principal, idempotency_key, agent_id, session_id, action, state, created_at_ms)
     values
@@ -409,6 +435,9 @@ create or replace function spawn_claim(
     out_session text,
     out_action  jsonb
 ) language sql as $$
+    -- One command per session at a time: nothing earlier in the session
+    -- may be unfinished. "Earlier" is id order, which is commit order
+    -- because `spawn_submit` takes its id under the append lock.
     with candidate as (
         select c.id
         from spawn_commands c
@@ -1116,6 +1145,46 @@ language sql stable as $$
       from (select spawn_principal() as p) x
 $$;
 
+-- Closure: whether a task may be in `p_state`, given its mission's state,
+-- whether the mission has a gate, and its resident's state (null for an
+-- ephemeral worker). The one rule that closing a mission, retiring a
+-- resident, the integrator's selection (the `GATED` query) and every task
+-- transition follow:
+-- - a closed state (cancelled, landed, accepted without a gate) always holds;
+-- - an open mission's task, with a worker that is not retired, may be in any;
+-- - a done mission with a gate takes in the work already handed out, and
+--   asks nothing new of a worker: delivered (its report still comes),
+--   reported (judged by the gate or reviewed), accepted and landing;
+-- - a retired resident's work goes on only where it needs nothing more from
+--   the worker: accepted and landing, for a mission with a gate that is not
+--   dropped;
+-- - a dropped mission's work goes on in no state.
+-- Anything else is cancelled when the mission closes or the resident
+-- retires, and no transition moves a task into it.
+create or replace function spawn_task_may_continue(p_state text, p_mission_state text,
+                                                   p_gated boolean, p_resident_state text)
+returns boolean language sql immutable as $$
+    select p_state in ('cancelled', 'landed')
+        or (p_state = 'accepted' and not p_gated)
+        or (p_mission_state in ('open', 'active') and p_resident_state is distinct from 'retired')
+        or (p_gated and p_mission_state <> 'dropped' and p_state in ('accepted', 'landing'))
+        or (p_gated and p_mission_state = 'done' and p_state in ('delivered', 'reported')
+            and p_resident_state is distinct from 'retired')
+$$;
+
+-- Whether task `p_task` may move to `p_to` under the closure rule: its
+-- current state and `p_to` both hold. False for a task that does not exist.
+create or replace function spawn_task_may_move(p_task bigint, p_to text)
+returns boolean language sql stable as $$
+    select coalesce((
+        select spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)
+               and spawn_task_may_continue(p_to, m.state, m.gate is not null, r.state)
+          from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+          left join mission_residents r on r.agent_id = k.agent_id
+         where k.id = p_task), false)
+$$;
+
 -- The control stream (docs/fleet-architecture.md §10.1). Every change to a
 -- mission, task or resident is one `control.recorded` event of session
 -- `session_control`; the `mission_*` tables are its fold, written only by
@@ -1142,18 +1211,12 @@ begin
         update mission_missions set state = p_record ->> 'state', summary = p_record ->> 'summary',
                                     updated_at_ms = p_at
          where id = v_id;
-        -- Work still queued for a closed mission is dropped. Accepted work
-        -- of a gated mission, and work the gate passed (landing), still
-        -- lands when the mission is done, and is dropped with the mission
-        -- otherwise.
-        update mission_tasks set state = 'cancelled', updated_at_ms = p_at
-         where mission_id = v_id
-           and (state in ('assigned', 'revise')
-                or (p_record ->> 'state' = 'dropped'
-                    and (state = 'landing'
-                         or (state = 'accepted'
-                             and exists (select 1 from mission_missions m
-                                          where m.id = v_id and m.gate is not null)))));
+        -- Its work that the closure rule does not let go on is dropped.
+        update mission_tasks k set state = 'cancelled', updated_at_ms = p_at
+          from mission_missions m
+         where m.id = k.mission_id and k.mission_id = v_id
+           and not spawn_task_may_continue(k.state, m.state, m.gate is not null,
+                   (select r.state from mission_residents r where r.agent_id = k.agent_id));
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model,
@@ -1270,9 +1333,16 @@ begin
     when 'resident.retired' then
         update mission_residents set state = 'retired', updated_at_ms = p_at
          where name = p_record ->> 'name';
-        -- Its queued tasks are dropped.
-        update mission_tasks set state = 'cancelled', updated_at_ms = p_at
-         where agent_id = 'agent_resident_' || (p_record ->> 'name') and state in ('assigned', 'revise');
+        -- Its work that the closure rule does not let go on is dropped.
+        update mission_tasks k set state = 'cancelled', updated_at_ms = p_at
+          from mission_missions m, mission_residents r
+         where m.id = k.mission_id and r.agent_id = k.agent_id
+           and r.name = p_record ->> 'name'
+           and not spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state);
+    when 'host.disk' then
+        -- A fact about this host's free disk (spawn loop, crate disk.rs):
+        -- read from the log, folded into no table.
+        null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
         case p_record ->> 'table'
@@ -1333,11 +1403,28 @@ begin
     end loop;
 end $$;
 
+-- Whether `p_source` is a mission source Spawn hands to git: an absolute
+-- path, an https:// or ssh:// URL, or ssh's `user@host:path`. Nothing that
+-- names another transport (`ext::`, `fd::`, `file://`), nothing relative,
+-- nothing that begins like an option, no whitespace or control character in
+-- a URL. The controller's git also allows only file, https and ssh
+-- (GIT_ALLOW_PROTOCOL), so a source stored before this check still reaches
+-- no other transport. Mirrors `MissionSource::parse` in spawn-cli.
+create or replace function spawn_source_allowed(p_source text)
+returns boolean language sql immutable as $$
+    select p_source is not null
+       and length(p_source) <= 4096
+       and (p_source ~ '^/[^[:cntrl:]]*$'
+            or p_source ~ '^(https|ssh)://[^-/[:space:][:cntrl:]][^[:space:][:cntrl:]]*$'
+            or p_source ~ '^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:[^-:[:space:][:cntrl:]][^[:space:][:cntrl:]]*$')
+$$;
+
 create or replace function spawn_mission_add(p_text text, p_sources jsonb, p_origin text)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
     v_id bigint;
+    v_source jsonb;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -1347,6 +1434,24 @@ begin
     if coalesce(trim(p_text), '') = '' then
         raise exception 'a mission needs text';
     end if;
+    if jsonb_typeof(coalesce(p_sources, '[]'::jsonb)) <> 'array' then
+        raise exception 'a mission''s sources are a list' using errcode = '22023';
+    end if;
+    -- Every source is one git runs as the owner: a checked shape, and from
+    -- the supervisor only one a human already gave a mission. The supervisor
+    -- reads text other agents write; it never introduces a repository.
+    for v_source in select value from jsonb_array_elements(coalesce(p_sources, '[]'::jsonb)) loop
+        if jsonb_typeof(v_source) <> 'string' or not spawn_source_allowed(v_source #>> '{}') then
+            raise exception 'a source is an absolute path or an https:// or ssh:// URL, not %',
+                v_source using errcode = '22023';
+        end if;
+        if v_caller = 'spawn_supervisor' and not exists (
+            select 1 from mission_missions
+             where origin <> 'spawn_supervisor' and sources @> jsonb_build_array(v_source)) then
+            raise exception 'the supervisor names only a source a human gave a mission, not %',
+                v_source using errcode = '42501';
+        end if;
+    end loop;
     v_id := nextval(pg_get_serial_sequence('mission_missions', 'id'));
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.added', 'id', v_id, 'text', p_text,
@@ -1442,7 +1547,10 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record deliveries', session_user using errcode = '42501';
     end if;
-    if not exists (select 1 from mission_tasks where id = p_task and state in ('assigned', 'revise')) then
+    -- A task of a closed mission, or of a retired resident, is not
+    -- delivered (the closure rule).
+    if not exists (select 1 from mission_tasks where id = p_task and state in ('assigned', 'revise'))
+       or not spawn_task_may_move(p_task, 'delivered') then
         return false;
     end if;
     perform spawn_control_record(jsonb_build_object(
@@ -1458,7 +1566,9 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record reports', session_user using errcode = '42501';
     end if;
-    if not exists (select 1 from mission_tasks where id = p_task and state = 'delivered') then
+    -- A report of work the closure rule dropped is not taken.
+    if not exists (select 1 from mission_tasks where id = p_task and state = 'delivered')
+       or not spawn_task_may_move(p_task, 'reported') then
         return false;
     end if;
     perform spawn_control_record(jsonb_build_object(
@@ -1480,6 +1590,12 @@ begin
     end if;
     if not exists (select 1 from mission_tasks where id = p_task and state = 'reported') then
         raise exception 'task % has no report to review', p_task;
+    end if;
+    -- A closed mission, or a retired resident, takes no new work: the
+    -- report is accepted (when its mission still lands work) or cancelled.
+    if not spawn_task_may_move(p_task, case when p_accept then 'accepted' else 'revise' end) then
+        raise exception 'task % belongs to a closed mission or a retired resident: it may not %',
+                        p_task, case when p_accept then 'be accepted' else 'be sent back' end;
     end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'task.reviewed', 'id', p_task, 'accepted', p_accept, 'note', p_note));
@@ -1666,6 +1782,7 @@ returns bigint language plpgsql security definer as $$
 declare
     v_mission bigint;
     v_stale bigint;
+    v_recorded bigint;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -1717,16 +1834,28 @@ begin
                                  v_stale + 1, v_mission)));
         end if;
     end if;
-    return spawn_control_record(p_record);
+    v_recorded := spawn_control_record(p_record);
+    -- A verdict that sends work back to a task the closure rule does not
+    -- let take new work (a closed mission's, a retired resident's) ends it.
+    if p_record ->> 'type' = 'task.gated' and not exists (
+        select 1 from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+          left join mission_residents r on r.agent_id = k.agent_id
+         where k.id = (p_record ->> 'id')::bigint
+           and spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)) then
+        perform spawn_control_record(jsonb_build_object(
+            'type', 'task.cancelled', 'id', (p_record ->> 'id')::bigint));
+    end if;
+    return v_recorded;
 end $$;
 
 -- The integrator's hold on one landing (owner only): taken right before its
 -- compare-and-swap push and released after it records what the push did
 -- (spawn_landing_release). Dropping a mission waits for the hold, so a push
 -- never lands work of a mission dropped meanwhile. True when the task is
--- still landing for a mission that is not dropped. A landing task of a
--- dropped mission (a fold from before drops cancelled landings) is
--- recorded cancelled instead.
+-- still landing and the closure rule lets it (its mission is not dropped).
+-- A landing task the rule dropped (a fold from before drops cancelled
+-- landings) is recorded cancelled instead.
 create or replace function spawn_landing_hold(p_task bigint)
 returns boolean language plpgsql security definer as $$
 begin
@@ -1734,13 +1863,13 @@ begin
         raise exception '% may not land work', session_user using errcode = '42501';
     end if;
     perform pg_advisory_lock(1399957337);
-    if exists (select 1 from mission_tasks k join mission_missions m on m.id = k.mission_id
-                where k.id = p_task and k.state = 'landing' and m.state <> 'dropped') then
+    if exists (select 1 from mission_tasks k where k.id = p_task and k.state = 'landing')
+       and spawn_task_may_move(p_task, 'landing') then
         return true;
     end if;
     perform pg_advisory_xact_lock(1399957335);
-    if exists (select 1 from mission_tasks k join mission_missions m on m.id = k.mission_id
-                where k.id = p_task and k.state = 'landing' and m.state = 'dropped') then
+    if exists (select 1 from mission_tasks k where k.id = p_task and k.state = 'landing')
+       and not spawn_task_may_move(p_task, 'landing') then
         perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
     end if;
     perform pg_advisory_unlock(1399957337);
@@ -1757,6 +1886,33 @@ end $$;
 create index if not exists spawn_events_control_record
     on spawn_events ((kind -> 'detail' -> 'record' ->> 'id'), session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded';
+
+-- The loop's disk records (`host.disk`, owner only): free space on a path
+-- the fleet writes to fell under the warning threshold (`low`) or came back
+-- (`recovered`). One record per crossing; the loop reads the latest per path
+-- back from the log after a restart.
+create or replace function spawn_host_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record host facts', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' is distinct from 'host.disk' then
+        raise exception 'not a host record: %', p_record ->> 'type';
+    end if;
+    if p_record ->> 'state' not in ('low', 'recovered') or p_record ->> 'path' is null
+       or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
+        raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The `host.disk` records, found without reading the rest of the stream.
+create index if not exists spawn_events_host_disk
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
 -- `stage` is the record type without `task.`; `verdict` is a gate's verdict
@@ -1817,6 +1973,40 @@ begin
 end
 $$;
 
+-- The closure rule's functions: search_path pinned, closed to public.
+do $$
+declare
+    v_function text;
+begin
+    foreach v_function in array array[
+        'spawn_task_may_continue(text, text, boolean, text)',
+        'spawn_task_may_move(bigint, text)'] loop
+        execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
+        execute format('revoke execute on function %s from public', v_function);
+    end loop;
+end
+$$;
+
+-- Closes and retirements from before the closure rule left work open that
+-- the rule drops (a dropped mission's delivered task, a retired resident's
+-- report): each such task is recorded cancelled, once.
+do $$
+declare
+    v_task bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    for v_task in
+        select k.id from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+          left join mission_residents r on r.agent_id = k.agent_id
+         where not spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)
+         order by k.id
+    loop
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+    end loop;
+end
+$$;
+
 revoke all on mission_missions, mission_residents, mission_tasks from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
@@ -1835,7 +2025,7 @@ begin
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
-        'spawn_source_moved(text, text, text)',
+        'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());

@@ -119,6 +119,7 @@ FAKE
     fi
 
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     drop_database "$db"
     rm -rf "$work"
 done

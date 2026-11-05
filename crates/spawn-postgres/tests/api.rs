@@ -70,6 +70,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
 fn postgres_passes_the_shared_contract() {
     let (store, _schema) = store("contract");
     contract::event_log("pg_evt", &store);
+    contract::one_execution("pg_one", &store);
     contract::command_queue("pg_cmd", &store, &store);
 }
 
@@ -164,6 +165,103 @@ fn one_session_runs_one_command_at_a_time() {
         .expect("claim succeeds")
         .expect("the younger command is ready");
     assert_eq!(next.command_id, younger);
+}
+
+/// `spawn_claim` leases a command only when nothing earlier (by id) in its
+/// session is unfinished, which holds only if commands commit in id order.
+/// A submission that waits for the append lock while another commits must
+/// not hold an id below the one that committed first: then both would be
+/// leased at once.
+#[test]
+fn two_commands_of_a_session_are_never_leased_at_once_when_their_submissions_race() {
+    let (_store, schema) = store("claim_order");
+    let submit = |key: &str| {
+        format!(
+            "select out_id from spawn_submit('human', '{key}', 'agent_one', 'session_one',
+                                             '{{\"type\":\"stop\"}}')"
+        )
+    };
+    let claim = |client: &mut Client| -> Option<i64> {
+        client
+            .query_opt("select out_id from spawn_claim('w1', 60000)", &[])
+            .expect("claim")
+            .map(|row| row.get(0))
+    };
+
+    // Another writer holds the append lock.
+    let mut holder = admin(&schema);
+    let mut holding = holder.transaction().expect("begin");
+    holding
+        .execute("select pg_advisory_xact_lock(1399957335)", &[])
+        .expect("hold the append lock");
+
+    // A submission starts and waits for it, in a transaction it keeps open.
+    let (submitted_tx, submitted) = std::sync::mpsc::channel::<(i32, Option<i64>)>();
+    let (commit_tx, commit) = std::sync::mpsc::channel::<()>();
+    let waiter_schema = schema.clone();
+    let waiter_submit = submit("key_waiter");
+    let waiter = std::thread::spawn(move || {
+        let mut client = admin(&waiter_schema);
+        let pid: i32 = client
+            .query_one("select pg_backend_pid()", &[])
+            .expect("pid")
+            .get(0);
+        submitted_tx.send((pid, None)).expect("send the pid");
+        let mut transaction = client.transaction().expect("begin");
+        let id: i64 = transaction
+            .query_one(&waiter_submit, &[])
+            .expect("the waiting submission")
+            .get(0);
+        submitted_tx.send((pid, Some(id))).expect("send the id");
+        commit.recv().expect("told to commit");
+        transaction.commit().expect("commit the waiting submission");
+        id
+    });
+    let (pid, _) = submitted.recv().expect("the waiter's pid");
+    let mut watcher = admin(&schema);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: bool = watcher
+            .query_one(
+                "select exists (select 1 from pg_locks
+                                 where pid = $1 and locktype = 'advisory' and not granted)",
+                &[&pid],
+            )
+            .expect("read the locks")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the submission waits for the lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The holder submits a command of the same session and commits first.
+    let first: i64 = holding
+        .query_one(&submit("key_holder"), &[])
+        .expect("the holder's submission")
+        .get(0);
+    holding.commit().expect("commit the holder");
+    let (_, second) = submitted.recv().expect("the waiting submission returns");
+    let second = second.expect("its id");
+    assert!(
+        first < second,
+        "the command that committed first has the lower id ({first}, {second})"
+    );
+
+    // While the second is uncommitted, the first is leased; once it is
+    // committed, it waits for the first to finish.
+    assert_eq!(claim(&mut watcher), Some(first));
+    commit_tx.send(()).expect("commit the waiter");
+    assert_eq!(waiter.join().expect("the waiter"), second);
+    assert_eq!(
+        claim(&mut watcher),
+        None,
+        "one command of the session is leased at a time"
+    );
 }
 
 #[test]
@@ -353,6 +451,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
                 command_id: CommandId(1),
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         ))
         .expect("append succeeds");
@@ -389,6 +488,72 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
         .duration_ms
         .expect("an ended execution has a duration");
     assert!(duration >= 0);
+}
+
+#[test]
+fn two_connections_racing_to_start_one_session_record_one_execution() {
+    let (first, schema) = store("one_execution");
+    let second = spawn_postgres::PostgresStore::connect_in_schema(&url(), &schema)
+        .expect("a second Bridge's connection");
+    let started = |name: &str| {
+        lifecycle(
+            &ExecutionId::new(name).expect("valid execution"),
+            Source::Bridge,
+            &format!("{name}:started"),
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
+                command_id: CommandId(1),
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        )
+    };
+    let outcomes: Vec<Result<_, _>> = std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.append(started("exec_a")));
+        let b = scope.spawn(|| second.append(started("exec_b")));
+        vec![a.join().expect("thread a"), b.join().expect("thread b")]
+    });
+    let taken = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(taken, 1, "{outcomes:?}");
+    assert!(
+        outcomes.iter().any(|outcome| matches!(
+            outcome,
+            Err(spawn_core::port::StoreError::Rejected(why)) if why.contains("already runs")
+        )),
+        "{outcomes:?}"
+    );
+    let live: i64 = admin(&schema)
+        .query_one(
+            "select count(*) from agent_executions where ended_at_ms is null",
+            &[],
+        )
+        .expect("executions read")
+        .get(0);
+    assert_eq!(live, 1);
+
+    // The lost-execution path: the Bridge's end frees the session, and the
+    // next start (a resume) is taken on either connection.
+    let winner = if outcomes[0].is_ok() {
+        "exec_a"
+    } else {
+        "exec_b"
+    };
+    first
+        .append(lifecycle(
+            &ExecutionId::new(winner).expect("valid execution"),
+            Source::Bridge,
+            &format!("{winner}:ended"),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Lost,
+                exit_code: None,
+            },
+        ))
+        .expect("the end of a lost execution");
+    second
+        .append(started("exec_c"))
+        .expect("a start after the end");
 }
 
 fn tool_event(execution: &ExecutionId, key: &str, kind: EventKind) -> NewEvent {
@@ -494,6 +659,7 @@ fn a_task_lists_its_command_and_execution_events() {
                 command_id: command,
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         ))
         .expect("append succeeds");
@@ -963,6 +1129,7 @@ fn status_joins_the_judgement_and_the_latest_execution() {
                 command_id: CommandId(1),
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         ))
         .expect("append succeeds");
@@ -1177,6 +1344,7 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
             "spawn_read_status EXECUTE",
             "spawn_read_tasks EXECUTE",
             "spawn_read_timeline EXECUTE",
+            "spawn_source_allowed EXECUTE",
         ]
     );
 }
@@ -1238,6 +1406,7 @@ fn a_delivered_task_starts_a_new_episode_and_a_nudge_does_not() {
             idempotency_key: IdempotencyKey::new(key).expect("valid key"),
             action: CommandAction::Input {
                 text: key.to_string(),
+                tags: Vec::new(),
             },
             ..start(session.clone(), key)
         };
@@ -1262,6 +1431,91 @@ fn a_delivered_task_starts_a_new_episode_and_a_nudge_does_not() {
     assert_eq!(episode(), (Some(human), Some("input".to_string())));
     let delivered = submit("spawn-dispatch", "deliver-4-0");
     assert_eq!(episode().0, Some(delivered), "a new task is a new episode");
+}
+
+#[test]
+fn dispatch_facts_name_the_latest_delivery_however_old() {
+    let (store, schema) = store("facts_delivery");
+    let worker = AgentId::new("agent_worker_a").expect("valid agent");
+    let session = SessionId::new("session_worker_a").expect("valid session");
+    store
+        .append(NewEvent {
+            agent_id: worker.clone(),
+            session_id: session.clone(),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    let submit = |principal: &str, key: &str| {
+        let submission = Submission {
+            agent_id: worker.clone(),
+            idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+            action: CommandAction::Input {
+                text: key.to_string(),
+                tags: Vec::new(),
+            },
+            ..start(session.clone(), key)
+        };
+        store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &submission,
+            )
+            .expect("submit succeeds")
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    assert!(row()["last_delivery"].is_null(), "nothing delivered yet");
+    submit("spawn-dispatch", "deliver-4-0");
+    let latest = submit("spawn-dispatch", "deliver-7-1");
+    submit("spawn-dispatch", "dispatch-nudge-session_worker_a-1");
+    submit("human", "deliver-9-0");
+    // A failed command carries its error (what a retried start looks at).
+    let claimed = store
+        .claim("w1", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("a command waits");
+    store
+        .finish(
+            &claimed,
+            &Outcome::Failed("the source did not answer".to_string()),
+        )
+        .expect("finish succeeds");
+    let failed = row()["dispatched"]
+        .as_array()
+        .expect("dispatched")
+        .iter()
+        .find(|sent| sent["succeeded"] == serde_json::json!(false))
+        .cloned()
+        .expect("the failed command is among the dispatched");
+    assert_eq!(failed["error"].as_str(), Some("the source did not answer"));
+    // Two days ago: out of the window `dispatched` keeps for other commands.
+    admin(&schema)
+        .execute(
+            "update spawn_commands set created_at_ms = created_at_ms - 2 * 86400000",
+            &[],
+        )
+        .expect("age the commands");
+    let facts = row();
+    let kept: Vec<&str> = facts["dispatched"]
+        .as_array()
+        .expect("dispatched")
+        .iter()
+        .filter_map(|sent| sent["key"].as_str())
+        .collect();
+    assert_eq!(
+        kept,
+        vec!["deliver-4-0", "deliver-7-1"],
+        "only the deliveries stay, to be confirmed however old"
+    );
+    assert!(
+        facts["dispatched"][0]["id"].is_i64(),
+        "a delivery names its command"
+    );
+    assert_eq!(
+        facts["last_delivery"].as_str(),
+        Some("deliver-7-1"),
+        "the dispatcher's latest delivery (command {}), not a nudge or another principal's",
+        latest.0
+    );
 }
 
 #[test]
@@ -1299,11 +1553,28 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                         command_id: CommandId(number),
                         fork: None,
                         model: profile,
+                        transcript_from: None,
                     },
                 )
             })
             .expect("append succeeds");
         assert_eq!(model().as_deref(), Some(profile.as_str()));
+        // One execution at a time: this one ends before the next starts.
+        store
+            .append(NewEvent {
+                agent_id: worker.clone(),
+                session_id: session.clone(),
+                ..lifecycle(
+                    &execution,
+                    Source::Bridge,
+                    &format!("exec_{number}:ended"),
+                    EventKind::ExecutionEnded {
+                        cause: EndCause::Stopped,
+                        exit_code: None,
+                    },
+                )
+            })
+            .expect("append succeeds");
     }
 }
 
@@ -1346,16 +1617,50 @@ fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
     }
 }
 
-/// The same server spelled another way: a socket directory moved to the
-/// `host` parameter, or 127.0.0.1 as `localhost`.
+/// The same server spelled another way: the authority's host and port
+/// moved to the `host` and `port` parameters. Any host works: a socket
+/// directory, 127.0.0.1, `localhost`, `[::1]` (the brackets dropped), a
+/// name.
 fn respelled(url: &str) -> String {
     let (head, tail) = url.rsplit_once('@').expect("a host");
-    let (host, path) = tail.split_once('/').expect("a database");
-    if host.starts_with("%2F") || host.starts_with("%2f") {
-        let separator = if path.contains('?') { '&' } else { '?' };
-        format!("{head}@/{path}{separator}host={host}")
-    } else {
-        format!("{head}@{}/{path}", host.replace("127.0.0.1", "localhost"))
+    let (authority, path) = tail.split_once('/').expect("a database");
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && (!host.starts_with('[') || host.ends_with(']')) =>
+        {
+            (host, format!("&port={port}"))
+        }
+        _ => (authority, String::new()),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{head}@/{path}{separator}host={host}{port}")
+}
+
+#[test]
+fn respelling_moves_any_host_to_the_parameters() {
+    for (url, expected) in [
+        (
+            "postgres://u:p@%2Frun%2Fpg/db",
+            "postgres://u:p@/db?host=%2Frun%2Fpg",
+        ),
+        (
+            "postgres://u:p@127.0.0.1:15434/db",
+            "postgres://u:p@/db?host=127.0.0.1&port=15434",
+        ),
+        (
+            "postgres://u:p@localhost/db?sslmode=disable",
+            "postgres://u:p@/db?sslmode=disable&host=localhost",
+        ),
+        (
+            "postgres://u:p@[::1]:5432/db",
+            "postgres://u:p@/db?host=::1&port=5432",
+        ),
+    ] {
+        assert_eq!(respelled(url), expected);
+        assert_ne!(respelled(url), url);
     }
 }
 
@@ -1415,4 +1720,262 @@ fn migrations_racing_on_one_server_all_succeed() {
     for result in results {
         result.expect("every racing migration succeeds");
     }
+}
+
+/// M15: a revival whose engine dies right after it launched counts as a
+/// failure though its command succeeded, so the backoff and the handoff
+/// after three failed resumes engage; a revival that stayed up past the
+/// grace minute starts the count over.
+#[test]
+fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
+    let (store, schema) = store("revival_storm");
+    let reviver = "spawn-supervise";
+    let run = |number: u64, command: CommandId| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:started"),
+                EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: command,
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                },
+            ))
+            .expect("started");
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:ended"),
+                EventKind::ExecutionEnded {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                },
+            ))
+            .expect("ended");
+    };
+    let revive = |key: &str| {
+        let command = store
+            .submit(
+                &Principal::new(reviver).expect("valid principal"),
+                &Submission {
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                    ..start(session(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the resume");
+        store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("the engine launched");
+        command
+    };
+    let first = store
+        .submit(
+            &Principal::new("human").expect("valid"),
+            &start(session(), "first"),
+        )
+        .expect("submit");
+    let claimed = store
+        .claim("bridge", Duration::from_mins(1))
+        .expect("claim")
+        .expect("start");
+    store.finish(&claimed, &Outcome::Succeeded).expect("finish");
+    run(1, first);
+    // Three revivals, each lost the moment it launched.
+    for attempt in 2..=4 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 3,
+        "three revivals died at once; counted {}",
+        facts.failures
+    );
+    assert!(facts.last_failure_ms.is_some(), "the backoff has a start");
+    // A fourth revival whose engine ran two minutes before it was lost.
+    let command = revive("revive-5");
+    run(5, command);
+    admin(&schema)
+        .execute(
+            "update spawn_events set recorded_at_ms = recorded_at_ms - 120000
+              where execution_id is distinct from 'exec_5' or event_name <> 'execution.ended'",
+            &[],
+        )
+        .expect("age all but the last end");
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 0,
+        "an engine that stayed up resets the count"
+    );
+}
+
+/// The dispatcher's facts count a resume whose engine was lost again within
+/// the grace minute (`resumed_young`), until an execution stays up.
+#[test]
+fn dispatch_facts_count_resumes_lost_again_at_once() {
+    let (store, schema) = store("facts_resumed_young");
+    let worker = AgentId::new("agent_worker_a").expect("valid agent");
+    let session = SessionId::new("session_worker_a").expect("valid session");
+    let run = |number: u64, command: CommandId| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        for (key, kind) in [
+            (
+                "started",
+                EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: command,
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                },
+            ),
+            (
+                "ended",
+                EventKind::ExecutionEnded {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                },
+            ),
+        ] {
+            store
+                .append(NewEvent {
+                    agent_id: worker.clone(),
+                    session_id: session.clone(),
+                    ..lifecycle(
+                        &execution,
+                        Source::Bridge,
+                        &format!("exec_{number}:{key}"),
+                        kind,
+                    )
+                })
+                .expect("append");
+        }
+    };
+    let send = |principal: &str, key: &str| {
+        let command = store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &Submission {
+                    agent_id: worker.clone(),
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                    ..start(session.clone(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the command");
+        store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("the engine launched");
+        command
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    run(1, send("human", "first"));
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(0),
+        "no resume yet"
+    );
+    run(2, send("spawn-dispatch", "dispatch-resume-exec_1"));
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(1),
+        "the resumed engine was lost at once"
+    );
+    // A later execution that ran two minutes before it was lost.
+    run(3, send("human", "again"));
+    admin(&schema)
+        .execute(
+            "update spawn_events set recorded_at_ms = recorded_at_ms - 120000
+              where execution_id is distinct from 'exec_3' or event_name <> 'execution.ended'",
+            &[],
+        )
+        .expect("age all but the last end");
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(0),
+        "an engine that stayed up starts the count over"
+    );
+}
+
+#[test]
+fn the_reader_reads_the_whole_log_from_a_time_without_screen_text() {
+    let (store, schema) = store("log_after");
+    for kind in [
+        EventKind::MessageReceived,
+        EventKind::ScreenObserved {
+            state: spawn_core::screen::ScreenState::Ready,
+            evidence: "pane text".to_string(),
+        },
+        EventKind::TurnStopped {
+            input_tokens: None,
+            output_tokens: None,
+        },
+        EventKind::MessageReceived,
+    ] {
+        store.append(message(kind)).expect("append succeeds");
+    }
+    // Ten seconds apart, first to last: positions 1..=4.
+    admin(&schema)
+        .batch_execute("update spawn_events set recorded_at_ms = 1000000 + id * 10000")
+        .expect("spread the record times");
+    let url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
+        .expect("the reader's URL");
+    let reader = spawn_postgres::PostgresStore::connect(&url).expect("the reader connects");
+
+    let entries = reader
+        .log_after(GlobalPosition(0), 10)
+        .expect("the log reads");
+    let names: Vec<&str> = entries.iter().map(|e| e.event_name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "message.received",
+            "screen.observed",
+            "turn.stopped",
+            "message.received"
+        ]
+    );
+    assert_eq!(
+        entries[1].detail,
+        Some(serde_json::json!({"state": "ready"})),
+        "the pane's text stays out"
+    );
+    assert_eq!(entries[0].session_id, session().as_str());
+    let after_two = reader
+        .log_after(GlobalPosition(2), 1)
+        .expect("the log reads");
+    assert_eq!(after_two.len(), 1);
+    assert_eq!(after_two[0].position, GlobalPosition(3));
+
+    let before = |ms: i64| {
+        reader
+            .position_before(spawn_core::time::Timestamp(ms))
+            .expect("a position")
+    };
+    assert_eq!(before(0), GlobalPosition(0), "everything is that recent");
+    assert_eq!(before(1_010_000), GlobalPosition(0));
+    assert_eq!(before(1_010_001), GlobalPosition(1));
+    assert_eq!(before(1_030_000), GlobalPosition(2));
+    assert_eq!(before(1_035_000), GlobalPosition(3));
+    assert_eq!(before(9_000_000), GlobalPosition(4), "nothing that recent");
 }

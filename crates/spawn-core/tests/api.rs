@@ -132,6 +132,33 @@ fn events_round_trip_through_json() {
         TerminalName::for_execution(&ExecutionId::new("exec_1").expect("valid")).as_str(),
         "spawn-exec_1"
     );
+    // `engine_version` is optional: a record from before it reads, and an
+    // unset one is left out.
+    let native = serde_json::json!({
+        "name": "session.native_started",
+        "detail": {"engine": ENGINE, "native_session_id": "n1", "transcript_path": null},
+    });
+    let read: EventKind = serde_json::from_value(native.clone()).expect("an old record reads");
+    assert!(matches!(
+        &read,
+        EventKind::NativeSessionStarted {
+            engine_version: None,
+            ..
+        }
+    ));
+    assert_eq!(serde_json::to_value(&read).expect("serialize"), native);
+    let versioned = EventKind::NativeSessionStarted {
+        engine: ENGINE.to_string(),
+        native_session_id: "n1".to_string(),
+        transcript_path: None,
+        engine_version: Some("2.1.318".to_string()),
+    };
+    let written = serde_json::to_value(&versioned).expect("serialize");
+    assert_eq!(written["detail"]["engine_version"], "2.1.318");
+    assert_eq!(
+        serde_json::from_value::<EventKind>(written).expect("reads back"),
+        versioned
+    );
     let start = |engine: &str| {
         serde_json::from_value::<CommandAction>(
             serde_json::json!({"type": "start", "engine": engine, "prompt": "x"}),
@@ -257,9 +284,12 @@ fn memory_backend_passes_the_contract() {
     let store = store();
     let concrete: &MemoryStore = store.as_ref();
     contract::event_log("mem_evt", concrete);
+    contract::one_execution("mem_one", concrete);
     contract::command_queue("mem_cmd", concrete, concrete);
     contract::workspace_store("mem_ws", concrete);
     contract::terminal("mem_tty", concrete);
+    contract::terminal_files("mem_files", concrete, "/scratch");
+    contract::transcript_archive("mem_archive", concrete);
 }
 
 fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
@@ -372,6 +402,88 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
     assert_eq!(ended(&store), vec![EndCause::Stopped, EndCause::Lost]);
 }
 
+/// A log whose reader sees nothing: a Bridge over it has not read what
+/// another Bridge appended.
+struct Unread(Arc<MemoryStore>);
+
+impl EventLog for Unread {
+    fn append(
+        &self,
+        event: NewEvent,
+    ) -> Result<spawn_core::event::Appended, spawn_core::port::StoreError> {
+        self.0.append(event)
+    }
+
+    fn read_global(
+        &self,
+        _after: GlobalPosition,
+        _limit: usize,
+    ) -> Result<Vec<spawn_core::event::EventRecord>, spawn_core::port::StoreError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn a_second_bridge_that_missed_the_start_is_refused_by_the_log() {
+    let store = store();
+    let first = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&first, READY);
+    submit_start(&store, "first");
+    tick_fresh(&store);
+
+    // Another Bridge process, which has not read that start, takes the
+    // session's next start.
+    submit(
+        &store,
+        "key_again",
+        CommandAction::Start {
+            engine: ENGINE.to_string(),
+            prompt: "second".to_string(),
+            parent_session_id: None,
+            from: None,
+            model: None,
+        },
+    );
+    let mut other = Bridge::new(
+        Arc::new(Unread(store.clone())),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("other"),
+    );
+    other.tick().expect("tick succeeds");
+
+    let failures: Vec<String> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::CommandFinished {
+                succeeded: false,
+                error,
+                ..
+            } => error,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures.len(), 1, "{:?}", names(&store));
+    assert!(failures[0].contains("already runs"), "{failures:?}");
+    let started = names(&store)
+        .into_iter()
+        .filter(|name| *name == "execution.started")
+        .count();
+    assert_eq!(started, 1, "one execution recorded");
+    assert_eq!(store.launches().len(), 1, "no second engine");
+    let calls = store.workspace_calls();
+    assert_eq!(
+        calls.iter().filter(|call| *call == "unmount").count(),
+        1,
+        "the refused start's own mount goes: {calls:?}"
+    );
+    assert!(store.is_alive(&first, &any_workspace()).expect("alive"));
+    // The first execution goes on and ends as before.
+    assert!(tick_fresh(&store).warnings.is_empty());
+    assert!(ended(&store).is_empty());
+}
+
 fn events(store: &MemoryStore) -> Vec<NewEvent> {
     store
         .read_global(spawn_core::event::GlobalPosition(0), 500)
@@ -415,9 +527,12 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
         names(&store),
         vec![
             "command.accepted",
+            "command.step",
             "execution.started",
             "session.native_started",
             "screen.observed",
+            "command.step",
+            "command.step",
             "command.finished",
         ]
     );
@@ -537,6 +652,223 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
             _ => None,
         });
     assert_eq!(ended, Some((EndCause::Exited, Some(3))));
+}
+
+#[test]
+fn the_engine_version_is_read_from_the_transcript_once_per_execution() {
+    let store = store();
+    let execution = ExecutionId::for_command(CommandId(1));
+    store.set_pane(&TerminalName::for_execution(&execution), READY);
+    submit_start(&store, "list the files");
+    tick_fresh(&store);
+    let path = events(&store)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::NativeSessionStarted {
+                transcript_path, ..
+            } => transcript_path,
+            _ => None,
+        })
+        .expect("the start records the transcript");
+    let at = r#""timestamp":"2099-01-01T00:00:00.000Z""#;
+    store.append_file(
+        &path,
+        &format!(
+            "{{\"type\":\"user\",\"uuid\":\"u1\",{at},\"version\":\"2.1.318\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"s1\",{at},\"version\":\"2.1.318\"}}\n"
+        ),
+    );
+    tick_fresh(&store);
+    // A restarted Bridge reads the file again; the key keeps one record.
+    tick_fresh(&store);
+    let versions: Vec<(Source, Option<String>)> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::NativeSessionStarted { engine_version, .. } => {
+                Some((event.source, engine_version))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        versions,
+        vec![
+            (Source::Bridge, None),
+            (Source::Claude, Some("2.1.318".to_string()))
+        ]
+    );
+}
+
+/// The transcript `session.native_started` names for the latest execution.
+fn transcript_of_latest(store: &MemoryStore) -> (String, String) {
+    let events = events(store);
+    let native = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::NativeSessionStarted {
+                native_session_id, ..
+            } => Some(native_session_id.clone()),
+            _ => None,
+        })
+        .expect("a native session");
+    let workspace = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            EventKind::ExecutionStarted { workspace, .. } => Some(workspace.clone()),
+            _ => None,
+        })
+        .expect("an execution");
+    let path = spawn_core::bridge::transcript_path(
+        &BridgeConfig::new("tester").claude_projects,
+        &workspace,
+        &native,
+    );
+    (native, path)
+}
+
+fn archiving_bridge(store: &Arc<MemoryStore>) -> Bridge {
+    Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    )
+    .with_transcript_archive(store.clone())
+}
+
+#[test]
+fn a_resume_restores_a_deleted_transcript_from_the_archive() {
+    use spawn_core::port::TranscriptArchive;
+    let store = store();
+    for command in 1..=3 {
+        let execution = ExecutionId::for_command(CommandId(command));
+        store.set_pane(&TerminalName::for_execution(&execution), READY);
+    }
+    let mut bridge = archiving_bridge(&store);
+    submit_start(&store, "first");
+    bridge.tick().expect("start");
+    let (native, first) = transcript_of_latest(&store);
+    let at = r#""timestamp":"2099-01-01T00:00:00.000Z""#;
+    store.append_file(
+        &first,
+        &format!(
+            "{{\"type\":\"user\",\"uuid\":\"u1\",{at},\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"s1\",{at}}}\n"
+        ),
+    );
+    bridge.tick().expect("read the turn");
+    bridge
+        .tick()
+        .expect("checkpoint the turn end, and copy the transcript");
+    let lengths = store.copies(&agent(), &native).expect("copies");
+    assert_eq!(lengths.len(), 1, "copied at the turn end");
+
+    // The engine rewrites its file (a format change, a compaction): the
+    // copy taken at the execution's end is a new one, the old one stays.
+    let rewritten =
+        format!("{{\"type\":\"user\",\"uuid\":\"u1\",{at},\"message\":{{\"content\":\"GO\"}}}}\n");
+    store.replace_file(&first, rewritten.as_bytes());
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(
+        store.copies(&agent(), &native).expect("copies"),
+        vec![lengths[0], u64::try_from(rewritten.len()).expect("fits")]
+    );
+
+    // Claude Code's cleanup deletes the transcript; the resume puts the
+    // latest copy back where the engine reads it.
+    store.remove_file(&first);
+    submit(
+        &store,
+        "key_resume",
+        CommandAction::Resume {
+            prompt: Some("go on".to_string()),
+            model: None,
+        },
+    );
+    let report = bridge.tick().expect("resume");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("restored")),
+        "{:?}",
+        report.warnings
+    );
+    let (_, resumed) = transcript_of_latest(&store);
+    assert_eq!(
+        store
+            .read_from(&any_workspace(), &resumed, 0)
+            .expect("read"),
+        Some(rewritten.into_bytes())
+    );
+    let launch = store.launches().pop().expect("a launch");
+    assert!(
+        launch
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == native),
+        "{:?}",
+        launch.arguments
+    );
+}
+
+#[test]
+fn a_resume_whose_transcript_is_gone_without_a_copy_fails_and_starts_nothing() {
+    let store = store();
+    store.set_pane(
+        &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+        READY,
+    );
+    // No archive.
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    );
+    submit_start(&store, "first");
+    bridge.tick().expect("start");
+    let (_, first) = transcript_of_latest(&store);
+    store.append_file(
+        &first,
+        "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":\"go\"}}\n",
+    );
+    bridge.tick().expect("read the prompt");
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    submit(
+        &store,
+        "key_resume",
+        CommandAction::Resume {
+            prompt: None,
+            model: None,
+        },
+    );
+    bridge.tick().expect("resume");
+    let failure = events(&store)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::CommandFinished {
+                succeeded: false,
+                error,
+                ..
+            } => error,
+            _ => None,
+        })
+        .expect("the resume failed");
+    assert!(failure.contains("start the agent blank"), "{failure}");
+    assert_eq!(store.launches().len(), 1, "no engine was started blank");
+    let calls = store.workspace_calls();
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("unmount"),
+        "{calls:?}"
+    );
 }
 
 #[test]
@@ -709,6 +1041,7 @@ fn bridge_resumes_the_stored_native_session() {
                 engine: ENGINE.to_string(),
                 native_session_id: "native-7".to_string(),
                 transcript_path: None,
+                engine_version: None,
             },
         })
         .expect("append succeeds");
@@ -778,6 +1111,7 @@ fn observer_writes_only_on_change() {
                 command_id: CommandId(1),
                 fork: None,
                 model: ModelProfile::Default,
+                transcript_from: None,
             },
         })
         .expect("append succeeds");

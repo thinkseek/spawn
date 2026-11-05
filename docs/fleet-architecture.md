@@ -56,7 +56,7 @@ No layer calls another layer's process directly; they meet in the log.
 
 | Layer | Parts |
 | --- | --- |
-| 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, the chunk store, transcripts and exit files |
+| 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, transcripts and exit files |
 | 2 Event log | `spawn_events` (with the control stream), `spawn_commands`, grants, projections, views |
 | 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
@@ -185,11 +185,13 @@ it, on the same ladder.
   with confidence ≥ 0.7, `needs_human` ≤ 0.2 and `stuck` < 0.5, once per
   episode (the latest non-dispatcher command) and three per agent-hour; a
   worker idle at its prompt and not nudged, a nudge that did not help, a
-  failed resume, attention, and a finished execution nobody stopped all
+  failed resume (or one whose engine was lost again within a minute),
+  attention, and a finished execution nobody stopped all
   escalate. Escalations coalesce into one digest typed into the supervisor
   while it is idle. The dispatcher keeps no state: idempotency keys mark its
-  nudges and resumes, and a `[spawn:esc <session> <id>]` marker per item in
-  each delivered digest marks what the supervisor was told.
+  nudges and resumes, and the tags a delivered digest files on its command
+  (`<session> <id>` per item, never in the text, which quotes workers'
+  reports) mark what the supervisor was told.
 - **Supervisor**: one perpetual Claude Code session (`agent_supervisor`).
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
@@ -215,9 +217,10 @@ the system. Its continuity is a design requirement, not a best effort:
 | Threat | What keeps the session |
 | --- | --- |
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
-| The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff |
+| The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff; a revival whose engine is lost or exits non-zero within a minute counts as a failed one, and only an execution that stayed up starts the count over |
 | The machine reboots | tmux is gone, so the execution is `Lost`; the same rule resumes it from the native transcript |
-| The native session cannot be resumed (transcript lost, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
+| A transcript Claude Code deleted (or a container took with it) | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
+| The native session cannot be resumed (transcript lost with no copy, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
 | The supervisor hangs or loops | Its own observations (rules, then Jev) flag `stuck`; that goes to a human, never to an automatic stop |
 
@@ -241,7 +244,7 @@ input of a mission.
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
 | Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
-| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker; resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, 8 when the source did not answer, then escalated; one that may have typed the task is escalated at once); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
 **Two kinds of worker.**
@@ -287,10 +290,15 @@ tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
 kind, assignee, model profile, state and report.
 
-**Mission sources.** A mission names its source: any git repository (a path
-or a URL), mirrored into `$SPAWN_WORKSPACE_ROOT/.sources/`, or none (an empty
-scratch repository). Each worker's workspace is a branch of that mirror.
-`SPAWN_GIT_REPO` is the repository of agents no mission owns.
+**Mission sources.** A mission names its source: a git repository, as an
+absolute path, an `https://` or `ssh://` URL, or ssh's `user@host:path`,
+mirrored into `$SPAWN_WORKSPACE_ROOT/.sources/`, or none (an empty scratch
+repository). Each worker's workspace is a branch of that mirror.
+`SPAWN_GIT_REPO` is the repository of agents no mission owns. A source is
+git run as the owner, so `spawn_mission_add` refuses any other shape (an
+`ext::` command, a relative path, an option), the supervisor may name only a
+source a human already gave a mission, and every git the controller runs
+allows only file, https and ssh (`GIT_ALLOW_PROTOCOL`).
 
 **Limits.** None fixed. The supervisor decides fleet size; humans stop what
 overreaches, and the UI shows the live workers.
@@ -313,7 +321,7 @@ Every task runs on one of two **profiles**:
 | Profile | Main model (and sonnet, opus slots) | Small model (haiku slot: titles, summaries, background work) | For |
 | --- | --- | --- | --- |
 | `default` | Claude Code's own (`claude-opus-5-5` on the gateway) | `deepseek-flash` | everything not listed below |
-| `cheap` | `deepseek-v4-pro` (`SPAWN_CHEAP_MODEL`) | `deepseek-flash` (`SPAWN_SMALL_MODEL`) | simple, well-specified work: docs, mechanical edits, tests for stated behaviour |
+| `cheap` | `deepseek-flash` (`SPAWN_CHEAP_MODEL`) | `deepseek-flash` (`SPAWN_SMALL_MODEL`) | simple, well-specified work: docs, mechanical edits, tests for stated behaviour |
 
 Design, concurrency, security, debugging and anything a gate judges as hard
 stay on `default`; the supervisor's charter says so.
@@ -340,8 +348,8 @@ How the profile travels:
 **When the relay is down.** The Bridge connects to the relay before every
 Claude start. Unreachable: a `default` engine starts on Claude Code's own
 settings (the gateway, its own small model) and the tick reports a warning;
-a `cheap` start fails, and the failed delivery reaches the supervisor's
-digest. An engine already running when the relay dies sees API errors until
+a `cheap` start fails, is retried, and the failed delivery reaches the
+supervisor's digest once its retries are spent. An engine already running when the relay dies sees API errors until
 systemd restarts it (`Restart=always`). Engines use the relay only where
 `SPAWN_MODEL_RELAY` names it (`http://127.0.0.1:8791` in `spawn.env`):
 unset or `off`, every engine runs on Claude Code's own settings, nothing
@@ -388,7 +396,7 @@ Known edges, each with its rule:
 | Edge | Rule |
 | --- | --- |
 | The UI's live terminal reads tmux | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
-| The supervisor's native transcript lives on the host (`~/.claude`) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
+| The supervisor's native transcript lives on the host (`~/.claude`, copied to the host's transcript archive) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
 | Code lives in git | Artifact storage; every commit is referenced from an event |
 
 - The event log is the only state; every process is restartable.
@@ -448,8 +456,7 @@ asserts:
 
 ## 8. Known limit: one uid
 
-Without container mode (`SPAWN_EXEC_IMAGE`) every engine runs as the owner's
-Unix user, and all panes share one tmux server. The database boundary holds
+Every engine runs as the owner's Unix user, and all panes share one tmux server. The database boundary holds
 (no pane can write the log), but the file boundary does not: an agent can
 read another process's environment through `/proc` or tmux (including the
 supervisor pane's login), write the files the Bridge reads for another
@@ -459,7 +466,7 @@ reads those files without following symlinks, refuses anything but a regular
 file and caps each read, so a planted FIFO or an endless file cannot stall
 or exhaust it. Holding no login stops a worker from forging facts through
 the database; it does not isolate agents from each other. Isolation between
-agents needs container mode or one uid per agent. The gate runs candidate
+agents needs one uid (or one sandbox) per agent. The gate runs candidate
 code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
@@ -480,9 +487,8 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   retrying after a transient API error (both escalate), and the actions
   `restart` and `reassign`.
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
-- **The integrator judging an agent's work from its pushed branch**, and the
-  backlog, scenarios and gate versioned with the source, so work done on
-  another host lands too (docs/storage.md).
+- **The backlog, scenarios and gate versioned with the source**
+  (docs/storage.md).
 
 ## 10. One log, one landing path
 
@@ -500,15 +506,16 @@ controller. Missions, tasks, residents and landings are events in
   `mission.halted`, `mission.resumed`, `source.moved`, `task.assigned`,
   `task.delivered`, `task.reported`, `task.reviewed`, `task.cancelled`,
   `task.gated`, `task.landed`, `task.aborted`, `resident.proposed`,
-  `resident.approved`, `resident.retired`, `legacy.imported`.
+  `resident.approved`, `resident.retired`, `legacy.imported`, `host.disk`.
   `legacy.imported` carries one row of the mission tables as it stood
   before the control stream existed: a database with mission rows and no
   records imports them once, on migration.
 - **Who writes it:** only the checked mission functions, through
   `spawn_control_record`. The integrator's records (`task.gated`,
-  `task.landed`, `task.aborted`, `mission.halted`) and `source.moved` need
-  the owner's login. The restricted logins write no events at all:
-  `spawn_append` refuses them.
+  `task.landed`, `task.aborted`, `mission.halted`), `source.moved` and the
+  loop's `host.disk` (through `spawn_host_record`; folded into no table,
+  [storage.md](storage.md#disk-room)) need the owner's login. The
+  restricted logins write no events at all: `spawn_append` refuses them.
 - **The tables are a projection.** `spawn_control_apply(record)` is the only
   writer of `mission_*`, and it runs in the same transaction as the append.
   `spawn_control_refold()` rebuilds the tables from the log, and a test
@@ -574,6 +581,19 @@ the tree's own:
   6. records `task.landed`.
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
+- **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
+  mission is closed, or a task's resident retired, work goes on only where
+  it asks nothing new of a worker:
+  - a done mission with a gate keeps its delivered, reported, accepted and
+    landing tasks: reports still come in, are judged or reviewed, and land,
+    and a delivered task is still held to the budget;
+  - a retired resident's accepted and landing tasks still land;
+  - a dropped mission keeps nothing.
+
+  Every other open task is cancelled by the close or the retirement. The
+  integrator's selection uses the same rule, and no transition moves a task
+  into a state the rule drops: a send-back is refused, a gate rejection
+  cancels the task, and deliveries and reports are not recorded.
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
   - three gate aborts in a row;

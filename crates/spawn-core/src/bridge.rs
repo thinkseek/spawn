@@ -8,7 +8,7 @@
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -17,27 +17,21 @@ use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, Outcome};
 use crate::event::{
-    ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, EventRecord, Fork, GlobalPosition,
-    ModelProfile, NewEvent, Source,
+    ArtifactRef, CheckpointReason, CommandStep, ENGINE, EndCause, EventKind, EventRecord, Fork,
+    GlobalPosition, ModelProfile, NewEvent, Source,
 };
-use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
-use crate::ingest::{MERGE_NOTICE_OPENING, claude_line};
+use crate::id::{
+    AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
+};
+use crate::ingest::{claude_line, claude_version};
+use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
-    TerminalHost, WorkspaceError, WorkspaceStore,
+    TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
-
-/// Transcript lines this much older than the execution's start are still
-/// read as its own.
-const CLOCK_SLACK_MS: i64 = 60_000;
-
-/// An idle execution's workspace is offered the source's main at most this
-/// often, by the Bridge's clock, besides right after each turn ends: an agent
-/// already idle when main moves gets the merge (or the conflict markers)
-/// without waiting for a turn.
-pub const IDLE_MERGE_MS: i64 = 30_000;
+use crate::transcripts;
 
 /// Final checkpoints an ending execution tries on consecutive ticks before
 /// its end counts as stalled: the terminal is killed, the workspace stays
@@ -170,15 +164,11 @@ struct Active {
     // idle session repeats one no-op commit per tick; record attempts if
     // Workspace calls get expensive.
     checkpoint: Option<CheckpointReason>,
-    /// A turn runs: a prompt reached the engine (or the Bridge typed one), or
-    /// a tool started, and no turn end followed. The base is never merged
-    /// into a workspace while a turn runs.
-    turn_open: bool,
     /// The runner reported the engine exit; cleanup is still due.
     reported_end: Option<(EndCause, Option<i32>)>,
-    /// When the execution started: transcript lines before it belong to
-    /// earlier executions of the session.
-    started_ms: i64,
+    /// The end committed its final checkpoint and killed the terminal
+    /// (`execution.unmounting`): what is left is the unmount and the record.
+    unmounting: bool,
     /// What the Bridge has read of the engine's files and screen.
     follow: Follow,
 }
@@ -210,14 +200,6 @@ struct Follow {
     warned: bool,
     /// The runner's exit file is unreadable; warned once.
     exit_warned: bool,
-    /// When `merge_base` last ran for this execution, by the Bridge's clock.
-    merge_at: Option<i64>,
-    /// The last merge warning reported: the same conflict (or failure) is
-    /// reported once, not every [`IDLE_MERGE_MS`].
-    merge_warning: Option<String>,
-    /// This tick read an event that asks for a checkpoint, not folded yet:
-    /// the workspace may hold work not on its branch.
-    checkpoint_read: bool,
     /// Final checkpoints of this execution's end that failed. The
     /// workspace stays mounted until one succeeds (or a `discard`); from
     /// [`END_ATTEMPTS`] on the end is stalled.
@@ -225,6 +207,14 @@ struct Follow {
     /// When the end's final checkpoint was last tried, by the Bridge's
     /// clock: a stalled end retries every [`END_RETRY_MS`].
     end_tried_at: Option<i64>,
+    /// The workspace answered [`WORKSPACE_STALE`] with this message: it
+    /// cannot checkpoint to its branch again, and its state is kept off it,
+    /// so the execution is ended (and its workspace unmounted) instead of
+    /// retried.
+    stale: Option<String>,
+    /// The engine's version, once read from this execution's transcript
+    /// and recorded.
+    version: Option<String>,
 }
 
 /// What the Bridge knows about one session.
@@ -234,117 +224,135 @@ struct SessionView {
     /// The native session the latest execution ran, which a resume
     /// continues.
     native: Option<String>,
+    /// The log holds events read from that session's transcript: it
+    /// existed, and a resume must not start without it.
+    transcript_read: bool,
     /// The profile the session's last execution started with: what a start
     /// or resume that names none runs on.
     model: ModelProfile,
     active: Option<Active>,
-    /// What merges of main changed under the agent and it has not been
-    /// told: told with the next prompt the Bridge types.
-    notice: Notice,
+    /// What the log last says the agent's branch points at: the commit of
+    /// its last `artifact.committed`, or the fork its branch was created at.
+    /// The agent's branch is shared by its sessions: recovery takes the
+    /// latest of these over all of them, by log position.
+    recorded_head: Option<(CommitId, GlobalPosition)>,
+    /// The session's latest execution, where it started in the log, and
+    /// whether it has ended.
+    latest: Option<(ExecutionId, GlobalPosition, bool)>,
+    /// What the log says each command's handling already did
+    /// ([`CommandStep`]): a retried command and a restarted Bridge go on from
+    /// there instead of doing an effect twice.
+    steps: HashMap<CommandId, Steps>,
+    /// The latest prompt the engine's transcript recorded: its execution and
+    /// where it is in the log.
+    last_message: Option<(ExecutionId, GlobalPosition)>,
 }
 
-/// Files merges of main changed in an agent's workspace that the agent has
-/// not been told of yet, each with the position of the last merge event that
-/// named it. Folded from the log: a merge adds its files; `notice.typed`
-/// records which of them a prompt the Bridge typed carried; the
-/// `notice.received` read from the engine's transcript clears those. No
-/// other prompt clears anything: a turn someone else typed told the agent
-/// nothing.
+/// The recorded steps of one command ([`CommandStep`]).
 #[derive(Debug, Clone, Default)]
-struct Notice {
-    merged: BTreeMap<String, GlobalPosition>,
-    conflicted: BTreeMap<String, GlobalPosition>,
-    /// The notice typed last and not received yet.
-    typed: Option<Typed>,
+struct Steps {
+    /// The start mounted this workspace.
+    mounted: Option<WorkspaceId>,
+    /// That mount went again before an execution used it.
+    released: bool,
+    /// The command's execution started.
+    started: bool,
+    /// Where the Bridge recorded that it was about to type.
+    typing_at: Option<GlobalPosition>,
+    /// The typing succeeded.
+    typed: bool,
 }
 
-/// A notice the Bridge typed.
-#[derive(Debug, Clone)]
-struct Typed {
-    /// What it told of: merge events up to this position.
-    through: GlobalPosition,
+/// What a retried command's typing comes to ([`SessionView::typing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typing {
+    /// Nothing was typed yet.
+    Due,
+    /// It was typed: the record says so, or the engine's transcript has a
+    /// prompt after the record that typing began.
+    Done,
+    /// Typing began and nothing says whether it reached the engine; it is
+    /// not typed again.
+    Unknown,
 }
 
-impl Notice {
-    /// The text that goes before the next prompt, if anything is to be
-    /// told, and the position of the last merge event it tells of.
-    fn text(&self) -> Option<(String, GlobalPosition)> {
-        let list = |files: &[&String]| {
-            files
-                .iter()
-                .map(|file| file.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let merged: Vec<&String> = self
-            .merged
-            .keys()
-            .filter(|file| !self.conflicted.contains_key(*file))
-            .collect();
-        let conflicted: Vec<&String> = self.conflicted.keys().collect();
-        let through = self
-            .merged
-            .values()
-            .chain(self.conflicted.values())
-            .max()
-            .copied()?;
-        let text = match (merged.is_empty(), conflicted.is_empty()) {
-            (true, true) => return None,
-            (false, true) => format!(
-                "{MERGE_NOTICE_OPENING}: {}. Re-read them before editing.",
-                list(&merged)
-            ),
-            (true, false) => format!(
-                "{MERGE_NOTICE_OPENING}; these files carry conflict markers: {}. Resolve them \
-                 by editing the marked regions; do not rewrite the files from memory.",
-                list(&conflicted)
-            ),
-            (false, false) => format!(
-                "{MERGE_NOTICE_OPENING}: {}. Re-read them before editing. These files carry \
-                 conflict markers: {}. Resolve them by editing the marked regions; do not \
-                 rewrite the files from memory.",
-                list(&merged),
-                list(&conflicted)
-            ),
-        };
-        Some((text, through))
-    }
-
-    /// Fold one event of the session: merges add files, the Bridge's
-    /// `notice.typed` records what a prompt carried, its receipt clears it.
-    fn fold(&mut self, record: &EventRecord) {
+impl SessionView {
+    /// Fold the command steps and the latest prompt.
+    fn fold_steps(&mut self, record: &EventRecord) {
         let event = &record.event;
         match &event.kind {
-            EventKind::ArtifactCommitted {
-                reason: CheckpointReason::BaseMerged,
-                files,
-                ..
-            } => {
-                for file in files {
-                    self.merged.insert(file.clone(), record.position);
+            EventKind::CommandStepped {
+                command_id,
+                step,
+                workspace,
+            } if event.source == Source::Bridge => {
+                let steps = self.steps.entry(*command_id).or_default();
+                match step {
+                    CommandStep::Mounted => steps.mounted.clone_from(workspace),
+                    CommandStep::MountReleased => steps.released = true,
+                    CommandStep::Typing => steps.typing_at = Some(record.position),
+                    CommandStep::Typed => steps.typed = true,
                 }
             }
-            EventKind::MergeConflicted {
-                files,
-                marked: true,
-            } => {
-                for file in files {
-                    self.conflicted.insert(file.clone(), record.position);
+            EventKind::ExecutionStarted { command_id, .. } => {
+                self.steps.entry(*command_id).or_default().started = true;
+            }
+            EventKind::MessageReceived => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.last_message = Some((execution, record.position));
                 }
             }
-            EventKind::NoticeTyped { through } if event.source == Source::Bridge => {
-                self.typed = Some(Typed { through: *through });
-            }
-            EventKind::NoticeReceived => self.received(),
             _ => {}
         }
     }
 
-    /// The typed notice reached the engine: what it told of is told.
-    fn received(&mut self) {
-        if let Some(typed) = self.typed.take() {
-            self.merged.retain(|_, at| *at > typed.through);
-            self.conflicted.retain(|_, at| *at > typed.through);
+    /// Whether the typing of `command` into `execution` is due, done or
+    /// unknown, from the log.
+    fn typing(&self, command: CommandId, execution: &ExecutionId) -> Typing {
+        let Some(steps) = self.steps.get(&command) else {
+            return Typing::Due;
+        };
+        match steps.typing_at {
+            _ if steps.typed => Typing::Done,
+            None => Typing::Due,
+            Some(at) => {
+                let arrived = self
+                    .last_message
+                    .as_ref()
+                    .is_some_and(|(seen, position)| seen == execution && *position > at);
+                if arrived {
+                    Typing::Done
+                } else {
+                    Typing::Unknown
+                }
+            }
+        }
+    }
+
+    /// Fold what recovery needs to compare the agent's branch with the log:
+    /// the commit last recorded for it and the latest execution.
+    fn fold_branch(&mut self, record: &EventRecord) {
+        let event = &record.event;
+        match &event.kind {
+            EventKind::ExecutionStarted { fork, .. } => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.latest = Some((execution, record.position, false));
+                }
+                if let Some(fork) = fork {
+                    self.recorded_head = Some((fork.commit.clone(), record.position));
+                }
+            }
+            EventKind::ExecutionEnded { .. } if event.source == Source::Bridge => {
+                if let Some((execution, _, ended)) = self.latest.as_mut()
+                    && event.execution_id.as_ref() == Some(execution)
+                {
+                    *ended = true;
+                }
+            }
+            EventKind::ArtifactCommitted { artifact, .. } => {
+                self.recorded_head = Some((artifact.commit.clone(), record.position));
+            }
+            _ => {}
         }
     }
 }
@@ -372,6 +380,11 @@ pub struct Bridge {
     /// took whose append failed: appended again first at the next tick
     /// ([`Bridge::record_commit`]).
     unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
+    /// Per session, what the workspace store had to tell the agent
+    /// ([`WorkspaceStore::take_notices`]) and no prompt carried yet.
+    untold: std::sync::Mutex<HashMap<SessionId, Vec<String>>>,
+    /// Where the engines' transcripts are copied ([`crate::transcripts`]).
+    transcripts: Option<Arc<dyn TranscriptArchive>>,
 }
 
 impl Bridge {
@@ -393,7 +406,17 @@ impl Bridge {
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
             unrecorded_commits: std::sync::Mutex::default(),
+            untold: std::sync::Mutex::default(),
+            transcripts: None,
         }
+    }
+
+    /// Copy every engine's transcript into `archive` at turn ends and
+    /// execution ends, and restore a missing one from it before a resume.
+    #[must_use]
+    pub fn with_transcript_archive(mut self, archive: Arc<dyn TranscriptArchive>) -> Self {
+        self.transcripts = Some(archive);
+        self
     }
 
     /// Use `clock` for screen refreshes instead of the system clock.
@@ -412,7 +435,147 @@ impl Bridge {
     pub fn recover(&mut self) -> Result<(), StoreError> {
         self.cursor = GlobalPosition(0);
         self.sessions.clear();
+        self.catch_up()?;
+        self.rederive_unrecorded();
+        self.release_orphan_mounts()?;
+        Ok(())
+    }
+
+    /// A start that mounted its workspace and died before its execution was
+    /// recorded (or before the mount's release was) left a mount no
+    /// execution owns. After a restart, each recorded mount with no
+    /// execution started and no release goes, unless an execution runs in
+    /// that workspace, and its release is recorded. An unmount that fails
+    /// is left for the next restart.
+    fn release_orphan_mounts(&mut self) -> Result<(), StoreError> {
+        let used: HashSet<WorkspaceId> = self
+            .sessions
+            .values()
+            .filter_map(|view| view.active.as_ref())
+            .map(|active| active.workspace.clone())
+            .collect();
+        let mut orphans = Vec::new();
+        for (session, view) in &self.sessions {
+            for (command, steps) in &view.steps {
+                if let Some(workspace) = steps.mounted.as_ref()
+                    && !steps.released
+                    && !steps.started
+                    && !used.contains(workspace)
+                {
+                    orphans.push((
+                        view.agent_id.clone(),
+                        session.clone(),
+                        *command,
+                        workspace.clone(),
+                    ));
+                }
+            }
+        }
+        for (agent_id, session, command, workspace) in orphans {
+            if self.workspaces.unmount(&workspace).is_err() {
+                continue;
+            }
+            self.append(
+                &agent_id,
+                &session,
+                None,
+                Source::Bridge,
+                Some(format!("{command}:mount_released")),
+                EventKind::CommandStepped {
+                    command_id: command,
+                    step: CommandStep::MountReleased,
+                    workspace: Some(workspace),
+                },
+            )?;
+        }
         self.catch_up()
+    }
+
+    /// After a restart, the `artifact.committed` records that were waiting
+    /// in memory are gone. Re-derive them: an agent whose branch head is not
+    /// the commit the log last recorded for it (its last checkpoint or
+    /// merge, or the fork it was created at) took a commit whose record
+    /// never reached the log. It waits, as a failed append would, under the
+    /// agent's latest session and execution, and the next tick appends it
+    /// before anything else of that session.
+    ///
+    /// The record says what the branch holds, not how it got there: a merge
+    /// of main re-derived this way is recorded as a checkpoint, without the
+    /// files the merge changed.
+    fn rederive_unrecorded(&self) {
+        let mut latest: HashMap<&AgentId, (&SessionId, &SessionView, GlobalPosition)> =
+            HashMap::new();
+        let mut recorded: HashMap<&AgentId, (&CommitId, GlobalPosition)> = HashMap::new();
+        for (session, view) in &self.sessions {
+            if let Some((commit, at)) = view.recorded_head.as_ref()
+                && recorded
+                    .get(&view.agent_id)
+                    .is_none_or(|(_, known)| at > known)
+            {
+                recorded.insert(&view.agent_id, (commit, *at));
+            }
+            let Some((_, started, _)) = view.latest.as_ref() else {
+                continue;
+            };
+            let newer = latest
+                .get(&view.agent_id)
+                .is_none_or(|(_, _, known)| *started > *known);
+            if newer {
+                latest.insert(&view.agent_id, (session, view, *started));
+            }
+        }
+        for (agent_id, (session, view, _)) in latest {
+            let (Some((recorded, _)), Some((execution, _, ended))) =
+                (recorded.get(agent_id), view.latest.as_ref())
+            else {
+                continue;
+            };
+            let branch = BranchName::for_agent(agent_id);
+            let Ok(Some(head)) = self.workspaces.branch_head(&branch) else {
+                continue;
+            };
+            if &head == *recorded {
+                continue;
+            }
+            let reason = if *ended {
+                CheckpointReason::ExecutionEnded
+            } else {
+                CheckpointReason::TurnStopped
+            };
+            self.unrecorded_commits_lock()
+                .entry(session.clone())
+                .or_default()
+                .push(NewEvent {
+                    agent_id: agent_id.clone(),
+                    session_id: session.clone(),
+                    execution_id: Some(execution.clone()),
+                    source: Source::Bridge,
+                    source_event_id: Some(format!("commit:{head}")),
+                    kind: EventKind::ArtifactCommitted {
+                        reason,
+                        artifact: ArtifactRef {
+                            project: self.workspaces.project().to_string(),
+                            branch,
+                            commit: head,
+                        },
+                        files: Vec::new(),
+                    },
+                });
+        }
+    }
+
+    /// Append the waiting commit records of every session, each on its own:
+    /// one that the log keeps refusing is warned and stays waiting, and the
+    /// other sessions go on.
+    fn flush_unrecorded(&self, report: &mut TickReport) {
+        let waiting: Vec<SessionId> = self.unrecorded_commits_lock().keys().cloned().collect();
+        for session in waiting {
+            if let Err(error) = self.record_unrecorded_commit(&session) {
+                report.warnings.push(format!(
+                    "{session}: a commit record waits, its append failed: {error}"
+                ));
+            }
+        }
     }
 
     /// Handle queued commands and advance running executions.
@@ -467,18 +630,27 @@ impl Bridge {
             .or_insert_with(|| SessionView {
                 agent_id: event.agent_id.clone(),
                 native: None,
+                transcript_read: false,
                 model: ModelProfile::Default,
                 active: None,
-                notice: Notice::default(),
+                recorded_head: None,
+                latest: None,
+                steps: HashMap::new(),
+                last_message: None,
             });
-        view.notice.fold(record);
+        view.fold_branch(record);
+        view.fold_steps(record);
+        view.transcript_read |= transcripts::read_from_transcript(event);
         let current = view
             .active
             .as_ref()
             .is_some_and(|active| event.execution_id.as_ref() == Some(&active.execution_id));
         match &event.kind {
             EventKind::ExecutionStarted {
-                workspace, model, ..
+                workspace,
+                model,
+                transcript_from,
+                ..
             } => {
                 view.model = *model;
                 if let Some(execution_id) = event.execution_id.clone() {
@@ -486,10 +658,14 @@ impl Bridge {
                         execution_id,
                         workspace: workspace.clone(),
                         checkpoint: None,
-                        turn_open: false,
                         reported_end: None,
-                        started_ms: record.recorded_at.0,
-                        follow: Follow::default(),
+                        unmounting: false,
+                        // The execution's lines are the ones after where the
+                        // transcript ended when it started, after a restart too.
+                        follow: Follow {
+                            offset: transcript_from.unwrap_or(0),
+                            ..Follow::default()
+                        },
                     });
                 }
             }
@@ -510,6 +686,12 @@ impl Bridge {
                     active.reported_end = Some((*cause, *exit_code));
                 }
             }
+            // A recovered end goes straight to the unmount.
+            EventKind::ExecutionUnmounting if current => {
+                if let Some(active) = view.active.as_mut() {
+                    active.unmounting = true;
+                }
+            }
             // A stalled end stays due after a restart, slow from the start.
             EventKind::ExecutionEndStalled {
                 cause, exit_code, ..
@@ -522,6 +704,9 @@ impl Bridge {
             EventKind::NativeSessionStarted {
                 native_session_id, ..
             } => {
+                if view.native.as_ref() != Some(native_session_id) {
+                    view.transcript_read = false;
+                }
                 view.native = Some(native_session_id.clone());
             }
             // A merge of main is no checkpoint of the agent's work: one
@@ -533,18 +718,14 @@ impl Bridge {
                     active.checkpoint = None;
                 }
             }
-            // Turns, tools and checkpoints are the current execution's own:
-            // an event of an earlier one that reaches the log late (or one
-            // with no execution) neither closes the running turn nor asks
-            // for a checkpoint and the merge after it.
+            // Checkpoints are the current execution's own: an event of an
+            // earlier one that reaches the log late (or one with no
+            // execution) asks for none.
             other if current => {
-                if let Some(active) = view.active.as_mut() {
-                    if let Some(open) = opens_turn(other) {
-                        active.turn_open = open;
-                    }
-                    if let Some(reason) = other.checkpoint_reason() {
-                        active.checkpoint = Some(reason);
-                    }
+                if let Some(active) = view.active.as_mut()
+                    && let Some(reason) = other.checkpoint_reason()
+                {
+                    active.checkpoint = Some(reason);
                 }
             }
             _ => {}
@@ -552,6 +733,8 @@ impl Bridge {
     }
 
     fn act(&mut self, report: &mut TickReport) -> Result<(), StoreError> {
+        // Sessions with no running execution have no `advance` to do it.
+        self.flush_unrecorded(report);
         let running: Vec<(SessionId, AgentId, Option<String>, Active)> = self
             .sessions
             .iter()
@@ -573,7 +756,6 @@ impl Bridge {
                     view.active = None;
                 } else if let Some(held) = view.active.as_mut() {
                     held.checkpoint = None;
-                    held.turn_open = active.turn_open;
                     held.reported_end = active.reported_end;
                     held.follow = active.follow;
                 }
@@ -593,8 +775,14 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
-        active.follow.checkpoint_read = false;
-        self.record_unrecorded_commit(session)?;
+        // Nothing of this session goes into the log before its waiting
+        // commit records; one that keeps failing holds up only this session.
+        if let Err(error) = self.record_unrecorded_commit(session) {
+            report.warnings.push(format!(
+                "{session}: a commit record waits, its append failed: {error}"
+            ));
+            return Ok(false);
+        }
         self.follow_output(agent_id, session, native, active, report)?;
         let end = match active
             .reported_end
@@ -630,111 +818,23 @@ impl Bridge {
             return self.end(agent_id, session, active, cause, exit_code, false, report);
         }
         if let Some(reason) = active.checkpoint {
-            let committed = self.checkpoint(agent_id, session, active, reason, report)?;
-            // An idle workspace whose state is on its branch takes the
-            // source's main. `turn_open` includes what was read just now.
-            if committed && reason == CheckpointReason::TurnStopped && !active.turn_open {
-                self.merge_base(agent_id, session, active, report)?;
+            self.checkpoint(agent_id, session, active, reason, report)?;
+            if reason == CheckpointReason::TurnStopped {
+                self.archive_transcript(agent_id, session, active, report);
             }
-        } else if self.idle_merge_due(active) {
-            self.merge_base(agent_id, session, active, report)?;
         }
-        Ok(false)
-    }
-
-    /// Whether an execution with nothing to checkpoint is offered main now:
-    /// no turn open, nothing read this tick that asks for a checkpoint, the
-    /// screen last read ready, and the last offer at least [`IDLE_MERGE_MS`]
-    /// ago.
-    fn idle_merge_due(&self, active: &Active) -> bool {
-        let ready = active
-            .follow
-            .screen
-            .is_some_and(|(state, _)| state == ScreenState::Ready);
-        let now = self.clock.now().0;
-        !active.turn_open
-            && !active.follow.checkpoint_read
-            && ready
-            && active
-                .follow
-                .merge_at
-                .is_none_or(|at| now.saturating_sub(at) >= IDLE_MERGE_MS)
-    }
-
-    /// Merge the source's main into the branch of an idle workspace, and
-    /// record the merge as a checkpoint. A conflict is reported, once per
-    /// conflict: landing tells the agent, and its files carry the markers.
-    fn merge_base(
-        &self,
-        agent_id: &AgentId,
-        session: &SessionId,
-        active: &mut Active,
-        report: &mut TickReport,
-    ) -> Result<(), StoreError> {
-        active.follow.merge_at = Some(self.clock.now().0);
-        let conflict = match self.workspaces.merge_base(&active.workspace) {
-            Ok(BaseMerge::Current) => None,
-            Ok(BaseMerge::Merged { commit, files }) => {
-                let artifact = ArtifactRef {
-                    project: self.workspaces.project().to_string(),
-                    branch: BranchName::for_agent(agent_id),
-                    commit,
-                };
-                self.record_commit(
-                    agent_id,
-                    session,
-                    Some(&active.execution_id),
-                    Source::Bridge,
-                    Some(format!("commit:{}", artifact.commit)),
-                    EventKind::ArtifactCommitted {
-                        reason: CheckpointReason::BaseMerged,
-                        artifact,
-                        files,
-                    },
-                )?;
-                None
-            }
-            Ok(BaseMerge::Conflicted { files, marked }) => Some((files, marked)),
-            Err(error) => {
-                let text = format!("{session}: merge main: {error}");
-                if active.follow.merge_warning.as_ref() != Some(&text) {
-                    report.warnings.push(text.clone());
-                }
-                active.follow.merge_warning = Some(text);
-                return Ok(());
-            }
-        };
-        let Some((files, marked)) = conflict else {
-            active.follow.merge_warning = None;
-            return Ok(());
-        };
-        let text = if marked {
-            format!(
-                "{session}: main conflicts with the branch in {}; the workspace carries \
-                     conflict markers there until they are resolved",
-                files.join(", ")
-            )
-        } else {
-            format!(
-                "{session}: main conflicts with the branch in {} in a way conflict markers \
-                 cannot show (a file deleted or renamed on one side); left unmerged",
-                files.join(", ")
-            )
-        };
-        // Once per conflict: reported, and recorded with its files.
-        if active.follow.merge_warning.as_ref() != Some(&text) {
-            report.warnings.push(text.clone());
-            self.append(
+        if active.follow.stale.is_some() {
+            return self.end(
                 agent_id,
                 session,
-                Some(&active.execution_id),
-                Source::Bridge,
+                active,
+                EndCause::Stopped,
                 None,
-                EventKind::MergeConflicted { files, marked },
-            )?;
+                false,
+                report,
+            );
         }
-        active.follow.merge_warning = Some(text);
-        Ok(())
+        Ok(false)
     }
 
     /// The exit status the runner wrote when the engine exited, if it has.
@@ -821,12 +921,13 @@ impl Bridge {
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             let line = String::from_utf8_lossy(line);
-            // A minute of slack for a log clock ahead of this host's: lines
-            // already recorded are dropped by their keys anyway.
-            for event in claude_line(&line, active.started_ms - CLOCK_SLACK_MS) {
-                let opens = opens_turn(&event.kind);
-                let checkpoint = event.kind.checkpoint_reason().is_some();
-                let stored = self.log.append(NewEvent {
+            if active.follow.version.is_none()
+                && let Some(version) = claude_version(&line)
+            {
+                self.record_version(agent_id, session, native, active, &path, version)?;
+            }
+            for event in claude_line(&line) {
+                self.log.append(NewEvent {
                     agent_id: agent_id.clone(),
                     session_id: session.clone(),
                     execution_id: Some(active.execution_id.clone()),
@@ -834,21 +935,37 @@ impl Bridge {
                     source_event_id: event.source_event_id,
                     kind: event.kind,
                 })?;
-                // A resumed session's transcript holds the earlier
-                // executions' lines too, already recorded under them (the
-                // key finds that record): they say nothing about this
-                // execution's turn.
-                if stored.record.event.execution_id.as_ref() != Some(&active.execution_id) {
-                    continue;
-                }
-                if let Some(open) = opens {
-                    active.turn_open = open;
-                }
-                active.follow.checkpoint_read |= checkpoint;
             }
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
         Ok(())
+    }
+
+    /// The engine's version, read from the execution's transcript: the
+    /// native session is recorded again with it, once per execution.
+    fn record_version(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        native: &str,
+        active: &mut Active,
+        path: &str,
+        version: String,
+    ) -> Result<(), StoreError> {
+        active.follow.version = Some(version.clone());
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Claude,
+            Some(format!("{}:engine_version", active.execution_id)),
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: native.to_string(),
+                transcript_path: Some(path.to_string()),
+                engine_version: Some(version),
+            },
+        )
     }
 
     /// Read the pane and record its state when it changes, or again after
@@ -922,6 +1039,29 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         active.reported_end = Some((cause, exit_code));
+        // The checkpoint and the terminal are behind an end that recorded
+        // its unmount: what is left is the unmount and the record.
+        if active.unmounting {
+            // A restart may find the engine's terminal still there.
+            if let Err(error) = self
+                .terminals
+                .terminate(&active.terminal(), &active.workspace)
+            {
+                report
+                    .warnings
+                    .push(format!("terminate {}: {error}", active.terminal()));
+                return Ok(false);
+            }
+            return self.finish_end(agent_id, session, active, cause, exit_code, report);
+        }
+        // A checkpoint whose record waits is recorded before the end.
+        if let Err(error) = self.record_unrecorded_commit(session) {
+            report.warnings.push(format!(
+                "{session}: a commit record waits, its append failed: {error}; the end is \
+                 tried again"
+            ));
+            return Ok(false);
+        }
         let now = self.clock.now().0;
         let stalled = active.follow.end_failures >= END_ATTEMPTS;
         if stalled
@@ -970,6 +1110,32 @@ impl Bridge {
                 .push(format!("terminate {}: {error}", active.terminal()));
             return Ok(false);
         }
+        // The transcript is whole now, and a container's copy goes next.
+        self.archive_transcript(agent_id, session, active, report);
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            Some(format!("{}:unmounting", active.execution_id)),
+            EventKind::ExecutionUnmounting,
+        )?;
+        active.unmounting = true;
+        self.finish_end(agent_id, session, active, cause, exit_code, report)
+    }
+
+    /// The last of an end, from its recorded `execution.unmounting` (the
+    /// terminal is gone): the workspace unmounted (an absent one is no
+    /// failure) and `execution.ended` recorded.
+    fn finish_end(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        cause: EndCause,
+        exit_code: Option<i32>,
+        report: &mut TickReport,
+    ) -> Result<bool, StoreError> {
         if let Err(error) = self.workspaces.unmount(&active.workspace) {
             report
                 .warnings
@@ -1029,13 +1195,14 @@ impl Bridge {
     }
 
     /// Commit the workspace and record a new commit. Returns whether the
-    /// workspace's state is now on its branch (false: the commit failed and
-    /// was reported).
+    /// workspace's state is now on its branch, or kept off it by a store
+    /// that answered [`WORKSPACE_STALE`] (`follow.stale` then holds why and the
+    /// execution ends); false: the commit failed and was reported.
     fn checkpoint(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
-        active: &Active,
+        active: &mut Active,
         reason: CheckpointReason,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
@@ -1061,6 +1228,16 @@ impl Bridge {
                     },
                 )?;
             }
+            // The store kept the workspace's state off its branch: an
+            // unmount loses nothing, and the execution ends.
+            Err(WorkspaceError::Refused { code, message }) if code == WORKSPACE_STALE => {
+                if active.follow.stale.is_none() {
+                    report.warnings.push(format!(
+                        "{session}: commit refused {code}: {message} The execution ends."
+                    ));
+                }
+                active.follow.stale = Some(message);
+            }
             Err(WorkspaceError::Refused { code, message }) => {
                 report
                     .warnings
@@ -1070,6 +1247,16 @@ impl Bridge {
             Err(WorkspaceError::Unavailable(text)) => {
                 report.warnings.push(format!("commit unavailable: {text}"));
                 return Ok(false);
+            }
+        }
+        // Logged, and carried by the next prompt the Bridge types.
+        let notices = self.workspaces.take_notices(&active.workspace);
+        if !notices.is_empty() {
+            for notice in &notices {
+                report.warnings.push(format!("{session}: {notice}"));
+            }
+            if let Ok(mut untold) = self.untold.lock() {
+                untold.entry(session.clone()).or_default().extend(notices);
             }
         }
         Ok(true)
@@ -1163,6 +1350,10 @@ impl Bridge {
         let Ok(action) = claimed.action() else {
             return Ok(Outcome::Failed("stored action is not valid".to_string()));
         };
+        // What a command appends comes after the session's waiting commit
+        // records. While the log refuses them the command is not handled
+        // (the error ends the tick; the lease brings the command back).
+        self.record_unrecorded_commit(&claimed.session_id)?;
         match action {
             CommandAction::Start {
                 engine: _,
@@ -1181,7 +1372,7 @@ impl Bridge {
                 },
                 report,
             ),
-            CommandAction::Input { text } => self.input(claimed, &text),
+            CommandAction::Input { text, .. } => self.input(claimed, &text),
             CommandAction::Stop => self.stop(claimed, false, report),
             CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt, model } => {
@@ -1207,11 +1398,11 @@ impl Bridge {
             from,
             model,
         } = *begin;
-        if self.running(&claimed.session_id).is_some() {
-            return Ok(Outcome::Failed(format!(
-                "{} already runs an execution",
-                claimed.session_id
-            )));
+        // Another Bridge may have started the session since this tick read
+        // the log; the log refuses a second start either way.
+        self.catch_up()?;
+        if let Some(outcome) = self.started_before(claimed, prompt, native.is_none()) {
+            return outcome;
         }
         let model = model.unwrap_or_else(|| {
             self.sessions
@@ -1227,14 +1418,28 @@ impl Bridge {
             Ok(fork) => fork,
             Err(why) => return Ok(Outcome::Failed(why)),
         };
-        // ponytail: a crash between mount and `execution.started` leaks one
-        // mount; a startup sweep of unrecorded mounts fixes it if it shows up.
+        self.merge_main_at_start(claimed, &branch, report)?;
         let workspace = match self.workspaces.mount(&branch) {
             Ok(workspace) => workspace,
             Err(error) => return Ok(Outcome::Failed(format!("mount {branch}: {error}"))),
         };
+        // Recorded, so a restart that finds no execution using it unmounts it
+        // ([`Self::release_orphan_mounts`]).
+        if let Err(error) = self.step(claimed, None, CommandStep::Mounted, Some(&workspace)) {
+            self.give_up_mount(claimed, &workspace, error.to_string());
+            return Err(error);
+        }
+        // A resumed session's transcript holds the earlier executions' lines:
+        // this execution's are the ones after its length now.
+        let transcript_from = match native
+            .map(|native| self.resumed_transcript(claimed, &workspace, native, report))
+            .transpose()
+        {
+            Ok(length) => length.flatten(),
+            Err(why) => return Ok(self.give_up_mount(claimed, &workspace, why)),
+        };
         if let Some(parent_session) = parent {
-            self.append(
+            let linked = self.append(
                 &claimed.agent_id,
                 &claimed.session_id,
                 None,
@@ -1243,20 +1448,23 @@ impl Bridge {
                 EventKind::SessionLinked {
                     parent_session_id: parent_session.clone(),
                 },
-            )?;
+            );
+            if let Err(error) = linked {
+                self.give_up_mount(claimed, &workspace, error.to_string());
+                return Err(error);
+            }
         }
         let active = Active {
             execution_id: ExecutionId::for_command(claimed.command_id),
             workspace,
             checkpoint: None,
-            turn_open: false,
             reported_end: None,
-            started_ms: self.clock.now().0,
+            unmounting: false,
             follow: Follow::default(),
         };
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
-        self.append(
+        let recorded = self.append(
             &claimed.agent_id,
             &claimed.session_id,
             Some(&active.execution_id),
@@ -1268,34 +1476,431 @@ impl Bridge {
                 command_id: claimed.command_id,
                 fork,
                 model,
+                transcript_from,
             },
+        );
+        match recorded {
+            Ok(()) => {}
+            Err(StoreError::Rejected(why)) => {
+                return self.refused_start(claimed, &active.workspace, why);
+            }
+            // Whether it reached the log is unknown: the mount goes either
+            // way. A recorded execution without its terminal or workspace
+            // ends as lost on the next tick.
+            Err(error) => {
+                self.give_up_mount(claimed, &active.workspace, error.to_string());
+                return Err(error);
+            }
+        }
+        self.launch_and_prompt(claimed, &active, native, &settings, prompt)
+    }
+
+    /// A retried Start or Resume whose execution the log already records
+    /// (the tick that handled it died, or its finish failed): go on from
+    /// what the log says it did. An engine whose terminal is gone ends as
+    /// lost on the next tick; a prompt is typed only when the log shows it
+    /// was not ([`SessionView::typing`]), and an engine whose prompt may or
+    /// may not have arrived is ended rather than typed into again or left
+    /// waiting at an empty prompt.
+    fn go_on_starting(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        prompt: &str,
+        fresh: bool,
+    ) -> Result<Outcome, StoreError> {
+        match self
+            .terminals
+            .is_alive(&active.terminal(), &active.workspace)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(Outcome::Failed(format!(
+                    "{}: the engine's terminal is gone; the execution ends as lost",
+                    claimed.session_id
+                )));
+            }
+            Err(error) => {
+                return Ok(Outcome::Failed(format!(
+                    "is_alive {}: {error}",
+                    active.terminal()
+                )));
+            }
+        }
+        if prompt.is_empty() {
+            return Ok(Outcome::Succeeded);
+        }
+        match self.typing_of(claimed, &active.execution_id) {
+            Typing::Done => Ok(Outcome::Succeeded),
+            Typing::Unknown => {
+                self.abandon(claimed, active, format!("the prompt {MAY_HAVE_TYPED}"))
+            }
+            Typing::Due => self.prompt_engine(claimed, active, prompt, fresh),
+        }
+    }
+
+    /// What a Start or Resume does when the session already runs an
+    /// execution or this command's ran: it goes on with its own execution
+    /// ([`Self::go_on_starting`]) and refuses otherwise. `None` when it
+    /// starts afresh.
+    fn started_before(
+        &mut self,
+        claimed: &Claimed,
+        prompt: &str,
+        fresh: bool,
+    ) -> Option<Result<Outcome, StoreError>> {
+        if let Some(active) = self.running(&claimed.session_id) {
+            if active.execution_id == ExecutionId::for_command(claimed.command_id) {
+                return Some(self.go_on_starting(claimed, &active, prompt, fresh));
+            }
+            return Some(Ok(Outcome::Failed(format!(
+                "{} already runs an execution",
+                claimed.session_id
+            ))));
+        }
+        self.recorded_steps(claimed).started.then(|| {
+            Ok(Outcome::Failed(format!(
+                "{}: this command's execution already ran and ended",
+                claimed.session_id
+            )))
+        })
+    }
+
+    /// The command's recorded steps.
+    fn recorded_steps(&self, claimed: &Claimed) -> Steps {
+        self.sessions
+            .get(&claimed.session_id)
+            .and_then(|view| view.steps.get(&claimed.command_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether the command's typing into `execution` is due, done or unknown.
+    fn typing_of(&self, claimed: &Claimed, execution: &ExecutionId) -> Typing {
+        self.sessions
+            .get(&claimed.session_id)
+            .map_or(Typing::Due, |view| {
+                view.typing(claimed.command_id, execution)
+            })
+    }
+
+    /// Record a step of the command being handled, once (keyed by command
+    /// and step).
+    fn step(
+        &self,
+        claimed: &Claimed,
+        execution: Option<&ExecutionId>,
+        step: CommandStep,
+        workspace: Option<&WorkspaceId>,
+    ) -> Result<(), StoreError> {
+        let name = match step {
+            CommandStep::Mounted => "mounted",
+            CommandStep::MountReleased => "mount_released",
+            CommandStep::Typing => "typing",
+            CommandStep::Typed => "typed",
+        };
+        self.append(
+            &claimed.agent_id,
+            &claimed.session_id,
+            execution,
+            Source::Bridge,
+            Some(format!("{}:{name}", claimed.command_id)),
+            EventKind::CommandStepped {
+                command_id: claimed.command_id,
+                step,
+                workspace: workspace.cloned(),
+            },
+        )
+    }
+
+    /// Text into the engine's input box, at most once: the intent is
+    /// recorded before the keys go and the completion after, so a retried
+    /// command or a restarted Bridge can tell whether it was typed. What the
+    /// workspace store told and no prompt carried yet goes before it.
+    fn type_once(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        text: &str,
+    ) -> Result<Result<(), TerminalError>, StoreError> {
+        // What the workspace store had to tell the agent goes first, and is
+        // told once: it clears when the typing is recorded.
+        let untold = self.untold.lock().ok().and_then(|untold| {
+            untold
+                .get(&claimed.session_id)
+                .map(|notices| notices.join("\n\n"))
+        });
+        let text = untold.map_or_else(|| text.to_string(), |told| format!("{told}\n\n{text}"));
+        self.step(
+            claimed,
+            Some(&active.execution_id),
+            CommandStep::Typing,
+            None,
         )?;
-        let fresh = self.name_session(claimed, native, &active)?;
+        let typed = self
+            .terminals
+            .submit_text(&active.terminal(), &active.workspace, &text);
+        if typed.is_ok() {
+            self.step(
+                claimed,
+                Some(&active.execution_id),
+                CommandStep::Typed,
+                None,
+            )?;
+            if let Ok(mut untold) = self.untold.lock() {
+                untold.remove(&claimed.session_id);
+            }
+        }
+        Ok(typed)
+    }
+
+    /// The engine of a recorded execution started in its terminal, then its
+    /// prompt typed (an engine that never got its prompt is abandoned).
+    fn launch_and_prompt(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        native: Option<&str>,
+        settings: &str,
+        prompt: &str,
+    ) -> Result<Outcome, StoreError> {
+        let fresh = self.name_session(claimed, native, active)?;
         let launch = self.launch(
             claimed,
-            &active,
+            active,
             &Run {
                 native: fresh.as_deref().or(native),
                 resume: native.is_some(),
-                settings: &settings,
+                settings,
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
-            return self.abandon(claimed, &active, format!("start terminal: {error}"));
+            return self.abandon(claimed, active, format!("start terminal: {error}"));
         }
-        if !prompt.is_empty() {
-            let outcome = self.type_prompt(claimed, &active, prompt)?;
-            if let Outcome::Failed(why) = outcome {
-                // An engine that never got its prompt must not look alive:
-                // whoever started it would wait on it forever.
-                return self.abandon(claimed, &active, why);
+        if prompt.is_empty() {
+            return Ok(Outcome::Succeeded);
+        }
+        self.prompt_engine(claimed, active, prompt, native.is_none())
+    }
+
+    /// Type a started engine's prompt (`fresh`: a new native session, whose
+    /// directory may be new to the engine). An engine that never got it must
+    /// not look alive (whoever started it would wait on it forever): it is
+    /// abandoned.
+    fn prompt_engine(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        prompt: &str,
+        fresh: bool,
+    ) -> Result<Outcome, StoreError> {
+        let outcome = self.type_prompt(claimed, active, prompt, fresh)?;
+        if let Outcome::Failed(why) = outcome {
+            return self.abandon(claimed, active, why);
+        }
+        self.catch_up()?;
+        Ok(outcome)
+    }
+
+    /// Before a resume of `native`: its transcript is where the engine
+    /// reads it, put back from the archive when it went missing, or why the
+    /// resume cannot go on ([`transcripts::restore`]).
+    fn ready_transcript(
+        &self,
+        claimed: &Claimed,
+        workspace: &WorkspaceId,
+        native: &str,
+        report: &mut TickReport,
+    ) -> Result<(), String> {
+        let path = transcript_path(&self.config.claude_projects, workspace, native);
+        let read_before = self
+            .sessions
+            .get(&claimed.session_id)
+            .is_some_and(|view| view.transcript_read);
+        let restored = transcripts::restore(
+            self.terminals.as_ref(),
+            self.transcripts.as_deref(),
+            workspace,
+            &path,
+            &claimed.agent_id,
+            native,
+            read_before,
+        )?;
+        if let Some(bytes) = restored {
+            report.warnings.push(format!(
+                "{}: {path} was missing; restored {bytes} bytes from the transcript archive",
+                claimed.session_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Copy what the engine appended to its transcript into the archive,
+    /// if there is one. A failure is warned; the next copy tries again.
+    fn archive_transcript(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        report: &mut TickReport,
+    ) {
+        let native = self
+            .sessions
+            .get(session)
+            .and_then(|view| view.native.as_deref());
+        let (Some(archive), Some(native)) = (self.transcripts.as_deref(), native) else {
+            return;
+        };
+        let path = transcript_path(&self.config.claude_projects, &active.workspace, native);
+        if let Err(error) = transcripts::archive(
+            self.terminals.as_ref(),
+            archive,
+            &active.workspace,
+            &path,
+            agent_id,
+            native,
+        ) {
+            report
+                .warnings
+                .push(format!("{session}: archive the transcript: {error}"));
+        }
+    }
+
+    /// The log refused `execution.started`: the session runs an execution
+    /// another Bridge started. The mount goes, unless it is that
+    /// execution's own workspace.
+    fn refused_start(
+        &mut self,
+        claimed: &Claimed,
+        workspace: &WorkspaceId,
+        why: String,
+    ) -> Result<Outcome, StoreError> {
+        self.catch_up()?;
+        let theirs = self
+            .running(&claimed.session_id)
+            .is_some_and(|active| active.workspace == *workspace);
+        if theirs {
+            return Ok(Outcome::Failed(why));
+        }
+        Ok(self.give_up_mount(claimed, workspace, why))
+    }
+
+    /// Main reaches an agent's branch only here, when an execution starts or
+    /// resumes, and only when it merges cleanly: the merge is recorded as a
+    /// `base_merged` commit. A conflict leaves the branch as it is and is
+    /// recorded (`merge.conflicted`, `marked: false`, keyed by the branch
+    /// head and the files, so a retried start records it once) for the
+    /// supervisor and the integrator; the execution starts on the branch as
+    /// it is. A store that cannot merge is warned of, and changes nothing.
+    fn merge_main_at_start(
+        &self,
+        claimed: &Claimed,
+        branch: &BranchName,
+        report: &mut TickReport,
+    ) -> Result<(), StoreError> {
+        let session = &claimed.session_id;
+        match self.workspaces.merge_main_clean(branch) {
+            Ok(BaseMerge::Current) => Ok(()),
+            Ok(BaseMerge::Merged { commit, files }) => {
+                let artifact = ArtifactRef {
+                    project: self.workspaces.project().to_string(),
+                    branch: branch.clone(),
+                    commit,
+                };
+                self.record_commit(
+                    &claimed.agent_id,
+                    session,
+                    None,
+                    Source::Bridge,
+                    Some(format!("commit:{}", artifact.commit)),
+                    EventKind::ArtifactCommitted {
+                        reason: CheckpointReason::BaseMerged,
+                        artifact,
+                        files,
+                    },
+                )
             }
-            // The prompt starts a turn before the transcript says so.
-            self.catch_up()?;
-            self.open_turn(&claimed.session_id);
-            return Ok(outcome);
+            Ok(BaseMerge::Conflicted { files, .. }) => {
+                report.warnings.push(format!(
+                    "{session}: main conflicts with {branch} in {}; the execution starts on \
+                     the branch as it is",
+                    files.join(", ")
+                ));
+                let head = self
+                    .workspaces
+                    .branch_head(branch)
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| "-".to_string(), |head| head.to_string());
+                self.append(
+                    &claimed.agent_id,
+                    session,
+                    None,
+                    Source::Bridge,
+                    Some(format!("conflict:{head}:{:016x}", files_digest(&files))),
+                    EventKind::MergeConflicted {
+                        files,
+                        marked: false,
+                    },
+                )
+            }
+            Err(error) => {
+                report.warnings.push(format!(
+                    "{session}: merge main into {branch}: {error}; the execution starts on the \
+                     branch as it is"
+                ));
+                Ok(())
+            }
         }
-        Ok(Outcome::Succeeded)
+    }
+
+    /// Before a resume of `native`: its transcript ready
+    /// ([`Self::ready_transcript`]), and its length, which the execution's
+    /// own lines come after.
+    fn resumed_transcript(
+        &self,
+        claimed: &Claimed,
+        workspace: &WorkspaceId,
+        native: &str,
+        report: &mut TickReport,
+    ) -> Result<Option<u64>, String> {
+        self.ready_transcript(claimed, workspace, native, report)?;
+        self.transcript_length(workspace, native)
+    }
+
+    /// How long the transcript of `native` is, as the engine will see it;
+    /// `None` when it does not exist (yet).
+    fn transcript_length(
+        &self,
+        workspace: &WorkspaceId,
+        native: &str,
+    ) -> Result<Option<u64>, String> {
+        let path = transcript_path(&self.config.claude_projects, workspace, native);
+        let mut length = 0u64;
+        loop {
+            match self.terminals.read_from(workspace, &path, length) {
+                Ok(None) => return Ok((length > 0).then_some(length)),
+                Ok(Some(bytes)) if bytes.is_empty() => return Ok(Some(length)),
+                Ok(Some(bytes)) => {
+                    length = length.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                }
+                Err(error) => return Err(format!("read {path}: {error}")),
+            }
+        }
+    }
+
+    /// A start that fails after its mount, before anything ran in it: the
+    /// mount goes, and the start fails with `why`. The release is recorded
+    /// when the log takes it; when it does not, a restart unmounts again
+    /// ([`Self::release_orphan_mounts`]).
+    fn give_up_mount(&self, claimed: &Claimed, workspace: &WorkspaceId, why: String) -> Outcome {
+        if let Err(error) = self.workspaces.unmount(workspace) {
+            return Outcome::Failed(format!("{why}; unmount {workspace}: {error}"));
+        }
+        match self.step(claimed, None, CommandStep::MountReleased, Some(workspace)) {
+            Ok(()) => Outcome::Failed(why),
+            Err(error) => Outcome::Failed(format!("{why}; record the unmount: {error}")),
+        }
     }
 
     /// Claude Code's inline settings for an engine on `model`, or why it
@@ -1409,6 +2014,7 @@ impl Bridge {
                     &active.workspace,
                     &id,
                 )),
+                engine_version: None,
             },
         )?;
         self.catch_up()?;
@@ -1464,9 +2070,17 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
+        fresh: bool,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
-        let mut trusted = false;
+        // Only a fresh session's directory can be new to the engine: a
+        // resume runs where its session ran, which was trusted then.
+        let mut trusted = !fresh;
+        // The trust dialog comes before the engine draws any prompt: once a
+        // prompt was seen, nothing on the pane is that dialog any more.
+        let mut prompt_seen = false;
+        // A dialog frame is answered only when the next read shows it again.
+        let mut dialog: Option<String> = None;
         // The trust dialog comes before the engine starts up, so answering it
         // restarts the budget instead of spending it.
         let mut attempt = 0;
@@ -1481,9 +2095,16 @@ impl Bridge {
             else {
                 return Ok(Outcome::Failed("terminal disappeared".to_string()));
             };
+            let reading = read_claude_screen(&pane);
+            prompt_seen |= reading.state != ScreenState::Unknown;
             // The Bridge exported this directory itself, so it trusts it.
-            // Answer once: a second answer would land in the input box.
-            if !trusted && is_trust_dialog(&pane) {
+            // Answer once (a second answer would land in the input box), and
+            // only the dialog itself: on two equal reads, before any prompt.
+            if !trusted && !prompt_seen && is_trust_dialog(&pane) {
+                if dialog.as_deref() != Some(pane.as_str()) {
+                    dialog = Some(pane);
+                    continue;
+                }
                 trusted = true;
                 if let Err(error) =
                     self.terminals
@@ -1494,7 +2115,7 @@ impl Bridge {
                 attempt = 1;
                 continue;
             }
-            let reading = read_claude_screen(&pane);
+            dialog = None;
             last = reading.state;
             if !reading.state.accepts_input() {
                 continue;
@@ -1510,10 +2131,7 @@ impl Bridge {
                     evidence: reading.evidence,
                 },
             )?;
-            return match self
-                .terminals
-                .submit_text(&active.terminal(), &active.workspace, prompt)
-            {
+            return match self.type_once(claimed, active, prompt)? {
                 Ok(()) => Ok(Outcome::Succeeded),
                 Err(error) => Ok(Outcome::Failed(format!("submit prompt: {error}"))),
             };
@@ -1530,6 +2148,14 @@ impl Bridge {
                 claimed.session_id
             )));
         };
+        // A retried input is never typed twice.
+        match self.typing_of(claimed, &active.execution_id) {
+            Typing::Due => {}
+            Typing::Done => return Ok(Outcome::Succeeded),
+            Typing::Unknown => {
+                return Ok(Outcome::Failed(format!("the text {MAY_HAVE_TYPED}")));
+            }
+        }
         let Ok(pane) =
             self.terminals
                 .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
@@ -1554,30 +2180,9 @@ impl Bridge {
                 reading.state
             )));
         }
-        let (typed, through) = self.with_notice(&claimed.session_id, text);
-        match self
-            .terminals
-            .submit_text(&active.terminal(), &active.workspace, &typed)
-        {
-            Ok(()) => {
-                // A turn starts now, before its transcript says so.
-                self.open_turn(&claimed.session_id);
-                self.notice_typed(claimed, &active, through)?;
-                Ok(Outcome::Succeeded)
-            }
+        match self.type_once(claimed, &active, text)? {
+            Ok(()) => Ok(Outcome::Succeeded),
             Err(error) => Ok(Outcome::Failed(format!("submit text: {error}"))),
-        }
-    }
-
-    /// The Bridge typed a prompt: the session's turn is open from now on, so
-    /// no merge touches the workspace until the turn ends.
-    fn open_turn(&mut self, session: &SessionId) {
-        if let Some(held) = self
-            .sessions
-            .get_mut(session)
-            .and_then(|view| view.active.as_mut())
-        {
-            held.turn_open = true;
         }
     }
 
@@ -1638,7 +2243,12 @@ impl Bridge {
         model: Option<ModelProfile>,
         report: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
-        if self.running(&claimed.session_id).is_some() {
+        // A retried resume whose execution started goes on in `start`.
+        let ours = ExecutionId::for_command(claimed.command_id);
+        if self
+            .running(&claimed.session_id)
+            .is_some_and(|active| active.execution_id != ours)
+        {
             return Ok(Outcome::Failed(format!(
                 "{} still runs an execution",
                 claimed.session_id
@@ -1651,81 +2261,37 @@ impl Bridge {
         else {
             return Ok(Outcome::Failed("no native session to resume".to_string()));
         };
-        let prompt = prompt.unwrap_or("");
-        // What merges changed goes with the prompt; nothing is typed
-        // unprompted.
-        let (prompt, through) = if prompt.is_empty() {
-            (String::new(), None)
-        } else {
-            self.with_notice(&claimed.session_id, prompt)
-        };
-        let outcome = self.start(
+        self.start(
             claimed,
             &Begin {
-                prompt: &prompt,
+                prompt: prompt.unwrap_or(""),
                 parent: None,
                 native: Some(native.as_str()),
                 from: None,
                 model,
             },
             report,
-        )?;
-        // The execution the prompt went to, folded.
-        self.catch_up()?;
-        if outcome == Outcome::Succeeded
-            && let Some(active) = self.running(&claimed.session_id)
-        {
-            self.notice_typed(claimed, &active, through)?;
-        }
-        Ok(outcome)
-    }
-
-    /// `prompt`, after what merges of main changed under the agent and it
-    /// was not told yet, if anything did; and the position of the last merge
-    /// event the notice tells of.
-    fn with_notice(&self, session: &SessionId, prompt: &str) -> (String, Option<GlobalPosition>) {
-        match self
-            .sessions
-            .get(session)
-            .and_then(|view| view.notice.text())
-        {
-            Some((notice, through)) => (format!("{notice}\n\n{prompt}"), Some(through)),
-            None => (prompt.to_string(), None),
-        }
-    }
-
-    /// A prompt with the notice through `through` went to the engine:
-    /// record it, so the notice clears when that prompt reaches the engine
-    /// (`notice.received`), and only then.
-    fn notice_typed(
-        &mut self,
-        claimed: &Claimed,
-        active: &Active,
-        through: Option<GlobalPosition>,
-    ) -> Result<(), StoreError> {
-        let Some(through) = through else {
-            return Ok(());
-        };
-        self.append(
-            &claimed.agent_id,
-            &claimed.session_id,
-            Some(&active.execution_id),
-            Source::Bridge,
-            Some(format!("cmd_{}:notice", claimed.command_id.0)),
-            EventKind::NoticeTyped { through },
-        )?;
-        self.catch_up()
+        )
     }
 }
 
-/// Whether an event opens a turn (`Some(true)`), ends one (`Some(false)`),
-/// or says nothing about turns.
-fn opens_turn(kind: &EventKind) -> Option<bool> {
-    match kind {
-        EventKind::MessageReceived | EventKind::ToolStarted { .. } => Some(true),
-        EventKind::TurnStopped { .. } | EventKind::TurnFailed { .. } => Some(false),
-        _ => None,
+/// How a command that may or may not have typed its text fails (the log
+/// shows typing began and nothing shows it arrived): it is not typed again,
+/// and whoever sent it must not send it again blindly either.
+pub const MAY_HAVE_TYPED: &str =
+    "may have been typed and the log cannot tell; it is not typed again";
+
+/// A digest of a list of paths that stays the same across builds and hosts
+/// (FNV-1a over the paths, each ended by a NUL): part of a record's key.
+fn files_digest(files: &[String]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for file in files {
+        for byte in file.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
     }
+    hash
 }
 
 /// Settings passed to Claude Code for an engine on `profile`, through
