@@ -1916,3 +1916,66 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
         "an engine that stayed up starts the count over"
     );
 }
+
+#[test]
+fn the_reader_reads_the_whole_log_from_a_time_without_screen_text() {
+    let (store, schema) = store("log_after");
+    for kind in [
+        EventKind::MessageReceived,
+        EventKind::ScreenObserved {
+            state: spawn_core::screen::ScreenState::Ready,
+            evidence: "pane text".to_string(),
+        },
+        EventKind::TurnStopped {
+            input_tokens: None,
+            output_tokens: None,
+        },
+        EventKind::MessageReceived,
+    ] {
+        store.append(message(kind)).expect("append succeeds");
+    }
+    // Ten seconds apart, first to last: positions 1..=4.
+    admin(&schema)
+        .batch_execute("update spawn_events set recorded_at_ms = 1000000 + id * 10000")
+        .expect("spread the record times");
+    let url = spawn_postgres::role_url(&common::schema_url(&schema), "spawn_reader")
+        .expect("the reader's URL");
+    let reader = spawn_postgres::PostgresStore::connect(&url).expect("the reader connects");
+
+    let entries = reader
+        .log_after(GlobalPosition(0), 10)
+        .expect("the log reads");
+    let names: Vec<&str> = entries.iter().map(|e| e.event_name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "message.received",
+            "screen.observed",
+            "turn.stopped",
+            "message.received"
+        ]
+    );
+    assert_eq!(
+        entries[1].detail,
+        Some(serde_json::json!({"state": "ready"})),
+        "the pane's text stays out"
+    );
+    assert_eq!(entries[0].session_id, session().as_str());
+    let after_two = reader
+        .log_after(GlobalPosition(2), 1)
+        .expect("the log reads");
+    assert_eq!(after_two.len(), 1);
+    assert_eq!(after_two[0].position, GlobalPosition(3));
+
+    let before = |ms: i64| {
+        reader
+            .position_before(spawn_core::time::Timestamp(ms))
+            .expect("a position")
+    };
+    assert_eq!(before(0), GlobalPosition(0), "everything is that recent");
+    assert_eq!(before(1_010_000), GlobalPosition(0));
+    assert_eq!(before(1_010_001), GlobalPosition(1));
+    assert_eq!(before(1_030_000), GlobalPosition(2));
+    assert_eq!(before(1_035_000), GlobalPosition(3));
+    assert_eq!(before(9_000_000), GlobalPosition(4), "nothing that recent");
+}

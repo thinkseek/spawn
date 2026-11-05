@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
-use spawn_core::event::SessionSeq;
+use spawn_core::event::{GlobalPosition, SessionSeq};
 use spawn_core::id::SessionId;
 use tiny_http::{Header, Request, Response, Server};
 
@@ -465,6 +465,7 @@ fn handle(
         "/api/rsi/pane" => rsi_pane(query),
         "/api/fleet" => fleet(),
         "/api/missions" => missions(),
+        "/api/events" => events(query),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 session(id, query)
@@ -1016,6 +1017,73 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
     }))
 }
 
+/// Where a read of the whole log starts: after a position, or at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogStart {
+    After(u64),
+    Since(i64),
+}
+
+/// The start and page size of `/api/events`: `after=<position>` or
+/// `since_ms=<epoch ms>` (not both), and `limit`, capped. A number that does
+/// not parse is the caller's mistake.
+fn log_window(query: &str) -> Result<(LogStart, usize), String> {
+    let number = |name: &str| -> Result<Option<i64>, String> {
+        parameter(query, name)
+            .map(|text| {
+                text.parse::<i64>()
+                    .ok()
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| format!("{BAD_REQUEST}bad {name} {text}"))
+            })
+            .transpose()
+    };
+    let start = match (number("after")?, number("since_ms")?) {
+        (Some(_), Some(_)) => return Err(format!("{BAD_REQUEST}after or since_ms, not both")),
+        (_, Some(since)) => LogStart::Since(since),
+        (after, None) => LogStart::After(after.unwrap_or(0).unsigned_abs()),
+    };
+    let limit = number("limit")?
+        .map_or(DEFAULT_LIMIT, |limit| {
+            usize::try_from(limit).unwrap_or(MAX_LIMIT)
+        })
+        .min(MAX_LIMIT);
+    Ok((start, limit))
+}
+
+/// Events of the whole log in log order, for the Show view: a page after a
+/// position, and `next`, the position to read after next time (the last
+/// one returned, or the start when nothing is newer). Read-only, through
+/// the reader login like every other answer.
+fn events(query: &str) -> Result<Value, String> {
+    let (start, limit) = log_window(query)?;
+    let store = open_store()?;
+    let after = match start {
+        LogStart::After(after) => GlobalPosition(after),
+        LogStart::Since(since) => store
+            .position_before(spawn_core::time::Timestamp(since))
+            .map_err(err)?,
+    };
+    let entries = store.log_after(after, limit).map_err(err)?;
+    let next = entries.last().map_or(after, |entry| entry.position);
+    let events: Vec<Value> = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.position.0,
+                "agent_id": entry.agent_id,
+                "session_id": entry.session_id,
+                "execution_id": entry.execution_id,
+                "source": entry.source,
+                "event_name": entry.event_name,
+                "detail": entry.detail,
+                "recorded_at_ms": entry.recorded_at.0,
+            })
+        })
+        .collect();
+    Ok(json!({ "events": events, "next": next.0, "now_ms": now_ms() }))
+}
+
 fn parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
@@ -1075,9 +1143,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Arc, ProcSocket, Shared, access_token, handle, is_loopback, local_exemption,
-        objective_json, owner_uid, peer_uid, proc_sockets, rsi_summary, same_secret,
-        serve_requests, server_hosts, tokenless_request, with_last_gates,
+        Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_LIMIT, ProcSocket, Shared, access_token,
+        handle, is_loopback, local_exemption, log_window, objective_json, owner_uid, peer_uid,
+        proc_sockets, rsi_summary, same_secret, serve_requests, server_hosts, tokenless_request,
+        with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1577,6 +1646,27 @@ mod tests {
             ),
             403
         );
+    }
+
+    #[test]
+    fn the_log_reads_after_a_position_or_from_a_time_with_a_capped_page() {
+        assert_eq!(log_window(""), Ok((LogStart::After(0), DEFAULT_LIMIT)));
+        assert_eq!(
+            log_window("after=42&limit=10"),
+            Ok((LogStart::After(42), 10))
+        );
+        assert_eq!(
+            log_window("since_ms=1700000000000"),
+            Ok((LogStart::Since(1_700_000_000_000), DEFAULT_LIMIT))
+        );
+        assert_eq!(
+            log_window("limit=999999999999"),
+            Ok((LogStart::After(0), MAX_LIMIT))
+        );
+        for bad in ["after=-1", "after=x", "limit=ten", "since_ms=1&after=2"] {
+            let error = log_window(bad).expect_err(bad);
+            assert!(error.starts_with(BAD_REQUEST), "{bad}: {error}");
+        }
     }
 
     #[test]
