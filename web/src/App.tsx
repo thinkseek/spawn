@@ -1,5 +1,5 @@
 import { PanelRight } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 
 import { fetchOverview, fetchSession, usePoll } from "./api";
 import type { SessionDetail } from "./api";
@@ -14,7 +14,12 @@ import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
 
-export type View = "fleet" | "missions" | "rsi" | "sessions";
+// Its own chunk: Motion and d3 load only when the Show view opens.
+const ShowView = lazy(() =>
+  import("./components/show/ShowView").then((module) => ({ default: module.ShowView })),
+);
+
+export type View = "fleet" | "missions" | "rsi" | "show" | "sessions";
 
 interface Route {
   view: View;
@@ -27,6 +32,7 @@ function routeFromHash(): Route {
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
+  if (hash.startsWith("#/show")) return { view: "show", agent: null };
   const match = /^#\/fleet\/(.+)$/.exec(hash);
   let agent: string | null = null;
   if (match) {
@@ -46,7 +52,21 @@ function hashFor(route: Route): string {
       : "#/fleet";
   }
   if (route.view === "missions") return "#/missions";
+  // The Show view keeps its options (`?present`, `?replay`) in its hash.
+  if (route.view === "show") {
+    return window.location.hash.startsWith("#/show") ? window.location.hash : "#/show";
+  }
   return route.view === "rsi" ? "#/rsi" : "#/sessions";
+}
+
+/** `?present`, in the query or the hash: the Show view alone, no chrome,
+ * for a wall screen. */
+function presenting(): boolean {
+  const hashQuery = window.location.hash.split("?")[1] ?? "";
+  return (
+    new URLSearchParams(window.location.search).has("present") ||
+    new URLSearchParams(hashQuery).has("present")
+  );
 }
 
 export default function App() {
@@ -115,6 +135,16 @@ export default function App() {
   const rsi = overview.data?.rsi ?? null;
   const observation = summary?.observation ?? null;
 
+  if (view === "show" && presenting()) {
+    return (
+      <div className="flex h-dvh w-full overflow-hidden bg-page-canvas text-label text-foreground">
+        <Suspense fallback={null}>
+          <ShowView fleet={fleet} present />
+        </Suspense>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-app-shell text-label text-foreground md:flex-row">
       <MobileNav
@@ -123,6 +153,7 @@ export default function App() {
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
+        onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
       />
       <Sidebar
@@ -135,6 +166,7 @@ export default function App() {
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
+        onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
           setSelectedId(id);
@@ -153,6 +185,10 @@ export default function App() {
         <MissionsView />
       ) : view === "rsi" ? (
         <RsiView onOpenSession={openTimeline} />
+      ) : view === "show" ? (
+        <Suspense fallback={<div className="flex-1 bg-page-canvas" />}>
+          <ShowView fleet={fleet} present={false} />
+        </Suspense>
       ) : (
         <div className="flex min-h-0 min-w-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col bg-page-canvas">
