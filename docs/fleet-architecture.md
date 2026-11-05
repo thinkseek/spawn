@@ -817,7 +817,8 @@ record of what was judged (§14 of design.md).
   it runs, the integrator's passes skip that mission and its source. At
   most `--gates N` (`SPAWN_INTEGRATE_GATES`) run at once across missions,
   and **N is 1**: more than one gate is unsafe until each gate has a test
-  database server of its own (a later task). Today every gate reaches the
+  database server of its own (GitHub issue #6, which also covers the
+  server state candidate code leaves behind). Today every gate reaches the
   same test PostgreSQL server, and its gate login is a superuser, so one
   gate's candidate code can disturb another gate's base runs (an
   "unsolved" is cached, and a regression then lands) or flake another
