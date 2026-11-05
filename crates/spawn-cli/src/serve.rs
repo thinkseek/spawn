@@ -11,6 +11,11 @@
 //! `?token=<token>`), except, with `SPAWN_SERVE_LOCAL_OPEN=1`, from a loopback
 //! client that runs as the owner's uid (Linux: the uid of its socket in
 //! `/proc/net/tcp{,6}`; without `/proc`, no client is exempt).
+//! An API read served without the token (no token set, or the local-open
+//! exemption) also needs a `Host` naming this server (127.0.0.1, localhost,
+//! [::1] or the bound address, with its port) and no cross-origin `Origin`:
+//! a page that rebinds its own name to 127.0.0.1, or a proxy on this machine
+//! that forwards another name here, reads nothing without the token.
 //! The built UI's static files are served without it:
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
@@ -71,8 +76,9 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         web.display()
     );
     let port = server.server_addr().to_ip().map(|address| address.port());
+    let hosts = port.map(|port| server_hosts(&address, port)).unwrap_or_default();
     for request in server.incoming_requests() {
-        if let Err(error) = handle(request, &web, token.as_deref(), port) {
+        if let Err(error) = handle(request, &web, token.as_deref(), port, &hosts) {
             eprintln!("serve: {error}");
         }
     }
@@ -217,17 +223,79 @@ fn is_loopback(address: &str) -> bool {
     !resolved.is_empty() && resolved.iter().all(|socket| socket.ip().is_loopback())
 }
 
-/// Whether `request` carries `token`, as a bearer header or `?token=`.
-fn authorized(request: &Request, query: &str, token: &str) -> bool {
-    let header = request
+/// The `Host` values that name this server on `port`: the loopback names,
+/// and the address it was told to bind unless that is a wildcard. Each is
+/// lowercase `host:port`.
+fn server_hosts(address: &str, port: u16) -> Vec<String> {
+    let mut hosts: Vec<String> = ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .map(|host| format!("{host}:{port}"))
+        .collect();
+    let bound = address
+        .rsplit_once(':')
+        .map_or(address, |(host, _)| host)
+        .to_ascii_lowercase();
+    let wildcard = bound
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+    if !bound.is_empty() && !wildcard {
+        let named = format!("{bound}:{port}");
+        if !hosts.contains(&named) {
+            hosts.push(named);
+        }
+    }
+    hosts
+}
+
+/// `authority` (a `Host` value, or an origin without its scheme) as
+/// lowercase `host:port`, port 80 when it names none.
+fn authority(text: &str) -> String {
+    let text = text.trim().to_ascii_lowercase();
+    let has_port = match text.rfind(']') {
+        Some(close) => text[close..].contains(':'),
+        None => text.contains(':'),
+    };
+    if has_port { text } else { format!("{text}:80") }
+}
+
+/// Whether a request with these `Host` and `Origin` headers may be served
+/// without the token: its `Host` names this server (`hosts`, from
+/// [`server_hosts`]) and its `Origin`, if any, is that same host over http.
+/// A page that rebinds its own name to 127.0.0.1 sends its own name as the
+/// `Host`; a page on another origin sends that origin.
+fn tokenless_request(host: Option<&str>, origin: Option<&str>, hosts: &[String]) -> bool {
+    let Some(host) = host.map(authority) else {
+        return false;
+    };
+    if !hosts.contains(&host) {
+        return false;
+    }
+    origin.is_none_or(|origin| {
+        origin
+            .trim()
+            .strip_prefix("http://")
+            .is_some_and(|rest| authority(rest) == host)
+    })
+}
+
+/// The value of `request`'s header `name`, if it has one.
+fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
         .headers()
         .iter()
-        .find(|header| header.field.equiv("Authorization"))
-        .and_then(|header| {
-            let (scheme, rest) = header.value.as_str().split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
-        });
-    [header, parameter(query, "token")]
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
+}
+
+/// Whether `request` carries `token`, as a bearer header or `?token=`.
+fn authorized(request: &Request, query: &str, token: &str) -> bool {
+    let bearer = header(request, "Authorization").and_then(|value| {
+        let (scheme, rest) = value.split_once(' ')?;
+        scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+    });
+    [bearer, parameter(query, "token")]
         .into_iter()
         .flatten()
         .any(|given| same_secret(given.as_bytes(), token.as_bytes()))
@@ -260,27 +328,31 @@ fn handle(
     web: &Path,
     token: Option<&str>,
     port: Option<u16>,
+    hosts: &[String],
 ) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((path, query)) => (path, query),
         None => (url.as_str(), ""),
     };
-    // With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
-    // needs no token: a client running as the owner's uid can read the
-    // token file anyway. Another user's loopback client still needs it.
-    // Off by default.
-    let local = owners_own_request(request.remote_addr().copied(), port);
-    if let Some(token) = token
-        && path.starts_with("/api/")
-        && !local
-        && !authorized(&request, query, token)
-    {
-        let challenge =
-            Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header is valid");
-        return request
-            .respond(json_response(401, &json!({ "error": "unauthorized" })).with_header(challenge))
-            .map_err(|error| error.to_string());
+    if path.starts_with("/api/") {
+        // Without the token a read needs a Host that names this server and
+        // no foreign Origin (DNS rebinding, a local proxy); with it, any.
+        // With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
+        // needs no token: a client running as the owner's uid can read the
+        // token file anyway. Another user's loopback client still needs it.
+        // Off by default.
+        let named = tokenless_request(header(&request, "Host"), header(&request, "Origin"), hosts);
+        let open = match token {
+            None => named,
+            Some(token) => {
+                authorized(&request, query, token)
+                    || (named && owners_own_request(request.remote_addr().copied(), port))
+            }
+        };
+        if !open {
+            return refuse(request, token.is_some());
+        }
     }
     let answer = match path {
         "/api/overview" => overview(),
@@ -311,6 +383,23 @@ fn handle(
     request
         .respond(json_response(status, &body))
         .map_err(|error| error.to_string())
+}
+
+/// Answer a refused API request: 401 with a bearer challenge when a token
+/// would let it in, 403 when no token is set (its Host or Origin is not this
+/// server's).
+fn refuse(request: Request, token_set: bool) -> Result<(), String> {
+    let response = if token_set {
+        let challenge =
+            Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header is valid");
+        json_response(401, &json!({ "error": "unauthorized" })).with_header(challenge)
+    } else {
+        json_response(
+            403,
+            &json!({ "error": "forbidden: the Host or Origin does not name this server" }),
+        )
+    };
+    request.respond(response).map_err(|error| error.to_string())
 }
 
 fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -881,8 +970,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ProcSocket, access_token, is_loopback, local_exemption, objective_json, owner_uid,
-        peer_uid, proc_sockets, rsi_summary, same_secret, with_last_gates,
+        ProcSocket, access_token, handle, is_loopback, local_exemption, objective_json,
+        owner_uid, peer_uid, proc_sockets, rsi_summary, same_secret, server_hosts,
+        tokenless_request, with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1116,6 +1206,115 @@ mod tests {
         assert_eq!(
             access_token("0.0.0.0:8787", Some("t".to_string())),
             Ok(Some("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_server_is_named_by_loopback_and_its_bound_address() {
+        let loopback = ["127.0.0.1:8787", "localhost:8787", "[::1]:8787"];
+        assert_eq!(server_hosts("127.0.0.1:8787", 8787), loopback);
+        assert_eq!(server_hosts("0.0.0.0:8787", 8787), loopback, "a wildcard names nothing");
+        assert_eq!(server_hosts("[::]:8787", 8787), loopback);
+        assert_eq!(
+            server_hosts("192.168.1.10:0", 41000).last().map(String::as_str),
+            Some("192.168.1.10:41000"),
+            "the bound port, not the requested 0"
+        );
+        assert_eq!(
+            server_hosts("Spawn-Box:8787", 8787).last().map(String::as_str),
+            Some("spawn-box:8787")
+        );
+    }
+
+    #[test]
+    fn only_this_servers_host_and_origin_read_without_the_token() {
+        let hosts = server_hosts("192.168.1.10:8787", 8787);
+        for host in [
+            "127.0.0.1:8787",
+            "localhost:8787",
+            "LOCALHOST:8787",
+            "[::1]:8787",
+            "192.168.1.10:8787",
+        ] {
+            assert!(tokenless_request(Some(host), None, &hosts), "{host}");
+        }
+        // DNS rebinding: the page's own name reaches 127.0.0.1.
+        assert!(!tokenless_request(Some("attacker.example:8787"), None, &hosts));
+        assert!(!tokenless_request(Some("attacker.example"), None, &hosts));
+        // Another port is another origin; no Host at all is refused.
+        assert!(!tokenless_request(Some("127.0.0.1:9999"), None, &hosts));
+        assert!(!tokenless_request(Some("localhost"), None, &hosts));
+        assert!(!tokenless_request(None, None, &hosts));
+        // Origin: the same host over http, or none; anything else is foreign.
+        let same = Some("http://127.0.0.1:8787");
+        assert!(tokenless_request(Some("127.0.0.1:8787"), same, &hosts));
+        assert!(tokenless_request(
+            Some("localhost:8787"),
+            Some("http://localhost:8787"),
+            &hosts
+        ));
+        for origin in [
+            "http://attacker.example",
+            "http://attacker.example:8787",
+            "http://localhost:8787",
+            "https://127.0.0.1:8787",
+            "null",
+        ] {
+            assert!(
+                !tokenless_request(Some("127.0.0.1:8787"), Some(origin), &hosts),
+                "{origin}"
+            );
+        }
+        // Port 80 is implied on both sides.
+        let web = server_hosts("127.0.0.1:80", 80);
+        assert!(tokenless_request(Some("localhost"), Some("http://localhost"), &web));
+    }
+
+    /// Status of one GET of `path` from `serve`'s request handler with no
+    /// token set, sending `headers` (each line ending in CRLF, `PORT` replaced
+    /// by the server's port) and no other.
+    fn tokenless_status(path: &str, headers: &str) -> u16 {
+        use std::io::{Read, Write};
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let hosts = server_hosts("127.0.0.1:0", port);
+        let web = std::env::temp_dir();
+        let worker = std::thread::spawn(move || {
+            let request = server.recv().expect("request");
+            handle(request, &web, None, Some(port), &hosts).expect("answered");
+        });
+        let headers = headers.replace("PORT", &port.to_string());
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(client, "GET {path} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n").expect("send");
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).expect("read");
+        worker.join().expect("handler");
+        answer
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status line")
+    }
+
+    #[test]
+    fn a_rebound_or_cross_origin_api_read_is_refused_before_it_reaches_the_store() {
+        // A malformed session id answers 400 without a store: the request
+        // passed the guard.
+        let path = "/api/session/not%20a%20session";
+        assert_eq!(tokenless_status(path, "Host: 127.0.0.1:PORT\r\n"), 400);
+        assert_eq!(
+            tokenless_status(path, "Host: localhost:PORT\r\nOrigin: http://localhost:PORT\r\n"),
+            400
+        );
+        assert_eq!(tokenless_status(path, "Host: attacker.example:PORT\r\n"), 403);
+        assert_eq!(tokenless_status(path, "Host: 127.0.0.1\r\n"), 403, "port missing");
+        assert_eq!(tokenless_status(path, ""), 403, "no Host");
+        assert_eq!(
+            tokenless_status(
+                path,
+                "Host: 127.0.0.1:PORT\r\nOrigin: http://attacker.example\r\n"
+            ),
+            403
         );
     }
 
