@@ -37,6 +37,23 @@ pub fn admin(schema: &str) -> Client {
     client
 }
 
+/// The test URL with `schema` as its search path, as an install's URL
+/// names its schema.
+pub fn schema_url(schema: &str) -> String {
+    let url = url();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}options=-csearch_path%3D{schema}")
+}
+
+/// This database's role for a restricted login (`spawn_supervisor`,
+/// `spawn_reader`), as the migrated `schema` names it.
+pub fn login(schema: &str, base: &str) -> String {
+    admin(schema)
+        .query_one("select spawn_login_role($1)", &[&base])
+        .expect("the database's login")
+        .get(0)
+}
+
 /// A schema holding the first shape of every table (tests/first-shapes.sql),
 /// not migrated yet, and an owner connection in it.
 pub fn first_shapes(case: &str) -> (String, Client) {
@@ -51,8 +68,17 @@ pub fn first_shapes(case: &str) -> (String, Client) {
     (schema, client)
 }
 
-/// Run the schema over `schema` as the owner and return its warnings.
+/// Run the schema over `schema` as the owner and return its warnings, but
+/// those about the cluster-wide logins of earlier installs, which the
+/// shared test cluster has (tests/roles.rs covers them).
 pub fn migrate_warnings(schema: &str) -> Vec<String> {
+    let mut warnings = all_migrate_warnings(schema);
+    warnings.retain(|warning| !warning.contains("from an earlier install"));
+    warnings
+}
+
+/// Run the schema over `schema` as the owner and return all its warnings.
+pub fn all_migrate_warnings(schema: &str) -> Vec<String> {
     let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = std::sync::Arc::clone(&warnings);
     let mut config: postgres::Config = url().parse().expect("the test URL parses");

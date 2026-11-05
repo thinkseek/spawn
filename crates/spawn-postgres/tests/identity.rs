@@ -58,7 +58,10 @@ fn two_first_submissions_for_one_session_with_different_agents_cannot_both_win()
     };
     let second = race(
         &schema,
-        "set session authorization spawn_supervisor",
+        &format!(
+            "set session authorization {}",
+            common::login(&schema, "spawn_supervisor")
+        ),
         &insert("agent_worker_a"),
         &insert("agent_worker_b"),
     );

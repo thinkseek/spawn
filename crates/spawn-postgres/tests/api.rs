@@ -668,16 +668,12 @@ fn a_granted_principal_inserts_and_reads_only_its_agents() {
         "the owner reads every agent"
     );
 
-    // Another login reads only the agents it holds a grant for.
-    client
-        .batch_execute(
-            "grant execute on function spawn_read_freshness(), spawn_read_timeline(text) \
-             to spawn_reader",
-        )
-        .expect("the reader may call the readers");
+    // Another login reads only the agents its principal holds a grant for:
+    // this database's reader login acts as `spawn_reader`.
+    let reader = common::login(&schema, "spawn_reader");
     let as_reader = |client: &mut Client| {
         client
-            .batch_execute("set session authorization spawn_reader")
+            .batch_execute(&format!("set session authorization {reader}"))
             .expect("become the reader");
     };
     as_reader(&mut client);
@@ -1075,8 +1071,10 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
             "spawn_gateway_insert EXECUTE",
             "spawn_gateway_submit EXECUTE",
             "spawn_grant_matches EXECUTE",
+            "spawn_login_role EXECUTE",
             "spawn_mission_caller EXECUTE",
             "spawn_now_ms EXECUTE",
+            "spawn_principal EXECUTE",
             "spawn_read_freshness EXECUTE",
             "spawn_read_judgements EXECUTE",
             "spawn_read_state EXECUTE",
@@ -1217,20 +1215,25 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
 #[test]
 fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
     let (_store, schema) = store("logins");
-    for role in ["spawn_supervisor", "spawn_reader"] {
+    for base in ["spawn_supervisor", "spawn_reader"] {
+        let role = common::login(&schema, base);
+        assert_ne!(role, base, "the login is this database's own");
         let fixed = format!(
             "postgres://{role}:{role}@{}",
             common::url().rsplit_once('@').expect("a host").1
         );
         assert!(
             postgres::Client::connect(&fixed, postgres::NoTls).is_err(),
-            "{role}'s old fixed password is refused"
+            "{role} has no fixed password"
         );
-        let mut client = postgres::Client::connect(
-            &spawn_postgres::role_url(&common::url(), role).expect("a password in the test URL"),
-            postgres::NoTls,
-        )
-        .expect("the derived password logs in");
+        let url = spawn_postgres::role_url(&common::schema_url(&schema), base)
+            .expect("a password in the test URL");
+        assert!(
+            url.contains(&format!("://{role}:")),
+            "{base} logs in as {role}"
+        );
+        let mut client =
+            postgres::Client::connect(&url, postgres::NoTls).expect("the derived password logs in");
         client
             .batch_execute(&format!("set search_path to {schema}"))
             .expect("schema");
