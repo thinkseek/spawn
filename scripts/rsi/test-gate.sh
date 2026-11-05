@@ -833,8 +833,9 @@ echo "ok   nothing planted in the base cache"
 # 9b. The base cache's key is everything that decides a base result, and
 # nothing else. The scenarios run from a controller checkout (two levels
 # above them) whose helper 011.sh sources; a controller file no scenario
-# names is not in the key.
-controller=$work/controller
+# names is not in the key. The controller lies under $HOME, as the owner's
+# does: the sandbox binds its scripts back from there.
+controller=$HOME/controller
 mkdir -p "$controller/rsi" "$controller/scripts/blackbox"
 cp -r "$objectives" "$controller/rsi/scenarios"
 printf '# helper\n' >"$controller/scripts/blackbox/lib.sh"
