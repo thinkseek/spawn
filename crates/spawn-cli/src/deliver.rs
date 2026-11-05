@@ -527,21 +527,21 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                     | Attempts::Delivered(_)
                     | Attempts::Failed(_) => continue,
                 };
-                let switch = match found.map_or(Attempts::None, |facts| switch_attempts(task, facts))
-                {
-                    Attempts::None => Some(Switch {
-                        key: switch_key(task),
-                        retry: false,
-                    }),
-                    Attempts::Retry { number, due_ms } if now_ms >= due_ms => Some(Switch {
-                        key: format!("{}-retry-{number}", switch_key(task)),
-                        retry: true,
-                    }),
-                    Attempts::Retry { .. }
-                    | Attempts::Open
-                    | Attempts::Delivered(_)
-                    | Attempts::Failed(_) => None,
-                };
+                let switch =
+                    match found.map_or(Attempts::None, |facts| switch_attempts(task, facts)) {
+                        Attempts::None => Some(Switch {
+                            key: switch_key(task),
+                            retry: false,
+                        }),
+                        Attempts::Retry { number, due_ms } if now_ms >= due_ms => Some(Switch {
+                            key: format!("{}-retry-{number}", switch_key(task)),
+                            retry: true,
+                        }),
+                        Attempts::Retry { .. }
+                        | Attempts::Open
+                        | Attempts::Delivered(_)
+                        | Attempts::Failed(_) => None,
+                    };
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
                 orders.extend(delivery(task, found, settled, key, switch));
             }
@@ -1100,6 +1100,127 @@ mod tests {
         };
         let plan = orders(&work(vec![cheap]), &[on_cheap]);
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+    }
+
+    /// A worker idle at its prompt on the default profile, whose judgement a
+    /// failed Stop's own records have made stale, and the cheap task it
+    /// should be switched for.
+    fn refused_switch() -> (Work, Facts) {
+        let cheap = TaskRow {
+            model: ModelProfile::Cheap,
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        let mut facts = worker(true, true);
+        facts.evidence_seq = Some(9);
+        facts.dispatched.push(sent(
+            10,
+            "switch-model-4-0",
+            1_000,
+            Some("kill-session refused"),
+        ));
+        (work(vec![cheap]), facts)
+    }
+
+    #[test]
+    fn a_failed_switch_stop_is_retried_under_a_new_key_once_due() {
+        let (tasks, facts) = refused_switch();
+        let rows = |facts: &Facts| vec![facts.clone()];
+        assert!(!facts.idle_at_prompt(), "the judgement is stale");
+        assert!(delivered(&tasks, &rows(&facts)).is_empty(), "still waiting");
+        assert!(
+            news_items(&tasks, &rows(&facts)).is_empty(),
+            "a retry is coming: no one is asked yet"
+        );
+        assert!(
+            super::orders(&tasks, &rows(&facts), 1_000 + 59_999).is_empty(),
+            "not due yet"
+        );
+        let retry = super::orders(&tasks, &rows(&facts), 1_000 + 60_000);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].key, "switch-model-4-0-retry-1");
+        assert_eq!(retry[0].action, CommandAction::Stop);
+        assert_eq!(retry[0].task, None, "a stop delivers nothing");
+
+        // A worker judged busy since is not stopped, retry due or not.
+        let busy = Facts {
+            observation: worker(true, false).observation,
+            ..facts.clone()
+        };
+        assert!(super::orders(&tasks, &rows(&busy), 1_000 + 60_000).is_empty());
+        // Nor while the retry runs.
+        let mut stopping = facts.clone();
+        stopping.open_command = true;
+        stopping.dispatched.push(Sent {
+            finished_at_ms: None,
+            succeeded: None,
+            ..sent(11, "switch-model-4-0-retry-1", 70_000, None)
+        });
+        assert!(super::orders(&tasks, &rows(&stopping), 10_000_000).is_empty());
+
+        // The wait doubles after the second failure.
+        let mut again = facts;
+        again.dispatched.push(sent(
+            11,
+            "switch-model-4-0-retry-1",
+            70_000,
+            Some("kill-session refused"),
+        ));
+        assert!(super::orders(&tasks, &rows(&again), 70_000 + 119_999).is_empty());
+        let retry = super::orders(&tasks, &rows(&again), 70_000 + 120_000);
+        assert_eq!(retry[0].key, "switch-model-4-0-retry-2");
+    }
+
+    #[test]
+    fn a_switch_stop_given_up_is_escalated_and_never_sent_again() {
+        let (tasks, mut facts) = refused_switch();
+        for retry in 1..=DELIVERY_RETRIES {
+            facts.dispatched.push(sent(
+                10 + i64::try_from(retry).expect("small"),
+                &format!("switch-model-4-0-retry-{retry}"),
+                2_000,
+                Some("kill-session refused"),
+            ));
+        }
+        let rows = vec![facts];
+        assert!(DELIVERY_RETRIES < 5, "at most 5 Stops in all");
+        assert!(
+            super::orders(&tasks, &rows, i64::MAX / 2).is_empty(),
+            "no Stop after the last retry"
+        );
+        assert!(delivered(&tasks, &rows).is_empty(), "never delivered");
+        let items = news_items(&tasks, &rows);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].why, Why::DeliveryFailed);
+        assert_eq!(items[0].tag(), "session_resident_core switch-model-4-0");
+        assert!(
+            items[0].line.starts_with("task #4 ") && items[0].line.contains("could not be stopped"),
+            "{}",
+            items[0].line
+        );
+    }
+
+    #[test]
+    fn a_switch_stop_retried_successfully_leads_to_the_resume_that_delivers() {
+        let (tasks, facts) = refused_switch();
+        let mut stopped = Facts {
+            live: false,
+            ..facts
+        };
+        stopped
+            .dispatched
+            .push(sent(11, "switch-model-4-0-retry-1", 70_000, None));
+        let plan = super::orders(&tasks, std::slice::from_ref(&stopped), 80_000);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].key, "deliver-4-0");
+        assert_eq!(plan[0].task, Some(4));
+        assert!(matches!(
+            plan[0].action,
+            CommandAction::Resume {
+                model: Some(ModelProfile::Cheap),
+                ..
+            }
+        ));
+        assert!(news_items(&tasks, std::slice::from_ref(&stopped)).is_empty());
     }
 
     #[test]
