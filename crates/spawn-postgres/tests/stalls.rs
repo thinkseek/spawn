@@ -118,7 +118,7 @@ fn each_open_task_comes_with_its_steps_record_and_its_age_on_the_databases_clock
         &store,
         &session,
         "tool-1",
-        Source::Transcript,
+        Source::Claude,
         EventKind::ToolStarted {
             tool_name: "Bash".to_string(),
             tool_use_id: "toolu_1".to_string(),
