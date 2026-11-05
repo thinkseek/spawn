@@ -1243,6 +1243,7 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
             "spawn_read_status EXECUTE",
             "spawn_read_tasks EXECUTE",
             "spawn_read_timeline EXECUTE",
+            "spawn_source_allowed EXECUTE",
         ]
     );
 }
