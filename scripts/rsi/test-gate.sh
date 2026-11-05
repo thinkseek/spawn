@@ -1014,4 +1014,25 @@ printf '#!/bin/sh\nexit 1\n' >"$quoted_scenarios/check-\"q\".sh"
 expect "a quote in a reason is escaped" "$(judge "$good" "" "$quoted_scenarios")" \
     '{"verdict":"rejected","reason":"regression: check-\"q\".sh fails on the candidate"}'
 
+# 15. `<scenarios-dir>/bind` names the owner's read-only inputs under $HOME
+# (a project's installed dependencies): visible in the sandbox only when
+# listed; a listed directory that is missing stops the gate (exit 3).
+owner_inputs=$(mktemp -d "$HOME/.cache/spawn-gate-test-bind.XXXXXX")
+printf 'here\n' >"$owner_inputs/marker"
+unlisted_scenarios=$work/unlisted
+cp -r "$scenarios" "$unlisted_scenarios"
+printf '#!/bin/sh\n[ "$(cat "%s/marker" 2>/dev/null)" = here ]\n' "$owner_inputs" \
+    >"$unlisted_scenarios/check-owner-inputs.sh"
+expect "an unlisted directory under \$HOME is not visible" \
+    "$(judge "$good" "" "$unlisted_scenarios")" 'check-owner-inputs.sh fails'
+listed_inputs=$work/listed-inputs
+cp -r "$unlisted_scenarios" "$listed_inputs"
+printf '# owner inputs\n%s\n' "$owner_inputs" >"$listed_inputs/bind"
+expect "a directory listed in bind is visible" "$(judge "$good" "" "$listed_inputs")" \
+    'exit=0 {"verdict":"accepted"}'
+printf '%s/gone\n' "$owner_inputs" >"$listed_inputs/bind"
+expect "a listed directory that is missing stops the gate" \
+    "$(judge "$good" "" "$listed_inputs")" 'exit=3'
+rm -rf "$owner_inputs"
+
 echo "gate: all cases pass"
