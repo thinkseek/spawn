@@ -2395,7 +2395,8 @@ mod database_tests {
             spawn_core::mission::TaskState::Reported
         );
         assert!(after.halted.is_none());
-        let escalations = db.store.gate_room_escalations(0).expect("escalations");
+        assert_eq!(after.gate_room_task, Some(task));
+        let escalations = db.store.gate_room_escalations().expect("escalations");
         assert_eq!(
             escalations.as_array().map(Vec::len),
             Some(1),
@@ -2403,6 +2404,34 @@ mod database_tests {
         );
         assert_eq!(escalations[0]["mission"], mission);
         assert_eq!(escalations[0]["free_kb"], 1024);
+        // Told is a record: a digest that reached the supervisor with the
+        // item's tag, however long ago. Until then it stays, whatever its age.
+        let tag = format!("host gate-room-{}", escalations[0]["event_id"]);
+        let digest = |key: &str, succeeded: bool| {
+            db.admin()
+                .execute(
+                    "insert into spawn_commands (principal, idempotency_key, agent_id, session_id,
+                                                 action, state, succeeded, created_at_ms)
+                     values ('spawn-dispatch', $1, 'agent_supervisor', 'session_supervisor',
+                             jsonb_build_object('type', 'input', 'text', 'digest',
+                                                'tags', jsonb_build_array($2::text)),
+                             'finished', $3, 0)",
+                    &[&key, &tag, &succeeded],
+                )
+                .expect("a digest");
+        };
+        digest("dispatch-digest-failed", false);
+        assert_eq!(
+            db.store.gate_room_escalations().expect("escalations").as_array().map(Vec::len),
+            Some(1),
+            "a digest that failed told nothing"
+        );
+        digest("dispatch-digest-told", true);
+        assert_eq!(
+            db.store.gate_room_escalations().expect("escalations").as_array().map(Vec::len),
+            Some(0),
+            "told once, by its record"
+        );
 
         // A no_room that names no free space or TMPDIR is refused.
         assert!(
@@ -2422,6 +2451,55 @@ mod database_tests {
         assert_eq!(after.gate_room_waits, 0, "a gate that ran ends the run");
         assert!(after.gate_room_since_ms.is_none() && !after.gate_room_escalated);
         assert!(super::halt_reason(&after, 0).is_some_and(|reason| reason.contains("aborts")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Task 40 review: a run of `no_room` is one task's. The task leaving
+    /// the gate (cancelled, aborted over budget) ends it, and a later task's
+    /// first `no_room` starts a new run: no inherited age, backoff or
+    /// escalation.
+    #[test]
+    fn a_task_leaving_the_gate_ends_its_run_of_no_room() {
+        let (base, source, scenarios, _) = world("no-room-leaves", "exit 1\n");
+        let db = Db::new("no_room_leaves");
+        let mission = db.gated_mission(&source, &scenarios);
+        let no_room = |task: i64, escalate: bool| {
+            json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "no_room",
+                   "reason": "no room", "free_kb": 0, "min_gb": 10, "tmpdir": "/t",
+                   "escalate": escalate})
+        };
+        let first = db.reported_task(mission, "a");
+        for escalate in [false, false, true] {
+            db.record(&no_room(first, escalate));
+        }
+        let before = gated(&db, mission);
+        assert_eq!(
+            (before.gate_room_task, before.gate_room_waits, before.gate_room_escalated),
+            (Some(first), 3, true)
+        );
+        db.record(&json!({"type": "task.cancelled", "id": first}));
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_room_task, after.gate_room_waits, after.gate_room_escalated),
+            (None, 0, false),
+            "cancelled: the run ends"
+        );
+        assert!(after.gate_room_since_ms.is_none() && after.gate_room_last_ms.is_none());
+
+        // A run left behind without a record of its task leaving (a task
+        // dropped by a fold) does not reach the next task either.
+        let second = db.reported_task(mission, "b");
+        db.record(&no_room(second, true));
+        let third = db.reported_task(mission, "c");
+        db.record(&no_room(third, false));
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_room_task, after.gate_room_waits, after.gate_room_escalated),
+            (Some(third), 1, false),
+            "another task's no_room starts a new run"
+        );
+        assert_eq!(after.gate_room_since_ms, after.gate_room_last_ms);
+        assert_eq!(super::room_wait(&after, second, i64::MAX), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 
