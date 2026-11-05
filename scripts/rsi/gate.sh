@@ -154,12 +154,43 @@ STAGE_PREFIX="| "
 # shellcheck source=scripts/stage.sh
 . "$(dirname "$0")/../stage.sh"
 gate_started=$(stage_now)
+# Where the time goes, said once at the end (`gate_times`): the base's
+# stages (its build and scenario runs, all skipped on a cache hit), the
+# candidate's (its build, the test listing of both trees, its scenarios),
+# and the rest, the setup (exports, the socket scan, the static checks).
+# stage_emit is stage.sh's, with the sum kept.
+base_ms=0
+candidate_ms=0
+base_runs=0
+stage_emit() { # <suite> <result> <ms> <name>
+    case "$4" in
+    total) ;;
+    "base: build") base_ms=$((base_ms + $3)) ;;
+    base:*) base_ms=$((base_ms + $3)) base_runs=$((base_runs + 1)) ;;
+    *) candidate_ms=$((candidate_ms + $3)) ;;
+    esac
+    printf '%sstage %s %s %sms %s\n' "${STAGE_PREFIX-}" "$1" "$2" "$3" "$4"
+    if [ -n "${SPAWN_STAGE_LOG-}" ]; then
+        printf '{"suite":"%s","stage":"%s","result":"%s","ms":%s}\n' \
+            "$(stage_json "$1")" "$(stage_json "$4")" "$(stage_json "$2")" "$3" >>"$SPAWN_STAGE_LOG"
+    fi
+}
+times_said=""
+gate_times() {
+    [ -z "$times_said" ] || return 0
+    times_said=1
+    total_ms=$(($(stage_now) - gate_started))
+    echo "| gate time: base $((base_ms / 1000)) s ($base_runs scenario runs," \
+        "$(printf '%s' "${from_cache-}" | wc -w | tr -d ' ') results from the cache)," \
+        "candidate $((candidate_ms / 1000)) s, setup $(((total_ms - base_ms - candidate_ms) / 1000)) s" \
+        "(exports, socket scan, static checks), total $((total_ms / 1000)) s"
+}
 # section <name>: a gate stage starts (and the one before it ends as ok).
 section() {
     stage_open gate "$1"
     echo "| == $1"
 }
-trap 'stage_close aborted; rm -rf "$work"' EXIT
+trap 'stage_close aborted; gate_times; rm -rf "$work"' EXIT
 # Sandboxed git reads this, never the owner's ~/.gitconfig.
 cat >"$work/gitconfig" <<'EOF'
 [user]
@@ -188,6 +219,7 @@ json_string() {
 verdict() {
     # The open section passed unless the verdict is a rejection of it.
     if [ "$1" = accepted ]; then stage_close ok; else stage_close "$1"; fi
+    gate_times
     stage_emit gate "$1" "$(($(stage_now) - gate_started))" total
     json="{\"verdict\":\"$1\""
     [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
@@ -438,7 +470,7 @@ EOF
     # shellcheck disable=SC2086 # host and port
     python3 "$work/test-db-forward.py" "$db_socket" $db_forward </dev/null >/dev/null 2>"$work/test-db-forward.log" &
     db_forwarder=$!
-    trap 'stage_close aborted; kill "$db_forwarder" 2>/dev/null; rm -rf "$work"' EXIT
+    trap 'stage_close aborted; gate_times; kill "$db_forwarder" 2>/dev/null; rm -rf "$work"' EXIT
     waited=0
     while [ ! -S "$db_socket" ]; do
         if ! kill -0 "$db_forwarder" 2>/dev/null || [ "$waited" -ge 100 ]; then
