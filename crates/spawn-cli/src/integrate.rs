@@ -897,12 +897,12 @@ pub(crate) fn landing_message(task: &Task, head: &str) -> String {
 /// section, or the whole report when it has none (or an empty one),
 /// trimmed and cut to [`SUMMARY_CHARS`].
 fn report_summary(report: &str) -> String {
-    let heading = |line: &str| {
+    fn heading(line: &str) -> Option<&str> {
         let level = line.bytes().take_while(|&byte| byte == b'#').count();
         (1..=2)
             .contains(&level)
             .then(|| line[level..].trim().trim_end_matches(':').trim())
-    };
+    }
     let mut lines = report.lines();
     let mut section = None;
     if lines.any(|line| heading(line).is_some_and(|text| text.eq_ignore_ascii_case("what changed")))
