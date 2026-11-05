@@ -1399,25 +1399,49 @@ mod tests {
     use crate::gate::GateFailure;
     use serde_json::json;
 
-    /// Only exit 1 is a conflict: a merge-tree git cannot run (an unknown
-    /// option, a crash, a signal) is an error carrying git's message.
+    /// One gate at a time unless the test server is per gate: more is
+    /// refused without the opt-in, whatever asks for it.
     #[test]
-    fn the_gate_cap_defaults_to_two_and_is_bounded() {
+    fn the_gate_cap_is_one_and_more_needs_a_server_per_gate() {
         use super::{DEFAULT_GATES, MAX_GATES, gate_slots};
-        assert_eq!(gate_slots(None, None), Ok(DEFAULT_GATES));
-        assert_eq!(DEFAULT_GATES, 2);
-        assert_eq!(gate_slots(None, Some("3".into())), Ok(3));
+        let per_gate = || Some("1".to_string());
+        assert_eq!(gate_slots(None, None, None), Ok(1));
+        assert_eq!(DEFAULT_GATES, 1);
+        assert_eq!(gate_slots(Some("1".into()), None, None), Ok(1));
+        for (flag, env) in [(Some("2"), None), (None, Some("3")), (Some("8"), Some("1"))] {
+            let refused = gate_slots(flag.map(Into::into), env.map(Into::into), None);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.contains("SPAWN_TEST_DATABASE_PER_GATE=1")),
+                "{flag:?} {env:?}: {refused:?}"
+            );
+            assert!(
+                gate_slots(
+                    flag.map(Into::into),
+                    env.map(Into::into),
+                    Some("yes".into())
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(gate_slots(None, Some("3".into()), per_gate()), Ok(3));
         assert_eq!(
-            gate_slots(Some("1".into()), Some("3".into())),
+            gate_slots(Some("1".into()), Some("3".into()), per_gate()),
             Ok(1),
             "the flag first"
         );
         for wrong in ["0", "-1", "two", ""] {
-            assert!(gate_slots(Some(wrong.into()), None).is_err(), "{wrong}");
+            assert!(
+                gate_slots(Some(wrong.into()), None, per_gate()).is_err(),
+                "{wrong}"
+            );
         }
-        assert!(gate_slots(None, Some((MAX_GATES + 1).to_string())).is_err());
+        assert!(gate_slots(None, Some((MAX_GATES + 1).to_string()), per_gate()).is_err());
     }
 
+    /// Only exit 1 is a conflict: a merge-tree git cannot run (an unknown
+    /// option, a crash, a signal) is an error carrying git's message.
     #[test]
     fn a_merge_git_cannot_run_is_an_error_not_a_conflict() {
         assert_eq!(
