@@ -1461,8 +1461,28 @@ begin
     return v_id;
 end $$;
 
+-- A close or a retirement cancels, in its fold, the work the closure rule
+-- does not let go on. Its writer then gives each task of `p_open` (the ones
+-- open before the close) that the fold cancelled its own `task.cancelled`
+-- record, so the task's stages end with `cancelled`. The record repeats what
+-- the fold did; the fold itself never appends, so replaying the log gives
+-- the same tables and adds nothing. Called under the append lock.
+create or replace function spawn_task_record_cancelled(p_open bigint[])
+returns void language plpgsql as $$
+declare
+    v_task bigint;
+begin
+    for v_task in
+        select id from mission_tasks where id = any(p_open) and state = 'cancelled' order by id
+    loop
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+    end loop;
+end $$;
+
 create or replace function spawn_mission_close(p_mission bigint, p_state text, p_summary text)
 returns void language plpgsql security definer as $$
+declare
+    v_open bigint[];
 begin
     -- A drop waits for a landing push in flight (spawn_landing_hold), so
     -- the push cannot land work of a mission dropped meanwhile.
@@ -1480,8 +1500,11 @@ begin
     if not exists (select 1 from mission_missions where id = p_mission and state in ('open', 'active')) then
         raise exception 'mission % is not open', p_mission;
     end if;
+    select coalesce(array_agg(id), '{}') into v_open
+      from mission_tasks where mission_id = p_mission and state <> 'cancelled';
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.closed', 'id', p_mission, 'state', p_state, 'summary', p_summary));
+    perform spawn_task_record_cancelled(v_open);
 end $$;
 
 -- Assign one task. A resident must be approved; an ephemeral worker gets a
@@ -1657,6 +1680,8 @@ end $$;
 
 create or replace function spawn_resident_retire(p_name text)
 returns void language plpgsql security definer as $$
+declare
+    v_open bigint[];
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -1666,7 +1691,11 @@ begin
     if not exists (select 1 from mission_residents where name = p_name and state <> 'retired') then
         raise exception 'resident % is already retired', p_name;
     end if;
+    select coalesce(array_agg(k.id), '{}') into v_open
+      from mission_tasks k join mission_residents r on r.agent_id = k.agent_id
+     where r.name = p_name and k.state <> 'cancelled';
     perform spawn_control_record(jsonb_build_object('type', 'resident.retired', 'name', p_name));
+    perform spawn_task_record_cancelled(v_open);
 end $$;
 
 -- Landing settings and halts are a human's (§10.3): the owner's login only.
@@ -2039,6 +2068,37 @@ begin
           join mission_missions m on m.id = k.mission_id
           left join mission_residents r on r.agent_id = k.agent_id
          where not spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)
+         order by k.id
+    loop
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+    end loop;
+end
+$$;
+
+-- Closes and retirements from before their writers recorded what they
+-- cancelled (spawn_task_record_cancelled) left tasks the fold cancelled with
+-- no record of it: their stages end at `assigned`, `delivered` or
+-- `reported`. Each cancelled task whose last `task.%` record closes nothing
+-- is recorded cancelled, once: a task that ends with `task.cancelled` or
+-- `task.aborted` (cancelled over budget) gets none, and neither does a row
+-- from before the control stream (`legacy.imported`, no `task.%` records).
+do $$
+declare
+    v_task bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    for v_task in
+        select k.id from mission_tasks k
+          cross join lateral (
+              select e.kind -> 'detail' -> 'record' ->> 'type' as type
+                from spawn_events e
+               where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                 and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+                 and e.kind -> 'detail' -> 'record' ->> 'type' like 'task.%'
+               order by e.session_seq desc
+               limit 1) last
+         where k.state = 'cancelled'
+           and last.type not in ('task.cancelled', 'task.aborted')
          order by k.id
     loop
         perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
