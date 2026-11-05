@@ -11,7 +11,7 @@
  *             → gate       the gate judges (accept = gate)
  *   reviewed  accepted → gate (with a gate) or done; rejected → sent back
  *   gated     accepted → landing; rejected / conflict → sent back;
- *             stale / aborted → still at the gate (judged again)
+ *             stale / aborted / no_room → still at the gate (judged again)
  *   landed, aborted, cancelled: the bar ends.
  *
  * Sent back, the task waits (`revise`) until it is delivered again, which

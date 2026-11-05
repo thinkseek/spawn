@@ -127,9 +127,17 @@
 #                              when the gate exits 0. The directory is hidden
 #                              from the sandbox.
 #
-# Exit status: 0 with a verdict; anything else is an infrastructure failure
-# (no bwrap, a git error, a killed gate), which the integrator records as
-# an abort.
+# Exit status: 0 with a verdict. 5 means no room to judge now: TMPDIR has
+# less than SPAWN_GATE_MIN_FREE_GB free (scripts/disk.sh gate_room). The
+# gate exits before it makes any scratch or runs any candidate code, after
+# it writes one JSON line to SPAWN_GATE_VERDICT:
+#   {"no_room":true,"free_kb":<n>,"min_gb":<n>,"tmpdir":"<dir>"}
+# When that write fails (no room at all), it still exits 5. The integrator
+# records `no_room` from that exit status with that file, or, with no
+# readable file, from its own measure of TMPDIR under the floor (gate.rs). It is no verdict and does not count toward a mission's halt.
+# Any other status is an infrastructure failure (no bwrap, a git error, a
+# missing bind directory, a bad SPAWN_GATE_MIN_FREE_GB, a killed gate),
+# which the integrator records as an abort that counts.
 
 set -eu
 
@@ -145,7 +153,25 @@ if ! command -v bwrap >/dev/null 2>&1; then
 fi
 
 . "$(dirname "$0")/../disk.sh"
-gate_room || exit 3
+room=0
+gate_room || room=$?
+case $room in
+0) ;;
+2)
+    # No room to judge now: a fact, written where only the integrator reads
+    # it (no candidate code has run), and a status of its own. A disk with
+    # no room at all may refuse the write: the status stays 5, and the
+    # integrator measures the free space itself.
+    if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
+        (printf '{"no_room":true,"free_kb":%s,"min_gb":%s,"tmpdir":"%s"}\n' \
+            "$disk_free" "$disk_min_gb" \
+            "$(printf '%s' "$disk_dir" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')" \
+            >"$SPAWN_GATE_VERDICT") 2>/dev/null || :
+    fi
+    exit 5
+    ;;
+*) exit 3 ;;
+esac
 work=$(gate_scratch)
 # Stage timing in the format every suite shares (scripts/stage.sh): one
 # `| stage gate <result> <ms>ms <name>` line as each section ends, and a
