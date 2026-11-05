@@ -592,7 +592,17 @@ the tree's own:
   - a retired resident's accepted and landing tasks still land;
   - a dropped mission keeps nothing.
 
-  Every other open task is cancelled by the close or the retirement. The
+  Every other open task is cancelled by the close or the retirement, for a
+  done mission as for a dropped one. The fold of `mission.closed` or
+  `resident.retired` cancels it in the tables, and the writer
+  (`spawn_mission_close`, `spawn_resident_retire`) then appends one
+  `task.cancelled` record for each task it cancelled. So `spawn task stages`
+  ends with `cancelled` for every cancelled task, and no reader has to
+  infer the stage. The fold never appends: rebuilding the tables
+  (`spawn_control_refold()`) gives the same tables and adds no record. A
+  database from before this rule gets the missing record once, on
+  migration. This covers each cancelled task whose last `task.%` record is
+  neither `task.cancelled` nor `task.aborted`. The
   integrator's selection uses the same rule, and no transition moves a task
   into a state the rule drops: a send-back is refused, a gate rejection
   cancels the task, and deliveries and reports are not recorded.
