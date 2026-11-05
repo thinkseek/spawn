@@ -1111,3 +1111,95 @@ fn host_disk_records_are_owner_only_facts_the_fold_ignores() {
         "the supervisor records no host facts"
     );
 }
+
+/// The id of every mission the integrator visits.
+fn gated_mission_ids(store: &PostgresStore) -> Vec<i64> {
+    store
+        .gated_missions()
+        .expect("gated")
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|row| row["id"].as_i64())
+        .collect()
+}
+
+fn task_state(client: &mut Client, task: i64) -> String {
+    client
+        .query_one("select state from mission_tasks where id = $1", &[&task])
+        .expect("task")
+        .get(0)
+}
+
+/// Audit L7: a gated mission that accepts by `gate` is closed done while its
+/// task is delivered. The report arrives (the dispatcher still collects it),
+/// the task is `reported`, and that is the state the integrator judges in
+/// this mode, but the integrator never visits the mission again: it visits
+/// done missions only with `accepted` or `landing` work. Nothing else moves
+/// a `reported` task of a `gate` mission, so it is never judged, landed or
+/// cancelled.
+#[test]
+#[ignore = "audit L7 repro"]
+fn a_gate_missions_report_that_arrives_after_done_is_judged_repro() {
+    let (store, schema) = store("control_l7_gate");
+    let mission = store
+        .mission_add("Gate", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    store
+        .mission_close(mission, "done", "shipped")
+        .expect("close");
+    let mut client = admin(&schema);
+    assert_eq!(
+        task_state(&mut client, task),
+        "delivered",
+        "close leaves it"
+    );
+    assert!(store.task_reported(task, "done").expect("reported"));
+    assert_eq!(task_state(&mut client, task), "reported");
+    assert!(
+        gated_mission_ids(&store).contains(&mission),
+        "the integrator never visits mission {mission} again; task {task} stays reported"
+    );
+}
+
+/// Audit L7, the drop: a mission dropped while its task is delivered keeps
+/// the task, which then goes on through report, review and revise, and is
+/// delivered to its worker again, for a mission that no longer exists.
+#[test]
+#[ignore = "audit L7 repro"]
+fn a_dropped_missions_delivered_task_is_cancelled_repro() {
+    let (store, schema) = store("control_l7_drop");
+    let mission = store
+        .mission_add("Drop", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "review", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    store
+        .mission_close(mission, "dropped", "gone")
+        .expect("drop");
+    let mut client = admin(&schema);
+    let after_drop = task_state(&mut client, task);
+    // Walk on, to show where it goes: a report, a send-back, a new delivery.
+    let reported = store.task_reported(task, "done").expect("report");
+    let sent_back = reported && store.task_review(task, false, "again").is_ok();
+    let redelivered = sent_back && store.task_delivered(task, 2).is_ok();
+    let delivered_again = task_state(&mut client, task) == "delivered";
+    assert!(
+        after_drop == "cancelled",
+        "after the drop the task is {after_drop}; reported {reported}, sent back {sent_back}, \
+         delivered again {}",
+        redelivered && delivered_again
+    );
+}

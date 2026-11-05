@@ -365,3 +365,79 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
         );
     }
 }
+
+/// Audit L8: a migration sends each login's derived password as the text of
+/// `alter role ... password '<hex>'`. Held behind another transaction's
+/// update of the role's row, the statement sits in `pg_stat_activity` with
+/// the password in it (readable by superusers and `pg_read_all_stats`), and
+/// the "tuple concurrently updated" error it then hits is logged with its
+/// statement under the default `log_min_error_statement = error`.
+#[test]
+#[ignore = "audit L8 repro"]
+fn a_login_password_never_appears_in_statement_text_repro() {
+    let database = Database::new("roles_l8", None);
+    PostgresStore::connect(&database.url())
+        .expect("connect")
+        .migrate()
+        .expect("the first migration");
+    let real = role_url(&database.url(), "spawn_supervisor").expect("the login's URL");
+    let login = format!("spawn_supervisor_{}", database.name);
+
+    // Hold the role's catalog row in an open transaction.
+    let mut holder = Client::connect(&database.url(), NoTls).expect("holder");
+    let mut transaction = holder.transaction().expect("begin");
+    transaction
+        .batch_execute(&format!("alter role {login} valid until 'infinity'"))
+        .expect("touch the role's row");
+
+    let url = database.url();
+    let migration = std::thread::spawn(move || {
+        PostgresStore::connect(&url)
+            .expect("connect")
+            .migrate()
+            .map_err(|error| error.to_string())
+    });
+
+    // The second migration waits on that row, at its `alter role ... password`.
+    let mut watcher = admin("public");
+    let prefix = format!("alter role \"{login}\" with login password '");
+    let mut seen: Option<String> = None;
+    for _ in 0..200 {
+        seen = watcher
+            .query(
+                "select query from pg_stat_activity where starts_with(query, $1)",
+                &[&prefix],
+            )
+            .expect("pg_stat_activity")
+            .first()
+            .map(|row| row.get(0));
+        if seen.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    transaction.commit().expect("release the row");
+    migration
+        .join()
+        .expect("the migration returns")
+        .expect("the retried migration succeeds");
+
+    let seen = seen.expect("the blocked alter role is in pg_stat_activity");
+    let leaked = seen
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split_once('\''))
+        .map(|(password, _)| password.to_string())
+        .expect("a quoted password");
+    let real_password = real
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .map(|(_, password)| password.to_string())
+        .expect("the login URL's password");
+    // Compare without printing either.
+    assert!(
+        leaked != real_password,
+        "pg_stat_activity showed the supervisor login's real password ({} hex chars)",
+        leaked.len()
+    );
+}
