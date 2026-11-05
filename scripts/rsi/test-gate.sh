@@ -912,6 +912,76 @@ expect "and the log names it" "$(cat "$work/gate.out")" 'toolchain rustc 0.0.1-o
 judge "$good" "" "$keyed" >/dev/null
 expect "the toolchain back: cached again" "$(from_cache)" '007.sh 011.sh'
 
+# The test server's version and the other tools the scenarios run are in
+# the key: a psql first on PATH that answers `-V` and the server's
+# `server_version_num` (asked through libpq's variables, never a URL on its
+# command line) from a file beside it.
+mkdir -p "$work/fake-pg"
+cat >"$work/fake-pg/psql" <<'EOF'
+#!/bin/sh
+here=$(dirname "$0")
+case "$*" in
+-V) cat "$here/client" ;;
+*"server_version_num"*)
+    [ -n "${PGHOST-}" ] && [ -n "${PGDATABASE-}" ] || { echo "no libpq variables" >&2; exit 2; }
+    case "$*" in *postgres:*) echo "a URL on the command line" >&2; exit 2 ;; esac
+    cat "$here/server" ;;
+*) exit 2 ;;
+esac
+EOF
+chmod +x "$work/fake-pg/psql"
+echo 'psql (PostgreSQL) 17.0' >"$work/fake-pg/client"
+echo 170000 >"$work/fake-pg/server"
+with_fake_pg() {
+    saved_path=$PATH
+    PATH=$work/fake-pg:$PATH
+    fake_pg_out=$(judge "$good" "" "${1:-$keyed}")
+    PATH=$saved_path
+}
+with_fake_pg
+expect "the log names the test server's version" "$(cat "$work/gate.out")" 'psql 17.0 server 170000'
+with_fake_pg
+expect "the same server: a hit" "$(from_cache)" '007.sh 011.sh'
+echo 170004 >"$work/fake-pg/server"
+with_fake_pg
+expect "a miss: the test server's version changed" "$fake_pg_out" 'exit=0 {"verdict":"accepted"}'
+expect "both run on the base" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+echo 'psql (PostgreSQL) 17.1' >"$work/fake-pg/client"
+with_fake_pg
+expect "a miss: another psql" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+
+# A hit touches its entry, so routine cleanup keeps the entries in use.
+for entry in "$cache"/*; do touch -d '20 days ago' "$entry"; done
+judge "$good" "" "$keyed" >/dev/null
+expect "a hit" "$(from_cache)" '007.sh 011.sh'
+expect "touches the two entries it used" "$(find "$cache" -type f -newermt '-1 hour' | grep -c .)" '2'
+
+# A helper reached indirectly (a variable after scripts/, or a cd into
+# scripts/ and a relative path) cannot be read off the text: all of the
+# controller's scripts/ is in the key.
+indirect=$HOME/indirect
+mkdir -p "$indirect/rsi/scenarios" "$indirect/scripts/blackbox"
+printf '# helper v1\n' >"$indirect/scripts/blackbox/lib.sh"
+cp "$scenarios/protected" "$scenarios/build" "$indirect/rsi/scenarios/"
+cat >"$indirect/rsi/scenarios/021.sh" <<'EOF'
+#!/bin/sh
+h=blackbox/lib.sh
+. "$(dirname "$0")/../../scripts/$h"
+[ "$(cat value)" != three ]
+EOF
+cat >"$indirect/rsi/scenarios/022.sh" <<'EOF'
+#!/bin/sh
+(cd "$(dirname "$0")/../../scripts" && . ./blackbox/lib.sh) || exit 2
+[ "$(cat value)" != three ]
+EOF
+judge "$good" "" "$indirect/rsi/scenarios" >/dev/null
+judge "$good" "" "$indirect/rsi/scenarios" >/dev/null
+expect "indirect helpers: a hit while nothing changed" "$(from_cache)" '021.sh 022.sh'
+printf '# helper v2\n' >"$indirect/scripts/blackbox/lib.sh"
+judge "$good" "" "$indirect/rsi/scenarios" >/dev/null
+expect "a miss: the helper reached through scripts/\$h or a cd changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 021.sh 022.sh'
+
 # A corrupt entry is a miss: whatever an entry holds but "solved" or
 # "unsolved", an entry that cannot be read, or one that is a directory, is
 # judged again, and rewritten.
