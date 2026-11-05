@@ -1547,6 +1547,8 @@ begin
 end $$;
 
 -- Landing settings and halts are a human's (§10.3): the owner's login only.
+-- The first version took no objectives.
+drop function if exists spawn_mission_configure(bigint, text, text, jsonb);
 create or replace function spawn_mission_configure(p_mission bigint, p_gate text, p_accept text,
                                                    p_budget jsonb, p_objectives jsonb)
 returns void language plpgsql security definer as $$

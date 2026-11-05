@@ -50,6 +50,27 @@ fn constraints(client: &mut Client, schema: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every index (`create index if not exists` keeps an old definition), and
+/// every function by signature, with how it runs.
+fn indexes_and_functions(client: &mut Client, schema: &str) -> Vec<String> {
+    client
+        .query(
+            "select indexdef from pg_indexes where schemaname = $1
+             union all
+             select format('%s(%s) definer=%s %s', p.proname,
+                           pg_get_function_identity_arguments(p.oid), p.prosecdef,
+                           array_to_string(p.proconfig, ','))
+               from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+              where n.nspname = $1
+              order by 1",
+            &[&schema],
+        )
+        .expect("read the indexes and functions")
+        .iter()
+        .map(|row| row.get::<_, String>(0).replace(schema, "<schema>"))
+        .collect()
+}
+
 #[test]
 fn the_first_shape_of_every_table_migrates_to_the_current_columns() {
     let (schema, mut client) = first_shapes("first_shapes");
@@ -86,6 +107,11 @@ fn the_first_shape_of_every_table_migrates_to_the_current_columns() {
         constraints(&mut client, &schema),
         constraints(&mut client, &fresh_schema),
         "every check a fresh schema has"
+    );
+    assert_eq!(
+        indexes_and_functions(&mut client, &schema),
+        indexes_and_functions(&mut client, &fresh_schema),
+        "every index and function a fresh schema has, and no other"
     );
 
     // The rows read through the code: the grant took the default scope, the
