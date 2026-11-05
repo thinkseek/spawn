@@ -613,6 +613,7 @@ impl Integrator {
             return Ok(assigned);
         }
         let judge = self.judge.clone();
+        let task_id = task.id;
         let (store, task, source_owned, mission_id) = (
             Arc::clone(store),
             task.clone(),
@@ -634,18 +635,18 @@ impl Integrator {
                     eprintln!("integrate: mission {mission_id}: {error}");
                 }
             })
-            .map_err(|error| format!("start the judging of task {}: {error}", task.id))?;
+            .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
         println!(
             "integrate: mission {}: judging task {} ({} of {} gates)",
             mission.id,
-            task.id,
+            task_id,
             running + 1,
             self.gates
         );
         self.running.borrow_mut().push(Running {
             mission: mission.id,
             source: source.to_string(),
-            task: task.id,
+            task: task_id,
             handle,
         });
         Ok(assigned)
@@ -2319,20 +2320,20 @@ mod database_tests {
         let a = db.gated_mission(&source_a, &scenarios);
         let b = db.gated_mission(&source_b, &scenarios);
         let c = db.gated_mission(&source_c, &scenarios);
-        let a1 = db.reported_task(a, "a1");
-        let a2 = db.reported_task(a, "a2");
-        let b1 = db.reported_task(b, "b1");
-        let c1 = db.reported_task(c, "c1");
-        let work_a1 = push_work(&base_a, &source_a, &agent_of(&db, a, a1), "a1.txt");
-        let work_a2 = push_work(&base_a, &source_a, &agent_of(&db, a, a2), "a2.txt");
-        let work_b1 = push_work(&base_b, &source_b, &agent_of(&db, b, b1), "b1.txt");
-        let work_c1 = push_work(&base_c, &source_c, &agent_of(&db, c, c1), "c1.txt");
+        let a_one = db.reported_task(a, "a1");
+        let a_two = db.reported_task(a, "a2");
+        let b_task = db.reported_task(b, "b1");
+        let c_task = db.reported_task(c, "c1");
+        let pushed_a_one = push_work(&base_a, &source_a, &agent_of(&db, a, a_one), "a1.txt");
+        let pushed_a_two = push_work(&base_a, &source_a, &agent_of(&db, a, a_two), "a2.txt");
+        let pushed_b = push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
+        let pushed_c = push_work(&base_c, &source_c, &agent_of(&db, c, c_task), "c1.txt");
 
         integrator.pass_on(&db.store).expect("the first pass");
         let first = wait_started(&marks, 2);
         assert_eq!(
             first,
-            vec![work_a1.clone(), work_b1.clone()],
+            vec![pushed_a_one.clone(), pushed_b.clone()],
             "A's first and B's"
         );
         // More passes while both hold: nothing else starts.
@@ -2352,17 +2353,17 @@ mod database_tests {
 
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
-        assert_eq!(source_main(&source_a), work_a1, "A's first landed");
-        assert_eq!(source_main(&source_b), work_b1, "B's landed");
+        assert_eq!(source_main(&source_a), pushed_a_one, "A's first landed");
+        assert_eq!(source_main(&source_b), pushed_b, "B's landed");
         std::fs::remove_file(marks.join("release")).expect("hold again");
 
         integrator.reap();
         integrator.pass_on(&db.store).expect("the next pass");
         let next = wait_started(&marks, 4);
         assert_eq!(next.len(), 4, "A's second and C's: {next:?}");
-        assert_eq!(next[3], work_c1, "C's after A's second: {next:?}");
+        assert_eq!(next[3], pushed_c, "C's after A's second: {next:?}");
         assert_ne!(
-            next[2], work_a2,
+            next[2], pushed_a_two,
             "A's second is merged with the main A's first left"
         );
         std::fs::write(marks.join("release"), "").expect("release");
@@ -2394,21 +2395,25 @@ mod database_tests {
         let db = Db::new("cap_one");
         let a = db.gated_mission(&source_a, &scenarios);
         let b = db.gated_mission(&source_b, &scenarios);
-        let a1 = db.reported_task(a, "a1");
-        let b1 = db.reported_task(b, "b1");
-        let work_a1 = push_work(&base_a, &source_a, &agent_of(&db, a, a1), "a1.txt");
-        let work_b1 = push_work(&base_b, &source_b, &agent_of(&db, b, b1), "b1.txt");
+        let a_one = db.reported_task(a, "a1");
+        let b_task = db.reported_task(b, "b1");
+        let pushed_a_one = push_work(&base_a, &source_a, &agent_of(&db, a, a_one), "a1.txt");
+        let pushed_b = push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
 
         integrator.pass_on(&db.store).expect("a pass");
         integrator.pass_on(&db.store).expect("another pass");
-        assert_eq!(wait_started(&marks, 1), vec![work_a1.clone()]);
+        assert_eq!(wait_started(&marks, 1), vec![pushed_a_one.clone()]);
         std::thread::sleep(std::time::Duration::from_millis(500));
-        assert_eq!(started(&marks), vec![work_a1], "B waits for the one gate");
+        assert_eq!(
+            started(&marks),
+            vec![pushed_a_one],
+            "B waits for the one gate"
+        );
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
         integrator.pass_on(&db.store).expect("the pass after");
         integrator.settle();
-        assert_eq!(started(&marks).last(), Some(&work_b1));
+        assert_eq!(started(&marks).last(), Some(&pushed_b));
         assert_eq!(db.mission(b)["tasks"][0]["state"], "landed");
         for base in [base_a, base_b, marks] {
             let _ = std::fs::remove_dir_all(&base);
