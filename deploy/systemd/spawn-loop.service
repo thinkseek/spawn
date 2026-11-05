@@ -4,7 +4,8 @@ After=spawn-jev-relay.service spawn-model-relay.service docker.service
 Wants=spawn-jev-relay.service spawn-model-relay.service
 
 [Service]
-WorkingDirectory=%h/projects/Spawn
+# Not the owner's checkout: nothing live reads it (deploy/deploy.sh).
+WorkingDirectory=%h/.local/share/spawn-rsi
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=PATH=%h/.cargo/bin:%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Claude Code reaches its API through the local proxy; loopback stays direct.

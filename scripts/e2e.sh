@@ -20,6 +20,8 @@
 #      resumed, a resident stopped by the supervisor stays down.
 #
 # Usage: SPAWN_DATABASE_URL=postgres://... scripts/e2e.sh
+# With SPAWN_TIMING=adversarial it runs under perturbed timing
+# (scripts/timing/timing.sh); SPAWN_TIMING_OUT keeps the perturbation log.
 # Runs in its own schema (dropped afterwards when psql is installed) and its own tmux socket.
 set -euo pipefail
 
@@ -43,6 +45,14 @@ socket="spawn-e2e-$run"
 schema="e2e_$run"
 loop_pid=""
 jev_pid=""
+timing_out=""
+if [ "${SPAWN_TIMING:-}" = adversarial ]; then
+  # shellcheck source=scripts/timing/timing.sh
+  . "$root/scripts/timing/timing.sh"
+  timing_out=${SPAWN_TIMING_OUT:-$work}/timing-e2e
+  timing_enable "$timing_out" "$bin" || { echo "e2e: timing: cannot enable" >&2; exit 2; }
+  bin=$TIMING_SPAWN
+fi
 
 case "$base_url" in
 *\?*) url="$base_url&options=-csearch_path%3D$schema" ;;
@@ -83,6 +93,7 @@ print(hashlib.pbkdf2_hmac("sha256", owner.encode(), salt, 600000).hex())' "$salt
 }
 
 cleanup() {
+  [ -n "$timing_out" ] && timing_report "$timing_out"
   [ -n "$loop_pid" ] && kill "$loop_pid" 2>/dev/null || true
   [ -n "$jev_pid" ] && kill "$jev_pid" 2>/dev/null || true
   "$tmux" -L "$socket" kill-server 2>/dev/null || true
@@ -94,7 +105,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Under adversarial timing a failure keeps its evidence beside the
+# perturbation log: the loop's and the integrator's logs, the engines'
+# argv, and the event log. psql gets its connection from PG* variables
+# (pg_url_parse below), never from a URL on its command line.
+keep_evidence() {
+  [ -n "$timing_out" ] || return 0
+  cp "$work/loop.log" "$work/integrate.log" "$work/argv.log" "$timing_out/" 2>/dev/null || true
+  command -v psql >/dev/null || return 0
+  (
+    export PGHOST=$pg_url_host PGPORT=$pg_url_port PGUSER=$pg_url_user
+    export PGPASSWORD=$pg_url_password PGDATABASE=$pg_url_database
+    export PGOPTIONS="-csearch_path=$schema"
+    psql -X -q -At -F ' | ' -c "select id, to_char(to_timestamp(recorded_at_ms / 1000.0), 'HH24:MI:SS.MS'),
+        session_id, session_seq, source, event_name, left(kind::text, 400)
+        from spawn_events order by id" >"$timing_out/events.txt" 2>&1
+    psql -X -q -At -F ' | ' -c "select id, idempotency_key, session_id, state, succeeded, left(coalesce(error, ''), 200)
+        from spawn_commands order by id" >"$timing_out/commands.txt" 2>&1
+  ) || true
+}
+
 fail() {
+  keep_evidence
   stage_mark e2e fail "$*" >&2
   echo "e2e: FAIL: $*" >&2
   echo "--- loop log (tail)" >&2
@@ -342,15 +374,18 @@ pass "Jev decided the idle prompt; the supervisor got the digest"
 
 # --- 3. the guarded nudge, once --------------------------------------------
 start_worker session_worker_b "E2E:STALL do half"
-nudged_once() {
-  tail_of session_worker_b | jq -e '
-    [.commands[]? | select(.principal == "spawn-dispatch")] | length == 1' >/dev/null
+nudges() {
+  tail_of session_worker_b | jq -r '[.commands[]? | select(.principal == "spawn-dispatch")] | length'
 }
-wait_for 60 "one nudge into worker b" nudged_once
+nudged_once() { [ "$(nudges)" -eq 1 ] 2>/dev/null; }
+# At least one: a second nudge between two polls is checked below, as such,
+# not as a timeout.
+nudged() { [ "$(nudges)" -ge 1 ] 2>/dev/null; }
+wait_for 60 "a nudge into worker b" nudged
 finished_after_nudge() { pane session_worker_b | grep -q 'finished after continue'; }
 wait_for 30 "worker b to finish after the nudge" finished_after_nudge
 sleep 3
-nudged_once || fail "worker b was nudged more than once"
+nudged_once || fail "worker b was nudged $(nudges) times, not once"
 pass "the guarded nudge restarted a stalled worker, once"
 
 # --- 4. HUMAN: question pages despite a confident Jev; human resolves ------
@@ -389,6 +424,18 @@ sup() { SPAWN_DATABASE_URL=$sup_url "$bin" "$@"; }
 board() { sup mission list; }
 task_state() { board | jq -r --argjson id "$1" '.missions[].tasks[] | select(.id == $id) | .state'; }
 state_is() { [ "$(task_state "$1")" = "$2" ]; }
+# state_in <task> <state>...: the task is in one of the states. A wait for a
+# state the loop moves on from by itself must accept the state after it too:
+# a resident's task goes delivered -> reported as soon as the worker reports,
+# which can fall between two polls. Moves only a human or the supervisor
+# makes (reject, accept) are not accepted: this script makes them itself.
+state_in() {
+  local state want
+  state=$(task_state "$1")
+  shift
+  for want in "$@"; do [ "$state" = "$want" ] && return 0; done
+  return 1
+}
 
 mission=$("$bin" mission add --text "E2E mission: prove the mission layer" | jq -r .mission)
 wait_for 60 "the new mission in the supervisor's digest" digest_has missions
@@ -406,7 +453,7 @@ pass "a resident runs only after a human approves the supervisor's proposal"
 
 t1=$(sup task assign --mission "$mission" --kind resident --worker core --brief "E2E:REPORT first" | jq -r .task)
 t2=$(sup task assign --mission "$mission" --kind resident --worker core --brief "E2E:REPORT second" | jq -r .task)
-wait_for 60 "task $t1 to be delivered" state_is "$t1" delivered
+wait_for 60 "task $t1 to be delivered" state_in "$t1" delivered reported
 [ "$(task_state "$t2")" = assigned ] || fail "the resident got two tasks at once"
 wait_for 60 "task $t1's report" state_is "$t1" reported
 wait_for 60 "the report in the supervisor's digest" digest_has session_resident_core
@@ -417,7 +464,7 @@ wait_for 60 "task $t1 to come back after the note" state_is "$t1" reported
 board | jq -e --argjson id "$t1" '.missions[].tasks[] | select(.id == $id) | .revisions == 1 and (.report | test("redo"))' >/dev/null ||
   fail "the revision did not carry the note"
 sup task accept --id "$t1" >/dev/null
-wait_for 60 "task $t2 to be delivered after $t1" state_is "$t2" delivered
+wait_for 60 "task $t2 to be delivered after $t1" state_in "$t2" delivered reported
 wait_for 60 "task $t2's report" state_is "$t2" reported
 sup task accept --id "$t2" >/dev/null
 pass "resident tasks: one at a time, reported, sent back once, accepted"

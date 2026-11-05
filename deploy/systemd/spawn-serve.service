@@ -3,7 +3,8 @@ Description=Spawn: read-only UI and API on the LAN (port 8787)
 After=docker.service
 
 [Service]
-WorkingDirectory=%h/projects/Spawn
+# Not the owner's checkout: nothing live reads it (deploy/deploy.sh).
+WorkingDirectory=%h/.local/share/spawn-rsi
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # The deployed UI build (deploy/deploy.sh installs it), not the checkout's.
