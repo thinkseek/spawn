@@ -202,7 +202,7 @@ mod tests {
             .collect();
         let bytes = Manifest {
             files: vec![LargeFile {
-                path: "big.bin".to_string(),
+                path: "big.bin".into(),
                 mode: 0o100_644,
                 size: chunks.iter().map(|chunk| chunk.len() as u64).sum(),
                 chunks: names.clone(),
