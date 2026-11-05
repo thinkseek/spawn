@@ -2467,4 +2467,120 @@ mod tests {
             );
         }
     }
+
+    /// A store with branch `agent_a` checkpointed once (`start`, holding
+    /// `kept.txt`) and once more with a cancelled task's work (`work`,
+    /// adding `one.txt` and changing `kept.txt`).
+    fn worked(tag: &str) -> (GitWorkspace, WorkspaceId, PathBuf, String, String) {
+        let (_, store, workspace, base) = capped(tag);
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("kept.txt"), "before\n").expect("write");
+        let Commit::Created(start) = store.commit(&workspace, "start").expect("commit") else {
+            panic!("a change");
+        };
+        std::fs::write(directory.join("kept.txt"), "during\n").expect("write");
+        std::fs::write(directory.join("one.txt"), "one\n").expect("write");
+        let Commit::Created(work) = store.commit(&workspace, "work").expect("commit") else {
+            panic!("a change");
+        };
+        (
+            store,
+            workspace,
+            base,
+            start.as_str().to_string(),
+            work.as_str().to_string(),
+        )
+    }
+
+    /// The set-aside is a new commit on top of the head: its tree is the
+    /// start's, it descends from the old head, and the old head (the work)
+    /// stays reachable from the branch. The mounted workspace follows it.
+    #[test]
+    fn a_set_aside_restores_the_start_tree_on_top_of_the_work() {
+        use spawn_core::port::SetAside;
+        let (store, workspace, base, start, work) = worked("set-aside");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let SetAside::Created {
+            commit,
+            kept,
+            files,
+        } = store
+            .set_aside(&branch, Some(&start), "spawn: set aside task #7")
+            .expect("set aside")
+        else {
+            panic!("the work differs from the start");
+        };
+        assert_eq!(kept.as_str(), work, "the old head holds the work");
+        assert_eq!(files, ["kept.txt", "one.txt"]);
+        let repo = base.join("repo");
+        let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
+        assert_eq!(tree(commit.as_str()), tree(&start), "the start's tree");
+        assert_eq!(git(&repo, &["rev-parse", "agent_a"]), commit.as_str());
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("{}^", commit.as_str())]),
+            work,
+            "it descends from the old head"
+        );
+        assert_eq!(git(&repo, &["show", &format!("agent_a~1:one.txt")]), "one");
+        let directory = PathBuf::from(workspace.path());
+        assert!(!directory.join("one.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("kept.txt")).expect("read"),
+            "before\n"
+        );
+        assert_eq!(
+            store.commit(&workspace, "next").expect("commit"),
+            Commit::Unchanged,
+            "the workspace is the branch head"
+        );
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), "again")
+                .expect("again"),
+            SetAside::Unchanged,
+            "a second set-aside finds nothing to set aside"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What the workspace holds and no checkpoint took is committed before
+    /// the set-aside, so it is kept too; a branch not mounted moves alone;
+    /// a start that is no commit of the branch is refused.
+    #[test]
+    fn a_set_aside_keeps_what_no_checkpoint_took_and_refuses_a_foreign_start() {
+        use spawn_core::port::SetAside;
+        let (store, workspace, base, start, work) = worked("set-aside-unsaved");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("late.txt"), "late\n").expect("write");
+        let repo = base.join("repo");
+        let foreign = git(&repo, &["commit-tree", "-m", "foreign", &format!("{start}^{{tree}}")]);
+        assert!(matches!(
+            store.set_aside(&branch, Some(&foreign), "no"),
+            Err(WorkspaceError::Refused { .. })
+        ));
+        let SetAside::Created { kept, .. } = store
+            .set_aside(&branch, Some(&start), "spawn: set aside")
+            .expect("set aside")
+        else {
+            panic!("the work differs from the start");
+        };
+        assert_ne!(kept.as_str(), work, "the unsaved state got a commit of its own");
+        assert_eq!(git(&repo, &["rev-parse", &format!("{}^", kept.as_str())]), work);
+        assert_eq!(git(&repo, &["show", &format!("{}:late.txt", kept.as_str())]), "late");
+        assert!(!directory.join("late.txt").exists());
+
+        // Not mounted: the branch moves, no directory is made.
+        std::fs::write(directory.join("two.txt"), "two\n").expect("write");
+        store.commit(&workspace, "more").expect("commit");
+        store.unmount(&workspace).expect("unmount");
+        assert!(matches!(
+            store.set_aside(&branch, Some(&start), "spawn: set aside"),
+            Ok(SetAside::Created { .. })
+        ));
+        assert!(!directory.exists());
+        let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
+        assert_eq!(tree("agent_a"), tree(&start));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
