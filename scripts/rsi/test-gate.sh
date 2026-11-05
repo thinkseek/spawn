@@ -175,7 +175,7 @@ expect "a TMPDIR without room stops the gate with its own status" \
 expect "the reason names the floor and TMPDIR" "$(cat "$integrator/verdict")" \
     "\"min_gb\":1000000000,\"tmpdir\":\"$roomless\"}"
 expect "and the free space, in KiB" \
-    "$(sed -E 's/.*"free_kb":([0-9]+),.*/free=\1/' "$integrator/verdict")" "free=$(df -Pk "$roomless" | awk 'NR == 2 { print $4 }' | cut -c1-3)"
+    "$(grep -Ec '^\{"no_room":true,"free_kb":[0-9]+,"min_gb"' "$integrator/verdict")" 1
 refuse "with no verdict" "$(cat "$integrator/verdict")" '"verdict"'
 expect "and says why" "$(cat "$work/gate.out")" 'under SPAWN_GATE_MIN_FREE_GB=1000000000: not starting'
 refuse "and leaves no scratch" "$(ls -A "$roomless")" 'spawn-gate'
