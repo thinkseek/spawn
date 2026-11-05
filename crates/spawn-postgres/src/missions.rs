@@ -163,9 +163,21 @@ from (
 ) x";
 
 /// The `no_room` gate records that carry `escalate` (the mission's gate
-/// went without room past the integrator's limit), recorded at or after
-/// `$1` (ms), oldest first, each with its `event_id`, `at_ms` and `mission`.
+/// went without room past the integrator's limit) and that the supervisor
+/// was not told of yet, oldest first, each with its `event_id`, `at_ms` and
+/// `mission`. Told is a record, not a window: a digest that reached the
+/// supervisor carrying the tag `host gate-room-<event_id>` (as
+/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was away
+/// for days is still told once.
 pub(crate) const GATE_ROOM_ESCALATIONS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
 select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms,
                                                   'mission', k.mission_id)
                           order by e.session_seq), '[]'::jsonb)
@@ -176,7 +188,7 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
-   and e.recorded_at_ms >= $1";
+   and not exists (select 1 from told where tag = 'host gate-room-' || e.id)";
 
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
@@ -457,10 +469,10 @@ impl PostgresStore {
         self.query_json(GATED, &[])
     }
 
-    /// The `no_room` gate records that escalate, recorded since `since_ms`
-    /// ([`GATE_ROOM_ESCALATIONS`]).
-    pub fn gate_room_escalations(&self, since_ms: i64) -> Result<Value, StoreError> {
-        self.query_json(GATE_ROOM_ESCALATIONS, &[&since_ms])
+    /// The `no_room` gate records that escalate and were not told to the
+    /// supervisor yet ([`GATE_ROOM_ESCALATIONS`]).
+    pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
+        self.query_json(GATE_ROOM_ESCALATIONS, &[])
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.
