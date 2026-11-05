@@ -12,6 +12,10 @@
   --color-border-strong: var(--border-strong);
   --color-chart-line: var(--chart-line);
   --color-jev: var(--jev);
+  --color-trace-command: var(--trace-command);
+  --color-trace-execution: var(--trace-execution);
+  --color-trace-turn: var(--trace-turn);
+  --color-trace-tool: var(--trace-tool);
 }
 
 :root {
@@ -53,6 +57,15 @@
   --jev: oklch(0.74 0.13 300);
 
   --chart-line: #c6cbd3;
+
+  /* Trace span kinds: the first three categorical slots, in slot order
+   * (blue, orange, aqua), stepped for the dark surface and validated
+   * all-pairs against it. Commands stay neutral: they are the frame the
+   * rest hangs from. Failure is never one of these — it is --destructive. */
+  --trace-execution: #3987e5;
+  --trace-turn: #d95926;
+  --trace-tool: #199e70;
+  --trace-command: #8b929c;
   --terminal: #08090b;
   --terminal-foreground: #cfd3d9;
 
@@ -116,4 +129,33 @@ code,
 kbd {
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "calt" 0;
+}
+
+/* The same kinds stepped for a light surface, for a light theme scope. */
+[data-theme="light"] {
+  --trace-execution: #2a78d6;
+  --trace-turn: #eb6834;
+  --trace-tool: #1baf7a;
+  --trace-command: #8a8f98;
+}
+
+/* The live edge of a span that has not ended: a slow breath, not a blink. */
+@keyframes spawn-live-edge {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.animate-live-edge {
+  animation: spawn-live-edge 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-live-edge {
+    animation: none;
+  }
 }
