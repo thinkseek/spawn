@@ -124,7 +124,7 @@ fn model_relay() -> Option<ModelRelay> {
     let url = env_value("SPAWN_MODEL_RELAY").filter(|url| url != "off")?;
     Some(ModelRelay {
         url: url.trim_end_matches('/').to_string(),
-        cheap_model: env_or("SPAWN_CHEAP_MODEL", "deepseek-v4-pro"),
+        cheap_model: env_or("SPAWN_CHEAP_MODEL", "deepseek-flash"),
         small_model: env_or("SPAWN_SMALL_MODEL", "deepseek-flash"),
     })
 }
