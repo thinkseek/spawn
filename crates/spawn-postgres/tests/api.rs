@@ -1568,3 +1568,87 @@ fn migrations_racing_on_one_server_all_succeed() {
         result.expect("every racing migration succeeds");
     }
 }
+
+/// M15: a revival whose engine dies right after it launched counts as no
+/// failure: the resume command succeeded, and only failed commands since
+/// the last execution started are counted. The backoff and the handoff
+/// after three failed resumes never engage.
+#[test]
+#[ignore = "audit M15 repro"]
+fn m15_a_revival_that_dies_at_once_counts_as_a_failure_repro() {
+    let (store, _schema) = store("revival_storm");
+    let reviver = "spawn-supervise";
+    let run = |number: u64, command: CommandId| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:started"),
+                EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: command,
+                    fork: None,
+                    model: ModelProfile::Default,
+                },
+            ))
+            .expect("started");
+        store
+            .append(lifecycle(
+                &execution,
+                Source::Bridge,
+                &format!("exec_{number}:ended"),
+                EventKind::ExecutionEnded {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                },
+            ))
+            .expect("ended");
+    };
+    let revive = |key: &str| {
+        let command = store
+            .submit(
+                &Principal::new(reviver).expect("valid principal"),
+                &Submission {
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                    ..start(session(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the resume");
+        store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("the engine launched");
+        command
+    };
+    let first = store
+        .submit(
+            &Principal::new("human").expect("valid"),
+            &start(session(), "first"),
+        )
+        .expect("submit");
+    let claimed = store
+        .claim("bridge", Duration::from_mins(1))
+        .expect("claim")
+        .expect("start");
+    store.finish(&claimed, &Outcome::Succeeded).expect("finish");
+    run(1, first);
+    // Three revivals, each lost the moment it launched.
+    for attempt in 2..=4 {
+        let command = revive(&format!("revive-{attempt}"));
+        run(attempt, command);
+    }
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert!(
+        facts.failures >= 3,
+        "three revivals died at once; counted {}",
+        facts.failures
+    );
+}
