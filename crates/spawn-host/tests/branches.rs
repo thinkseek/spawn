@@ -484,6 +484,59 @@ fn the_merge_rules_come_from_mains_gitattributes() {
     ));
 }
 
+#[test]
+fn a_large_blob_from_main_stays_a_blob_and_survives_the_landing() {
+    let fixture = Fixture::new("large-from-main", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    // Main takes a 9 MiB file as a plain blob, from outside Spawn.
+    let large = vec![7_u8; 9 << 20];
+    fs::write(fixture.checkout.join("weights.bin"), &large).expect("write on main");
+    let main = fixture.land(&[]);
+    let blob = git(&fixture.checkout, &["rev-parse", "main:weights.bin"]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Merged { .. }
+    ));
+    assert_eq!(
+        fs::read(directory.join("weights.bin")).expect("merged"),
+        large
+    );
+
+    // A checkpoint keeps it a blob in the branch's tree.
+    let head = fixture.work(&workspace, &[("work.txt", "more\n")]);
+    assert_eq!(
+        git(
+            &fixture.checkout,
+            &["rev-parse", &format!("{head}:weights.bin")]
+        ),
+        blob
+    );
+    let message = git(&fixture.checkout, &["show", "-s", "--format=%B", &head]);
+    assert!(!message.contains("Spawn-Large"), "{message}");
+
+    // Landed (main moves to the branch head), main still has it.
+    git(&fixture.checkout, &["merge", "-q", "--ff-only", &head]);
+    assert_ne!(fixture.head("main"), main);
+    assert_eq!(
+        git(&fixture.checkout, &["rev-parse", "main:weights.bin"]),
+        blob
+    );
+
+    // A large file the agent made itself still goes to the chunk store.
+    fs::write(directory.join("own.bin"), &large).expect("write a large file");
+    let own = fixture.work(&workspace, &[]);
+    let message = git(&fixture.checkout, &["show", "-s", "--format=%B", &own]);
+    assert!(message.contains("Spawn-Large"), "{message}");
+    assert_eq!(
+        git(
+            &fixture.checkout,
+            &["ls-tree", "--name-only", &own, "own.bin"]
+        ),
+        ""
+    );
+}
+
 /// Put a manifest of one large file at `path` (a few bytes of content) in
 /// the store's chunk directory, and make the branch head name it, as a
 /// checkpoint with a large file does. Returns the manifest's name.
