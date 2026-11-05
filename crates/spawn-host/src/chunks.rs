@@ -764,6 +764,24 @@ impl HeldDirectory {
     }
 }
 
+/// Remove the large file at `path` under `directory`, its parent
+/// directories walked as [`materialize`] walks them, so a symlink in the
+/// way fails instead of leading the removal out of the workspace. A file
+/// that is not there is fine.
+pub fn remove_large(directory: &Path, path: &TreePath) -> Result<(), String> {
+    if !path.is_safe() {
+        return Err(format!("unsafe path {path}"));
+    }
+    let parent = HeldDirectory::parent_of(directory, path)?;
+    match rustix::fs::unlinkat(&parent.descriptor, path.file_name(), AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(error) => Err(format!(
+            "remove {}: {error}",
+            directory.join(path.as_path()).display()
+        )),
+    }
+}
+
 /// Write `file` under `directory` from `store`, atomically and inside the
 /// workspace only ([`HeldDirectory::write`]): on any error the target is
 /// left untouched.

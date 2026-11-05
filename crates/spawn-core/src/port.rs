@@ -91,6 +91,13 @@ pub enum WorkspaceError {
     Unavailable(String),
 }
 
+/// The [`WorkspaceError::Refused`] code of a checkpoint of a workspace that
+/// can no longer follow its branch (another writer moved the branch under a
+/// merge, and the directory differs from both sides). The store has kept the
+/// directory's state off the branch before refusing, so nothing is lost by
+/// unmounting it; the execution cannot checkpoint again and is ended.
+pub const WORKSPACE_STALE: &str = "WorkspaceStale";
+
 /// Result of a workspace commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Commit {
