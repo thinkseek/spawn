@@ -582,6 +582,21 @@ the tree's own:
   the base commit and the scenario, build hook, controller helpers and gate
   hashes; candidate code cannot see or write the cache, but any process of
   the same uid outside the sandbox can (the same-uid limit).
+- **Exit status.** The gate exits 0 with a verdict. It exits 5 when it has
+  no room to judge now: `TMPDIR` has less than `SPAWN_GATE_MIN_FREE_GB`
+  free (`scripts/disk.sh` `gate_room`). In that case it first writes the
+  fact `{"no_room":true,"free_kb","min_gb","tmpdir"}` to the verdict file,
+  before any scratch is made or any candidate code runs. On a disk with no
+  room at all, that write may fail, and the gate still exits 5. The
+  integrator reads `no_room` from exit 5 together with the fact (`gate.rs`).
+  Without a readable fact, it measures the free space itself (`df`), and it
+  records `no_room` with its own measurement only when that is under the
+  floor. It does this in two cases: the gate exited 5 (it measures the
+  gate's `TMPDIR`), or the integrator could not create or use its private
+  directory for the gate (it measures that directory's parent). Any other
+  status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
+  `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
+  a timeout or a signal.
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
@@ -640,7 +655,25 @@ record of what was judged (§14 of design.md).
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
   3. runs the gate, with a 45-minute wall clock;
-  4. records `task.gated` (verdict, log, metric) before git moves;
+  4. records `task.gated` (verdict, log, metric) before git moves. A gate
+     that had no room (exit 5 with its fact, §10.2) is gated `no_room`. This
+     is no verdict on the work. The task stays where it was, and the record
+     names the reason, `free_kb`, `min_gb` and `tmpdir`. It moves neither
+     `gate_aborts` nor `gate_rejections`, so a disk that another project
+     filled halts no mission. The fold keeps the mission's current run of
+     them, which belongs to one task (`gate_room_task`, `gate_room_since_ms`,
+     `gate_room_last_ms`, `gate_room_waits`, `gate_room_escalated`). These
+     end the run: a gate that judges, conflicts or aborts, the task leaving
+     the gate (`task.cancelled`, `task.aborted`), or `mission.resumed`. A
+     `stale` leaves it. A `no_room` on another task starts a new run, with
+     no inherited age, backoff or escalation. The integrator tries that task
+     again only after a backoff from the latest `no_room`: 5 minutes,
+     doubled each time, at most 40. The first `no_room` more than 2 hours
+     into a run carries `escalate`. The dispatcher's digest takes that
+     record to the supervisor, with the free space and `TMPDIR` ("no room
+     for the gate on this host"). It stays pending until a delivered digest
+     carries its tag (`host gate-room-<event>`), however long that takes, so
+     it is told once.
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
@@ -674,7 +707,7 @@ record of what was judged (§14 of design.md).
   cancels the task, and deliveries and reports are not recorded.
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
-  - three gate aborts in a row;
+  - three gate aborts in a row (`no_room` is not an abort);
   - the scenario count below its floor (the most scenarios a gate run of
     the mission has counted since it was configured or last resumed);
   - the source's `main` not where the last landing left it.

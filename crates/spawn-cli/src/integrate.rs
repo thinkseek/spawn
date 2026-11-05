@@ -40,6 +40,18 @@
 //!    rejection is counted, nothing reaches the worker, and a later pass
 //!    judges again. An agent with neither a checkpoint nor a pushed branch
 //!    has no branch to land;
+//!
+//!    **No room is not a verdict.** A gate that finds TMPDIR short of room
+//!    (exit [`gate::NO_ROOM_EXIT`] with its no-room fact,
+//!    [`GateFailure::NoRoom`]) is gated `no_room`: the task stays where it
+//!    was, the verdict names the free space and TMPDIR, and neither the
+//!    abort nor the rejection count moves. The store folds the mission's
+//!    run of them (`gate_room_*`); the next try waits [`room_backoff`] after
+//!    the latest, and the first `no_room` more than [`ROOM_ESCALATE_AFTER`]
+//!    into a run carries `escalate`, which the dispatcher's digest takes to
+//!    the supervisor once ([`crate::disk::gate_room_escalations`]). Every
+//!    other gate failure, the gate's own exit 3 included (a missing bind
+//!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
 //! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
@@ -72,6 +84,17 @@ use crate::{main_merge, objectives, sources};
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
+
+/// The wait before the first retry of a gate that had no room; it doubles
+/// with each `no_room` in a row, up to [`ROOM_BACKOFF_MAX`].
+const ROOM_BACKOFF: Duration = Duration::from_mins(5);
+
+/// The longest wait between two tries of a gate that had no room.
+const ROOM_BACKOFF_MAX: Duration = Duration::from_mins(40);
+
+/// How long a mission's gate may go without room before the supervisor is
+/// told, once per run.
+const ROOM_ESCALATE_AFTER: Duration = Duration::from_hours(2);
 
 /// Wall clock of one gate run: two builds, clippy, the tests, the e2e and
 /// the black-box scenarios fit well inside it.
@@ -118,6 +141,20 @@ pub(crate) struct Mission {
     pub(crate) gate_rejections: u32,
     #[serde(default)]
     pub(crate) gate_aborts: u32,
+    /// The mission's current run of `no_room` gate outcomes, folded by the
+    /// store: the task it is about (a run is one task's; it ends when that
+    /// task leaves the gate), when it began, when the latest was recorded,
+    /// how many, and whether one carried `escalate`.
+    #[serde(default)]
+    pub(crate) gate_room_task: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_since_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_last_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_waits: u32,
+    #[serde(default)]
+    pub(crate) gate_room_escalated: bool,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
@@ -191,6 +228,66 @@ pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
         ));
     }
     None
+}
+
+/// The wait after the `waits`-th `no_room` in a row: [`ROOM_BACKOFF`],
+/// doubled each time, at most [`ROOM_BACKOFF_MAX`]. None before the first.
+pub(crate) fn room_backoff(waits: u32) -> Duration {
+    if waits == 0 {
+        return Duration::ZERO;
+    }
+    ROOM_BACKOFF
+        .saturating_mul(2u32.saturating_pow(waits - 1))
+        .min(ROOM_BACKOFF_MAX)
+}
+
+/// How long `task`'s gate still waits for room at `now_ms`, read from the
+/// store's record of its latest `no_room` (never from memory). None when the
+/// gate may run: also when the mission's run is another task's, which never
+/// lends its backoff.
+pub(crate) fn room_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Duration> {
+    if mission.gate_room_task != Some(task) {
+        return None;
+    }
+    let last = mission.gate_room_last_ms?;
+    let backoff = i64::try_from(room_backoff(mission.gate_room_waits).as_millis()).ok()?;
+    let left = last.saturating_add(backoff).saturating_sub(now_ms);
+    (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
+}
+
+/// The record of a gate that had no room to judge `task`, at `now_ms`: the
+/// reason with the free space and TMPDIR, the facts themselves, and
+/// `escalate` when the run of them on this task began more than
+/// [`ROOM_ESCALATE_AFTER`] ago and none escalated yet. Another task's run
+/// gives it no age.
+pub(crate) fn no_room(
+    mission: &Mission,
+    task: i64,
+    free_kb: u64,
+    min_gb: u64,
+    tmpdir: &str,
+    log: &str,
+    now_ms: i64,
+) -> Value {
+    let after = i64::try_from(ROOM_ESCALATE_AFTER.as_millis()).unwrap_or(i64::MAX);
+    let escalate = mission.gate_room_task == Some(task)
+        && !mission.gate_room_escalated
+        && mission
+            .gate_room_since_ms
+            .is_some_and(|since| now_ms.saturating_sub(since) > after);
+    #[allow(clippy::cast_precision_loss)]
+    let free_gib = free_kb as f64 / 1_048_576.0;
+    json!({
+        "reason": format!(
+            "no room to judge now: {free_gib:.1} GiB free in {tmpdir} (TMPDIR), under \
+             SPAWN_GATE_MIN_FREE_GB={min_gb}; not a verdict, judged again later"
+        ),
+        "free_kb": free_kb,
+        "min_gb": min_gb,
+        "tmpdir": tmpdir,
+        "log": log,
+        "escalate": escalate,
+    })
 }
 
 /// Whether a delivered task ran past its mission's budget
@@ -460,7 +557,17 @@ impl Integrator {
         let Some(task) = mission.ready() else {
             return Ok(assigned);
         };
-        let judged = self.judge(store, &mirror, source, &main, &scenarios, count, task)?;
+        // The gate had no room last time: wait out the backoff, then try.
+        if let Some(wait) = room_wait(mission, task.id, now_ms()) {
+            println!(
+                "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
+                mission.id,
+                task.id,
+                wait.as_secs()
+            );
+            return Ok(assigned);
+        }
+        let judged = self.judge(store, &mirror, source, &main, mission, count, task)?;
         Ok(judged || assigned)
     }
 
@@ -540,7 +647,7 @@ impl Integrator {
         mirror: &Path,
         source: &str,
         main: &str,
-        scenarios: &Path,
+        mission: &Mission,
         count: u32,
         task: &Task,
     ) -> Result<bool, String> {
@@ -563,7 +670,7 @@ impl Integrator {
             mirror,
             source,
             main,
-            scenarios,
+            mission,
             count,
             task,
             branch.as_deref(),
@@ -580,11 +687,12 @@ impl Integrator {
         mirror: &Path,
         source: &str,
         main: &str,
-        scenarios: &Path,
+        mission: &Mission,
         count: u32,
         task: &Task,
         branch: Option<&str>,
     ) -> Result<(), String> {
+        let scenarios = Path::new(&mission.gate);
         // Read only: the integrator never commits a workspace.
         let repo = GitWorkspace::new(mirror, &self.root);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
@@ -689,6 +797,16 @@ impl Integrator {
                 land(store, mirror, source, &landing)
             }
             Ok(verdict) => rejected(&verdict.reason, &verdict.output),
+            // No room in TMPDIR: a fact about the host, never a count.
+            Err(GateFailure::NoRoom {
+                free_kb,
+                min_gb,
+                tmpdir,
+                log,
+            }) => gated(
+                "no_room",
+                no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms()),
+            ),
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
@@ -865,7 +983,16 @@ fn aborted(failure: &GateFailure) -> Value {
         GateFailure::Aborted { reason, log } => {
             json!({"reason": format!("the gate failed: {reason}"), "log": log})
         }
+        // Recorded as `no_room` by the caller; counted here only if a
+        // caller forgets that.
+        GateFailure::NoRoom { tmpdir, log, .. } => {
+            json!({"reason": format!("the gate had no room in {tmpdir}"), "log": log})
+        }
     }
+}
+
+fn now_ms() -> i64 {
+    spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
 /// Move the source's default branch from the task's base to its candidate,
@@ -1036,8 +1163,8 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree,
-        over_budget, pinned, task_scenario,
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, no_room,
+        over_budget, pinned, room_backoff, room_wait, task_scenario,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
@@ -1798,6 +1925,84 @@ mod tests {
         assert_eq!(halt_reason(&mission(0, 0, 0), 0), None, "no floor yet");
     }
 
+    const MINUTE: i64 = 60_000;
+
+    #[test]
+    fn no_room_backs_off_doubling_to_a_cap() {
+        let minutes: Vec<u64> = (0..=6)
+            .map(|waits| room_backoff(waits).as_secs() / 60)
+            .collect();
+        assert_eq!(minutes, [0, 5, 10, 20, 40, 40, 40]);
+        assert_eq!(room_backoff(u32::MAX).as_secs(), 40 * 60, "no overflow");
+    }
+
+    #[test]
+    fn the_gate_waits_out_its_backoff_from_the_recorded_no_room() {
+        let mut waiting = mission(0, 0, 0);
+        assert_eq!(
+            room_wait(&waiting, 4, 0),
+            None,
+            "no run of no_room: judge now"
+        );
+        waiting.gate_room_task = Some(4);
+        waiting.gate_room_since_ms = Some(100 * MINUTE);
+        waiting.gate_room_last_ms = Some(110 * MINUTE);
+        waiting.gate_room_waits = 2;
+        assert_eq!(
+            room_wait(&waiting, 4, 112 * MINUTE).map(|wait| wait.as_secs()),
+            Some(8 * 60)
+        );
+        assert_eq!(room_wait(&waiting, 4, 120 * MINUTE), None, "backoff over");
+        assert_eq!(
+            room_wait(&waiting, 5, 112 * MINUTE),
+            None,
+            "another task does not inherit the backoff"
+        );
+    }
+
+    #[test]
+    fn no_room_names_the_reason_and_the_free_space_and_escalates_once_after_two_hours() {
+        let mut waiting = mission(0, 2, 0);
+        let first = no_room(
+            &waiting,
+            4,
+            3 * 1_048_576 + 104_858,
+            10,
+            "/data/tmp",
+            "log",
+            0,
+        );
+        assert_eq!(
+            first["reason"],
+            "no room to judge now: 3.1 GiB free in /data/tmp (TMPDIR), under \
+             SPAWN_GATE_MIN_FREE_GB=10; not a verdict, judged again later"
+        );
+        assert_eq!(first["free_kb"], 3 * 1_048_576 + 104_858);
+        assert_eq!(first["tmpdir"], "/data/tmp");
+        assert_eq!(first["min_gb"], 10);
+        assert_eq!(first["escalate"], false, "the first of a run");
+        waiting.gate_room_task = Some(4);
+        waiting.gate_room_since_ms = Some(0);
+        let at = |mission: &Mission, minutes: i64| {
+            no_room(mission, 4, 1, 10, "/t", "", minutes * MINUTE)["escalate"].clone()
+        };
+        assert_eq!(
+            no_room(&waiting, 5, 1, 10, "/t", "", 500 * MINUTE)["escalate"],
+            false,
+            "a later task's first no_room starts its own run"
+        );
+        assert_eq!(
+            at(&waiting, 120),
+            false,
+            "two hours exactly is not more than two"
+        );
+        assert_eq!(at(&waiting, 121), true);
+        waiting.gate_room_escalated = true;
+        assert_eq!(at(&waiting, 500), false, "told once per run");
+        // And it never counts toward the halt the mission already nears.
+        assert_eq!(halt_reason(&waiting, 0), None);
+    }
+
     #[test]
     fn a_budget_bounds_minutes_and_tool_calls() {
         let budget = json!({"minutes": 45, "tool_calls": 60});
@@ -2213,6 +2418,253 @@ mod database_tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("never lands")),
             "halted: {halted}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn gated(db: &Db, mission: i64) -> super::Mission {
+        let missions: Vec<super::Mission> =
+            serde_json::from_value(db.store.gated_missions().expect("gated")).expect("missions");
+        missions
+            .into_iter()
+            .find(|found| found.id == mission)
+            .expect("the mission")
+    }
+
+    /// Task 40: the fold. `no_room` keeps the task where it was, names the
+    /// free space, moves neither the abort nor the rejection count, and
+    /// folds the mission's run of them; a gate that judged ends the run, and
+    /// a real abort still counts.
+    #[test]
+    fn no_room_counts_toward_no_halt_and_a_real_abort_still_does() {
+        let (base, source, scenarios, _) = world("no-room-fold", "exit 1\n");
+        let db = Db::new("no_room_fold");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let no_room = |escalate: bool| {
+            json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "no_room",
+                   "reason": "no room to judge now", "free_kb": 1024, "min_gb": 10,
+                   "tmpdir": "/data/tmp", "log": "! gate: short", "escalate": escalate})
+        };
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "aborted", "reason": "a gate that died"}));
+        for _ in 0..4 {
+            db.record(&no_room(false));
+        }
+        db.record(&no_room(true));
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_aborts, 1, "no_room moves no abort count");
+        assert_eq!(after.gate_rejections, 0);
+        assert_eq!(after.gate_room_waits, 5);
+        assert!(after.gate_room_escalated);
+        assert!(after.gate_room_since_ms.is_some() && after.gate_room_last_ms.is_some());
+        assert_eq!(
+            after.tasks[0].state,
+            spawn_core::mission::TaskState::Reported
+        );
+        assert!(after.halted.is_none());
+        assert_eq!(after.gate_room_task, Some(task));
+        let escalations = db.store.gate_room_escalations().expect("escalations");
+        assert_eq!(
+            escalations.as_array().map(Vec::len),
+            Some(1),
+            "{escalations}"
+        );
+        assert_eq!(escalations[0]["mission"], mission);
+        assert_eq!(escalations[0]["free_kb"], 1024);
+        // Told is a record: a digest that reached the supervisor with the
+        // item's tag, however long ago. Until then it stays, whatever its age.
+        let tag = format!("host gate-room-{}", escalations[0]["event_id"]);
+        let digest = |key: &str, succeeded: bool| {
+            db.admin()
+                .execute(
+                    "insert into spawn_commands (principal, idempotency_key, agent_id, session_id,
+                                                 action, state, succeeded, created_at_ms)
+                     values ('spawn-dispatch', $1, 'agent_supervisor', 'session_supervisor',
+                             jsonb_build_object('type', 'input', 'text', 'digest',
+                                                'tags', jsonb_build_array($2::text)),
+                             'finished', $3, 0)",
+                    &[&key, &tag, &succeeded],
+                )
+                .expect("a digest");
+        };
+        digest("dispatch-digest-failed", false);
+        assert_eq!(
+            db.store
+                .gate_room_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "a digest that failed told nothing"
+        );
+        digest("dispatch-digest-told", true);
+        assert_eq!(
+            db.store
+                .gate_room_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "told once, by its record"
+        );
+
+        // A no_room that names no free space or TMPDIR is refused.
+        assert!(
+            db.store
+                .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                           "verdict": "no_room", "reason": "?"}))
+                .is_err()
+        );
+
+        // Two more real aborts make three in a row: the halt still fires.
+        for _ in 0..2 {
+            db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                              "verdict": "aborted", "reason": "bind dir missing"}));
+        }
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_aborts, 3);
+        assert_eq!(after.gate_room_waits, 0, "a gate that ran ends the run");
+        assert!(after.gate_room_since_ms.is_none() && !after.gate_room_escalated);
+        assert!(super::halt_reason(&after, 0).is_some_and(|reason| reason.contains("aborts")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Task 40 review: a run of `no_room` is one task's. The task leaving
+    /// the gate (cancelled, aborted over budget) ends it, and a later task's
+    /// first `no_room` starts a new run: no inherited age, backoff or
+    /// escalation.
+    #[test]
+    fn a_task_leaving_the_gate_ends_its_run_of_no_room() {
+        let (base, source, scenarios, _) = world("no-room-leaves", "exit 1\n");
+        let db = Db::new("no_room_leaves");
+        let mission = db.gated_mission(&source, &scenarios);
+        let no_room = |task: i64, escalate: bool| {
+            json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "no_room",
+                   "reason": "no room", "free_kb": 0, "min_gb": 10, "tmpdir": "/t",
+                   "escalate": escalate})
+        };
+        let first = db.reported_task(mission, "a");
+        for escalate in [false, false, true] {
+            db.record(&no_room(first, escalate));
+        }
+        let before = gated(&db, mission);
+        assert_eq!(
+            (
+                before.gate_room_task,
+                before.gate_room_waits,
+                before.gate_room_escalated
+            ),
+            (Some(first), 3, true)
+        );
+        db.store.task_cancel(first).expect("cancel");
+        let after = gated(&db, mission);
+        assert_eq!(
+            (
+                after.gate_room_task,
+                after.gate_room_waits,
+                after.gate_room_escalated
+            ),
+            (None, 0, false),
+            "cancelled: the run ends"
+        );
+        assert!(after.gate_room_since_ms.is_none() && after.gate_room_last_ms.is_none());
+
+        // A no_room on another task, while the run's task still waits (or
+        // left without a record), starts a new run too.
+        let second = db.reported_task(mission, "b");
+        db.record(&no_room(second, true));
+        let third = db.reported_task(mission, "c");
+        db.record(&no_room(third, false));
+        let after = gated(&db, mission);
+        assert_eq!(
+            (
+                after.gate_room_task,
+                after.gate_room_waits,
+                after.gate_room_escalated
+            ),
+            (Some(third), 1, false),
+            "another task's no_room starts a new run"
+        );
+        assert_eq!(after.gate_room_since_ms, after.gate_room_last_ms);
+        assert_eq!(super::room_wait(&after, second, i64::MAX), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Task 40, end to end: a gate that exits 5 with its no-room fact is
+    /// recorded `no_room` with the free space, the task stays reported, and
+    /// the next pass waits out the backoff instead of running the gate.
+    #[test]
+    fn a_gate_without_room_is_recorded_no_room_and_retried_later() {
+        let gate = "echo 'gate: 0.0 GiB free' >&2\n\
+                    printf '{\"no_room\":true,\"free_kb\":2048,\"min_gb\":10,\"tmpdir\":\"/data/tmp\"}\\n' \
+                    >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo ran >>\"$(dirname \"$0\")/runs\"\n\
+                    exit 5\n";
+        let (base, source, scenarios, integrator) = world("no-room-pass", gate);
+        let db = Db::new("no_room_pass");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent_id = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let clone = base.join("agent");
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &clone_path]).expect("clone");
+        std::fs::write(clone.join("work.txt"), "work\n").expect("write");
+        super::tests::commit_in(&clone_path, "work");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/spawn/{agent_id}"),
+        ])
+        .expect("push the agent's branch");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.pass_on(&db.store).expect("a second pass");
+        let runs = std::fs::read_to_string(base.join("runs")).expect("the gate ran");
+        assert_eq!(
+            runs.lines().count(),
+            1,
+            "the second pass waits out the backoff"
+        );
+        let after = gated(&db, mission);
+        assert_eq!(
+            after.tasks[0].state,
+            spawn_core::mission::TaskState::Reported
+        );
+        assert_eq!((after.gate_aborts, after.gate_rejections), (0, 0));
+        assert_eq!(after.gate_room_waits, 1);
+        let record: Value = db
+            .admin()
+            .query_one(
+                "select kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                  order by session_seq desc limit 1",
+                &[],
+            )
+            .expect("the verdict")
+            .get(0);
+        assert_eq!(record["id"], task);
+        assert_eq!(record["verdict"], "no_room");
+        assert_eq!(record["free_kb"], 2048);
+        assert_eq!(record["tmpdir"], "/data/tmp");
+        assert_eq!(record["escalate"], false);
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("0.0 GiB free in /data/tmp")),
+            "{record}"
+        );
+        assert!(
+            record["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("! gate: 0.0 GiB free"))
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -1049,6 +1049,18 @@ create table if not exists mission_missions (
     scenario_floor  integer not null default 0,
     gate_rejections integer not null default 0,
     gate_aborts     integer not null default 0,
+    -- The gate's current run of `no_room` outcomes (TMPDIR short of room,
+    -- scripts/disk.sh) on one task, `gate_room_task`: when the first and
+    -- the latest were recorded, how many, and whether one of them escalated
+    -- to the supervisor. No verdict on the work, so it counts toward no
+    -- halt. A gate that judged (or aborted) ends the run, and so does its
+    -- task leaving the gate (cancelled, aborted); a `no_room` on another
+    -- task starts a new one.
+    gate_room_task     bigint,
+    gate_room_since_ms bigint,
+    gate_room_last_ms  bigint,
+    gate_room_waits    integer not null default 0,
+    gate_room_escalated boolean not null default false,
     -- An objective mission (§10.4): `{"backlog": <dir>, "resident": <name>}`.
     objectives      jsonb
 );
@@ -1107,6 +1119,11 @@ alter table mission_missions add column if not exists halted text;
 alter table mission_missions add column if not exists scenario_floor integer not null default 0;
 alter table mission_missions add column if not exists gate_rejections integer not null default 0;
 alter table mission_missions add column if not exists gate_aborts integer not null default 0;
+alter table mission_missions add column if not exists gate_room_task bigint;
+alter table mission_missions add column if not exists gate_room_since_ms bigint;
+alter table mission_missions add column if not exists gate_room_last_ms bigint;
+alter table mission_missions add column if not exists gate_room_waits integer not null default 0;
+alter table mission_missions add column if not exists gate_room_escalated boolean not null default false;
 alter table mission_missions add column if not exists objectives jsonb;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
@@ -1241,7 +1258,10 @@ begin
         -- the scenario count as the new floor: a human who resumes has seen
         -- the scenarios as they are (only the owner changes them).
         update mission_missions set halted = null, baseline = null, gate_rejections = 0,
-                                    gate_aborts = 0, scenario_floor = 0, updated_at_ms = p_at
+                                    gate_aborts = 0, scenario_floor = 0, gate_room_task = null,
+                                    gate_room_since_ms = null,
+                                    gate_room_last_ms = null, gate_room_waits = 0,
+                                    gate_room_escalated = false, updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
         -- The owner moved a source's main on purpose (a deploy), forward from
@@ -1280,7 +1300,7 @@ begin
                          else state end,
                base = coalesce(p_record ->> 'base', base),
                candidate = case when v_verdict = 'accepted' then p_record ->> 'candidate'
-                                when v_verdict = 'aborted' then candidate end,
+                                when v_verdict in ('aborted', 'no_room') then candidate end,
                gate_log = coalesce(p_record ->> 'log', gate_log),
                metric = case when v_verdict = 'accepted' then p_record ->> 'metric' else metric end,
                review_note = case when v_verdict in ('rejected', 'conflict') then p_record ->> 'note'
@@ -1292,9 +1312,33 @@ begin
            set baseline = coalesce(baseline, p_record ->> 'base'),
                gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
                                                 when 'accepted' then 0 else gate_rejections end,
+               -- `no_room`: the gate found no room in TMPDIR to judge, a
+               -- fact about the host, not the work. It moves neither count.
                gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
                                             when 'stale' then gate_aborts
+                                            when 'no_room' then gate_aborts
                                             else 0 end,
+               -- The run is this task's: a `no_room` on another task starts
+               -- a new one (no inherited backoff or age).
+               gate_room_task = case v_verdict when 'no_room' then v_id
+                                               when 'stale' then gate_room_task end,
+               gate_room_since_ms = case when v_verdict = 'no_room' and gate_room_task = v_id
+                                              then coalesce(gate_room_since_ms, p_at)
+                                         when v_verdict = 'no_room' then p_at
+                                         when v_verdict = 'stale' then gate_room_since_ms end,
+               gate_room_last_ms = case v_verdict when 'no_room' then p_at
+                                                  when 'stale' then gate_room_last_ms end,
+               gate_room_waits = case when v_verdict = 'no_room' and gate_room_task = v_id
+                                           then gate_room_waits + 1
+                                      when v_verdict = 'no_room' then 1
+                                      when v_verdict = 'stale' then gate_room_waits else 0 end,
+               gate_room_escalated = case when v_verdict = 'no_room' and gate_room_task = v_id
+                                               then gate_room_escalated
+                                                    or coalesce((p_record ->> 'escalate')::boolean, false)
+                                          when v_verdict = 'no_room'
+                                               then coalesce((p_record ->> 'escalate')::boolean, false)
+                                          when v_verdict = 'stale' then gate_room_escalated
+                                          else false end,
                scenario_floor = greatest(scenario_floor, coalesce((p_record ->> 'scenarios')::integer, 0)),
                updated_at_ms = p_at
          where id = v_mission;
@@ -1320,6 +1364,11 @@ begin
          where id = v_id;
         update mission_missions set gate_aborts = gate_aborts + 1, updated_at_ms = p_at
          where id = (select mission_id from mission_tasks where id = v_id);
+        -- A task that leaves the gate ends its run of `no_room`.
+        update mission_missions set gate_room_task = null, gate_room_since_ms = null,
+                                    gate_room_last_ms = null, gate_room_waits = 0,
+                                    gate_room_escalated = false, updated_at_ms = p_at
+         where gate_room_task = v_id;
     when 'task.reported' then
         update mission_tasks set state = 'reported', report = p_record ->> 'report',
                                  updated_at_ms = p_at
@@ -1338,6 +1387,11 @@ begin
                 or revisions = (p_record ->> 'revision')::integer);
     when 'task.cancelled' then
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
+        -- A task that leaves the gate ends its run of `no_room`.
+        update mission_missions set gate_room_task = null, gate_room_since_ms = null,
+                                    gate_room_last_ms = null, gate_room_waits = 0,
+                                    gate_room_escalated = false, updated_at_ms = p_at
+         where gate_room_task = v_id;
     when 'resident.proposed' then
         insert into mission_residents (name, agent_id, session_id, charter, proposed_by,
                                        created_at_ms, updated_at_ms)
@@ -1370,7 +1424,8 @@ begin
             insert into mission_missions
             select * from jsonb_populate_record(null::mission_missions,
                 jsonb_build_object('accept', 'review', 'scenario_floor', 0,
-                                   'gate_rejections', 0, 'gate_aborts', 0) || (p_record -> 'row'));
+                                   'gate_rejections', 0, 'gate_aborts', 0, 'gate_room_waits', 0,
+                                   'gate_room_escalated', false) || (p_record -> 'row'));
         when 'mission_residents' then
             insert into mission_residents
             select * from jsonb_populate_record(null::mission_residents, p_record -> 'row');
@@ -1912,8 +1967,15 @@ begin
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     if p_record ->> 'type' = 'task.gated'
-       and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'aborted', 'stale') then
+       and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'aborted', 'stale',
+                                          'no_room') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
+    end if;
+    -- No room to judge names what it saw: the free space and the directory.
+    if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'no_room'
+       and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
+            or p_record ->> 'tmpdir' is null) then
+        raise exception 'a no_room verdict names free_kb and tmpdir: %', p_record;
     end if;
     -- The gate runs for minutes: the task may have been closed meanwhile.
     -- A verdict only moves work that is still waiting for it.
@@ -2055,6 +2117,15 @@ create index if not exists spawn_events_host_disk
     on spawn_events (session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
+
+-- The `no_room` gate records that escalate, found without reading the rest
+-- of the stream (the dispatcher reads them on every step).
+create index if not exists spawn_events_gate_room
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+      and kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
+      and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
 
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
 -- `stage` is the record type without `task.`; `verdict` is a gate's verdict

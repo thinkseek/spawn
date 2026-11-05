@@ -270,9 +270,13 @@ state and wedges nothing:
 
 - **The gate refuses to start without room.** With less than
   `SPAWN_GATE_MIN_FREE_GB` (default 10) GiB free in `TMPDIR`, `gate.sh`
-  exits 3 before it makes any scratch (`scripts/disk.sh`): an abort, which
-  the integrator records and retries, never a verdict on the candidate. The
-  integrator passes the variable through. The gate's scratch is
+  exits 5 with a no-room fact before it makes any scratch
+  (`scripts/disk.sh`). The integrator records it as `no_room`, which is
+  never a verdict on the candidate and never counts toward a halt. If no
+  room is left even for the fact, the integrator measures `TMPDIR` itself.
+  It tries again with a backoff, and after 2 hours it tells the supervisor
+  once (fleet-architecture.md §10.2, §10.3). The integrator passes the variable
+  through. The gate's scratch is
   `$TMPDIR/spawn-gate.XXXXXX`, so cleanup can tell it from everyone else's.
 - **The loop watches free space.** Once a minute `spawn loop` reads the free
   space of the workspace root and `TMPDIR` (`df`). A path that falls under
