@@ -67,7 +67,10 @@ These are not about process lifetime. They break when two versions meet.
    reader does not know (a source since removed, such as `layerfs` or
    `codex`) is skipped with one warning per name, and the timeline shows it
    as stored, so removing a writer stops no reader. An `engine` field is
-   text, read whatever it names.
+   text, read whatever it names. A field added to a variant is optional
+   (`serde(default)`, left out when unset), so a record from before it
+   reads, and a reader from before it ignores it: `session.native_started`
+   gained `engine_version` this way.
 2. **The schema.** `migrate()` runs `create or replace` on every connect. An
    additive column or view is safe for a reader built before it. A removed or renamed
    column is not. `spawn loop` holds one connection, so a migrated schema takes

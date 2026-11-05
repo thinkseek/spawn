@@ -244,9 +244,39 @@ pub fn claude_line(line: &str, since_ms: i64) -> Vec<Normalized> {
     }
 }
 
+/// The engine version a Claude Code transcript line names (its `version`
+/// field), for a line written at or after `since_ms` (a resumed session's
+/// transcript holds lines an earlier engine wrote).
+pub fn claude_version(line: &str, since_ms: i64) -> Option<String> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let written = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(utc_ms);
+    if written.is_some_and(|at| at < since_ms) {
+        return None;
+    }
+    let version = value.get("version").and_then(Value::as_str)?.trim();
+    (!version.is_empty() && version.len() <= 64).then(|| version.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{claude_line, utc_ms};
+    use super::{claude_line, claude_version, utc_ms};
+
+    #[test]
+    fn a_line_names_the_engine_version_it_was_written_by() {
+        let line = r#"{"type":"user","uuid":"u1","timestamp":"2026-11-04T05:46:12.345Z","version":"2.1.318","message":{"content":"x"}}"#;
+        assert_eq!(claude_version(line, 0).as_deref(), Some("2.1.318"));
+        assert_eq!(
+            claude_version(line, 1_793_771_172_346),
+            None,
+            "an earlier execution's line"
+        );
+        assert_eq!(claude_version(r#"{"type":"mode","version":""}"#, 0), None);
+        assert_eq!(claude_version(r#"{"type":"mode"}"#, 0), None);
+        assert_eq!(claude_version("not json", 0), None);
+    }
     use crate::event::EventKind;
 
     #[test]

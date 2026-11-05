@@ -59,7 +59,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 
 | 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |
-| `session.native_started` | Bridge（新会话由它命名） | engine、native_session_id、transcript_path |
+| `session.native_started` | Bridge（新会话由它命名，引擎启动前记，不带版本）；会话记录（每个执行读到的第一行带 `version` 的会话记录行，键 `<exec>:engine_version`，恢复也记） | engine、native_session_id、transcript_path；可选 engine_version（引擎版本，取自 Claude Code 写在会话记录行上的 `version`；旧记录没有它照样能读，未设时不写） |
 | `session.native_ended` | 无；保留它以读取日志里已有的行 | reason |
 | `session.linked` | Bridge | parent_session_id |
 | `message.received` | 会话记录（transcript） | 无 |
