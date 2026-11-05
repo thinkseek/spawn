@@ -5,11 +5,14 @@
 //! - `init-db` installs the SQL schema.
 //! - `submit` writes one command to the queue.
 //! - `tick` runs one Bridge and Observer pass.
+//! - `loop` runs the fleet until killed: Bridge, Observer, dispatcher and
+//!   the supervisor's liveness rule.
+//! - `mission`, `task`, `resident` manage the mission layer.
 //! - `integrate` lands gated missions' work and assigns objectives (RSI).
 //! - `chunks gc` removes chunk-store objects no reachable commit names.
-//! - `status` prints the latest observation per session.
-//! - `hook` accepts and ignores a hook payload from an engine started by an
-//!   older build; the Bridge reads engines' transcripts instead.
+//! - `serve` serves the read-only dashboard and API.
+//! - `fleet` prints every session with its judgement; `tail` one session's
+//!   judgement, events, judgements and commands.
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
 //! - `version` prints `spawn <crate version>`.
@@ -41,11 +44,7 @@ pub(crate) use config::{Flags, env_or, env_value, open_store};
 
 use commands::{chunks, engine, inspect, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|dispatch|integrate|chunks|serve|status|fleet|tail|hook|run|version>";
-
-/// Usage of `spawn dispatch`, the one command that mixes a bare switch with
-/// valued flags.
-pub(crate) const DISPATCH_USAGE: &str = "usage: spawn dispatch [--dry-run] [--root <dir>]";
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|chunks|serve|fleet|tail|run|version>";
 
 fn main() {
     let code = match dispatch() {
@@ -74,20 +73,13 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "tick" => loops::tick(&Flags::parse(&rest)?),
         "loop" => loops::resident_loop(&Flags::parse(&rest)?),
         "serve" => serve::serve(&Flags::parse(&rest)?),
-        "dispatch" => queue::dispatch_once(&rest),
         "integrate" => integrate::integrate(&rest),
         "chunks" => chunks::command(&rest),
         "mission" => missions::mission(&rest),
-        "charter" => {
-            println!("{}", supervise::current_charter());
-            Ok(0)
-        }
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),
-        "status" => inspect::status(&Flags::parse(&rest)?),
         "fleet" => inspect::fleet(),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
-        "hook" => Ok(engine::hook()),
         "run" => engine::run(&rest),
         "version" => {
             if let Some(word) = rest.first() {

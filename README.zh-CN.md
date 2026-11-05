@@ -52,10 +52,11 @@ spawn submit --agent agent_demo --session session_demo --key demo-1 --action '{"
 spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws
 ```
 
-打印每个会话的最新判定：
+打印每个会话及其最新判定，以及单个会话的事件：
 
 ```bash
-spawn status
+spawn fleet
+spawn tail --session session_demo
 ```
 
 生产部署跑常驻进程：`spawn loop`（Bridge、Observer、派发、存活规则，默认 500 ms 一轮）、`spawn integrate`（门禁与落地）、`spawn serve`（只读看板），对应 `deploy/systemd/` 下的 user unit。`spawn tick` 只跑一轮，用于调试和测试。
@@ -67,8 +68,12 @@ spawn status
 | `init-db` | 安装或更新 SQL schema，可重复执行 |
 | `submit` | 向队列写一条命令。参数：`--agent`、`--session`、`--key`、`--action`、`--principal`（默认 `spawn`） |
 | `tick` | 领取并执行排队命令，推进活跃执行，记录判定。参数：`--repo`、`--root`、`--judge-url` |
-| `status` | 打印每个会话的最新判定 |
-| `hook` | 读取并忽略标准输入。Spawn 不配置 hook；它只为设置里写了它的引擎存在 |
+| `loop` | 常驻运行舰队：Bridge、Observer、派发，以及（`SPAWN_SUPERVISOR=1` 时）supervisor 的存活规则 |
+| `fleet` | 以 JSON 打印当前登录可读的每个会话及其判定 |
+| `tail --session <id>` | 以 JSON 打印单个会话的最新判定、近期事件、判定与命令 |
+| `integrate [--once] [--root <dir>]` | 唯一的落地路径：用 `scripts/rsi/gate.sh` 判定就绪的工作，以 compare-and-swap 推送落到来源，按停机规则暂停任务，并给目标任务（RSI）分配下一条 backlog |
+| `serve` | 以 `spawn_reader` 提供只读看板与 API；默认绑定 `127.0.0.1:8787`，其他地址需要 `SPAWN_SERVE_TOKEN` |
+| `mission`、`task`、`resident` | 任务层：添加、配置、关闭、恢复任务；分派、验收、退回子任务；提议、批准、退役常驻 worker。每条命令输出 JSON |
 | `run` | 在终端内运行引擎，把退出状态写入文件供 Bridge 读取。由 Spawn 配置，无需手动调用 |
 | `version` | 打印 `spawn <版本>` |
 

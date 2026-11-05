@@ -31,9 +31,6 @@ These hold no state that is not rebuildable.
 - **Integrator.** Its state is the control stream of the event log (task and
   mission rows are folds of it). It records a verdict before it moves git, so
   a killed integrator resumes from the recorded state.
-- **`spawn hook`.** A no-op that reads and discards standard input. Spawn
-  configures no hooks; an engine whose settings name it calls it by absolute
-  path, and its events come from the transcript.
 - **UI server.** Read-only. No writes exist in `spawn serve`.
 - **Model relay.** `scripts/model-relay.py` keeps nothing between requests.
   Install the new script over the old one
@@ -91,7 +88,12 @@ These are not about process lifetime. They break when two versions meet.
    fields, so a binary from before `model` fails a `start` or `resume` that
    names one (delivery always does). `execution.started` carries `model` only
    for the cheap profile, and readers ignore fields they do not know.
-7. **The prompt contract.** Delivery writes the task prompt and the
+7. **Hooks.** Spawn configures none (the Bridge's inline `--settings` has no
+   `hooks`) and has no `spawn hook` command. An engine whose own settings
+   still name `spawn hook` gets exit status 1 from it, which Claude Code
+   reports as a non-blocking hook error; its events still come from the
+   transcript.
+8. **The prompt contract.** Delivery writes the task prompt and the
    `.spawn/report.md` convention. The engine reads them as plain text. A
    change here is hot for the dispatcher and cold for the engine only in that
    the running turn keeps the old instruction.
