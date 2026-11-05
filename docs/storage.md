@@ -274,6 +274,11 @@ state and wedges nothing:
   the integrator records and retries, never a verdict on the candidate. The
   integrator passes the variable through. The gate's scratch is
   `$TMPDIR/spawn-gate.XXXXXX`, so cleanup can tell it from everyone else's.
+  The integrator runs up to `--gates` (default 2) gates at once, each
+  checking the floor at its own start: measured 2026-11-06, a Spawn gate's
+  scratch peaks near 1.7 GiB, two at once 3.4 GiB, well inside the default
+  floor. Routine cleanup removes only scratch untouched for a day, which no
+  running gate (45 minutes at most) is.
 - **The loop watches free space.** Once a minute `spawn loop` reads the free
   space of the workspace root and `TMPDIR` (`df`). A path that falls under
   `SPAWN_DISK_WARN_GB` (default 20) GiB is recorded once as a control record
