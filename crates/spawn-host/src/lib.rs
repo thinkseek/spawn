@@ -12,6 +12,9 @@ pub mod tmux;
 pub mod transcripts;
 pub mod tree_path;
 
+#[cfg(test)]
+mod audit_repro;
+
 pub use chunks::LocalChunkStore;
 pub use git::{
     DEFAULT_CHUNK_DIRECTORY, GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix,
