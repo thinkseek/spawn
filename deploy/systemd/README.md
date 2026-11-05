@@ -10,6 +10,7 @@ The units this host runs, with `%h` for the home directory.
 | `spawn-jev-relay` | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key | never |
 | `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.hermes/.env`, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
 | `spawn-backup` (`.timer`) | `pg-backup.sh`: daily encrypted `pg_dump` to R2 (bucket-locked, R2 expires it); install and keys in [deploy/backup](../backup/README.md) | oneshot, daily at 03:30 + random delay |
+| `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the checkout: `spawn chunks gc --grace 120`, the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` older than a day), deploy.sh's dumps in the backups directory beyond the newest 5; nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, daily at 05:15 + random delay |
 
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
 server alive. That only works because `ExecStart` is `spawn loop` itself: with
@@ -45,6 +46,37 @@ Configuration lives in `~/.local/share/spawn-rsi/spawn.env` (KEY=VALUE),
 including `SPAWN_SUPERVISOR=1`, `SPAWN_MISSION_FILE`, and `SPAWN_SERVE_ADDRESS`
 with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
 `openssl rand -hex 32`).
+
+## Disk room
+
+Three guards keep a full disk from corrupting state or wedging the fleet
+([docs/storage.md](../../docs/storage.md#disk-room)); the first two ship in
+the binary and the checkout, the third is a timer to install.
+
+- The gate exits 3 (an abort, retried) with less than
+  `SPAWN_GATE_MIN_FREE_GB` (default 10) GiB free in `TMPDIR`.
+- `spawn loop` records a `host.disk` warning when the workspace root or
+  `TMPDIR` falls under `SPAWN_DISK_WARN_GB` (default 20) GiB free, and starts
+  no new executions under `SPAWN_DISK_FLOOR_GB` (default 2). The fleet view's
+  health strip shows free space now.
+- `spawn-maintenance.timer`, installed by hand. Look first at what it would
+  remove (it deletes nothing in a dry run):
+
+```sh
+cd ~/projects/Spawn   # the checkout the unit runs from, at the merged main
+set -a; . ~/.local/share/spawn-rsi/spawn.env; set +a
+SPAWN_MAINTENANCE_DRY_RUN=1 sh scripts/maintenance.sh
+sh scripts/test-maintenance.sh                    # throwaway directories only
+cp deploy/systemd/spawn-maintenance.service deploy/systemd/spawn-maintenance.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spawn-maintenance.timer
+systemctl --user start spawn-maintenance.service  # one run now, optional
+journalctl --user -u spawn-maintenance -n 20
+```
+
+Settings, in `spawn.env`: `SPAWN_MAINTENANCE_KEEP_DUMPS` (5),
+`SPAWN_MAINTENANCE_CHUNK_GRACE_MIN` (120), `SPAWN_MAINTENANCE_SCRATCH_AGE_MIN`
+(1440), `SPAWN_MAINTENANCE_CHUNKS=0` to skip the chunk collection.
 
 ## Deploying
 
