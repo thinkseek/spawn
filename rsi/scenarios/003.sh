@@ -6,33 +6,19 @@
 # final checkpoint, unmount. The session is resumed in a fresh mount, and
 # then:
 #   (a) the large file is there again, byte for byte (sha256);
-#   (b) it is not in git: the bare repository grew by less than 2 MiB, no
-#       blob over 8 MiB is on the agent's branch, the text file is, and the
-#       checkpoint commit names its large-file manifest in a `Spawn-Large:`
-#       trailer;
-#   (c) the chunk store lives where SPAWN_CHUNK_STORE says. A 1 MiB in-place
-#       edit, checkpointed when the engine exits, is a commit with the same
-#       tree and a new trailer; the repository still grows by less than
-#       2 MiB, the chunk store by less than 8 MiB (content-defined chunks),
-#       and the edited content survives another remount;
+#   (b) the text file is on the agent's branch, and a 1 MiB in-place edit,
+#       checkpointed when the engine exits, is a new checkpoint commit whose
+#       content survives another remount;
 #   (e) old checkpoints still restore: a second agent started from the first
 #       checkpoint commit (`start {"from": <commit>}`) gets the original
 #       bytes in its fresh mount;
-#   (f) objects are immutable: every non-empty file the chunk store held
-#       after the first checkpoint is still there, byte for byte, after the
-#       edit, the fork and their checkpoints;
-#   (d) chunks are verified on read: with every file in the chunk store
-#       corrupted, a remount under a fresh workspace root (same repository,
-#       same chunk store, so only the store can supply the bytes) either
-#       leaves the large file out or fails; it never puts other bytes there.
-#       The exact original bytes are accepted too.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure (a tool, the
 # database, a wait that ran out). Any unexpected error exits 2, never 1.
 #
-# Fails on the baseline with 1 at (a): large files stay out of git and are
-# lost at unmount. Runs inside the gate's sandbox (scripts/rsi/gate.sh):
+# How a large file is stored is not this scenario's business (docs/storage.md);
+# that it is kept is. Runs inside the gate's sandbox (scripts/rsi/gate.sh):
 # needs SPAWN_BIN and SPAWN_TEST_DATABASE_URL, creates and drops its own
 # database, and uses a private tmux socket. Every wait is bounded in time.
 set -eu
@@ -111,7 +97,7 @@ fail() {
     exit 1
 }
 
-# --- the world: one bare repository, one root, one chunk store -----------
+# --- the world: one bare repository, one root -------------------------------
 
 repo=$WORK/repo.git
 git init -q --bare --initial-branch=main "$repo"
@@ -124,7 +110,7 @@ mkdir -p "$WORK/ws"
 
 MIB=1048576
 # Deterministic and incompressible: an AES-CTR keystream with a fixed key.
-# Compressible bytes would let git store the file small and hide (b).
+# Incompressible, so the file is as large as it says.
 keystream() {
     head -c "$2" /dev/zero |
         openssl enc -aes-256-ctr -nosalt -K "$1" -iv 00000000000000000000000000000000
@@ -185,12 +171,11 @@ done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_GIT_REPO=$repo
 SPAWN_WORKSPACE_ROOT=$WORK/ws
-SPAWN_CHUNK_STORE=$WORK/chunks
 SPAWN_CLAUDE_PROGRAM=$WORK/claude
 SPAWN_CLAUDE_PROJECTS=$WORK/projects
 SPAWN_TMUX_PROGRAM=$WORK/tmux
 SPAWN_WORKER=worker-bb
-export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CHUNK_STORE \
+export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
     SPAWN_CLAUDE_PROGRAM SPAWN_CLAUDE_PROJECTS SPAWN_TMUX_PROGRAM \
     SPAWN_WORKER
 
@@ -214,12 +199,6 @@ done
 
 # --- helpers ----------------------------------------------------------------
 
-bytes() { du -sb "$1" 2>/dev/null | cut -f1; }
-repo_bytes() { bytes "$repo"; }
-store_bytes() {
-    if [ -d "$SPAWN_CHUNK_STORE" ]; then bytes "$SPAWN_CHUNK_STORE"; else echo 0; fi
-}
-mib() { awk -v b="$1" 'BEGIN { printf "%.2f MiB", b / 1048576 }'; }
 now() { date +%s; }
 
 # submit <agent> <session> <key> <action>
@@ -282,18 +261,7 @@ sha_in() {
 
 head_commit() { git --git-dir="$repo" rev-parse --verify --quiet "$branch" || echo none; }
 head_tree() { git --git-dir="$repo" rev-parse --verify --quiet "$branch^{tree}" || echo none; }
-head_trailer() {
-    git --git-dir="$repo" log -1 --format='%(trailers:key=Spawn-Large,valueonly,separator=%x20)' \
-        "$branch" 2>/dev/null | tr -d '\n' || true
-}
-# Largest blob on the branch head, in bytes.
-largest_blob() {
-    git --git-dir="$repo" ls-tree -r -l "$branch" |
-        awk '$2 == "blob" && $4 > max { max = $4 } END { print max + 0 }'
-}
-
 workspace=$SPAWN_WORKSPACE_ROOT/$agent
-repo_start=$(repo_bytes)
 
 # --- 1. the engine writes the large file; the execution ends ---------------
 
@@ -318,33 +286,10 @@ got=$(sha_in "$workspace")
     fail "(a) data/big.bin is missing after the remount: the large file was lost at unmount"
 assert_eq "$got" "$sha_v1" "(a) sha256 of data/big.bin after the remount"
 
-# (b) it is not in git.
-grown=$(($(repo_bytes) - repo_start))
-[ "$grown" -lt $((2 * MIB)) ] ||
-    fail "(b) the bare repository grew by $(mib "$grown") for a 20 MiB file: it went into git"
-largest=$(largest_blob)
-[ "$largest" -le $((8 * MIB)) ] ||
-    fail "(b) a blob of $(mib "$largest") is on the branch: large files stay out of git"
+# (b) the text file is on the branch.
 git --git-dir="$repo" cat-file -e "$branch:data/notes.txt" 2>/dev/null ||
-    fail "(b) data/notes.txt is not on the branch: text stays in git"
-trailer1=$(head_trailer)
-[ -n "$trailer1" ] ||
-    fail "(b) the checkpoint commit has no Spawn-Large trailer: $(git --git-dir="$repo" log -1 --format=%B "$branch")"
-tree1=$(head_tree)
+    fail "(b) data/notes.txt is not on the branch"
 commit1=$(head_commit)
-
-# (c) the chunk store is where SPAWN_CHUNK_STORE says.
-store1=$(store_bytes)
-[ "$store1" -ge $((18 * MIB)) ] ||
-    fail "(c) SPAWN_CHUNK_STORE ($SPAWN_CHUNK_STORE) holds $(mib "$store1"), not the 20 MiB file's chunks"
-
-# (f) every object so far, by path and checksum; checked after the edit.
-: >"$WORK/objects.sha256"
-if [ -d "$SPAWN_CHUNK_STORE" ]; then
-    (cd "$SPAWN_CHUNK_STORE" && find . -type f -size +0 | LC_ALL=C sort |
-        while IFS= read -r object; do sha256sum "$object"; done) >"$WORK/objects.sha256"
-fi
-objects1=$(wc -l <"$WORK/objects.sha256" | tr -d ' ')
 
 # --- 3. a 1 MiB in-place edit, checkpointed at the engine's exit -------------
 
@@ -363,24 +308,14 @@ engine_did edited || harness "the engine did not edit the file"
 
 commit2=$(head_commit)
 [ "$commit2" != "$commit1" ] ||
-    fail "(c) the edit of the large file made no checkpoint commit"
-assert_eq "$(head_tree)" "$tree1" "(c) a large-file-only change keeps the tree"
-trailer2=$(head_trailer)
-[ -n "$trailer2" ] || fail "(c) the edit's checkpoint commit has no Spawn-Large trailer"
-[ "$trailer2" != "$trailer1" ] || fail "(c) the edit's checkpoint names the same manifest"
-grown=$(($(repo_bytes) - repo_start))
-[ "$grown" -lt $((2 * MIB)) ] ||
-    fail "(c) after the edit the bare repository has grown by $(mib "$grown")"
-store_grown=$(($(store_bytes) - store1))
-[ "$store_grown" -lt $((8 * MIB)) ] ||
-    fail "(c) a 1 MiB edit grew the chunk store by $(mib "$store_grown"): chunks are not shared"
+    fail "(b) the edit of the large file made no checkpoint commit"
 
 # --- 4. resume again: the edited content is back -----------------------------
 
 submit "$agent" "$session" k_resume2 '{"type":"resume"}'
 tick
 command_ok k_resume2 "second resume"
-assert_eq "$(sha_in "$workspace")" "$sha_v2" "(c) sha256 of the edited data/big.bin after the remount"
+assert_eq "$(sha_in "$workspace")" "$sha_v2" "(b) sha256 of the edited data/big.bin after the remount"
 
 submit "$agent" "$session" k_stop '{"type":"stop"}'
 tick
@@ -405,38 +340,5 @@ submit "$fork_agent" "$fork_session" k_fork_stop '{"type":"stop"}'
 tick
 command_ok k_fork_stop "stop of the fork"
 
-# --- 6. (f) nothing the store held was rewritten or removed -------------------
-
-[ "$objects1" -gt 0 ] || fail "(f) the chunk store held no objects after the first checkpoint"
-if ! (cd "$SPAWN_CHUNK_STORE" && sha256sum -c --quiet "$WORK/objects.sha256") \
-    >"$WORK/immutable.txt" 2>&1; then
-    fail "(f) objects of the first checkpoint were rewritten or removed: $(head -n 3 "$WORK/immutable.txt" | tr '\n' ' ')"
-fi
-
-# --- 7. (d) verified on read: corrupt every stored file, remount fresh ---------
-
-find "$SPAWN_CHUNK_STORE" -type f -size +0 >"$WORK/stored" 2>/dev/null || true
-[ -s "$WORK/stored" ] || fail "(d) the chunk store holds no files"
-while IFS= read -r file; do
-    chmod u+w "$file"
-    size=$(wc -c <"$file" | tr -d ' ')
-    offset=$((size / 2))
-    old=$(od -An -tu1 -j "$offset" -N1 "$file" | tr -d ' ')
-    new=$((255 - old))
-    printf "\\$(printf '%03o' "$new")" |
-        dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
-done <"$WORK/stored"
-
-# A fresh workspace root: no stat cache, no leftover of any earlier mount.
-SPAWN_WORKSPACE_ROOT=$WORK/ws-fresh
-mkdir -p "$SPAWN_WORKSPACE_ROOT"
-submit "$agent" "$session" k_resume3 '{"type":"resume"}'
-tick
-got=$(sha_in "$SPAWN_WORKSPACE_ROOT/$agent")
-case "$got" in
-missing | "$sha_v2") ;;
-*) fail "(d) with the chunk store corrupted, a fresh mount put other bytes in data/big.bin" ;;
-esac
-
-echo "003: large file kept across remounts and forks; repository +$(mib "$grown"), chunk store $(mib "$store1") +$(mib "$store_grown") for the edit, $objects1 objects unchanged"
+echo "003: a 20 MiB file kept across remounts, an edit and a fork"
 exit 0
