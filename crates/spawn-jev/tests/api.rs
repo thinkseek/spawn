@@ -33,6 +33,7 @@ fn input() -> JudgeInput {
         evidence_seq: spawn_core::event::SessionSeq(1),
         ambiguity: None,
         quiet_ms: None,
+        progress_ms: None,
         task: None,
         screen_tail: None,
         perpetual: false,

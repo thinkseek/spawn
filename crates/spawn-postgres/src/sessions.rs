@@ -5,7 +5,7 @@
 //! reader (for example an HTTP read service) appears.
 
 use spawn_core::event::{GlobalPosition, SessionSeq};
-use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId};
+use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, TerminalName};
 use spawn_core::observation::Observation;
 use spawn_core::port::StoreError;
 use spawn_core::time::Timestamp;
@@ -94,8 +94,8 @@ pub(crate) const LATEST_TASK: &str =
                     and coalesce(action ->> 'prompt', action ->> 'text') is not null
                   order by id desc limit 1";
 
-/// Terminal and workspace of the newest execution. `$1` session.
-pub(crate) const LATEST_TERMINAL: &str = "select kind -> 'detail' ->> 'terminal' as terminal,
+/// The newest execution and its workspace. `$1` session.
+pub(crate) const LATEST_TERMINAL: &str = "select execution_id,
                         kind -> 'detail' ->> 'workspace' as workspace
                    from spawn_events
                   where session_id = $1 and event_name = 'execution.started'
@@ -319,18 +319,22 @@ impl PostgresStore {
         Ok(row.and_then(|row| row.get("task")))
     }
 
-    /// Terminal and workspace of a session's newest execution.
+    /// Terminal and workspace of a session's newest execution. The terminal
+    /// is the execution's own ([`TerminalName::for_execution`]), whatever
+    /// an older record also wrote.
     pub fn latest_terminal(
         &self,
         session: &SessionId,
-    ) -> Result<Option<(String, String)>, StoreError> {
-        let row = self.query_opt(LATEST_TERMINAL, &[&session.as_str()])?;
-        Ok(row.and_then(|row| {
-            Some((
-                row.get::<_, Option<String>>("terminal")?,
-                row.get::<_, Option<String>>("workspace")?,
-            ))
-        }))
+    ) -> Result<Option<(TerminalName, String)>, StoreError> {
+        let Some(row) = self.query_opt(LATEST_TERMINAL, &[&session.as_str()])? else {
+            return Ok(None);
+        };
+        let Some(execution) = execution_id(&row)? else {
+            return Ok(None);
+        };
+        Ok(row
+            .get::<_, Option<String>>("workspace")
+            .map(|workspace| (TerminalName::for_execution(&execution), workspace)))
     }
 
     /// Executions of one session, newest first.

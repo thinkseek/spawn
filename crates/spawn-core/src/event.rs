@@ -7,9 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::{
-    AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId,
-};
+use crate::id::{AgentId, BranchName, CommandId, CommitId, ExecutionId, SessionId, WorkspaceId};
 use crate::observation::Observation;
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
@@ -237,13 +235,14 @@ pub enum EventKind {
         /// Engine error text, truncated.
         error: String,
     },
-    /// An execution started in a terminal against a workspace.
+    /// An execution started in a terminal against a workspace. The
+    /// terminal is [`crate::id::TerminalName::for_execution`] of the event's
+    /// execution, so it is not recorded; a record that still names it reads
+    /// as before.
     #[serde(rename = "execution.started")]
     ExecutionStarted {
         /// Engine of the execution: [`ENGINE`].
         engine: String,
-        /// Terminal session that hosts the process.
-        terminal: TerminalName,
         /// Mounted workspace.
         workspace: WorkspaceId,
         /// Command that created the execution.

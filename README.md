@@ -18,7 +18,7 @@ The log is the only state. Each `spawn tick` is a new process that rebuilds its 
 | Rust | 1.95 or later | Build |
 | PostgreSQL | 16 or later | Event log, command queue, views |
 | tmux | 3.x | Terminals |
-| git | 2.30 or later | Branches and workspaces |
+| git | 2.40 or later (`git --attr-source`, checked at start) | Branches and workspaces |
 | Claude Code | current | Engine |
 | docker | optional | Runs the engine in a container when `SPAWN_EXEC_IMAGE` is set |
 
@@ -117,7 +117,8 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_EXEC_IMAGE` | unset | When set, the engine and its tmux run in one container per branch |
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker path |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
-| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts, as the Bridge sees that directory |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`; with `SPAWN_EXEC_IMAGE`, `$SPAWN_EXEC_HOME/.claude/projects` | Where Claude Code writes its transcripts, as the engine sees that directory (the Bridge reads it inside the container in container mode) |
+| `SPAWN_EXEC_HOME` | `/root` | The engine's home inside the container (`docker exec` passes none of the host's `HOME` or `CLAUDE_CONFIG_DIR`) |
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
