@@ -742,8 +742,13 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
     # local_build_time <writable dir> <tree>: `<directory>\t<name>` of each
     # local package with a build-time target, the directory relative to the
     # tree.
+    # The host's platform only: the graph of every platform names crates
+    # (wasm's js-sys) this host never fetched, and offline cannot resolve
+    # them; this host's build compiles only its own platform's.
+    host_triple=$(cd "$work" && rustc -vV 2>/dev/null | sed -n 's/^host: //p')
     local_build_time() {
         sandbox "$1" cargo metadata --offline --format-version 1 --manifest-path "$2/Cargo.toml" \
+            ${host_triple:+--filter-platform "$host_triple"} \
             >"$work/metadata-full.json" 2>>"$work/metadata.log" || return 1
         jq -r --arg tree "$2/" '
             .packages[] | select(.source == null)
