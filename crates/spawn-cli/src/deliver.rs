@@ -1019,14 +1019,9 @@ pub(crate) fn collect_reports(
 #[cfg(test)]
 mod tests {
     use super::{
-<<<<<<< c6453bc8cf38a32f1691a9404d2ff6d8fcfbac65
-        DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery,
-        new_report, news_items, put_aside, report_contract, report_due, task_prompt,
-=======
         Cancelled, DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark,
-        mark_delivery, new_report, news_items, notice_task, put_aside, report_contract,
+        mark_delivery, new_report, news_items, notice_task, put_aside, report_contract, report_due,
         task_prompt,
->>>>>>> 57c95766873b3c372bc3e394d052a0e252565003
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
