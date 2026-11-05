@@ -99,7 +99,8 @@ spawn tail --session session_demo
 | `SPAWN_EXEC_IMAGE` | 未设置 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker 路径 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
-| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录（Bridge 所见路径） |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects`；设置 `SPAWN_EXEC_IMAGE` 时为 `$SPAWN_EXEC_HOME/.claude/projects` | Claude Code 写 transcript 的目录（引擎所见路径；容器模式下 Bridge 在容器内读取） |
+| `SPAWN_EXEC_HOME` | `/root` | 容器内引擎的 home（`docker exec` 不带宿主机的 `HOME`、`CLAUDE_CONFIG_DIR`） |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
 | `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时只用规则判定，规则定不了的情形要求关注 |
 

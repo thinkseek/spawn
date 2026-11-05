@@ -143,7 +143,8 @@ spawn fleet
 | `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
-| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录（Bridge 所见路径） |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects`；设置 `SPAWN_EXEC_IMAGE` 时为 `$SPAWN_EXEC_HOME/.claude/projects` | Claude 写 transcript 的目录（引擎所见路径；容器模式下 Bridge 在容器内读取） |
+| `SPAWN_EXEC_HOME` | `/root` | 容器内引擎的 home（`docker exec` 不带宿主机的 `HOME`、`CLAUDE_CONFIG_DIR`） |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件 |
 | `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket |
 | `SPAWN_EXEC_IMAGE` | 未设 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
