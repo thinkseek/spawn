@@ -58,26 +58,30 @@
 //!    gets this far, before the judging of step 4. A halted mission gets no
 //!    new task.
 //!
-//! **Gates run per mission, a few at once.** A judging (step 4, from the
-//! fetch of the pushed branch to the landing) runs on a thread of its own,
-//! so one mission's 20-minute gate does not hold another's:
+//! **Gates run per mission, on threads.** A judging (step 4, from the
+//! fetch of the pushed branch to the landing) runs on a thread of its own:
 //! - a mission has at most one judging in flight, its lowest ready task:
 //!   its tasks stay serial, each landing on the main the next is judged
 //!   against. While it runs, the pass skips the mission altogether (halts,
 //!   budgets, landings, assignments), and every other mission on its source
 //!   too: they share the mirror and the main it judges against;
-//! - at most [`DEFAULT_GATES`] judgings run at once across missions
-//!   (`--gates N` or `SPAWN_INTEGRATE_GATES`, 1 to [`MAX_GATES`]): gates
-//!   share the CPU and the test database. A ready task over the cap waits
-//!   for a later pass.
+//! - at most `--gates N` (`SPAWN_INTEGRATE_GATES`) judgings run at once
+//!   across missions, and N is [`DEFAULT_GATES`], one: the gates share one
+//!   test database server whose gate login is a superuser, so a second
+//!   gate's candidate could disturb the first's base runs. N up to
+//!   [`MAX_GATES`] is allowed only with [`PER_GATE_SERVER`]`=1`, once each
+//!   gate has a server of its own. A ready task over the cap waits for a
+//!   later pass (said once).
 //!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. A
 //! finished thread is reaped only at the start of a pass, before the
 //! missions are read, so no pass acts on a snapshot older than a judging's
-//! records. A restart mid-gate behaves as it did with one gate: the process
-//! (and with it every gate under it) dies before any record, so the next
-//! integrator judges the task again.
+//! records. A judging that errs or panics before any record of its own is
+//! recorded `aborted` ([`judged_or_aborted`]), so the three-aborts halt
+//! bounds it. A restart mid-gate behaves as before: the process (and the
+//! gate under it) dies before any record, so the next integrator judges the
+//! task again.
 //!
 //! Like the dispatcher, it keeps no state of its own beyond the gates it is
 //! running: the control stream says what was judged and landed. An advisory
