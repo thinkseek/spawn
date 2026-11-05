@@ -19,7 +19,18 @@
 //! - a report (`.spawn/report.md`) is collected once its worker is idle, if
 //!   it was written after the delivery's mark in the workspace (one clock,
 //!   the filesystem's, sets both times), and moved aside so the next task
-//!   starts clean;
+//!   starts clean. **A report is judged against the checkpoint of the turn
+//!   that produced it.** The Bridge commits a turn's workspace and records
+//!   its `artifact.committed` before the turn's end (`turn.stopped`,
+//!   `turn.failed`), so a report is collected only once the worker's latest
+//!   turn event in the log is a turn's end, not a newer `message.received`,
+//!   and never on a ready screen alone ([`Facts::report_due`]). The
+//!   `task.reported` record names in `commit` the agent's latest checkpoint
+//!   read with that turn's end (null only when the agent has none); a turn
+//!   that changed nothing leaves the branch head, the earlier checkpoint, as
+//!   its own. The idle judgement need not be newer than the turn's end: an
+//!   Observer with no model judge writes again only when its verdict
+//!   changes;
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
@@ -812,6 +823,15 @@ fn new_report(workspace: &Path, key: &str) -> Option<String> {
 /// idle prompt, judged waiting, completed or blocked alike: the report
 /// contract asks for one when the task is done or the worker cannot go on.
 /// Returns log lines. The file is moved to `.spawn/reports/task-<id>.md`.
+/// The facts of `task`'s worker when a report of it may be collected now
+/// ([`Facts::report_due`]): the turn that wrote it has ended in the log,
+/// after its checkpoint, which the report then names.
+fn report_due<'a>(task: &TaskRow, rows: &'a [Facts]) -> Option<&'a Facts> {
+    rows.iter()
+        .find(|facts| facts.session_id == task.session_id)
+        .filter(|facts| facts.report_due())
+}
+
 pub(crate) fn collect_reports(
     store: &PostgresStore,
     work: &Work,
@@ -824,13 +844,9 @@ pub(crate) fn collect_reports(
         .iter()
         .filter(|task| task.state == TaskState::Delivered)
     {
-        let idle = rows
-            .iter()
-            .find(|facts| facts.session_id == task.session_id)
-            .is_some_and(Facts::turn_stopped_idle);
-        if !idle {
+        let Some(facts) = report_due(task, rows) else {
             continue;
-        }
+        };
         let workspace = root.join(&task.agent_id);
         let key = task.delivery_key();
         let Some(report) = new_report(&workspace, &key) else {
@@ -839,7 +855,7 @@ pub(crate) fn collect_reports(
         if report.trim().is_empty() {
             continue;
         }
-        match store.task_reported(task.id, report.trim()) {
+        match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref()) {
             Ok(true) => {
                 put_aside(&workspace, task.id);
                 let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
