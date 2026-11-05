@@ -16,7 +16,10 @@ gate=$(cd "$(dirname "$0")" && pwd)/gate.sh
 work=$(mktemp -d)
 # A file in the host's /tmp, which the sandbox must not show.
 marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
-trap 'rm -rf "$work" "$marker"' EXIT
+# Background helpers (listeners, fake servers) are killed on exit.
+background=""
+# shellcheck disable=SC2086 # pids
+trap 'kill $background 2>/dev/null; rm -rf "$work" "$marker"' EXIT
 
 # The owner's home, with secrets the candidate must not read. The gate's base
 # cache goes under it too, never into the real one.
@@ -227,11 +230,15 @@ printf 'two\n' >"$seed/value"
 cat >"$seed/probe.sh" <<'EOF'
 #!/bin/sh
 [ -z "${SPAWN_DATABASE_URL-}" ] || { echo "owner database: $SPAWN_DATABASE_URL"; exit 1; }
-[ "${SPAWN_TEST_DATABASE_URL-}" = postgres://test ] || { echo "no test database"; exit 1; }
+case "${SPAWN_TEST_DATABASE_URL-}" in
+"postgres://t:p%40ss@%2F"*"%2Ftest-db:5433/spawn_test?sslmode=disable") ;;
+*) echo "no test database: ${SPAWN_TEST_DATABASE_URL-}"; exit 1 ;;
+esac
 [ -z "${OWNER_TOKEN-}" ] || { echo "owner token leaked"; exit 1; }
 EOF
 env_candidate=$(commit env)
-export SPAWN_DATABASE_URL=postgres://owner SPAWN_TEST_DATABASE_URL=postgres://test OWNER_TOKEN=secret
+export SPAWN_DATABASE_URL=postgres://owner OWNER_TOKEN=secret \
+    SPAWN_TEST_DATABASE_URL="postgres://t:p%40ss@test:5433/spawn_test?sslmode=disable"
 expect "candidate code sees only the allowed environment" "$(judge "$env_candidate")" 'exit=0 {"verdict":"accepted"}'
 unset SPAWN_DATABASE_URL SPAWN_TEST_DATABASE_URL OWNER_TOKEN
 
@@ -306,7 +313,7 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
 print(s.getsockname()[1], flush=True)
 time.sleep(600)' >"$listener" &
 listener_pid=$!
-trap 'kill "$listener_pid" 2>/dev/null; rm -rf "$work" "$marker"' EXIT
+background="$background $listener_pid"
 while [ ! -s "$listener" ]; do sleep 0.1; done
 host_port=$(cat "$listener")
 # The probe's control: the host listener answers from outside the sandbox.
@@ -329,6 +336,68 @@ exit \$fail
 EOF
 network=$(commit network)
 expect "the host's listeners (and 127.0.0.1:15433) are unreachable" "$(judge "$network")" 'exit=0 {"verdict":"accepted"}'
+
+# 3e. A TCP test database URL works inside, through the gate's forwarder,
+# for 127.0.0.1, localhost and [::1] (when the host has it): the sandbox
+# reaches that server over a socket of the gate's, and still has no
+# network. The fake server echoes what it is sent.
+tcp_db=$work/tcp-db.ports
+python3 -c '
+import socket, sys, threading, time
+def serve(listener):
+    while True:
+        client, _ = listener.accept()
+        client.sendall(client.recv(64)); client.close()
+for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    try:
+        listener = socket.socket(family); listener.bind((address, 0)); listener.listen(16)
+    except OSError:
+        print(address, "none", flush=True); continue
+    print(address, listener.getsockname()[1], flush=True)
+    threading.Thread(target=serve, args=(listener,), daemon=True).start()
+time.sleep(900)' >"$tcp_db" &
+background="$background $!"
+while [ "$(grep -c . "$tcp_db" 2>/dev/null)" != 2 ]; do sleep 0.1; done
+v4_port=$(awk '$1 == "127.0.0.1" { print $2 }' "$tcp_db")
+v6_port=$(awk '$1 == "::1" { print $2 }' "$tcp_db")
+branch tcp-db
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+exec python3 -c '
+import os, socket, sys, urllib.parse
+url = os.environ["SPAWN_TEST_DATABASE_URL"]
+authority = url.split("://", 1)[1].split("/", 1)[0]
+user, hostport = authority.rsplit("@", 1)
+host, port = hostport.rsplit(":", 1)
+directory = urllib.parse.unquote(host)
+if user != "u:p%40ss" or not directory.startswith("/") or not url.endswith("/spawn_test?sslmode=disable"):
+    print("not the forwarded socket URL:", url); sys.exit(1)
+s = socket.socket(socket.AF_UNIX); s.settimeout(5)
+s.connect(os.path.join(directory, ".s.PGSQL." + port)); s.sendall(b"ping")
+if s.recv(64) != b"ping":
+    print("the test server did not answer"); sys.exit(1)
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), 2)
+    print("reached 127.0.0.1 over TCP"); sys.exit(1)
+except OSError:
+    pass' "$(cat tcp-port)"
+EOF
+printf '%s\n' "$v4_port" >"$seed/tcp-port"
+tcp_candidate=$(commit tcp-db)
+for host in 127.0.0.1 localhost; do
+    expect "a TCP test URL to $host reaches the test server, through the forwarder only" \
+        "$(SPAWN_TEST_DATABASE_URL="postgres://u:p%40ss@$host:$v4_port/spawn_test?sslmode=disable" \
+            judge "$tcp_candidate")" 'exit=0 {"verdict":"accepted"}'
+done
+if [ "$v6_port" != none ]; then
+    expect "a TCP test URL to [::1] reaches the test server" \
+        "$(SPAWN_TEST_DATABASE_URL="postgres://u:p%40ss@[::1]:$v6_port/spawn_test?sslmode=disable" \
+            judge "$tcp_candidate")" 'exit=0 {"verdict":"accepted"}'
+fi
+expect "a socket URL whose socket is missing is no verdict" \
+    "$(SPAWN_TEST_DATABASE_URL="postgres://u:p@%2Fnonexistent%2Fdir/db" judge "$tcp_candidate")" 'exit=3 '
+expect "and says why" "$(cat "$work/gate.out")" 'no test database socket at /nonexistent/dir/.s.PGSQL.5432'
 
 # 4. A build script by another name: `build = ` in any Cargo.toml, however
 # spelled. `[build-dependencies]` and `build-override` are not build keys.
@@ -491,17 +560,17 @@ while True:
     elif command == "count": count += 1
     elif command == "reset": count = 0
     c.sendall((str(count) if command == "count" else ("broken" if broken else "ok")).encode())
-    c.close()' "$server_dir/server" &
+    c.close()' "$server_dir/.s.PGSQL.5432" &
 server_pid=$!
-trap 'kill "$listener_pid" "$server_pid" 2>/dev/null; rm -rf "$work" "$marker"' EXIT
-while [ ! -S "$server_dir/server" ]; do sleep 0.1; done
+background="$background $server_pid"
+while [ ! -S "$server_dir/.s.PGSQL.5432" ]; do sleep 0.1; done
 # server <command>: ok, broken, or a count.
 cat >"$work/server-client" <<EOF
 #!/bin/sh
 exec python3 -c '
 import socket, sys
 c = socket.socket(socket.AF_UNIX); c.connect(sys.argv[1]); c.sendall(sys.argv[2].encode())
-print(c.recv(64).decode())' "$server_dir/server" "\$1"
+print(c.recv(64).decode())' "$server_dir/.s.PGSQL.5432" "\$1"
 EOF
 server() { sh "$work/server-client" "$1"; }
 export SPAWN_TEST_DATABASE_URL="postgres://u:p@$(printf '%s' "$server_dir" | sed 's|/|%2F|g')/db"
