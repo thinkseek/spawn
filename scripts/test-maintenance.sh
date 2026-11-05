@@ -41,17 +41,8 @@ for name in spawn-auto-20261101-000000.dump spawn-auto-20261102-000000.dump \
 done
 mkdir "$backups/spawn-20261101-000000.dump"          # a directory, not a dump
 
-# A `spawn` that records how it was called.
-fake=$work/spawn
-cat >"$fake" <<EOF
-#!/bin/sh
-echo "\$*" >"$work/spawn-args"
-exit "\${FAKE_EXIT:-0}"
-EOF
-chmod +x "$fake"
-
 run() {
-    env TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" SPAWN_PROGRAM="$fake" "$@" \
+    env TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" "$@" \
         sh "$maintenance" >"$work/out" 2>&1
 }
 listing() { (cd "$1" && ls -A | LC_ALL=C sort | tr '\n' ' '); }
@@ -72,13 +63,11 @@ before_backups=$(listing "$backups")
 run SPAWN_MAINTENANCE_DRY_RUN=1
 expect "a dry run deletes nothing in TMPDIR" "$(listing "$tmp")" "$before_tmp"
 expect "nor in the backups" "$(listing "$backups")" "$before_backups"
-expect "nor collects chunks" "$(cat "$work/spawn-args" 2>/dev/null || echo none)" "none"
 expect "it says what would go" "$(grep -c 'would remove' "$work/out")" "3"
 
 status=0
 run || status=$?
 expect "a run succeeds" "$status" "0"
-expect "chunks are collected with a grace period" "$(cat "$work/spawn-args")" "chunks gc --grace 120"
 expect "only the old gate scratch directory goes" "$(listing "$tmp")" \
     "other-project spawn-gate-other spawn-gate.def456 spawn-gate.fil123 spawn-gate.lnk123 spawn-gate.toolong1 "
 expect "a symlink's target is untouched" "$(listing "$elsewhere")" "keep "
@@ -90,8 +79,8 @@ run || status=$?
 expect "a second run removes nothing more" "$(listing "$backups")" "$after_backups"
 
 status=0
-run FAKE_EXIT=1 SPAWN_MAINTENANCE_KEEP_DUMPS=2 || status=$?
-expect "a failed collection fails the run" "$status" "1"
+run SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=old SPAWN_MAINTENANCE_KEEP_DUMPS=2 || status=$?
+expect "a failed step fails the run" "$status" "1"
 expect "after the other steps ran" "$(listing "$backups" | grep -o 'spawn-2026110[0-9]-010101.dump ' | tr -d '\n')" \
     "spawn-20261106-010101.dump spawn-20261107-010101.dump "
 

@@ -63,7 +63,7 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 **剩余风险。** 沙箱与积分器同一个 uid，没有用户命名空间。门禁还拒绝改 `rsi/`、`scripts/rsi/`、`scripts/blackbox/`、`scripts/e2e.sh`、任何 `build.rs`、`.cargo/` 和 Cargo.toml 里的 `build` 键。落地只移动任务源的 `main`；线上二进制只在 owner 运行 `deploy/deploy.sh` 时更换。黑盒场景只证明被覆盖的行为正确，不证明无恶意，缓解只能是人审抽样。
 
-**agent 一侧。** RSI 的常驻 worker 是普通 worker，受同一 uid 的限制（fleet-architecture.md §8）；设置 `SPAWN_EXEC_IMAGE` 时在容器里运行。
+**agent 一侧。** RSI 的常驻 worker 是普通 worker，受同一 uid 的限制（fleet-architecture.md §8）。
 
 **不给 `SYS_ADMIN`，不用 FUSE，不用 overlay。** 工作区由 `git archive` 导出，已经够用。实测 `--device /dev/fuse --cap-add SYS_ADMIN` 在 `overlay2` 存储驱动上挂 overlay 返回 `Invalid argument`；而且 `SYS_ADMIN` 接近宿主 root，抵消隔离。
 

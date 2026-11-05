@@ -41,7 +41,7 @@ use crate::push::{Pusher, pushed_ref};
 /// Least time between two refreshes of one mirror's `main` at turn ends.
 pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(30);
 
-/// Builds a store for one bare repository (local, or in containers).
+/// Builds a store for one bare repository.
 pub(crate) type Factory = Arc<dyn Fn(&Path) -> GitWorkspace + Send + Sync>;
 
 /// Workspace store that routes every agent to its mission's source.

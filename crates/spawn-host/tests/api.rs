@@ -7,13 +7,13 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use spawn_core::contract;
 use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
 use spawn_core::port::{Commit, Launch, TerminalError, TerminalHost, WorkspaceStore};
-use spawn_host::{GitWorkspace, PrefixBuilder, TmuxHost, container_name, docker_prefix};
+use spawn_host::{GitWorkspace, TmuxHost};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -179,30 +179,30 @@ fn a_changed_workspace_advances_the_branch() {
     store.unmount(&workspace).expect("unmount succeeds");
 }
 
+/// The cap the size tests run under: 1 MiB, so a file over it is small.
+const CAP: u64 = 1 << 20;
+
 #[test]
-fn a_large_file_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
+fn a_file_over_the_cap_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
     let _exclusive = exclusive();
     let (repo, root) = repository("large");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
-    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 1;
+    let size = usize::try_from(CAP).expect("fits") + 1;
     fs::write(directory.join("model.bin"), vec![7u8; size]).expect("write a large file");
     fs::write(directory.join("code.rs"), "fn main() {}\n").expect("write a small file");
     assert!(matches!(
         store.commit(&workspace, "work").expect("commit succeeds"),
         Commit::Created(_)
     ));
-    let listed = Command::new("git")
-        .arg("--git-dir")
-        .arg(&repo)
-        .args(["ls-tree", "-r", "--name-only", &branch().to_string()])
-        .output()
-        .expect("list the branch");
-    let listed = String::from_utf8_lossy(&listed.stdout);
+    let listed = git_out(
+        &repo,
+        &["ls-tree", "-r", "--name-only", &branch().to_string()],
+    );
     assert!(listed.lines().any(|line| line == "code.rs"), "{listed}");
     assert!(!listed.lines().any(|line| line == "model.bin"), "{listed}");
     // The kept index sees an unchanged tree as unchanged, large file and all.
@@ -236,8 +236,11 @@ fn noise(seed: u64, length: usize) -> Vec<u8> {
         .collect()
 }
 
+/// A file under the default cap, however large for a source file, is an
+/// ordinary blob of the checkpoint: a fresh mount brings it back byte for
+/// byte, and an edit to it alone is a new checkpoint.
 #[test]
-fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
+fn a_file_under_the_cap_is_a_blob_across_remounts() {
     let _exclusive = exclusive();
     let (repo, root) = repository("kept");
     let store = GitWorkspace::new(&repo, &root);
@@ -247,8 +250,7 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
         .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
-    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 4096;
-    let original = noise(11, size);
+    let original = noise(11, 9 << 20);
     fs::create_dir_all(directory.join("data")).expect("create data");
     fs::write(directory.join("data/model.bin"), &original).expect("write a large file");
     fs::write(directory.join("notes.txt"), "text\n").expect("write a small file");
@@ -256,21 +258,15 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
         store.commit(&workspace, "work").expect("commit succeeds"),
         Commit::Created(_)
     ));
-    let trailer = git_out(
-        &repo,
-        &[
-            "log",
-            "-1",
-            "--format=%(trailers:key=Spawn-Large,valueonly)",
-            &reference,
-        ],
+    assert_eq!(
+        git_out(
+            &repo,
+            &["cat-file", "-s", &format!("{reference}:data/model.bin")]
+        ),
+        (9u64 << 20).to_string()
     );
-    assert_eq!(trailer.len(), 64, "{trailer}");
-    let tree = git_out(&repo, &["rev-parse", &format!("{reference}^{{tree}}")]);
     store.unmount(&workspace).expect("unmount succeeds");
-    assert!(root.join(spawn_host::DEFAULT_CHUNK_DIRECTORY).is_dir());
 
-    // A fresh mount brings the large file back, byte for byte.
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
     assert_eq!(
@@ -282,70 +278,33 @@ fn a_large_file_is_kept_in_the_chunk_store_across_remounts() {
         Commit::Unchanged,
         "a fresh mount is not a change"
     );
-
-    // A large-file-only edit: same tree, new trailer.
-    let mut edited = original.clone();
+    let mut edited = original;
     edited[1000..2000].copy_from_slice(&noise(12, 1000));
     fs::write(directory.join("data/model.bin"), &edited).expect("edit the large file");
     assert!(matches!(
         store.commit(&workspace, "edit").expect("commit succeeds"),
         Commit::Created(_)
     ));
-    assert_eq!(
-        git_out(&repo, &["rev-parse", &format!("{reference}^{{tree}}")]),
-        tree
-    );
-    let edited_trailer = git_out(
-        &repo,
-        &[
-            "log",
-            "-1",
-            "--format=%(trailers:key=Spawn-Large,valueonly)",
-            &reference,
-        ],
-    );
-    assert_eq!(edited_trailer.len(), 64);
-    assert_ne!(edited_trailer, trailer);
     store.unmount(&workspace).expect("unmount succeeds");
-
-    // Every stored object corrupted: the mount fails rather than hand back
-    // wrong bytes.
-    let mut pending = vec![root.join(spawn_host::DEFAULT_CHUNK_DIRECTORY)];
-    while let Some(path) = pending.pop() {
-        if path.is_dir() {
-            pending.extend(
-                fs::read_dir(&path)
-                    .expect("read")
-                    .flatten()
-                    .map(|e| e.path()),
-            );
-        } else {
-            let mut bytes = fs::read(&path).expect("read object");
-            let middle = bytes.len() / 2;
-            bytes[middle] ^= 0xff;
-            fs::write(&path, bytes).expect("corrupt object");
-        }
-    }
-    match store.mount(&branch()) {
-        Err(_) => {}
-        Ok(workspace) => {
-            let got = fs::read(PathBuf::from(workspace.path()).join("data/model.bin"));
-            assert!(got.is_err() || got.expect("read") == edited, "wrong bytes");
-        }
-    }
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    assert_eq!(
+        fs::read(PathBuf::from(workspace.path()).join("data/model.bin")).expect("read"),
+        edited
+    );
+    store.unmount(&workspace).expect("unmount succeeds");
 }
 
 #[test]
-fn a_large_file_named_like_a_pattern_drops_nothing_else() {
+fn a_file_over_the_cap_named_like_a_pattern_drops_nothing_else() {
     let _exclusive = exclusive();
     let (repo, root) = repository("pattern");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
-    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 1;
+    let size = usize::try_from(CAP).expect("fits") + 1;
     fs::write(directory.join("a.txt"), "a\n").expect("write");
     fs::write(directory.join("b.txt"), "b\n").expect("write");
     for name in ["*", "*.txt", ":"] {
@@ -355,13 +314,10 @@ fn a_large_file_named_like_a_pattern_drops_nothing_else() {
         store.commit(&workspace, "work").expect("commit succeeds"),
         Commit::Created(_)
     ));
-    let listed = Command::new("git")
-        .arg("--git-dir")
-        .arg(&repo)
-        .args(["ls-tree", "-r", "--name-only", &branch().to_string()])
-        .output()
-        .expect("list the branch");
-    let listed = String::from_utf8_lossy(&listed.stdout);
+    let listed = git_out(
+        &repo,
+        &["ls-tree", "-r", "--name-only", &branch().to_string()],
+    );
     for kept in ["a.txt", "b.txt", "README.md"] {
         assert!(
             listed.lines().any(|line| line == kept),
@@ -377,109 +333,8 @@ fn a_large_file_named_like_a_pattern_drops_nothing_else() {
     store.unmount(&workspace).expect("unmount succeeds");
 }
 
-/// Every file under `directory`, recursively.
-fn files_under(directory: &Path) -> Vec<PathBuf> {
-    let mut pending = vec![directory.to_path_buf()];
-    let mut files = Vec::new();
-    while let Some(path) = pending.pop() {
-        if path.is_dir() {
-            pending.extend(
-                fs::read_dir(&path)
-                    .expect("read")
-                    .flatten()
-                    .map(|e| e.path()),
-            );
-        } else {
-            files.push(path);
-        }
-    }
-    files
-}
-
-#[test]
-fn a_mount_whose_chunks_do_not_verify_leaves_the_workspace_as_it_was() {
-    let _exclusive = exclusive();
-    let (repo, root) = repository("mount-verify");
-    let store = GitWorkspace::new(&repo, &root);
-    store
-        .ensure_branch(&branch(), None)
-        .expect("create the branch");
-    let workspace = store.mount(&branch()).expect("mount succeeds");
-    let directory = PathBuf::from(workspace.path());
-    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 4096;
-    let original = noise(31, size);
-    fs::write(directory.join("model.bin"), &original).expect("write a large file");
-    assert!(matches!(
-        store.commit(&workspace, "work").expect("commit succeeds"),
-        Commit::Created(_)
-    ));
-    let manifest = git_out(
-        &repo,
-        &[
-            "log",
-            "-1",
-            "--format=%(trailers:key=Spawn-Large,valueonly)",
-            &format!("refs/heads/{}", branch()),
-        ],
-    );
-    // Work the branch does not hold yet.
-    fs::write(directory.join("draft.txt"), "not committed\n").expect("write a draft");
-
-    // Every chunk corrupted, the manifest left sound.
-    let objects = files_under(&root.join(spawn_host::DEFAULT_CHUNK_DIRECTORY));
-    let chunks: Vec<(PathBuf, Vec<u8>)> = objects
-        .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name != manifest.as_str())
-        })
-        .map(|path| {
-            let bytes = fs::read(&path).expect("read object");
-            (path, bytes)
-        })
-        .collect();
-    assert!(!chunks.is_empty());
-    for (path, bytes) in &chunks {
-        let mut corrupt = bytes.clone();
-        let middle = corrupt.len() / 2;
-        corrupt[middle] ^= 0xff;
-        fs::write(path, corrupt).expect("corrupt a chunk");
-    }
-    assert!(store.mount(&branch()).is_err(), "the chunks do not verify");
-    assert_eq!(
-        fs::read_to_string(directory.join("draft.txt")).expect("the draft is still there"),
-        "not committed\n"
-    );
-    assert_eq!(
-        fs::read(directory.join("model.bin")).expect("read"),
-        original
-    );
-    assert!(
-        files_under(&root.join(".mount")).is_empty(),
-        "the staged tree is gone"
-    );
-
-    // Sound again: the mount replaces the workspace with the branch head.
-    for (path, bytes) in &chunks {
-        fs::write(path, bytes).expect("restore a chunk");
-    }
-    let workspace = store.mount(&branch()).expect("mount succeeds");
-    let directory = PathBuf::from(workspace.path());
-    assert!(!directory.join("draft.txt").exists());
-    assert_eq!(
-        fs::read(directory.join("model.bin")).expect("read"),
-        original
-    );
-    assert!(files_under(&root.join(".mount")).is_empty());
-    assert_eq!(
-        store.commit(&workspace, "again").expect("commit succeeds"),
-        Commit::Unchanged
-    );
-    store.unmount(&workspace).expect("unmount succeeds");
-}
-
-/// Names of large files that are not plain: bytes that are not UTF-8, in a
-/// file and in a directory, and newlines.
+/// Names of files over the cap that are not plain: bytes that are not
+/// UTF-8, in a file and in a directory, and newlines.
 const ODD_LARGE_NAMES: [&[u8]; 4] = [
     b"bad\xffname.bin",
     b"dir\xfe/model.bin",
@@ -488,24 +343,23 @@ const ODD_LARGE_NAMES: [&[u8]; 4] = [
 ];
 
 #[test]
-fn a_large_file_of_any_name_round_trips_through_a_mount() {
+fn a_file_over_the_cap_of_any_name_is_left_out_and_told_of() {
     use std::os::unix::ffi::OsStrExt;
     let _exclusive = exclusive();
     let (repo, root) = repository("odd-names");
-    let store = GitWorkspace::new(&repo, &root);
+    let store = GitWorkspace::new(&repo, &root).with_max_file_bytes(CAP);
     store
         .ensure_branch(&branch(), None)
         .expect("create the branch");
     let workspace = store.mount(&branch()).expect("mount succeeds");
     let directory = PathBuf::from(workspace.path());
-    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 1;
-    let named =
-        |directory: &PathBuf, name: &[u8]| directory.join(std::ffi::OsStr::from_bytes(name));
-    for (seed, name) in (20..).zip(ODD_LARGE_NAMES) {
-        let path = named(&directory, name);
+    let size = usize::try_from(CAP).expect("fits") + 1;
+    for name in ODD_LARGE_NAMES {
+        let path = directory.join(std::ffi::OsStr::from_bytes(name));
         fs::create_dir_all(path.parent().expect("a parent")).expect("create the directory");
-        fs::write(&path, noise(seed, size)).expect("write a large file");
+        fs::write(&path, vec![9u8; size]).expect("write a large file");
     }
+    fs::write(directory.join("kept.txt"), "kept\n").expect("write");
     assert!(matches!(
         store.commit(&workspace, "work").expect("commit succeeds"),
         Commit::Created(_)
@@ -521,16 +375,8 @@ fn a_large_file_of_any_name_round_trips_through_a_mount() {
     for name in ODD_LARGE_NAMES {
         assert!(!listed.contains(&name), "out of git: {listed:?}");
     }
-    store.unmount(&workspace).expect("unmount succeeds");
-
-    let workspace = store.mount(&branch()).expect("mount succeeds");
-    let directory = PathBuf::from(workspace.path());
-    for (seed, name) in (20..).zip(ODD_LARGE_NAMES) {
-        assert_eq!(
-            fs::read(named(&directory, name)).expect("read back"),
-            noise(seed, size)
-        );
-    }
+    assert!(listed.contains(&b"kept.txt".as_slice()), "{listed:?}");
+    assert_eq!(store.take_notices(&workspace).len(), ODD_LARGE_NAMES.len());
     assert_eq!(
         store.commit(&workspace, "again").expect("commit succeeds"),
         Commit::Unchanged
@@ -554,17 +400,6 @@ fn a_commit_records_the_branch_from_the_identifier() {
         "the identifier carries the workspace directory"
     );
     store.unmount(&workspace).expect("unmount succeeds");
-}
-
-#[test]
-fn the_container_prefix_runs_a_shell_in_the_named_container() {
-    let _exclusive = exclusive();
-    let prefix = docker_prefix("docker", "agent_test");
-    assert_eq!(prefix[0], "docker");
-    assert_eq!(prefix[1], "exec");
-    assert_eq!(prefix[4], container_name("agent_test"));
-    assert_eq!(prefix[6], "-c");
-    assert_eq!(prefix.len(), 7, "{prefix:?}");
 }
 
 /// A tmux program pinned to a private server, which goes when the test does,
@@ -788,89 +623,84 @@ fn tmux_starts_in_the_launch_directory() {
     host.terminate(&name, &workspace()).expect("clean up");
 }
 
-/// `write_new` writes on this host, and inside a workspace through the
-/// container prefix (a fake `docker` that runs the command here), with the
-/// bytes on standard input.
+/// `write_new` writes on this host: bytes that are not text, and more than
+/// a pipe holds, arrive whole, and no temporary file is left.
 #[test]
-fn files_are_written_new_on_the_host_and_through_the_prefix() {
+fn files_are_written_new_on_the_host() {
     let directory = scratch().join("write-new");
     let _ = fs::remove_dir_all(&directory);
     let local = TmuxHost::local("tmux");
     contract::terminal_files("local", &local, &directory.to_string_lossy());
-    let prefix_program = script(
-        "fake-docker-write",
-        "#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
-    );
-    let builder: std::sync::Arc<PrefixBuilder> = {
-        let words = docker_prefix(&prefix_program, "agent_test");
-        std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
-    };
-    let inside = TmuxHost::in_workspaces("tmux", builder, None);
-    contract::terminal_files("inside", &inside, &directory.to_string_lossy());
-    // Bytes that are not text, and more than a pipe holds, arrive whole.
     let big: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
-    let path = directory.join("inside/big.jsonl");
+    let path = directory.join("local/big.jsonl");
     assert!(
-        inside
+        local
             .write_new(&workspace(), &path.to_string_lossy(), &big)
             .expect("write")
     );
     assert_eq!(fs::read(&path).expect("read back"), big);
-    let left: Vec<_> = fs::read_dir(directory.join("inside"))
+    let left: Vec<_> = fs::read_dir(directory.join("local"))
         .expect("list")
         .map(|entry| entry.expect("entry").file_name())
         .collect();
-    assert_eq!(left.len(), 2, "no temporary file is left: {left:?}");
+    assert!(
+        !left
+            .iter()
+            .any(|name| name.to_string_lossy().contains("spawn-write")),
+        "no temporary file is left: {left:?}"
+    );
     fs::remove_dir_all(&directory).expect("clean up");
 }
 
+/// A host on a socket runs every tmux call on that server (`tmux -L`).
 #[test]
-fn tmux_calls_go_through_the_container_prefix() {
+fn a_host_on_a_socket_runs_tmux_on_that_server() {
     let _exclusive = exclusive();
-    let calls = scratch().join("tmux-calls.log");
+    let calls = scratch().join("tmux-socket-calls.log");
     let _ = fs::remove_file(&calls);
-    let socket = format!("spawn-host-test-prefix-{}", std::process::id());
+    let socket = format!("spawn-host-test-socket-{}", std::process::id());
     let _server = IsolatedTmux {
         program: String::new(),
         socket: socket.clone(),
     };
-    let inner = script(
-        "fake-tmux-prefix",
+    let logging = script(
+        "fake-tmux-socket",
         &format!(
-            "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec tmux -L {socket} \"$@\"\n",
+            "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec tmux \"$@\"\n",
             calls = calls.display()
         ),
     );
-    let prefix_program = script(
-        "fake-docker-prefix",
-        &format!(
-            "#!/bin/sh\nprintf 'docker %s\\n' \"$*\" >> '{calls}'\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
-            calls = calls.display()
-        ),
-    );
-    let builder: std::sync::Arc<PrefixBuilder> = {
-        let words = docker_prefix(&prefix_program, "agent_test");
-        std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
-    };
-    let host = TmuxHost::in_workspaces(&inner, builder.clone(), None);
-    let name = terminal("prefix");
-    start_session(&host, &launch(&name)).expect("start through the prefix succeeds");
-    let later = TmuxHost::in_workspaces(&inner, builder, None);
-    assert!(
-        later
-            .is_alive(&name, &workspace())
-            .expect("is_alive in a new host")
-    );
-    later
-        .terminate(&name, &workspace())
-        .expect("terminate through the prefix");
+    let host = TmuxHost::on_socket(&logging, Some(socket.clone()));
+    let name = terminal("socket");
+    start_session(&host, &launch(&name)).expect("start on the socket");
+    assert!(host.is_alive(&name, &workspace()).expect("is_alive"));
+    host.terminate(&name, &workspace()).expect("terminate");
     let log = fs::read_to_string(&calls).expect("read the call log");
-    assert!(
-        log.contains("exec -i -t spawn-exec-agent_test sh -c"),
+    assert_eq!(
+        log.lines()
+            .filter(|line| !line.starts_with(&format!("tmux -L {socket} ")))
+            .count(),
+        0,
         "{log}"
     );
     assert!(log.contains("new-session"), "{log}");
-    assert!(log.contains("-c /tmp"), "{log}");
+}
+
+/// A capture from a tmux that never answers fails within its bound
+/// instead of holding the caller.
+#[test]
+fn a_capture_from_a_tmux_that_never_answers_fails_in_time() {
+    let _exclusive = exclusive();
+    let hung = script("fake-tmux-hung", "#!/bin/sh\nexec sleep 60\n");
+    let host = TmuxHost::local(&hung);
+    let started = std::time::Instant::now();
+    let captured = host.capture_tail(&terminal("hung"), &workspace(), 20);
+    let took = started.elapsed();
+    assert!(
+        matches!(&captured, Err(TerminalError(text)) if text.contains("did not answer")),
+        "{captured:?}"
+    );
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
 }
 
 /// The real adapters obey the same contract as the memory fake the Bridge

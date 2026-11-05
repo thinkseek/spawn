@@ -211,7 +211,7 @@ fn a_stalled_end_asks_for_attention_until_the_execution_ends() {
             cause: EndCause::Exited,
             exit_code: Some(0),
             failures: 20,
-            error: "commit unavailable: chunk store: No space left on device".to_string(),
+            error: "commit unavailable: No space left on device".to_string(),
         },
     );
     fixture.observer.tick().expect("tick");

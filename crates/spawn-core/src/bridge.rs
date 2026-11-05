@@ -380,6 +380,9 @@ pub struct Bridge {
     /// took whose append failed: appended again first at the next tick
     /// ([`Bridge::record_commit`]).
     unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
+    /// Per session, what the workspace store had to tell the agent
+    /// ([`WorkspaceStore::take_notices`]) and no prompt carried yet.
+    untold: std::sync::Mutex<HashMap<SessionId, Vec<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
 }
@@ -403,6 +406,7 @@ impl Bridge {
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
             unrecorded_commits: std::sync::Mutex::default(),
+            untold: std::sync::Mutex::default(),
             transcripts: None,
         }
     }
@@ -1245,6 +1249,16 @@ impl Bridge {
                 return Ok(false);
             }
         }
+        // Logged, and carried by the next prompt the Bridge types.
+        let notices = self.workspaces.take_notices(&active.workspace);
+        if !notices.is_empty() {
+            for notice in &notices {
+                report.warnings.push(format!("{session}: {notice}"));
+            }
+            if let Ok(mut untold) = self.untold.lock() {
+                untold.entry(session.clone()).or_default().extend(notices);
+            }
+        }
         Ok(true)
     }
 
@@ -1601,13 +1615,22 @@ impl Bridge {
 
     /// Text into the engine's input box, at most once: the intent is
     /// recorded before the keys go and the completion after, so a retried
-    /// command or a restarted Bridge can tell whether it was typed.
+    /// command or a restarted Bridge can tell whether it was typed. What the
+    /// workspace store told and no prompt carried yet goes before it.
     fn type_once(
         &self,
         claimed: &Claimed,
         active: &Active,
         text: &str,
     ) -> Result<Result<(), TerminalError>, StoreError> {
+        // What the workspace store had to tell the agent goes first, and is
+        // told once: it clears when the typing is recorded.
+        let untold = self.untold.lock().ok().and_then(|untold| {
+            untold
+                .get(&claimed.session_id)
+                .map(|notices| notices.join("\n\n"))
+        });
+        let text = untold.map_or_else(|| text.to_string(), |told| format!("{told}\n\n{text}"));
         self.step(
             claimed,
             Some(&active.execution_id),
@@ -1616,7 +1639,7 @@ impl Bridge {
         )?;
         let typed = self
             .terminals
-            .submit_text(&active.terminal(), &active.workspace, text);
+            .submit_text(&active.terminal(), &active.workspace, &text);
         if typed.is_ok() {
             self.step(
                 claimed,
@@ -1624,6 +1647,9 @@ impl Bridge {
                 CommandStep::Typed,
                 None,
             )?;
+            if let Ok(mut untold) = self.untold.lock() {
+                untold.remove(&claimed.session_id);
+            }
         }
         Ok(typed)
     }

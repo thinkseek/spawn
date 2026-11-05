@@ -19,7 +19,6 @@ Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部�
 | PostgreSQL | 16 及以上 | 事件日志、命令队列、视图 |
 | tmux | 3.x | 终端 |
 | git | 2.40 及以上（`git --attr-source`，启动时检查） | 分支与工作区 |
-| docker | 可选 | 设置 `SPAWN_EXEC_IMAGE` 时在容器内运行引擎 |
 | Claude Code | 当前版本 | 引擎 |
 
 ## 安装
@@ -96,11 +95,9 @@ spawn tail --session session_demo
 | `SPAWN_WORKER` | `spawn-worker` | 领取命令时记录的 worker 名 |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 路径 |
 | `SPAWN_TMUX_SOCKET` | 默认 socket | tmux `-L` socket 名 |
-| `SPAWN_EXEC_IMAGE` | 未设置 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
-| `SPAWN_DOCKER_PROGRAM` | `docker` | docker 路径 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
-| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects`；设置 `SPAWN_EXEC_IMAGE` 时为 `$SPAWN_EXEC_HOME/.claude/projects` | Claude Code 写 transcript 的目录（引擎所见路径；容器模式下 Bridge 在容器内读取） |
-| `SPAWN_EXEC_HOME` | `/root` | 容器内引擎的 home（`docker exec` 不带宿主机的 `HOME`、`CLAUDE_CONFIG_DIR`） |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录 |
+| `SPAWN_MAX_FILE_MB` | `100` | checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次 |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
 | `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时只用规则判定，规则定不了的情形要求关注 |
 
