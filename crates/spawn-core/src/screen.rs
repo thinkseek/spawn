@@ -456,3 +456,43 @@ $";
         assert_eq!(read_claude_screen(pane).state, ScreenState::Error);
     }
 }
+
+#[cfg(test)]
+mod background_shell_tests {
+    use super::{ScreenState, read_claude_screen, shows_background_shells};
+
+    const STATUS: &str = "  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+    /// Live case (task 33): a resident ran clippy, the tests and the e2e in
+    /// background shells and sat at its prompt for over 15 minutes. The
+    /// reading is Ready (input is safe), and its evidence is the line that
+    /// says the shells still run.
+    #[test]
+    fn a_finished_turn_with_shells_running_is_ready_with_that_line_as_evidence() {
+        for line in [
+            "✻ Sautéed for 6s · done 11:27 PM · 5 shells still running",
+            "✻ Baked for 2m 3s · done 9:01 AM · 1 shell still running",
+        ] {
+            let reading = read_claude_screen(&format!("claude: started them\n{line}\n❯ \n{STATUS}"));
+            assert_eq!(reading.state, ScreenState::Ready);
+            assert_eq!(reading.evidence, line);
+            assert!(shows_background_shells(&reading.evidence));
+        }
+        let done = read_claude_screen(&format!("✻ Sautéed for 6s · done 11:27 PM\n❯ \n{STATUS}"));
+        assert_eq!(done.state, ScreenState::Ready);
+        assert!(!shows_background_shells(&done.evidence));
+        assert!(!shows_background_shells("❯"));
+    }
+
+    /// Text the model printed is transcript: a line that quotes the engine's
+    /// above other output is not the engine's.
+    #[test]
+    fn a_quoted_shells_line_in_the_transcript_is_not_read() {
+        let pane = format!(
+            "claude: ✻ Sautéed for 6s · done 11:27 PM · 5 shells still running\n❯ \n{STATUS}"
+        );
+        let reading = read_claude_screen(&pane);
+        assert_eq!(reading.state, ScreenState::Ready);
+        assert!(!shows_background_shells(&reading.evidence));
+    }
+}
