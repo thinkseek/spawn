@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -35,6 +36,7 @@ use spawn_core::port::{
     WorkspaceStore,
 };
 
+use crate::agent_files::AgentFileError;
 use crate::chunks::{
     LargeFile, LocalChunkStore, Manifest, materialize, mode_of, remove_large, store_file,
 };
@@ -64,25 +66,59 @@ pub struct Container {
     pub image: String,
 }
 
-/// Name of the container that hosts one branch's workspace.
-pub fn container_name(branch: &str) -> String {
-    format!("spawn-exec-{branch}")
+/// The identity of the fleet whose workspaces live under `root`: a short
+/// hash of the root's path (lexically normalized, so `root/` and `root` are
+/// one fleet). Two fleets on one host have two roots, so their containers
+/// never share a name ([`container_name`]).
+pub fn fleet_of(root: &Path) -> String {
+    let normalized: PathBuf = root.components().collect();
+    let hash = blake3::hash(normalized.as_os_str().as_bytes());
+    hash.to_hex()[..12].to_string()
 }
 
-/// argv prefix that runs one shell command inside a workspace container.
+/// The fleet of a workspace: that of the root it is mounted under (a
+/// workspace is `<root>/<branch>`).
+pub fn fleet_of_workspace(workspace: &WorkspaceId) -> String {
+    let path = Path::new(workspace.path());
+    fleet_of(path.parent().unwrap_or(path))
+}
+
+/// Label on every workspace container naming its fleet: only a container
+/// carrying this fleet's label is ever removed.
+pub const FLEET_LABEL: &str = "spawn.fleet";
+
+/// Name of the container that hosts one branch's workspace in `fleet`
+/// ([`fleet_of`]).
+pub fn container_name(fleet: &str, branch: &str) -> String {
+    format!("spawn-exec-{fleet}-{branch}")
+}
+
+/// argv prefix that runs one shell command inside the container of
+/// `workspace` ([`container_name`] of its fleet and branch).
 ///
-/// The container mounts the workspace at its host path, so no path
-/// translation is needed anywhere.
-pub fn docker_prefix(docker: &str, branch: &str) -> Vec<String> {
+/// No `-t`: the terminal host runs it with no terminal on stdin, and docker
+/// refuses a TTY then. The container mounts the workspace at its host path,
+/// so no path translation is needed anywhere.
+pub fn docker_prefix(docker: &str, workspace: &WorkspaceId) -> Vec<String> {
     vec![
         docker.to_string(),
         "exec".to_string(),
         "-i".to_string(),
-        "-t".to_string(),
-        container_name(branch),
+        container_name(&fleet_of_workspace(workspace), workspace.sandbox()),
         "sh".to_string(),
         "-c".to_string(),
     ]
+}
+
+/// Whose a container of a given name is.
+#[derive(Debug, PartialEq, Eq)]
+enum Holder {
+    /// No container has the name.
+    Nobody,
+    /// One labelled with this fleet.
+    Us,
+    /// One without this fleet's label: another fleet's, or not spawn's.
+    Other(String),
 }
 
 /// Stdout of a git command exactly as written, bytes and all, or the
@@ -231,21 +267,29 @@ struct FileStat {
     mode: u32,
 }
 
-/// The stat of a file, `None` when it is not a regular file.
+/// The stat of a file, `None` when it is not a regular file. Only for a
+/// file the controller just wrote; one the agent may have written is opened
+/// through [`crate::agent_files::open_regular`] and its descriptor's stat
+/// taken ([`file_stat`]).
 fn stat_of(path: &Path) -> Option<FileStat> {
-    use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path)
         .ok()
         .filter(std::fs::Metadata::is_file)?;
+    Some(file_stat(&metadata))
+}
+
+/// The [`FileStat`] of `metadata`.
+fn file_stat(metadata: &std::fs::Metadata) -> FileStat {
+    use std::os::unix::fs::MetadataExt;
     let nanoseconds =
         |seconds: i64, nanos: i64| i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
-    Some(FileStat {
+    FileStat {
         size: metadata.len(),
         mtime_ns: nanoseconds(metadata.mtime(), metadata.mtime_nsec()),
         ctime_ns: nanoseconds(metadata.ctime(), metadata.ctime_nsec()),
         inode: metadata.ino(),
-        mode: mode_of(&metadata),
-    })
+        mode: mode_of(metadata),
+    }
 }
 
 /// Wall-clock time now, in nanoseconds since the epoch.
@@ -418,22 +462,73 @@ impl GitWorkspace {
         Ok(())
     }
 
+    /// Who holds the container `name`, from its [`FLEET_LABEL`]. A failed
+    /// inspection is nobody's: `docker run` reports the daemon's trouble.
+    fn holder_of(container: &Container, name: &str, fleet: &str) -> Holder {
+        let output = Command::new(&container.docker)
+            .args([
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                &format!("{{{{index .Config.Labels \"{FLEET_LABEL}\"}}}}"),
+                name,
+            ])
+            .stdin(Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let label = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if label == fleet {
+                    Holder::Us
+                } else {
+                    Holder::Other(label)
+                }
+            }
+            _ => Holder::Nobody,
+        }
+    }
+
+    /// Remove the container `name` when this fleet's label is on it; one
+    /// of another fleet (or not spawn's) is left alone, and `Err` names it.
+    fn remove_container(&self, container: &Container, name: &str) -> Result<(), String> {
+        match Self::holder_of(container, name, &fleet_of(&self.root)) {
+            Holder::Nobody => Ok(()),
+            Holder::Us => {
+                let _ = Command::new(&container.docker)
+                    .args(["rm", "-f", name])
+                    .stdin(Stdio::null())
+                    .output();
+                Ok(())
+            }
+            Holder::Other(label) => Err(format!(
+                "container {name} is not this fleet's (its {FLEET_LABEL} label is {label:?}); \
+                 left alone"
+            )),
+        }
+    }
+
     fn start_container(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
         let Some(container) = self.container.as_ref() else {
             return Ok(());
         };
-        let name = container_name(branch);
-        let _ = Command::new(&container.docker)
-            .args(["rm", "-f", &name])
-            .stdin(Stdio::null())
-            .output();
+        let fleet = fleet_of(&self.root);
+        let name = container_name(&fleet, branch);
+        self.remove_container(container, &name)
+            .map_err(WorkspaceError::Unavailable)?;
         let mount = format!("{}:{}", directory.display(), directory.display());
+        let fleet_label = format!("{FLEET_LABEL}={fleet}");
+        let root_label = format!("spawn.root={}", self.root.display());
         let output = Command::new(&container.docker)
             .args([
                 "run",
                 "-d",
                 "--name",
                 &name,
+                "--label",
+                &fleet_label,
+                "--label",
+                &root_label,
                 "-v",
                 &mount,
                 "-w",
@@ -538,11 +633,17 @@ impl GitWorkspace {
         index: &Path,
         kept_in: &[String],
     ) -> Result<(String, Vec<(TreePath, u64)>), WorkspaceError> {
-        let mut large = self.large_files(directory, index)?;
+        clear_dead_lock(index);
+        let (mut large, special) = self.large_and_special_files(directory, index)?;
         let blobs = self.blobs_in(kept_in, &large)?;
         large.retain(|(path, _)| !blobs.contains(path));
-        self.stage_all_but(directory, index, &large)?;
-        self.unstage(directory, index, &large)?;
+        // Special files (a FIFO, a socket, a device) are never committed:
+        // `git add` refuses one at a tracked path, which would fail every
+        // checkpoint, so they are left out like large files, and not stored.
+        let mut left_out = large.clone();
+        left_out.extend(special);
+        self.stage_all_but(directory, index, &left_out)?;
+        self.unstage(directory, index, &left_out)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the limit between the size check and `add`
         // was hashed anyway; keep it off the branch all the same, and in the
@@ -669,13 +770,15 @@ impl GitWorkspace {
             .collect())
     }
 
-    /// Files git would commit that are larger than [`LARGE_FILE_BYTES`], with
-    /// their sizes: tracked or untracked, ignore rules applied.
-    fn large_files(
+    /// Files git would commit (tracked or untracked, ignore rules applied)
+    /// that are larger than [`LARGE_FILE_BYTES`], with their sizes; then
+    /// the paths among them that hold something other than a regular file,
+    /// a symlink or a directory (a FIFO, a socket, a device).
+    fn large_and_special_files(
         &self,
         directory: &Path,
         index: &Path,
-    ) -> Result<Vec<(TreePath, u64)>, WorkspaceError> {
+    ) -> Result<LargeAndSpecial, WorkspaceError> {
         let listed = self.listing_in(
             directory,
             index,
@@ -687,19 +790,26 @@ impl GitWorkspace {
                 "--exclude-standard",
             ],
         )?;
-        let mut large: Vec<(TreePath, u64)> = listed_paths(&listed)
-            .into_iter()
-            .filter_map(|path| {
-                let size = std::fs::symlink_metadata(directory.join(path.as_path()))
-                    .ok()
-                    .filter(std::fs::Metadata::is_file)?
-                    .len();
-                (size > LARGE_FILE_BYTES).then_some((path, size))
-            })
-            .collect();
+        let mut large = Vec::new();
+        let mut special = Vec::new();
+        for path in listed_paths(&listed) {
+            let Ok(metadata) = std::fs::symlink_metadata(directory.join(path.as_path())) else {
+                continue;
+            };
+            let kind = metadata.file_type();
+            if kind.is_file() {
+                if metadata.len() > LARGE_FILE_BYTES {
+                    large.push((path, metadata.len()));
+                }
+            } else if !kind.is_symlink() && !kind.is_dir() {
+                special.push((path, 0));
+            }
+        }
         large.sort();
         large.dedup();
-        Ok(large)
+        special.sort();
+        special.dedup();
+        Ok((large, special))
     }
 
     /// The stat cache of one branch's large files, beside its kept index:
@@ -793,13 +903,15 @@ impl GitWorkspace {
         Ok(true)
     }
 
-    /// The chunks of the stat-cache entry `cached` when they are still the
-    /// file's at `full` with stat `stat`: the stat is the entry's, the store
-    /// holds the chunks, and a racily clean entry hashes to the same chunks
-    /// again. `None`: chunk the file again.
+    /// The chunks of the stat-cache entry `cached` when they are still those
+    /// of the open `file` (shown as `full`) whose descriptor's stat is
+    /// `stat`: the stat is the entry's, the store holds the chunks, and a
+    /// racily clean entry hashes to the same chunks again. `None`: chunk the
+    /// file again.
     fn cached_chunks(
         &self,
         cached: Option<&Known>,
+        file: &std::fs::File,
         full: &Path,
         stat: FileStat,
     ) -> Result<Option<Vec<String>>, WorkspaceError> {
@@ -812,8 +924,11 @@ impl GitWorkspace {
         if !entry.is_racy() {
             return Ok(Some(entry.chunks.clone()));
         }
-        let (chunks, read) = crate::chunks::chunk_names_of(full).map_err(chunk_failure)?;
-        let same = chunks == entry.chunks && read == stat.size && stat_of(full) == Some(stat);
+        let (chunks, read) =
+            crate::chunks::chunk_names_of(bounded(file, stat.size)?, full).map_err(chunk_failure)?;
+        let same = chunks == entry.chunks
+            && read == stat.size
+            && descriptor_stat(file, full)? == stat;
         Ok(same.then_some(chunks))
     }
 
@@ -832,18 +947,28 @@ impl GitWorkspace {
             let full = directory.join(path.as_path());
             // Before the stat: a rewrite after it falls in the racy window.
             let cached_at_ns = now_ns();
-            let Some(stat) = stat_of(&full) else {
-                continue;
+            // The file itself, never followed through a symlink, never a
+            // FIFO, and its stat from the descriptor: what is read is what
+            // was stat'ed, whatever the path names a moment later.
+            let file = match crate::agent_files::open_regular(directory, path) {
+                Ok(Some(opened)) => opened.file,
+                Ok(None)
+                | Err(AgentFileError::NotRegular(_) | AgentFileError::Unsafe(_)) => continue,
+                Err(error @ AgentFileError::Failed(_)) => {
+                    return Err(WorkspaceError::Unavailable(error.to_string()));
+                }
             };
+            let stat = descriptor_stat(&file, &full)?;
             let (chunks, size, stable) =
-                if let Some(chunks) = self.cached_chunks(cached.get(path), &full, stat)? {
+                if let Some(chunks) = self.cached_chunks(cached.get(path), &file, &full, stat)? {
                     (chunks, stat.size, true)
                 } else {
                     let (chunks, read) =
-                        store_file(self.chunks.as_ref(), &full).map_err(chunk_failure)?;
+                        store_file(self.chunks.as_ref(), bounded(&file, stat.size)?, &full)
+                            .map_err(chunk_failure)?;
                     // A file that changed while it was read is recorded as
                     // read and chunked again at the next checkpoint.
-                    let stable = stat_of(&full) == Some(stat) && read == stat.size;
+                    let stable = descriptor_stat(&file, &full)? == stat && read == stat.size;
                     (chunks, read, stable)
                 };
             files.push(LargeFile {
@@ -871,6 +996,26 @@ impl GitWorkspace {
         let manifest = Manifest { files }.to_bytes();
         self.chunks.put(&manifest).map(Some).map_err(chunk_failure)
     }
+    /// Whether the manifest `name` and every chunk it names are in the
+    /// store: a commit never names an object that is not there.
+    fn check_stored(&self, name: Option<&str>) -> Result<(), WorkspaceError> {
+        let Some(name) = name else {
+            return Ok(());
+        };
+        let manifest = self.manifest(name)?;
+        for file in &manifest.files {
+            for chunk in &file.chunks {
+                if !self.chunks.contains(chunk).map_err(chunk_failure)? {
+                    return Err(WorkspaceError::Unavailable(format!(
+                        "chunk {chunk} of {} is missing from the chunk store",
+                        file.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The large-file manifest a commit names in its `Spawn-Large` trailer.
     fn manifest_of(&self, commit: &str) -> Result<Option<String>, WorkspaceError> {
         let message = self.git_output(&["show", "-s", "--format=%B", commit, "--"])?;
@@ -1251,7 +1396,10 @@ impl WorkspaceStore for GitWorkspace {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, large) = tree?;
+        // Until the ref names them, no collection reads the refs.
+        let _writing = self.chunks.writing().map_err(chunk_failure)?;
         let manifest = self.store_large(&branch, &directory, &large)?;
+        self.check_stored(manifest.as_deref())?;
 
         let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
         // A merge of main whose conflicts are now resolved: main is the
@@ -1287,10 +1435,10 @@ impl WorkspaceStore for GitWorkspace {
         // A pending merge stays only when the branch carries its markers.
         self.settle_pending(workspace.sandbox());
         if let Some(container) = self.container.as_ref() {
-            let _ = Command::new(&container.docker)
-                .args(["rm", "-f", &container_name(workspace.sandbox())])
-                .stdin(Stdio::null())
-                .output();
+            let name = container_name(&fleet_of(&self.root), workspace.sandbox());
+            // Another fleet's container is left alone; the next mount of
+            // this branch reports it.
+            let _ = self.remove_container(container, &name);
         }
         match std::fs::remove_dir_all(&directory) {
             Ok(()) => {
@@ -1612,23 +1760,23 @@ impl GitWorkspace {
         // Every file first: nothing is written unless all are as `from` left them.
         for path in &changed {
             let full = directory.join(path.as_path());
-            let present = match std::fs::symlink_metadata(&full) {
-                Ok(metadata) if metadata.is_file() => Some(
-                    crate::chunks::chunk_names_of(&full)
-                        .map_err(chunk_failure)?
-                        .0,
+            let present = match crate::agent_files::open_regular(directory, path) {
+                Ok(Some(opened)) => Some(
+                    crate::chunks::chunk_names_of(
+                        bounded(&opened.file, opened.metadata.len())?,
+                        &full,
+                    )
+                    .map_err(chunk_failure)?
+                    .0,
                 ),
-                Ok(_) => {
+                Ok(None) => None,
+                Err(AgentFileError::NotRegular(_) | AgentFileError::Unsafe(_)) => {
                     return Err(refused(format!(
                         "large file {path}: something other than a file is in the workspace"
                     )));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(WorkspaceError::Unavailable(format!(
-                        "stat {}: {error}",
-                        full.display()
-                    )));
+                Err(error @ AgentFileError::Failed(_)) => {
+                    return Err(WorkspaceError::Unavailable(error.to_string()));
                 }
             };
             if present.as_ref() != before.get(path).map(|file| &file.chunks) {
@@ -1720,7 +1868,10 @@ impl GitWorkspace {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, large) = tree?;
+        // Until the ref names them, no collection reads the refs.
+        let _writing = self.chunks.writing().map_err(chunk_failure)?;
         let manifest = self.store_large(branch, directory, &large)?;
+        self.check_stored(manifest.as_deref())?;
         if let Some(previous) = &previous
             && self.git_output(&["rev-parse", &format!("{previous}^{{tree}}")])? == tree
             && self.manifest_of(previous)? == manifest
@@ -1771,6 +1922,7 @@ impl GitWorkspace {
                 WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
             })?;
         }
+        clear_dead_lock(&index);
         let _ = std::fs::remove_file(&index);
         let result = self
             .output_in(directory, &index, &["read-tree", from])
@@ -2108,12 +2260,53 @@ fn merge_tree_output(stdout: &[u8]) -> (String, Vec<TreePath>, Vec<String>) {
 /// Whether any of `files` (the ones the merge listed) in `directory` still
 /// holds a whole conflict marker block whose markers are at least as long
 /// as the path's shortest ([`GitWorkspace::shortest_markers`]). A deleted
-/// file holds none.
+/// file holds none, and neither does something that is not a regular file
+/// (a symlink is not followed, a FIFO is not waited on). A file read up to
+/// [`CONFLICT_READ_LIMIT`] without a block, with more after it, or one that
+/// cannot be read, counts as unresolved.
 fn unresolved(directory: &Path, files: &[(TreePath, usize)]) -> bool {
     files.iter().any(|(file, shortest)| {
-        std::fs::read(directory.join(file.as_path()))
-            .is_ok_and(|bytes| has_conflict_block_sized(&bytes, *shortest))
+        match crate::agent_files::read_regular(directory, file, CONFLICT_READ_LIMIT) {
+            Ok(Some((bytes, _, more))) => more || has_conflict_block_sized(&bytes, *shortest),
+            Ok(None) | Err(AgentFileError::NotRegular(_) | AgentFileError::Unsafe(_)) => false,
+            Err(AgentFileError::Failed(_)) => true,
+        }
     })
+}
+
+/// Large files with their sizes, then special files ([`GitWorkspace::large_and_special_files`]).
+type LargeAndSpecial = (Vec<(TreePath, u64)>, Vec<(TreePath, u64)>);
+
+/// Remove git's own lock beside `index` (`<index>.lock`), left by a git
+/// that died mid-command (killed, out of memory, a SIGBUS on a file the
+/// agent truncated while git mapped it): while it is there every git on
+/// the index fails, so every checkpoint and merge of the branch would. Only
+/// called under the branch's lock, where no git of ours is running on the
+/// index.
+fn clear_dead_lock(index: &Path) {
+    let mut lock = index.as_os_str().to_owned();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(PathBuf::from(lock));
+}
+
+/// How much of a conflicted file [`unresolved`] reads.
+const CONFLICT_READ_LIMIT: u64 = 64 << 20;
+
+/// `file` read from its start, at most `size` bytes: a file of a workspace
+/// is read up to the size its descriptor had, however it grows meanwhile.
+fn bounded(file: &std::fs::File, size: u64) -> Result<impl Read + '_, WorkspaceError> {
+    use std::io::Seek;
+    let mut file = file;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| WorkspaceError::Unavailable(format!("seek: {error}")))?;
+    Ok(file.take(size))
+}
+
+/// The stat of the open `file` (shown as `full`), from its descriptor.
+fn descriptor_stat(file: &std::fs::File, full: &Path) -> Result<FileStat, WorkspaceError> {
+    file.metadata()
+        .map(|metadata| file_stat(&metadata))
+        .map_err(|error| WorkspaceError::Unavailable(format!("stat {}: {error}", full.display())))
 }
 
 /// The length of the conflict markers git writes by default.
@@ -2180,6 +2373,12 @@ mod tests {
     use spawn_core::port::{BaseMerge, Commit, WorkspaceError, WorkspaceStore};
 
     use super::GitWorkspace;
+
+    /// The chunk names of the file at `path`.
+    fn names_of(path: &Path) -> (Vec<String>, u64) {
+        let file = std::fs::File::open(path).expect("open");
+        crate::chunks::chunk_names_of(file, path).expect("hash")
+    }
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
@@ -2651,7 +2850,7 @@ mod tests {
         let name = store.manifest_of(&kept).expect("read").expect("a manifest");
         let chunks = &store.manifest(&name).expect("manifest").files[0].chunks;
         let (expected, _) =
-            crate::chunks::chunk_names_of(&directory.join("model.bin")).expect("hash");
+            names_of(&directory.join("model.bin"));
         assert_eq!(
             chunks, &expected,
             "the snapshot holds the agent's model.bin"
@@ -2743,7 +2942,7 @@ mod tests {
             store.commit(&workspace, "rewrite").expect("commit"),
             Commit::Created(_)
         ));
-        let (expected, _) = crate::chunks::chunk_names_of(&model).expect("hash");
+        let (expected, _) = names_of(&model);
         assert_eq!(committed_chunks(&store), expected, "the new content");
     }
 
@@ -2767,7 +2966,7 @@ mod tests {
             store.commit(&workspace, "rewrite").expect("commit"),
             Commit::Created(_)
         ));
-        let (expected, _) = crate::chunks::chunk_names_of(&model).expect("hash");
+        let (expected, _) = names_of(&model);
         assert_ne!(expected, old);
         assert_eq!(committed_chunks(&store), expected, "hashed again");
 

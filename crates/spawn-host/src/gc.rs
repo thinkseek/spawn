@@ -189,6 +189,12 @@ pub fn collect(
     repos: &[PathBuf],
     grace: Duration,
 ) -> Result<Collected, String> {
+    // No commit is between its first object and its ref while this is held
+    // (they hold `writing` that long): the refs read next name every object
+    // a commit wrote, however long it took.
+    let _collecting = store
+        .collecting()
+        .map_err(|error| format!("cannot lock the chunk store: {error}"))?;
     // Decide everything first: any read error returns before a removal.
     let live = live_objects(store, repos)?;
     let objects = store

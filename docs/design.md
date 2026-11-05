@@ -275,7 +275,7 @@ tmux：
 
 git：一个裸仓库持有全部基线 commit，每个分支一份工作树。工作树由 `git archive` 导出，**不含 `.git`**，引擎读不到历史、其他分支和控制器的 ref。
 
-`WorkspaceId` 是 `<branch>:<绝对目录>`；分支在冒号前，容器名由它派生为 `spawn-exec-<branch>`，任何进程只凭标识符就能重建映射。
+`WorkspaceId` 是 `<branch>:<绝对目录>`；分支在冒号前，容器名由它和舰队标识派生为 `spawn-exec-<fleet>-<branch>`（`<fleet>` 是工作区根目录路径的短哈希，即目录的父目录，`fleet_of`），任何进程只凭标识符就能重建映射。容器带 `spawn.fleet=<fleet>` 标签，挂载和卸载只删除带本舰队标签的同名容器，别的舰队或非 spawn 的容器原样保留（挂载时报错）。`docker exec` 只用 `-i`，不带 `-t`：终端宿主的 stdin 不是终端，docker 会拒绝 TTY。
 
 | 方法 | 命令 |
 | --- | --- |

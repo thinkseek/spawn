@@ -5,6 +5,7 @@
 //! The tmux and git adapters call an external program and read its exit
 //! code, so they share the same failure rules as the programs they wrap.
 
+pub mod agent_files;
 pub mod chunks;
 pub mod gc;
 pub mod git;
@@ -17,7 +18,7 @@ mod audit_repro;
 
 pub use chunks::LocalChunkStore;
 pub use git::{
-    DEFAULT_CHUNK_DIRECTORY, GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix,
+    DEFAULT_CHUNK_DIRECTORY, GitWorkspace, LARGE_FILE_BYTES, FLEET_LABEL, container_name, docker_prefix, fleet_of, fleet_of_workspace,
     has_conflict_block, has_conflict_block_sized,
 };
 pub use tmux::{PrefixBuilder, TmuxHost};

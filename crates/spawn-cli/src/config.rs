@@ -261,7 +261,7 @@ pub(crate) fn terminal_host() -> spawn_host::TmuxHost {
         Some(_) => {
             let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
             std::sync::Arc::new(move |workspace: &WorkspaceId| {
-                spawn_host::docker_prefix(&docker, workspace.sandbox())
+                spawn_host::docker_prefix(&docker, workspace)
             })
         }
         None => std::sync::Arc::new(|_: &WorkspaceId| Vec::new()),
