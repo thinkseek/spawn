@@ -652,9 +652,15 @@ mod tests {
         };
         let first = super::fingerprint_of(&input, crate::event::SessionSeq(1));
         input.screen_tail = Some("✽ Working… (47s · 3.9k tokens)".to_string());
-        assert_eq!(super::fingerprint_of(&input, crate::event::SessionSeq(1)), first);
+        assert_eq!(
+            super::fingerprint_of(&input, crate::event::SessionSeq(1)),
+            first
+        );
         input.screen_tail = Some("HUMAN: which region?".to_string());
-        assert_ne!(super::fingerprint_of(&input, crate::event::SessionSeq(1)), first);
+        assert_ne!(
+            super::fingerprint_of(&input, crate::event::SessionSeq(1)),
+            first
+        );
     }
 
     #[test]
