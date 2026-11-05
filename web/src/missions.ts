@@ -43,6 +43,44 @@ export interface LastGate {
   at_ms: number | null;
 }
 
+/** One of a task's records in the control stream (`spawn task stages`). */
+export interface TaskStage {
+  /** The record type without `task.`: assigned, delivered, reported,
+   * reviewed, gated, landed, aborted or cancelled. */
+  stage: string;
+  /** A gate's verdict, or a review's (`accepted`, `rejected`). */
+  verdict: string | null;
+  at_ms: number | null;
+  /** The time since the task's previous record; null on the first. */
+  took_ms: number | null;
+}
+
+/** A stage is slow when it took over ten minutes and over three times the
+ * median of the task's other stages: a delivery that waited for an hour
+ * while the rest took minutes stands out, a long piece of work among long
+ * ones does not. */
+export const SLOW_STAGE_MS = 10 * 60_000;
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+export function slowStages(stages: ReadonlyArray<TaskStage>): boolean[] {
+  return stages.map((stage, index) => {
+    if (stage.took_ms === null || stage.took_ms <= SLOW_STAGE_MS) return false;
+    const others = stages
+      .filter((_, other) => other !== index)
+      .map((other) => other.took_ms)
+      .filter((ms): ms is number => ms !== null);
+    return stage.took_ms > 3 * median(others);
+  });
+}
+
 /** What a mission's tasks are budgeted, when it has a budget. */
 export interface Budget {
   minutes: number | null;
@@ -70,6 +108,8 @@ export interface MissionTask {
   /** The gate's metric line of the accepted candidate. */
   metric: string | null;
   last_gate: LastGate | null;
+  /** Every record of the task, oldest first; empty when the server has none. */
+  stages: TaskStage[];
   /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
   model: string | null;
   created_by: string | null;
@@ -163,6 +203,18 @@ function normalizeLastGate(value: unknown): LastGate | null {
   };
 }
 
+function normalizeStage(value: unknown): TaskStage | null {
+  if (!isObject(value)) return null;
+  const stage = optionalText(value.stage);
+  if (stage === null) return null;
+  return {
+    stage,
+    verdict: optionalText(value.verdict),
+    at_ms: optionalNumber(value.at_ms),
+    took_ms: optionalNumber(value.took_ms),
+  };
+}
+
 function normalizeTask(value: unknown): MissionTask | null {
   if (!isObject(value)) return null;
   return {
@@ -180,6 +232,9 @@ function normalizeTask(value: unknown): MissionTask | null {
     objective: optionalNumber(value.objective),
     metric: optionalText(value.metric),
     last_gate: normalizeLastGate(value.last_gate),
+    stages: list(value.stages)
+      .map(normalizeStage)
+      .filter((stage): stage is TaskStage => stage !== null),
     model: optionalText(value.model),
     created_by: optionalText(value.created_by),
     created_at_ms: optionalNumber(value.created_at_ms),

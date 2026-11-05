@@ -13,15 +13,21 @@ import {
 import type { ReactNode } from "react";
 
 import { usePoll } from "../../api";
-import { relativeTime } from "../../format";
+import { relativeTime, stageDuration } from "../../format";
 import type {
   Mission,
   MissionTask,
   Missions,
   Resident,
+  TaskStage,
   TaskState,
 } from "../../missions";
-import { approveCommand, fetchMissions, pipelineOf } from "../../missions";
+import {
+  approveCommand,
+  fetchMissions,
+  pipelineOf,
+  slowStages,
+} from "../../missions";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
@@ -475,7 +481,11 @@ function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
         </span>
       </div>
 
-      <Pipeline task={task} steps={pipelineOf(mission)} />
+      {task.stages.length > 0 ? (
+        <StageSteps task={task} steps={pipelineOf(mission)} />
+      ) : (
+        <Pipeline task={task} steps={pipelineOf(mission)} />
+      )}
 
       {(task.objective !== null ||
         task.candidate ||
@@ -646,6 +656,186 @@ function Pipeline({
         </li>
       )}
     </ol>
+  );
+}
+
+/** How a record shows as a step: what it moved the task to. */
+interface StageStep {
+  label: string;
+  /** `back`: sent back for another round; `closed`: the task ended there. */
+  tone: "forward" | "back" | "closed";
+}
+
+function stageStep(stage: TaskStage): StageStep {
+  switch (stage.stage) {
+    case "reviewed":
+      return stage.verdict === "accepted"
+        ? { label: "accepted", tone: "forward" }
+        : { label: "sent back", tone: "back" };
+    case "gated":
+      if (stage.verdict === "accepted") return { label: "landing", tone: "forward" };
+      return {
+        label: `gate ${stage.verdict ?? "verdict"}`,
+        tone:
+          stage.verdict === "rejected" || stage.verdict === "conflict"
+            ? "back"
+            : "forward",
+      };
+    case "aborted":
+    case "cancelled":
+      return { label: stage.stage, tone: "closed" };
+    default:
+      return { label: stage.stage, tone: "forward" };
+  }
+}
+
+/** The steps of the task's path it has still to walk. */
+function remainingSteps(
+  state: TaskState,
+  steps: ReadonlyArray<TaskState>,
+): ReadonlyArray<TaskState> {
+  if (state === "cancelled" || state === "landed" || state === "unknown") return [];
+  // Sent back: another delivery and report, then the rest of the path.
+  if (state === "revise") return steps.slice(Math.max(0, steps.indexOf("delivered")));
+  const at = reached(state, steps);
+  return at < 0 ? [] : steps.slice(at + 1);
+}
+
+/** The task's stepper from its records: one step per record, so a second
+ * round shows as steps of its own, each with the time it took, then the
+ * steps still ahead. The first of those counts the wait so far. */
+function StageSteps({
+  task,
+  steps,
+}: {
+  task: MissionTask;
+  steps: ReadonlyArray<TaskState>;
+}) {
+  const ahead = remainingSteps(task.state, steps);
+  const last = task.stages[task.stages.length - 1];
+  const waiting =
+    ahead.length > 0 && last.at_ms !== null
+      ? Math.max(0, Date.now() - last.at_ms)
+      : null;
+  const slow = slowStages([
+    ...task.stages,
+    ...(waiting !== null
+      ? [{ stage: "waiting", verdict: null, at_ms: null, took_ms: waiting }]
+      : []),
+  ]);
+  const settled =
+    task.state === "landed" || task.state === "accepted" || task.state === "cancelled";
+  return (
+    <ol
+      aria-label={`Task stages, state ${task.raw_state ?? "unknown"}`}
+      className="flex flex-wrap items-start gap-x-1 gap-y-2"
+    >
+      {task.stages.map((stage, index) => {
+        const step = stageStep(stage);
+        const current = index === task.stages.length - 1;
+        return (
+          <StepItem
+            key={`${index}-${stage.stage}`}
+            first={index === 0}
+            title={`task.${stage.stage}${stage.verdict ? ` ${stage.verdict}` : ""} at ${absolute(stage.at_ms) ?? "an unknown time"}`}
+            chip={
+              step.tone === "closed"
+                ? "bg-destructive/12 text-destructive ring-destructive/25"
+                : current && settled
+                  ? "bg-success/15 text-success ring-success/30"
+                  : current
+                    ? "bg-info/15 text-info ring-info/30"
+                    : "bg-muted text-foreground ring-surface-border"
+            }
+            icon={
+              step.tone === "closed" ? (
+                <Ban size={11} />
+              ) : step.tone === "back" ? (
+                <RotateCcw size={11} className="text-warning" />
+              ) : !current ? (
+                <Check size={11} />
+              ) : null
+            }
+            label={step.label}
+            took={stage.took_ms}
+            slow={slow[index]}
+          />
+        );
+      })}
+      {ahead.map((step, index) => (
+        <StepItem
+          key={`ahead-${step}`}
+          first={false}
+          pending
+          title={
+            index === 0 && waiting !== null
+              ? `waiting since ${absolute(last.at_ms) ?? "an unknown time"}`
+              : undefined
+          }
+          chip="text-faint-foreground ring-surface-border"
+          label={step}
+          took={index === 0 ? waiting : null}
+          slow={index === 0 && waiting !== null && slow[slow.length - 1]}
+        />
+      ))}
+    </ol>
+  );
+}
+
+function StepItem({
+  first,
+  pending = false,
+  title,
+  chip,
+  icon,
+  label,
+  took,
+  slow,
+}: {
+  first: boolean;
+  pending?: boolean;
+  title?: string;
+  chip: string;
+  icon?: ReactNode;
+  label: string;
+  took: number | null;
+  slow: boolean;
+}) {
+  const duration = stageDuration(took);
+  return (
+    <li className="flex items-start gap-1">
+      {!first && (
+        <span className="flex h-6 items-center">
+          <ChevronRight
+            size={12}
+            className={pending ? "text-faint-foreground/50" : "text-muted-foreground"}
+          />
+        </span>
+      )}
+      <span className="flex flex-col items-center gap-0.5" title={title}>
+        <span
+          className={cx(
+            "inline-flex h-6 items-center gap-1 rounded-md px-2 text-micro font-medium ring-1 ring-inset",
+            chip,
+          )}
+        >
+          {icon}
+          {label}
+        </span>
+        <span
+          className={cx(
+            "tnum h-4 rounded px-1 text-micro leading-4",
+            slow
+              ? "bg-warning/15 font-semibold text-warning"
+              : pending
+                ? "text-faint-foreground"
+                : "text-muted-foreground",
+          )}
+        >
+          {duration && pending ? `${duration} so far` : duration}
+        </span>
+      </span>
+    </li>
   );
 }
 
