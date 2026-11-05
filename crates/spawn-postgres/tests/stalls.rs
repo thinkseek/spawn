@@ -50,7 +50,7 @@ fn age_record(client: &mut Client, id: i64, ago_ms: i64) -> i64 {
     at
 }
 
-fn task<'a>(facts: &'a Value, id: i64) -> &'a Value {
+fn task(facts: &Value, id: i64) -> &Value {
     facts["tasks"]
         .as_array()
         .expect("tasks")
