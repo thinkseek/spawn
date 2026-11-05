@@ -76,7 +76,9 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         web.display()
     );
     let port = server.server_addr().to_ip().map(|address| address.port());
-    let hosts = port.map(|port| server_hosts(&address, port)).unwrap_or_default();
+    let hosts = port
+        .map(|port| server_hosts(&address, port))
+        .unwrap_or_default();
     for request in server.incoming_requests() {
         if let Err(error) = handle(request, &web, token.as_deref(), port, &hosts) {
             eprintln!("serve: {error}");
@@ -970,9 +972,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ProcSocket, access_token, handle, is_loopback, local_exemption, objective_json,
-        owner_uid, peer_uid, proc_sockets, rsi_summary, same_secret, server_hosts,
-        tokenless_request, with_last_gates,
+        ProcSocket, access_token, handle, is_loopback, local_exemption, objective_json, owner_uid,
+        peer_uid, proc_sockets, rsi_summary, same_secret, server_hosts, tokenless_request,
+        with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1213,15 +1215,23 @@ mod tests {
     fn the_server_is_named_by_loopback_and_its_bound_address() {
         let loopback = ["127.0.0.1:8787", "localhost:8787", "[::1]:8787"];
         assert_eq!(server_hosts("127.0.0.1:8787", 8787), loopback);
-        assert_eq!(server_hosts("0.0.0.0:8787", 8787), loopback, "a wildcard names nothing");
+        assert_eq!(
+            server_hosts("0.0.0.0:8787", 8787),
+            loopback,
+            "a wildcard names nothing"
+        );
         assert_eq!(server_hosts("[::]:8787", 8787), loopback);
         assert_eq!(
-            server_hosts("192.168.1.10:0", 41000).last().map(String::as_str),
+            server_hosts("192.168.1.10:0", 41000)
+                .last()
+                .map(String::as_str),
             Some("192.168.1.10:41000"),
             "the bound port, not the requested 0"
         );
         assert_eq!(
-            server_hosts("Spawn-Box:8787", 8787).last().map(String::as_str),
+            server_hosts("Spawn-Box:8787", 8787)
+                .last()
+                .map(String::as_str),
             Some("spawn-box:8787")
         );
     }
@@ -1239,7 +1249,11 @@ mod tests {
             assert!(tokenless_request(Some(host), None, &hosts), "{host}");
         }
         // DNS rebinding: the page's own name reaches 127.0.0.1.
-        assert!(!tokenless_request(Some("attacker.example:8787"), None, &hosts));
+        assert!(!tokenless_request(
+            Some("attacker.example:8787"),
+            None,
+            &hosts
+        ));
         assert!(!tokenless_request(Some("attacker.example"), None, &hosts));
         // Another port is another origin; no Host at all is refused.
         assert!(!tokenless_request(Some("127.0.0.1:9999"), None, &hosts));
@@ -1267,7 +1281,11 @@ mod tests {
         }
         // Port 80 is implied on both sides.
         let web = server_hosts("127.0.0.1:80", 80);
-        assert!(tokenless_request(Some("localhost"), Some("http://localhost"), &web));
+        assert!(tokenless_request(
+            Some("localhost"),
+            Some("http://localhost"),
+            &web
+        ));
     }
 
     /// Status of one GET of `path` from `serve`'s request handler with no
@@ -1285,7 +1303,11 @@ mod tests {
         });
         let headers = headers.replace("PORT", &port.to_string());
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        write!(client, "GET {path} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n").expect("send");
+        write!(
+            client,
+            "GET {path} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n"
+        )
+        .expect("send");
         let mut answer = String::new();
         client.read_to_string(&mut answer).expect("read");
         worker.join().expect("handler");
@@ -1303,11 +1325,21 @@ mod tests {
         let path = "/api/session/not%20a%20session";
         assert_eq!(tokenless_status(path, "Host: 127.0.0.1:PORT\r\n"), 400);
         assert_eq!(
-            tokenless_status(path, "Host: localhost:PORT\r\nOrigin: http://localhost:PORT\r\n"),
+            tokenless_status(
+                path,
+                "Host: localhost:PORT\r\nOrigin: http://localhost:PORT\r\n"
+            ),
             400
         );
-        assert_eq!(tokenless_status(path, "Host: attacker.example:PORT\r\n"), 403);
-        assert_eq!(tokenless_status(path, "Host: 127.0.0.1\r\n"), 403, "port missing");
+        assert_eq!(
+            tokenless_status(path, "Host: attacker.example:PORT\r\n"),
+            403
+        );
+        assert_eq!(
+            tokenless_status(path, "Host: 127.0.0.1\r\n"),
+            403,
+            "port missing"
+        );
         assert_eq!(tokenless_status(path, ""), 403, "no Host");
         assert_eq!(
             tokenless_status(
