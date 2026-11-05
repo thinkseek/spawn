@@ -244,7 +244,7 @@ input of a mission.
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
 | Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
-| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, 8 when the source did not answer, then escalated; one that may have typed the task is escalated at once); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, 8 when the source did not answer, then escalated; one that may have typed the task is escalated at once); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
 **Two kinds of worker.**
@@ -570,9 +570,11 @@ the tree's own:
      run, no rejection, the task stays ready and is judged again later
      ([storage.md](storage.md), "Landing");
   2. builds the candidate: the pushed branch itself, or a merge of it with `main`
-     when `main` has moved. A conflict sends the task back. A branch with a
-     pending merge of `main` or with conflict markers is sent back as
-     `conflict` before it is judged.
+     when `main` has moved. A conflict first merges `main` into the agent's
+     idle workspace, with conflict markers, then sends the task back with a
+     note that names the marked files ([storage.md](storage.md), "Main into
+     a workspace"). A branch with a pending merge of `main` or with conflict
+     markers is sent back as `conflict` before it is judged.
   3. runs the gate, with a 45-minute wall clock;
   4. records `task.gated` (verdict, log, metric) before git moves;
   5. moves `main` on the source with a compare-and-swap push
