@@ -19,7 +19,9 @@
 # committed web/vite.config.js or web/postcss.config.js is never run; a
 # failure before the install leaves the live binary, UI and rollback copies
 # alone; a deploy killed after its push leaves deploy.pending and the next
-# deploy completes it; a relay unit that is not installed does not stop a
+# deploy completes it; the controller becomes HEAD's tree with the install
+# (with the UI's node_modules, without the checkout's untracked files), and
+# not before it; a relay unit that is not installed does not stop a
 # deploy; a deploy run again keeps its rollback copies; a deploy failing
 # after its push completes it on exit; a pending deploy that main has moved
 # past stops the deploy.
@@ -208,6 +210,7 @@ check "no rollback copy was written" [ ! -e "$live/bin/spawn.prev" ]
 check "no UI was installed" [ ! -e "$live/web" ]
 check "nothing is left staged" bash -c '[ ! -e "$1/bin/spawn.staged" ] && [ ! -e "$1/web.staged" ]' _ "$live"
 check "main did not move" [ "$(main)" = "$base" ]
+check "no controller was made current" [ ! -e "$live/controllers/spawn" ]
 check "the services restarted" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
 : >"$SYSTEMCTL_LOG"
 
@@ -225,6 +228,11 @@ check "the untracked web/public/stray.txt did not reach the UI" [ ! -e "$live/we
 check "the UI is installed (the planted vite.config.js and postcss.config.js did not run)" \
   [ -f "$live/web/index.html" ]
 check "spawn.prev is the binary it replaced" cmp -s "$live/bin/spawn.prev" "$scratch/stand-in"
+check "the controller is HEAD's tree" \
+  bash -c '[ "$(cat "$1/controllers/spawn/.controller")" = "$2" ] && [ -f "$1/controllers/spawn/scripts/rsi/gate.sh" ]' _ "$live" "$head"
+check "the controller has the UI's node_modules" [ -x "$live/controllers/spawn/web/node_modules/.bin/vite" ]
+check "the untracked web/public/stray.txt did not reach the controller" \
+  [ ! -e "$live/controllers/spawn/web/public/stray.txt" ]
 
 echo "== the next deploy completes it (the model relay's unit is not installed)"
 # Main is HEAD now: the operator runs the gate again, over it.
@@ -238,6 +246,7 @@ check "both relay scripts are installed" \
 check "the same build again keeps spawn.prev the binary it replaced" cmp -s "$live/bin/spawn.prev" "$scratch/stand-in"
 check "the same UI again leaves no web.prev of itself" [ ! -e "$live/web.prev" ]
 check "completed the pending deploy" grep -q "completed the pending deploy: main $base -> $head" "$out"
+check "the controller stays HEAD's" [ "$(readlink "$live/controllers/spawn")" = "spawn-$head" ]
 check "deploy.pending is gone" [ ! -e "$live/deploy.pending" ]
 check "the integrator was stopped, started, and the services restarted" \
   bash -c 'grep -qx -- "--user stop spawn-integrate" "$1" && grep -qx -- "--user start spawn-integrate" "$1" &&

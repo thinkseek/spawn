@@ -393,7 +393,7 @@ impl Integrator {
         if mission.halted.is_some() {
             return Ok(false);
         }
-        let scenarios = PathBuf::from(&mission.gate);
+        let scenarios = pinned(Path::new(&mission.gate));
         let count = gate::count_scenarios(&scenarios)?;
         if let Some(reason) = halt_reason(mission, count) {
             return halt(store, mission, &reason).map(|()| true);
@@ -652,7 +652,7 @@ impl Integrator {
             return rejected("the patch is larger than 1 MiB", "");
         }
 
-        let scenario = task.scenario.as_deref().map(PathBuf::from);
+        let scenario = task_scenario(scenarios, task.scenario.as_deref());
         // The test server must not be the owner's, by identity, asked now:
         // a socket mount or a DNS name can change between gate runs.
         let owner = std::env::var("SPAWN_DATABASE_URL").ok();
@@ -664,7 +664,7 @@ impl Integrator {
             eprintln!("integrate: {warning}");
         }
         match gate::judge(
-            &self.gate,
+            &pinned(&self.gate),
             mirror,
             main,
             &candidate,
@@ -976,11 +976,70 @@ fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
         .map_err(|e| error(&e))
 }
 
+/// A path through the controller's symlink (`controllers/<name>` in the
+/// live directory, switched by deploy/controller.sh), resolved once for a
+/// step: what counts the scenarios, the gate and its scenarios are then one
+/// deployed commit's, even if a switch happens while the gate runs (the
+/// previous controller stays until nothing uses it). A path that does not
+/// resolve stays as named; the step that reads it reports it.
+fn pinned(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The scenario that judges an objective task: its file (`<objective>.sh`,
+/// named when the task was assigned) in the mission's scenarios directory as
+/// it is now. Not the recorded path: a mission moved to another directory (the
+/// owner's checkout to the deployed controller) must not keep judging its
+/// tasks in flight with a scenario from the old one, which nothing deploys.
+fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
+    let name = Path::new(recorded?).file_name()?;
+    Some(scenarios.join(name))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget};
+    use super::{
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget, pinned,
+        task_scenario,
+    };
     use crate::gate::GateFailure;
     use serde_json::json;
+
+    #[test]
+    fn a_task_scenario_is_read_from_the_mission_s_scenarios_as_they_are_now() {
+        let now = std::path::Path::new("/live/controllers/spawn-abc/rsi/scenarios");
+        assert_eq!(
+            task_scenario(now, Some("/home/owner/projects/Spawn/rsi/scenarios/007.sh")),
+            Some(now.join("007.sh"))
+        );
+        assert_eq!(task_scenario(now, None), None);
+        assert_eq!(task_scenario(now, Some("/")), None);
+    }
+
+    #[test]
+    fn pinned_resolves_the_controller_symlink_once() {
+        let base = std::env::temp_dir().join(format!("spawn-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("spawn-one/rsi/scenarios")).expect("one");
+        std::fs::create_dir_all(base.join("spawn-two/rsi/scenarios")).expect("two");
+        std::os::unix::fs::symlink("spawn-one", base.join("spawn")).expect("link");
+        let through = base.join("spawn/rsi/scenarios");
+        let held = pinned(&through);
+        assert!(
+            held.ends_with("spawn-one/rsi/scenarios"),
+            "{}",
+            held.display()
+        );
+        // The switch: what was pinned stays the first controller's.
+        std::fs::remove_file(base.join("spawn")).expect("unlink");
+        std::os::unix::fs::symlink("spawn-two", base.join("spawn")).expect("relink");
+        assert!(held.ends_with("spawn-one/rsi/scenarios"));
+        assert!(pinned(&through).ends_with("spawn-two/rsi/scenarios"));
+        // A path that does not resolve stays as named.
+        let missing = base.join("missing/scenarios");
+        assert_eq!(pinned(&missing), missing);
+        std::fs::remove_dir_all(&base).expect("clean");
+    }
 
     /// Commit everything in the checkout `directory`.
     pub(super) fn commit_in(directory: &str, message: &str) {
