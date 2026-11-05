@@ -300,8 +300,8 @@ state and wedges nothing:
   file is left alone. A dry run (`SPAWN_MAINTENANCE_DRY_RUN=1`) prints what
   would go.
 
-Not guarded: the kache compiler cache (`~/.cache/kache`, size-bounded by
-kache's own settings) and the mirrors under `<root>/.sources`, which hold
+Not guarded: the kache compiler cache (`~/.cache/kache`, a derived cache
+outside Spawn's cleanup) and the mirrors under `<root>/.sources`, which hold
 branches and are never pruned automatically.
 
 ## Not built
