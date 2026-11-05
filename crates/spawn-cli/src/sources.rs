@@ -9,9 +9,9 @@
 //!
 //! A mirror follows its source: before a new agent's branch is created,
 //! `main` is fetched again, so a worker starts from the source as it is now
-//! (a merge that landed since is in), and at a turn end at most every
-//! [`REFRESH_EVERY`], so `main` can be merged into the idle branch
-//! (docs/storage.md, "Main into branches automatically").
+//! (a merge that landed since is in), and before a merge of `main` at most
+//! every [`REFRESH_EVERY`] (docs/storage.md, "Main at a start or resume" and
+//! "Main into a workspace").
 //!
 //! Every checkpoint's branch is published, in the background
 //! ([`crate::push`]), to the source's `spawn/<agent>` when the source is a

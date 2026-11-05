@@ -176,6 +176,34 @@ pub fn create_new(top: &Path, relative: &TreePath) -> Result<bool, AgentFileErro
     }
 }
 
+/// Write `bytes` as the regular file `relative` under `top`, replacing what
+/// is there (a regular file or a symlink, never followed: the entry is
+/// unlinked first), its missing parents made the way [`create_new`] makes
+/// them, and the file created exclusively.
+pub fn replace_with(top: &Path, relative: &TreePath, bytes: &[u8]) -> Result<(), AgentFileError> {
+    use std::io::Write;
+    checked(relative)?;
+    let parent = HeldDirectory::parent_of(top, relative).map_err(AgentFileError::NotRegular)?;
+    match rustix::fs::unlinkat(parent.descriptor(), relative.file_name(), AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => {}
+        Err(error) => {
+            return Err(AgentFileError::Failed(format!(
+                "remove {relative}: {error}"
+            )));
+        }
+    }
+    let descriptor = rustix::fs::openat(
+        parent.descriptor(),
+        relative.file_name(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .map_err(|error| AgentFileError::Failed(format!("create {relative}: {error}")))?;
+    File::from(descriptor)
+        .write_all(bytes)
+        .map_err(|error| AgentFileError::Failed(format!("write {relative}: {error}")))
+}
+
 /// Move the entry `from` to `to`, both under `top`: the parents of `to` are
 /// made when missing, and neither side's parents are followed through a
 /// symlink. The entry itself is moved as it is (a rename never follows it).

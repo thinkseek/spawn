@@ -70,9 +70,10 @@ head alone is the whole workspace, so everything below is a git operation.
   `spawn tick`). Only a source that is a directory on this host receives
   branches: a remote may be public, and every agent commit would leave the
   host.
-- **Main at a start or resume**: main reaches an agent's branch only when an
-  execution starts or resumes, before its workspace is mounted, and never
-  while an execution runs: nothing changes files under a running agent.
+- **Main at a start or resume**: the Bridge merges main into an agent's
+  branch only when an execution starts or resumes, before its workspace is
+  mounted, and never while a turn runs: nothing changes files under a
+  working agent (two merges between turns, below, are not the Bridge's).
   When the source's `main` moved (the mirror's `main` is fetched at most
   every 30 s for this), it is merged into the branch if, and only if, the
   merge is clean (`merge-tree --attr-source=main`, so the rules come from
@@ -83,10 +84,37 @@ head alone is the whole workspace, so everything below is a git operation.
   conflict leaves the branch as it is: the execution starts on it, and the
   conflict is recorded as `merge.conflicted {files, marked: false}` (keyed by
   the branch head and the files, so a retried start records it once) for the
-  supervisor and the integrator; the integrator's landing reports it as
-  before. `notice.typed`, `notice.received` and `merge.conflicted` records
-  with `marked: true`, written while main was merged into running workspaces,
-  still decode and change nothing.
+  supervisor and the integrator. `notice.typed` and `notice.received`
+  records, written while main was merged after every turn, still decode and
+  change nothing.
+- **Main into a workspace**: a worker that never restarts (a resident) would
+  never get main that way, and every piece of its work after main moved
+  would be judged `conflict` with nothing to resolve. So main is also merged
+  into the agent's mounted workspace (`merge_base`, routed and refreshed by
+  `MissionWorkspaces`, holding the branch's lock so no checkpoint reads the
+  directory halfway) at two moments when the agent is idle between turns
+  (spawn-cli's `main_merge`):
+  - the integrator's `conflict` verdict, before the verdict is recorded, so
+    its note names the files that now carry markers;
+  - the dispatcher's delivery of a task typed into a live worker, so the
+    task starts from main and its text says what the merge did. (A start or
+    resume mounts later; the Bridge's clean merge above covers it.)
+
+  A clean merge is a merge commit recorded as `artifact.committed`
+  (`base_merged`, its files) and pushed. A content conflict writes the merge
+  with conflict markers into the directory and leaves `main` pending under
+  `<root>/.merge/<agent>`: the checkpoint after the last marker is gone
+  takes `main` as its second parent (a checkpoint with markers still in is a
+  plain commit, and the merge stays pending), and is gated and landed like
+  any other. Until then no newer `main` is merged: markers never stack. It
+  is recorded as `merge.conflicted {files, marked: true}`. A conflict
+  markers cannot show (a file deleted on one side and changed on the other,
+  a rename, a binary file) changes nothing but a copy of `main`'s version of
+  each such file under `.spawn/main/` in the workspace, and the note or the
+  task text tells the worker, who cannot run git, to make each file exactly
+  `main`'s version (or delete it where `main` has none); recorded as
+  `merge.conflicted {files, marked: false}`. An agent with no workspace on
+  the integrator's host gets no merge, and its note says so.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won by the same two-tree update
@@ -138,8 +166,9 @@ head alone is the whole workspace, so everything below is a git operation.
   rejected ("the worker has no branch to land"). So only a source that is a
   directory on this host has its agents' work landed. The
   rest is unchanged: a branch behind a moved `main` lands as the merge by
-  `main`'s merge rules, marker blocks in the files the branch changes are
-  gated `conflict`, a pending merge of `main` (it lives with the workspace
+  `main`'s merge rules; one that conflicts with it is gated `conflict` after
+  `main` is merged into its workspace (above); marker blocks in the files
+  the branch changes are gated `conflict`, a pending merge of `main` (it lives with the workspace
   directory, on the Bridge's host) blocks judging when that directory is on
   the integrator's host, and its markers, once checkpointed and pushed, are
   caught by the marker check wherever the integrator runs. The gate judges

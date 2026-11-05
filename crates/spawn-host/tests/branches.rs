@@ -1,6 +1,7 @@
 //! Branching and merging in the git store (docs/storage.md, "Branching and
 //! merging"): fork from an agent or a commit, and the source's `main` merged
-//! into an idle workspace.
+//! into a branch (cleanly) or a mounted workspace between turns (with
+//! markers on a conflict).
 
 use std::fs;
 use std::path::{Path, PathBuf};
