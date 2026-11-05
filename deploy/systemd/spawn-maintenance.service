@@ -12,6 +12,9 @@ ExecStart=%h/projects/Spawn/scripts/maintenance.sh
 # and any SPAWN_MAINTENANCE_*.
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Scratch older than 3 h is a dead gate's: no gate runs longer (the
+# integrator's wall clock is 45 min).
+Environment=SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180
 TimeoutStartSec=1h
 Nice=10
 IOSchedulingClass=idle
