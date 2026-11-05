@@ -86,6 +86,8 @@ struct State {
     /// Every terminal start, in order.
     launches: Vec<Launch>,
     panes: HashMap<TerminalName, String>,
+    /// Text staged for a terminal's next submit.
+    staged: HashMap<TerminalName, String>,
     files: HashMap<String, Vec<u8>>,
     /// Engines that exit at the next liveness check: the file is written
     /// and the terminal closes then, between the Bridge's two reads.
@@ -644,18 +646,33 @@ impl TerminalHost for MemoryStore {
         Ok(())
     }
 
-    fn submit_text(
+    fn stage_text(
         &self,
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError> {
+        // Like a tmux buffer: held by the server, whatever the pane.
+        self.lock()
+            .staged
+            .insert(terminal.clone(), text.to_string());
+        Ok(())
+    }
+
+    fn submit_staged(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
         let mut state = self.lock();
         if !state.terminals.contains(terminal) {
             return Err(TerminalError(format!("terminal {terminal} is gone")));
         }
+        let Some(text) = state.staged.remove(terminal) else {
+            return Err(TerminalError(format!("nothing staged for {terminal}")));
+        };
         let pane = state.panes.entry(terminal.clone()).or_default();
-        pane.push_str(text);
+        pane.push_str(&text);
         pane.push('\n');
         Ok(())
     }
