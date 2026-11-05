@@ -9,13 +9,14 @@
 # weaken the test that judges it.
 #
 # - The candidate may not change a path listed in `<scenarios-dir>/protected`
-#   (one prefix per line, `#` comments): the controller's tasks, scenarios,
-#   gate and black-box tests. Paths are compared as git stores them (no
+#   (one prefix per line, `#` comments, `!<prefix>` for an exception): the
+#   controller's tasks, scenarios, gate and black-box tests, and the UI's
+#   build configuration (all of `web/` but `web/src/` and `web/index.html`). Paths are compared as git stores them (no
 #   rename detection, no quoting); a path with a newline is refused, and so
 #   is every candidate when the list is missing (an empty list protects
 #   nothing on purpose).
 # - It may not change anything under a `node_modules/` or `target/`
-#   directory, nor anything under `web/` but `web/src/` and `web/index.html`.
+#   directory.
 # - It may not add build-time code: a changed `build.rs` or `.cargo/`, a
 #   `build =` key in any Cargo.toml of the tree (cargo would run the file it
 #   names as a build script), a workspace member with a build script or a
@@ -651,9 +652,13 @@ if [ ! -f "$scenarios/protected" ]; then
     verdict rejected "the scenarios directory has no protected list"
     exit 0
 fi
+# A line `!<prefix>` excepts paths under it from the prefixes above it, so
+# the owner can protect a directory but its sources (`web/`, `!web/src/`).
 touched=$(printf '%s\n' "$changed" | awk -v list="$scenarios/protected" '
-    BEGIN { while ((getline line < list) > 0) if (line != "" && line !~ /^#/) prefix[++n] = line }
-    { for (i = 1; i <= n; i++) if (index($0, prefix[i]) == 1) { print; break } }')
+    BEGIN { while ((getline line < list) > 0) if (line != "" && line !~ /^#/) {
+        if (substr(line, 1, 1) == "!") allowed[++a] = substr(line, 2); else prefix[++n] = line } }
+    { for (i = 1; i <= a; i++) if (index($0, allowed[i]) == 1) next
+      for (i = 1; i <= n; i++) if (index($0, prefix[i]) == 1) { print; break } }')
 if [ -n "$touched" ]; then
     echo "| candidate touches protected paths:$(echo "$touched" | tr '\n' ' ')"
     verdict rejected "candidate touches protected paths"
@@ -678,17 +683,6 @@ planted=$(printf '%s\n' "$changed" | grep -E '(^|/)(node_modules|target)/' || tr
 if [ -n "$planted" ]; then
     echo "| candidate commits build output or installed packages: $(echo "$planted" | head -n 5 | tr '\n' ' ')"
     verdict rejected "candidate changes a path under node_modules/ or target/"
-    exit 0
-fi
-
-# Under web/, an allow-list: the UI's sources (web/src/) and web/index.html.
-# Anything else there is build configuration that the owner's `vite build`
-# may load and run (vite.config.js and .mjs come before .ts, postcss.config.*
-# and .postcssrc* load on their own), or the package set check-web guards.
-web_config=$(printf '%s\n' "$changed" | grep -E '^web/' | grep -vE '^web/src/|^web/index\.html$' || true)
-if [ -n "$web_config" ]; then
-    echo "| candidate changes web/ outside web/src/ and web/index.html: $(echo "$web_config" | head -n 5 | tr '\n' ' ')"
-    verdict rejected "candidate changes web/ outside web/src/ and web/index.html"
     exit 0
 fi
 
