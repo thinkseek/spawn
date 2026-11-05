@@ -7,7 +7,8 @@
 #                  stderr and returns:
 #                    2  room is short. It sets disk_free (KiB), disk_dir
 #                       and disk_min_gb. The gate writes them as a no-room
-#                       fact to its verdict file and exits 5. The integrator
+#                       fact to its verdict file and exits 5, even when that
+#                       write fails (then the integrator measures). The integrator
 #                       records `no_room` (crates/spawn-cli/src/gate.rs),
 #                       which is no verdict on the candidate and no abort. It
 #                       does not count toward a mission's halt, and it is
