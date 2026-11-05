@@ -1945,3 +1945,35 @@ fn a_review_lands_only_on_the_revision_it_read() {
         "every review names its revision (the human's, the current one)"
     );
 }
+
+/// A report names the checkpoint its turn ended with (`commit` of the
+/// `task.reported` record); one recorded the first way names none.
+#[test]
+fn a_report_names_the_checkpoint_of_its_turn() {
+    let (store, _schema) = store("control_report_commit");
+    let mission = store
+        .mission_add("Report", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    assert_eq!(store.reported_commit(task).expect("read"), None, "no report");
+    store.task_delivered(task, 1).expect("delivered");
+    let commit = "c".repeat(40);
+    assert!(
+        store
+            .task_reported_with(task, "done", Some(&commit))
+            .expect("reported")
+    );
+    assert_eq!(store.reported_commit(task).expect("read"), Some(commit));
+    store
+        .task_review(task, false, "again", None)
+        .expect("send back");
+    store.task_delivered(task, 2).expect("delivered again");
+    assert!(store.task_reported(task, "fixed").expect("reported, no commit"));
+    assert_eq!(
+        store.reported_commit(task).expect("read"),
+        None,
+        "the latest report names no checkpoint"
+    );
+}
