@@ -397,15 +397,26 @@ pub(crate) const RETIRED_RESIDENTS: &str =
     "select agent_id, session_id from mission_residents where state = 'retired'";
 
 /// First source of the mission behind an agent's first task. `$1` agent.
+///
+/// An agent whose first execution started before its first task was
+/// mounted from the default repository (`SPAWN_GIT_REPO`), where its branch
+/// lives (a resident started before it had work): it stays there, read from
+/// the records (`execution.started` against the task's creation, one clock),
+/// so its checkpoints find the branch it was mounted on. No row then.
 pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
                    from mission_tasks k join mission_missions m on m.id = k.mission_id
                   where k.agent_id = $1
+                    and not exists (select 1 from spawn_events e
+                                     where e.agent_id = $1 and e.event_name = 'execution.started'
+                                       and e.recorded_at_ms < k.created_at_ms)
                   order by k.id limit 1";
 
 /// Agents with a task still open (not cancelled, not landed) and the
 /// source their workspace comes from, by [`AGENT_SOURCE`]'s rule (the
-/// agent's first task decides): the branches a restarted Bridge publishes
-/// again, since its pusher's queue lived in memory.
+/// agent's first task decides, and an agent that ran before it stays on
+/// the default repository, published by no mission): the branches a
+/// restarted Bridge publishes again, since its pusher's queue lived in
+/// memory.
 pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
                         (select m.sources ->> 0
                            from mission_tasks k join mission_missions m on m.id = k.mission_id
@@ -413,6 +424,11 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
                           order by k.id limit 1)
                    from (select distinct agent_id from mission_tasks
                           where state not in ('cancelled', 'landed')) a
+                  where not exists (
+                          select 1 from spawn_events e
+                           where e.agent_id = a.agent_id and e.event_name = 'execution.started'
+                             and e.recorded_at_ms < (select min(k.created_at_ms) from mission_tasks k
+                                                      where k.agent_id = a.agent_id))
                   order by a.agent_id";
 
 // Delivery bookkeeping, run by the dispatcher as the owner.
@@ -704,7 +720,9 @@ impl PostgresStore {
     /// Where an agent's workspace comes from: `None` when no mission owns
     /// the agent, `Some(None)` for a mission without sources (a scratch
     /// workspace), `Some(Some(source))` otherwise. The agent's first task
-    /// decides, so a resident's workspace never jumps between sources.
+    /// decides, so a resident's workspace never jumps between sources; an
+    /// agent that ran before its first task keeps the default repository it
+    /// was mounted from (`None`).
     pub fn agent_source(&self, agent: &str) -> Result<Option<Option<String>>, StoreError> {
         let rows = self.query(AGENT_SOURCE, &[&agent])?;
         Ok(rows.first().map(|row| row.get::<_, Option<String>>(0)))
