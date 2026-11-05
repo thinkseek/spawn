@@ -2477,7 +2477,7 @@ mod database_tests {
             (before.gate_room_task, before.gate_room_waits, before.gate_room_escalated),
             (Some(first), 3, true)
         );
-        db.record(&json!({"type": "task.cancelled", "id": first}));
+        db.store.task_cancel(first).expect("cancel");
         let after = gated(&db, mission);
         assert_eq!(
             (after.gate_room_task, after.gate_room_waits, after.gate_room_escalated),
