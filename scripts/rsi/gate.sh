@@ -1046,7 +1046,14 @@ fi
 #   shapes the sandbox's database URL);
 # - the scenarios directory's other files, but its scenarios and the lists
 #   only the gate reads (`protected`, `retired-tests`): the build hook, the
-#   `bind` list, helpers a scenario runs from beside it;
+#   `bind` list's text, helpers a scenario runs from beside it;
+# - each directory the `bind` list names, by a fingerprint of what is
+#   installed there: the blobs of its `.modules.yaml` and `.pnpm/lock.yaml`
+#   (pnpm's record of an install) when either is present, and otherwise a
+#   listing of everything under it, symlinks not followed (path, type, size,
+#   modification time, link target). A `pnpm install` rewrites those, so the
+#   next gate judges the base again; a file edited inside a directory that
+#   has the markers, without an install, is not seen;
 # - the files the scenario names on its code lines, and those they name in
 #   turn: a path `scripts/...` is the controller's (the scenarios source
 #   `$controller/scripts/blackbox/assertions.sh` and
@@ -1067,6 +1074,10 @@ fi
 # cached. A hit touches its entry: spawn-maintenance removes entries no
 # gate used for 14 days (scripts/maintenance.sh). The log says which
 # results came from the cache.
+#
+# Not keyed: the state candidate code leaves on the shared test server
+# (roles, databases, settings). A disposable test server per gate is
+# GitHub issue #6; until then one gate runs at a time (integrate.rs).
 blob() { git hash-object --no-filters -- "$1"; }
 gate_key="gate $(blob "$0")"
 [ -f "$(dirname "$0")/../pg-url.sh" ] && gate_key="$gate_key $(blob "$(dirname "$0")/../pg-url.sh")"
@@ -1074,6 +1085,26 @@ scenarios_key=$(cd "$scenarios" && find . -type f ! -path './protected' ! -path 
     grep -vE '^\./[^/]*\.sh$' | LC_ALL=C sort |
     while IFS= read -r file; do printf '%s %s\n' "$(blob "$file")" "$file"; done |
     sha256sum | cut -d' ' -f1)
+# bind_fingerprint <dir>: what is installed in a bound directory (above).
+bind_fingerprint() {
+    bind_marked=""
+    for bind_marker in .modules.yaml .pnpm/lock.yaml; do
+        if [ -f "$1/$bind_marker" ]; then
+            printf '%s %s\n' "$bind_marker" "$(blob "$1/$bind_marker")"
+            bind_marked=1
+        fi
+    done
+    [ -n "$bind_marked" ] ||
+        printf 'listing %s\n' "$(find "$1" -printf '%P %y %s %T@ %l\n' 2>/dev/null | LC_ALL=C sort |
+            sha256sum | cut -d' ' -f1)"
+}
+binds_key=none
+if [ -f "$scenarios/bind" ]; then
+    binds_key=$(while IFS= read -r path || [ -n "$path" ]; do
+        case "$path" in '' | '#'*) continue ;; esac
+        printf '%s\n%s\n' "$path" "$(bind_fingerprint "$path")"
+    done <"$scenarios/bind" | sha256sum | cut -d' ' -f1)
+fi
 # named_by <file>: the paths a file names on its code lines, one per line
 # (see above). Comments do not count: this file's own comments name
 # scripts/blackbox, and a scenario that mentions the gate would otherwise
@@ -1151,8 +1182,8 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     objective_name=$(basename "$objective")
     toolchain
     key=$( {
-        printf 'base %s\nscenario %s\n%s\ntoolchain %s\nscenarios %s\n' "$base_commit" \
-            "$(blob "$objective")" "$gate_key" "$toolchain_key" "$scenarios_key"
+        printf 'base %s\nscenario %s\n%s\ntoolchain %s\nscenarios %s\nbinds %s\n' "$base_commit" \
+            "$(blob "$objective")" "$gate_key" "$toolchain_key" "$scenarios_key" "$binds_key"
         depends_on "$objective"
     } | sha256sum | cut -d' ' -f1)
     entry=$base_cache/$key
