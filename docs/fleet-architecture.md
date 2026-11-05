@@ -243,7 +243,7 @@ input of a mission.
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
 | Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
-| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker; resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, 8 when the source did not answer, then escalated; one that may have typed the task is escalated at once); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
 **Two kinds of worker.**
@@ -342,8 +342,8 @@ How the profile travels:
 **When the relay is down.** The Bridge connects to the relay before every
 Claude start. Unreachable: a `default` engine starts on Claude Code's own
 settings (the gateway, its own small model) and the tick reports a warning;
-a `cheap` start fails, and the failed delivery reaches the supervisor's
-digest. An engine already running when the relay dies sees API errors until
+a `cheap` start fails, is retried, and the failed delivery reaches the
+supervisor's digest once its retries are spent. An engine already running when the relay dies sees API errors until
 systemd restarts it (`Restart=always`). Engines use the relay only where
 `SPAWN_MODEL_RELAY` names it (`http://127.0.0.1:8791` in `spawn.env`):
 unset or `off`, every engine runs on Claude Code's own settings, nothing
