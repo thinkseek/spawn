@@ -11,13 +11,13 @@ import {
   focusObjective,
   metricPoints,
   openTask,
-  verdictsOf,
 } from "../../rsi";
 import { Button, Card, CardHeader, Eyebrow, LiveStatus, PageHeader, cx } from "../ui";
 import { AgentPane } from "./AgentPane";
 import { ChartLegend, MetricChart } from "./MetricChart";
 import { PhaseBadge, VerdictBadge, formatMetric, formatNumber, phaseStyle, useNow } from "./Phase";
-import { TaskDetail, VerdictList } from "./Verdicts";
+import { GateVerdicts } from "./GateVerdicts";
+import { TaskDetail } from "./Verdicts";
 import {
   formatPercent,
   isImprovement,
@@ -141,9 +141,9 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
                   onChoose={setChosenObjective}
                   onSelectTask={setSelected}
                 />
-                <VerdictList
-                  className="max-h-[28rem] shrink-0"
-                  verdicts={verdictsOf(mission)}
+                <GateVerdicts
+                  className="shrink-0"
+                  mission={mission}
                   selected={selected}
                   onSelect={(task) =>
                     setSelected((current) => (current === task ? null : task))
