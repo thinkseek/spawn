@@ -347,10 +347,61 @@ pub trait TerminalHost: Send + Sync {
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError>;
 
+    /// Create the file at `path`, as the terminal's process sees it, with
+    /// its missing parent directories, holding `bytes`, unless something is
+    /// at `path` already: whether it was written. Never replaces what is
+    /// there, and the file appears whole or not at all. How the Bridge puts
+    /// back an engine's transcript from the archive before a resume.
+    fn write_new(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<bool, TerminalError>;
+
     /// Kill the terminal and its process. A missing terminal is not an error.
     fn terminate(
         &self,
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError>;
+}
+
+/// Transcript archive failure.
+#[derive(Debug, Error)]
+#[error("transcript archive: {0}")]
+pub struct ArchiveError(pub String);
+
+/// Durable copies of engines' native transcripts, beside the workspace
+/// store ([`crate::transcripts`]). Each native session of an agent has
+/// numbered copies, oldest first: copy 0 is the transcript as the Bridge
+/// first saw it, and a later copy holds the whole file again after it
+/// shrank or was replaced. A copy only grows; archived bytes never change.
+pub trait TranscriptArchive: Send + Sync {
+    /// The length of each copy of the transcript of `native`, oldest first;
+    /// empty when none is archived.
+    fn copies(&self, agent: &AgentId, native: &str) -> Result<Vec<u64>, ArchiveError>;
+
+    /// At most `limit` bytes of copy `copy` from byte `offset`.
+    fn read(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>, ArchiveError>;
+
+    /// Append `bytes` to copy `copy`, which must hold exactly `at` bytes (a
+    /// new copy: the next number, at 0), and make them durable. Any other
+    /// `at`, or a copy number past the next, is refused: nothing archived is
+    /// overwritten.
+    fn append(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        at: u64,
+        bytes: &[u8],
+    ) -> Result<(), ArchiveError>;
 }

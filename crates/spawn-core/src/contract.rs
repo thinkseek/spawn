@@ -379,3 +379,84 @@ pub fn terminal(tag: &str, terminals: &dyn TerminalHost) {
         .terminate(&terminal, &workspace)
         .expect("terminating a missing terminal is harmless");
 }
+
+/// Files through the terminal host: `write_new` creates a file (and its
+/// parent directories) that `read_from` then reads, and never replaces one
+/// that exists. `directory` is a scratch directory the host can write.
+pub fn terminal_files(tag: &str, terminals: &dyn TerminalHost, directory: &str) {
+    let workspace = WorkspaceId::new("1:/workspaces/1").expect("valid workspace");
+    let path = format!(
+        "{}/{tag}/projects/n1.jsonl",
+        directory.trim_end_matches('/')
+    );
+    assert!(
+        terminals
+            .read_from(&workspace, &path, 0)
+            .expect("read succeeds")
+            .is_none()
+    );
+    assert!(
+        terminals
+            .write_new(&workspace, &path, b"{\"a\":1}\n")
+            .expect("write succeeds"),
+        "a missing file is written"
+    );
+    assert!(
+        !terminals
+            .write_new(&workspace, &path, b"other")
+            .expect("write succeeds"),
+        "an existing file is not"
+    );
+    assert_eq!(
+        terminals
+            .read_from(&workspace, &path, 0)
+            .expect("read succeeds"),
+        Some(b"{\"a\":1}\n".to_vec()),
+        "and keeps what it held"
+    );
+}
+
+/// Transcript archive rules: copies are numbered from 0 and only grow; an
+/// append at any length but a copy's own, or past the next copy, is
+/// refused; reads return what was appended.
+pub fn transcript_archive(tag: &str, archive: &dyn crate::port::TranscriptArchive) {
+    let agent = agent(tag);
+    let native = "0b7c1d2e-0000-4000-8000-000000000001";
+    assert!(archive.copies(&agent, native).expect("copies").is_empty());
+    archive
+        .append(&agent, native, 0, 0, b"one\n")
+        .expect("a first copy");
+    archive
+        .append(&agent, native, 0, 4, b"two\n")
+        .expect("it grows");
+    assert!(
+        archive.append(&agent, native, 0, 4, b"again\n").is_err(),
+        "archived bytes are never overwritten"
+    );
+    assert!(
+        archive.append(&agent, native, 2, 0, b"x").is_err(),
+        "no copy past the next"
+    );
+    archive
+        .append(&agent, native, 1, 0, b"whole\n")
+        .expect("the next copy");
+    assert_eq!(archive.copies(&agent, native).expect("copies"), vec![8, 6]);
+    assert_eq!(
+        archive.read(&agent, native, 0, 2, 4).expect("read"),
+        b"e\ntw".to_vec()
+    );
+    assert_eq!(
+        archive.read(&agent, native, 1, 0, 100).expect("read"),
+        b"whole\n".to_vec()
+    );
+    assert!(
+        archive
+            .copies(
+                &crate::id::AgentId::new(format!("agent_{tag}_other")).expect("valid"),
+                native
+            )
+            .expect("copies")
+            .is_empty(),
+        "copies are per agent"
+    );
+}

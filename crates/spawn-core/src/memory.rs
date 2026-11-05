@@ -14,12 +14,12 @@ use crate::event::{
     Appended, EventKind, EventRecord, Fork, GlobalPosition, NewEvent, SessionSeq, Source,
 };
 use crate::id::{
-    BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
+    AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
     TerminalName, WorkspaceId,
 };
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT, StoreError,
-    TerminalError, TerminalHost, WorkspaceError, WorkspaceStore,
+    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT,
+    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -85,6 +85,8 @@ struct State {
     /// Engines that exit at the next liveness check: the file is written
     /// and the terminal closes then, between the Bridge's two reads.
     exits_on_check: HashMap<TerminalName, (String, Vec<u8>)>,
+    /// The transcript archive: per agent and native session, its copies.
+    transcripts: HashMap<(AgentId, String), Vec<Vec<u8>>>,
 }
 
 impl State {
@@ -196,6 +198,18 @@ impl MemoryStore {
             .entry(path.to_string())
             .or_default()
             .extend_from_slice(bytes.as_bytes());
+    }
+
+    /// Replace a file the terminal host can read, as an engine that
+    /// rewrites or truncates it would. Test helper.
+    pub fn replace_file(&self, path: &str, bytes: &[u8]) {
+        self.lock().files.insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// Delete a file the terminal host can read, as Claude Code's cleanup
+    /// would. Test helper.
+    pub fn remove_file(&self, path: &str) {
+        self.lock().files.remove(path);
     }
 
     /// What `merge_base` answers from now on (a merge moves the branch to
@@ -640,6 +654,20 @@ impl TerminalHost for MemoryStore {
         }))
     }
 
+    fn write_new(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<bool, TerminalError> {
+        let mut state = self.lock();
+        if state.files.contains_key(path) {
+            return Ok(false);
+        }
+        state.files.insert(path.to_string(), bytes.to_vec());
+        Ok(true)
+    }
+
     fn terminate(
         &self,
         terminal: &TerminalName,
@@ -648,6 +676,71 @@ impl TerminalHost for MemoryStore {
         let mut state = self.lock();
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
+        Ok(())
+    }
+}
+
+impl TranscriptArchive for MemoryStore {
+    fn copies(&self, agent: &AgentId, native: &str) -> Result<Vec<u64>, ArchiveError> {
+        Ok(self
+            .lock()
+            .transcripts
+            .get(&(agent.clone(), native.to_string()))
+            .map(|copies| {
+                copies
+                    .iter()
+                    .map(|copy| u64::try_from(copy.len()).unwrap_or(u64::MAX))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn read(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>, ArchiveError> {
+        let state = self.lock();
+        let bytes = state
+            .transcripts
+            .get(&(agent.clone(), native.to_string()))
+            .and_then(|copies| copies.get(copy))
+            .ok_or_else(|| ArchiveError(format!("no copy {copy} of {native}")))?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        Ok(bytes[start..bytes.len().min(start.saturating_add(limit))].to_vec())
+    }
+
+    fn append(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        at: u64,
+        bytes: &[u8],
+    ) -> Result<(), ArchiveError> {
+        let mut state = self.lock();
+        let copies = state
+            .transcripts
+            .entry((agent.clone(), native.to_string()))
+            .or_default();
+        if copy == copies.len() {
+            copies.push(Vec::new());
+        }
+        let held = copies
+            .get_mut(copy)
+            .ok_or_else(|| ArchiveError(format!("copy {copy} of {native} is past the next")))?;
+        if u64::try_from(held.len()).unwrap_or(u64::MAX) != at {
+            return Err(ArchiveError(format!(
+                "copy {copy} of {native} holds {} bytes, not {at}",
+                held.len()
+            )));
+        }
+        held.extend_from_slice(bytes);
         Ok(())
     }
 }

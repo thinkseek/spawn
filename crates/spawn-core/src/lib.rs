@@ -18,3 +18,4 @@ pub mod redact;
 pub mod screen;
 pub mod shell;
 pub mod time;
+pub mod transcripts;

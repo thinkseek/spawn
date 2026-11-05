@@ -27,7 +27,7 @@ So each kind of object goes where its shape fits.
 | Source text | code, docs, configs, scenarios, backlog | small text files | branch per agent; three-way merge with the source's `.gitattributes` rules (read from `main`) | git: the mission's source repository | yes |
 | Workspace snapshots | the whole tree an agent works in, at every tool call | many files, few change per checkpoint | a branch is a git commit (text) plus a large-file manifest it names; fork is O(1) | the agent's git branch + the chunk store | yes |
 | Large and binary files | weights, datasets, images, archives, anything over 8 MiB | MB–GB, opaque, small edits | not merged: a branch keeps its own | content-defined chunks (FastCDC), zstd, by hash, in the chunk store | yes, host-local |
-| Streams | transcripts, engine output, gate logs | append-only, read in order | none | compressed segments in the chunk store, indexed by execution in PostgreSQL | no: transcripts stay on the compute host, gate logs are in `task.gated` records |
+| Streams | transcripts, engine output, gate logs | append-only, read in order | none | compressed segments in the chunk store, indexed by execution in PostgreSQL | no: transcripts are copied to the transcript archive beside the workspaces (below), gate logs are in `task.gated` records |
 | Derived caches | `target/`, `node_modules/`, the kache store | rebuildable, large, hot | none; never authoritative | local to each host (kache may share a remote) | yes |
 | Secrets | `spawn.env`, test URLs, keys | tiny | none | never stored centrally | yes |
 
@@ -273,6 +273,45 @@ files, a chunk fetch.
 - **Landing.** A branch head that names a manifest lands as a commit of the
   same tree without the trailer, so large files never reach `main`.
 
+## The transcript archive
+
+Claude Code's transcript of a native session (one JSONL file under its
+projects directory) is the agent's history: `--resume` reads it, and the
+Bridge derives the session's events from it. It is not Spawn's to keep.
+Claude Code deletes old transcripts (its `cleanupPeriodDays` sweep runs at
+every engine start, over the projects directory the owner's own sessions
+share), a container's copy goes with the container at unmount, and the
+format is the engine's. So Spawn keeps its own copy
+(`spawn_core::transcripts`, the `TranscriptArchive` port, a local directory
+adapter in `spawn_host::transcripts`):
+
+- **Where.** `<root>/.transcripts/<agent>/<native session>.jsonl`, beside
+  the workspaces and the chunk store, on the host that ran the engine.
+- **When.** After the checkpoint of each turn end, and at the end of each
+  execution, after its terminal is killed and before its workspace is
+  unmounted: the Bridge reads (through the terminal host, so inside a
+  container too) what the file gained since the latest copy and appends it,
+  each append made durable (`fdatasync`, and the directory for a new file).
+  A failure is a tick warning; the next copy takes what was missed.
+- **Never overwritten.** The file is append-only. The Bridge compares the
+  last 4 KiB it copied with the file at the same place: a file that shrank,
+  or whose bytes there differ (rewritten, replaced), is copied whole as the
+  next copy, `<native session>.<n>.jsonl`, and the earlier copies stay as
+  they were. An append to a copy at any length but its own is refused.
+- **Restore on resume.** Before a `resume` starts the engine (after the
+  mount, so a container exists), a missing transcript is put back from the
+  latest copy, created whole or not at all (a temporary file linked into
+  place; never over a file that is there), and the tick warns that it was
+  restored. A transcript that is gone with no copy, for a session whose
+  events were read from one, fails the resume with that reason and
+  unmounts: resuming would start the agent blank under its old id. A
+  session that never wrote a transcript resumes as before.
+- **The log.** No transcript content and no record of the copies: the
+  archive is its own index, and the events already derived from the lines
+  are in the log.
+- **Not built.** The archive is host-local (like the chunk store) and is
+  never pruned; moving it to R2 with the chunks is the way off this host.
+
 ## Disk room
 
 The host's disks are shared with other projects, so Spawn guards what it
@@ -317,8 +356,9 @@ state and wedges nothing:
   would go.
 
 Not guarded: the kache compiler cache (`~/.cache/kache`, a derived cache
-outside Spawn's cleanup) and the mirrors under `<root>/.sources`, which hold
-branches and are never pruned automatically.
+outside Spawn's cleanup), the mirrors under `<root>/.sources`, which hold
+branches, and the transcript archive under `<root>/.transcripts`, which
+holds the agents' history; none of them is pruned automatically.
 
 ## Not built
 
@@ -337,7 +377,7 @@ branches and are never pruned automatically.
 | Event log | PostgreSQL, one container on this host, bound to 127.0.0.1 | It *is* the source |
 | Event log backups | daily encrypted `pg_dump` in R2 bucket `spawn-store`: `postgres/daily/` (15 d), `weekly/` (60 d), `monthly/` (400 d), bucket-locked against deletion, expired by R2 lifecycle; newest also in `~/.local/share/spawn-rsi/backups/` ([deploy/backup](../deploy/backup/README.md)) | They are the copy; the key is kept off-host |
 | What an engine did | read by the Bridge from transcript and pane into the log | Yes: in the log |
-| Full transcript text | `~/.claude/projects/...` on the compute host | **No** (streams as segments are not built) |
+| Full transcript text | `~/.claude/projects/...` on the compute host, copied to `<root>/.transcripts/<agent>/` at turn ends and execution ends | From the archive, on the same host (restored before a resume when missing); **no** on another host |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
 | Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed to the source as `spawn/<agent>` | Yes for missions with a source; no for scratch missions and the default repository |
 | Work a task lands | the source's `spawn/<agent>`, fetched by the integrator into its mirror's `refs/spawn-integrate/<agent>`; judged only when it contains the agent's latest checkpoint (its `artifact.committed` in the event log) | Yes: the source holds it; nothing on the host that ran the agent is needed |

@@ -59,13 +59,18 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     let config = bridge_config()?;
     let log: Arc<dyn EventLog> = store.clone();
     let queue: Arc<dyn CommandQueue> = store.clone();
+    // Beside the workspaces: the transcripts are the agents' history.
+    let transcripts = spawn_host::LocalTranscriptArchive::new(
+        std::path::Path::new(&root).join(spawn_host::TRANSCRIPT_DIRECTORY),
+    );
     let mut bridge = Bridge::new(
         Arc::clone(&log),
         queue,
         workspaces,
         Arc::clone(&terminals),
         config,
-    );
+    )
+    .with_transcript_archive(Arc::new(transcripts));
     bridge.recover().map_err(|error| error.to_string())?;
 
     let context = context::HostContext::new(open_store()?, terminals);
