@@ -106,11 +106,8 @@
 //! lock allows one integrator per database; it belongs to the connection,
 //! which the integrator keeps while any of its gates runs.
 
-<<<<<<< 67c5b1bba25ebe9d3af830a13ccfd01c7a9b5fb0
-use std::fmt::Write as _;
-=======
 use std::cell::RefCell;
->>>>>>> c947c614d64f241207db346e41187fa7c8c1a62f
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1025,20 +1022,6 @@ impl Judge {
     }
 }
 
-<<<<<<< 67c5b1bba25ebe9d3af830a13ccfd01c7a9b5fb0
-/// The commit that lands `branch` (the agent's pushed head, in the mirror)
-/// on `main`, with `message` ([`landing_message`]), or `None` when the two
-/// conflict. Always one new merge commit: first parent `main` (the base the
-/// gate judges against), second parent `branch`, so main's first-parent line
-/// is one commit per landing and every checkpoint stays reachable through
-/// the second parents. Its tree is the branch's when main is in it, and the
-/// merge of both by main's merge rules otherwise. Never the branch head
-/// itself, so a head that names a large-file manifest lands without it.
-/// Only objects are written, never a ref: the agent's `refs/heads/<agent>`
-/// stays the Bridge's, and `spawn/<agent>` catches up with a landing through
-/// the Bridge's next merge of main, which its pusher pushes like any
-/// checkpoint.
-=======
 /// Run a judging, and when it errs or panics, record its abort unless it
 /// recorded something already: a judging that ends without a record of its
 /// own would be judged again on every pass, forever; an abort counts toward
@@ -1100,12 +1083,18 @@ fn abort_unrecorded(
     Ok(true)
 }
 
-/// The commit that would land `branch` (the agent's pushed head, in the
-/// mirror) on `main`, or `None` when the two conflict. Only objects are
-/// written, never a ref: the agent's `refs/heads/<agent>` stays the Bridge's,
-/// and `spawn/<agent>` catches up with a landing through the Bridge's next
-/// merge of main, which its pusher pushes like any checkpoint.
->>>>>>> c947c614d64f241207db346e41187fa7c8c1a62f
+/// The commit that lands `branch` (the agent's pushed head, in the mirror)
+/// on `main`, with `message` ([`landing_message`]), or `None` when the two
+/// conflict. Always one new merge commit: first parent `main` (the base the
+/// gate judges against), second parent `branch`, so main's first-parent line
+/// is one commit per landing and every checkpoint stays reachable through
+/// the second parents. Its tree is the branch's when main is in it, and the
+/// merge of both by main's merge rules otherwise. Never the branch head
+/// itself, so a head that names a large-file manifest lands without it.
+/// Only objects are written, never a ref: the agent's `refs/heads/<agent>`
+/// stays the Bridge's, and `spawn/<agent>` catches up with a landing through
+/// the Bridge's next merge of main, which its pusher pushes like any
+/// checkpoint.
 fn landing_candidate(
     mirror_path: &str,
     main: &str,
