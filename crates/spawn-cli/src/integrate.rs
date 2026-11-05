@@ -44,14 +44,36 @@
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
 //!    and never two for one objective. Filling happens on every pass that
-//!    gets this far, before the judging of step 4, which stays one
-//!    candidate per pass, the lowest ready task first. A halted mission gets
-//!    no new task.
+//!    gets this far, before the judging of step 4. A halted mission gets no
+//!    new task.
 //!
-//! Like the dispatcher, it keeps no state of its own: the control stream
-//! says what was judged and landed. An advisory lock allows one integrator
-//! per database, so two gates never run at once.
+//! **Gates run per mission, a few at once.** A judging (step 4, from the
+//! fetch of the pushed branch to the landing) runs on a thread of its own,
+//! so one mission's 20-minute gate does not hold another's:
+//! - a mission has at most one judging in flight, its lowest ready task:
+//!   its tasks stay serial, each landing on the main the next is judged
+//!   against. While it runs, the pass skips the mission altogether (halts,
+//!   budgets, landings, assignments), and every other mission on its source
+//!   too: they share the mirror and the main it judges against;
+//! - at most [`DEFAULT_GATES`] judgings run at once across missions
+//!   (`--gates N` or `SPAWN_INTEGRATE_GATES`, 1 to [`MAX_GATES`]): gates
+//!   share the CPU and the test database. A ready task over the cap waits
+//!   for a later pass.
+//!
+//! Every judging records its own outcome (`task.gated`, `task.landed`), as
+//! before; the pass reads those records, never the thread's result. A
+//! finished thread is reaped only at the start of a pass, before the
+//! missions are read, so no pass acts on a snapshot older than a judging's
+//! records. A restart mid-gate behaves as it did with one gate: the process
+//! (and with it every gate under it) dies before any record, so the next
+//! integrator judges the task again.
+//!
+//! Like the dispatcher, it keeps no state of its own beyond the gates it is
+//! running: the control stream says what was judged and landed. An advisory
+//! lock allows one integrator per database; it belongs to the connection,
+//! which the integrator keeps while any of its gates runs.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,7 +116,32 @@ const PUSH_POLL: Duration = Duration::from_millis(500);
 /// Who the integrator's commands come from.
 const PRINCIPAL: &str = "spawn-integrate";
 
-const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>]";
+const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>] [--gates <n>]";
+
+/// Gates that run at once, across missions, unless `--gates` or
+/// `SPAWN_INTEGRATE_GATES` says otherwise.
+pub(crate) const DEFAULT_GATES: usize = 2;
+
+/// The most gates `--gates` allows: each holds two trees, their builds and
+/// a share of the test database.
+pub(crate) const MAX_GATES: usize = 8;
+
+/// How many gates may run at once: `--gates`, else `SPAWN_INTEGRATE_GATES`,
+/// else [`DEFAULT_GATES`]; a whole number from 1 to [`MAX_GATES`].
+pub(crate) fn gate_slots(flag: Option<String>, env: Option<String>) -> Result<usize, String> {
+    let Some((name, text)) = flag
+        .map(|text| ("--gates", text))
+        .or_else(|| env.map(|text| ("SPAWN_INTEGRATE_GATES", text)))
+    else {
+        return Ok(DEFAULT_GATES);
+    };
+    match text.trim().parse::<usize>() {
+        Ok(slots) if (1..=MAX_GATES).contains(&slots) => Ok(slots),
+        _ => Err(format!(
+            "{name} is a whole number from 1 to {MAX_GATES}, not '{text}'"
+        )),
+    }
+}
 
 /// One mission with a gate the integrator visits, from `gated_missions`.
 #[derive(Debug, Clone, Deserialize)]
@@ -325,13 +372,16 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
              the gate does not get it"
         );
     }
-    let integrator = Integrator {
-        root,
-        gate,
-        gate_env,
-    };
+    let gates = gate_slots(flags.get("gates"), crate::config::env_value("SPAWN_INTEGRATE_GATES"))
+        .map_err(|error| format!("{error}\n{USAGE}"))?;
+    let integrator = Integrator::new(root, gate, gate_env, gates);
     loop {
-        if let Err(error) = integrator.pass() {
+        let pass = integrator.pass();
+        if once {
+            // One pass, and the gates it started run to their records.
+            integrator.settle();
+        }
+        if let Err(error) = pass {
             eprintln!("integrate: {error}");
             if once {
                 return Err(error);
@@ -345,24 +395,114 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
 }
 
 struct Integrator {
+    judge: Judge,
+    /// Gates that may run at once ([`gate_slots`]).
+    gates: usize,
+    /// The judgings in flight, one per mission at most.
+    running: RefCell<Vec<Running>>,
+    /// The store whose connection holds the integrator's lock, kept while
+    /// a judging runs: its thread records through it.
+    held: RefCell<Option<Arc<PostgresStore>>>,
+}
+
+/// What a judging needs, owned, so it runs on a thread of its own.
+#[derive(Clone)]
+struct Judge {
     root: PathBuf,
     gate: PathBuf,
     /// The gate's whole environment ([`gate::gate_env`]).
     gate_env: Vec<(String, String)>,
 }
 
+/// One judging in flight.
+struct Running {
+    mission: i64,
+    source: String,
+    task: i64,
+    handle: std::thread::JoinHandle<()>,
+}
+
 impl Integrator {
-    fn pass(&self) -> Result<(), String> {
-        // A store per pass: the advisory lock belongs to the connection, and
-        // is released with it.
-        let store = Arc::new(open_store()?);
-        if !store
-            .integrator_try_lock()
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(());
+    fn new(root: PathBuf, gate: PathBuf, gate_env: Vec<(String, String)>, gates: usize) -> Self {
+        Self {
+            judge: Judge {
+                root,
+                gate,
+                gate_env,
+            },
+            gates,
+            running: RefCell::new(Vec::new()),
+            held: RefCell::new(None),
         }
-        self.pass_on(&store)
+    }
+
+    fn pass(&self) -> Result<(), String> {
+        self.reap();
+        // A store per pass while no gate runs: the advisory lock belongs to
+        // the connection, and is released with it. While one runs, its
+        // thread holds the store, so the lock stays this integrator's.
+        if self.running.borrow().is_empty() {
+            self.held.borrow_mut().take();
+        }
+        let held = self.held.borrow().clone();
+        let store = if let Some(store) = held {
+            store
+        } else {
+            let store = Arc::new(open_store()?);
+            if !store
+                .integrator_try_lock()
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
+            store
+        };
+        let pass = self.pass_on(&store);
+        // A pass that failed may have lost the connection: the next pass
+        // asks for the lock again (refused while the old connection lives).
+        *self.held.borrow_mut() = (pass.is_ok() && !self.running.borrow().is_empty()).then_some(store);
+        pass
+    }
+
+    /// Join the judgings that ended. Their records are in the log already;
+    /// a thread that panicked recorded nothing, so its task is judged again.
+    fn reap(&self) {
+        let finished: Vec<Running> = {
+            let mut running = self.running.borrow_mut();
+            let (finished, still) = running
+                .drain(..)
+                .partition(|gate: &Running| gate.handle.is_finished());
+            *running = still;
+            finished
+        };
+        for gate in finished {
+            Self::join(gate);
+        }
+    }
+
+    /// Wait for every judging in flight (`--once`, and tests).
+    fn settle(&self) {
+        let running: Vec<Running> = self.running.borrow_mut().drain(..).collect();
+        for gate in running {
+            Self::join(gate);
+        }
+    }
+
+    fn join(gate: Running) {
+        if gate.handle.join().is_err() {
+            eprintln!(
+                "integrate: mission {}: the judging of task {} panicked; it is judged again",
+                gate.mission, gate.task
+            );
+        }
+    }
+
+    /// The judging in flight that keeps `mission` out of this pass: its
+    /// own, or one on its source.
+    fn busy(&self, mission: &Mission) -> bool {
+        self.running.borrow().iter().any(|gate| {
+            gate.mission == mission.id || mission.source.as_deref() == Some(gate.source.as_str())
+        })
     }
 
     /// One pass over every gated mission, holding the integrator's lock.
@@ -390,7 +530,7 @@ impl Integrator {
         missions: &[Mission],
         mission: &Mission,
     ) -> Result<bool, String> {
-        if mission.halted.is_some() {
+        if mission.halted.is_some() || self.busy(mission) {
             return Ok(false);
         }
         let scenarios = PathBuf::from(&mission.gate);
@@ -407,8 +547,7 @@ impl Integrator {
         if let Some(reason) = unlandable(source) {
             return halt(store, mission, &reason).map(|()| true);
         }
-        let mirror =
-            sources::ensure_mirror(&self.root, Some(source)).map_err(|error| error.to_string())?;
+        let mirror = sources::ensure_mirror(&self.judge.root, Some(source)).map_err(|error| error.to_string())?;
         if let Some(task) = mission.landing() {
             return land(store, &mirror, source, task).map(|()| true);
         }
@@ -460,8 +599,47 @@ impl Integrator {
         let Some(task) = mission.ready() else {
             return Ok(assigned);
         };
-        let judged = self.judge(store, &mirror, source, &main, &scenarios, count, task)?;
-        Ok(judged || assigned)
+        let running = self.running.borrow().len();
+        if running >= self.gates {
+            println!(
+                "integrate: mission {}: task {} waits for a gate ({running} of {} running)",
+                mission.id, task.id, self.gates
+            );
+            return Ok(assigned);
+        }
+        let judge = self.judge.clone();
+        let (store, task, source_owned, mission_id) =
+            (Arc::clone(store), task.clone(), source.to_string(), mission.id);
+        let handle = std::thread::Builder::new()
+            .name(format!("gate-{}", task.id))
+            .spawn(move || {
+                if let Err(error) = judge.judge(
+                    &store,
+                    &mirror,
+                    &source_owned,
+                    &main,
+                    &scenarios,
+                    count,
+                    &task,
+                ) {
+                    eprintln!("integrate: mission {mission_id}: {error}");
+                }
+            })
+            .map_err(|error| format!("start the judging of task {}: {error}", task.id))?;
+        println!(
+            "integrate: mission {}: judging task {} ({} of {} gates)",
+            mission.id,
+            task.id,
+            running + 1,
+            self.gates
+        );
+        self.running.borrow_mut().push(Running {
+            mission: mission.id,
+            source: source.to_string(),
+            task: task.id,
+            handle,
+        });
+        Ok(assigned)
     }
 
     /// Abort delivered tasks over budget. True when it aborted one.
@@ -493,7 +671,9 @@ impl Integrator {
         }
         Ok(aborted)
     }
+}
 
+impl Judge {
     /// The agent's pushed branch, fetched into the mirror, checked against
     /// its latest checkpoint. A lagging push is fetched again for up to
     /// [`PUSH_WAIT`] before it counts as stale.
@@ -530,9 +710,8 @@ impl Integrator {
         }
     }
 
-    /// Judge one task from its pushed branch. True when what it recorded may
-    /// move another mission's view; a stale push moves nothing, so the other
-    /// missions still get their turn in this pass.
+    /// Judge one task from its pushed branch, on its own thread. True when
+    /// the gate ran; a stale push runs none.
     #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
