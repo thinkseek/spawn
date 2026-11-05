@@ -744,18 +744,26 @@ fn landing_candidate(
     // Main moved since the worker started: land the merge of both, by
     // main's merge rules (a bare repository reads no in-tree
     // .gitattributes otherwise), as main is merged into agents' branches.
-    let Ok(tree) = git(&[
-        "--git-dir",
-        mirror_path,
-        &format!("--attr-source={main}"),
-        "merge-tree",
-        "--write-tree",
-        main,
-        branch,
-    ]) else {
+    let output = sources::controller_git()
+        .args([
+            "--git-dir",
+            mirror_path,
+            &format!("--attr-source={main}"),
+            "merge-tree",
+            "--write-tree",
+            main,
+            branch,
+        ])
+        .output()
+        .map_err(|error| format!("run git merge-tree: {error}"))?;
+    let Some(tree) = merged_tree(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )?
+    else {
         return Ok(None);
     };
-    let tree = tree.lines().next().unwrap_or_default().to_string();
     commit_landing(
         mirror_path,
         &[
@@ -769,6 +777,33 @@ fn landing_candidate(
         ],
     )
     .map(Some)
+}
+
+/// What `git merge-tree --write-tree` said, from its exit code (`None`: no
+/// code, killed by a signal) and output: `Ok(Some(tree))` for a clean merge,
+/// `Ok(None)` for a conflict (exit 1, the only code git gives one), and any
+/// other failure an error with git's own message. A git that cannot run the
+/// merge (an unknown option, a crash) says nothing about the work: it must
+/// reach the operator, never send the worker after conflicts that do not
+/// exist.
+fn merged_tree(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Option<String>, String> {
+    match code {
+        Some(0) => Ok(Some(stdout.lines().next().unwrap_or_default().trim().to_string())),
+        Some(1) => Ok(None),
+        failure => {
+            let how = failure.map_or_else(
+                || "was killed by a signal".to_string(),
+                |code| format!("exited {code}"),
+            );
+            Err(format!(
+                "git merge-tree {how}, so the landing could not be merged (this is not a \
+                 conflict; Spawn needs git {}.{} or later): {}",
+                crate::config::MIN_GIT.0,
+                crate::config::MIN_GIT.1,
+                stderr.trim()
+            ))
+        }
+    }
 }
 
 /// Name and email of the author and committer of every landing commit.
