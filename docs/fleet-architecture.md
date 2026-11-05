@@ -373,6 +373,35 @@ accept` /
 close`. Every one is a checked SQL function that appends to the control
 stream (§10.1).
 
+**When a task closes.** A task closes by landing (or, without a gate,
+acceptance), or by a cancel: `spawn task cancel`, the supervisor's, the
+integrator's abort over budget (`task.aborted`), a gate rejection the
+closure rule turns into a cancel, or a mission closed or a resident retired
+under it (§10). A cancelled task's live work ends with it, at the source:
+
+- *Stopped.* When a delivered task is cancelled and it was its worker's
+  latest delivery, the dispatcher stops the worker at once, in the middle of
+  a turn or idle (a Stop takes a final checkpoint, which keeps what it did;
+  its turn for the task is never left to finish). An ephemeral worker is
+  stopped and nothing more; a retired resident is stopped and not told.
+- *Set aside.* Before a resident gets anything else, the task's work leaves
+  its branch's tree: a new commit on top of the branch head, whose tree is
+  the checkpoint the task started from ([storage.md](storage.md), "Work set
+  aside"). Nothing is rewound or lost, and the next task's candidate holds
+  none of it, so nothing rides into another objective's landing.
+- *Told.* The resident is then resumed with a notice that names the task,
+  says it is cancelled, and says where its work is (the commit that holds
+  it). Its next task waits until the notice reached it.
+- *Never collected.* A cancelled task's report is not collected, recorded
+  or judged; a report file it leaves is not the next task's (the delivery
+  mark rule).
+
+A task never delivered changes nothing for its worker, and a resident whose
+cancelled task is not its latest delivery is left alone. The dispatcher
+keeps no state for this either: `spawn_events`, `spawn_commands` and their
+keys (`cancel-stop-<task>-<execution>`, `cancel-notice-<task>-<n>`,
+`set-aside:<task>`) say what was done.
+
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
@@ -689,20 +718,33 @@ record of what was judged (§14 of design.md).
      agent's latest checkpoint is gated `stale` after a short wait: no gate
      run, no rejection, the task stays ready and is judged again later
      ([storage.md](storage.md), "Landing");
-  2. builds the candidate: the pushed branch itself, or a merge of it with `main`
-     when `main` has moved. A conflict first merges `main` into the agent's
+  2. builds the candidate, the landing commit C: one merge commit whose
+     first parent is `main` (the base) and second the pushed head, with the
+     head's tree when `main` is in it and the merge by `main`'s merge rules
+     when `main` has moved, never a fast-forward to a worker's commit. Its
+     message says what landed: the objective's title, the objective and the
+     task on the first line (for a task without an objective, the brief's
+     first line and the task), then the report's `## What changed` (the
+     whole report without one, bounded, a line that could read as a
+     `Spawn-` trailer indented), then `Spawn-Task`, `Spawn-Objective` and
+     `Spawn-Head` trailers. So `git log --first-parent main` is one line
+     per landed task, `git bisect start --first-parent` visits only gated
+     landings, `git revert -m 1 <C>` undoes one task, and every checkpoint
+     stays reachable through the second parents ([storage.md](storage.md),
+     "Landing"). A conflict first merges `main` into the agent's
      idle workspace, with conflict markers, then sends the task back with a
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate, with a 45-minute wall clock;
-  4. records `task.gated` (verdict, log, metric) before git moves;
+  3. runs the gate on C, with a 45-minute wall clock;
+  4. records `task.gated` (verdict, log, metric, C as `candidate`) before
+     git moves;
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
      record was lost), which is a landing;
-  6. records `task.landed` (`from`, `to`).
+  6. records `task.landed` (`from`, `to` = C).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
 - **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
@@ -727,7 +769,10 @@ record of what was judged (§14 of design.md).
   neither `task.cancelled` nor `task.aborted`. The
   integrator's selection uses the same rule, and no transition moves a task
   into a state the rule drops: a send-back is refused, a gate rejection
-  cancels the task, and deliveries and reports are not recorded.
+  cancels the task, and deliveries and reports are not recorded. A worker
+  still working on a task the rule cancels is stopped, and a resident gets
+  the task's work set aside and is told before anything else (§3.2, "When a
+  task closes").
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
   - three gate aborts in a row;

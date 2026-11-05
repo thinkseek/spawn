@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{BaseMerge, Branch, Commit, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{BaseMerge, Branch, Commit, SetAside, WorkspaceError, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
@@ -498,6 +498,20 @@ impl WorkspaceStore for MissionWorkspaces {
 
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         self.route(branch.as_str())?.store.branch_head(branch)
+    }
+
+    fn set_aside(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        let routed = self.route(branch.as_str())?;
+        let set_aside = routed.store.set_aside(branch, start, message)?;
+        if let (SetAside::Created { .. }, Some((repo, source))) = (&set_aside, &routed.mirror) {
+            self.mark(repo, source, branch.as_str());
+        }
+        Ok(set_aside)
     }
 
     fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {

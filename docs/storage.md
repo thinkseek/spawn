@@ -135,6 +135,29 @@ head alone is the whole workspace, so everything below is a git operation.
   `main`'s version (or delete it where `main` has none); recorded as
   `merge.conflicted {files, marked: false}`. An agent with no workspace on
   the integrator's host gets no merge, and its note says so.
+- **Work set aside**: a resident keeps its branch from task to task, so the
+  work of a task cancelled while it was delivered (by `spawn task cancel`,
+  the supervisor, the integrator's abort over budget, or the closure rule)
+  would otherwise stay in its workspace, the next task would start on top
+  of it, and in a gated mission the next task's candidate would carry it
+  into a landing under another objective's name. Before the resident gets
+  anything else, the dispatcher (spawn-cli's `set_aside`) puts a new commit
+  on top of its branch whose tree is the checkpoint the task started from:
+  the agent's latest `artifact.committed` before the task's first delivery
+  was accepted, the merge of `main` typed just before it included (and a
+  start's or resume's `base_merged`, recorded before `task.delivered`). It
+  runs only while nothing of the agent writes the branch, after the
+  dispatcher's Stop took the final checkpoint, under the branch's lock
+  (`set_aside`, routed like `merge_base`): a mounted directory holding
+  what no checkpoint took is committed first, the directory moves to the
+  start's tree the two-tree way, then the branch moves by compare-and-swap.
+  Nothing is rewound (pushes are never forced, and the integrator requires
+  the published branch to descend from the latest checkpoint), and nothing
+  is lost: the work is the set-aside commit's parent, and the worker's
+  notice names both commits. The set-aside is recorded as
+  `artifact.committed` (`set_aside`, key `set-aside:<task>`, so it is made
+  once) and pushed like any checkpoint. A merge pending its markers is set
+  aside with the work.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won by the same two-tree update
@@ -213,7 +236,37 @@ head alone is the whole workspace, so everything below is a git operation.
   caught by the marker check wherever the integrator runs. The gate judges
   the candidate; the integrator moves `main` by a compare-and-swap push. A
   branch head an earlier version wrote with a `Spawn-Large` trailer lands
-  as a commit of the same tree without it.
+  without it: the landing commit's message is the integrator's.
+
+  **A landing is one commit per task on `main`'s first-parent line.** Every
+  landing, also of a branch that already contains `main`, moves `main` by
+  exactly one new merge commit C, never by a fast-forward to a worker's
+  commit: first parent the `main` the gate judged against (the task's base),
+  second parent the pushed head that was judged. C's tree is the head's when
+  `main` is its ancestor, and the merge by `main`'s merge rules otherwise.
+  C is built before the gate runs: the gate judges it, `task.gated` names it
+  in `candidate`, the push moves `main` to exactly it, and `task.landed`
+  names it in `to`. Its message is the integrator's, written from the record
+  alone (never from a workspace), and says what landed: the first line is
+  the objective's title (the brief's first line) with the objective and the
+  task, `Greet the harbour (objective 7, task 42)`, or, for a task without
+  an objective, the brief's first non-empty line and `(task <id>)`; after a
+  blank line, the report's `## What changed` section (the whole report when
+  it has none), at most 3000 characters, with any line of it that could
+  read as a `Spawn-` trailer indented; last, the trailers `Spawn-Task`,
+  `Spawn-Objective` and `Spawn-Head` (the judged head). Author and committer
+  are `spawn-integrate`, unsigned. So `git log --first-parent main` reads one
+  line per landed task, `git bisect start --first-parent` (git 2.29+) visits
+  only landings, each one gated (a plain bisect may stop on an ungated
+  checkpoint: the price of keeping the history), and `git revert -m 1 <C>`
+  undoes exactly one task. The worker's checkpoints stay reachable from
+  `main` through the second parents, off that line, so a reverted objective
+  comes back as a new task from the current `main` (or by reverting the
+  revert), never by merging the same branch again. It is a merge and not a
+  squash so that no other ref has to keep the history, and so that the
+  worker's head is in `main`: the next merge of `main` into its branch is
+  clean, where after a squash every later merge would see the same change
+  from both sides.
 
 ## Files over the cap
 
