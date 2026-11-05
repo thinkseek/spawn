@@ -982,6 +982,47 @@ judge "$good" "" "$indirect/rsi/scenarios" >/dev/null
 expect "a miss: the helper reached through scripts/\$h or a cd changed" "$(cat "$work/gate.out")" \
     'from the cache: none; run on the base: 021.sh 022.sh'
 
+# What is installed in a directory the `bind` list names decides base
+# results (a project's node_modules), so it is in the key: a listing of the
+# directory, or pnpm's install record when it has one.
+bound=$HOME/bound-inputs
+mkdir -p "$bound/lib" "$HOME/bound-ctl/rsi/scenarios"
+echo v1 >"$bound/lib/answer"
+cp "$scenarios/protected" "$scenarios/build" "$HOME/bound-ctl/rsi/scenarios/"
+printf '%s\n' "$bound" >"$HOME/bound-ctl/rsi/scenarios/bind"
+cat >"$HOME/bound-ctl/rsi/scenarios/031.sh" <<EOF
+#!/bin/sh
+[ -f '$bound/lib/answer' ] || exit 2
+[ "\$(cat value)" != three ]
+EOF
+bound_scenarios=$HOME/bound-ctl/rsi/scenarios
+judge "$good" "" "$bound_scenarios" >/dev/null
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a bound directory unchanged: a hit" "$(from_cache)" '031.sh'
+echo v2-longer >"$bound/lib/answer"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: a file in a bound directory changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+mkdir -p "$bound/.pnpm"
+printf 'lockfileVersion: 9\n' >"$bound/.pnpm/lock.yaml"
+printf 'prunedAt: one\n' >"$bound/.modules.yaml"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: the directory now has pnpm's install record" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "with the record: a hit" "$(from_cache)" '031.sh'
+echo v3 >"$bound/lib/answer"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "an edit without an install is not keyed (the record stands for it)" "$(from_cache)" '031.sh'
+printf 'prunedAt: two\n' >"$bound/.modules.yaml"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: an install rewrote the record" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+printf 'lockfileVersion: 9\npackages: {}\n' >"$bound/.pnpm/lock.yaml"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: the installed lockfile changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+
 # A corrupt entry is a miss: whatever an entry holds but "solved" or
 # "unsolved", an entry that cannot be read, or one that is a directory, is
 # judged again, and rewritten.
