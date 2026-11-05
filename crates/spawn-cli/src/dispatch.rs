@@ -45,6 +45,9 @@ use crate::supervise::SUPERVISOR_SESSION;
 /// One command the dispatcher sent.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub(crate) struct Sent {
+    /// The command's id.
+    #[serde(default)]
+    pub(crate) id: Option<i64>,
     pub(crate) key: String,
     #[serde(default)]
     pub(crate) text: Option<String>,
@@ -210,7 +213,8 @@ pub(crate) struct Order {
     pub(crate) session_id: String,
     pub(crate) key: String,
     pub(crate) action: CommandAction,
-    /// The task this command delivers, if any.
+    /// The task this command delivers, if any: it is marked delivered once
+    /// the command has succeeded ([`Plan::delivered`]).
     pub(crate) task: Option<i64>,
 }
 
@@ -230,6 +234,9 @@ impl Order {
 /// What one dispatcher step does.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Plan {
+    /// Tasks whose delivery command succeeded, as (task, command): they
+    /// are marked delivered.
+    pub(crate) delivered: Vec<(i64, i64)>,
     pub(crate) orders: Vec<Order>,
     /// Escalations not delivered yet, whether or not a digest goes out now.
     pub(crate) pending: Vec<Escalation>,
@@ -265,11 +272,10 @@ pub(crate) fn decide_with(
         .find(|facts| facts.session_id == SUPERVISOR_SESSION);
     let told = digest::told(supervisor);
     let mut plan = Plan {
-        orders: deliver::orders(work, rows),
+        delivered: deliver::delivered(work, rows),
+        orders: deliver::orders(work, rows, now_ms),
         pending: Vec::new(),
     };
-    plan.orders
-        .extend(deliver::start_retries(work, rows, now_ms));
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
         // A managed worker between tasks is not news: its report already
@@ -305,8 +311,8 @@ fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
-/// Submit one order as the dispatcher; an order that delivers a task marks
-/// the task delivered with the command's id.
+/// Submit one order as the dispatcher. An order that delivers a task does
+/// not move it: the task is marked delivered once the command succeeded.
 fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<(), String> {
     let submission = Submission {
         agent_id: AgentId::new(order.agent_id).map_err(|error| error.to_string())?,
@@ -314,14 +320,9 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
         idempotency_key: IdempotencyKey::new(order.key).map_err(|error| error.to_string())?,
         action: order.action,
     };
-    let command = store
+    store
         .submit(principal, &submission)
         .map_err(|error| error.to_string())?;
-    if let Some(task) = order.task {
-        store
-            .task_delivered(task, i64::try_from(command.0).unwrap_or(i64::MAX))
-            .map_err(|error| error.to_string())?;
-    }
     Ok(())
 }
 
@@ -352,6 +353,14 @@ pub(crate) fn step(
                 "dispatch: held {held} new execution(s): free disk is under SPAWN_DISK_FLOOR_GB"
             ));
         }
+    }
+    for (task, command) in plan.delivered {
+        store
+            .task_delivered(task, command)
+            .map_err(|error| error.to_string())?;
+        lines.push(format!(
+            "dispatch: task #{task} delivered (command {command})"
+        ));
     }
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for order in plan.orders {
@@ -452,6 +461,7 @@ mod tests {
 
     fn nudge_sent(finished_at_ms: i64) -> Sent {
         Sent {
+            id: None,
             key: "dispatch-nudge-session_worker_a-7".to_string(),
             text: Some("continue".to_string()),
             created_at_ms: finished_at_ms - 500,
@@ -548,6 +558,7 @@ mod tests {
         // Once delivered, the same escalation is not sent again.
         let mut supervisor = idle_supervisor();
         supervisor.dispatched.push(Sent {
+            id: None,
             key: digest.key.clone(),
             text: Some(text.clone()),
             created_at_ms: NOW,
@@ -579,6 +590,7 @@ mod tests {
         ));
         let mut supervisor = idle_supervisor();
         supervisor.dispatched.push(Sent {
+            id: None,
             key: plan.orders[0].key.clone(),
             text: Some(text.clone()),
             created_at_ms: NOW,
@@ -618,6 +630,7 @@ mod tests {
         let plan = decide(&[lost.clone()], false, NOW, "spawn");
         assert_eq!(plan.orders[0].key, "dispatch-resume-exec_5");
         lost.dispatched.push(Sent {
+            id: None,
             key: "dispatch-resume-exec_5".to_string(),
             text: None,
             created_at_ms: NOW - 10,
@@ -665,6 +678,7 @@ mod tests {
         let mut facts = worker(judged(SemanticState::Waiting, 0.9));
         for episode in 1..=3 {
             facts.dispatched.push(Sent {
+                id: None,
                 key: format!("dispatch-nudge-session_worker_a-{episode}"),
                 text: Some("continue".to_string()),
                 created_at_ms: NOW - 60_000,

@@ -1387,7 +1387,7 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
         .cloned()
         .expect("the failed command is among the dispatched");
     assert_eq!(failed["error"].as_str(), Some("the source did not answer"));
-    // Two days ago: out of the window `dispatched` keeps.
+    // Two days ago: out of the window `dispatched` keeps for other commands.
     admin(&schema)
         .execute(
             "update spawn_commands set created_at_ms = created_at_ms - 2 * 86400000",
@@ -1395,7 +1395,21 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
         )
         .expect("age the commands");
     let facts = row();
-    assert_eq!(facts["dispatched"], serde_json::json!([]));
+    let kept: Vec<&str> = facts["dispatched"]
+        .as_array()
+        .expect("dispatched")
+        .iter()
+        .filter_map(|sent| sent["key"].as_str())
+        .collect();
+    assert_eq!(
+        kept,
+        vec!["deliver-4-0", "deliver-7-1"],
+        "only the deliveries stay, to be confirmed however old"
+    );
+    assert!(
+        facts["dispatched"][0]["id"].is_i64(),
+        "a delivery names its command"
+    );
     assert_eq!(
         facts["last_delivery"].as_str(),
         Some("deliver-7-1"),

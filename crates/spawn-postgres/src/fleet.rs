@@ -139,7 +139,8 @@ select jsonb_build_object(
 /// supervisor, with the latest judgement, the episode (latest command from
 /// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
 /// model profile of its latest execution, and what the dispatcher already
-/// sent there in the last day; `resumed_young` counts the executions its
+/// sent there in the last day (its deliveries, however old: a delivery is
+/// confirmed from its command); `resumed_young` counts the executions its
 /// resumes started that died young (`died_young!`) since the session's last
 /// execution that did not.
 pub(crate) const DISPATCH_FACTS: &str = concat!(
@@ -166,6 +167,7 @@ from (
                where e.session_id = s.session_id and e.event_name = 'execution.started'
                order by e.session_seq desc limit 1), 'default') as model,
     (select coalesce(jsonb_agg(jsonb_build_object(
+              'id', c.id,
               'key', c.idempotency_key,
               'text', c.action ->> 'text',
               'created_at_ms', c.created_at_ms,
@@ -174,7 +176,8 @@ from (
               'error', c.error) order by c.id), '[]'::jsonb)
        from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
-        and c.created_at_ms > spawn_now_ms() - 86400000) as dispatched,
+        and (c.created_at_ms > spawn_now_ms() - 86400000
+             or c.idempotency_key like 'deliver-%')) as dispatched,
     (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'

@@ -1517,12 +1517,9 @@ impl Bridge {
         }
         match self.typing_of(claimed, &active.execution_id) {
             Typing::Done => Ok(Outcome::Succeeded),
-            Typing::Unknown => self.abandon(
-                claimed,
-                active,
-                "the prompt may have been typed and the log cannot tell; it is not typed again"
-                    .to_string(),
-            ),
+            Typing::Unknown => {
+                self.abandon(claimed, active, format!("the prompt {MAY_HAVE_TYPED}"))
+            }
             Typing::Due => self.prompt_engine(claimed, active, prompt),
         }
     }
@@ -2111,11 +2108,7 @@ impl Bridge {
             Typing::Due => {}
             Typing::Done => return Ok(Outcome::Succeeded),
             Typing::Unknown => {
-                return Ok(Outcome::Failed(
-                    "the text may have been typed and the log cannot tell; it is not typed \
-                     again"
-                        .to_string(),
-                ));
+                return Ok(Outcome::Failed(format!("the text {MAY_HAVE_TYPED}")));
             }
         }
         let Ok(pane) =
@@ -2236,6 +2229,12 @@ impl Bridge {
         )
     }
 }
+
+/// How a command that may or may not have typed its text fails (the log
+/// shows typing began and nothing shows it arrived): it is not typed again,
+/// and whoever sent it must not send it again blindly either.
+pub const MAY_HAVE_TYPED: &str =
+    "may have been typed and the log cannot tell; it is not typed again";
 
 /// A digest of a list of paths that stays the same across builds and hosts
 /// (FNV-1a over the paths, each ended by a NUL): part of a record's key.
