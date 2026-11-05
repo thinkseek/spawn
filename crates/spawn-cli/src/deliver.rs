@@ -30,6 +30,14 @@
 //! the dispatcher, delivery keeps no state: idempotency keys and the task
 //! rows say what was already done.
 //!
+//! A waiting task that does not move is not left to wait silently: the
+//! task whose turn it is ([`next_up`]) is at its `delivery` step from the
+//! record that put it there, and the dispatcher's stall layer
+//! (`dispatch::stall`) escalates it once its bound
+//! (`SPAWN_STALL_DELIVERY_SECS`) has passed, naming every attempt and its
+//! outcome and the retry still due or held ([`delivery_status`]). One whose
+//! retries are spent was escalated as delivery failed, and gets no stall.
+//!
 //! [`orders`] is pure; [`collect_reports`] is the one step with side effects
 //! (the report file and the task row).
 
