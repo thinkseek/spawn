@@ -166,7 +166,9 @@ pub(crate) struct OpenTask {
 pub(crate) struct Verdict {
     pub(crate) mission_id: i64,
     pub(crate) id: i64,
-    pub(crate) verdict: String,
+    /// `accepted`, `rejected`, `conflict` or `aborted`.
+    #[serde(rename = "verdict")]
+    pub(crate) outcome: String,
     #[serde(default)]
     pub(crate) task: Option<String>,
     pub(crate) at_ms: i64,
@@ -497,7 +499,7 @@ fn measure(
                 |verdict| {
                     format!(
                         "the mission's latest verdict: {} on task #{} (record {}, {} ago)",
-                        verdict.verdict,
+                        verdict.outcome,
                         verdict.task.as_deref().unwrap_or("?"),
                         verdict.id,
                         took(now - verdict.at_ms)
