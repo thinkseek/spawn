@@ -118,8 +118,17 @@ removed at start. It prints the row counts of `spawn_events`,
 `spawn_commands`, `mission_missions`, `mission_tasks` beside live's
 (read-only transactions) and checks `spawn_events` against the count recorded
 at upload. It refuses if the drill server has the live server's system
-identifier or postmaster start time. Nothing reaches the shared test server.
+identifier or postmaster start time. A fresh container starts twice (the
+entrypoint's initdb server, then the real one); the drill waits for the real
+one and refuses if its start time changes between the identity check, the
+restore and the counts. Nothing reaches the shared test server.
 Run it after any change here, and periodically.
+
+`pg-restore-drill.sh --file DUMP` restores a local, unencrypted `pg_dump -Fc`
+file instead (no R2, no backup.key). `test-pg-restore-drill.sh` uses it to
+test the drill without R2 or the live database: a throwaway database on the
+test server (`SPAWN_TEST_DATABASE_URL`, a socket URL) plays live, and a
+drill server restarted after the identity check must be refused.
 
 ## Restoring for real
 
