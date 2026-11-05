@@ -3,12 +3,14 @@
 
 Run: python3 -I scripts/model-relay-test.py   (no network, no keys)
 
-Covers routing by model, header replacement, server-sent events arriving
-before the upstream finishes, upstream errors, an unreachable upstream, and
-the request size cap.
+Covers routing by model, header replacement (an allow-list toward DeepSeek),
+server-sent events arriving before the upstream finishes, upstream errors,
+an unreachable upstream, redirects passed back unfollowed, a stalled client
+timed out, and the request size cap.
 """
 
 import http.client
+import socket
 import importlib.util
 import json
 import os
@@ -63,7 +65,12 @@ class Upstream:
                     request = json.loads(body or b"{}")
                 except ValueError:
                     request = {}
-                if request.get("unauthorized"):
+                if request.get("redirect"):
+                    self.send_response(request.get("redirect_status", 302))
+                    self.send_header("Location", request["redirect"])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif request.get("unauthorized"):
                     self._json(401, {"type": "error", "error": {"type": "authentication_error"}})
                 elif request.get("stream"):
                     self._stream()
@@ -121,7 +128,7 @@ class RelayTest(unittest.TestCase):
         self.deepseek = Upstream("deepseek")
         self.relay = self.start_relay(self.gateway.url, self.deepseek.url + "/anthropic")
 
-    def start_relay(self, upstream, deepseek, max_body=4096):
+    def start_relay(self, upstream, deepseek, max_body=4096, client_timeout=10):
         settings = relay.config(
             {
                 "DEEPSEEK_API_KEY": FAKE_KEY,
@@ -129,6 +136,7 @@ class RelayTest(unittest.TestCase):
                 "MODEL_RELAY_UPSTREAM": upstream,
                 "MODEL_RELAY_ADDRESS": "127.0.0.1:0",
                 "MODEL_RELAY_MAX_BODY": str(max_body),
+                "MODEL_RELAY_CLIENT_TIMEOUT": str(client_timeout),
             }
         )
         server = relay.serve(settings)
@@ -225,6 +233,59 @@ class RelayTest(unittest.TestCase):
             self.assertIn(b"message_stop", first + rest)
             self.assertTrue(upstream.finished.is_set())
             connection.close()
+
+    def test_deepseek_gets_only_the_messages_api_headers(self):
+        extra = {"Cookie": "session=gateway", "X-Gateway-Tenant": "tenant-secret"}
+        status, _ = self.post(
+            "/v1/messages", {"model": "deepseek-flash"},
+            headers={**extra, "anthropic-beta": "beta-1"},
+        )
+        self.assertEqual(status, 200)
+        (seen,) = self.deepseek.requests
+        self.assertNotIn("cookie", seen["headers"])
+        self.assertNotIn("x-gateway-tenant", seen["headers"])
+        self.assertNotIn("authorization", seen["headers"])
+        # What urllib adds itself: the hop's own headers.
+        urllib_own = {"host", "content-length", "connection", "accept-encoding"}
+        self.assertLessEqual(
+            set(seen["headers"]), relay.DEEPSEEK_HEADERS | {"x-api-key"} | urllib_own
+        )
+        self.assertEqual(seen["headers"]["x-api-key"], FAKE_KEY)
+        self.assertEqual(seen["headers"]["anthropic-beta"], "beta-1")
+        # The gateway still gets the client's headers unchanged.
+        self.post("/v1/messages", {"model": "claude-x"}, headers=extra)
+        (seen,) = self.gateway.requests
+        self.assertEqual(seen["headers"]["cookie"], "session=gateway")
+        self.assertEqual(seen["headers"]["x-gateway-tenant"], "tenant-secret")
+
+    def test_a_redirect_is_passed_back_not_followed(self):
+        collector = Upstream("collector")
+        self.addCleanup(collector.close)
+        for model, upstream in (("deepseek-flash", self.deepseek), ("claude-x", self.gateway)):
+            for code in (301, 302, 303, 307, 308):
+                status, _ = self.post(
+                    "/v1/messages",
+                    {"model": model, "redirect": collector.url + "/steal", "redirect_status": code},
+                )
+                self.assertEqual(status, code, (model, code))
+        self.assertEqual(collector.requests, [], "a credential reached the redirect target")
+        self.assertEqual(len(self.deepseek.requests), 5)
+        self.assertEqual(len(self.gateway.requests), 5)
+
+    def test_a_stalled_client_is_timed_out(self):
+        server = self.start_relay(self.gateway.url, self.deepseek.url, client_timeout=0.5)
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as client:
+            # Half a request, then nothing: the relay must give the thread up.
+            client.sendall(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 100\r\n\r\n{")
+            client.settimeout(5)
+            try:
+                closed = client.recv(1) == b""
+            except ConnectionResetError:
+                closed = True
+            except socket.timeout:
+                closed = False
+        self.assertTrue(closed, "the relay still holds a client that stopped sending")
+        self.assertEqual(self.gateway.requests, [])
 
     def test_upstream_errors_pass_through(self):
         status, payload = self.post(
