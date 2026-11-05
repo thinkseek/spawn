@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use super::SCREEN_STALE;
 use super::judge::{JudgeInput, TurnFact};
-use crate::event::{EndCause, EventKind, EventRecord, SessionSeq, Source};
+use crate::event::{CommandStep, EndCause, EventKind, EventRecord, SessionSeq, Source};
 use crate::id::{AgentId, ExecutionId, SessionId, WorkspaceId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
@@ -147,12 +147,17 @@ impl Snapshot {
             EventKind::MessageReceived => {
                 self.turn = None;
             }
-            // The Bridge reads the pane as ready only right before it types
-            // input. A command that then succeeds delivered that input: the
-            // ready screen is consumed and a new turn begins, even though the
-            // engine's own hook for it may land a moment later.
-            EventKind::CommandFinished {
-                succeeded: true, ..
+            // The Bridge reads the pane as ready right before it types
+            // input, and records the typing (`typed`, once per command). A
+            // typing that comes after the latest ready reading delivered
+            // that input: the ready screen is consumed and a new turn
+            // begins, even though the engine's own hook for it may land a
+            // moment later. Not the command's `command.finished`: a retried
+            // command whose text was typed before the turn ended finishes
+            // after the turn's end and a ready screen, and starts nothing.
+            EventKind::CommandStepped {
+                step: CommandStep::Typed,
+                ..
             } if self.screen == Some(ScreenState::Ready) => {
                 self.screen = None;
                 self.turn = None;
