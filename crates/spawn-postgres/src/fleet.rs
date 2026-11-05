@@ -167,10 +167,15 @@ from (
               'text', c.action ->> 'text',
               'created_at_ms', c.created_at_ms,
               'finished_at_ms', c.finished_at_ms,
-              'succeeded', c.succeeded) order by c.id), '[]'::jsonb)
+              'succeeded', c.succeeded,
+              'error', c.error) order by c.id), '[]'::jsonb)
        from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
-        and c.created_at_ms > spawn_now_ms() - 86400000) as dispatched
+        and c.created_at_ms > spawn_now_ms() - 86400000) as dispatched,
+    (select c.idempotency_key from spawn_commands c
+      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.idempotency_key like 'deliver-%'
+      order by c.id desc limit 1) as last_delivery
   from agent_status s
   join spawn_session_state p using (session_id)
   left join lateral (select c.id, c.action from spawn_commands c

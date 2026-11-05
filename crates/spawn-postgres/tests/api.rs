@@ -1265,6 +1265,76 @@ fn a_delivered_task_starts_a_new_episode_and_a_nudge_does_not() {
 }
 
 #[test]
+fn dispatch_facts_name_the_latest_delivery_however_old() {
+    let (store, schema) = store("facts_delivery");
+    let worker = AgentId::new("agent_worker_a").expect("valid agent");
+    let session = SessionId::new("session_worker_a").expect("valid session");
+    store
+        .append(NewEvent {
+            agent_id: worker.clone(),
+            session_id: session.clone(),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+    let submit = |principal: &str, key: &str| {
+        let submission = Submission {
+            agent_id: worker.clone(),
+            idempotency_key: IdempotencyKey::new(key).expect("valid key"),
+            action: CommandAction::Input {
+                text: key.to_string(),
+            },
+            ..start(session.clone(), key)
+        };
+        store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &submission,
+            )
+            .expect("submit succeeds")
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    assert!(row()["last_delivery"].is_null(), "nothing delivered yet");
+    submit("spawn-dispatch", "deliver-4-0");
+    let latest = submit("spawn-dispatch", "deliver-7-1");
+    submit("spawn-dispatch", "dispatch-nudge-session_worker_a-1");
+    submit("human", "deliver-9-0");
+    // A failed command carries its error (what a retried start looks at).
+    let claimed = store
+        .claim("w1", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("a command waits");
+    store
+        .finish(
+            &claimed,
+            &Outcome::Failed("the source did not answer".to_string()),
+        )
+        .expect("finish succeeds");
+    let failed = row()["dispatched"]
+        .as_array()
+        .expect("dispatched")
+        .iter()
+        .find(|sent| sent["succeeded"] == serde_json::json!(false))
+        .cloned()
+        .expect("the failed command is among the dispatched");
+    assert_eq!(failed["error"].as_str(), Some("the source did not answer"));
+    // Two days ago: out of the window `dispatched` keeps.
+    admin(&schema)
+        .execute(
+            "update spawn_commands set created_at_ms = created_at_ms - 2 * 86400000",
+            &[],
+        )
+        .expect("age the commands");
+    let facts = row();
+    assert_eq!(facts["dispatched"], serde_json::json!([]));
+    assert_eq!(
+        facts["last_delivery"].as_str(),
+        Some("deliver-7-1"),
+        "the dispatcher's latest delivery (command {}), not a nudge or another principal's",
+        latest.0
+    );
+}
+
+#[test]
 fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
     let (store, _schema) = store("facts_model");
     let worker = AgentId::new("agent_worker_docs_1").expect("valid agent");

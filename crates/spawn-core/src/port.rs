@@ -204,6 +204,14 @@ pub trait WorkspaceStore: Send + Sync {
         let _ = workspace;
         Ok(BaseMerge::Current)
     }
+
+    /// The commit `branch` points at, `None` when the branch does not exist
+    /// (or the store cannot tell). The Bridge compares it at recovery with
+    /// the last commit the log recorded for the branch.
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        let _ = branch;
+        Ok(None)
+    }
 }
 
 /// Chunk store failure.

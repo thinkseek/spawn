@@ -77,6 +77,9 @@ struct State {
     commit_fails: bool,
     /// The next append of an `artifact.committed` event fails.
     branch_record_fails: bool,
+    /// Sessions whose `artifact.committed` and `merge.conflicted` appends
+    /// all fail, as a record the log can never take would.
+    branch_records_refused: HashSet<SessionId>,
     terminals: HashSet<TerminalName>,
     /// Every terminal start, in order.
     launches: Vec<Launch>,
@@ -192,6 +195,17 @@ impl MemoryStore {
         self.lock().branch_record_fails = true;
     }
 
+    /// Make every append of an `artifact.committed` or `merge.conflicted`
+    /// event of `session` fail (`true`) or work again. Test helper.
+    pub fn refuse_branch_records_of(&self, session: &SessionId, refuse: bool) {
+        let mut state = self.lock();
+        if refuse {
+            state.branch_records_refused.insert(session.clone());
+        } else {
+            state.branch_records_refused.remove(session);
+        }
+    }
+
     /// Mark a workspace as holding uncommitted changes. Test helper.
     pub fn mark_dirty(&self, workspace: &WorkspaceId) {
         if let Some(mount) = self.lock().mounts.get_mut(workspace) {
@@ -211,6 +225,11 @@ impl EventLog for MemoryStore {
         if state.branch_record_fails && branch_record {
             state.branch_record_fails = false;
             return Err(StoreError::Backend("the log is down".to_string()));
+        }
+        if branch_record && state.branch_records_refused.contains(&event.session_id) {
+            return Err(StoreError::Backend(
+                "the log refuses this record".to_string(),
+            ));
         }
         let (record, inserted) = state.insert(event, now);
         Ok(Appended { record, inserted })
@@ -495,6 +514,10 @@ impl WorkspaceStore for MemoryStore {
             state.heads.insert(branch, commit.clone());
         }
         Ok(merge)
+    }
+
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        Ok(self.lock().heads.get(branch).cloned())
     }
 }
 
