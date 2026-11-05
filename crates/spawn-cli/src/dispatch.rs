@@ -223,6 +223,9 @@ pub(crate) enum Why {
     StopFailed,
     /// Free disk on this host crossed the warning threshold (crate::disk).
     Disk,
+    /// A mission's gate has had no room in TMPDIR for hours
+    /// ([`crate::disk::gate_room_escalations`]).
+    GateRoom,
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -399,7 +402,16 @@ pub(crate) fn step(
         (rows, work) = load(store)?;
     }
     let now = now_ms();
-    let mut plan = decide_with(&rows, &work, &disk.escalations(now), supervised, now, spawn);
+    let mut host = disk.escalations(now);
+    host.extend(crate::disk::gate_room_escalations(
+        store
+            .gate_room_escalations(now - crate::disk::DIGEST_WINDOW_MS)
+            .map_err(|error| format!("gate room records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+        now,
+    ));
+    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
         if held > 0 {
