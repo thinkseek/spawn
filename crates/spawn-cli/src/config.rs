@@ -109,9 +109,8 @@ fn check_git_version(answer: &str) -> Result<(), String> {
 /// so an old git fails with a clear error instead of an unknown option in
 /// the middle of a merge.
 pub(crate) fn require_git() -> Result<(), String> {
-    let output = std::process::Command::new("git")
+    let output = crate::sources::controller_git()
         .arg("--version")
-        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("run git --version: {error}"))?;
     check_git_version(&String::from_utf8_lossy(&output.stdout))

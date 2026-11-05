@@ -55,7 +55,17 @@ esac
 # derived from the owner's as spawn-postgres does it (role_password):
 # PBKDF2-HMAC-SHA256 of the owner password with the salt
 # "spawn-login-v2\0<salt>\0<role>", 600000 rounds, in hex. Set after init-db
-# below, which makes the login.
+# below, which makes the login. The owner password is the URL's,
+# percent-decoded (`p%40ss` is `p@ss`) by the parser every script shares
+# (scripts/pg-url.sh), and reaches python through its environment, not its
+# argv.
+# shellcheck source=scripts/pg-url.sh
+. "$root/scripts/pg-url.sh"
+if ! pg_url_parse "$base_url"; then
+  echo "e2e: SPAWN_DATABASE_URL is not a single-host postgres:// URL" >&2
+  exit 1
+fi
+owner_password=$pg_url_password
 supervisor_url() {
   local login role salt password
   login=$(psql -X -q -At "$url" -c "select r.rolname || ' ' || substring(
@@ -63,12 +73,12 @@ supervisor_url() {
             from pg_roles r where r.rolname = spawn_login_role('spawn_supervisor')")
   role=${login% *}
   salt=${login#* }
-  password=$(python3 -I -c '
-import hashlib, sys, urllib.parse
-url, salt, role = sys.argv[1:]
-owner = urllib.parse.unquote(url.split("://", 1)[1].rsplit("@", 1)[0].split(":", 1)[1])
+  password=$(SPAWN_E2E_OWNER_PASSWORD=$owner_password python3 -I -c '
+import hashlib, os, sys
+salt, role = sys.argv[1:]
+owner = os.environ["SPAWN_E2E_OWNER_PASSWORD"]
 salt = b"spawn-login-v2\0" + salt.encode() + b"\0" + role.encode()
-print(hashlib.pbkdf2_hmac("sha256", owner.encode(), salt, 600000).hex())' "$url" "$salt" "$role")
+print(hashlib.pbkdf2_hmac("sha256", owner.encode(), salt, 600000).hex())' "$salt" "$role")
   printf '%s' "$url" | sed -E "s#://[^@]*@#://$role:$password@#"
 }
 
@@ -188,6 +198,9 @@ while :; do
       stop; pending=0 ;;
     *E2E:ASK*)
       prompt
+      # The question is the model's text in the transcript, as Claude Code
+      # writes it; the screen shows it too.
+      line '"type":"assistant","message":{"content":[{"type":"text","text":"HUMAN: which region should I deploy to?"}]}'
       printf 'HUMAN: which region should I deploy to?\n'
       stop; pending=0 ;;
     *)
@@ -322,7 +335,8 @@ pass "rule decided WORKING while the tool ran"
 unset E2E_TOOL_SECONDS
 completed_by_jev() { observation session_worker_a | jq -e '.state == "COMPLETED" and .judge == "jev"'; }
 wait_for 60 "Jev to judge worker a COMPLETED" completed_by_jev
-digest_has() { pane session_supervisor | grep -q "\[spawn:esc $1 "; }
+# A digest item reads `- <session> — <what>: …`.
+digest_has() { pane session_supervisor | grep -qF -- "- $1 — "; }
 wait_for 60 "a digest about worker a in the supervisor's pane" digest_has session_worker_a
 pass "Jev decided the idle prompt; the supervisor got the digest"
 
@@ -447,6 +461,8 @@ git -C "$seed" push -q "$gated" main:main
 gate=$work/gate
 mkdir -p "$gate"
 printf '#!/bin/sh\n# Check: no file named BAD.\n[ ! -e BAD ]\n' >"$gate/check-no-bad.sh"
+# The gate refuses a scenarios directory without a protected list; this one protects nothing.
+printf '# nothing protected\n' >"$gate/protected"
 gm=$("$bin" mission add --text "E2E gated mission" --source "$gated" --gate "$gate" | jq -r .mission)
 if sup mission configure --id "$gm" --gate "$gate" --accept gate >/dev/null 2>&1; then
   fail "the supervisor set a mission's gate"
@@ -517,6 +533,7 @@ rsi_backlog=$work/rsi-backlog
 mkdir -p "$rsi_gate" "$rsi_backlog"
 printf '#!/bin/sh\n# Objective 1: the file exists.\n[ -e OBJECTIVE_DONE ]\n' >"$rsi_gate/001.sh"
 printf '#!/bin/sh\n# Check: no file named BAD.\n[ ! -e BAD ]\n' >"$rsi_gate/check-no-bad.sh"
+printf '# nothing protected\n' >"$rsi_gate/protected"
 printf '{"id": 1, "title": "Mark it done", "prompt": "E2E:REPORT E2E:WRITE=OBJECTIVE_DONE"}\n' >"$rsi_backlog/001.json"
 sup resident propose --name improver --charter "Pursues the backlog's objectives" >/dev/null
 "$bin" resident approve --name improver >/dev/null
@@ -542,7 +559,7 @@ pass "an objective becomes a resident's task, the gate alone lands it, and a sol
 
 "$bin" submit --principal human --agent agent_resident_core --session session_resident_core \
   --key "human-$(date +%s%N)" --action '{"type":"input","text":"hello from a human"}' >/dev/null
-human_noted() { pane session_supervisor | grep -q '\[spawn:esc session_resident_core human-'; }
+human_noted() { pane session_supervisor | grep -qF -- '- session_resident_core — human message: '; }
 wait_for 60 "the human message in the supervisor's digest" human_noted
 pass "a human message to a worker reached the supervisor"
 

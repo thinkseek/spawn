@@ -471,6 +471,7 @@ mod tests {
             }),
             order(CommandAction::Input {
                 text: "next".to_string(),
+                tags: Vec::new(),
             }),
             order(CommandAction::Resume {
                 prompt: None,
@@ -484,7 +485,8 @@ mod tests {
             kept,
             [
                 &CommandAction::Input {
-                    text: "next".to_string()
+                    text: "next".to_string(),
+                    tags: Vec::new(),
                 },
                 &CommandAction::Stop
             ]
@@ -528,21 +530,13 @@ mod tests {
         let items = escalations(&records, 11 * day - 1);
         let summary: Vec<(String, Why, String)> = items
             .iter()
-            .map(|item| (item.id.clone(), item.why, item.marker()))
+            .map(|item| (item.id.clone(), item.why, item.tag()))
             .collect();
         assert_eq!(
             summary,
             [
-                (
-                    "disk-7".to_string(),
-                    Why::Disk,
-                    "[spawn:esc host disk-7]".to_string()
-                ),
-                (
-                    "disk-9".to_string(),
-                    Why::Disk,
-                    "[spawn:esc host disk-9]".to_string()
-                ),
+                ("disk-7".to_string(), Why::Disk, "host disk-7".to_string()),
+                ("disk-9".to_string(), Why::Disk, "host disk-9".to_string()),
             ]
         );
         assert!(

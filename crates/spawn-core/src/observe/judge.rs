@@ -66,6 +66,12 @@ pub struct JudgeInput {
     pub task: Option<String>,
     /// Tail of the agent's terminal, as a person would see it.
     pub screen_tail: Option<String>,
+    /// The model's latest reply: its own text since the last prompt, from the
+    /// transcript. Where a question for a person is read (`HUMAN:`); the
+    /// question itself is kept on the observation, so this stays out of the
+    /// stored evidence and of what the judge is shown.
+    #[serde(skip)]
+    pub reply: Option<String>,
     /// The session is meant never to end (the supervisor): it waits for
     /// instructions rather than completing.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

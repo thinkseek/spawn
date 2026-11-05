@@ -13,6 +13,7 @@
 //! [`NO_JUDGE`].
 //!
 //! `judge` holds the judge contract, `snapshot` the per-session facts,
+//! `reply` the model's latest reply from its transcript,
 //! `classify` reads facts against answers (the rules, and narrowing a model
 //! answer), and `observer` is the loop, with what the model is shown.
 //!
@@ -23,6 +24,7 @@ use std::time::Duration;
 mod classify;
 mod judge;
 mod observer;
+pub mod reply;
 mod snapshot;
 
 pub use classify::{RulesVerdict, attention_reason, narrow, rules};

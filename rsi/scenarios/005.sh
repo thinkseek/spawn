@@ -57,20 +57,13 @@ SPAWN_TMUX_SOCKET="bb-005-$run"
 SPAWN_PSQL=psql
 export WORK SPAWN_DB_NAME SPAWN_TMUX_SOCKET SPAWN_PSQL
 
-# psql reaches the test server the way check-blackbox.sh does.
-url=$SPAWN_TEST_DATABASE_URL
-rest=${url#*://}
-credentials=${rest%%@*}
-address=${rest#*@}
-address=${address%%/*}
-PGUSER=${credentials%%:*}
-PGPASSWORD=${credentials#*:}
-case "$address" in
-*:*) host=${address%:*} PGPORT=${address##*:} ;;
-*) host=$address PGPORT=5432 ;;
-esac
-PGHOST=$(printf '%s' "$host" | sed 's/%2[Ff]/\//g')
-export PGUSER PGPASSWORD PGHOST PGPORT
+# psql reaches the test server the way check-blackbox.sh does: the URL read
+# as libpq reads it (scripts/pg-url.sh), the password percent-decoded.
+# shellcheck source=scripts/pg-url.sh
+. "$controller/scripts/pg-url.sh"
+pg_url_export "$SPAWN_TEST_DATABASE_URL" ||
+    harness "SPAWN_TEST_DATABASE_URL is not a single-host postgres:// URL"
+server_url=$(pg_url_server "$SPAWN_TEST_DATABASE_URL")
 
 database_made=""
 cleanup() {
@@ -192,7 +185,7 @@ for name in SPAWN_EXEC_IMAGE SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL \
     SPAWN_SUPERVISED SPAWN_PUSH_SOURCES CLAUDE_CONFIG_DIR; do
     unset "$name" 2>/dev/null || true
 done
-SPAWN_DATABASE_URL="${url%/*}/$SPAWN_DB_NAME"
+SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_GIT_REPO=$default
 SPAWN_WORKSPACE_ROOT=$root
 SPAWN_CHUNK_STORE=$store

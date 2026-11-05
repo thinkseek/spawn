@@ -134,6 +134,7 @@ fn nudge(facts: &Facts, observation: &Observation, now_ms: i64) -> Decision {
             key,
             CommandAction::Input {
                 text: "continue".to_string(),
+                tags: Vec::new(),
             },
         )),
         None => Decision::Escalate(Escalation::about(

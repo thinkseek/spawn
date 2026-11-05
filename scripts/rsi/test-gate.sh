@@ -19,7 +19,10 @@ work=$(mktemp -d)
 export SPAWN_GATE_MIN_FREE_GB=0
 # A file in the host's /tmp, which the sandbox must not show.
 marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
-trap 'rm -rf "$work" "$marker"' EXIT
+# Background helpers (listeners, fake servers) are killed on exit.
+background=""
+# shellcheck disable=SC2086 # pids
+trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker"' EXIT
 
 # The owner's home, with secrets the candidate must not read. The gate's base
 # cache goes under it too, never into the real one.
@@ -260,11 +263,15 @@ printf 'two\n' >"$seed/value"
 cat >"$seed/probe.sh" <<'EOF'
 #!/bin/sh
 [ -z "${SPAWN_DATABASE_URL-}" ] || { echo "owner database: $SPAWN_DATABASE_URL"; exit 1; }
-[ "${SPAWN_TEST_DATABASE_URL-}" = postgres://test ] || { echo "no test database"; exit 1; }
+case "${SPAWN_TEST_DATABASE_URL-}" in
+"postgres://t:p%40ss@%2F"*"%2Ftest-db:5433/spawn_test?sslmode=disable") ;;
+*) echo "no test database: ${SPAWN_TEST_DATABASE_URL-}"; exit 1 ;;
+esac
 [ -z "${OWNER_TOKEN-}" ] || { echo "owner token leaked"; exit 1; }
 EOF
 env_candidate=$(commit env)
-export SPAWN_DATABASE_URL=postgres://owner SPAWN_TEST_DATABASE_URL=postgres://test OWNER_TOKEN=secret
+export SPAWN_DATABASE_URL=postgres://owner OWNER_TOKEN=secret \
+    SPAWN_TEST_DATABASE_URL="postgres://t:p%40ss@test:5433/spawn_test?sslmode=disable"
 expect "candidate code sees only the allowed environment" "$(judge "$env_candidate")" 'exit=0 {"verdict":"accepted"}'
 unset SPAWN_DATABASE_URL SPAWN_TEST_DATABASE_URL OWNER_TOKEN
 
@@ -339,7 +346,7 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen()
 print(s.getsockname()[1], flush=True)
 time.sleep(600)' >"$listener" &
 listener_pid=$!
-trap 'kill "$listener_pid" 2>/dev/null; rm -rf "$work" "$marker"' EXIT
+background="$background $listener_pid"
 while [ ! -s "$listener" ]; do sleep 0.1; done
 host_port=$(cat "$listener")
 # The probe's control: the host listener answers from outside the sandbox.
@@ -362,6 +369,181 @@ exit \$fail
 EOF
 network=$(commit network)
 expect "the host's listeners (and 127.0.0.1:15433) are unreachable" "$(judge "$network")" 'exit=0 {"verdict":"accepted"}'
+
+# 3d. No Unix socket of the host but the test database's: candidate code
+# tries connect() on every socket this uid may connect to outside the
+# sandbox (`find / -type s -writable`, as the host has them now) and on the
+# host's abstract sockets, and must reach only the test database. Planted
+# beside them, where a host keeps its services: a PostgreSQL socket in
+# /tmp, one in the user's runtime directory and in /var/tmp, a neighbour
+# cluster in the test database's own socket directory, and one in a
+# directory none of the sandbox's tmpfs covers (the scan finds it). The gate
+# runs without TMPDIR, as the owner's `env -i` run does.
+plant=$(mktemp -d "$work/plant.XXXXXX")
+socket_db=$work/socket-db
+mkdir -p "$socket_db"
+planted="/tmp/.s.PGSQL.$$ $socket_db/.s.PGSQL.5433 $plant/service.sock"
+for dir in "/run/user/$(id -u)" /var/tmp; do
+    [ -d "$dir" ] && [ -w "$dir" ] && planted="$planted $dir/test-gate-$$.sock"
+done
+# shellcheck disable=SC2086 # paths
+python3 -c '
+import socket, sys, time
+for path in sys.argv[1:]:
+    s = socket.socket(socket.AF_UNIX); s.bind(path); s.listen(64)
+    globals().setdefault("held", []).append(s)
+time.sleep(900)' "$socket_db/.s.PGSQL.5432" $planted &
+background="$background $!"
+for path in "$socket_db/.s.PGSQL.5432" $planted; do
+    while [ ! -S "$path" ]; do sleep 0.1; done
+done
+trap 'kill $background 2>/dev/null || true; rm -f /tmp/.s.PGSQL.$$ /run/user/$(id -u)/test-gate-$$.sock /var/tmp/test-gate-$$.sock; rm -rf "$work" "$marker"' EXIT
+find / \( -path /proc -o -path /sys \) -prune -o -type s -writable -print 2>/dev/null |
+    grep -vxF "$socket_db/.s.PGSQL.5432" >"$work/host-sockets" || true
+for path in $planted; do
+    grep -qxF "$path" "$work/host-sockets" || { echo "FAIL the scan outside misses $path"; exit 1; }
+done
+awk 'NR > 1 && $8 ~ /^@/ { print substr($8, 2) }' /proc/net/unix | sort -u >"$work/host-abstract"
+# The probe's control: outside, every planted socket and the test database
+# answer.
+# shellcheck disable=SC2086 # paths
+python3 -c '
+import socket, sys
+for path in sys.argv[1:]:
+    socket.socket(socket.AF_UNIX).connect(path)' "$socket_db/.s.PGSQL.5432" $planted
+branch sockets
+printf 'two\n' >"$seed/value"
+cp "$work/host-sockets" "$seed/host-sockets"
+cp "$work/host-abstract" "$seed/host-abstract"
+cat >"$seed/probe.sh" <<EOF
+#!/bin/sh
+exec python3 -c '
+import socket, sys
+reached = []
+for path in open("host-sockets").read().split("\n"):
+    if not path:
+        continue
+    s = socket.socket(socket.AF_UNIX); s.settimeout(1)
+    try:
+        s.connect(path); reached.append(path)
+    except OSError:
+        pass
+for name in open("host-abstract").read().split("\n"):
+    if not name:
+        continue
+    s = socket.socket(socket.AF_UNIX); s.settimeout(1)
+    try:
+        s.connect("\\0" + name); reached.append("@" + name)
+    except OSError:
+        pass
+database = "$socket_db/.s.PGSQL.5432"
+try:
+    socket.socket(socket.AF_UNIX).connect(database)
+except OSError as error:
+    print("the test database is unreachable:", error); sys.exit(1)
+for path in reached:
+    print("reached", path)
+print("tried", len(open("host-sockets").read().split()), "sockets")
+sys.exit(1 if reached else 0)'
+EOF
+sockets=$(commit sockets)
+expect "no host socket but the test database's is reachable" "$(
+    SPAWN_TEST_DATABASE_URL="postgres://u:p%40ss@$(printf '%s' "$socket_db" | sed 's|/|%2F|g')/db"
+    export SPAWN_TEST_DATABASE_URL
+    unset TMPDIR
+    judge "$sockets"
+)" 'exit=0 {"verdict":"accepted"}'
+case "$plant" in
+/tmp/*) ;;
+*) expect "the scan hid what no tmpfs covers" "$(cat "$work/gate.out")" 'sockets hidden from the sandbox' ;;
+esac
+
+# 3d'. A socket directory the scan found and that then goes away (a host
+# process's temporary directory) does not break the sandbox: the gate does
+# not mount over it, and the verdict is the candidate's.
+vanish=$(mktemp -d "$work/vanish.XXXXXX")
+python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(900)' "$vanish/service.sock" &
+vanish_listener=$!
+background="$background $vanish_listener"
+while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
+rm -f "$work/gate.out"
+(
+    until grep -q 'sockets hidden from the sandbox' "$work/gate.out" 2>/dev/null; do sleep 0.05; done
+    kill "$vanish_listener"
+    rm -rf "$vanish"
+) &
+vanish_watcher=$!
+expect "a hidden socket directory that goes away mid-gate changes no verdict" "$(
+    unset TMPDIR
+    judge "$good"
+)" 'exit=0 {"verdict":"accepted"}'
+kill "$vanish_watcher" 2>/dev/null || true
+[ ! -e "$vanish" ] || echo "note: $vanish was not under a scanned directory (TMPDIR covers it)"
+
+# 3e. A TCP test database URL works inside, through the gate's forwarder,
+# for 127.0.0.1, localhost and [::1] (when the host has it): the sandbox
+# reaches that server over a socket of the gate's, and still has no
+# network. The fake server echoes what it is sent.
+tcp_db=$work/tcp-db.ports
+python3 -c '
+import socket, sys, threading, time
+def serve(listener):
+    while True:
+        client, _ = listener.accept()
+        client.sendall(client.recv(64)); client.close()
+for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    try:
+        listener = socket.socket(family); listener.bind((address, 0)); listener.listen(16)
+    except OSError:
+        print(address, "none", flush=True); continue
+    print(address, listener.getsockname()[1], flush=True)
+    threading.Thread(target=serve, args=(listener,), daemon=True).start()
+time.sleep(900)' >"$tcp_db" &
+background="$background $!"
+while [ "$(grep -c . "$tcp_db" 2>/dev/null)" != 2 ]; do sleep 0.1; done
+v4_port=$(awk '$1 == "127.0.0.1" { print $2 }' "$tcp_db")
+v6_port=$(awk '$1 == "::1" { print $2 }' "$tcp_db")
+branch tcp-db
+printf 'two\n' >"$seed/value"
+cat >"$seed/probe.sh" <<'EOF'
+#!/bin/sh
+exec python3 -c '
+import os, socket, sys, urllib.parse
+url = os.environ["SPAWN_TEST_DATABASE_URL"]
+authority = url.split("://", 1)[1].split("/", 1)[0]
+user, hostport = authority.rsplit("@", 1)
+host, port = hostport.rsplit(":", 1)
+directory = urllib.parse.unquote(host)
+if user != "u:p%40ss" or not directory.startswith("/") or not url.endswith("/spawn_test?sslmode=disable"):
+    print("not the forwarded socket URL:", url); sys.exit(1)
+s = socket.socket(socket.AF_UNIX); s.settimeout(5)
+s.connect(os.path.join(directory, ".s.PGSQL." + port)); s.sendall(b"ping")
+if s.recv(64) != b"ping":
+    print("the test server did not answer"); sys.exit(1)
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), 2)
+    print("reached 127.0.0.1 over TCP"); sys.exit(1)
+except OSError:
+    pass' "$(cat tcp-port)"
+EOF
+printf '%s\n' "$v4_port" >"$seed/tcp-port"
+tcp_candidate=$(commit tcp-db)
+for host in 127.0.0.1 localhost; do
+    expect "a TCP test URL to $host reaches the test server, through the forwarder only" \
+        "$(SPAWN_TEST_DATABASE_URL="postgres://u:p%40ss@$host:$v4_port/spawn_test?sslmode=disable" \
+            judge "$tcp_candidate")" 'exit=0 {"verdict":"accepted"}'
+done
+if [ "$v6_port" != none ]; then
+    expect "a TCP test URL to [::1] reaches the test server" \
+        "$(SPAWN_TEST_DATABASE_URL="postgres://u:p%40ss@[::1]:$v6_port/spawn_test?sslmode=disable" \
+            judge "$tcp_candidate")" 'exit=0 {"verdict":"accepted"}'
+fi
+expect "a socket URL whose socket is missing is no verdict" \
+    "$(SPAWN_TEST_DATABASE_URL="postgres://u:p@%2Fnonexistent%2Fdir/db" judge "$tcp_candidate")" 'exit=3 '
+expect "and says why" "$(cat "$work/gate.out")" 'no test database socket at /nonexistent/dir/.s.PGSQL.5432'
 
 # 4. A build script by another name: `build = ` in any Cargo.toml, however
 # spelled. `[build-dependencies]` and `build-override` are not build keys.
@@ -402,8 +584,10 @@ expect "two METRIC lines on stdout: no metric" "$(judge "$twice" "$scenarios/008
 expect "two METRIC lines are reported" "$(cat "$work/gate.out")" 'two or more METRIC lines'
 
 # 7. The candidate may not run fewer tests than the base, as cargo counts
-# them: a tiny crate on a base of its own (the only cases that run cargo,
-# offline, no dependencies). Its base runs 3: a, b and extra (c is ignored).
+# them, nor stop running one of the base's by name, nor add or edit a test
+# into an empty body: a tiny crate on a base of its own (the only cases that
+# run cargo, offline, no dependencies). Its base runs 4: tests::a, tests::b,
+# extra and the doctest of `one` (tests::c is ignored).
 branch base-rust
 printf '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n' >"$seed/Cargo.toml"
 mkdir -p "$seed/src" "$seed/tests"
@@ -411,6 +595,10 @@ cat >"$seed/src/lib.rs" <<'EOF'
 //! A crate with tests.
 
 /// One.
+///
+/// ```
+/// assert_eq!(t::one(), 1);
+/// ```
 pub fn one() -> u32 {
     1
 }
@@ -423,14 +611,14 @@ mod tests {
     }
 
     #[test]
-    fn b() {}
+    fn b() { assert_eq!(super::one() + 1, 2); }
 
     #[test]
     #[ignore]
-    fn c() {}
+    fn c() { assert_eq!(super::one(), 1); }
 }
 EOF
-printf '#[test]\nfn extra() {}\n' >"$seed/tests/extra.rs"
+printf '#[test]\nfn extra() {\n    assert_eq!(t::one(), 1);\n}\n' >"$seed/tests/extra.rs"
 (cd "$seed" && CARGO_NET_OFFLINE=true cargo generate-lockfile -q)
 rust_base=$(commit base-rust)
 rust_branch() {
@@ -443,36 +631,76 @@ judge_rust() {
     judge "$1"
     base=$saved_base
 }
+# drop_b: tests::b leaves src/lib.rs.
+drop_b() { sed -i '/#\[test\]$/{N;/fn b() {/d}' "$seed/src/lib.rs"; }
 rust_branch rust-same
 same=$(commit rust-same)
 expect "the same tests land" "$(judge_rust "$same")" 'exit=0 {"verdict":"accepted"}'
-expect "the counts are reported" "$(cat "$work/gate.out")" 'tests cargo runs: 3 on the base, 3 on the candidate'
+expect "the counts are reported" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+rust_branch rust-doc-shifted
+sed -i '1a //!\n//! More about the crate.' "$seed/src/lib.rs"
+shifted=$(commit rust-doc-shifted)
+expect "a doctest whose line moved keeps its name" "$(judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
 rust_branch rust-comment
-sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
+drop_b
 printf '\n// #[test]\n// fn b() {}\n/// A string, not a test.\npub const B: &str = "#[test] fn b() {}";\n' \
     >>"$seed/src/lib.rs"
 comment=$(commit rust-comment)
 expect "a test replaced by a comment and a string is refused" "$(judge_rust "$comment")" \
-    'runs fewer tests (3 -> 2)'
+    'runs fewer tests (4 -> 3)'
 rust_branch rust-orphan
-sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
-printf '#[test]\nfn b() {}\n' >"$seed/src/orphan.rs"
+drop_b
+printf '#[test]\nfn b() {\n    assert_eq!(1 + 1, 2);\n}\n' >"$seed/src/orphan.rs"
 orphan=$(commit rust-orphan)
 expect "a test moved to a file no mod includes is refused" "$(judge_rust "$orphan")" \
-    'runs fewer tests (3 -> 2)'
+    'runs fewer tests (4 -> 3)'
 rust_branch rust-ignored
-sed -i 's/^    fn b() {}$/    #[ignore]\n    fn b() {}/' "$seed/src/lib.rs"
+sed -i 's/^    fn b() {/    #[ignore]\n&/' "$seed/src/lib.rs"
 ignored=$(commit rust-ignored)
-expect "an ignored test is refused" "$(judge_rust "$ignored")" 'runs fewer tests (3 -> 2)'
+expect "an ignored test is refused" "$(judge_rust "$ignored")" 'runs fewer tests (4 -> 3)'
 rust_branch rust-cfg
 sed -i 's/^#\[cfg(test)\]$/#[cfg(any())]/' "$seed/src/lib.rs"
 uncompiled=$(commit rust-cfg)
-expect "a test module compiled out is refused" "$(judge_rust "$uncompiled")" 'runs fewer tests (3 -> 1)'
+expect "a test module compiled out is refused" "$(judge_rust "$uncompiled")" 'runs fewer tests (4 -> 2)'
+rust_branch rust-renamed
+sed -i 's/^    fn b() {/    fn b_renamed() {/' "$seed/src/lib.rs"
+renamed=$(commit rust-renamed)
+expect "a renamed test is refused though the count holds" "$(judge_rust "$renamed")" \
+    'drops or renames base tests (1: tests::b)'
+expect "the count did hold" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+rust_branch rust-moved-path
+drop_b
+printf '#[test]\nfn b() {\n    assert_eq!(t::one() + 1, 2);\n}\n' >>"$seed/tests/extra.rs"
+moved_path=$(commit rust-moved-path)
+expect "a test moved to another module path is a rename" "$(judge_rust "$moved_path")" \
+    'drops or renames base tests (1: tests::b)'
 rust_branch rust-moved
-sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
-printf '#[test]\nfn b() {}\n' >>"$seed/tests/extra.rs"
+drop_b
+printf 'mod tests {\n    #[test]\n    fn b() {\n        assert_eq!(t::one() + 1, 2);\n    }\n}\n' \
+    >>"$seed/tests/extra.rs"
 moved=$(commit rust-moved)
-expect "a moved test is not a drop" "$(judge_rust "$moved")" 'exit=0 {"verdict":"accepted"}'
+expect "a test moved to another file under its module path lands" "$(judge_rust "$moved")" \
+    'exit=0 {"verdict":"accepted"}'
+rust_branch rust-emptied
+sed -i 's/^    fn b() { .*/    fn b() {}/' "$seed/src/lib.rs"
+emptied=$(commit rust-emptied)
+expect "a test whose body is emptied is refused" "$(judge_rust "$emptied")" \
+    'adds or edits a test with an empty body (src/lib.rs:19 b)'
+rust_branch rust-emptied-comment
+sed -i 's|^    fn b() { .*|    fn b() {\n        // kept for later\n        ;\n    }|' "$seed/src/lib.rs"
+emptied_comment=$(commit rust-emptied-comment)
+expect "a body of a comment and a semicolon is empty" "$(judge_rust "$emptied_comment")" \
+    'adds or edits a test with an empty body (src/lib.rs:19 b)'
+rust_branch rust-new-empty
+printf '\n#[tokio::test(flavor = "current_thread")]\nasync fn d() {}\n' >>"$seed/tests/extra.rs"
+new_empty=$(commit rust-new-empty)
+expect "a new test with an empty body is refused" "$(judge_rust "$new_empty")" \
+    'adds or edits a test with an empty body (tests/extra.rs:6 d)'
+# The limit, stated: a body that asserts nothing real is not empty text.
+rust_branch rust-assert-true
+sed -i 's/^    fn b() { .*/    fn b() { assert!(true); }/' "$seed/src/lib.rs"
+assert_true=$(commit rust-assert-true)
+expect "the limit: assert!(true) is not caught" "$(judge_rust "$assert_true")" 'exit=0 {"verdict":"accepted"}'
 rust_branch rust-broken
 printf '#[test]\nfn broken() { let x: u32 = "no"; }\n' >>"$seed/tests/extra.rs"
 broken=$(commit rust-broken)
@@ -524,17 +752,17 @@ while True:
     elif command == "count": count += 1
     elif command == "reset": count = 0
     c.sendall((str(count) if command == "count" else ("broken" if broken else "ok")).encode())
-    c.close()' "$server_dir/server" &
+    c.close()' "$server_dir/.s.PGSQL.5432" &
 server_pid=$!
-trap 'kill "$listener_pid" "$server_pid" 2>/dev/null; rm -rf "$work" "$marker"' EXIT
-while [ ! -S "$server_dir/server" ]; do sleep 0.1; done
+background="$background $server_pid"
+while [ ! -S "$server_dir/.s.PGSQL.5432" ]; do sleep 0.1; done
 # server <command>: ok, broken, or a count.
 cat >"$work/server-client" <<EOF
 #!/bin/sh
 exec python3 -c '
 import socket, sys
 c = socket.socket(socket.AF_UNIX); c.connect(sys.argv[1]); c.sendall(sys.argv[2].encode())
-print(c.recv(64).decode())' "$server_dir/server" "\$1"
+print(c.recv(64).decode())' "$server_dir/.s.PGSQL.5432" "\$1"
 EOF
 server() { sh "$work/server-client" "$1"; }
 export SPAWN_TEST_DATABASE_URL="postgres://u:p@$(printf '%s' "$server_dir" | sed 's|/|%2F|g')/db"
@@ -645,11 +873,166 @@ expect "an unsolved result needs two runs that agree" \
 expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
 unset SPAWN_TEST_DATABASE_URL
 
+# 10. The URL parser the gate and the checks share (scripts/pg-url.sh):
+# `parsed <url>` prints what psql gets, `user|password|host|port|db|options`.
+# shellcheck source=scripts/pg-url.sh
+. "$(dirname "$gate")/../pg-url.sh"
+parsed() {
+    if pg_url_parse "$1"; then
+        printf '%s|%s|%s|%s|%s|%s' "$pg_url_user" "$pg_url_password" "$pg_url_host" "$pg_url_port" \
+            "$pg_url_database" "$pg_url_options"
+    else
+        printf 'not a URL'
+    fi
+}
+expect "a socket URL, the password percent-decoded" "$(parsed 'postgres://u:p%40ss@%2Ftmp%2Fs/db')" \
+    'u|p@ss|/tmp/s|5432|db|'
+expect "a socket URL with a port" "$(parsed 'postgres://u:p%40ss@%2Ftmp%2Fs:5433/db')" 'u|p@ss|/tmp/s|5433|db|'
+expect "localhost, the other parameters kept" \
+    "$(parsed 'postgresql://u:pw@localhost:5434/spawn_test?sslmode=disable&application_name=t')" \
+    'u|pw|localhost|5434|spawn_test|sslmode=disable&application_name=t'
+expect "an IPv6 literal with a port" "$(parsed 'postgres://u:pw@[::1]:5435/x')" 'u|pw|::1|5435|x|'
+expect "an IPv6 literal without one" "$(parsed 'postgres://u:pw@[::1]/x')" 'u|pw|::1|5432|x|'
+expect "host and port as parameters" "$(parsed 'postgres://u:pw@/x?host=%2Frun%2Fpg&port=5436')" \
+    'u|pw|/run/pg|5436|x|'
+expect "a host parameter not encoded" "$(parsed 'postgres://u:pw@/x?host=/run/pg')" 'u|pw|/run/pg|5432|x|'
+expect "no password" "$(parsed 'postgres://u@db.example:6543/x')" 'u||db.example|6543|x|'
+expect "an encoded colon and percent" "$(parsed 'postgres://u:a%3Ab%25c@h/x')" 'u|a:b%c|h|5432|x|'
+expect "a raw @ in the password: the host is after the last" "$(parsed 'postgres://u:p@ss@h/x')" 'u|p@ss|h|5432|x|'
+expect "a list of hosts is refused" "$(parsed 'postgres://u@a,b/x')" 'not a URL'
+expect "another scheme is refused" "$(parsed 'mysql://u@h/x')" 'not a URL'
+expect "the server URL puts host and port in the authority" \
+    "$(pg_url_server 'postgres://u:p%40ss@/x?host=/run/pg&port=5436')" 'postgres://u:p%40ss@%2Frun%2Fpg:5436'
+expect "the server URL of an IPv6 host keeps the brackets" \
+    "$(pg_url_server 'postgres://u:pw@[::1]:5435/x')" 'postgres://u:pw@[::1]:5435'
+expect "psql gets the decoded password" \
+    "$(pg_url_export 'postgres://u:p%40ss@%2Ftmp%2Fs/db' && printf '%s %s %s %s' "$PGUSER" "$PGPASSWORD" "$PGHOST" "$PGPORT")" \
+    'u p@ss /tmp/s 5432'
+refuse "no password, no PGPASSWORD" \
+    "$(PGPASSWORD=stale; export PGPASSWORD; pg_url_export 'postgres://u@h/x'; printf '%s' "${PGPASSWORD-unset}")" 'stale'
+
+# 11. The changed paths are read as they are (no rename detection, no
+# quoting): a protected file moved away, a protected or build.rs path with a
+# quote or a non-ASCII name, and a name with a newline are all refused, and
+# a scenarios directory without a protected list judges nothing.
+branch renamed-protected
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/elsewhere"
+git -C "$seed" mv judge/rule elsewhere/rule
+renamed=$(commit renamed-protected)
+expect "a protected file moved away is refused" "$(judge "$renamed")" 'touches protected paths'
+branch quoted-protected
+printf 'two\n' >"$seed/value"
+printf 'x\n' >"$seed/judge/é.sh"
+printf 'x\n' >"$seed/judge/a\"b.sh"
+quoted=$(commit quoted-protected)
+expect "a protected path with a non-ASCII name or a quote is refused" "$(judge "$quoted")" 'touches protected paths'
+branch quoted-buildrs
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/é"
+printf 'fn main() {}\n' >"$seed/crates/é/build.rs"
+quoted_build=$(commit quoted-buildrs)
+expect "a build.rs under a non-ASCII directory is refused" "$(judge "$quoted_build")" 'build-time'
+branch newline-path
+printf 'two\n' >"$seed/value"
+printf 'x\n' >"$seed/new
+line"
+newline=$(commit newline-path)
+expect "a path with a newline is refused" "$(judge "$newline")" 'a changed path holds a newline'
+unprotected_scenarios=$work/unprotected
+cp -r "$scenarios" "$unprotected_scenarios"
+rm "$unprotected_scenarios/protected"
+expect "a scenarios directory without a protected list judges nothing" \
+    "$(judge "$good" "" "$unprotected_scenarios")" 'no protected list'
+
+# 12. No committed node_modules/ or target/ anywhere: git overwrites an
+# ignored file with a committed one, and the owner's build runs them.
+for planted_path in web/node_modules/.bin/tsc target/debug/spawn crates/lib/target/x; do
+    branch "planted-${planted_path%%/*}"
+    printf 'two\n' >"$seed/value"
+    mkdir -p "$seed/$(dirname "$planted_path")"
+    printf '#!/bin/sh\n' >"$seed/$planted_path"
+    planted=$(commit "planted-${planted_path%%/*}")
+    expect "a committed $planted_path is refused" "$(judge "$planted")" 'node_modules/ or target/'
+done
+
+# 13. The controller's list protects web/ but web/src/ and web/index.html
+# (an exception line, `!<prefix>`): a new
+# vite.config.js (loaded before vite.config.ts) or postcss.config.js would
+# run as the owner at deploy.
+for web_path in web/vite.config.js web/postcss.config.js web/.postcssrc.json; do
+    branch "web-${web_path#web/}"
+    printf 'two\n' >"$seed/value"
+    mkdir -p "$seed/web"
+    printf 'export default {}\n' >"$seed/$web_path"
+    web_config=$(commit "web-${web_path#web/}")
+    expect "a new $web_path is refused" "$(judge "$web_config" "$listed/007.sh" "$listed")" 'candidate touches protected paths'
+done
+branch web-src
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/web/src"
+printf 'export const x = 1;\n' >"$seed/web/src/app.ts"
+printf '<!doctype html>\n' >"$seed/web/index.html"
+web_src=$(commit web-src)
+expect "web/src/ and web/index.html may change" "$(judge "$web_src" "$listed/007.sh" "$listed")" 'exit=0 {"verdict":"accepted"}'
+
+# 14. A proc-macro crate outside the workspace (a path dependency the
+# workspace does not include) runs at compile time too: refused when new or
+# changed; one the base already had, untouched, is not.
+macro_crate() {
+    mkdir -p "$seed/evil/src"
+    printf '[package]\nname = "evil"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nproc-macro = true\n' \
+        >"$seed/evil/Cargo.toml"
+    printf 'extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n/// Echo.\n#[proc_macro]\npub fn echo(input: TokenStream) -> TokenStream {\n    input\n}\n' \
+        >"$seed/evil/src/lib.rs"
+    printf '\n[dependencies]\nevil = { path = "evil" }\n' >>"$seed/Cargo.toml"
+    (cd "$seed" && CARGO_NET_OFFLINE=true cargo generate-lockfile -q)
+}
+rust_branch rust-macro
+macro_crate
+macro=$(commit rust-macro)
+expect "a new proc-macro crate outside the workspace is refused" "$(judge_rust "$macro")" \
+    'candidate adds build-time code (a local proc-macro or build script outside the workspace: evil)'
+saved_rust_base=$rust_base
+rust_base=$macro
+rust_branch rust-macro-kept
+printf 'a change outside the macro crate\n' >"$seed/notes.txt"
+macro_kept=$(commit rust-macro-kept)
+expect "one the base had, untouched, is not" "$(judge_rust "$macro_kept")" 'exit=0 {"verdict":"accepted"}'
+rust_branch rust-macro-edited
+printf '\n/// Another.\n#[proc_macro]\npub fn other(input: TokenStream) -> TokenStream {\n    input\n}\n' \
+    >>"$seed/evil/src/lib.rs"
+macro_edited=$(commit rust-macro-edited)
+expect "one the candidate edits is refused" "$(judge_rust "$macro_edited")" \
+    'a local proc-macro or build script outside the workspace: evil'
+rust_base=$saved_rust_base
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
 printf '#!/bin/sh\nexit 1\n' >"$quoted_scenarios/check-\"q\".sh"
 expect "a quote in a reason is escaped" "$(judge "$good" "" "$quoted_scenarios")" \
     '{"verdict":"rejected","reason":"regression: check-\"q\".sh fails on the candidate"}'
+
+# 15. `<scenarios-dir>/bind` names the owner's read-only inputs under $HOME
+# (a project's installed dependencies): visible in the sandbox only when
+# listed; a listed directory that is missing stops the gate (exit 3).
+owner_inputs=$(mktemp -d "$HOME/.cache/spawn-gate-test-bind.XXXXXX")
+printf 'here\n' >"$owner_inputs/marker"
+unlisted_scenarios=$work/unlisted
+cp -r "$scenarios" "$unlisted_scenarios"
+printf '#!/bin/sh\n[ "$(cat "%s/marker" 2>/dev/null)" = here ]\n' "$owner_inputs" \
+    >"$unlisted_scenarios/check-owner-inputs.sh"
+expect "an unlisted directory under \$HOME is not visible" \
+    "$(judge "$good" "" "$unlisted_scenarios")" 'check-owner-inputs.sh fails'
+listed_inputs=$work/listed-inputs
+cp -r "$unlisted_scenarios" "$listed_inputs"
+printf '# owner inputs\n%s\n' "$owner_inputs" >"$listed_inputs/bind"
+expect "a directory listed in bind is visible" "$(judge "$good" "" "$listed_inputs")" \
+    'exit=0 {"verdict":"accepted"}'
+printf '%s/gone\n' "$owner_inputs" >"$listed_inputs/bind"
+expect "a listed directory that is missing stops the gate" \
+    "$(judge "$good" "" "$listed_inputs")" 'exit=3'
+rm -rf "$owner_inputs"
 
 echo "gate: all cases pass"

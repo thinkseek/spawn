@@ -367,6 +367,7 @@ fn m6_an_input_whose_lease_expires_is_typed_twice() {
         "key_input",
         CommandAction::Input {
             text: "delete the old table".to_string(),
+            tags: Vec::new(),
         },
     );
     rig.fail_finish_once();
@@ -449,6 +450,7 @@ fn m4_main_merges_under_a_turn_typed_before_a_restart() {
         "key_input",
         CommandAction::Input {
             text: "go on".to_string(),
+            tags: Vec::new(),
         },
     );
     bridge.tick().expect("typed: a turn runs");
@@ -583,6 +585,7 @@ fn every_input_is_typed_at_most_once() {
                 "key_input",
                 CommandAction::Input {
                     text: "delete the old table".to_string(),
+                    tags: Vec::new(),
                 },
             );
             if fail_once(&rig, bridge, failure, restart, 3).is_none() {
