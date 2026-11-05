@@ -851,6 +851,8 @@ expect "a cache hit: the same key again" "$(judge "$good" "" "$keyed")" 'exit=0 
 expect "both results from the cache" "$(from_cache)" '007.sh 011.sh'
 expect "each named so in the log" "$(cat "$work/gate.out")" '| == base: 007.sh: unsolved (cached)'
 refuse "and nothing built on the base" "$(cat "$work/gate.out")" '== base: build'
+expect "the log says where the time went" "$(cat "$work/gate.out")" \
+    '| gate time: base 0 s (0 scenario runs, 2 results from the cache), candidate '
 expect "the log names the toolchain" "$(cat "$work/gate.out")" '| base cache: toolchain rustc '
 
 printf '# changed\n' >>"$controller/scripts/blackbox/runner.sh"
