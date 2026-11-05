@@ -608,6 +608,23 @@ fn a_host_on_a_socket_runs_tmux_on_that_server() {
     assert!(log.contains("new-session"), "{log}");
 }
 
+/// A capture from a tmux that never answers fails within its bound
+/// instead of holding the caller.
+#[test]
+fn a_capture_from_a_tmux_that_never_answers_fails_in_time() {
+    let _exclusive = exclusive();
+    let hung = script("fake-tmux-hung", "#!/bin/sh\nexec sleep 60\n");
+    let host = TmuxHost::local(&hung);
+    let started = std::time::Instant::now();
+    let captured = host.capture_tail(&terminal("hung"), &workspace(), 20);
+    let took = started.elapsed();
+    assert!(
+        matches!(&captured, Err(TerminalError(text)) if text.contains("did not answer")),
+        "{captured:?}"
+    );
+    assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+}
+
 /// The real adapters obey the same contract as the memory fake the Bridge
 /// tests run on.
 #[test]
