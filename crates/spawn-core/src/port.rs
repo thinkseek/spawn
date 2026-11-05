@@ -228,13 +228,16 @@ pub trait WorkspaceStore: Send + Sync {
         Ok(BaseMerge::Current)
     }
 
-    /// What the store must tell the agent of the workspace and has not yet
-    /// (a file a checkpoint left out), each notice once: a notice taken is
-    /// not returned again. A store with nothing to tell returns none.
-    fn take_notices(&self, workspace: &WorkspaceId) -> Vec<String> {
-        let _ = workspace;
-        Vec::new()
-    }
+    /// What the store must tell the agent of the workspace and has not
+    /// told yet (a file a checkpoint left out). Reading changes nothing: a
+    /// notice is returned until [`Self::notices_told`] says a prompt
+    /// carried it, so one no prompt carried yet outlives a restart of the
+    /// Bridge. No default: a store that wraps another must pass it on.
+    fn notices(&self, workspace: &WorkspaceId) -> Vec<String>;
+
+    /// A prompt typed into the agent's engine carried `notices` (as
+    /// [`Self::notices`] returned them): they are not returned again.
+    fn notices_told(&self, workspace: &WorkspaceId, notices: &[String]);
 
     /// The commit `branch` points at, `None` when the branch does not exist
     /// (or the store cannot tell). The Bridge compares it at recovery with

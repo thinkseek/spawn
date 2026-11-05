@@ -34,12 +34,17 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         let root = root.clone();
         Arc::new(move |repo: &std::path::Path| GitWorkspace::new(repo, &root))
     };
-    let workspaces: Arc<dyn WorkspaceStore> = Arc::new(sources::MissionWorkspaces::new(
+    let missions = sources::MissionWorkspaces::new(
         factory(std::path::Path::new(&repo)),
         std::path::Path::new(&root),
         store.clone(),
         factory,
-    ));
+    );
+    // A push queued by the last process and lost with it is made now.
+    if let Err(error) = missions.republish() {
+        eprintln!("sources: {error}; a push lost with the last process waits for its next");
+    }
+    let workspaces: Arc<dyn WorkspaceStore> = Arc::new(missions);
     let terminals: Arc<dyn TerminalHost> = Arc::new(crate::config::terminal_host());
 
     let config = bridge_config()?;

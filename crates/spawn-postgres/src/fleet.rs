@@ -266,7 +266,35 @@ pub(crate) const SESSION_COMMANDS: &str =
                            from spawn_commands where session_id = $1
                           order by id desc limit $2) c";
 
+/// The files main's merges into a session's branch changed that no
+/// delivery has told the worker of yet: those of every `base_merged`
+/// `artifact.committed` recorded after the latest `typed` step of a
+/// dispatcher delivery (`deliver-%`) in the session. A delivery refused
+/// before typing told nothing, so its retry still tells them. `$1` session.
+pub(crate) const UNTOLD_MERGES: &str = "
+select coalesce(jsonb_agg(m.file order by m.file), '[]'::jsonb)
+  from (select distinct f.file
+          from spawn_events e,
+               jsonb_array_elements_text(coalesce(e.kind -> 'detail' -> 'files', '[]'::jsonb)) f(file)
+         where e.session_id = $1 and e.event_name = 'artifact.committed'
+           and e.kind -> 'detail' ->> 'reason' = 'base_merged'
+           and e.session_seq > coalesce(
+                 (select max(t.session_seq)
+                    from spawn_events t
+                    join spawn_commands c on c.id = (t.kind -> 'detail' ->> 'command_id')::bigint
+                   where t.session_id = $1 and t.event_name = 'command.step'
+                     and t.kind -> 'detail' ->> 'step' = 'typed'
+                     and c.principal = 'spawn-dispatch'
+                     and c.idempotency_key like 'deliver-%'), 0)) m";
+
 impl PostgresStore {
+    /// Files main's merges changed in `session`'s branch since the last
+    /// delivery the worker was typed ([`UNTOLD_MERGES`]).
+    pub fn untold_merges(&self, session: &str) -> Result<Vec<String>, StoreError> {
+        let files = self.query_json(UNTOLD_MERGES, &[&session])?;
+        Ok(serde_json::from_value(files).unwrap_or_default())
+    }
+
     /// Facts for the dispatcher, as JSON rows.
     pub fn dispatch_facts(&self) -> Result<Value, StoreError> {
         self.query_json(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])

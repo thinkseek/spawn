@@ -276,6 +276,19 @@ pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
                   where k.agent_id = $1
                   order by k.id limit 1";
 
+/// Agents with a task still open (not cancelled, not landed) and the
+/// source their workspace comes from, by [`AGENT_SOURCE`]'s rule (the
+/// agent's first task decides): the branches a restarted Bridge publishes
+/// again, since its pusher's queue lived in memory.
+pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
+                        (select m.sources ->> 0
+                           from mission_tasks k join mission_missions m on m.id = k.mission_id
+                          where k.agent_id = a.agent_id
+                          order by k.id limit 1)
+                   from (select distinct agent_id from mission_tasks
+                          where state not in ('cancelled', 'landed')) a
+                  order by a.agent_id";
+
 // Delivery bookkeeping, run by the dispatcher as the owner.
 
 /// A landing held by [`PostgresStore::landing_hold`]; released when dropped
@@ -564,6 +577,16 @@ impl PostgresStore {
     pub fn agent_source(&self, agent: &str) -> Result<Option<Option<String>>, StoreError> {
         let rows = self.query(AGENT_SOURCE, &[&agent])?;
         Ok(rows.first().map(|row| row.get::<_, Option<String>>(0)))
+    }
+
+    /// Agents with an open task, each with its workspace's source (`None`
+    /// for a mission without one), as [`Self::agent_source`] decides it.
+    pub fn publishing_agents(&self) -> Result<Vec<(String, Option<String>)>, StoreError> {
+        Ok(self
+            .query(PUBLISHING_AGENTS, &[])?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 }
 

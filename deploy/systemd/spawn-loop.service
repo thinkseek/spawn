@@ -20,6 +20,9 @@ ExecStart=%h/.local/share/spawn-rsi/bin/spawn loop
 # must be `spawn loop` itself; a wrapper script would leave the old loop
 # running beside the new one.
 KillMode=process
+# SIGTERM ends the loop after its pass, once its queued branch pushes are
+# made (a flush waits up to 30 s for pushes in flight, then pushes the rest).
+TimeoutStopSec=120
 Restart=always
 RestartSec=5
 RestartSteps=5

@@ -376,7 +376,11 @@ fn a_file_over_the_cap_of_any_name_is_left_out_and_told_of() {
         assert!(!listed.contains(&name), "out of git: {listed:?}");
     }
     assert!(listed.contains(&b"kept.txt".as_slice()), "{listed:?}");
-    assert_eq!(store.take_notices(&workspace).len(), ODD_LARGE_NAMES.len());
+    let notices = store.notices(&workspace);
+    assert_eq!(notices.len(), ODD_LARGE_NAMES.len());
+    assert_eq!(store.notices(&workspace), notices, "untold until carried");
+    store.notices_told(&workspace, &notices);
+    assert!(store.notices(&workspace).is_empty(), "told once");
     assert_eq!(
         store.commit(&workspace, "again").expect("commit succeeds"),
         Commit::Unchanged

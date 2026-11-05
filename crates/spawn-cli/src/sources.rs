@@ -16,8 +16,12 @@
 //! Every checkpoint's branch is published, in the background
 //! ([`crate::push`]), to the source's `spawn/<agent>` when the source is a
 //! directory on this host ([`receives_branches`]); the integrator lands what
-//! was published there, never a mounted workspace. A branch lives on this
-//! host: nothing is taken from the source but `main`.
+//! was published there, never a mounted workspace. The pusher's queue is in
+//! memory: a process that ends cleanly pushes what waits ([`Drop`]), and a
+//! new one queues again the branch of every agent with an open task
+//! ([`MissionWorkspaces::republish`]), so a push lost with a killed process
+//! is made after the restart. A branch lives on this host: nothing is taken
+//! from the source but `main`.
 //!
 //! A source is git run as the owner, so it is checked before git sees it
 //! ([`MissionSource`]: an absolute path, `https://` or `ssh://`), and every
@@ -216,6 +220,19 @@ impl MissionWorkspaces {
         }
     }
 
+    /// Publish again every branch of an agent with an open task: the
+    /// pusher's queue lives in this process's memory, so a push that was
+    /// queued or backing off when the last process died is otherwise never
+    /// made, and the integrator judges the task `stale` on every pass. Run
+    /// once, when the Bridge is built; returns how many were queued.
+    pub(crate) fn republish(&self) -> Result<usize, String> {
+        let agents = self
+            .store
+            .publishing_agents()
+            .map_err(|error| format!("agents to publish: {error}"))?;
+        Ok(republish(&self.pusher, &self.root, &agents))
+    }
+
     /// Fetch a mirror's `main` from its source, unless that happened less
     /// than [`REFRESH_EVERY`] ago and `force` is false.
     fn refresh_main(&self, mirror: &Path, source: &str, force: bool) {
@@ -315,6 +332,25 @@ pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf
         }
     }
     Ok(mirror)
+}
+
+/// Queue a push of each `(agent, source)` branch that this host's mirror
+/// of a source receiving branches holds. A branch the source already has
+/// is pushed as a no-op; one it lacks, or has behind, is published. Returns
+/// how many were queued.
+fn republish(pusher: &Pusher, root: &Path, agents: &[(String, Option<String>)]) -> usize {
+    let mut queued = 0;
+    for (agent, source) in agents {
+        let Some(source) = source.as_deref().filter(|source| receives_branches(source)) else {
+            continue;
+        };
+        let mirror = root.join(".sources").join(mirror_name(source));
+        if mirror.is_dir() && has_branch(&mirror, agent) {
+            pusher.mark(&mirror, source, agent);
+            queued += 1;
+        }
+    }
+    queued
 }
 
 /// Bring a mirror's `main` up to its source's default branch. A source that
@@ -426,7 +462,7 @@ impl WorkspaceStore for MissionWorkspaces {
         }
         let made = routed.store.ensure_branch(branch, from)?;
         // A new branch publishes its fork point; an existing one is pushed
-        // again in case its last push was lost with a process.
+        // again (a lost push is also re-queued at a restart: `republish`).
         self.mark(&repo, &source, branch.as_str());
         Ok(made)
     }
@@ -464,6 +500,18 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(branch.as_str())?.store.branch_head(branch)
     }
 
+    fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
+        self.route(workspace.sandbox())
+            .map(|routed| routed.store.notices(workspace))
+            .unwrap_or_default()
+    }
+
+    fn notices_told(&self, workspace: &WorkspaceId, notices: &[String]) {
+        if let Ok(routed) = self.route(workspace.sandbox()) {
+            routed.store.notices_told(workspace, notices);
+        }
+    }
+
     fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
         let routed = self.route(branch.as_str())?;
         if let Some((repo, source)) = &routed.mirror {
@@ -489,7 +537,7 @@ mod tests {
     use super::{
         MissionSource, ensure_mirror, fetch_pushed_into, git, mirror_name, receives_branches,
     };
-    use crate::push::{Pushed, push_branch};
+    use crate::push::{Pushed, Pusher, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
     use spawn_core::port::{Commit, WorkspaceStore};
     use spawn_host::GitWorkspace;
@@ -577,6 +625,63 @@ mod tests {
             Pushed::Failed(_)
         ));
         assert!(fetch_pushed_into(&mirror, &gone, "agent_x", landing).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A checkpoint whose push was queued in a process that was killed
+    /// (a deploy's SIGTERM, before the pusher ran) is published by the next
+    /// process: the integrator would otherwise judge it `stale` forever
+    /// (causality audit #4).
+    #[test]
+    fn a_push_lost_with_a_killed_process_is_made_after_the_restart() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-republish-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            &seed_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let root = base.join("host");
+        let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
+        let host = GitWorkspace::new(&mirror, &root);
+        let landing = "refs/spawn-integrate/agent_x";
+
+        // The killed process committed and queued a push it never made.
+        let head = checkpoint(&host, "agent_x", "one.txt");
+        assert_eq!(
+            fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("asked"),
+            None
+        );
+
+        // The next process: its pusher starts empty.
+        let pusher = Pusher::new();
+        let agents = [
+            ("agent_x".to_string(), Some(source.clone())),
+            ("agent_none".to_string(), Some(source.clone())),
+            ("agent_scratch".to_string(), None),
+        ];
+        assert_eq!(super::republish(&pusher, &root, &agents), 1);
+        pusher.flush();
+        assert_eq!(
+            fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
+            Some(head)
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
