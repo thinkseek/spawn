@@ -19,7 +19,7 @@ marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
 # Background helpers (listeners, fake servers) are killed on exit.
 background=""
 # shellcheck disable=SC2086 # pids
-trap 'kill $background 2>/dev/null; rm -rf "$work" "$marker"' EXIT
+trap 'kill $background 2>/dev/null || true; rm -rf "$work" "$marker"' EXIT
 
 # The owner's home, with secrets the candidate must not read. The gate's base
 # cache goes under it too, never into the real one.
@@ -364,7 +364,7 @@ background="$background $!"
 for path in "$socket_db/.s.PGSQL.5432" $planted; do
     while [ ! -S "$path" ]; do sleep 0.1; done
 done
-trap 'kill $background 2>/dev/null; rm -f /tmp/.s.PGSQL.$$ /run/user/$(id -u)/test-gate-$$.sock /var/tmp/test-gate-$$.sock; rm -rf "$work" "$marker"' EXIT
+trap 'kill $background 2>/dev/null || true; rm -f /tmp/.s.PGSQL.$$ /run/user/$(id -u)/test-gate-$$.sock /var/tmp/test-gate-$$.sock; rm -rf "$work" "$marker"' EXIT
 find / \( -path /proc -o -path /sys \) -prune -o -type s -writable -print 2>/dev/null |
     grep -vxF "$socket_db/.s.PGSQL.5432" >"$work/host-sockets" || true
 for path in $planted; do
