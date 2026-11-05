@@ -201,7 +201,8 @@ impl MemoryStore {
 }
 
 impl EventLog for MemoryStore {
-    fn append(&self, event: NewEvent) -> Result<Appended, StoreError> {
+    fn append(&self, mut event: NewEvent) -> Result<Appended, StoreError> {
+        crate::redact::redact_event(&mut event.kind);
         let now = self.clock.now();
         let mut state = self.lock();
         let branch_record = matches!(
@@ -315,7 +316,7 @@ impl CommandQueue for MemoryStore {
         let mut state = self.lock();
         let failure = match outcome {
             Outcome::Succeeded => None,
-            Outcome::Failed(reason) => Some(reason.clone()),
+            Outcome::Failed(reason) => Some(crate::redact::redact(reason)),
         };
         let (agent_id, session_id) = {
             let row = state

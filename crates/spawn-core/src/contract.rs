@@ -90,6 +90,24 @@ pub fn event_log(tag: &str, log: &dyn EventLog) {
         tail.iter()
             .all(|record| record.position > second.record.position)
     );
+
+    // Free text is stored with its credentials redacted.
+    let mut failed = message(tag, 1);
+    failed.kind = EventKind::ToolFailed {
+        tool_use_id: format!("{tag}_tool_2"),
+        error: "psql postgres://spawn:hunter2@db/spawn: PGPASSWORD=hunter2".to_string(),
+    };
+    let stored = log.append(failed).expect("append succeeds");
+    let read = log
+        .read_global(GlobalPosition(stored.record.position.0 - 1), 1)
+        .expect("read succeeds");
+    for kind in [&stored.record.event.kind, &read[0].event.kind] {
+        assert!(
+            matches!(kind, EventKind::ToolFailed { error, .. }
+                if !error.contains("hunter2") && error.contains("[redacted]")),
+            "stored redacted: {kind:?}"
+        );
+    }
 }
 
 /// Command queue rules: idempotent intake, one live lease per session,
@@ -162,17 +180,27 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
         "an old attempt must not finish the command"
     );
     queue
-        .finish(&renewed, &Outcome::Failed("worker stopped".to_string()))
+        .finish(
+            &renewed,
+            &Outcome::Failed("worker stopped: Bearer abcdefghijkl0123".to_string()),
+        )
         .expect("finish succeeds");
 
     let events = log
         .read_global(GlobalPosition(0), 100)
         .expect("read succeeds");
-    let finished = events
+    let finished: Vec<&EventKind> = events
         .iter()
-        .filter(|record| record.event.kind.name() == "command.finished")
-        .count();
-    assert_eq!(finished, 2);
+        .map(|record| &record.event.kind)
+        .filter(|kind| kind.name() == "command.finished")
+        .collect();
+    assert_eq!(finished.len(), 2);
+    assert!(
+        matches!(finished[1], EventKind::CommandFinished { error: Some(error), .. }
+            if error == "worker stopped: Bearer [redacted]"),
+        "a failure is stored redacted: {:?}",
+        finished[1]
+    );
 }
 
 /// Workspace rules: an unknown branch is refused; a new branch starts at
