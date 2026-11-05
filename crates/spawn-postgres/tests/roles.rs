@@ -142,9 +142,14 @@ fn each_database_has_its_own_logins_and_another_install_sets_none_of_ours() {
     }
 }
 
+/// The owner's password is the one the driver connects with, however the
+/// URL spells it: as a `password=` parameter it derives the same logins as
+/// in the user info, and the migration replaces a fixed password an earlier
+/// install left. (A migration with no owner password at all turns the
+/// logins off: `lib.rs`, `a_migration_without_the_owner_password_turns_the_logins_off`.)
 #[test]
-fn a_migration_without_the_owner_password_turns_the_logins_off() {
-    let database = Database::new("roles_off", None);
+fn an_owner_password_given_as_a_parameter_is_the_same_password() {
+    let database = Database::new("roles_param", None);
     PostgresStore::connect(&database.url())
         .expect("connect")
         .migrate()
@@ -159,8 +164,6 @@ fn a_migration_without_the_owner_password_turns_the_logins_off() {
     let fixed = database_url(&login, &login, &database.name);
     assert!(can_log_in(&fixed));
 
-    // The owner without a password in the URL (it travels as a parameter,
-    // as PGPASSWORD or a peer login would leave it out of the URL).
     let Parts {
         scheme,
         user,
@@ -171,66 +174,24 @@ fn a_migration_without_the_owner_password_turns_the_logins_off() {
         .replace('&', "%26")
         .replace('=', "%3D")
         .replace('+', "%2B");
-    let passwordless = format!(
+    let as_parameter = format!(
         "{scheme}://{user}@{host}/{}?password={encoded}",
         database.name
     );
-    PostgresStore::connect(&passwordless)
+    PostgresStore::connect(&as_parameter)
         .expect("the owner connects")
         .migrate()
-        .expect("migrate without the owner's password");
+        .expect("migrate");
     assert!(!can_log_in(&fixed), "the earlier password is gone");
-    assert!(!can_log_in(&supervisor), "the derived one too");
-    let rows = admin("public")
-        .query(
-            "select rolname::text, rolcanlogin, rolpassword is null from pg_authid
-              where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1)
-              order by 1",
-            &[&database.name],
-        )
-        .expect("the logins");
-    let logins: Vec<(String, bool, bool)> = rows
-        .iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
-        .collect();
-    assert_eq!(
-        logins,
-        [
-            (format!("spawn_reader_{}", database.name), false, true),
-            (format!("spawn_supervisor_{}", database.name), false, true),
-        ]
-    );
-
-    // It says so.
-    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&warnings);
-    let mut config: postgres::Config = passwordless.parse().expect("parses");
-    config.notice_callback(move |notice| {
-        if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
-            sink.lock()
-                .expect("warnings")
-                .push(notice.message().to_string());
-        }
-    });
-    config
-        .connect(NoTls)
-        .expect("connect")
-        .batch_execute("select spawn_logins_off()")
-        .expect("turn them off again");
-    let warnings = warnings.lock().expect("warnings").clone();
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
-        warnings[0].contains("no owner password") && warnings[0].contains(&login),
-        "{warnings:?}"
+        can_log_in(&supervisor),
+        "the same derived password as before"
     );
-
-    // A migration with the password turns them on again.
-    PostgresStore::connect(&database.url())
-        .expect("connect")
-        .migrate()
-        .expect("migrate with the owner's password");
-    assert!(can_log_in(&supervisor));
-    assert!(!can_log_in(&fixed));
+    assert_eq!(
+        role_url(&as_parameter, "spawn_supervisor").expect("the login's URL"),
+        supervisor,
+        "one login URL, whichever way the owner's password is given"
+    );
 }
 
 #[test]
@@ -364,4 +325,91 @@ fn many_migrations_at_once_on_one_cluster_all_succeed() {
             "every migration succeeds and its supervisor logs in"
         );
     }
+}
+
+/// Audit L8: a migration's `alter role ... password` carries a SCRAM
+/// verifier computed by the client, never the login's password. Held
+/// behind another transaction's update of the role's row, the statement
+/// sits in `pg_stat_activity` (readable by superusers and
+/// `pg_read_all_stats`), and the "tuple concurrently updated" error it then
+/// hits is logged with its statement under the default
+/// `log_min_error_statement = error`: what both show is the verifier.
+#[test]
+fn a_login_password_never_appears_in_statement_text() {
+    let database = Database::new("roles_l8", None);
+    PostgresStore::connect(&database.url())
+        .expect("connect")
+        .migrate()
+        .expect("the first migration");
+    let real = role_url(&database.url(), "spawn_supervisor").expect("the login's URL");
+    let login = format!("spawn_supervisor_{}", database.name);
+
+    // Hold the role's catalog row in an open transaction.
+    let mut holder = Client::connect(&database.url(), NoTls).expect("holder");
+    let mut transaction = holder.transaction().expect("begin");
+    transaction
+        .batch_execute(&format!("alter role {login} valid until 'infinity'"))
+        .expect("touch the role's row");
+
+    let url = database.url();
+    let migration = std::thread::spawn(move || {
+        PostgresStore::connect(&url)
+            .expect("connect")
+            .migrate()
+            .map_err(|error| error.to_string())
+    });
+
+    // The second migration waits on that row, at its `alter role ... password`.
+    let mut watcher = admin("public");
+    let prefix = format!("alter role \"{login}\" with login password '");
+    let mut seen: Option<String> = None;
+    // Other tests' migrations hold the server-wide migration lock first, so
+    // the wait is long; it ends early once the statement shows or the
+    // migration finished without blocking.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(3);
+    while std::time::Instant::now() < deadline && !migration.is_finished() {
+        seen = watcher
+            .query(
+                "select query from pg_stat_activity where starts_with(query, $1)",
+                &[&prefix],
+            )
+            .expect("pg_stat_activity")
+            .first()
+            .map(|row| row.get(0));
+        if seen.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    transaction.commit().expect("release the row");
+    migration
+        .join()
+        .expect("the migration returns")
+        .expect("the retried migration succeeds");
+
+    let seen = seen.expect("the blocked alter role is in pg_stat_activity");
+    let leaked = seen
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split_once('\''))
+        .map(|(password, _)| password.to_string())
+        .expect("a quoted password");
+    let real_password = real
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .map(|(_, password)| password.to_string())
+        .expect("the login URL's password");
+    // Compare without printing either.
+    assert!(
+        !leaked.contains(&real_password),
+        "pg_stat_activity showed the supervisor login's real password ({} chars)",
+        leaked.len()
+    );
+    assert!(
+        leaked.starts_with("SCRAM-SHA-256$"),
+        "the statement carries a SCRAM verifier"
+    );
+    // And the login still logs in with its password.
+    let mut supervisor = Client::connect(&real, NoTls).expect("the supervisor logs in");
+    supervisor.batch_execute("select 1").expect("a query");
 }

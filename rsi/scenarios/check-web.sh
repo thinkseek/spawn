@@ -16,4 +16,8 @@ rm -rf web/node_modules
 ln -s "$controller/web/node_modules" web/node_modules
 # The controller's node_modules is read-only in the gate's sandbox: Vite
 # loads its config in memory instead of writing it to node_modules/.vite-temp.
-cd web && npm run build -- --configLoader runner
+cd web
+# The UI's pure modules have tests of their own (web/test), run by node
+# itself (it strips the types); no package is added for them.
+node --test test/
+npm run build -- --configLoader runner

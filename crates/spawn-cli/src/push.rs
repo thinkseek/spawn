@@ -1,18 +1,18 @@
-//! Agents' branches pushed to their mission's source (docs/storage.md,
-//! "Central").
+//! Agents' branches published to their mission's source for the integrator
+//! to land (docs/storage.md, "Published for landing").
 //!
 //! A checkpoint marks its branch dirty; a background thread pushes the
 //! branch's head as it is then, `refs/heads/<agent>` to the source's
 //! `refs/heads/spawn/<agent>`, at most once per [`INTERVAL`] per branch, so a
 //! burst of checkpoints costs one push and the Bridge's loop never waits on
 //! the network. A push carries the head, so pushes that never happened in
-//! between lose nothing. It is never forced: a rejection means another
-//! writer moved `spawn/<agent>`, which is reported, not overwritten. A push
+//! between lose nothing. It is never forced: a rejection means
+//! `spawn/<agent>` is not an ancestor of the head (a rewritten branch), which
+//! is reported, not overwritten. A push
 //! that failed (an unreachable source) is retried with a growing pause.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -45,11 +45,15 @@ pub(crate) fn pushed_ref(branch: &str) -> String {
 /// Push one branch's head from a mirror to its source, without force.
 pub(crate) fn push_branch(mirror: &Path, source: &str, branch: &str) -> Pushed {
     let refspec = format!("refs/heads/{branch}:{}", pushed_ref(branch));
-    let output = Command::new("git")
+    // Not a source git may be given: no push can ever succeed, so it is not
+    // retried.
+    if let Err(error) = crate::sources::MissionSource::parse(source) {
+        return Pushed::Rejected(error);
+    }
+    let output = crate::sources::controller_git()
         .arg("--git-dir")
         .arg(mirror)
         .args(["push", "--porcelain", "--", source, &refspec])
-        .stdin(Stdio::null())
         .output();
     let output = match output {
         Ok(output) => output,

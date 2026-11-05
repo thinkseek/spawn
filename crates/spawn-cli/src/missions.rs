@@ -140,9 +140,12 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
     let err = |error: spawn_core::port::StoreError| error.to_string();
     match verb {
         "add" => {
-            let sources = flags
-                .get("source")
-                .map_or_else(|| json!([]), |source| json!([source]));
+            // Checked here for a clear error; spawn_mission_add holds the
+            // same rule for every caller.
+            let sources = match flags.get("source") {
+                Some(source) => json!([crate::sources::MissionSource::parse(&source)?.as_str()]),
+                None => json!([]),
+            };
             let settings = Settings::from(&flags)?;
             let id = store
                 .mission_add(&text(&flags, "text")?, &sources, "human")
@@ -168,10 +171,11 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         }
         "moved" => {
             let source = text(&flags, "source")?;
+            crate::sources::MissionSource::parse(&source)?;
             let from = text(&flags, "from")?;
             let to = text(&flags, "to")?;
             // Forward only: a main that dropped landed work is a halt, not a deploy.
-            let forward = std::process::Command::new("git")
+            let forward = crate::sources::controller_git()
                 .args([
                     "--git-dir",
                     &source,
