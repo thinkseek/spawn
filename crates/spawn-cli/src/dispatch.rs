@@ -412,7 +412,13 @@ fn merge_main_before(
     };
     let task = order.task?;
     let merge = crate::main_merge::merge_main(store, root, &order.agent_id, &order.session_id);
-    if let Some(note) = crate::main_merge::delivery_note(&merge) {
+    // What earlier merges changed and no typed delivery told yet, from
+    // their records: this attempt's merge may find main already in.
+    let untold = store
+        .untold_merges(&order.session_id)
+        .map_err(|error| eprintln!("deliver: untold merges of {}: {error}", order.session_id))
+        .unwrap_or_default();
+    if let Some(note) = crate::main_merge::delivery_note(&merge, &untold) {
         text.push_str("\n\n");
         text.push_str(&note);
     }
