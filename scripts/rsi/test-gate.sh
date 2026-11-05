@@ -929,6 +929,17 @@ rm "$unprotected_scenarios/protected"
 expect "a scenarios directory without a protected list judges nothing" \
     "$(judge "$good" "" "$unprotected_scenarios")" 'no protected list'
 
+# 12. No committed node_modules/ or target/ anywhere: git overwrites an
+# ignored file with a committed one, and the owner's build runs them.
+for planted_path in web/node_modules/.bin/tsc target/debug/spawn crates/lib/target/x; do
+    branch "planted-${planted_path%%/*}"
+    printf 'two\n' >"$seed/value"
+    mkdir -p "$seed/$(dirname "$planted_path")"
+    printf '#!/bin/sh\n' >"$seed/$planted_path"
+    planted=$(commit "planted-${planted_path%%/*}")
+    expect "a committed $planted_path is refused" "$(judge "$planted")" 'node_modules/ or target/'
+done
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
