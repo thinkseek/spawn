@@ -14,7 +14,7 @@ use postgres::Client;
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
-    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, GlobalPosition, ModelProfile,
+    ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, GlobalPosition, ModelProfile,
     NewEvent, SessionSeq, Source,
 };
 use spawn_core::id::{
@@ -52,7 +52,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
         session_id: submission_session,
         idempotency_key: IdempotencyKey::new(key).expect("valid key"),
         action: CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "hello".to_string(),
             parent_session_id: None,
             from: None,
@@ -343,7 +343,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
             Source::Bridge,
             "exec_1:started",
             EventKind::ExecutionStarted {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: CommandId(1),
@@ -484,7 +484,7 @@ fn a_task_lists_its_command_and_execution_events() {
             Source::Bridge,
             "exec_1:started",
             EventKind::ExecutionStarted {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: command,
@@ -868,7 +868,7 @@ fn status_joins_the_judgement_and_the_latest_execution() {
             Source::Bridge,
             "exec_status:started",
             EventKind::ExecutionStarted {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 terminal: TerminalName::new("spawn-exec_status").expect("valid terminal"),
                 workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
                 command_id: CommandId(1),
@@ -1099,7 +1099,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                     Source::Bridge,
                     &format!("exec_{number}:started"),
                     EventKind::ExecutionStarted {
-                        engine: Engine::Claude,
+                        engine: ENGINE.to_string(),
                         terminal: TerminalName::for_execution(&execution),
                         workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
                         command_id: CommandId(number),

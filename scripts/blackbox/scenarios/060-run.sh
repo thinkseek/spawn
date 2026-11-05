@@ -3,9 +3,9 @@
 #
 # The runner starts the program, waits for it and returns its exit code. The
 # pane holds no database login: the runner writes the exit status to
-# SPAWN_EXIT_FILE (whole, then renamed) for the Bridge to read, and with
-# SPAWN_ENGINE=codex and SPAWN_ENGINE_OUTPUT set it also copies every output
-# line there. It never writes to the store, whatever the environment holds.
+# SPAWN_EXIT_FILE (whole, then renamed) for the Bridge to read, and leaves
+# the program's output to the pane. It never writes to the store, whatever
+# the environment holds.
 
 # --- the program is required ------------------------------------------------
 
@@ -21,7 +21,7 @@ assert_contains "$(err)" "spawn: run needs a program after --" \
 
 # --- no exit file: the program still runs and its code is forwarded ---------
 
-capture env SPAWN_EXIT_FILE= SPAWN_ENGINE=claude \
+capture env SPAWN_EXIT_FILE= \
     "$SPAWN_BIN" run -- sh -c 'printf "engine-out\n"; exit 7'
 assert_eq "$status" 7 "exit code without SPAWN_EXIT_FILE"
 assert_eq "$(out)" "engine-out" "stdout forwarded without SPAWN_EXIT_FILE"
@@ -71,25 +71,19 @@ assert_eq "$status" 1 "signal-killed program exits 1"
 assert_file "$exits/exec_signal"
 assert_eq "$(cat "$exits/exec_signal")" "" "a signal death leaves an empty exit file"
 
-# --- SPAWN_ENGINE=codex copies stdout and still forwards every line ----------
+# --- the output goes to the pane only -----------------------------------------
+# The runner makes no output copy, whatever the environment asks for
+# (SPAWN_ENGINE=codex with SPAWN_ENGINE_OUTPUT): every line reaches the pane.
 
-capture env SPAWN_ENGINE=codex SPAWN_ENGINE_OUTPUT="$WORK/codex/out.jsonl" \
-    SPAWN_EXIT_FILE="$exits/exec_codex" \
-    "$SPAWN_BIN" run -- sh -c 'printf "codex-line-1\ncodex-line-2\n"; exit 5'
-assert_eq "$status" 5 "exit code on the codex stdout path"
-assert_eq "$(out)" "codex-line-1
-codex-line-2" "codex stdout is echoed line by line"
-assert_eq "$(err)" "" "no error on the codex stdout path"
-assert_eq "$(cat "$WORK/codex/out.jsonl")" "codex-line-1
-codex-line-2" "codex output is copied to SPAWN_ENGINE_OUTPUT"
-assert_eq "$(cat "$exits/exec_codex")" 5 "the codex exit file holds the exit code"
-
-# The copy is Codex's alone: a Claude run leaves SPAWN_ENGINE_OUTPUT untouched.
-capture env SPAWN_ENGINE=claude SPAWN_ENGINE_OUTPUT="$WORK/claude/out.jsonl" \
-    "$SPAWN_BIN" run -- sh -c 'printf "claude-line\n"'
-assert_eq "$status" 0 "exit code of a claude run with SPAWN_ENGINE_OUTPUT"
-assert_eq "$(out)" "claude-line" "claude stdout is forwarded"
-assert_no_file "$WORK/claude/out.jsonl"
+capture env SPAWN_ENGINE=codex SPAWN_ENGINE_OUTPUT="$WORK/copy/out.jsonl" \
+    SPAWN_EXIT_FILE="$exits/exec_lines" \
+    "$SPAWN_BIN" run -- sh -c 'printf "line-1\nline-2\n"; exit 5'
+assert_eq "$status" 5 "exit code with an output copy asked for"
+assert_eq "$(out)" "line-1
+line-2" "every output line reaches the pane"
+assert_eq "$(err)" "" "no error with an output copy asked for"
+assert_no_file "$WORK/copy/out.jsonl"
+assert_eq "$(cat "$exits/exec_lines")" 5 "the exit file holds the exit code"
 
 assert_eq "$(scalar 'select count(*) from spawn_events')" 0 \
     "no run appended an event"

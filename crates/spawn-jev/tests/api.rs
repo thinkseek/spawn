@@ -19,7 +19,7 @@ fn input() -> JudgeInput {
     JudgeInput {
         agent_id: "agent_one".to_string(),
         session_id: "session_one".to_string(),
-        engine: Some(spawn_core::event::Engine::Claude),
+        engine: Some(spawn_core::event::ENGINE.to_string()),
         execution_active: true,
         stalled_end: None,
         last_end: None,

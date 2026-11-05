@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::event::{EndCause, Engine, SessionSeq};
+use crate::event::{EndCause, SessionSeq};
 use crate::observation::{Ambiguity, Confidence, SemanticState};
 use crate::screen::ScreenState;
 
@@ -28,8 +28,8 @@ pub struct JudgeInput {
     pub agent_id: String,
     /// Judged session.
     pub session_id: String,
-    /// Engine of the latest execution.
-    pub engine: Option<Engine>,
+    /// Engine of the latest execution, as its record names it.
+    pub engine: Option<String>,
     /// Whether an execution is running.
     pub execution_active: bool,
     /// The end under way whose final checkpoint keeps failing
