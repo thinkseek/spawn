@@ -105,6 +105,8 @@
 #   code that forges libtest's output at start-up could inflate it, and a
 #   body that asserts nothing real (`assert!(true)`) is not empty text: this
 #   stops weakening, not a forger.
+#   A test the owner retired with its feature is named in
+#   `<scenarios-dir>/retired-tests` and may go.
 # - Lint configuration (text, before anything runs): a change to a
 #   `[lints]` / `[workspace.lints]` table (or `lints.` keys) in any
 #   Cargo.toml, any change to clippy.toml or .clippy.toml, a new crate-level
@@ -1138,6 +1140,12 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; th
         exit 0
     fi
     dropped=$(LC_ALL=C comm -23 "$work/tests.base-names" "$work/tests.candidate-names")
+    # The owner retires tests with the features they removed: names listed in
+    # `<scenarios-dir>/retired-tests` (one per line, `#` comments) may go.
+    if [ -n "$dropped" ] && [ -f "$scenarios/retired-tests" ]; then
+        grep -v '^#' "$scenarios/retired-tests" | grep . | LC_ALL=C sort -u >"$work/tests.retired"
+        dropped=$(printf '%s\n' "$dropped" | LC_ALL=C comm -23 - "$work/tests.retired")
+    fi
     if [ -n "$dropped" ]; then
         echo "| base tests the candidate does not run by name: $(printf '%s\n' "$dropped" | head -n 20 | tr '\n' ' ')"
         verdict rejected "candidate drops or renames base tests ($(printf '%s\n' "$dropped" | grep -c .): $(printf '%s\n' "$dropped" | head -n 3 | tr '\n' ' ' | sed 's/ $//'))"

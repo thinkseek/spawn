@@ -668,6 +668,14 @@ renamed=$(commit rust-renamed)
 expect "a renamed test is refused though the count holds" "$(judge_rust "$renamed")" \
     'drops or renames base tests (1: tests::b)'
 expect "the count did hold" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+retiring_scenarios=$work/retiring
+cp -r "$scenarios" "$retiring_scenarios"
+printf '# retired with their feature\ntests::b\n' >"$retiring_scenarios/retired-tests"
+saved_base=$base
+base=$rust_base
+expect "a test the owner retired may go" "$(judge "$renamed" "" "$retiring_scenarios")" \
+    'exit=0 {"verdict":"accepted"}'
+base=$saved_base
 rust_branch rust-moved-path
 drop_b
 printf '#[test]\nfn b() {\n    assert_eq!(t::one() + 1, 2);\n}\n' >>"$seed/tests/extra.rs"
