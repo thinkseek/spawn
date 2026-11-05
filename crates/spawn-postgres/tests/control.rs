@@ -472,7 +472,10 @@ fn an_objective_mission_keeps_up_to_its_workers_in_flight_each_on_its_own_agent(
         .expect("first");
     // A second task for the same objective is refused while one is in flight.
     let doubled = refusal(store.objective_assign(mission, 1, None, "again"));
-    assert!(doubled.contains("already has a task in flight"), "{doubled}");
+    assert!(
+        doubled.contains("already has a task in flight"),
+        "{doubled}"
+    );
     // The resident has one open: the next goes to a per-task worker.
     let second = store
         .objective_assign(mission, 2, None, "brief two")
@@ -518,7 +521,11 @@ fn an_objective_mission_keeps_up_to_its_workers_in_flight_each_on_its_own_agent(
 
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
 }
 
 #[test]
@@ -548,9 +555,7 @@ fn a_mission_is_configured_with_one_to_sixteen_workers() {
     let mission = store
         .mission_add("Improve", &json!(["/tmp/source.git"]), "human")
         .expect("add");
-    let with = |workers: serde_json::Value| {
-        json!({"backlog": "/controller/rsi/backlog", "resident": "r", "workers": workers})
-    };
+    let with = |workers: serde_json::Value| json!({"backlog": "/controller/rsi/backlog", "resident": "r", "workers": workers});
     for refused in [json!(0), json!(17), json!(2.5), json!("3"), json!(-1)] {
         let error = refusal(store.mission_configure(
             mission,
@@ -563,7 +568,13 @@ fn a_mission_is_configured_with_one_to_sixteen_workers() {
     }
     for accepted in [1, 16] {
         store
-            .mission_configure(mission, Some("/scenarios"), "gate", None, Some(&with(json!(accepted))))
+            .mission_configure(
+                mission,
+                Some("/scenarios"),
+                "gate",
+                None,
+                Some(&with(json!(accepted))),
+            )
             .expect("in range");
     }
 }
