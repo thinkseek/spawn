@@ -152,7 +152,11 @@ impl Facts {
     ///
     /// A judgement older than the latest fact describes a moment that has
     /// passed (for example the ready screen just before the prompt was
-    /// typed); the Observer is about to judge again.
+    /// typed). The Observer judges again, and once the session's facts
+    /// settle its latest observation covers its latest fact, whether or not
+    /// the verdict changed (the coverage rule in `spawn_core::observe`): an
+    /// idle worker whose last fact changed nothing still gets a current
+    /// judgement, a few seconds later.
     pub(crate) fn current_observation(&self) -> Option<&Observation> {
         self.observation.as_ref().filter(|observation| {
             self.evidence_seq

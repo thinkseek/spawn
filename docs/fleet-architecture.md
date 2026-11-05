@@ -117,6 +117,23 @@ If Jev is down, the rules' best guess is written with
 to at most 10 min. While retries are pending they replace the 30 s recheck.
 It is never marked dead.
 
+The Observer writes an observation at once when the judgement changes
+(state, reason, attention, ambiguity). It also keeps a session's latest
+judgement covering its latest fact: when a later fact (any record of the
+session not the Observer's: a screen reading, a Bridge step, a checkpoint, a
+command) leaves the verdict as it was, the session is judged again and, once
+its facts have settled (no newer fact for 2 s), that verdict is written with
+`based_on_seq` at the latest fact. It is a judgement of those facts: the
+rules run again, and a Jev answer stands for them only when the evidence it
+was shown is the same (its fingerprint, which counts the engine's moves and
+what the facts say, not every record), with no second call. A session with no
+new fact gets no new observation; a burst of facts with an unchanged verdict
+(a busy turn) gets one, once it settles. A restarted Observer checks every
+session once, and covers one that lags with a single observation. The
+dispatcher acts only on a judgement that covers the latest fact, so this is
+what lets it act on a worker that ended its turn before the screen settled at
+its prompt.
+
 Every Jev answer is written, even when the state did not change, together
 with the evidence and a stable fingerprint of it. That makes the log the full
 record of what the model saw and said, and lets a restarted Observer (or a
