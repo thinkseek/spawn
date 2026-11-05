@@ -803,7 +803,7 @@ fn a_done_missions_landing_that_stays_stale_is_aborted_after_three_tries() {
             .expect("task")
             .get(0)
     };
-    let stale = |task: i64| {
+    let gate_stale = |task: i64| {
         store
             .integrator_record(&json!({"type": "task.gated", "id": task, "verdict": "stale"}))
             .expect("stale")
@@ -813,24 +813,24 @@ fn a_done_missions_landing_that_stays_stale_is_aborted_after_three_tries() {
     // its worker may still push.
     let (_open, open_task) = landing_task("Open");
     for _ in 0..4 {
-        stale(open_task);
+        gate_stale(open_task);
         assert_eq!(state(&mut client, open_task), "accepted");
     }
 
     // A done mission's: twice, then the third aborts it, and the integrator
     // has nothing left to judge.
     let (done, done_task) = landing_task("Done");
-    stale(done_task);
+    gate_stale(done_task);
     store.mission_close(done, "done", "shipped").expect("close");
     for _ in 0..2 {
-        stale(done_task);
+        gate_stale(done_task);
         assert_eq!(
             state(&mut client, done_task),
             "accepted",
             "stale before the bound"
         );
     }
-    stale(done_task);
+    gate_stale(done_task);
     assert_eq!(state(&mut client, done_task), "cancelled");
     assert_eq!(
         control_types(&mut client).last().map(String::as_str),
