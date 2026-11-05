@@ -123,7 +123,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts, as the Bridge sees that directory |
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
-| `SPAWN_JUDGE_URL` | unset | Jev judge service; without it a local heuristic judges |
+| `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
 | `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | Address `spawn serve` binds (`--address` overrides it) |
 | `SPAWN_SERVE_TOKEN` | unset | Token every `spawn serve` API request must carry; required off loopback |

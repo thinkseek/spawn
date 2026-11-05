@@ -8,7 +8,9 @@
 //! The Observer never acts. It appends an `observation.recorded` event when
 //! the judgement changes, with who decided, why the rules could not, and the
 //! evidence the model saw. A judge failure keeps the rules' guess, marks it
-//! `JudgeUnavailable` and asks for attention; it never reports "dead".
+//! `JudgeUnavailable` and asks for attention; it never reports "dead". With
+//! no judge configured an ambiguous case goes the same way, its judge named
+//! [`NO_JUDGE`].
 //!
 //! `judge` holds the judge contract, `snapshot` the per-session facts,
 //! `classify` reads facts against answers (the rules, and narrowing a model
@@ -24,8 +26,8 @@ mod observer;
 mod snapshot;
 
 pub use classify::{RulesVerdict, attention_reason, narrow, rules};
-pub use judge::{HeuristicJudge, JudgeError, JudgeInput, Judgement, StateJudge, TurnFact};
-pub use observer::{ObservationContext, Observer};
+pub use judge::{JudgeError, JudgeInput, Judgement, StateJudge, TurnFact};
+pub use observer::{NO_JUDGE, ObservationContext, Observer};
 
 /// A live execution with no open tool and no fact for this long is ambiguous.
 pub const QUIET_AFTER: Duration = Duration::from_mins(2);

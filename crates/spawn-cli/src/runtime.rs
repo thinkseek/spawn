@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use spawn_core::bridge::{Bridge, BridgeConfig, ModelRelay};
-use spawn_core::observe::{HeuristicJudge, Observer, StateJudge};
+use spawn_core::observe::{Observer, StateJudge};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_jev::{JevConfig, JevJudge};
@@ -67,7 +67,10 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     bridge.recover().map_err(|error| error.to_string())?;
 
     let context = context::HostContext::new(open_store()?, terminals);
-    let mut observer = Observer::new(log, judge(flags)).with_context(Arc::new(context));
+    let mut observer = Observer::new(log).with_context(Arc::new(context));
+    if let Some(judge) = judge(flags) {
+        observer = observer.with_judge(judge);
+    }
     observer.recover().map_err(|error| error.to_string())?;
     Ok((bridge, observer))
 }
@@ -128,19 +131,16 @@ fn claude_projects() -> String {
         .unwrap_or_else(|| format!("{}/.claude/projects", env_or("HOME", "/root")))
 }
 
-/// The model judge at `--judge-url` or `SPAWN_JUDGE_URL`, else the heuristic.
-fn judge(flags: &Flags) -> Arc<dyn StateJudge> {
-    match flags
+/// The model judge at `--judge-url` or `SPAWN_JUDGE_URL`. Without one the
+/// Observer judges by the rules alone, and a case they cannot settle asks
+/// for attention.
+fn judge(flags: &Flags) -> Option<Arc<dyn StateJudge>> {
+    let url = flags
         .get("judge-url")
-        .or_else(|| env_value("SPAWN_JUDGE_URL"))
-    {
-        Some(url) => {
-            let mut config = JevConfig::new(&url);
-            if let Some(model) = env_value("SPAWN_JUDGE_MODEL") {
-                config.model = model;
-            }
-            Arc::new(JevJudge::new(config))
-        }
-        None => Arc::new(HeuristicJudge),
+        .or_else(|| env_value("SPAWN_JUDGE_URL"))?;
+    let mut config = JevConfig::new(&url);
+    if let Some(model) = env_value("SPAWN_JUDGE_MODEL") {
+        config.model = model;
     }
+    Some(Arc::new(JevJudge::new(config)))
 }

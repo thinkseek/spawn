@@ -77,7 +77,8 @@ fn fixture(judge: Arc<Scripted>) -> Fixture {
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
-    let observer = Observer::new(log, judge)
+    let observer = Observer::new(log)
+        .with_judge(judge)
         .with_clock(clock.clone())
         .with_context(Arc::new(Context));
     Fixture {
@@ -331,7 +332,8 @@ fn a_restarted_observer_does_not_ask_about_judged_evidence() {
 
     // A one-shot `spawn tick` builds a new Observer every run.
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut again = Observer::new(log, judge.clone())
+    let mut again = Observer::new(log)
+        .with_judge(judge.clone())
         .with_clock(fixture.clock.clone())
         .with_context(Arc::new(Context));
     fixture.clock.advance(Duration::from_secs(31));
@@ -593,7 +595,9 @@ fn a_restarted_observer_corrects_a_stale_row() {
         },
     );
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut fresh = Observer::new(log, judge.clone()).with_clock(fixture.clock.clone());
+    let mut fresh = Observer::new(log)
+        .with_judge(judge.clone())
+        .with_clock(fixture.clock.clone());
     assert_eq!(fresh.tick().expect("tick"), 1);
     let last = observations(&fixture.store).pop().expect("an observation");
     assert_eq!(last.state, SemanticState::Completed);
@@ -602,7 +606,9 @@ fn a_restarted_observer_corrects_a_stale_row() {
 
     // And a second restart writes nothing.
     let log: Arc<dyn EventLog> = fixture.store.clone();
-    let mut again = Observer::new(log, judge).with_clock(fixture.clock.clone());
+    let mut again = Observer::new(log)
+        .with_judge(judge)
+        .with_clock(fixture.clock.clone());
     assert_eq!(again.tick().expect("tick"), 0);
 }
 
@@ -639,7 +645,8 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let store = Arc::new(MemoryStore::new("shop", clock.clone()));
     let log: Arc<dyn EventLog> = store.clone();
-    let mut observer = Observer::new(log, judge)
+    let mut observer = Observer::new(log)
+        .with_judge(judge)
         .with_clock(clock)
         .with_context(Arc::new(Supervisor));
     started(&store);

@@ -197,10 +197,9 @@ Observer 每次 tick：
 
 | 实现 | 用途 |
 | --- | --- |
-| `HeuristicJudge` | 没有 Jev 地址（`SPAWN_JUDGE_URL`、`--judge-url`）时回答歧义情形的确定性判定器，离线可用，测试也用它；它不是规则层。`name()` 返回 `heuristic` |
 | `JevJudge` | HTTP，见第 8 节。`name()` 返回 `jev` |
 
-判定错误时写规则的猜测，原因 `JudgeUnavailable`、置信度 0、要求关注；不标记 Agent 死亡，按退避重试。
+判定错误时写规则的猜测，原因 `JudgeUnavailable`、置信度 0、要求关注；不标记 Agent 死亡，按退避重试。没有 Jev 地址（`SPAWN_JUDGE_URL`、`--judge-url`）时 Observer 只用规则（`Observer::new` 不带 `with_judge`）：规则定不了的情形照判定器不可用处理，记下歧义与规则的猜测，`judge` 为 `none`（`NO_JUDGE`），要求关注，由 dispatcher 上报而不是催促。日志里 `judge` 为 `heuristic`（已删除的判定器）的判定照常读取和显示。
 
 ## 8. Jev HTTP 契约
 

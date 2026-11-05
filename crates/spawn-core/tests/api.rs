@@ -15,8 +15,8 @@ use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
 };
 use spawn_core::memory::MemoryStore;
-use spawn_core::observation::SemanticState;
-use spawn_core::observe::{HeuristicJudge, Observer};
+use spawn_core::observation::{SemanticState, WaitReason};
+use spawn_core::observe::{NO_JUDGE, Observer};
 use spawn_core::port::{CommandQueue, EventLog, TerminalHost, WorkspaceStore};
 use spawn_core::screen::{ScreenState, read_claude_screen};
 use spawn_core::time::{ManualClock, Timestamp};
@@ -745,7 +745,7 @@ fn bridge_resumes_the_stored_native_session() {
 fn observer_writes_only_on_change() {
     let store = store();
     let log: Arc<dyn EventLog> = store.clone();
-    let mut observer = Observer::new(log, Arc::new(HeuristicJudge));
+    let mut observer = Observer::new(log);
 
     store
         .append(NewEvent {
@@ -795,7 +795,7 @@ fn observer_writes_only_on_change() {
         0,
         "no change, no write"
     );
-    let mut next = Observer::new(store.clone(), Arc::new(HeuristicJudge));
+    let mut next = Observer::new(store.clone());
     next.recover().expect("recover succeeds");
     assert_eq!(
         next.tick().expect("tick succeeds"),
@@ -819,9 +819,20 @@ fn observer_writes_only_on_change() {
     assert_eq!(observer.tick().expect("tick succeeds"), 1);
     let last = events(&store).pop().expect("an event");
     match last.kind {
+        // The rules cannot settle a stopped turn and no judge is
+        // configured: their guess stands, as ambiguous, and asks for
+        // attention, as when the judge is down.
         EventKind::ObservationRecorded { observation } => {
             assert_eq!(observation.state, SemanticState::Waiting);
             assert!(observation.based_on_seq >= SessionSeq(1));
+            assert_eq!(observation.judge, NO_JUDGE);
+            assert!(observation.ambiguity.is_some());
+            assert_eq!(observation.reason, Some(WaitReason::JudgeUnavailable));
+            assert!(observation.attention);
+            assert_eq!(
+                observation.attention_reason.as_deref(),
+                Some("judge_unavailable")
+            );
         }
         other => panic!("unexpected {other:?}"),
     }
