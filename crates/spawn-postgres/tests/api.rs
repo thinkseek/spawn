@@ -21,7 +21,7 @@ use spawn_core::event::{
 };
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
-    TerminalName, WorkspaceId,
+    WorkspaceId,
 };
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Confidence, Observation, SemanticState};
@@ -349,7 +349,6 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
             "exec_1:started",
             EventKind::ExecutionStarted {
                 engine: ENGINE.to_string(),
-                terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: CommandId(1),
                 fork: None,
@@ -490,7 +489,6 @@ fn a_task_lists_its_command_and_execution_events() {
             "exec_1:started",
             EventKind::ExecutionStarted {
                 engine: ENGINE.to_string(),
-                terminal: TerminalName::new("spawn-exec_1").expect("valid terminal"),
                 workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
                 command_id: command,
                 fork: None,
@@ -961,7 +959,6 @@ fn status_joins_the_judgement_and_the_latest_execution() {
             "exec_status:started",
             EventKind::ExecutionStarted {
                 engine: ENGINE.to_string(),
-                terminal: TerminalName::new("spawn-exec_status").expect("valid terminal"),
                 workspace: WorkspaceId::new("1:/workspaces/1").expect("valid workspace"),
                 command_id: CommandId(1),
                 fork: None,
@@ -982,6 +979,13 @@ fn status_joins_the_judgement_and_the_latest_execution() {
     );
     assert!(row.get::<_, bool>(2), "a started execution is live");
     assert_eq!(row.get::<_, i64>(3), 2);
+    // The record names no terminal: the pane is the execution's own.
+    let (terminal, workspace) = store
+        .latest_terminal(&session())
+        .expect("query succeeds")
+        .expect("an execution");
+    assert_eq!(terminal.as_str(), "spawn-exec_status");
+    assert_eq!(workspace, "1:/workspaces/1");
 }
 
 #[test]
@@ -1192,7 +1196,6 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                     &format!("exec_{number}:started"),
                     EventKind::ExecutionStarted {
                         engine: ENGINE.to_string(),
-                        terminal: TerminalName::for_execution(&execution),
                         workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
                         command_id: CommandId(number),
                         fork: None,

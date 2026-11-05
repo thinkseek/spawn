@@ -164,7 +164,6 @@ impl BridgeConfig {
 #[derive(Debug, Clone)]
 struct Active {
     execution_id: ExecutionId,
-    terminal: TerminalName,
     workspace: WorkspaceId,
     /// A tool or turn finished after the last commit.
     // ponytail: an `Unchanged` commit writes no event, so after a refold an
@@ -182,6 +181,14 @@ struct Active {
     started_ms: i64,
     /// What the Bridge has read of the engine's files and screen.
     follow: Follow,
+}
+
+impl Active {
+    /// The terminal that hosts the execution: always `spawn-<execution>`,
+    /// so it is derived, never stored.
+    fn terminal(&self) -> TerminalName {
+        TerminalName::for_execution(&self.execution_id)
+    }
 }
 
 /// The Bridge's own view of a running engine, rebuilt after a restart: read
@@ -471,16 +478,12 @@ impl Bridge {
             .is_some_and(|active| event.execution_id.as_ref() == Some(&active.execution_id));
         match &event.kind {
             EventKind::ExecutionStarted {
-                terminal,
-                workspace,
-                model,
-                ..
+                workspace, model, ..
             } => {
                 view.model = *model;
                 if let Some(execution_id) = event.execution_id.clone() {
                     view.active = Some(Active {
                         execution_id,
-                        terminal: terminal.clone(),
                         workspace: workspace.clone(),
                         checkpoint: None,
                         turn_open: false,
@@ -598,7 +601,10 @@ impl Bridge {
             .or_else(|| self.exit_status(session, active, report))
         {
             Some(end) => Some(end),
-            None => match self.terminals.is_alive(&active.terminal, &active.workspace) {
+            None => match self
+                .terminals
+                .is_alive(&active.terminal(), &active.workspace)
+            {
                 Ok(true) => {
                     self.follow_screen(agent_id, session, active)?;
                     None
@@ -613,7 +619,7 @@ impl Bridge {
                 Err(error) => {
                     report
                         .warnings
-                        .push(format!("is_alive {}: {error}", active.terminal));
+                        .push(format!("is_alive {}: {error}", active.terminal()));
                     None
                 }
             },
@@ -853,9 +859,9 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
     ) -> Result<(), StoreError> {
-        let Ok(pane) = self
-            .terminals
-            .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+        let Ok(pane) =
+            self.terminals
+                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
         else {
             return Ok(());
         };
@@ -957,11 +963,11 @@ impl Bridge {
         }
         if let Err(error) = self
             .terminals
-            .terminate(&active.terminal, &active.workspace)
+            .terminate(&active.terminal(), &active.workspace)
         {
             report
                 .warnings
-                .push(format!("terminate {}: {error}", active.terminal));
+                .push(format!("terminate {}: {error}", active.terminal()));
             return Ok(false);
         }
         if let Err(error) = self.workspaces.unmount(&active.workspace) {
@@ -993,11 +999,11 @@ impl Bridge {
     ) -> Result<(), StoreError> {
         if let Err(error) = self
             .terminals
-            .terminate(&active.terminal, &active.workspace)
+            .terminate(&active.terminal(), &active.workspace)
         {
             report
                 .warnings
-                .push(format!("terminate {}: {error}", active.terminal));
+                .push(format!("terminate {}: {error}", active.terminal()));
         }
         report.warnings.push(format!(
             "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; the terminal is down, \
@@ -1239,10 +1245,8 @@ impl Bridge {
                 },
             )?;
         }
-        let execution = ExecutionId::for_command(claimed.command_id);
         let active = Active {
-            terminal: TerminalName::for_execution(&execution),
-            execution_id: execution,
+            execution_id: ExecutionId::for_command(claimed.command_id),
             workspace,
             checkpoint: None,
             turn_open: false,
@@ -1260,7 +1264,6 @@ impl Bridge {
             Some(format!("{}:started", active.execution_id)),
             EventKind::ExecutionStarted {
                 engine: ENGINE.to_string(),
-                terminal: active.terminal.clone(),
                 workspace: active.workspace.clone(),
                 command_id: claimed.command_id,
                 fork,
@@ -1447,7 +1450,7 @@ impl Bridge {
         // pane needs no login of its own.
         environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file(active)));
         Launch {
-            terminal: active.terminal.clone(),
+            terminal: active.terminal(),
             workspace: active.workspace.clone(),
             cwd: active.workspace.path().to_string(),
             program: self.config.spawn_program.clone(),
@@ -1474,7 +1477,7 @@ impl Bridge {
             attempt += 1;
             let Ok(pane) =
                 self.terminals
-                    .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+                    .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
             else {
                 return Ok(Outcome::Failed("terminal disappeared".to_string()));
             };
@@ -1484,7 +1487,7 @@ impl Bridge {
                 trusted = true;
                 if let Err(error) =
                     self.terminals
-                        .send_keys(&active.terminal, &active.workspace, &TRUST_KEYS)
+                        .send_keys(&active.terminal(), &active.workspace, &TRUST_KEYS)
                 {
                     return Ok(Outcome::Failed(format!("answer trust dialog: {error}")));
                 }
@@ -1509,7 +1512,7 @@ impl Bridge {
             )?;
             return match self
                 .terminals
-                .submit_text(&active.terminal, &active.workspace, prompt)
+                .submit_text(&active.terminal(), &active.workspace, prompt)
             {
                 Ok(()) => Ok(Outcome::Succeeded),
                 Err(error) => Ok(Outcome::Failed(format!("submit prompt: {error}"))),
@@ -1527,9 +1530,9 @@ impl Bridge {
                 claimed.session_id
             )));
         };
-        let Ok(pane) = self
-            .terminals
-            .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+        let Ok(pane) =
+            self.terminals
+                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
         else {
             return Ok(Outcome::Failed("terminal disappeared".to_string()));
         };
@@ -1554,7 +1557,7 @@ impl Bridge {
         let (typed, through) = self.with_notice(&claimed.session_id, text);
         match self
             .terminals
-            .submit_text(&active.terminal, &active.workspace, &typed)
+            .submit_text(&active.terminal(), &active.workspace, &typed)
         {
             Ok(()) => {
                 // A turn starts now, before its transcript says so.

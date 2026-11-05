@@ -69,7 +69,7 @@ spawn-core
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行） | error |
-| `execution.started` | Bridge | engine、terminal、workspace、command_id；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
+| `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code |
 | `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
 | `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
