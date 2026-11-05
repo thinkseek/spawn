@@ -23,7 +23,21 @@
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
-//!   next task waits) until the work lands or the gate sends it back.
+//!   next task waits) until the work lands or the gate sends it back;
+//! - a resident whose latest delivered task is cancelled, whatever cancelled
+//!   it (`spawn task cancel`, the supervisor, the integrator's abort over
+//!   budget, the closure rule), is stopped at once if it runs, idle or in
+//!   the middle of a turn: a Stop takes a final checkpoint, and nothing of
+//!   the task's turn is left to finish. Once it no longer runs, the task's
+//!   work is set aside ([`crate::set_aside`]: a commit on top of its branch
+//!   whose tree is the checkpoint the task started from; the work stays in
+//!   the branch's history) and the worker is resumed with a notice that
+//!   names the task, says it is cancelled and where its work is. Its next
+//!   task waits until that notice reached it ([`Work::blocked`]). A task
+//!   never delivered, or not the latest delivery, changes nothing for its
+//!   worker; an ephemeral worker is only stopped, and a retired resident is
+//!   stopped and not told. A cancelled task's report is never collected: only
+//!   delivered tasks are, and only a report written after their own mark.
 //!
 //! Missions, reports, approvals, human commands to workers (with their
 //! outcome) and failed deliveries become digest items for the supervisor ([`news_items`]). Like
@@ -156,6 +170,78 @@ impl TaskRow {
     }
 }
 
+/// A resident whose latest delivered task is cancelled, from
+/// `cancelled_deliveries`: it is stopped, its work set aside, and it is told.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Cancelled {
+    /// The cancelled task.
+    pub(crate) id: i64,
+    pub(crate) mission_id: i64,
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    /// The checkpoint the task started from; `None`: the branch's fork from
+    /// `main`.
+    #[serde(default)]
+    pub(crate) start: Option<String>,
+    /// The set-aside already recorded for the task.
+    #[serde(default)]
+    pub(crate) set_aside: Option<String>,
+    /// The notice reached the worker.
+    #[serde(default)]
+    pub(crate) told: bool,
+    /// The task's last control record (`task.cancelled`, `task.aborted`).
+    #[serde(default)]
+    pub(crate) closed_by: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+}
+
+impl Cancelled {
+    /// Key prefix of the notice's attempts: `cancel-notice-<task>-<n>`.
+    fn notice_prefix(&self) -> String {
+        format!("cancel-notice-{}-", self.id)
+    }
+
+    fn command(&self, key: String, action: CommandAction) -> Order {
+        Order {
+            agent_id: self.agent_id.clone(),
+            session_id: self.session_id.clone(),
+            key,
+            action,
+            task: None,
+        }
+    }
+}
+
+/// The task a cancel notice's key (`cancel-notice-<task>-<n>`) is about.
+pub(crate) fn notice_task(key: &str) -> Option<i64> {
+    key.strip_prefix("cancel-notice-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// What a resident is told when its latest task was cancelled: the task,
+/// that it is cancelled, and what to do now. Where its work went is added
+/// when the work is set aside ([`crate::set_aside::note`]).
+pub(crate) fn cancel_notice(cancelled: &Cancelled) -> String {
+    let by = match (cancelled.closed_by.as_deref(), cancelled.reason.as_deref()) {
+        (Some("task.aborted"), Some(reason)) => {
+            format!(" by the integrator ({})", one_line(reason, 300))
+        }
+        (Some("task.aborted"), None) => " by the integrator".to_string(),
+        _ => String::new(),
+    };
+    format!(
+        "[Task #{id} was cancelled — this is not a new task]\nTask #{id} of mission #{mission} \
+was cancelled{by}. Stop working on it: do not continue it and do not write a report for it; \
+nothing written for it is collected. Wait for your next task.",
+        id = cancelled.id,
+        mission = cancelled.mission_id,
+    )
+}
+
 /// An open mission, for the supervisor's inbox.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct MissionNote {
@@ -235,6 +321,8 @@ pub(crate) struct Work {
     pub(crate) news: News,
     /// Retired residents, as (agent, session).
     pub(crate) retired: Vec<(String, String)>,
+    /// Residents whose latest delivered task is cancelled.
+    pub(crate) cancelled: Vec<Cancelled>,
 }
 
 impl Work {
@@ -247,6 +335,8 @@ impl Work {
             news: serde_json::from_value(store.mission_news().map_err(error)?)
                 .map_err(|error| format!("mission news: {error}"))?,
             retired: store.retired_residents().map_err(error)?,
+            cancelled: serde_json::from_value(store.cancelled_deliveries().map_err(error)?)
+                .map_err(|error| format!("cancelled deliveries: {error}"))?,
         })
     }
 
@@ -273,6 +363,14 @@ impl Work {
                 .iter()
                 .filter(|task| task.state == TaskState::Accepted && task.gated)
                 .map(|task| task.session_id.as_str()),
+        );
+        // A resident not yet told that its latest task was cancelled gets
+        // nothing else first.
+        blocked.extend(
+            self.cancelled
+                .iter()
+                .filter(|cancelled| !cancelled.told)
+                .map(|cancelled| cancelled.session_id.as_str()),
         );
         blocked
     }
@@ -560,6 +658,11 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
             | TaskState::Landed => {}
         }
     }
+    for cancelled in work.cancelled.iter().filter(|cancelled| !cancelled.told) {
+        if let Some(facts) = facts.get(cancelled.session_id.as_str()) {
+            orders.extend(cancel_order(cancelled, facts, now_ms));
+        }
+    }
     for (agent, session) in &work.retired {
         if let Some(facts) = facts.get(session.as_str())
             && facts.live_and_free()
@@ -578,6 +681,49 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
         }
     }
     orders
+}
+
+/// The next step for a resident not yet told that its latest task was
+/// cancelled: a live one is stopped (once per execution; a stop that fails is
+/// pursued by [`crate::dispatch`]), one that no longer runs is resumed with
+/// the notice, whose work is set aside first ([`crate::dispatch::step`]). A
+/// notice that failed goes again under a key of its own, after a wait that
+/// doubles ([`retry_wait_ms`]).
+fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Order> {
+    if facts.open_command || facts.stopping() {
+        return None;
+    }
+    if facts.live {
+        let execution = facts.execution_id.as_deref().unwrap_or("none");
+        let key = format!("cancel-stop-{}-{execution}", cancelled.id);
+        return Some(cancelled.command(key, CommandAction::Stop));
+    }
+    facts.execution_id.as_ref()?;
+    let prefix = cancelled.notice_prefix();
+    let attempts: Vec<&crate::dispatch::Sent> = facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key.starts_with(&prefix))
+        .collect();
+    if let Some(last) = attempts.last() {
+        match last.succeeded {
+            // Told: the next pass reads it from the log.
+            None | Some(true) => return None,
+            Some(false) => {
+                let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+                if now_ms < finished.saturating_add(retry_wait_ms(attempts.len())) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(cancelled.command(
+        format!("{prefix}{}", attempts.len()),
+        CommandAction::Resume {
+            prompt: Some(cancel_notice(cancelled)),
+            model: None,
+        },
+    ))
 }
 
 /// How every task asks to be reported on.
