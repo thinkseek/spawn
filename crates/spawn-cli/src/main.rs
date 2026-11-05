@@ -91,3 +91,38 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         other => Err(format!("unknown command {other}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    #[test]
+    fn the_usage_names_each_command_once_and_no_removed_one() {
+        let list = USAGE
+            .split_once('<')
+            .and_then(|(_, rest)| rest.strip_suffix('>'))
+            .expect("usage: spawn <a|b|…>");
+        let words: Vec<&str> = list.split('|').collect();
+        let mut unique = words.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), words.len(), "a command listed twice: {list}");
+        for removed in ["status", "dispatch", "charter", "hook", "corpus", "judge"] {
+            assert!(
+                !words.contains(&removed),
+                "{removed} is no longer a command"
+            );
+        }
+        for core in [
+            "loop",
+            "integrate",
+            "mission",
+            "task",
+            "fleet",
+            "tail",
+            "run",
+        ] {
+            assert!(words.contains(&core), "{core} is a core command");
+        }
+    }
+}
