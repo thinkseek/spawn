@@ -1182,7 +1182,7 @@ mod tests {
             ));
         }
         let rows = vec![facts];
-        assert!(DELIVERY_RETRIES < 5, "at most 5 Stops in all");
+        const { assert!(DELIVERY_RETRIES < 5, "at most 5 Stops in all") };
         assert!(
             super::orders(&tasks, &rows, i64::MAX / 2).is_empty(),
             "no Stop after the last retry"
