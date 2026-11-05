@@ -38,6 +38,8 @@ interface VerdictListProps {
   selected: number | null;
   onSelect: (task: number) => void;
   className?: string;
+  /** Beside the title: the Timeline/Table switch. */
+  action?: ReactNode;
 }
 
 /** Every gate verdict of the mission, newest first: what the gate said
@@ -47,6 +49,7 @@ export function VerdictList({
   selected,
   onSelect,
   className,
+  action,
 }: VerdictListProps) {
   useNow(1_000);
   const accepted = verdicts.filter((entry) => entry.verdict === "accepted").length;
@@ -56,7 +59,8 @@ export function VerdictList({
         icon={<Gavel size={14} />}
         title="Gate verdicts"
         meta={
-          verdicts.length > 0 && (
+          <>
+          {verdicts.length > 0 && (
             <span className="tnum">
               {verdicts.length} total
               <span className="mx-1.5 text-faint-foreground">·</span>
@@ -64,7 +68,9 @@ export function VerdictList({
                 {accepted} accepted
               </span>
             </span>
-          )
+          )}
+          {action}
+          </>
         }
       />
       {verdicts.length === 0 ? (

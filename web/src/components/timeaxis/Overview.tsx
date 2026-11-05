@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useRef } from "react";
 import type { PointerEvent } from "react";
 
-import { clampDomain, panDomain, spanEnd, zoomDomain } from "../../trace";
-import type { Domain, Trace } from "../../trace";
-import { KIND_COLOR } from "./style";
+import { clampDomain, panDomain, zoomDomain } from "../../timeWindow";
+import type { Domain } from "../../timeWindow";
 
 const HEIGHT = 40;
 const PAD_Y = 5;
@@ -15,22 +14,31 @@ type Grab =
   | { mode: "from" | "to"; domain: Domain }
   | { mode: "select"; x: number; moved: boolean };
 
-/** The whole session compressed into one strip, with the visible window as
+/** One mark in the strip: a hairline from `from` to `to` at a height
+ * between 0 (top) and 1 (bottom). */
+export interface OverviewLine {
+  id: string;
+  from: number;
+  to: number;
+  /** 0..1, top to bottom. */
+  y: number;
+  color: string;
+}
+
+/** The whole extent compressed into one strip, with the visible window as
  * a brush: drag it to pan, drag its edges to resize, drag elsewhere to pick
  * a new window, click to centre there, scroll to zoom. */
 export function Overview({
-  trace,
+  lines,
   extent,
   domain,
-  now,
   width,
   onDomain,
   onGlide,
 }: {
-  trace: Trace;
+  lines: OverviewLine[];
   extent: Domain;
   domain: Domain;
-  now: number;
   width: number;
   onDomain: (domain: Domain) => void;
   onGlide: (domain: Domain) => void;
@@ -43,20 +51,6 @@ export function Overview({
     const left = ref.current?.getBoundingClientRect().left ?? 0;
     return extent.from + (clientX - left) * msPerPx;
   };
-
-  // Each span as a hairline at its row's height in the full list: the
-  // strip reads as a thumbnail of the trace below.
-  const lines = useMemo(() => {
-    const count = Math.max(trace.spans.length - 1, 1);
-    const band = HEIGHT - PAD_Y * 2;
-    return trace.spans.map((span, index) => ({
-      id: span.id,
-      y: PAD_Y + (trace.spans.length === 1 ? band / 2 : (index / count) * band),
-      from: span.start,
-      to: spanEnd(span, now),
-      color: span.failed && span.kind === "tool" ? "var(--destructive)" : KIND_COLOR[span.kind],
-    }));
-  }, [trace, now]);
 
   const latest = useRef({ domain, extent, msPerPx, onDomain });
   latest.current = { domain, extent, msPerPx, onDomain };
@@ -160,6 +154,7 @@ export function Overview({
       <svg width={width} height={HEIGHT} className="absolute inset-0" aria-hidden="true">
         <g strokeLinecap="round" strokeWidth={2}>
           {lines.map((line) => {
+            const y = PAD_Y + line.y * (HEIGHT - PAD_Y * 2);
             const a = px(line.from);
             const b = Math.max(px(line.to), a + 1);
             return (
@@ -167,8 +162,8 @@ export function Overview({
                 key={line.id}
                 x1={a}
                 x2={b}
-                y1={line.y}
-                y2={line.y}
+                y1={y}
+                y2={y}
                 stroke={line.color}
                 opacity={0.75}
               />
