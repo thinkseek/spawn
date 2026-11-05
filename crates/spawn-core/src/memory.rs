@@ -14,8 +14,8 @@ use crate::event::{
     Appended, EventKind, EventRecord, Fork, GlobalPosition, NewEvent, SessionSeq, Source,
 };
 use crate::id::{
-    BranchName, CommandId, CommitId, IdempotencyKey, Principal, SessionId, TerminalName,
-    WorkspaceId,
+    BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
+    TerminalName, WorkspaceId,
 };
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT, StoreError,
@@ -88,6 +88,41 @@ struct State {
 }
 
 impl State {
+    /// The session's latest execution when it has no end the Bridge wrote:
+    /// a start of another is refused, as `spawn_append_trusted` refuses it.
+    fn open_execution(&self, session: &SessionId) -> Option<ExecutionId> {
+        let (index, started) =
+            self.events
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, record)| {
+                    let event = &record.event;
+                    let started = event.execution_id.as_ref()?;
+                    (event.session_id == *session
+                        && matches!(event.kind, EventKind::ExecutionStarted { .. }))
+                    .then_some((index, started))
+                })?;
+        let ended = self.events[index + 1..].iter().any(|record| {
+            record.event.session_id == *session
+                && record.event.source == Source::Bridge
+                && record.event.execution_id.as_ref() == Some(started)
+                && matches!(record.event.kind, EventKind::ExecutionEnded { .. })
+        });
+        (!ended).then(|| started.clone())
+    }
+
+    /// Whether `event` repeats a stored `(session, source, key)`.
+    fn repeats(&self, event: &NewEvent) -> bool {
+        event.source_event_id.as_deref().is_some_and(|key| {
+            self.events.iter().any(|record| {
+                record.event.session_id == event.session_id
+                    && record.event.source == event.source
+                    && record.event.source_event_id.as_deref() == Some(key)
+            })
+        })
+    }
+
     fn insert(&mut self, event: NewEvent, now: Timestamp) -> (EventRecord, bool) {
         if let Some(key) = event.source_event_id.as_deref() {
             let repeated = self.events.iter().find(|record| {
@@ -212,6 +247,15 @@ impl EventLog for MemoryStore {
         if state.branch_record_fails && branch_record {
             state.branch_record_fails = false;
             return Err(StoreError::Backend("the log is down".to_string()));
+        }
+        if matches!(event.kind, EventKind::ExecutionStarted { .. })
+            && !state.repeats(&event)
+            && let Some(open) = state.open_execution(&event.session_id)
+        {
+            return Err(StoreError::Rejected(format!(
+                "session {} already runs execution {open}",
+                event.session_id
+            )));
         }
         let (record, inserted) = state.insert(event, now);
         Ok(Appended { record, inserted })

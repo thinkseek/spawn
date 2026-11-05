@@ -150,9 +150,7 @@ fn bearer(text: &str) -> String {
             let start = at + 6 + spaces;
             let token = bytes[start..]
                 .iter()
-                .take_while(|byte| {
-                    byte.is_ascii_alphanumeric() || b"-._~+/=_".contains(byte)
-                })
+                .take_while(|byte| byte.is_ascii_alphanumeric() || b"-._~+/=_".contains(byte))
                 .count();
             if spaces > 0 && token >= 8 {
                 out.extend_from_slice(&bytes[at..start]);
@@ -191,7 +189,10 @@ fn api_key_header(text: &str) -> String {
                 }
             };
             skip(&mut start, b" \t\"'");
-            if bytes.get(start).is_some_and(|byte| *byte == b':' || *byte == b'=') {
+            if bytes
+                .get(start)
+                .is_some_and(|byte| *byte == b':' || *byte == b'=')
+            {
                 start += 1;
                 skip(&mut start, b" \t\"'");
                 let end = value_end(bytes, start, b"\"',;}");
@@ -220,9 +221,7 @@ fn userinfo(text: &str) -> String {
             let end = start
                 + bytes[start..]
                     .iter()
-                    .take_while(|byte| {
-                        !byte.is_ascii_whitespace() && !b"@/?#\"'<>".contains(byte)
-                    })
+                    .take_while(|byte| !byte.is_ascii_whitespace() && !b"@/?#\"'<>".contains(byte))
                     .count();
             if bytes.get(end) == Some(&b'@')
                 && let Some(colon) = bytes[start..end].iter().position(|byte| *byte == b':')
@@ -374,7 +373,10 @@ mod tests {
             redact("GET /cb?token=abc&page=2"),
             format!("GET /cb?token={REDACTED}&page=2")
         );
-        assert_eq!(redact("AWS_SECRET_ACCESS_KEY=wJal"), format!("AWS_SECRET_ACCESS_KEY={REDACTED}"));
+        assert_eq!(
+            redact("AWS_SECRET_ACCESS_KEY=wJal"),
+            format!("AWS_SECRET_ACCESS_KEY={REDACTED}")
+        );
         // Other assignments, and empty values, stay.
         assert_eq!(redact("PATH=/bin a==b KEY= x"), "PATH=/bin a==b KEY= x");
     }

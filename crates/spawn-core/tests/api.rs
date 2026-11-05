@@ -257,6 +257,7 @@ fn memory_backend_passes_the_contract() {
     let store = store();
     let concrete: &MemoryStore = store.as_ref();
     contract::event_log("mem_evt", concrete);
+    contract::one_execution("mem_one", concrete);
     contract::command_queue("mem_cmd", concrete, concrete);
     contract::workspace_store("mem_ws", concrete);
     contract::terminal("mem_tty", concrete);
@@ -370,6 +371,88 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
     tick_fresh(&store);
     tick_fresh(&store);
     assert_eq!(ended(&store), vec![EndCause::Stopped, EndCause::Lost]);
+}
+
+/// A log whose reader sees nothing: a Bridge over it has not read what
+/// another Bridge appended.
+struct Unread(Arc<MemoryStore>);
+
+impl EventLog for Unread {
+    fn append(
+        &self,
+        event: NewEvent,
+    ) -> Result<spawn_core::event::Appended, spawn_core::port::StoreError> {
+        self.0.append(event)
+    }
+
+    fn read_global(
+        &self,
+        _after: GlobalPosition,
+        _limit: usize,
+    ) -> Result<Vec<spawn_core::event::EventRecord>, spawn_core::port::StoreError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn a_second_bridge_that_missed_the_start_is_refused_by_the_log() {
+    let store = store();
+    let first = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&first, READY);
+    submit_start(&store, "first");
+    tick_fresh(&store);
+
+    // Another Bridge process, which has not read that start, takes the
+    // session's next start.
+    submit(
+        &store,
+        "key_again",
+        CommandAction::Start {
+            engine: ENGINE.to_string(),
+            prompt: "second".to_string(),
+            parent_session_id: None,
+            from: None,
+            model: None,
+        },
+    );
+    let mut other = Bridge::new(
+        Arc::new(Unread(store.clone())),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("other"),
+    );
+    other.tick().expect("tick succeeds");
+
+    let failures: Vec<String> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::CommandFinished {
+                succeeded: false,
+                error,
+                ..
+            } => error,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures.len(), 1, "{:?}", names(&store));
+    assert!(failures[0].contains("already runs"), "{failures:?}");
+    let started = names(&store)
+        .into_iter()
+        .filter(|name| *name == "execution.started")
+        .count();
+    assert_eq!(started, 1, "one execution recorded");
+    assert_eq!(store.launches().len(), 1, "no second engine");
+    let calls = store.workspace_calls();
+    assert_eq!(
+        calls.iter().filter(|call| *call == "unmount").count(),
+        1,
+        "the refused start's own mount goes: {calls:?}"
+    );
+    assert!(store.is_alive(&first, &any_workspace()).expect("alive"));
+    // The first execution goes on and ends as before.
+    assert!(tick_fresh(&store).warnings.is_empty());
+    assert!(ended(&store).is_empty());
 }
 
 fn events(store: &MemoryStore) -> Vec<NewEvent> {
