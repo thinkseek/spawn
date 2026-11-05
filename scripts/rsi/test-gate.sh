@@ -844,8 +844,8 @@ keyed=$controller/rsi/scenarios
 # from_cache: the base results the last run took from the cache.
 from_cache() { sed -n 's/^| base results from the cache: \(.*\); run on the base:.*/\1/p' "$work/gate.out"; }
 judge "$good" "" "$keyed" >/dev/null
-expect "a first run on a base runs both objectives there" "$(cat "$work/gate.out")" \
-    '| base results from the cache: none; run on the base: 007.sh 011.sh'
+expect "the key is not the scenario's path: 007.sh is a hit from another directory" \
+    "$(cat "$work/gate.out")" '| base results from the cache: 007.sh; run on the base: 011.sh'
 expect "a cache hit: the same key again" "$(judge "$good" "" "$keyed")" 'exit=0 {"verdict":"accepted"}'
 expect "both results from the cache" "$(from_cache)" '007.sh 011.sh'
 expect "each named so in the log" "$(cat "$work/gate.out")" '| == base: 007.sh: unsolved (cached)'
@@ -897,8 +897,11 @@ expect "a miss: gate.sh's blob changed" "$(cat "$work/gate.out")" \
 mkdir -p "$work/other-rust"
 printf '#!/bin/sh\necho "rustc 0.0.1-other (test)"\necho "release: 0.0.1-other"\n' >"$work/other-rust/rustc"
 chmod +x "$work/other-rust/rustc"
-expect "a miss: another toolchain" "$(PATH="$work/other-rust:$PATH" judge "$good" "" "$keyed")" \
-    'exit=0 {"verdict":"accepted"}'
+saved_path=$PATH
+PATH=$work/other-rust:$PATH
+other_toolchain=$(judge "$good" "" "$keyed")
+PATH=$saved_path
+expect "a miss: another toolchain" "$other_toolchain" 'exit=0 {"verdict":"accepted"}'
 expect "run on the base" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
 expect "and the log names it" "$(cat "$work/gate.out")" 'toolchain rustc 0.0.1-other'
 judge "$good" "" "$keyed" >/dev/null
