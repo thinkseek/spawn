@@ -550,7 +550,7 @@ fn name_large_file(fixture: &Fixture, workspace: &WorkspaceId, branch: &str, pat
     let chunk = chunks.put(b"model").expect("put a chunk");
     let manifest = Manifest {
         files: vec![LargeFile {
-            path: path.to_string(),
+            path: path.into(),
             mode: 0o100_644,
             size: 5,
             chunks: vec![chunk],
@@ -871,4 +871,68 @@ fn a_path_with_a_leading_space_survives_a_conflicted_merge() {
     );
     let resolved = fixture.work(&workspace, &[(SPACED, "both\n")]);
     assert_eq!(parents(&fixture, &resolved)[1], main);
+}
+
+/// A file name that is not UTF-8.
+const NOT_UTF8: &[u8] = b"bad\xffname.txt";
+
+/// Write `text` to the file named [`NOT_UTF8`] in `directory`.
+fn write_not_utf8(directory: &Path, text: &str) {
+    use std::os::unix::ffi::OsStrExt;
+    fs::write(directory.join(std::ffi::OsStr::from_bytes(NOT_UTF8)), text)
+        .expect("write the file whose name is not UTF-8");
+}
+
+fn read_not_utf8(directory: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    fs::read(directory.join(std::ffi::OsStr::from_bytes(NOT_UTF8))).expect("read it")
+}
+
+#[test]
+fn a_conflict_in_a_file_whose_name_is_not_utf8_keeps_its_markers_until_resolved() {
+    let fixture = Fixture::new("not-utf8", &[("README.md", "base\n")]);
+    write_not_utf8(&fixture.checkout, "base\n");
+    fixture.land(&[]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    assert_eq!(read_not_utf8(&directory), b"base\n");
+    write_not_utf8(&directory, "mine\n");
+    let head = fixture.work(&workspace, &[]);
+    write_not_utf8(&fixture.checkout, "theirs\n");
+    let main = fixture.land(&[]);
+    let shown = String::from_utf8_lossy(NOT_UTF8).into_owned();
+
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec![shown.clone()],
+            marked: true
+        }
+    );
+    assert!(has_conflict_block(&read_not_utf8(&directory)));
+    // A checkpoint with the markers in is no resolution: main is no parent.
+    let Commit::Created(marked) = fixture.store.commit(&workspace, "wip").expect("commit") else {
+        panic!("the merge changed the workspace");
+    };
+    assert_eq!(parents(&fixture, marked.as_str()), vec![head]);
+    assert!(pending(&directory, "agent_a").exists());
+    // The integrator finds the committed markers under the file's own bytes.
+    assert_eq!(
+        fixture
+            .store
+            .conflict_markers(&main, marked.as_str())
+            .expect("scan"),
+        vec![shown.clone()]
+    );
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("still marked"),
+        BaseMerge::Conflicted {
+            files: vec![shown],
+            marked: true
+        }
+    );
+
+    write_not_utf8(&directory, "both\n");
+    let resolved = fixture.work(&workspace, &[]);
+    assert_eq!(parents(&fixture, &resolved)[1], main);
+    assert!(!pending(&directory, "agent_a").exists());
 }

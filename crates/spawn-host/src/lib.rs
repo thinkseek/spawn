@@ -8,6 +8,7 @@ pub mod chunks;
 pub mod gc;
 pub mod git;
 pub mod tmux;
+pub mod tree_path;
 
 pub use chunks::LocalChunkStore;
 pub use git::{
