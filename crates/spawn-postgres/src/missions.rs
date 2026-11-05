@@ -54,7 +54,8 @@ select jsonb_build_object(
                 and c.created_at_ms > spawn_now_ms() - 86400000), '[]'::jsonb)
 )";
 
-/// The board of missions with their tasks, newest first.
+/// The board of missions with their tasks, newest first; each task carries
+/// its stages ([`PostgresStore::task_stages`]).
 pub(crate) const MISSION_BOARD: &str = r"
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
@@ -67,7 +68,7 @@ select jsonb_build_object(
                  'state', k.state, 'revisions', k.revisions,
                  'review_note', k.review_note, 'report', k.report,
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
-                 'model', k.model,
+                 'model', k.model, 'stages', spawn_task_stages(k.id),
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
                  'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
@@ -437,6 +438,14 @@ impl PostgresStore {
     /// Missions with their tasks, and the resident roster.
     pub fn mission_board(&self, limit: i64) -> Result<Value, StoreError> {
         self.query_json(MISSION_BOARD, &[&limit])
+    }
+
+    /// A task's stages from the control stream, oldest first:
+    /// `[{stage, verdict?, at_ms, took_ms?}]`, `took_ms` the time since the
+    /// task's previous record. `[]` for a task with no records. The owner's
+    /// and the supervisor's logins both read it.
+    pub fn task_stages(&self, task: i64) -> Result<Value, StoreError> {
+        self.query_json("select spawn_task_stages($1)", &[&task])
     }
 
     /// The last gate verdict of every task, keyed by task id. Needs read
