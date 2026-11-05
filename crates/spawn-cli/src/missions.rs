@@ -27,6 +27,8 @@ const USAGE: &str = "usage:
   spawn task reject --id N [--revision R] --note <what to fix>
       (R: the report's revision as read; refused once the task has moved on)
   spawn task cancel --id N
+      (a delivered task's resident is stopped at once, its work set aside on its branch,
+       and it is told before its next task; an ephemeral worker is stopped)
   spawn task stages --id N   (each stage with its verdict, time, and how long since the one before)
   spawn resident propose --name <name> --charter <text>
   spawn resident approve --name <name>
