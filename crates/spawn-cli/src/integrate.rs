@@ -675,16 +675,10 @@ fn landing_candidate(
             "rev-parse",
             &format!("{branch}^{{tree}}"),
         ])?;
-        return git(&[
-            "--git-dir",
+        return commit_landing(
             mirror_path,
-            "commit-tree",
-            &tree,
-            "-p",
-            branch,
-            "-m",
-            &format!("Land task {task}"),
-        ])
+            &[&tree, "-p", branch, "-m", &format!("Land task {task}")],
+        )
         .map(Some);
     }
     // Main moved since the worker started: land the merge of both, by
@@ -703,19 +697,48 @@ fn landing_candidate(
         return Ok(None);
     };
     let tree = tree.lines().next().unwrap_or_default().to_string();
-    git(&[
-        "--git-dir",
+    commit_landing(
         mirror_path,
-        "commit-tree",
-        &tree,
-        "-p",
-        main,
-        "-p",
-        branch,
-        "-m",
-        &format!("Land task {task} (merged with main)"),
-    ])
+        &[
+            &tree,
+            "-p",
+            main,
+            "-p",
+            branch,
+            "-m",
+            &format!("Land task {task} (merged with main)"),
+        ],
+    )
     .map(Some)
+}
+
+/// Name and email of the author and committer of every landing commit.
+const LANDING_IDENTITY: (&str, &str) = ("spawn-integrate", "integrate@localhost");
+
+/// `git commit-tree <arguments>` in the mirror, authored and committed as
+/// [`LANDING_IDENTITY`] and unsigned: a landing never depends on the host's
+/// git configuration (no identity in `~/.gitconfig`, another one there or in
+/// the environment, `commit.gpgSign`). The identity goes in the environment,
+/// which git takes over any configuration.
+fn commit_landing(mirror_path: &str, arguments: &[&str]) -> Result<String, String> {
+    let (name, email) = LANDING_IDENTITY;
+    let output = std::process::Command::new("git")
+        .args(["--git-dir", mirror_path, "commit-tree", "--no-gpg-sign"])
+        .args(arguments)
+        .env("GIT_AUTHOR_NAME", name)
+        .env("GIT_AUTHOR_EMAIL", email)
+        .env("GIT_COMMITTER_NAME", name)
+        .env("GIT_COMMITTER_EMAIL", email)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("run git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git commit-tree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// The note that sends work back before it is judged, when a merge of main
@@ -848,6 +871,7 @@ mod tests {
             "-c",
             "user.email=t@t",
             "commit",
+            "--no-gpg-sign",
             "-qm",
             message,
         ])
@@ -1115,5 +1139,116 @@ mod tests {
         assert_eq!(gated.ready().map(|task| task.id), Some(2));
         gated.accept = "gate".to_string();
         assert_eq!(gated.ready().map(|task| task.id), Some(1));
+    }
+
+    /// Both landing commits [`super::landing_candidate`] writes (a branch
+    /// head with the large-file trailer, a merge with a main that moved) are
+    /// by [`super::LANDING_IDENTITY`], as author and as committer. Run by
+    /// [`landing_commits_ignore_the_hosts_git_configuration`] under a home
+    /// without or with a hostile git configuration; alone it checks the same
+    /// under the caller's.
+    #[test]
+    #[ignore = "run by landing_commits_ignore_the_hosts_git_configuration"]
+    fn landing_commits_are_by_the_integrator() {
+        let git = crate::sources::git;
+        let base = std::env::temp_dir().join(format!(
+            "spawn-land-identity-{}-{}",
+            std::process::id(),
+            std::env::var("SPAWN_TEST_LANDING_CASE").unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let main = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("main");
+        // A branch head on main that names a large-file manifest.
+        git(&["-C", &seed_path, "checkout", "-qb", "agent_large"]).expect("branch");
+        std::fs::write(seed.join("work.txt"), "work\n").expect("write");
+        let trailer = format!("work\n\nSpawn-Large: {}", "a".repeat(64));
+        commit_in(&seed_path, &trailer);
+        let large = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("large");
+        // A branch beside a main that moved on.
+        git(&["-C", &seed_path, "checkout", "-qb", "agent_late", &main]).expect("branch");
+        std::fs::write(seed.join("late.txt"), "late\n").expect("write");
+        commit_in(&seed_path, "late");
+        let late = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("late");
+        git(&["-C", &seed_path, "checkout", "-q", "main"]).expect("main");
+        std::fs::write(seed.join("other.txt"), "theirs\n").expect("write");
+        commit_in(&seed_path, "elsewhere");
+        let moved = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("moved");
+        let mirror = format!("{seed_path}/.git");
+
+        for (main, branch) in [(main.as_str(), large.as_str()), (&moved, &late)] {
+            let landing = super::landing_candidate(&mirror, main, branch, 7)
+                .expect("a landing")
+                .expect("no conflict");
+            assert_ne!(landing, branch, "a commit of the integrator's own");
+            let who = git(&[
+                "--git-dir",
+                &mirror,
+                "show",
+                "-s",
+                "--format=%an <%ae>%n%cn <%ce>",
+                &landing,
+            ])
+            .expect("show");
+            let expected = format!(
+                "{0} <{1}>",
+                super::LANDING_IDENTITY.0,
+                super::LANDING_IDENTITY.1
+            );
+            assert_eq!(who, format!("{expected}\n{expected}"));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn landing_commits_ignore_the_hosts_git_configuration() {
+        let base = std::env::temp_dir().join(format!("spawn-land-homes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).expect("an empty home");
+        // Another identity, no identity guessed, and every commit signed by
+        // a gpg that does not exist.
+        let hostile = base.join("hostile");
+        std::fs::create_dir_all(&hostile).expect("a hostile home");
+        std::fs::write(
+            hostile.join(".gitconfig"),
+            "[user]\n\tname = Someone Else\n\temail = else@example.com\n\tuseConfigOnly = true\n\
+             [commit]\n\tgpgSign = true\n[gpg]\n\tprogram = /nonexistent/gpg\n",
+        )
+        .expect("write the hostile configuration");
+        let program = std::env::current_exe().expect("the test binary");
+        for (case, home) in [("empty", &empty), ("hostile", &hostile)] {
+            let output = std::process::Command::new(&program)
+                .args([
+                    "--exact",
+                    "integrate::tests::landing_commits_are_by_the_integrator",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HOME", home)
+                .env("XDG_CONFIG_HOME", home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("SPAWN_TEST_LANDING_CASE", case)
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_AUTHOR_NAME")
+                .env_remove("GIT_AUTHOR_EMAIL")
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_COMMITTER_EMAIL")
+                .env_remove("EMAIL")
+                .output()
+                .expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{case} home: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
