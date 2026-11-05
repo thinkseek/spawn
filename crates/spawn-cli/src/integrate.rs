@@ -43,6 +43,7 @@
 //! per database, so two gates never run at once.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -57,7 +58,7 @@ use spawn_postgres::PostgresStore;
 use crate::config::{loop_interval, workspace_root};
 use crate::gate::{self, GateFailure};
 use crate::{Flags, env_or, open_store};
-use crate::{objectives, sources};
+use crate::{main_merge, objectives, sources};
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
@@ -336,7 +337,7 @@ impl Integrator {
     fn pass(&self) -> Result<(), String> {
         // A store per pass: the advisory lock belongs to the connection, and
         // is released with it.
-        let store = open_store()?;
+        let store = Arc::new(open_store()?);
         if !store
             .integrator_try_lock()
             .map_err(|error| error.to_string())?
@@ -359,7 +360,7 @@ impl Integrator {
     }
 
     /// One mission's step. True when it recorded anything.
-    fn mission(&self, store: &PostgresStore, mission: &Mission) -> Result<bool, String> {
+    fn mission(&self, store: &Arc<PostgresStore>, mission: &Mission) -> Result<bool, String> {
         if mission.halted.is_some() {
             return Ok(false);
         }
@@ -476,7 +477,7 @@ impl Integrator {
     #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
-        store: &PostgresStore,
+        store: &Arc<PostgresStore>,
         mirror: &Path,
         source: &str,
         main: &str,
@@ -522,7 +523,7 @@ impl Integrator {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn judge_pushed(
         &self,
-        store: &PostgresStore,
+        store: &Arc<PostgresStore>,
         mirror: &Path,
         source: &str,
         main: &str,
@@ -566,16 +567,17 @@ impl Integrator {
             return gated("conflict", json!({ "note": note }));
         }
         let Some(candidate) = landing_candidate(&mirror_path, main, &branch, task.id)? else {
+            // The worker cannot merge main itself: merge it into the
+            // workspace now, while the worker waits for this verdict, so
+            // the note names what it has to resolve.
+            let merge = main_merge::merge_main(store, &self.root, &task.agent_id, &task.session_id);
+            println!(
+                "integrate: task {}: main into its workspace: {merge:?}",
+                task.id
+            );
             return gated(
                 "conflict",
-                json!({"note": format!(
-                        "Your work conflicts with the source's current main ({main}). \
-                         Main is merged into your workspace when a turn of yours ends and \
-                         while you are idle (within about 30 s), so the conflicting files \
-                         carry conflict markers there (<<<<<<< / ======= / >>>>>>>; if \
-                         none show yet, they will once this turn ends). Resolve them, keeping both sides' intent and removing every \
-                         marker, then report again: the checkpoint after the last marker \
-                         is gone records the merge.")}),
+                json!({"note": main_merge::conflict_note(main, &merge)}),
             );
         };
         let tree_of = |commit: &str| {
@@ -687,8 +689,7 @@ fn landing_candidate(
     }
     // Main moved since the worker started: land the merge of both, by
     // main's merge rules (a bare repository reads no in-tree
-    // .gitattributes otherwise), as the Bridge merges main into idle
-    // branches.
+    // .gitattributes otherwise), as main is merged into agents' branches.
     let Ok(tree) = git(&[
         "--git-dir",
         mirror_path,
@@ -1036,6 +1037,392 @@ mod tests {
             .expect("spawn/<agent> contains main");
             store.unmount(&workspace).expect("unmount");
         }
+    }
+
+    /// A source with `README.md` and `notes.txt` on main, its mirror under a
+    /// host root, and that host's store: `(base, source, root, mirror, store)`.
+    fn world(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        String,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        spawn_host::GitWorkspace,
+    ) {
+        use crate::sources::{ensure_mirror, git};
+        let base = std::env::temp_dir().join(format!("spawn-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "one\ntwo\nthree\n").expect("write");
+        std::fs::write(seed.join("notes.txt"), "notes\n").expect("write");
+        commit_in(&seed_path, "base");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let root = base.join("host");
+        let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
+        let store = spawn_host::GitWorkspace::new(&mirror, &root);
+        (base, source, root, mirror, store)
+    }
+
+    /// Main moves on the source by `change` in a clone, and the mirror
+    /// follows; main's new commit.
+    fn main_moves(
+        base: &std::path::Path,
+        source: &str,
+        mirror: &std::path::Path,
+        change: impl Fn(&std::path::Path),
+    ) -> String {
+        use crate::sources::git;
+        let clone = base.join(format!("clone-{}", fastrand_name()));
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", source, &clone_path]).expect("clone");
+        change(&clone);
+        commit_in(&clone_path, "main moves");
+        git(&["-C", &clone_path, "push", "-q", "origin", "main"]).expect("push main");
+        crate::sources::refresh(mirror, source);
+        git(&[
+            "--git-dir",
+            &mirror.to_string_lossy(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .expect("main")
+    }
+
+    fn fastrand_name() -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed).to_string()
+    }
+
+    /// An agent's branch with one checkpoint by `work`, mounted, and pushed
+    /// as `spawn/<agent>`: its workspace.
+    fn agent_with_work(
+        store: &spawn_host::GitWorkspace,
+        mirror: &std::path::Path,
+        source: &str,
+        agent: &str,
+        work: impl Fn(&std::path::Path),
+    ) -> spawn_core::id::WorkspaceId {
+        use crate::push::{Pushed, push_branch};
+        use spawn_core::id::BranchName;
+        use spawn_core::port::{Commit, WorkspaceStore};
+        let branch = BranchName::new(agent).expect("valid branch");
+        store.ensure_branch(&branch, None).expect("branch");
+        let workspace = store.mount(&branch).expect("mount");
+        work(std::path::Path::new(workspace.path()));
+        assert!(matches!(
+            store.commit(&workspace, "work").expect("commit"),
+            Commit::Created(_)
+        ));
+        assert_eq!(push_branch(mirror, source, agent), Pushed::Done);
+        workspace
+    }
+
+    /// What one integrator pass judges of `agent`'s push against the
+    /// mirror's main: the landing candidate, `None` for a conflict.
+    fn judged(mirror: &std::path::Path, source: &str, agent: &str) -> Option<String> {
+        let mirror_path = mirror.to_string_lossy().to_string();
+        let pushed = crate::sources::fetch_pushed_into(
+            mirror,
+            source,
+            agent,
+            &format!("refs/spawn-integrate/{agent}"),
+        )
+        .expect("fetch")
+        .expect("pushed");
+        let main =
+            crate::sources::git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
+                .expect("main");
+        super::landing_candidate(&mirror_path, &main, &pushed, 1).expect("candidate")
+    }
+
+    /// The whole loop of a conflict: the verdict merges main into the idle
+    /// workspace with markers and leaves the merge pending, its note names
+    /// the marked file, a report before they are resolved is sent back, the
+    /// checkpoint that resolves them has main as its second parent, and that
+    /// work lands.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_conflict_verdict_leaves_markers_the_resolution_merges_main_and_lands() {
+        use crate::main_merge::{Merge, conflict_note, into_workspace};
+        use crate::push::{Pushed, push_branch};
+        use crate::sources::git;
+        use spawn_core::port::{Commit, WorkspaceStore};
+
+        let (base, source, root, mirror, store) = world("conflict-loop");
+        let mirror_path = mirror.to_string_lossy().to_string();
+        let agent = "agent_resident";
+        let workspace = agent_with_work(&store, &mirror, &source, agent, |directory| {
+            std::fs::write(
+                directory.join("README.md"),
+                "one\nTWO by the agent\nthree\n",
+            )
+            .expect("write");
+        });
+        let main = main_moves(&base, &source, &mirror, |clone| {
+            std::fs::write(clone.join("README.md"), "one\nTWO on main\nthree\n").expect("write");
+        });
+        assert_eq!(judged(&mirror, &source, agent), None, "a conflict verdict");
+
+        // The verdict's merge, before the note is written.
+        let merge = into_workspace(&store, &mirror, &root, agent);
+        assert_eq!(
+            merge,
+            Merge::Marked {
+                files: vec!["README.md".to_string()]
+            }
+        );
+        assert!(
+            store.has_pending_merge(agent),
+            "main waits as the second parent"
+        );
+        let readme = std::fs::read_to_string(root.join(agent).join("README.md")).expect("read");
+        assert!(
+            readme.contains("<<<<<<<") && readme.contains("TWO on main"),
+            "{readme}"
+        );
+        let note = conflict_note(&main, &merge);
+        assert!(
+            note.contains("README.md")
+                && note.contains("carry conflict markers")
+                && note.contains(&main)
+                && !note.contains("within about 30 s"),
+            "{note}"
+        );
+        // Asked again (the next delivery), the merge is still the same one.
+        assert_eq!(into_workspace(&store, &mirror, &root, agent), merge);
+
+        // A report with the markers in: the judge sends it back unjudged.
+        assert!(matches!(
+            store.commit(&workspace, "markers").expect("commit"),
+            Commit::Created(_)
+        ));
+        assert_eq!(push_branch(&mirror, &source, agent), Pushed::Done);
+        let head = git(&[
+            "--git-dir",
+            &mirror_path,
+            "rev-parse",
+            &format!("refs/heads/{agent}"),
+        ])
+        .expect("head");
+        let marked = store.conflict_markers(&main, &head).expect("markers");
+        assert!(
+            super::markers_note(store.has_pending_merge(agent), &marked).is_some(),
+            "unresolved markers are not judged"
+        );
+
+        // The agent resolves them; that checkpoint records the merge.
+        std::fs::write(
+            root.join(agent).join("README.md"),
+            "one\nTWO by the agent, on main\nthree\n",
+        )
+        .expect("resolve");
+        let Commit::Created(resolved) = store.commit(&workspace, "resolved").expect("commit")
+        else {
+            panic!("the resolution is a commit");
+        };
+        assert_eq!(
+            git(&[
+                "--git-dir",
+                &mirror_path,
+                "rev-parse",
+                &format!("{resolved}^2")
+            ])
+            .expect("second parent"),
+            main,
+            "main is the resolved checkpoint's second parent"
+        );
+        assert!(!store.has_pending_merge(agent));
+        assert_eq!(push_branch(&mirror, &source, agent), Pushed::Done);
+        assert!(
+            store
+                .conflict_markers(&main, resolved.as_str())
+                .expect("markers")
+                .is_empty()
+        );
+        assert_eq!(super::markers_note(false, &[]), None);
+
+        // Judged again: it contains main, so it lands as it is.
+        let candidate = judged(&mirror, &source, agent).expect("no conflict now");
+        assert_eq!(candidate, resolved.as_str());
+        git(&[
+            "--git-dir",
+            &mirror_path,
+            "push",
+            "-q",
+            &source,
+            &format!("{candidate}:refs/heads/main"),
+        ])
+        .expect("lands with a fast-forward of main");
+        assert_eq!(
+            git(&["--git-dir", &source, "show", "main:README.md"]).expect("main's README"),
+            "one\nTWO by the agent, on main\nthree"
+        );
+        store.unmount(&workspace).expect("unmount");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A conflict markers cannot show: nothing in the workspace changes but
+    /// main's version of each file, copied aside, and the note says what to
+    /// do with each one. Done as it says, the work lands.
+    #[test]
+    fn a_conflict_without_markers_is_explained_and_resolvable_without_git() {
+        use crate::main_merge::{MAIN_COPIES, Merge, conflict_note, into_workspace};
+        use crate::push::{Pushed, push_branch};
+        use spawn_core::port::{Commit, WorkspaceStore};
+
+        let (base, source, root, mirror, store) = world("conflict-unmarked");
+        let agent = "agent_unmarked";
+        // The agent deletes notes.txt and changes README.md; main changes
+        // notes.txt and deletes README.md.
+        let workspace = agent_with_work(&store, &mirror, &source, agent, |directory| {
+            std::fs::remove_file(directory.join("notes.txt")).expect("delete");
+            std::fs::write(directory.join("README.md"), "one\nmine\nthree\n").expect("write");
+            std::fs::write(directory.join("work.txt"), "my work\n").expect("write");
+        });
+        let main = main_moves(&base, &source, &mirror, |clone| {
+            std::fs::write(clone.join("notes.txt"), "notes, revised\n").expect("write");
+            std::fs::remove_file(clone.join("README.md")).expect("delete");
+        });
+        assert_eq!(judged(&mirror, &source, agent), None, "a conflict verdict");
+
+        let merge = into_workspace(&store, &mirror, &root, agent);
+        let Merge::Unmarked { files, copied } = &merge else {
+            panic!("no markers can show this: {merge:?}");
+        };
+        assert_eq!(files, &["README.md".to_string(), "notes.txt".to_string()]);
+        assert_eq!(copied, &["notes.txt".to_string()]);
+        assert!(!store.has_pending_merge(agent));
+        let directory = root.join(agent);
+        assert_eq!(
+            std::fs::read_to_string(directory.join(MAIN_COPIES).join("notes.txt")).expect("copy"),
+            "notes, revised\n"
+        );
+        assert!(
+            !directory.join("notes.txt").exists(),
+            "the workspace is unchanged"
+        );
+        let note = conflict_note(&main, &merge);
+        assert!(
+            note.contains("cannot show")
+                && note.contains(".spawn/main")
+                && note.contains("make each of notes.txt exactly main's version")
+                && note.contains("delete README.md"),
+            "{note}"
+        );
+
+        // What the note says, done by hand: then it merges and lands.
+        std::fs::copy(
+            directory.join(MAIN_COPIES).join("notes.txt"),
+            directory.join("notes.txt"),
+        )
+        .expect("copy main's version");
+        std::fs::remove_file(directory.join("README.md")).expect("delete");
+        assert!(matches!(
+            store.commit(&workspace, "resolved").expect("commit"),
+            Commit::Created(_)
+        ));
+        assert_eq!(push_branch(&mirror, &source, agent), Pushed::Done);
+        assert!(
+            judged(&mirror, &source, agent).is_some(),
+            "the resolved work merges with main"
+        );
+        store.unmount(&workspace).expect("unmount");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A task delivered to a worker whose branch does not contain main gets
+    /// main first: a clean merge is a merge commit (the `base_merged`
+    /// checkpoint) and the brief names what changed; a conflicting one
+    /// leaves markers and the brief names the marked files. A worker with
+    /// no workspace on this host gets nothing.
+    #[test]
+    fn a_delivery_to_a_stale_branch_merges_main_first() {
+        use crate::main_merge::{Merge, delivery_note, into_workspace};
+        use crate::sources::git;
+        use spawn_core::port::WorkspaceStore;
+
+        let (base, source, root, mirror, store) = world("delivery-merge");
+        let mirror_path = mirror.to_string_lossy().to_string();
+        let clean = agent_with_work(&store, &mirror, &source, "agent_clean", |directory| {
+            std::fs::write(directory.join("clean.txt"), "mine\n").expect("write");
+        });
+        let marked = agent_with_work(&store, &mirror, &source, "agent_marked", |directory| {
+            std::fs::write(
+                directory.join("README.md"),
+                "one\nTWO by the agent\nthree\n",
+            )
+            .expect("write");
+        });
+        let main = main_moves(&base, &source, &mirror, |clone| {
+            std::fs::write(clone.join("README.md"), "one\nTWO on main\nthree\n").expect("write");
+            std::fs::write(clone.join("added.txt"), "from main\n").expect("write");
+        });
+
+        let merge = into_workspace(&store, &mirror, &root, "agent_clean");
+        let Merge::Merged { commit, files } = &merge else {
+            panic!("a clean merge: {merge:?}");
+        };
+        assert_eq!(files, &["README.md".to_string(), "added.txt".to_string()]);
+        assert_eq!(
+            git(&[
+                "--git-dir",
+                &mirror_path,
+                "rev-parse",
+                "refs/heads/agent_clean"
+            ])
+            .expect("head"),
+            *commit
+        );
+        assert_eq!(
+            git(&[
+                "--git-dir",
+                &mirror_path,
+                "rev-parse",
+                &format!("{commit}^2")
+            ])
+            .expect("second parent"),
+            main
+        );
+        assert!(root.join("agent_clean").join("added.txt").exists());
+        let note = delivery_note(&merge).expect("the brief says so");
+        assert!(
+            note.contains("added.txt") && note.contains("without a conflict"),
+            "{note}"
+        );
+        assert_eq!(
+            into_workspace(&store, &mirror, &root, "agent_clean"),
+            Merge::Current,
+            "a branch that contains main is left alone"
+        );
+        assert_eq!(delivery_note(&Merge::Current), None);
+
+        let merge = into_workspace(&store, &mirror, &root, "agent_marked");
+        assert_eq!(
+            merge,
+            Merge::Marked {
+                files: vec!["README.md".to_string()]
+            }
+        );
+        assert!(store.has_pending_merge("agent_marked"));
+        let note = delivery_note(&merge).expect("the brief says so");
+        assert!(
+            note.contains("README.md") && note.contains("conflict markers"),
+            "{note}"
+        );
+
+        assert_eq!(
+            into_workspace(&store, &mirror, &root, "agent_elsewhere"),
+            Merge::NotMounted
+        );
+        store.unmount(&clean).expect("unmount");
+        store.unmount(&marked).expect("unmount");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// History c1 <- c2 <- c3, and d2 forked from c1: `contains(a, b)` when

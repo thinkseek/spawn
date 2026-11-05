@@ -127,8 +127,9 @@ pub enum CheckpointReason {
     TurnStopped,
     /// The execution ended.
     ExecutionEnded,
-    /// `main` was merged into the agent's branch: when an execution starts or
-    /// resumes, and only cleanly (older records: into an idle workspace).
+    /// `main` was merged into the agent's branch: cleanly when an execution
+    /// starts or resumes, or into its mounted workspace between turns (a
+    /// `conflict` verdict, a task's delivery).
     BaseMerged,
 }
 
@@ -342,15 +343,18 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
     },
-    /// Merging the source's `main` into an agent's branch at a start or
-    /// resume conflicted: the branch stayed as it was.
+    /// Merging the source's `main` into an agent's branch conflicted: the
+    /// branch stayed as it was.
     #[serde(rename = "merge.conflicted")]
     MergeConflicted {
         /// Conflicting paths.
         files: Vec<String>,
-        /// Always false now. True only in records written while main was
-        /// merged into running workspaces: that workspace held the merge with
-        /// conflict markers in `files`.
+        /// The agent's mounted workspace holds the merge with conflict
+        /// markers in `files`, `main` pending as the second parent of the
+        /// checkpoint that resolves them (a merge between turns: a `conflict`
+        /// verdict or a task's delivery). False: nothing changed (a start or
+        /// resume, which merges only cleanly, or a conflict markers cannot
+        /// show).
         marked: bool,
     },
     /// The SQL gateway accepted a command.
