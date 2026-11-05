@@ -53,7 +53,9 @@ mod row;
 mod sessions;
 
 pub use missions::LandingHold;
-pub use sessions::{ExecutionRow, Freshness, LivenessFacts, OpenTool, SessionState, TimelineEntry};
+pub use sessions::{
+    ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
+};
 
 /// Schema installed by [`PostgresStore::migrate`].
 const SCHEMA: &str = include_str!("../sql/schema.sql");
