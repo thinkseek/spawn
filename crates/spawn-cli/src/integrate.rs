@@ -21,9 +21,27 @@
 //!    own `refs/spawn-integrate/<agent>`. The integrator never commits a
 //!    mounted workspace and never moves the agent's `refs/heads/<agent>`,
 //!    so it works the same on a host that never ran the agent, and a file
-//!    written after the last checkpoint never lands. The candidate is
-//!    merged with the source's main when main moved, and judged by
-//!    `scripts/rsi/gate.sh` with the mission's scenarios. Every verdict
+//!    written after the last checkpoint never lands.
+//!
+//!    **A landing is one commit per task on main's first-parent line.**
+//!    The candidate is a new merge commit C ([`landing_candidate`]), never
+//!    the worker's commit and never a fast-forward to one: first parent the
+//!    source's main (the task's base), second parent the pushed head
+//!    judged fresh; its tree is the head's when main is in it, and the merge
+//!    by main's merge rules when main moved (a conflict is `conflict`). Its
+//!    message ([`landing_message`]) says what landed, from the record alone:
+//!    the objective's title with the objective and the task on the first
+//!    line (a task without one: its brief's first line and the task), the
+//!    report's `## What changed` (or the whole report, bounded) after a
+//!    blank line, with no line of it able to pass for a `Spawn-` trailer,
+//!    and the integrator's `Spawn-Task`, `Spawn-Objective` and `Spawn-Head`
+//!    trailers. C is judged by `scripts/rsi/gate.sh` with the mission's
+//!    scenarios, named in the accepted `task.gated` (`candidate`), pushed
+//!    as it is, and named in `task.landed` (`to`). So `git log
+//!    --first-parent` is one line per landed task, `git bisect start
+//!    --first-parent` visits only gated landings, `git revert -m 1 <C>`
+//!    undoes one task, and every checkpoint stays reachable from main
+//!    through the second parents. Every verdict
 //!    names the revision of the report it judged (the task's `revisions`),
 //!    and the store refuses it once the task has moved on. A pass records
 //!    the verdict before git moves, then moves the source's main with a
