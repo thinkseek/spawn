@@ -367,7 +367,6 @@ doubled() {
         where mission_id = $1 and objective is not null and state not in ('landed', 'cancelled')
         group by objective having count(*) > 1) d"
 }
-# Tasks delivered and not reported yet: the worker has them.
 # Tasks of the mission ever delivered (a task.delivered record), whatever
 # their state now. The barrier releases three delivered tasks at once, and
 # each moves on to reported by itself, possibly between two polls: a wait
