@@ -327,8 +327,9 @@ export function landedToday(events: readonly LogEvent[], nowMs: number): number 
   ).length;
 }
 
-/** Verdicts that judge the work. `stale` (main moved on) and `aborted`
- * (the gate itself did not finish) say nothing about the candidate. */
+/** Verdicts that judge the work. `stale` (main moved on), `aborted` (the
+ * gate itself did not finish) and `no_room` (TMPDIR had no room to start)
+ * say nothing about the candidate. */
 const JUDGING = new Set(["accepted", "rejected", "conflict"]);
 
 /** Share of judging gate verdicts that accepted, up to `nowMs`; null with
