@@ -300,8 +300,10 @@ pub(crate) fn decide_with(
         orders: deliver::orders(work, rows, now_ms),
         pending: Vec::new(),
     };
-    // A model-switch Stop that failed is retried, then given up.
+    // A model-switch Stop that failed is retried, then given up and
+    // escalated.
     switch::fit(&mut plan.orders, work, rows, now_ms);
+    plan.pending.extend(switch::news(work, rows));
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
         // A managed worker between tasks is not news: its report already
@@ -316,7 +318,6 @@ pub(crate) fn decide_with(
         }
     }
     plan.pending.extend(deliver::news_items(work, rows));
-    plan.pending.extend(switch::news(work, rows));
     plan.pending.extend_from_slice(host);
     plan.pending.retain(|item| !told.contains(&item.tag()));
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
