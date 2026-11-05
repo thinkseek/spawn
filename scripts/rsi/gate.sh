@@ -54,6 +54,10 @@
 # that breaks that objective land. Closing that needs the gate under a uid
 # agents do not have.
 #
+# A tree that is not Spawn names its owner-installed inputs (dependencies the
+# sandbox cannot download) in `<scenarios-dir>/bind`: absolute directories
+# under $HOME, bound read-only at the same path.
+#
 # Scenarios run inside the tree with SPAWN_BIN (the tree's `spawn`, when the
 # build made one) and SPAWN_BASELINE_TREE set. Their output is printed with a
 # `| ` prefix. The verdict is one JSON line, last, on stdout; when the
@@ -287,6 +291,28 @@ done
 for path in "$controller/scripts" "$controller/web/node_modules"; do
     under_home "$path" && bind_home "$path"
 done
+# The owner's own read-only inputs for a tree that is not Spawn (a project's
+# installed dependencies, which the sandbox cannot download): one absolute
+# directory per line in `<scenarios-dir>/bind`, `#` comments. Only under
+# $HOME (anything else outside the emptied directories is visible already),
+# and a missing one stops the gate (exit 3) rather than judging without it.
+if [ -f "$scenarios/bind" ]; then
+    while IFS= read -r path || [ -n "$path" ]; do
+        case "$path" in '' | '#'*) continue ;; esac
+        case "$path" in
+        /*) ;;
+        *)
+            echo "gate: $scenarios/bind: not an absolute path: $path" >&2
+            exit 3
+            ;;
+        esac
+        if [ ! -d "$path" ]; then
+            echo "gate: $scenarios/bind: no directory $path" >&2
+            exit 3
+        fi
+        under_home "$path" && ! bound "$path" && bind_home "$path"
+    done <"$scenarios/bind"
+fi
 
 # The base cache must stay hidden: the sandbox puts a tmpfs over it, and a
 # bind of a directory above it, made after that tmpfs, would show it again.
