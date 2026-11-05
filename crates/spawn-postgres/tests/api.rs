@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use postgres::Client;
+use postgres::{Client, NoTls};
 use spawn_core::bridge::{Bridge, BridgeConfig};
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
@@ -30,7 +30,7 @@ use spawn_core::port::{CommandQueue, EventLog};
 use spawn_core::time::SystemClock;
 
 mod common;
-use common::{admin, store};
+use common::{admin, store, url};
 
 fn agent() -> AgentId {
     AgentId::new("agent_one").expect("valid agent")
@@ -1275,12 +1275,40 @@ fn a_cluster_is_known_by_its_identity_not_its_spelling() {
 #[test]
 fn migrations_racing_on_one_server_all_succeed() {
     // Roles and grants are shared by the whole server: parallel migrations of
-    // separate schemas used to fail with "tuple concurrently updated".
-    let workers: Vec<_> = (0..4)
-        .map(|index| std::thread::spawn(move || store(&format!("race{index}"))))
+    // separate databases used to fail with "tuple concurrently updated".
+    let base = url();
+    let (server, _) = base.rsplit_once('/').expect("a database URL");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let names: Vec<String> = (0..4)
+        .map(|index| format!("spawn_race_{}_{nanos:x}_{index}", std::process::id()))
         .collect();
-    for worker in workers {
-        let (store, _schema) = worker.join().expect("a migration thread");
-        store.migrate().expect("migrating again is idempotent");
+    let mut admin = Client::connect(&base, NoTls).expect("admin connection");
+    for name in &names {
+        admin
+            .batch_execute(&format!("create database {name}"))
+            .expect("create a database");
+    }
+    let workers: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let url = format!("{server}/{name}");
+            std::thread::spawn(move || {
+                spawn_postgres::PostgresStore::connect(&url)
+                    .and_then(|store| store.migrate())
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("a migration thread"))
+        .collect();
+    for name in &names {
+        let _ = admin.batch_execute(&format!("drop database if exists {name} with (force)"));
+    }
+    for result in results {
+        result.expect("every racing migration succeeds");
     }
 }
