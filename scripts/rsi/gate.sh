@@ -1001,8 +1001,7 @@ fi
 #   only the gate reads (`protected`, `retired-tests`): the build hook, the
 #   `bind` list, helpers a scenario runs from beside it;
 # - the files the scenario names on its code lines, and those they name in
-#   turn: a path
-#   `scripts/...` is the controller's (the scenarios source
+#   turn: a path `scripts/...` is the controller's (the scenarios source
 #   `$controller/scripts/blackbox/assertions.sh` and
 #   `$controller/scripts/pg-url.sh`), a directory is all of its files, a
 #   `<name>.sh` is a sibling scenario; one that does not exist is keyed as
