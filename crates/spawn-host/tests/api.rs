@@ -13,7 +13,7 @@ use std::process::Command;
 use spawn_core::contract;
 use spawn_core::id::{BranchName, TerminalName, WorkspaceId};
 use spawn_core::port::{Commit, Launch, TerminalError, TerminalHost, WorkspaceStore};
-use spawn_host::{GitWorkspace, PrefixBuilder, TmuxHost, container_name, docker_prefix};
+use spawn_host::{GitWorkspace, TmuxHost};
 
 /// Serialize the external programs of this test binary.
 ///
@@ -556,17 +556,6 @@ fn a_commit_records_the_branch_from_the_identifier() {
     store.unmount(&workspace).expect("unmount succeeds");
 }
 
-#[test]
-fn the_container_prefix_runs_a_shell_in_the_named_container() {
-    let _exclusive = exclusive();
-    let prefix = docker_prefix("docker", "agent_test");
-    assert_eq!(prefix[0], "docker");
-    assert_eq!(prefix[1], "exec");
-    assert_eq!(prefix[4], container_name("agent_test"));
-    assert_eq!(prefix[6], "-c");
-    assert_eq!(prefix.len(), 7, "{prefix:?}");
-}
-
 /// A tmux program pinned to a private server, which goes when the test does,
 /// even when it panics: no server or socket outlives a test run.
 struct IsolatedTmux {
@@ -710,89 +699,67 @@ fn tmux_starts_in_the_launch_directory() {
     host.terminate(&name, &workspace()).expect("clean up");
 }
 
-/// `write_new` writes on this host, and inside a workspace through the
-/// container prefix (a fake `docker` that runs the command here), with the
-/// bytes on standard input.
+/// `write_new` writes on this host: bytes that are not text, and more than
+/// a pipe holds, arrive whole, and no temporary file is left.
 #[test]
-fn files_are_written_new_on_the_host_and_through_the_prefix() {
+fn files_are_written_new_on_the_host() {
     let directory = scratch().join("write-new");
     let _ = fs::remove_dir_all(&directory);
     let local = TmuxHost::local("tmux");
     contract::terminal_files("local", &local, &directory.to_string_lossy());
-    let prefix_program = script(
-        "fake-docker-write",
-        "#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
-    );
-    let builder: std::sync::Arc<PrefixBuilder> = {
-        let words = docker_prefix(&prefix_program, "agent_test");
-        std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
-    };
-    let inside = TmuxHost::in_workspaces("tmux", builder, None);
-    contract::terminal_files("inside", &inside, &directory.to_string_lossy());
-    // Bytes that are not text, and more than a pipe holds, arrive whole.
     let big: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
-    let path = directory.join("inside/big.jsonl");
+    let path = directory.join("local/big.jsonl");
     assert!(
-        inside
+        local
             .write_new(&workspace(), &path.to_string_lossy(), &big)
             .expect("write")
     );
     assert_eq!(fs::read(&path).expect("read back"), big);
-    let left: Vec<_> = fs::read_dir(directory.join("inside"))
+    let left: Vec<_> = fs::read_dir(directory.join("local"))
         .expect("list")
         .map(|entry| entry.expect("entry").file_name())
         .collect();
-    assert_eq!(left.len(), 2, "no temporary file is left: {left:?}");
+    assert!(
+        !left
+            .iter()
+            .any(|name| name.to_string_lossy().contains("spawn-write")),
+        "no temporary file is left: {left:?}"
+    );
     fs::remove_dir_all(&directory).expect("clean up");
 }
 
+/// A host on a socket runs every tmux call on that server (`tmux -L`).
 #[test]
-fn tmux_calls_go_through_the_container_prefix() {
+fn a_host_on_a_socket_runs_tmux_on_that_server() {
     let _exclusive = exclusive();
-    let calls = scratch().join("tmux-calls.log");
+    let calls = scratch().join("tmux-socket-calls.log");
     let _ = fs::remove_file(&calls);
-    let socket = format!("spawn-host-test-prefix-{}", std::process::id());
+    let socket = format!("spawn-host-test-socket-{}", std::process::id());
     let _server = IsolatedTmux {
         program: String::new(),
         socket: socket.clone(),
     };
-    let inner = script(
-        "fake-tmux-prefix",
+    let logging = script(
+        "fake-tmux-socket",
         &format!(
-            "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec tmux -L {socket} \"$@\"\n",
+            "#!/bin/sh\nprintf 'tmux %s\\n' \"$*\" >> '{calls}'\nexec tmux \"$@\"\n",
             calls = calls.display()
         ),
     );
-    let prefix_program = script(
-        "fake-docker-prefix",
-        &format!(
-            "#!/bin/sh\nprintf 'docker %s\\n' \"$*\" >> '{calls}'\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
-            calls = calls.display()
-        ),
-    );
-    let builder: std::sync::Arc<PrefixBuilder> = {
-        let words = docker_prefix(&prefix_program, "agent_test");
-        std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
-    };
-    let host = TmuxHost::in_workspaces(&inner, builder.clone(), None);
-    let name = terminal("prefix");
-    start_session(&host, &launch(&name)).expect("start through the prefix succeeds");
-    let later = TmuxHost::in_workspaces(&inner, builder, None);
-    assert!(
-        later
-            .is_alive(&name, &workspace())
-            .expect("is_alive in a new host")
-    );
-    later
-        .terminate(&name, &workspace())
-        .expect("terminate through the prefix");
+    let host = TmuxHost::on_socket(&logging, Some(socket.clone()));
+    let name = terminal("socket");
+    start_session(&host, &launch(&name)).expect("start on the socket");
+    assert!(host.is_alive(&name, &workspace()).expect("is_alive"));
+    host.terminate(&name, &workspace()).expect("terminate");
     let log = fs::read_to_string(&calls).expect("read the call log");
-    assert!(
-        log.contains("exec -i -t spawn-exec-agent_test sh -c"),
+    assert_eq!(
+        log.lines()
+            .filter(|line| !line.starts_with(&format!("tmux -L {socket} ")))
+            .count(),
+        0,
         "{log}"
     );
     assert!(log.contains("new-session"), "{log}");
-    assert!(log.contains("-c /tmp"), "{log}");
 }
 
 /// The real adapters obey the same contract as the memory fake the Bridge

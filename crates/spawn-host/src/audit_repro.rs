@@ -13,7 +13,7 @@ use spawn_core::id::BranchName;
 use spawn_core::port::{BaseMerge, ChunkError, ChunkStore, Commit, StoredObject, WorkspaceStore};
 
 use crate::chunks::{LocalChunkStore, Manifest, hash_of, store_file};
-use crate::git::{GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix};
+use crate::git::{GitWorkspace, LARGE_FILE_BYTES};
 
 fn scratch(tag: &str) -> PathBuf {
     let directory = std::env::temp_dir().join(format!("spawn-audit-{tag}-{}", std::process::id()));
@@ -330,57 +330,6 @@ fn audit_m13_a_collection_during_a_long_checkpoint_loses_its_chunks_repro() {
     assert!(
         remounted.is_ok(),
         "the checkpoint's own chunks were collected before its commit: {remounted:?}"
-    );
-}
-
-/// L5: the container of a branch is named from the branch alone, and a
-/// mount removes any container of that name first (`docker rm -f`). Two
-/// fleets on one host (two workspace roots) with an `agent_001` share it.
-#[test]
-#[ignore = "audit L5 repro"]
-fn audit_l5_two_fleets_name_the_same_container_repro() {
-    // The name has no input but the branch: there is nothing a root or a
-    // fleet could change.
-    let one = container_name("agent_001");
-    let other = container_name("agent_001");
-    assert_ne!(one, other, "two fleets' agent_001 share container {one}");
-}
-
-/// Container mode: every terminal call is `docker exec -i -t ...` run with
-/// `Command::output()` (stdin null) or with piped stdin, and docker refuses
-/// a TTY without a terminal on stdin. Needs docker and the `ubuntu:22.04`
-/// image; uses a container of its own name, never a `spawn-exec-*` one.
-#[test]
-#[ignore = "audit container-mode repro (needs docker)"]
-fn audit_container_exec_prefix_needs_a_terminal_repro() {
-    let name = format!("spawn-audit-probe-{}", std::process::id());
-    let started = Command::new("docker")
-        .args([
-            "run",
-            "-d",
-            "--rm",
-            "--name",
-            &name,
-            "ubuntu:22.04",
-            "sleep",
-            "60",
-        ])
-        .output()
-        .expect("docker");
-    assert!(started.status.success(), "{started:?}");
-    let mut prefix = docker_prefix("docker", "agent_probe");
-    assert_eq!(prefix[4], container_name("agent_probe"));
-    prefix[4].clone_from(&name);
-    let output = Command::new(&prefix[0])
-        .args(&prefix[1..])
-        .arg("echo hi")
-        .output()
-        .expect("docker exec");
-    let _ = Command::new("docker").args(["rm", "-f", &name]).output();
-    assert!(
-        output.status.success(),
-        "docker exec as TmuxHost runs it: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
     );
 }
 

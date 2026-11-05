@@ -449,8 +449,7 @@ asserts:
 
 ## 8. Known limit: one uid
 
-Without container mode (`SPAWN_EXEC_IMAGE`) every engine runs as the owner's
-Unix user, and all panes share one tmux server. The database boundary holds
+Every engine runs as the owner's Unix user, and all panes share one tmux server. The database boundary holds
 (no pane can write the log), but the file boundary does not: an agent can
 read another process's environment through `/proc` or tmux (including the
 supervisor pane's login), write the files the Bridge reads for another
@@ -460,7 +459,7 @@ reads those files without following symlinks, refuses anything but a regular
 file and caps each read, so a planted FIFO or an endless file cannot stall
 or exhaust it. Holding no login stops a worker from forging facts through
 the database; it does not isolate agents from each other. Isolation between
-agents needs container mode or one uid per agent. The gate runs candidate
+agents needs one uid (or one sandbox) per agent. The gate runs candidate
 code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
