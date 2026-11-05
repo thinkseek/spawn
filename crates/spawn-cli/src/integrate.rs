@@ -63,6 +63,7 @@
 //! says what was judged and landed. An advisory lock allows one integrator
 //! per database, so two gates never run at once.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -887,9 +888,9 @@ pub(crate) fn landing_message(task: &Task, head: &str) -> String {
     let message = message.trim_end().to_string();
     let mut trailers = format!("Spawn-Task: {}\n", task.id);
     if let Some(objective) = task.objective {
-        trailers.push_str(&format!("Spawn-Objective: {objective}\n"));
+        let _ = writeln!(trailers, "Spawn-Objective: {objective}");
     }
-    trailers.push_str(&format!("Spawn-Head: {head}\n"));
+    let _ = writeln!(trailers, "Spawn-Head: {head}");
     format!("{message}\n\n{trailers}")
 }
 
@@ -1284,7 +1285,8 @@ mod tests {
             .expect("fetch")
             .expect("pushed");
         let main = git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"]).expect("main");
-        let candidate = super::landing_candidate(&mirror_path, &main, &pushed, task)
+        let message = format!("Work (task {task})\n\nThe work.\n");
+        let candidate = super::landing_candidate(&mirror_path, &main, &pushed, &message)
             .expect("candidate")
             .expect("no conflict");
         assert_ne!(candidate, pushed, "a landing of its own");
@@ -1518,7 +1520,8 @@ mod tests {
         let main =
             crate::sources::git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
                 .expect("main");
-        super::landing_candidate(&mirror_path, &main, &pushed, 1).expect("candidate")
+        super::landing_candidate(&mirror_path, &main, &pushed, "Work (task 1)\n\nThe work.\n")
+            .expect("candidate")
     }
 
     /// The whole loop of a conflict: the verdict merges main into the idle
@@ -1627,9 +1630,19 @@ mod tests {
         );
         assert_eq!(super::markers_note(false, &[]), None);
 
-        // Judged again: it contains main, so it lands as it is.
+        // Judged again: it contains main, so it lands as a commit of its
+        // tree on top of main, with the resolution as its second parent.
         let candidate = judged(&mirror, &source, agent).expect("no conflict now");
-        assert_eq!(candidate, resolved.as_str());
+        assert_ne!(candidate, resolved.as_str(), "never the worker's commit");
+        let rev = |reference: String| {
+            git(&["--git-dir", &mirror_path, "rev-parse", &reference]).expect("rev-parse")
+        };
+        assert_eq!(rev(format!("{candidate}^1")), main, "main is the first parent");
+        assert_eq!(rev(format!("{candidate}^2")), resolved.as_str());
+        assert_eq!(
+            rev(format!("{candidate}^{{tree}}")),
+            rev(format!("{resolved}^{{tree}}"))
+        );
         git(&[
             "--git-dir",
             &mirror_path,
@@ -1638,7 +1651,7 @@ mod tests {
             &source,
             &format!("{candidate}:refs/heads/main"),
         ])
-        .expect("lands with a fast-forward of main");
+        .expect("lands with one commit on top of main");
         assert_eq!(
             git(&["--git-dir", &source, "show", "main:README.md"]).expect("main's README"),
             "one\nTWO by the agent, on main\nthree"
@@ -2062,10 +2075,15 @@ mod tests {
         let mirror = format!("{seed_path}/.git");
 
         for (main, branch) in [(main.as_str(), large.as_str()), (&moved, &late)] {
-            let landing = super::landing_candidate(&mirror, main, branch, 7)
+            let message = "Work (task 7)\n\nThe work.\n\nSpawn-Task: 7\n";
+            let landing = super::landing_candidate(&mirror, main, branch, message)
                 .expect("a landing")
                 .expect("no conflict");
             assert_ne!(landing, branch, "a commit of the integrator's own");
+            let said = git(&["--git-dir", &mirror, "show", "-s", "--format=%B", &landing])
+                .expect("message");
+            assert_eq!(said, message.trim_end(), "the integrator's message");
+            assert!(!spawn_host::names_files_outside_git(&said));
             let who = git(&[
                 "--git-dir",
                 &mirror,
