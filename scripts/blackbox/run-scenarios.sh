@@ -6,6 +6,9 @@
 # SPAWN_PSQL     command prefix of psql, without -d, e.g. `docker exec c psql -U postgres`
 # SPAWN_PG_BASE  server URL without a database, e.g. postgres://postgres:spawn@127.0.0.1:15432
 # SPAWN_BIN      binary under test; defaults to the cargo target directory
+# SPAWN_TIMING   `adversarial` runs each scenario under perturbed timing
+#                (scripts/timing/timing.sh: SPAWN_TIMING_SEED, _KINDS, _SCALE);
+#                SPAWN_TIMING_OUT keeps each scenario's perturbation log there
 #
 # Every scenario gets its own database, its own bare repository, its own
 # workspace root and its own tmux socket, so no scenario can see another.
@@ -56,6 +59,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+base_path=$PATH
+if [ "${SPAWN_TIMING:-}" = adversarial ]; then
+    # shellcheck source=scripts/timing/timing.sh
+    . "$root/scripts/timing/timing.sh"
+fi
+
 for scenario in "$root"/scripts/blackbox/scenarios/$pattern; do
     [ -f "$scenario" ] || continue
     matched=$((matched + 1))
@@ -105,6 +114,22 @@ FAKE
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
         SPAWN_CLAUDE_PROGRAM SPAWN_TMUX_SOCKET SPAWN_WORKER WORK
 
+    PATH=$base_path
+    timing_out=""
+    if [ "${SPAWN_TIMING:-}" = adversarial ]; then
+        timing_out=${SPAWN_TIMING_OUT:-$work}/timing-$slug
+        if ! timing_enable "$timing_out" "$bin"; then
+            stage_emit blackbox fail 0 "$slug (timing)"
+            failed=$((failed + 1))
+            failed_names="$failed_names $slug"
+            drop_database "$db"
+            rm -rf "$work"
+            continue
+        fi
+        SPAWN_BIN=$TIMING_SPAWN
+        export SPAWN_BIN PATH
+    fi
+
     stage_open blackbox "$slug"
     if (
         . "$root/scripts/blackbox/assertions.sh"
@@ -118,6 +143,7 @@ FAKE
         failed_names="$failed_names $slug"
     fi
 
+    [ -n "$timing_out" ] && timing_report "$timing_out"
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
     rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     drop_database "$db"
