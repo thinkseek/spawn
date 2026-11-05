@@ -33,10 +33,19 @@ failed=0
 matched=0
 failed_names=""
 
+# A scenario's database, and the restricted logins its init-db made: they are
+# the cluster's, named after the database (spawn_login_role).
+drop_database() {
+    $SPAWN_PSQL -d postgres -tA -c "drop database if exists $1 with (force)" >/dev/null 2>&1
+    $SPAWN_PSQL -d postgres -tA -c \
+        "drop role if exists spawn_supervisor_$1, spawn_reader_$1" >/dev/null 2>&1
+    return 0
+}
+
 cleanup() {
     [ -n "${work:-}" ] && rm -rf "$work"
     if [ -n "${db:-}" ]; then
-        $SPAWN_PSQL -d postgres -tA -c "drop database if exists $db with (force)" >/dev/null 2>&1
+        drop_database "$db"
     fi
     # Only a socket this runner made: an inherited SPAWN_TMUX_SOCKET may be
     # a live fleet's.
@@ -110,7 +119,8 @@ FAKE
     fi
 
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-    $SPAWN_PSQL -d postgres -tA -c "drop database if exists $db with (force)" >/dev/null 2>&1 || true
+    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
+    drop_database "$db"
     rm -rf "$work"
 done
 

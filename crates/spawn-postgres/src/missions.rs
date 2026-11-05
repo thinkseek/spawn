@@ -249,6 +249,19 @@ pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
 
 // Delivery bookkeeping, run by the dispatcher as the owner.
 
+/// A landing held by [`PostgresStore::landing_hold`]; released when dropped
+/// (and with the connection, if the process dies first).
+pub struct LandingHold<'store> {
+    store: &'store PostgresStore,
+}
+
+impl Drop for LandingHold<'_> {
+    fn drop(&mut self) {
+        // A failure here is a broken connection, which releases it too.
+        let _ = self.store.execute("select spawn_landing_release()", &[]);
+    }
+}
+
 /// Checked decisions.
 impl PostgresStore {
     /// Add a mission; returns its id. `origin` is ignored for the
@@ -339,6 +352,18 @@ impl PostgresStore {
                 &[&INTEGRATOR_LOCK_KEY],
             )?
             .get("held"))
+    }
+
+    /// Hold `task`'s landing for its compare-and-swap push (owner only):
+    /// `None` when the task is no longer landing or its mission was dropped
+    /// (then it is recorded cancelled). Dropping the mission waits until the
+    /// hold is dropped, so take it right before the push and keep it until
+    /// the landing is recorded.
+    pub fn landing_hold(&self, task: i64) -> Result<Option<LandingHold<'_>>, StoreError> {
+        let held: bool = self
+            .query_one("select spawn_landing_hold($1)", &[&task])?
+            .get(0);
+        Ok(held.then_some(LandingHold { store: self }))
     }
 
     /// Clear a halted mission. A human's decision: owner only.

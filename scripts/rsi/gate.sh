@@ -130,7 +130,9 @@ if ! command -v bwrap >/dev/null 2>&1; then
     exit 3
 fi
 
-work=$(mktemp -d)
+. "$(dirname "$0")/../disk.sh"
+gate_room || exit 3
+work=$(gate_scratch)
 # Stage timing in the format every suite shares (scripts/stage.sh): one
 # `| stage gate <result> <ms>ms <name>` line as each section ends, and a
 # total with the verdict.

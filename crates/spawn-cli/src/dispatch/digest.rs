@@ -63,6 +63,7 @@ fn heading(why: Why) -> &'static str {
         Why::Approved => "resident approved",
         Why::Human => "human message",
         Why::DeliveryFailed => "delivery failed",
+        Why::Disk => "disk space on this host",
     }
 }
 
