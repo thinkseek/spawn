@@ -1053,14 +1053,20 @@ fi
 #   `$controller/scripts/pg-url.sh`), a directory is all of its files, a
 #   `<name>.sh` is a sibling scenario; one that does not exist is keyed as
 #   missing. A controller file no scenario names (the black-box runner,
-#   the e2e) changes no objective's key;
-# - the toolchain the base builds with: `rustc -vV`, `cargo -V` and
-#   `node --version`, asked in the sandbox inside the base tree, whose
-#   rust-toolchain.toml picks the toolchain.
+#   the e2e) changes no objective's key. A code line that reaches into
+#   scripts/ indirectly (`scripts/$name`, `cd "$controller/scripts"` and a
+#   relative path after it) keys all of the controller's scripts/;
+# - the tools the scenarios run, asked in the sandbox inside the base tree
+#   (whose rust-toolchain.toml picks the Rust toolchain): `rustc -vV`,
+#   `cargo -V`, `node --version`, `psql -V`, `git --version`, `tmux -V`,
+#   `python3 -V`, `jq --version`, and the test server's
+#   `server_version_num`, asked over its socket.
 # An entry is written only here, after a completed base run, and only
 # "solved" or "unsolved"; an entry that cannot be read, or holds anything
 # else, is a miss, judged again and rewritten. Candidate runs are never
-# cached. The log says which results came from the cache.
+# cached. A hit touches its entry: spawn-maintenance removes entries no
+# gate used for 14 days (scripts/maintenance.sh). The log says which
+# results came from the cache.
 blob() { git hash-object --no-filters -- "$1"; }
 gate_key="gate $(blob "$0")"
 [ -f "$(dirname "$0")/../pg-url.sh" ] && gate_key="$gate_key $(blob "$(dirname "$0")/../pg-url.sh")"
@@ -1078,6 +1084,11 @@ named_by() {
     grep -oE '[A-Za-z0-9_-]+\.sh' "$work/deps.code" | while IFS= read -r name; do
         [ ! -f "$scenarios/$name" ] || printf '%s\n' "$scenarios/$name"
     done
+    # scripts/ as a bare directory, or a scripts/ path that goes on in a
+    # variable: what it reaches cannot be read off the text.
+    if grep -qE 'scripts/?([^A-Za-z0-9_./-]|$)|scripts/[A-Za-z0-9_./-]*[$`{]' "$work/deps.code"; then
+        printf '%s\n' "$controller/scripts"
+    fi
 }
 # depends_on <scenario>: `<blob> <path>` (or `missing <path>`) of the
 # scenario and everything it names, transitively, sorted.
@@ -1104,11 +1115,27 @@ depends_on() {
 toolchain_key=""
 toolchain() {
     [ -z "$toolchain_key" ] || return 0
-    sandbox "$work/baseline" sh -c 'rustc -vV 2>&1; echo "rustc: $?"; cargo -V 2>&1; echo "cargo: $?"
-        node --version 2>&1; echo "node: $?"' >"$work/toolchain" 2>&1 || true
+    # The server's version through libpq's variables (pg-url.sh), never a
+    # URL on psql's command line: it holds the password.
+    sandbox "$work/baseline" sh -c '
+        for tool in "rustc -vV" "cargo -V" "node --version" "psql -V" "git --version" \
+            "tmux -V" "python3 -V" "jq --version"; do
+            $tool 2>&1
+            echo "${tool%% *}: $?"
+        done
+        if [ -z "${SPAWN_TEST_DATABASE_URL-}" ]; then
+            echo "server: none"
+        elif [ -f "$1" ] && . "$1" && pg_url_export "$SPAWN_TEST_DATABASE_URL"; then
+            PGDATABASE=$pg_url_database PGCONNECT_TIMEOUT=10 psql -XtAc "show server_version_num" 2>&1
+            echo "server: $?"
+        else
+            echo "server: unreadable"
+        fi' toolchain "$(cd "$(dirname "$0")/.." && pwd)/pg-url.sh" >"$work/toolchain" 2>&1 || true
     toolchain_key=$(sha256sum <"$work/toolchain" | cut -d' ' -f1)
     echo "| base cache: toolchain $(sed -n 's/^release: /rustc /p' "$work/toolchain" | head -n 1)" \
-        "$(sed -n 's/^\(cargo [^ ]*\).*/\1/p' "$work/toolchain" | head -n 1)"
+        "$(sed -n 's/^\(cargo [^ ]*\).*/\1/p' "$work/toolchain" | head -n 1)" \
+        "$(sed -n 's/^\(psql\) (PostgreSQL) \([^ ]*\).*/\1 \2/p' "$work/toolchain" | head -n 1)" \
+        "server $(grep -B1 '^server: ' "$work/toolchain" | head -n 1)"
 }
 : >"$work/base-results"
 from_cache=""
@@ -1141,6 +1168,8 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         esac
     fi
     if [ -n "$result" ]; then
+        # A used entry stays: maintenance removes the ones untouched.
+        touch -c -- "$entry" 2>/dev/null || :
         echo "| == base: $objective_name: $result (cached)"
         from_cache="$from_cache $objective_name"
     else
@@ -1174,7 +1203,7 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         # A completed run, and only one, writes its entry. One that cannot
         # be written costs the next gate a run, not this one its verdict.
         if [ -d "$entry" ] && [ ! -L "$entry" ]; then rm -rf -- "$entry"; fi
-        if ! { printf '%s\n' "$result" >"$entry.$$" && mv -f -- "$entry.$$" "$entry"; } 2>/dev/null; then
+        if ! { printf '%s\n' "$result" >"$entry.$$" && mv -fT -- "$entry.$$" "$entry"; } 2>/dev/null; then
             rm -f -- "$entry.$$"
             echo "| base cache: could not write the entry of $objective_name"
         fi
