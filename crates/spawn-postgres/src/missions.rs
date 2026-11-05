@@ -140,7 +140,8 @@ pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
-         m.gate_rejections, m.gate_aborts, m.gate_room_since_ms, m.gate_room_last_ms,
+         m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
+         m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.objectives, m.sources ->> 0 as source,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m

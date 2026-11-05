@@ -1050,10 +1050,13 @@ create table if not exists mission_missions (
     gate_rejections integer not null default 0,
     gate_aborts     integer not null default 0,
     -- The gate's current run of `no_room` outcomes (TMPDIR short of room,
-    -- scripts/disk.sh): when the first and the latest were recorded, how
-    -- many, and whether one of them escalated to the supervisor. No verdict
-    -- on the work, so it counts toward no halt. A gate that judged (or
-    -- aborted) ends the run.
+    -- scripts/disk.sh) on one task, `gate_room_task`: when the first and
+    -- the latest were recorded, how many, and whether one of them escalated
+    -- to the supervisor. No verdict on the work, so it counts toward no
+    -- halt. A gate that judged (or aborted) ends the run, and so does its
+    -- task leaving the gate (cancelled, aborted); a `no_room` on another
+    -- task starts a new one.
+    gate_room_task     bigint,
     gate_room_since_ms bigint,
     gate_room_last_ms  bigint,
     gate_room_waits    integer not null default 0,
@@ -1116,6 +1119,7 @@ alter table mission_missions add column if not exists halted text;
 alter table mission_missions add column if not exists scenario_floor integer not null default 0;
 alter table mission_missions add column if not exists gate_rejections integer not null default 0;
 alter table mission_missions add column if not exists gate_aborts integer not null default 0;
+alter table mission_missions add column if not exists gate_room_task bigint;
 alter table mission_missions add column if not exists gate_room_since_ms bigint;
 alter table mission_missions add column if not exists gate_room_last_ms bigint;
 alter table mission_missions add column if not exists gate_room_waits integer not null default 0;
@@ -1254,7 +1258,8 @@ begin
         -- the scenario count as the new floor: a human who resumes has seen
         -- the scenarios as they are (only the owner changes them).
         update mission_missions set halted = null, baseline = null, gate_rejections = 0,
-                                    gate_aborts = 0, scenario_floor = 0, gate_room_since_ms = null,
+                                    gate_aborts = 0, scenario_floor = 0, gate_room_task = null,
+                                    gate_room_since_ms = null,
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, updated_at_ms = p_at
          where id = v_id;
@@ -1313,16 +1318,27 @@ begin
                                             when 'stale' then gate_aborts
                                             when 'no_room' then gate_aborts
                                             else 0 end,
-               gate_room_since_ms = case v_verdict when 'no_room' then coalesce(gate_room_since_ms, p_at)
-                                                   when 'stale' then gate_room_since_ms end,
+               -- The run is this task's: a `no_room` on another task starts
+               -- a new one (no inherited backoff or age).
+               gate_room_task = case v_verdict when 'no_room' then v_id
+                                               when 'stale' then gate_room_task end,
+               gate_room_since_ms = case when v_verdict = 'no_room' and gate_room_task = v_id
+                                              then coalesce(gate_room_since_ms, p_at)
+                                         when v_verdict = 'no_room' then p_at
+                                         when v_verdict = 'stale' then gate_room_since_ms end,
                gate_room_last_ms = case v_verdict when 'no_room' then p_at
                                                   when 'stale' then gate_room_last_ms end,
-               gate_room_waits = case v_verdict when 'no_room' then gate_room_waits + 1
-                                                when 'stale' then gate_room_waits else 0 end,
-               gate_room_escalated = case v_verdict
-                                       when 'no_room' then gate_room_escalated
-                                                           or coalesce((p_record ->> 'escalate')::boolean, false)
-                                       when 'stale' then gate_room_escalated else false end,
+               gate_room_waits = case when v_verdict = 'no_room' and gate_room_task = v_id
+                                           then gate_room_waits + 1
+                                      when v_verdict = 'no_room' then 1
+                                      when v_verdict = 'stale' then gate_room_waits else 0 end,
+               gate_room_escalated = case when v_verdict = 'no_room' and gate_room_task = v_id
+                                               then gate_room_escalated
+                                                    or coalesce((p_record ->> 'escalate')::boolean, false)
+                                          when v_verdict = 'no_room'
+                                               then coalesce((p_record ->> 'escalate')::boolean, false)
+                                          when v_verdict = 'stale' then gate_room_escalated
+                                          else false end,
                scenario_floor = greatest(scenario_floor, coalesce((p_record ->> 'scenarios')::integer, 0)),
                updated_at_ms = p_at
          where id = v_mission;
@@ -1348,6 +1364,11 @@ begin
          where id = v_id;
         update mission_missions set gate_aborts = gate_aborts + 1, updated_at_ms = p_at
          where id = (select mission_id from mission_tasks where id = v_id);
+        -- A task that leaves the gate ends its run of `no_room`.
+        update mission_missions set gate_room_task = null, gate_room_since_ms = null,
+                                    gate_room_last_ms = null, gate_room_waits = 0,
+                                    gate_room_escalated = false, updated_at_ms = p_at
+         where gate_room_task = v_id;
     when 'task.reported' then
         update mission_tasks set state = 'reported', report = p_record ->> 'report',
                                  updated_at_ms = p_at
@@ -1366,6 +1387,11 @@ begin
                 or revisions = (p_record ->> 'revision')::integer);
     when 'task.cancelled' then
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
+        -- A task that leaves the gate ends its run of `no_room`.
+        update mission_missions set gate_room_task = null, gate_room_since_ms = null,
+                                    gate_room_last_ms = null, gate_room_waits = 0,
+                                    gate_room_escalated = false, updated_at_ms = p_at
+         where gate_room_task = v_id;
     when 'resident.proposed' then
         insert into mission_residents (name, agent_id, session_id, charter, proposed_by,
                                        created_at_ms, updated_at_ms)
