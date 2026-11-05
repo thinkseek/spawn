@@ -840,6 +840,7 @@ cp -r "$objectives" "$controller/rsi/scenarios"
 printf '# helper\n' >"$controller/scripts/blackbox/lib.sh"
 printf '# the runner of other suites\n' >"$controller/scripts/blackbox/runner.sh"
 printf '. "$(dirname "$0")/../../scripts/blackbox/lib.sh"\n' >>"$controller/rsi/scenarios/011.sh"
+printf '# like scripts/blackbox/runner.sh, which it does not run\n' >>"$controller/rsi/scenarios/011.sh"
 keyed=$controller/rsi/scenarios
 # from_cache: the base results the last run took from the cache.
 from_cache() { sed -n 's/^| base results from the cache: \(.*\); run on the base:.*/\1/p' "$work/gate.out"; }
@@ -854,7 +855,8 @@ expect "the log names the toolchain" "$(cat "$work/gate.out")" '| base cache: to
 
 printf '# changed\n' >>"$controller/scripts/blackbox/runner.sh"
 judge "$good" "" "$keyed" >/dev/null
-expect "a controller file no scenario names changes no key" "$(from_cache)" '007.sh 011.sh'
+expect "a controller file no scenario names, or names in a comment only, changes no key" \
+    "$(from_cache)" '007.sh 011.sh'
 
 printf '# changed\n' >>"$controller/scripts/blackbox/lib.sh"
 judge "$good" "" "$keyed" >/dev/null
