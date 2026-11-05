@@ -93,7 +93,10 @@ fn each_open_task_comes_with_its_steps_record_and_its_age_on_the_databases_clock
     let facts = store.stall_facts().expect("stall facts");
     let now = facts["now_ms"].as_i64().expect("now");
     let after = db_now(&mut client);
-    assert!(now <= after && after - now < 5_000, "now {now}, then {after}");
+    assert!(
+        now <= after && after - now < 5_000,
+        "now {now}, then {after}"
+    );
     let record = &task(&facts, first)["record"];
     assert_eq!(record["id"], assigned);
     assert_eq!(record["type"], "task.assigned");
