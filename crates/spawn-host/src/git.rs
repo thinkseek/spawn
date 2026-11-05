@@ -1203,6 +1203,20 @@ impl WorkspaceStore for GitWorkspace {
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         self.merge_main(workspace)
     }
+
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        let head = self.git_output(&[
+            "for-each-ref",
+            "--format=%(objectname)",
+            &format!("refs/heads/{branch}"),
+        ])?;
+        if head.is_empty() {
+            return Ok(None);
+        }
+        CommitId::new(head)
+            .map(Some)
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
+    }
 }
 
 /// Branching and merging (docs/storage.md, "Branching and merging").
