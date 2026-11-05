@@ -1026,6 +1026,15 @@ impl WorkspaceStore for GitWorkspace {
         self.merge_main_into_branch(branch.as_str())
     }
 
+    fn set_aside(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        self.set_aside_since(branch.as_str(), start, message)
+    }
+
     /// What checkpoints of the workspace left out and the agent was not
     /// told of yet ([`GitWorkspace::record_oversized`]).
     fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
@@ -1213,6 +1222,99 @@ impl GitWorkspace {
         }
         Ok(BaseMerge::Merged {
             commit: CommitId::new(commit)
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            files,
+        })
+    }
+
+    /// [`WorkspaceStore::set_aside`]: a new commit on top of `branch` whose
+    /// tree is `start`'s, so the work done since `start` leaves the branch's
+    /// tree but stays in its history. Under the branch's lock, like a
+    /// checkpoint. A mounted directory that holds what no checkpoint took is
+    /// committed first (its parent is the head), so nothing it holds is
+    /// lost; then the directory moves to `start`'s tree, the same two-tree
+    /// way a merge of main does; only then does the branch move, by
+    /// compare-and-swap. `start` must be an ancestor of the head: no foreign
+    /// tree is ever written. `None` is where the branch forked from `main`.
+    fn set_aside_since(
+        &self,
+        branch: &str,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        let _lock = self.lock_branch(branch)?;
+        self.refuse_stale(branch)?;
+        let reference = format!("refs/heads/{branch}");
+        let mut head = self.commit_id_of(&reference)?;
+        let start = match start {
+            Some(start) => self.commit_id_of(&format!("{start}^{{commit}}"))?,
+            None => {
+                let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
+                self.git_output(&["merge-base", &main, &head])?
+            }
+        };
+        if !self.is_ancestor(&start, &head)? {
+            return Err(WorkspaceError::Refused {
+                code: "NotAncestor".to_string(),
+                message: format!("{start} is not a commit of branch {branch} (head {head})"),
+            });
+        }
+        let directory = self.root.join(branch);
+        let mounted = directory.is_dir();
+        if mounted {
+            // What the workspace holds that no checkpoint took is kept first.
+            let index = self.root.join(".index").join(format!("{branch}.set-aside"));
+            if let Some(parent) = index.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+                })?;
+            }
+            let _ = std::fs::remove_file(&index);
+            let tree = self.tree_of(&directory, &index, &self.source_commits(branch));
+            let _ = std::fs::remove_file(&index);
+            let (tree, _) = tree?;
+            if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
+                let kept_message = format!(
+                    "spawn: the workspace of {branch} as it was, kept before its work is set aside"
+                );
+                let kept =
+                    self.git_output(&["commit-tree", &tree, "-p", &head, "-m", &kept_message])?;
+                self.git_output(&["update-ref", &reference, &kept, &head])
+                    .map_err(|error| {
+                        WorkspaceError::Unavailable(format!(
+                            "{error} (branch moved under the set-aside)"
+                        ))
+                    })?;
+                head = kept;
+            }
+        }
+        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
+        let start_tree = self.git_output(&["rev-parse", &format!("{start}^{{tree}}")])?;
+        if head_tree == start_tree {
+            return Ok(SetAside::Unchanged);
+        }
+        let changed =
+            self.git_listing(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &start_tree])?;
+        let files = shown_paths(&listed_paths(&changed));
+        if mounted {
+            self.update_directory(branch, &directory, &head_tree, &start_tree)?;
+        }
+        let commit =
+            self.git_output(&["commit-tree", &start_tree, "-p", &head, "-m", message])?;
+        if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
+            if mounted {
+                return Err(self.follow_moved_branch(branch, &directory, &start_tree, &error));
+            }
+            return Err(WorkspaceError::Unavailable(format!(
+                "{error} (branch moved under the set-aside)"
+            )));
+        }
+        // A merge whose markers were in the work is set aside with it.
+        self.clear_pending(branch);
+        Ok(SetAside::Created {
+            commit: CommitId::new(commit)
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            kept: CommitId::new(head)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
             files,
         })
