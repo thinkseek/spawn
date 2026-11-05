@@ -1246,12 +1246,11 @@ impl GitWorkspace {
         self.refuse_stale(branch)?;
         let reference = format!("refs/heads/{branch}");
         let mut head = self.commit_id_of(&reference)?;
-        let start = match start {
-            Some(start) => self.commit_id_of(&format!("{start}^{{commit}}"))?,
-            None => {
-                let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
-                self.git_output(&["merge-base", &main, &head])?
-            }
+        let start = if let Some(start) = start {
+            self.commit_id_of(&format!("{start}^{{commit}}"))?
+        } else {
+            let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
+            self.git_output(&["merge-base", &main, &head])?
         };
         if !self.is_ancestor(&start, &head)? {
             return Err(WorkspaceError::Refused {
@@ -2526,7 +2525,7 @@ mod tests {
             work,
             "it descends from the old head"
         );
-        assert_eq!(git(&repo, &["show", &format!("agent_a~1:one.txt")]), "one");
+        assert_eq!(git(&repo, &["show", "agent_a~1:one.txt"]), "one");
         let directory = PathBuf::from(workspace.path());
         assert!(!directory.join("one.txt").exists());
         assert_eq!(
