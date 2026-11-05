@@ -337,6 +337,94 @@ EOF
 network=$(commit network)
 expect "the host's listeners (and 127.0.0.1:15433) are unreachable" "$(judge "$network")" 'exit=0 {"verdict":"accepted"}'
 
+# 3d. No Unix socket of the host but the test database's: candidate code
+# tries connect() on every socket this uid may connect to outside the
+# sandbox (`find / -type s -writable`, as the host has them now) and on the
+# host's abstract sockets, and must reach only the test database. Planted
+# beside them, where a host keeps its services: a PostgreSQL socket in
+# /tmp, one in the user's runtime directory and in /var/tmp, a neighbour
+# cluster in the test database's own socket directory, and one in a
+# directory none of the sandbox's tmpfs covers (the scan finds it). The gate
+# runs without TMPDIR, as the owner's `env -i` run does.
+plant=$(mktemp -d "$work/plant.XXXXXX")
+socket_db=$work/socket-db
+mkdir -p "$socket_db"
+planted="/tmp/.s.PGSQL.$$ $socket_db/.s.PGSQL.5433 $plant/service.sock"
+for dir in "/run/user/$(id -u)" /var/tmp; do
+    [ -d "$dir" ] && [ -w "$dir" ] && planted="$planted $dir/test-gate-$$.sock"
+done
+# shellcheck disable=SC2086 # paths
+python3 -c '
+import socket, sys, time
+for path in sys.argv[1:]:
+    s = socket.socket(socket.AF_UNIX); s.bind(path); s.listen(64)
+    globals().setdefault("held", []).append(s)
+time.sleep(900)' "$socket_db/.s.PGSQL.5432" $planted &
+background="$background $!"
+for path in "$socket_db/.s.PGSQL.5432" $planted; do
+    while [ ! -S "$path" ]; do sleep 0.1; done
+done
+trap 'kill $background 2>/dev/null; rm -f /tmp/.s.PGSQL.$$ /run/user/$(id -u)/test-gate-$$.sock /var/tmp/test-gate-$$.sock; rm -rf "$work" "$marker"' EXIT
+find / \( -path /proc -o -path /sys \) -prune -o -type s -writable -print 2>/dev/null |
+    grep -vxF "$socket_db/.s.PGSQL.5432" >"$work/host-sockets" || true
+for path in $planted; do
+    grep -qxF "$path" "$work/host-sockets" || { echo "FAIL the scan outside misses $path"; exit 1; }
+done
+awk 'NR > 1 && $8 ~ /^@/ { print substr($8, 2) }' /proc/net/unix | sort -u >"$work/host-abstract"
+# The probe's control: outside, every planted socket and the test database
+# answer.
+# shellcheck disable=SC2086 # paths
+python3 -c '
+import socket, sys
+for path in sys.argv[1:]:
+    socket.socket(socket.AF_UNIX).connect(path)' "$socket_db/.s.PGSQL.5432" $planted
+branch sockets
+printf 'two\n' >"$seed/value"
+cp "$work/host-sockets" "$seed/host-sockets"
+cp "$work/host-abstract" "$seed/host-abstract"
+cat >"$seed/probe.sh" <<EOF
+#!/bin/sh
+exec python3 -c '
+import socket, sys
+reached = []
+for path in open("host-sockets").read().split("\n"):
+    if not path:
+        continue
+    s = socket.socket(socket.AF_UNIX); s.settimeout(1)
+    try:
+        s.connect(path); reached.append(path)
+    except OSError:
+        pass
+for name in open("host-abstract").read().split("\n"):
+    if not name:
+        continue
+    s = socket.socket(socket.AF_UNIX); s.settimeout(1)
+    try:
+        s.connect("\\0" + name); reached.append("@" + name)
+    except OSError:
+        pass
+database = "$socket_db/.s.PGSQL.5432"
+try:
+    socket.socket(socket.AF_UNIX).connect(database)
+except OSError as error:
+    print("the test database is unreachable:", error); sys.exit(1)
+for path in reached:
+    print("reached", path)
+print("tried", len(open("host-sockets").read().split()), "sockets")
+sys.exit(1 if reached else 0)'
+EOF
+sockets=$(commit sockets)
+expect "no host socket but the test database's is reachable" "$(
+    SPAWN_TEST_DATABASE_URL="postgres://u:p%40ss@$(printf '%s' "$socket_db" | sed 's|/|%2F|g')/db"
+    export SPAWN_TEST_DATABASE_URL
+    unset TMPDIR
+    judge "$sockets"
+)" 'exit=0 {"verdict":"accepted"}'
+case "$plant" in
+/tmp/*) ;;
+*) expect "the scan hid what no tmpfs covers" "$(cat "$work/gate.out")" 'sockets hidden from the sandbox' ;;
+esac
+
 # 3e. A TCP test database URL works inside, through the gate's forwarder,
 # for 127.0.0.1, localhost and [::1] (when the host has it): the sandbox
 # reaches that server over a socket of the gate's, and still has no
