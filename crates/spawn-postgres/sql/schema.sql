@@ -1736,7 +1736,7 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not assign objectives', session_user using errcode = '42501';
     end if;
-    select r.agent_id, r.session_id, coalesce((m.objectives ->> 'workers')::integer, 1)
+    select r.agent_id, r.session_id, coalesce((m.objectives ->> 'workers')::numeric::integer, 1)
       into v_agent, v_session, v_workers
       from mission_missions m join mission_residents r on r.name = m.objectives ->> 'resident'
      where m.id = p_mission and m.state in ('open', 'active') and r.state = 'approved';
