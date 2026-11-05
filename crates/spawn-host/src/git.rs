@@ -19,7 +19,8 @@
 //! part before the colon, and the container of an execution is named from it,
 //! so every call rebuilds the mapping from the identifier alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use spawn_core::port::{
 };
 
 use crate::chunks::{LargeFile, LocalChunkStore, Manifest, materialize, mode_of, store_file};
+use crate::tree_path::{TreePath, nul_fields};
 
 /// Ref a new branch is forked from.
 const BASE: &str = "main";
@@ -76,10 +78,11 @@ pub fn docker_prefix(docker: &str, branch: &str) -> Vec<String> {
     ]
 }
 
-/// Stdout of a git command exactly as written, or the failure as an error.
-/// A `-z` listing is read this way: a path may begin or end with
-/// whitespace, which trimming would cut off the first or the last path.
-fn report_listing(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
+/// Stdout of a git command exactly as written, bytes and all, or the
+/// failure as an error. A `-z` listing is read this way: a path may begin
+/// or end with whitespace, which trimming would cut off the first or the
+/// last path, and its bytes need not be UTF-8 ([`TreePath`]).
+fn report_listing(output: std::io::Result<Output>, word: &str) -> Result<Vec<u8>, WorkspaceError> {
     let output =
         output.map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
     if !output.status.success() {
@@ -88,18 +91,33 @@ fn report_listing(output: std::io::Result<Output>, word: &str) -> Result<String,
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
 /// Trimmed stdout of a git command that prints one value (a commit, a
 /// tree), or the failure as an error. Never for a listing of paths.
 fn report(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
-    report_listing(output, word).map(|stdout| stdout.trim().to_string())
+    report_listing(output, word).map(|stdout| String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
-/// The fields of a NUL-separated (`-z`) listing, the empty end dropped.
-fn nul_fields(listing: &str) -> impl Iterator<Item = &str> {
-    listing.split('\0').filter(|field| !field.is_empty())
+/// git arguments joined for an error message.
+fn shown_arguments<S: AsRef<OsStr>>(arguments: &[S]) -> String {
+    arguments
+        .iter()
+        .map(|argument| argument.as_ref().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The paths of a NUL-separated listing of paths.
+fn listed_paths(listing: &[u8]) -> Vec<TreePath> {
+    nul_fields(listing).map(TreePath::from_bytes).collect()
+}
+
+/// `paths` as they are shown (in an event, a note): bytes that are not
+/// UTF-8 replaced.
+fn shown_paths(paths: &[TreePath]) -> Vec<String> {
+    paths.iter().map(TreePath::shown).collect()
 }
 
 /// First field of a pending merge's file.
@@ -115,7 +133,7 @@ struct Pending {
     /// before the head was recorded.
     written_over: Option<String>,
     /// The conflicted paths.
-    files: Vec<String>,
+    files: Vec<TreePath>,
 }
 
 /// Workspace store backed by a bare git repository.
@@ -237,35 +255,36 @@ impl GitWorkspace {
         report(output, &arguments.join(" "))
     }
 
-    /// Stdout of a `-z` listing of paths, untrimmed ([`report_listing`]).
-    fn git_listing(&self, arguments: &[&str]) -> Result<String, WorkspaceError> {
+    /// Stdout of a `-z` listing of paths, untrimmed bytes
+    /// ([`report_listing`]).
+    fn git_listing<S: AsRef<OsStr>>(&self, arguments: &[S]) -> Result<Vec<u8>, WorkspaceError> {
         let output = self.command().args(arguments).stdin(Stdio::null()).output();
-        report_listing(output, &arguments.join(" "))
+        report_listing(output, &shown_arguments(arguments))
     }
 
-    fn output_in(
+    fn output_in<S: AsRef<OsStr>>(
         &self,
         directory: &Path,
         index: &Path,
-        arguments: &[&str],
+        arguments: &[S],
     ) -> Result<String, WorkspaceError> {
         self.listing_in(directory, index, arguments)
-            .map(|stdout| stdout.trim().to_string())
+            .map(|stdout| String::from_utf8_lossy(&stdout).trim().to_string())
     }
 
-    /// Stdout of a `-z` listing of paths in a work tree, untrimmed.
-    fn listing_in(
+    /// Stdout of a `-z` listing of paths in a work tree, untrimmed bytes.
+    fn listing_in<S: AsRef<OsStr>>(
         &self,
         directory: &Path,
         index: &Path,
-        arguments: &[&str],
-    ) -> Result<String, WorkspaceError> {
+        arguments: &[S],
+    ) -> Result<Vec<u8>, WorkspaceError> {
         let output = self
             .command_in(directory, index)
             .args(arguments)
             .stdin(Stdio::null())
             .output();
-        report_listing(output, &arguments.join(" "))
+        report_listing(output, &shown_arguments(arguments))
     }
 
     fn has_base(&self) -> bool {
@@ -405,16 +424,16 @@ impl GitWorkspace {
         directory: &Path,
         index: &Path,
         kept_in: &[String],
-    ) -> Result<(String, Vec<(String, u64)>), WorkspaceError> {
+    ) -> Result<(String, Vec<(TreePath, u64)>), WorkspaceError> {
         let mut large = self.large_files(directory, index)?;
         let blobs = self.blobs_in(kept_in, &large)?;
         large.retain(|(path, _)| !blobs.contains(path));
-        let mut add = vec!["add", "-A", "--", "."];
-        let excluded: Vec<String> = large
-            .iter()
-            .map(|(path, _)| format!(":(exclude,literal){path}"))
-            .collect();
-        add.extend(excluded.iter().map(String::as_str));
+        let mut add: Vec<OsString> = ["add", "-A", "--", "."].map(OsString::from).into();
+        add.extend(
+            large
+                .iter()
+                .map(|(path, _)| path.pathspec("exclude,literal")),
+        );
         self.output_in(directory, index, &add)?;
         self.unstage(directory, index, &large)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
@@ -441,15 +460,14 @@ impl GitWorkspace {
         &self,
         directory: &Path,
         index: &Path,
-        paths: &[(String, u64)],
+        paths: &[(TreePath, u64)],
     ) -> Result<(), WorkspaceError> {
-        let literal: Vec<String> = paths
-            .iter()
-            .map(|(path, _)| format!(":(literal){path}"))
+        let mut remove: Vec<OsString> = ["rm", "-r", "--cached", "--ignore-unmatch", "--"]
+            .into_iter()
+            .chain(BUILD_OUTPUT)
+            .map(OsString::from)
             .collect();
-        let mut remove = vec!["rm", "-r", "--cached", "--ignore-unmatch", "--"];
-        remove.extend(BUILD_OUTPUT);
-        remove.extend(literal.iter().map(String::as_str));
+        remove.extend(paths.iter().map(|(path, _)| path.pathspec("literal")));
         self.output_in(directory, index, &remove).map(|_| ())
     }
 
@@ -457,27 +475,26 @@ impl GitWorkspace {
     fn blobs_in(
         &self,
         commits: &[String],
-        paths: &[(String, u64)],
-    ) -> Result<std::collections::HashSet<String>, WorkspaceError> {
-        let mut found = std::collections::HashSet::new();
+        paths: &[(TreePath, u64)],
+    ) -> Result<HashSet<TreePath>, WorkspaceError> {
+        let mut found = HashSet::new();
         if paths.is_empty() {
             return Ok(found);
         }
-        let literal: Vec<String> = paths
-            .iter()
-            .map(|(path, _)| format!(":(literal){path}"))
-            .collect();
         for commit in commits {
-            let mut arguments = vec!["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"];
-            arguments.extend(literal.iter().map(String::as_str));
+            let mut arguments: Vec<OsString> =
+                ["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"]
+                    .map(OsString::from)
+                    .into();
+            arguments.extend(paths.iter().map(|(path, _)| path.pathspec("literal")));
             let listed = self.git_listing(&arguments)?;
             for entry in nul_fields(&listed) {
                 // `<mode> blob <id>\t<path>`
-                if let Some((meta, path)) = entry.split_once('\t')
+                if let Some((meta, path)) = tree_entry(entry)
                     && meta.split_whitespace().nth(1) == Some("blob")
-                    && paths.iter().any(|(large, _)| large == path)
+                    && paths.iter().any(|(large, _)| *large == path)
                 {
-                    found.insert(path.to_string());
+                    found.insert(path);
                 }
             }
         }
@@ -501,16 +518,16 @@ impl GitWorkspace {
     }
 
     /// Blobs of `tree` larger than [`LARGE_FILE_BYTES`], with their sizes.
-    fn large_blobs(&self, tree: &str) -> Result<Vec<(String, u64)>, WorkspaceError> {
+    fn large_blobs(&self, tree: &str) -> Result<Vec<(TreePath, u64)>, WorkspaceError> {
         let listed = self.git_listing(&["ls-tree", "-r", "-l", "-z", tree])?;
         Ok(nul_fields(&listed)
             .filter_map(|entry| {
                 // `<mode> blob <id> <size>\t<path>`
-                let (meta, path) = entry.split_once('\t')?;
+                let (meta, path) = tree_entry(entry)?;
                 let mut fields = meta.split_whitespace();
                 let kind = fields.nth(1)?;
                 let size: u64 = fields.nth(1)?.parse().ok()?;
-                (kind == "blob" && size > LARGE_FILE_BYTES).then(|| (path.to_string(), size))
+                (kind == "blob" && size > LARGE_FILE_BYTES).then_some((path, size))
             })
             .collect())
     }
@@ -521,7 +538,7 @@ impl GitWorkspace {
         &self,
         directory: &Path,
         index: &Path,
-    ) -> Result<Vec<(String, u64)>, WorkspaceError> {
+    ) -> Result<Vec<(TreePath, u64)>, WorkspaceError> {
         let listed = self.listing_in(
             directory,
             index,
@@ -533,13 +550,14 @@ impl GitWorkspace {
                 "--exclude-standard",
             ],
         )?;
-        let mut large: Vec<(String, u64)> = nul_fields(&listed)
+        let mut large: Vec<(TreePath, u64)> = listed_paths(&listed)
+            .into_iter()
             .filter_map(|path| {
-                let size = std::fs::symlink_metadata(directory.join(path))
+                let size = std::fs::symlink_metadata(directory.join(path.as_path()))
                     .ok()
                     .filter(std::fs::Metadata::is_file)?
                     .len();
-                (size > LARGE_FILE_BYTES).then(|| (path.to_string(), size))
+                (size > LARGE_FILE_BYTES).then_some((path, size))
             })
             .collect();
         large.sort();
@@ -553,16 +571,19 @@ impl GitWorkspace {
         self.root.join(".large").join(branch)
     }
 
-    fn read_cache(&self, branch: &str) -> BTreeMap<String, Known> {
+    /// The stat cache: a JSON array of entries, each path in the form of a
+    /// manifest's ([`crate::chunks::put_path`]). A cache in another form
+    /// (the object keyed by path of earlier builds) counts as empty.
+    fn read_cache(&self, branch: &str) -> BTreeMap<TreePath, Known> {
         let Ok(bytes) = std::fs::read(self.large_cache(branch)) else {
             return BTreeMap::new();
         };
-        let Ok(Value::Object(files)) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(Value::Array(files)) = serde_json::from_slice::<Value>(&bytes) else {
             return BTreeMap::new();
         };
         files
-            .into_iter()
-            .filter_map(|(path, entry)| {
+            .iter()
+            .filter_map(|entry| {
                 let known = Known {
                     size: entry.get("size")?.as_u64()?,
                     mtime_ns: entry.get("mtime_ns")?.as_str()?.parse().ok()?,
@@ -574,39 +595,36 @@ impl GitWorkspace {
                         .map(|chunk| chunk.as_str().map(str::to_string))
                         .collect::<Option<Vec<_>>>()?,
                 };
-                Some((path, known))
+                Some((crate::chunks::path_of(entry)?, known))
             })
             .collect()
     }
 
     /// Best effort: a lost cache only costs one re-chunk.
-    fn write_cache(&self, branch: &str, known: &BTreeMap<String, Known>) {
+    fn write_cache(&self, branch: &str, known: &BTreeMap<TreePath, Known>) {
         let path = self.large_cache(branch);
         if known.is_empty() {
             let _ = std::fs::remove_file(&path);
             return;
         }
-        let files: serde_json::Map<String, Value> = known
+        let files: Vec<Value> = known
             .iter()
             .map(|(file, known)| {
-                (
-                    file.clone(),
-                    json!({"size": known.size, "mtime_ns": known.mtime_ns.to_string(),
-                           "mode": known.mode, "chunks": known.chunks}),
-                )
+                let mut entry = json!({"size": known.size, "mtime_ns": known.mtime_ns.to_string(),
+                                       "mode": known.mode, "chunks": known.chunks});
+                crate::chunks::put_path(&mut entry, file);
+                entry
             })
             .collect();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let temporary = path.with_extension("tmp");
-        if std::fs::write(&temporary, Value::Object(files).to_string()).is_ok() {
+        if std::fs::write(&temporary, Value::Array(files).to_string()).is_ok() {
             let _ = std::fs::rename(&temporary, &path);
         }
     }
 
-    /// Chunk the large files of a checkpoint into the store and store their
-    /// manifest; its name, or `None` when there are no large files.
     /// Whether the store still holds every chunk a stat-cache entry names,
     /// each made young again (a collection must not take it before this
     /// checkpoint's commit names it). False: chunk the file again.
@@ -619,17 +637,19 @@ impl GitWorkspace {
         Ok(true)
     }
 
+    /// Chunk the large files of a checkpoint into the store and store their
+    /// manifest; its name, or `None` when there are no large files.
     fn store_large(
         &self,
         branch: &str,
         directory: &Path,
-        large: &[(String, u64)],
+        large: &[(TreePath, u64)],
     ) -> Result<Option<String>, WorkspaceError> {
         let cached = self.read_cache(branch);
         let mut known = BTreeMap::new();
         let mut files = Vec::with_capacity(large.len());
         for (path, _) in large {
-            let full = directory.join(path);
+            let full = directory.join(path.as_path());
             let Some((size, mtime_ns, mode)) = stat_of(&full) else {
                 continue;
             };
@@ -715,26 +735,18 @@ impl GitWorkspace {
         &self,
         manifest: &Manifest,
         tree: &str,
-    ) -> Result<Vec<String>, WorkspaceError> {
+    ) -> Result<Vec<TreePath>, WorkspaceError> {
         // `<tree>:<path>` per line, then the object type or `missing`.
         let mut asked = Vec::new();
         let mut clashes = Vec::new();
         for file in &manifest.files {
-            if file.path.contains('\n') {
+            if file.path.as_bytes().contains(&b'\n') {
                 clashes.push(file.path.clone());
                 continue;
             }
-            let mut prefix = String::new();
-            for component in file.path.split('/') {
-                if !prefix.is_empty() {
-                    prefix.push('/');
-                }
-                prefix.push_str(component);
-                asked.push((
-                    file.path.clone(),
-                    prefix.clone(),
-                    prefix.len() == file.path.len(),
-                ));
+            for prefix in file.path.prefixes() {
+                let whole = prefix == file.path;
+                asked.push((file.path.clone(), prefix, whole));
             }
         }
         if asked.is_empty() {
@@ -748,16 +760,15 @@ impl GitWorkspace {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
-        let mut input = String::new();
+        let mut input = Vec::new();
         for (_, path, _) in &asked {
-            input.push_str(tree);
-            input.push(':');
-            input.push_str(path);
-            input.push('\n');
+            use std::os::unix::ffi::OsStrExt;
+            input.extend_from_slice(path.in_tree(tree).as_bytes());
+            input.push(b'\n');
         }
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
-            stdin.write_all(input.as_bytes()).map_err(|error| {
+            stdin.write_all(&input).map_err(|error| {
                 WorkspaceError::Unavailable(format!("write to git cat-file: {error}"))
             })?;
         }
@@ -793,7 +804,7 @@ impl GitWorkspace {
         &self,
         head: &str,
         tree: &str,
-    ) -> Result<(Option<String>, Vec<String>), WorkspaceError> {
+    ) -> Result<(Option<String>, Vec<TreePath>), WorkspaceError> {
         let Some(name) = self.manifest_of(head)? else {
             return Ok((None, Vec::new()));
         };
@@ -818,7 +829,7 @@ impl GitWorkspace {
             return Err(WorkspaceError::Unavailable(format!(
                 "large files {} clash with the tree of {branch}: a tracked entry is at the \
                  path, or a symlink or a file at a parent directory",
-                clashes.join(", ")
+                shown_paths(&clashes).join(", ")
             )));
         }
         let mut known = BTreeMap::new();
@@ -826,7 +837,7 @@ impl GitWorkspace {
             materialize(self.chunks.as_ref(), directory, file).map_err(|error| {
                 WorkspaceError::Unavailable(format!("large file {}: {error}", file.path))
             })?;
-            if let Some((size, mtime_ns, mode)) = stat_of(&directory.join(&file.path)) {
+            if let Some((size, mtime_ns, mode)) = stat_of(&directory.join(file.path.as_path())) {
                 known.insert(
                     file.path.clone(),
                     Known {
@@ -1113,7 +1124,7 @@ impl GitWorkspace {
         if let Some(Pending { files, .. }) = self.pending_merge(&branch) {
             if unresolved(&directory, &files) {
                 return Ok(BaseMerge::Conflicted {
-                    files,
+                    files: shown_paths(&files),
                     marked: true,
                 });
             }
@@ -1147,8 +1158,7 @@ impl GitWorkspace {
             .stdin(Stdio::null())
             .output()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let (merged, files, kinds) = merge_tree_output(&stdout);
+        let (merged, files, kinds) = merge_tree_output(&output.stdout);
         let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
         match output.status.code() {
             Some(0) => {}
@@ -1166,7 +1176,10 @@ impl GitWorkspace {
                         return Err(error);
                     }
                 }
-                return Ok(BaseMerge::Conflicted { files, marked });
+                return Ok(BaseMerge::Conflicted {
+                    files: shown_paths(&files),
+                    marked,
+                });
             }
             _ => {
                 return Err(WorkspaceError::Unavailable(format!(
@@ -1178,14 +1191,14 @@ impl GitWorkspace {
         let (manifest, clashes) = self.manifest_over(&head, &merged)?;
         if !clashes.is_empty() {
             return Ok(BaseMerge::Conflicted {
-                files: clashes,
+                files: shown_paths(&clashes),
                 marked: false,
             });
         }
         self.update_directory(&branch, &directory, &head_tree, &merged)?;
         let changed =
             self.git_listing(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
-        let files = nul_fields(&changed).map(str::to_string).collect();
+        let files = shown_paths(&listed_paths(&changed));
         let message = crate::chunks::with_trailer(
             &format!("spawn: merge main {main} into {branch}"),
             manifest.as_deref(),
@@ -1329,24 +1342,24 @@ impl GitWorkspace {
     /// as none; so does one without the head it was written over (the form
     /// before the head was recorded is `main`, then the paths).
     fn pending_merge(&self, branch: &str) -> Option<Pending> {
-        let text = std::fs::read_to_string(self.pending_path(branch)).ok()?;
-        let mut fields = text.split('\0').filter(|field| !field.is_empty());
-        let is_commit =
-            |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let bytes = std::fs::read(self.pending_path(branch)).ok()?;
+        let mut fields = nul_fields(&bytes);
+        let commit = |field: &[u8]| {
+            (field.iter().all(u8::is_ascii_hexdigit))
+                .then(|| String::from_utf8_lossy(field).into_owned())
+        };
         let first = fields.next()?;
-        let (main, written_over) = if first == PENDING_TAG {
-            let main = fields.next().filter(|text| is_commit(text))?;
-            let head = fields.next().filter(|text| is_commit(text))?;
-            (main.to_string(), Some(head.to_string()))
-        } else if is_commit(first) {
-            (first.to_string(), None)
+        let (main, written_over) = if first == PENDING_TAG.as_bytes() {
+            let main = commit(fields.next()?)?;
+            let head = commit(fields.next()?)?;
+            (main, Some(head))
         } else {
-            return None;
+            (commit(first)?, None)
         };
         Some(Pending {
             main,
             written_over,
-            files: fields.map(str::to_string).collect(),
+            files: fields.map(TreePath::from_bytes).collect(),
         })
     }
 
@@ -1357,7 +1370,7 @@ impl GitWorkspace {
         branch: &str,
         main: &str,
         head: &str,
-        files: &[String],
+        files: &[TreePath],
     ) -> Result<(), WorkspaceError> {
         let path = self.pending_path(branch);
         let unavailable = |what: &str, error: std::io::Error| {
@@ -1366,10 +1379,10 @@ impl GitWorkspace {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| unavailable("create", error))?;
         }
-        let mut text = format!("{PENDING_TAG}\0{main}\0{head}\0");
+        let mut text = format!("{PENDING_TAG}\0{main}\0{head}\0").into_bytes();
         for file in files {
-            text.push_str(file);
-            text.push('\0');
+            text.extend_from_slice(file.as_bytes());
+            text.push(0);
         }
         let temporary = path.with_extension("tmp");
         std::fs::write(&temporary, text).map_err(|error| unavailable("write", error))?;
@@ -1451,7 +1464,8 @@ impl GitWorkspace {
 
     /// The files `commit` changes against `base` that hold a whole conflict
     /// marker block ([`has_conflict_block`]): work that must not be judged,
-    /// let alone land.
+    /// let alone land. The paths are shown lossily; each file is read by its
+    /// own bytes.
     pub fn conflict_markers(
         &self,
         base: &str,
@@ -1460,50 +1474,87 @@ impl GitWorkspace {
         let changed = self.git_listing(&[
             "diff-tree",
             "-r",
-            "--name-only",
+            "--raw",
             "--diff-filter=AM",
             "-z",
             base,
             commit,
         ])?;
+        // `:<old mode> <new mode> <old id> <new id> <status>`, then the path.
+        let mut records = nul_fields(&changed);
+        let mut files = Vec::new();
+        while let (Some(meta), Some(path)) = (records.next(), records.next()) {
+            let mode = String::from_utf8_lossy(meta)
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            // A submodule's commit is not in this repository.
+            if mode != "160000" {
+                files.push(TreePath::from_bytes(path));
+            }
+        }
         let mut marked = Vec::new();
-        for path in nul_fields(&changed) {
+        for path in files {
             let output = self
                 .command()
-                .args(["cat-file", "blob", &format!("{commit}:{path}")])
+                .arg("cat-file")
+                .arg("blob")
+                .arg(path.in_tree(commit))
                 .stdin(Stdio::null())
                 .output()
                 .map_err(|error| {
                     WorkspaceError::Unavailable(format!("run {}: {error}", self.git))
                 })?;
-            if output.status.success() && has_conflict_block(&output.stdout) {
-                marked.push(path.to_string());
+            if !output.status.success() {
+                // Listed as added or modified, so it is there: a blob that
+                // cannot be read is not one without markers.
+                return Err(WorkspaceError::Unavailable(format!(
+                    "git cat-file blob {commit}:{path}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            if has_conflict_block(&output.stdout) {
+                marked.push(path.shown());
             }
         }
         Ok(marked)
     }
 }
 
+/// `<meta>\t<path>`, an entry of a `-z` tree listing: the meta fields
+/// (ASCII) and the path as bytes.
+fn tree_entry(entry: &[u8]) -> Option<(&str, TreePath)> {
+    let tab = entry.iter().position(|byte| *byte == b'\t')?;
+    let meta = std::str::from_utf8(&entry[..tab]).ok()?;
+    Some((meta, TreePath::from_bytes(&entry[tab + 1..])))
+}
+
 /// The tree, the conflicted paths and the message kinds (`Auto-merging`,
 /// `CONFLICT (contents)`, `CONFLICT (modify/delete)`, ...: stable, never
 /// translated) of `git merge-tree --write-tree --name-only -z`.
-fn merge_tree_output(stdout: &str) -> (String, Vec<String>, Vec<String>) {
-    let mut fields = stdout.split('\0');
-    let tree = fields.next().unwrap_or_default().trim().to_string();
-    let mut files: Vec<String> = fields
+fn merge_tree_output(stdout: &[u8]) -> (String, Vec<TreePath>, Vec<String>) {
+    let mut fields = stdout.split(|byte| *byte == 0);
+    let tree = String::from_utf8_lossy(fields.next().unwrap_or_default())
+        .trim()
+        .to_string();
+    let mut files: Vec<TreePath> = fields
         .by_ref()
         .take_while(|field| !field.is_empty())
-        .map(str::to_string)
+        .map(TreePath::from_bytes)
         .collect();
     files.dedup();
     // Each message: a path count, the paths, its kind, its text.
     let mut kinds = Vec::new();
-    while let Some(count) = fields.next().and_then(|field| field.parse::<usize>().ok()) {
+    while let Some(count) = fields
+        .next()
+        .and_then(|field| std::str::from_utf8(field).ok()?.parse::<usize>().ok())
+    {
         if fields.by_ref().take(count).count() < count {
             break;
         }
         let Some(kind) = fields.next() else { break };
-        kinds.push(kind.to_string());
+        kinds.push(String::from_utf8_lossy(kind).into_owned());
         fields.next();
     }
     (tree, files, kinds)
@@ -1511,9 +1562,9 @@ fn merge_tree_output(stdout: &str) -> (String, Vec<String>, Vec<String>) {
 
 /// Whether any of `files` (the ones the merge listed) in `directory` still
 /// holds a whole conflict marker block. A deleted file holds none.
-fn unresolved(directory: &Path, files: &[String]) -> bool {
+fn unresolved(directory: &Path, files: &[TreePath]) -> bool {
     files.iter().any(|file| {
-        std::fs::read(directory.join(file)).is_ok_and(|bytes| has_conflict_block(&bytes))
+        std::fs::read(directory.join(file.as_path())).is_ok_and(|bytes| has_conflict_block(&bytes))
     })
 }
 

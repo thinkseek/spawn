@@ -11,12 +11,14 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use spawn_core::port::{ChunkError, ChunkStore, StoredObject};
+
+use crate::tree_path::TreePath;
 
 /// Smallest chunk the chunker cuts, except at the end of a file.
 pub const MIN_CHUNK: usize = 128 << 10;
@@ -423,8 +425,9 @@ impl ChunkStore for LocalChunkStore {
 /// One large file in a manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LargeFile {
-    /// Path relative to the workspace, `/`-separated.
-    pub path: String,
+    /// Path relative to the workspace, `/`-separated, as the bytes of its
+    /// name: not always UTF-8, and it may hold a newline.
+    pub path: TreePath,
     /// git file mode: `0o100644` or `0o100755`.
     pub mode: u32,
     /// Size in bytes.
@@ -447,8 +450,10 @@ impl Manifest {
             .files
             .iter()
             .map(|file| {
-                json!({"path": file.path, "mode": file.mode, "size": file.size,
-                       "chunks": file.chunks})
+                let mut entry = json!({"mode": file.mode, "size": file.size,
+                                       "chunks": file.chunks});
+                put_path(&mut entry, &file.path);
+                entry
             })
             .collect();
         serde_json::to_vec(&json!({"version": 1, "files": files})).unwrap_or_default()
@@ -468,12 +473,9 @@ impl Manifest {
             .ok_or("manifest: no files")?;
         let mut files = Vec::with_capacity(listed.len());
         for entry in listed {
-            let path = entry
-                .get("path")
-                .and_then(Value::as_str)
-                .filter(|path| is_safe_path(path))
-                .ok_or("manifest: bad path")?
-                .to_string();
+            let path = path_of(entry)
+                .filter(TreePath::is_safe)
+                .ok_or("manifest: bad path")?;
             let mode = entry
                 .get("mode")
                 .and_then(Value::as_u64)
@@ -508,16 +510,62 @@ impl Manifest {
     }
 }
 
-/// A relative path of normal components only: no root, no `..`, no `.git`.
-pub fn is_safe_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.contains('\0')
-        && Path::new(path)
-            .components()
-            .all(|component| match component {
-                Component::Normal(name) => name != ".git",
-                _ => false,
-            })
+/// Write `path` into a JSON `entry` so that any bytes round-trip: a UTF-8
+/// path as `"path"` (JSON escapes a newline or a control character), any
+/// other as `"path_hex"`, the bytes in lowercase hex. One path has one form,
+/// so the same files always give the same manifest.
+pub fn put_path(entry: &mut Value, path: &TreePath) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    match path.as_str() {
+        Some(text) => object.insert("path".to_string(), json!(text)),
+        None => object.insert("path_hex".to_string(), json!(hex(path.as_bytes()))),
+    };
+}
+
+/// The path [`put_path`] wrote into `entry`.
+pub fn path_of(entry: &Value) -> Option<TreePath> {
+    match (entry.get("path"), entry.get("path_hex")) {
+        (Some(path), None) => path.as_str().map(TreePath::from),
+        (None, Some(path)) => {
+            let bytes = unhex(path.as_str()?)?;
+            // A UTF-8 path has the other form.
+            std::str::from_utf8(&bytes)
+                .is_err()
+                .then(|| TreePath::from_bytes(bytes))
+        }
+        _ => None,
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                DIGITS[usize::from(byte >> 4)],
+                DIGITS[usize::from(byte & 15)],
+            ]
+        })
+        .map(char::from)
+        .collect()
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| {
+            let pair = text.get(at..at + 2)?;
+            pair.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                .then(|| u8::from_str_radix(pair, 16).ok())?
+        })
+        .collect()
 }
 
 /// The commit message with the manifest named in a trailer, or unchanged
@@ -640,10 +688,10 @@ pub fn materialize(
     file: &LargeFile,
 ) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
-    if !is_safe_path(&file.path) {
+    if !file.path.is_safe() {
         return Err(format!("unsafe path {}", file.path));
     }
-    let relative = Path::new(&file.path);
+    let relative = file.path.as_path();
     let name = relative
         .file_name()
         .ok_or_else(|| format!("{} has no file name", file.path))?;
@@ -840,7 +888,7 @@ mod tests {
         let bytes = noise(5, 200_000);
         let name = store.put(&bytes).expect("put");
         let file = LargeFile {
-            path: "data/big.bin".to_string(),
+            path: "data/big.bin".into(),
             mode: 0o100_644,
             size: bytes.len() as u64,
             chunks: vec![name.clone()],
@@ -914,7 +962,7 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("outside");
         std::fs::write(outside.join("model.bin"), b"owner's file").expect("victim");
         let file = |path: &str| LargeFile {
-            path: path.to_string(),
+            path: path.into(),
             mode: 0o100_644,
             size: bytes.len() as u64,
             chunks: vec![name.clone()],
@@ -973,7 +1021,7 @@ mod tests {
     fn manifests_round_trip_and_refuse_unsafe_entries() {
         let manifest = Manifest {
             files: vec![LargeFile {
-                path: "a/b.bin".to_string(),
+                path: "a/b.bin".into(),
                 mode: 0o100_755,
                 size: 3,
                 chunks: vec![hash_of(b"abc")],
@@ -984,12 +1032,48 @@ mod tests {
         assert_eq!(manifest.to_bytes(), bytes, "canonical");
         for path in ["../x", "/etc/passwd", "a/../../x", ".git/config", ""] {
             let mut bad = manifest.clone();
-            bad.files[0].path = path.to_string();
+            bad.files[0].path = path.into();
             assert!(Manifest::from_bytes(&bad.to_bytes()).is_err(), "{path}");
         }
         let mut bad = manifest.clone();
         bad.files[0].chunks = vec!["../../x".to_string()];
         assert!(Manifest::from_bytes(&bad.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_manifest_path_of_any_bytes_round_trips() {
+        let file = |path: TreePath| LargeFile {
+            path,
+            mode: 0o100_644,
+            size: 3,
+            chunks: vec![hash_of(b"abc")],
+        };
+        let manifest = Manifest {
+            files: vec![
+                file(TreePath::from_bytes(b"dir/bad\xffname.bin".to_vec())),
+                file(TreePath::from("line\nbreak.bin")),
+                file(TreePath::from("tab\tand \"quote\".bin")),
+            ],
+        };
+        let bytes = manifest.to_bytes();
+        assert_eq!(Manifest::from_bytes(&bytes).expect("parse"), manifest);
+        let text = String::from_utf8(bytes).expect("JSON");
+        assert!(
+            text.contains(r#""path_hex":"6469722f626164ff6e616d652e62696e""#),
+            "{text}"
+        );
+        assert!(text.contains(r#""path":"line\nbreak.bin""#), "{text}");
+        // A UTF-8 path has one form only, and hex must be hex.
+        for entry in [
+            r#""path_hex":"6162""#,
+            r#""path_hex":"zz""#,
+            r#""path_hex":"616""#,
+        ] {
+            let forged = format!(
+                r#"{{"version":1,"files":[{{"chunks":[],"mode":33188,"size":0,{entry}}}]}}"#
+            );
+            assert!(Manifest::from_bytes(forged.as_bytes()).is_err(), "{entry}");
+        }
     }
 
     #[test]

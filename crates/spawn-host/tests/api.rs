@@ -377,6 +377,61 @@ fn a_large_file_named_like_a_pattern_drops_nothing_else() {
     store.unmount(&workspace).expect("unmount succeeds");
 }
 
+/// Names of large files that are not plain: bytes that are not UTF-8, in a
+/// file and in a directory.
+const ODD_LARGE_NAMES: [&[u8]; 2] = [b"bad\xffname.bin", b"dir\xfe/model.bin"];
+
+#[test]
+fn a_large_file_of_any_name_round_trips_through_a_mount() {
+    use std::os::unix::ffi::OsStrExt;
+    let _exclusive = exclusive();
+    let (repo, root) = repository("odd-names");
+    let store = GitWorkspace::new(&repo, &root);
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 1;
+    let named =
+        |directory: &PathBuf, name: &[u8]| directory.join(std::ffi::OsStr::from_bytes(name));
+    for (seed, name) in (20..).zip(ODD_LARGE_NAMES) {
+        let path = named(&directory, name);
+        fs::create_dir_all(path.parent().expect("a parent")).expect("create the directory");
+        fs::write(&path, noise(seed, size)).expect("write a large file");
+    }
+    assert!(matches!(
+        store.commit(&workspace, "work").expect("commit succeeds"),
+        Commit::Created(_)
+    ));
+    let listed = Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args(["ls-tree", "-r", "-z", "--name-only", &branch().to_string()])
+        .output()
+        .expect("list the branch")
+        .stdout;
+    let listed: Vec<&[u8]> = listed.split(|byte| *byte == 0).collect();
+    for name in ODD_LARGE_NAMES {
+        assert!(!listed.contains(&name), "out of git: {listed:?}");
+    }
+    store.unmount(&workspace).expect("unmount succeeds");
+
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    for (seed, name) in (20..).zip(ODD_LARGE_NAMES) {
+        assert_eq!(
+            fs::read(named(&directory, name)).expect("read back"),
+            noise(seed, size)
+        );
+    }
+    assert_eq!(
+        store.commit(&workspace, "again").expect("commit succeeds"),
+        Commit::Unchanged
+    );
+    store.unmount(&workspace).expect("unmount succeeds");
+}
+
 #[test]
 fn a_commit_records_the_branch_from_the_identifier() {
     let _exclusive = exclusive();
