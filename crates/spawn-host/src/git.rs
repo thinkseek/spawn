@@ -412,11 +412,17 @@ impl GitWorkspace {
         index: &Path,
         kept_in: &[String],
     ) -> Result<(String, Vec<(TreePath, u64)>), WorkspaceError> {
-        let mut oversized = self.oversized_files(directory, index)?;
+        clear_dead_lock(index);
+        let (mut oversized, special) = self.left_out_files(directory, index)?;
         let blobs = self.blobs_in(kept_in, &oversized)?;
         oversized.retain(|(path, _)| !blobs.contains(path));
-        self.stage_all_but(directory, index, &oversized)?;
-        self.unstage(directory, index, &oversized)?;
+        // A special file (a FIFO, a socket, a device) is never committed:
+        // `git add` refuses one at a tracked path, which would fail every
+        // checkpoint, so it is left out too, silently: it holds no content.
+        let mut left_out = oversized.clone();
+        left_out.extend(special);
+        self.stage_all_but(directory, index, &left_out)?;
+        self.unstage(directory, index, &left_out)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the cap between the size check and `add`
         // was hashed anyway; it is left out all the same.
@@ -543,13 +549,12 @@ impl GitWorkspace {
             .collect())
     }
 
-    /// Files git would commit that are over the size cap, with their sizes:
-    /// tracked or untracked, ignore rules applied.
-    fn oversized_files(
-        &self,
-        directory: &Path,
-        index: &Path,
-    ) -> Result<Vec<(TreePath, u64)>, WorkspaceError> {
+    /// Paths git would commit (tracked or untracked, ignore rules applied)
+    /// that a checkpoint leaves out: the files over the size cap, with their
+    /// sizes; then the paths that hold something other than a regular file,
+    /// a symlink or a directory (a FIFO, a socket, a device), which git
+    /// cannot add.
+    fn left_out_files(&self, directory: &Path, index: &Path) -> Result<LeftOut, WorkspaceError> {
         let listed = self.listing_in(
             directory,
             index,
@@ -561,19 +566,26 @@ impl GitWorkspace {
                 "--exclude-standard",
             ],
         )?;
-        let mut oversized: Vec<(TreePath, u64)> = listed_paths(&listed)
-            .into_iter()
-            .filter_map(|path| {
-                let size = std::fs::symlink_metadata(directory.join(path.as_path()))
-                    .ok()
-                    .filter(std::fs::Metadata::is_file)?
-                    .len();
-                (size > self.max_file_bytes).then_some((path, size))
-            })
-            .collect();
+        let mut oversized = Vec::new();
+        let mut special = Vec::new();
+        for path in listed_paths(&listed) {
+            let Ok(metadata) = std::fs::symlink_metadata(directory.join(path.as_path())) else {
+                continue;
+            };
+            let kind = metadata.file_type();
+            if kind.is_file() {
+                if metadata.len() > self.max_file_bytes {
+                    oversized.push((path, metadata.len()));
+                }
+            } else if !kind.is_symlink() && !kind.is_dir() {
+                special.push((path, 0));
+            }
+        }
         oversized.sort();
         oversized.dedup();
-        Ok(oversized)
+        special.sort();
+        special.dedup();
+        Ok((oversized, special))
     }
 
     /// Where the files over the cap that checkpoints of a branch left out are
@@ -1326,6 +1338,7 @@ impl GitWorkspace {
                 WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
             })?;
         }
+        clear_dead_lock(&index);
         let _ = std::fs::remove_file(&index);
         let result = self
             .output_in(directory, &index, &["read-tree", from])
@@ -1676,6 +1689,22 @@ fn unresolved(directory: &Path, files: &[(TreePath, usize)]) -> bool {
             Err(AgentFileError::Failed(_)) => true,
         },
     )
+}
+
+/// Files over the cap with their sizes, then special files
+/// ([`GitWorkspace::left_out_files`]).
+type LeftOut = (Vec<(TreePath, u64)>, Vec<(TreePath, u64)>);
+
+/// Remove git's own lock beside `index` (`<index>.lock`), left by a git
+/// that died mid-command (killed, out of memory, a SIGBUS on a file the
+/// agent truncated while git mapped it): while it is there every git on
+/// the index fails, so every checkpoint and merge of the branch would, and
+/// only a discard got out. Called only under the branch's lock, where no
+/// git of ours runs on that index.
+fn clear_dead_lock(index: &Path) {
+    let mut lock = index.as_os_str().to_owned();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(PathBuf::from(lock));
 }
 
 /// The most of one conflicted file [`unresolved`] reads.
