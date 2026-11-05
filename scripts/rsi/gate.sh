@@ -120,7 +120,19 @@ if ! command -v bwrap >/dev/null 2>&1; then
 fi
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+# Stage timing in the format every suite shares (scripts/stage.sh): one
+# `| stage gate <result> <ms>ms <name>` line as each section ends, and a
+# total with the verdict.
+STAGE_PREFIX="| "
+# shellcheck source=scripts/stage.sh
+. "$(dirname "$0")/../stage.sh"
+gate_started=$(stage_now)
+# section <name>: a gate stage starts (and the one before it ends as ok).
+section() {
+    stage_open gate "$1"
+    echo "| == $1"
+}
+trap 'stage_close aborted; rm -rf "$work"' EXIT
 # Sandboxed git reads this, never the owner's ~/.gitconfig.
 cat >"$work/gitconfig" <<'EOF'
 [user]
@@ -147,6 +159,9 @@ json_string() {
 # verdict <accepted|rejected> [reason]: the verdict names the commits it
 # judged, resolved, so a reader can check what it is about (deploy.sh does).
 verdict() {
+    # The open section passed unless the verdict is a rejection of it.
+    if [ "$1" = accepted ]; then stage_close ok; else stage_close "$1"; fi
+    stage_emit gate "$1" "$(($(stage_now) - gate_started))" total
     json="{\"verdict\":\"$1\""
     [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
     [ -n "$metric" ] && json="$json,\"metric\":\"$(json_string "$metric")\""
@@ -538,6 +553,11 @@ if [ -d "$controller/scripts/blackbox" ]; then
 else
     helpers_sha=none
 fi
+# The stage helper is sourced by the black-box runner too.
+if [ -f "$controller/scripts/stage.sh" ]; then
+    helpers_sha=$(printf '%s %s\n' "$helpers_sha" "$(sha "$controller/scripts/stage.sh")" |
+        sha256sum | cut -d' ' -f1)
+fi
 : >"$work/base-results"
 for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     [ -f "$objective" ] || continue
@@ -555,21 +575,22 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         echo "| == base: $objective_name: $result (cached)"
     else
         if [ -z "${base_built-}" ]; then
-            echo "| == base: build"
+            section "base: build"
             if ! build "$work/baseline"; then
                 verdict rejected "base does not build"
                 exit 0
             fi
             base_built=1
         fi
-        echo "| == base: $objective_name"
+        section "base: $objective_name"
         first=0
         run_scenario "$work/baseline" "$objective" || first=$?
         result=""
         case "$first" in
         0) result=solved ;;
         1)
-            echo "| == base: $objective_name again (unsolved needs two runs that agree)"
+            stage_close "exit 1"
+            section "base: $objective_name again (unsolved needs two runs that agree)"
             again=0
             run_scenario "$work/baseline" "$objective" || again=$?
             [ "$again" -eq 1 ] && result=unsolved
@@ -578,11 +599,13 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         esac
         if [ -z "$result" ]; then
             echo "| $objective_name exited $first on the base: a harness error, not a verdict; the gate aborts"
+            stage_close aborted
             exit 4
         fi
         printf '%s\n' "$result" >"$base_cache/$key.$$"
         mv "$base_cache/$key.$$" "$base_cache/$key"
         echo "| == base: $objective_name: $result"
+        stage_close "$result"
     fi
     printf '%s|%s\n' "$result" "$objective" >>"$work/base-results"
 done
@@ -598,7 +621,7 @@ if [ -n "$scenario" ] && [ "$(base_result "$scenario")" = solved ]; then
     exit 0
 fi
 
-echo "| == candidate: build"
+section "candidate: build"
 if ! build "$work/candidate"; then
     verdict rejected "candidate does not build"
     exit 0
@@ -627,7 +650,7 @@ runnable_tests() {
 # read-only: its cargo writes to a target directory of its own. The
 # candidate's target directory is the one check-tests reuses.
 if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; then
-    echo "| == tests: what cargo runs, base and candidate"
+    section "tests: what cargo runs, base and candidate"
     listing_started=$(date +%s)
     mkdir -p "$work/base-target"
     : >"$work/tests.log"
@@ -651,7 +674,7 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; th
 fi
 
 if [ -n "$scenario" ]; then
-    echo "| == candidate: $(basename "$scenario") must pass"
+    section "candidate: $(basename "$scenario") must pass"
     green=0
     run_scenario "$work/candidate" "$scenario" || green=$?
     # The metric is the scenario's: one line on its stdout. Stderr is never
@@ -673,7 +696,7 @@ for other in "$scenarios"/*.sh; do
     [ -f "$other" ] || continue
     [ "$other" = "$scenario" ] && continue
     grep -q '^# rsi: ratchet' "$other" && continue
-    echo "| == regression: $(basename "$other") must still pass"
+    section "regression: $(basename "$other") must still pass"
     if run_scenario "$work/candidate" "$other"; then
         continue
     fi
@@ -681,6 +704,7 @@ for other in "$scenarios"/*.sh; do
     # judged before any candidate code ran.
     if [ "$(base_result "$other")" = unsolved ]; then
         echo "| $(basename "$other") fails on the base too: an unsolved objective, not a regression"
+        stage_close unsolved
         continue
     fi
     verdict rejected "regression: $(basename "$other") fails on the candidate"
