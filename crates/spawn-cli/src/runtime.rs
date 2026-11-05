@@ -21,6 +21,8 @@ use crate::{context, sources, supervise};
 /// them once. Rebuilding them per step would replay the whole log on every
 /// tick, and that cost grows with the log.
 pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
+    // The Bridge merges main into idle branches with `git --attr-source`.
+    crate::config::require_git()?;
     let store = Arc::new(open_store()?);
     let repo = flags
         .get("repo")

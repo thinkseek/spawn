@@ -18,7 +18,7 @@ Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部�
 | Rust | 1.95 及以上 | 编译 |
 | PostgreSQL | 16 及以上 | 事件日志、命令队列、视图 |
 | tmux | 3.x | 终端 |
-| git | 2.30 及以上 | 分支与工作区 |
+| git | 2.40 及以上（`git --attr-source`，启动时检查） | 分支与工作区 |
 | docker | 可选 | 设置 `SPAWN_EXEC_IMAGE` 时在容器内运行引擎 |
 | Claude Code | 当前版本 | 引擎 |
 
