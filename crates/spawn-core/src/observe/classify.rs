@@ -59,7 +59,17 @@ fn live_execution(input: &JudgeInput) -> RulesVerdict {
             .quiet_ms
             .is_some_and(|quiet| Duration::from_millis(quiet) >= limit)
     };
-    if input.open_tools > 0 && quiet_for(LONG_TOOL) {
+    // A tool open this long with no progress of the engine may hang,
+    // however busy the screen looks: the spinner over a hung tool keeps
+    // being redrawn, and read again. Evidence stored before progress was
+    // kept falls back on the latest fact of any kind.
+    let stalled_for = |limit: Duration| {
+        input
+            .progress_ms
+            .or(input.quiet_ms)
+            .is_some_and(|stalled| Duration::from_millis(stalled) >= limit)
+    };
+    if input.open_tools > 0 && stalled_for(LONG_TOOL) {
         return Ambiguous {
             ambiguity: Ambiguity::QuietLive,
             guess: SemanticState::Working,

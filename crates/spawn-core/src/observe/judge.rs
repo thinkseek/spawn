@@ -57,6 +57,11 @@ pub struct JudgeInput {
     pub ambiguity: Option<Ambiguity>,
     /// Milliseconds since the session's latest fact.
     pub quiet_ms: Option<u64>,
+    /// Milliseconds since the engine last moved: its latest transcript fact
+    /// (a tool, a message, a turn), or the execution's start. Screen
+    /// readings and commands are not progress: a spinner redrawn over a
+    /// hung tool keeps refreshing the screen, never this.
+    pub progress_ms: Option<u64>,
     /// The agent's task, as it was typed into the agent.
     pub task: Option<String>,
     /// Tail of the agent's terminal, as a person would see it.
