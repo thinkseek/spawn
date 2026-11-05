@@ -1546,7 +1546,7 @@ impl Bridge {
             return self.abandon(claimed, &active, format!("start terminal: {error}"));
         }
         if !prompt.is_empty() {
-            let outcome = self.type_prompt(claimed, &active, prompt)?;
+            let outcome = self.type_prompt(claimed, &active, prompt, native.is_none())?;
             if let Outcome::Failed(why) = outcome {
                 // An engine that never got its prompt must not look alive:
                 // whoever started it would wait on it forever.
@@ -1819,9 +1819,17 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
+        fresh: bool,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
-        let mut trusted = false;
+        // Only a fresh session's directory can be new to the engine: a
+        // resume runs where its session ran, which was trusted then.
+        let mut trusted = !fresh;
+        // The trust dialog comes before the engine draws any prompt: once a
+        // prompt was seen, nothing on the pane is that dialog any more.
+        let mut prompt_seen = false;
+        // A dialog frame is answered only when the next read shows it again.
+        let mut dialog: Option<String> = None;
         // The trust dialog comes before the engine starts up, so answering it
         // restarts the budget instead of spending it.
         let mut attempt = 0;
@@ -1836,9 +1844,16 @@ impl Bridge {
             else {
                 return Ok(Outcome::Failed("terminal disappeared".to_string()));
             };
+            let reading = read_claude_screen(&pane);
+            prompt_seen |= reading.state != ScreenState::Unknown;
             // The Bridge exported this directory itself, so it trusts it.
-            // Answer once: a second answer would land in the input box.
-            if !trusted && is_trust_dialog(&pane) {
+            // Answer once (a second answer would land in the input box), and
+            // only the dialog itself: on two equal reads, before any prompt.
+            if !trusted && !prompt_seen && is_trust_dialog(&pane) {
+                if dialog.as_deref() != Some(pane.as_str()) {
+                    dialog = Some(pane);
+                    continue;
+                }
                 trusted = true;
                 if let Err(error) =
                     self.terminals
@@ -1849,7 +1864,7 @@ impl Bridge {
                 attempt = 1;
                 continue;
             }
-            let reading = read_claude_screen(&pane);
+            dialog = None;
             last = reading.state;
             if !reading.state.accepts_input() {
                 continue;

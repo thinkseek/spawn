@@ -188,6 +188,9 @@ while :; do
       stop; pending=0 ;;
     *E2E:ASK*)
       prompt
+      # The question is the model's text in the transcript, as Claude Code
+      # writes it; the screen shows it too.
+      line '"type":"assistant","message":{"content":[{"type":"text","text":"HUMAN: which region should I deploy to?"}]}'
       printf 'HUMAN: which region should I deploy to?\n'
       stop; pending=0 ;;
     *)

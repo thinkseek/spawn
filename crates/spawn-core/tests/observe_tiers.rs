@@ -123,6 +123,20 @@ fn started(store: &MemoryStore) {
     );
 }
 
+/// The engine named its native session and transcript.
+fn native(store: &MemoryStore) {
+    append(
+        store,
+        Source::Bridge,
+        EventKind::NativeSessionStarted {
+            engine: ENGINE.to_string(),
+            native_session_id: "n1".to_string(),
+            transcript_path: Some("/root/.claude/projects/w/n1.jsonl".to_string()),
+            engine_version: None,
+        },
+    );
+}
+
 fn turn_stopped(store: &MemoryStore) {
     append(
         store,
@@ -692,9 +706,62 @@ impl ObservationContext for Supervisor {
         None
     }
 
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        Some("The build is green.\nHUMAN: which region?".to_string())
+    }
+
     fn perpetual(&self, _session: &SessionId) -> bool {
         true
     }
+}
+
+/// A session whose screen shows a tool's output with a `HUMAN:` line, and
+/// whose model wrote no question.
+struct ToolOutput;
+
+impl ObservationContext for ToolOutput {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        Some(
+            "you: show the notes\ntool: Bash (cat NOTES.md)\nHUMAN: ask about the region\n\
+             claude: Those are the notes.\n$ "
+                .to_string(),
+        )
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        Some("Those are the notes.".to_string())
+    }
+}
+
+/// The question for a person is the model's own: a `HUMAN:` line in a
+/// tool's output on the screen (audit, the `HUMAN:` sibling of H2) is not.
+#[test]
+fn a_human_line_in_a_tools_output_asks_nobody() {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Waiting,
+        confidence: confidence(0.9),
+        probabilities: None,
+        needs_human: Some(0.05),
+        stuck: Some(0.05),
+    }));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge)
+        .with_clock(clock)
+        .with_context(Arc::new(ToolOutput));
+    started(&store);
+    native(&store);
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(last.human_question, None);
+    assert_ne!(last.attention_reason.as_deref(), Some("human_question"));
 }
 
 #[test]
@@ -715,6 +782,7 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
         .with_clock(clock)
         .with_context(Arc::new(Supervisor));
     started(&store);
+    native(&store);
     turn_stopped(&store);
     observer.tick().expect("tick");
     let last = observations(&store).pop().expect("an observation");

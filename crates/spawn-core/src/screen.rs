@@ -1,29 +1,44 @@
 //! Reading the tail of a Claude Code pane.
 //!
 //! Claude Code runs with `--ax-screen-reader`, so its terminal output is
-//! plain text without the redrawn boxes of the default renderer. The pane
-//! still keeps history, so a match anywhere in the pane can be stale. Every
-//! decision here uses only the tail window and prefers the lowest matching
-//! line, which is the newest one.
+//! plain text without the redrawn boxes of the default renderer. Most of
+//! what the pane shows is transcript: the model's prose, the tools it ran
+//! and their output, a file it printed. None of that is the engine's own
+//! UI, and the model or any program it runs can print any text there. So a
+//! state is read only from the region the engine owns, at the bottom of the
+//! pane, never from a phrase anywhere in the transcript:
 //!
-//! The input box is always the bottom region: an `❯` prompt line, a rule
-//! line and status lines. Activity signals (spinner, permission dialog,
-//! error) appear above the prompt. A turn in progress still shows an empty
-//! prompt, so an empty prompt alone does not mean that input is safe: the
-//! body must be idle as well.
+//! - the input box: the prompt line (`❯` boxed, `$` in the screen-reader
+//!   layout) and the status lines around it (model, permission mode, mode
+//!   tags);
+//! - the activity region: the few lines the engine draws right above the
+//!   status lines while a turn runs (its spinner line, the hints of a
+//!   running or queued turn, an API error). It ends at a transcript line
+//!   (`you:`, `claude:`, `tool:`) and at a finished turn's `· done` line:
+//!   what is above those is history.
+//!
+//! A turn in progress still shows an empty prompt, so an empty prompt alone
+//! does not mean that input is safe: the activity region must be idle too.
+//!
+//! - Busy: a spinner or a running-turn hint in the activity region.
+//! - Error: an `API Error` (or a hook error) in the activity region.
+//! - Permission: a choice at the prompt position (`$ 1. …`). Every engine
+//!   runs with `bypassPermissions`, so no tool-permission dialog is drawn;
+//!   the choices of a question the engine asks sit at the prompt.
 
 use serde::{Deserialize, Serialize};
 
 /// Lines kept from the bottom of the pane.
 pub const TAIL_LINES: usize = 40;
 
-/// Body lines inspected above the input box.
-const BODY_WINDOW: usize = 14;
+/// Lines of the activity region, at most.
+const ACTIVITY_LINES: usize = 3;
 
 /// Prompt markers of the input box.
 ///
 /// `❯` is the boxed layout. The screen-reader layout draws `$` and keeps the
-/// status lines below it, so the marker is not the last line of the pane.
+/// status lines above or below it, so the marker is not always the last line
+/// of the pane.
 const PROMPTS: [char; 2] = ['❯', '$'];
 
 /// Spinner glyphs of a running turn.
@@ -32,16 +47,28 @@ const SPINNERS: [char; 8] = ['✻', '✽', '✳', '✢', '✶', '✷', '✸', '�
 /// Marker of a finished turn in the spinner line.
 const FINISHED: &str = "· done";
 
-/// Markers of a running turn in the screen-reader layout.
+/// Hints of a running turn in the screen-reader layout.
 ///
-/// That layout prints words instead of spinner glyphs, so the glyph test in
-/// [`busy_line`] never fires on it. Captured from Claude Code v2.1.316.
+/// That layout prints words instead of spinner glyphs (`Nucleating…`, a
+/// word that changes; see [`spinner_word`]). Captured from Claude Code
+/// v2.1.316.
 const SCREEN_READER_BUSY: [&str; 4] = [
     "Running…",
     "Nucleating…",
     "ctrl+x ctrl+s to send now",
     "(ctrl+b ctrl+b",
 ];
+
+/// Parts of the status lines around the prompt. Captured from v2.1.316.
+const STATUS_HINTS: [&str; 3] = [
+    "bypass permissions",
+    "shift+tab to cycle",
+    "? for shortcuts",
+];
+
+/// Speaker tags of the transcript in the screen-reader layout: a line with
+/// one is history, never the engine's live state.
+const SPEAKERS: [&str; 4] = ["you:", "claude:", "tool:", "tool error:"];
 
 /// What the pane shows right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -161,27 +188,46 @@ fn is_choice_line(text: &str) -> bool {
     !first.is_empty() && first.chars().all(|character| character.is_ascii_digit())
 }
 
-fn permission_line(line: &str) -> bool {
+/// A status line of the input box: the model line (`<model> · …`), the
+/// permission mode, a key hint.
+fn is_status(line: &str) -> bool {
     let trimmed = line.trim();
-    if let Some(body) = prompt_body(line) {
-        return is_choice_line(body);
+    if STATUS_HINTS.iter().any(|hint| trimmed.contains(hint)) {
+        return true;
     }
-    trimmed.starts_with("Do you want to")
-        || trimmed.starts_with("Would you like to")
-        || (is_choice_line(trimmed) && trimmed.contains(". Yes"))
+    trimmed
+        .split_once(" · ")
+        .is_some_and(|(model, _)| !model.is_empty() && !model.contains(char::is_whitespace))
+}
+
+/// A mode tag below the status lines (`ultracode`): one lowercase word.
+fn is_mode_tag(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|character| character.is_ascii_lowercase())
+}
+
+/// The screen-reader spinner: one word with an ellipsis (`Nucleating…`),
+/// maybe followed by a parenthesis (`Running…  (16s)`).
+fn spinner_word(line: &str) -> bool {
+    let Some((word, rest)) = line.split_once('…') else {
+        return false;
+    };
+    let rest = rest.trim();
+    !word.is_empty()
+        && word.chars().all(char::is_alphabetic)
+        && (rest.is_empty() || rest.starts_with('('))
 }
 
 fn busy_line(line: &str) -> bool {
     let trimmed = line.trim();
-    if trimmed.contains(FINISHED) {
-        return false;
-    }
-    if trimmed.contains("esc to interrupt") {
-        return true;
-    }
-    if SCREEN_READER_BUSY
-        .iter()
-        .any(|marker| trimmed.contains(marker))
+    if trimmed.contains("esc to interrupt")
+        || SCREEN_READER_BUSY
+            .iter()
+            .any(|marker| trimmed.contains(marker))
+        || spinner_word(trimmed)
     {
         return true;
     }
@@ -192,52 +238,83 @@ fn busy_line(line: &str) -> bool {
     SPINNERS.contains(&first) && (trimmed.contains('…') || trimmed.contains(" for "))
 }
 
+/// An error the engine draws itself: an API error, or a hook's failure.
+/// A failed tool call is transcript (`tool error:`, `Error: Exit code`).
 fn error_line(line: &str) -> bool {
     let trimmed = line.trim();
-    // A failed tool call is part of the transcript, not an engine error. The
-    // screen-reader layout prints it as `tool error: <tool> (...)` followed by
-    // `Error: Exit code <n>`, and a resumed session redraws it from history.
-    if trimmed.starts_with("Error: Exit code") {
-        return false;
-    }
-    let marker = trimmed.starts_with('⎿')
-        || trimmed.starts_with("Error")
-        || trimmed.starts_with("API Error");
-    let word = trimmed.contains("error") || trimmed.contains("Error");
-    marker && word
+    trimmed.starts_with("API Error") || (trimmed.starts_with('⎿') && trimmed.contains("hook error"))
 }
 
-/// Answer line of the workspace trust dialog.
+/// The activity region above the prompt at `index`, lowest line first: up
+/// to [`ACTIVITY_LINES`] lines above the status lines, ending at a
+/// transcript line or a finished turn's line.
+fn activity_region<'a>(tail: &[&'a str], index: usize) -> Vec<&'a str> {
+    let above: Vec<&str> = tail[..index]
+        .iter()
+        .copied()
+        .filter(|line| !is_rule(line) && !line.trim().is_empty())
+        .collect();
+    let mut end = above.len();
+    // The mode tags sit lowest, then the status lines.
+    let mut tags = true;
+    while end > 0 {
+        let line = above[end - 1];
+        if tags && is_mode_tag(line) {
+            end -= 1;
+        } else if is_status(line) {
+            tags = false;
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut region = Vec::new();
+    for line in above[..end].iter().rev() {
+        let trimmed = line.trim();
+        if region.len() == ACTIVITY_LINES
+            || trimmed.contains(FINISHED)
+            || SPEAKERS.iter().any(|speaker| trimmed.starts_with(speaker))
+        {
+            break;
+        }
+        region.push(*line);
+    }
+    region
+}
+
+/// The workspace trust dialog's last lines, as Claude Code draws them before
+/// its input box. Captured from Claude Code v2.1.317.
+const TRUST_FOOTER: [&str; 4] = [
+    "y. Yes, I trust this folder",
+    "n. No, exit",
+    "Enter y/n:",
+    "Enter to confirm · Esc to cancel",
+];
+
+/// Whether the pane ends with the workspace trust dialog.
 ///
 /// Claude Code asks once per directory whether it trusts the folder, before
 /// it draws the input box. `--settings` cannot silence it: trust lives in the
-/// user's global state, not in settings. Captured from Claude Code v2.1.317.
-const TRUST_ANSWER: &str = "Yes, I trust this folder";
-
-/// Whether the tail shows the workspace trust dialog.
+/// user's global state, not in settings. The dialog is recognized only when
+/// its own last lines are the last lines of the pane: a line of history that
+/// quotes it (a file the agent printed, redrawn on a resume) is not the
+/// dialog. The caller answers only on a fresh start (a resume runs in a
+/// directory trusted when its session started), before any prompt was
+/// drawn, and only when two reads agree.
 ///
 /// The dialog reads keystrokes, not pasted text: a bracketed paste of `y`
 /// gets "Please answer y or n". Answer it with [`TRUST_KEYS`].
 pub fn is_trust_dialog(pane: &str) -> bool {
-    let mut lines: Vec<String> = pane.lines().map(strip_ansi).collect();
-    // The dialog sits at the top of a fresh pane. Blank rows below it would
-    // push it out of the tail window, as in `read_claude_screen`.
-    while lines.last().is_some_and(|line| line.trim().is_empty()) {
-        lines.pop();
-    }
-    let start = lines.len().saturating_sub(TAIL_LINES);
-    lines[start..]
-        .iter()
-        .any(|line| line.contains(TRUST_ANSWER))
-        && prompt_index(&lines[start..]).is_none()
+    let lines: Vec<String> = pane
+        .lines()
+        .map(|line| strip_ansi(line).trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.len() >= TRUST_FOOTER.len() && lines[lines.len() - TRUST_FOOTER.len()..] == TRUST_FOOTER
 }
 
 /// Keys that accept the trust dialog.
 pub const TRUST_KEYS: [&str; 2] = ["y", "Enter"];
-
-fn prompt_index(lines: &[String]) -> Option<usize> {
-    lines.iter().rposition(|line| prompt_body(line).is_some())
-}
 
 /// Parse the pane tail.
 pub fn read_claude_screen(pane: &str) -> ScreenReading {
@@ -265,28 +342,11 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
         return ScreenReading::new(ScreenState::Permission, prompt);
     }
 
-    let body_start = index.saturating_sub(BODY_WINDOW);
-    let body: Vec<&str> = tail[body_start..index]
-        .iter()
-        .copied()
-        .filter(|line| !is_rule(line) && !line.trim().is_empty())
-        .collect();
-
-    if let Some(line) = body.iter().rev().find(|line| permission_line(line)) {
-        return ScreenReading::new(ScreenState::Permission, line);
-    }
-    if let Some(line) = body.iter().rev().find(|line| busy_line(line)) {
+    let region = activity_region(&tail, index);
+    if let Some(line) = region.iter().find(|line| busy_line(line)) {
         return ScreenReading::new(ScreenState::Busy, line);
     }
-    if body
-        .iter()
-        .rev()
-        .take(3)
-        .any(|line| line.contains("esc to interrupt"))
-    {
-        return ScreenReading::new(ScreenState::Busy, "esc to interrupt");
-    }
-    if let Some(line) = body.iter().rev().find(|line| error_line(line)) {
+    if let Some(line) = region.iter().find(|line| error_line(line)) {
         return ScreenReading::new(ScreenState::Error, line);
     }
 

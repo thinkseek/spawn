@@ -14,7 +14,7 @@ use super::judge::{JudgeInput, StateJudge};
 use super::snapshot::Snapshot;
 use super::{RECHECK_EVERY, RETRY_BASE, RETRY_MAX};
 use crate::event::{EventKind, EventRecord, GlobalPosition, NewEvent, SessionSeq, Source};
-use crate::id::{AgentId, SessionId};
+use crate::id::{AgentId, SessionId, WorkspaceId};
 use crate::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
 use crate::port::{EventLog, StoreError};
 use crate::time::{Clock, SystemClock, Timestamp};
@@ -343,13 +343,18 @@ impl Observer {
         seq: SessionSeq,
     ) -> Option<Classified> {
         input.ambiguity = Some(ambiguity);
-        attach_context(&mut input, self.context.as_deref(), session);
+        attach_context(
+            &mut input,
+            self.context.as_deref(),
+            session,
+            tracked.snapshot.transcript(),
+        );
         let fingerprint = fingerprint_of(&input);
         if tracked.failures == 0 && tracked.asked.as_deref() == Some(fingerprint.as_str()) {
             return None;
         }
         let (mut observation, failed) = self.ask_model(&input, ambiguity, guess, seq);
-        if let Some(question) = input.screen_tail.as_deref().and_then(human_question) {
+        if let Some(question) = input.reply.as_deref().and_then(human_question) {
             observation.human_question = Some(question);
             observation.attention = true;
             observation.attention_reason = Some("human_question".to_string());
@@ -457,6 +462,14 @@ pub trait ObservationContext: Send + Sync {
     /// The latest task typed into the session.
     fn task(&self, session: &SessionId) -> Option<String>;
 
+    /// The model's latest reply: the text it wrote since the last prompt,
+    /// read from its transcript at `transcript` in `workspace`
+    /// ([`super::reply::Reply`]), not from the screen, where a tool's output
+    /// looks the same.
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        None
+    }
+
     /// Whether the session is meant never to end (the supervisor). Its
     /// COMPLETED is read as WAITING.
     fn perpetual(&self, _session: &SessionId) -> bool {
@@ -471,6 +484,7 @@ fn attach_context(
     input: &mut JudgeInput,
     context: Option<&dyn ObservationContext>,
     session: &SessionId,
+    transcript: Option<(&WorkspaceId, &str)>,
 ) {
     let Some(context) = context else {
         input.perpetual = false;
@@ -482,23 +496,18 @@ fn attach_context(
     input.task = context
         .task(session)
         .map(|text| head_chars(&text, TASK_CHARS));
+    input.reply = transcript.and_then(|(workspace, path)| context.reply(workspace, path));
     input.perpetual = context.perpetual(session);
 }
 
-/// The last unanswered question for a person on the screen, without the
-/// tag: a line that starts with `HUMAN:` (after an optional `claude:` speaker
-/// tag), below the last line the user typed. An answered question no longer
-/// counts.
-fn human_question(screen_tail: &str) -> Option<String> {
-    let lines: Vec<&str> = screen_tail.lines().collect();
-    let start = lines
-        .iter()
-        .rposition(|line| line.trim_start().starts_with("you:"))
-        .map_or(0, |index| index + 1);
-    lines[start..].iter().rev().find_map(|line| {
-        let text = line.trim_start();
-        let text = text.strip_prefix("claude:").map_or(text, str::trim_start);
-        text.strip_prefix("HUMAN:")
+/// The question for a person in the model's latest reply, without the tag:
+/// its last line that starts with `HUMAN:`. The reply is what the model
+/// wrote since the last prompt, so a question someone answered is no longer
+/// in it.
+fn human_question(reply: &str) -> Option<String> {
+    reply.lines().rev().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("HUMAN:")
             .map(|question| head_chars(question.trim(), QUESTION_CHARS))
     })
 }
@@ -562,18 +571,9 @@ mod tests {
     }
 
     #[test]
-    fn a_question_for_a_person_is_seen_until_answered() {
-        assert!(asks_human(
-            "you: deploy it\nclaude: Done with the build.\nclaude: HUMAN: which region?\n$ "
-        ));
-        assert!(asks_human(
-            "claude: The key is missing.\nHUMAN: please add it\n"
-        ));
-        assert!(!asks_human(
-            "claude: HUMAN: which region?\nyou: eu-west\nclaude: deploying\n"
-        ));
-        assert!(!asks_human(
-            "claude: a human should look at the HUMAN: tag docs\n"
-        ));
+    fn a_question_for_a_person_is_a_line_of_the_models_reply() {
+        assert!(asks_human("Done with the build.\nHUMAN: which region?"));
+        assert!(asks_human("The key is missing.\n  HUMAN: please add it"));
+        assert!(!asks_human("a human should look at the HUMAN: tag docs"));
     }
 }
