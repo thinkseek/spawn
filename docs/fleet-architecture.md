@@ -676,9 +676,14 @@ record of what was judged (§14 of design.md).
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
   another mission's task in `landing` waits for it (the push may have moved
-  `main` before its `task.landed`). For a mission's lowest ready task (one
-  per mission at a time, and a few missions at once: §10.4, "One gate per
-  mission"), on a thread of its own, it:
+  `main` before its `task.landed`). Every pass visits every mission (its
+  halts, budget, landing and objective assignment never wait for another
+  mission's gate); only a landing makes the rest of its source wait for the
+  next pass. A free gate goes to the ready task that has waited longest,
+  across missions, counted from its report or from the end of its
+  mission's previous judging, whichever is later; the mission id decides
+  nothing. For a mission's lowest ready task (one per mission at a time:
+  §10.4, "One gate at a time, for now"), on a thread of its own, it:
   1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into
      its mirror's `refs/spawn-integrate/<agent>` (it never commits a
      workspace and never moves `refs/heads/<agent>`). A push that lags the
@@ -791,7 +796,9 @@ record of what was judged (§14 of design.md).
     report reaches the supervisor's digest like any report. With N = 1 this
     is one task at a time on the resident, as before.
   - Landing stays one at a time per mission: one candidate judged at a
-    time, the lowest ready task first, main moved by compare-and-swap. A task whose base is
+    time, the lowest ready task first, main moved by compare-and-swap.
+    Across missions the gate goes to the longest wait (§10.3), so a
+    mission that is always ready does not starve another's. A task whose base is
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
   - Budgets apply per task, from its delivery; the halt rules stay per
@@ -814,7 +821,9 @@ record of what was judged (§14 of design.md).
 - **One gate at a time, for now.** A judging (fetch, gate, landing) runs
   on a thread of its own. A mission has at most one in flight, and so does
   a source (missions on one source share its mirror and its main); while
-  it runs, the integrator's passes skip that mission and its source. At
+  it runs, the integrator's passes leave that source's mirror alone (no
+  landing, fetch or judging on it), but every mission still gets its
+  halts, budget and objective assignments. At
   most `--gates N` (`SPAWN_INTEGRATE_GATES`) run at once across missions,
   and **N is 1**: more than one gate is unsafe until each gate has a test
   database server of its own (GitHub issue #6, which also covers the
