@@ -58,8 +58,10 @@
 # `cargo metadata` on the candidate's manifests. Inside it the root is
 # read-only, /tmp is private, the PID namespace is new (the gate and the
 # integrator are not in /proc), the tree under test is the only writable
-# path, the base tree is read-only, and the user's runtime directory, the
-# docker socket and the host's TMPDIR are hidden. $HOME is an empty tmpfs
+# path, the base tree is read-only, and /run (the user's runtime directory,
+# the docker socket, the system bus), /var/tmp and the host's TMPDIR are
+# empty: no Unix socket of the host is reachable but the test database's
+# (see "Unix sockets" at `sandbox` below). $HOME is an empty tmpfs
 # with an allow-list bound back read-only (see `home_binds` below): the
 # Rust toolchain, the install root of node/npm/npx when it lives there,
 # and the controller's `scripts` and `web/node_modules` (the controller is
@@ -290,7 +292,8 @@ cache_exposed() {
 }
 
 # The test database, reached over one Unix socket file: the sandbox has no
-# network but its own loopback. The URL is read as libpq reads it
+# network but its own loopback, and sees no other socket of the host (see
+# "Unix sockets" below). The URL is read as libpq reads it
 # (scripts/pg-url.sh, percent-decoded):
 # - a socket directory (postgres://u:p@%2Fdir:5432/db, or ?host=/dir): the
 #   one file <dir>/.s.PGSQL.<port> is bound in, not the directory, so a
@@ -415,18 +418,49 @@ if cache_exposed "$scenarios" "$scenario" "$db_socket" $home_binds; then
 fi
 IFS=$old_ifs
 
+# PATH directories outside $HOME under the directories the sandbox empties
+# (a toolchain in /run/current-system): bound back read-only, one per line.
+hidden_path_dirs=""
+old_ifs=$IFS
+IFS=:
+for path in $PATH; do
+    [ -d "$path" ] || continue
+    # $HOME has its own allow-list (home_binds).
+    under_home "$path" && continue
+    case "$path" in
+    /tmp/* | /run/* | /var/run/* | /var/tmp/*) ;;
+    *)
+        case "${TMPDIR:-/tmp}" in / | /tmp | /tmp/) continue ;; esac
+        case "$path" in "${TMPDIR%/}"/*) ;; *) continue ;; esac
+        ;;
+    esac
+    hidden_path_dirs="$hidden_path_dirs$path
+"
+done
+IFS=$old_ifs
+socket_masks=""
+
 # sandbox <tree> <command...>: run a command inside the tree, in bwrap.
+#
+# Unix sockets. A read-only bind does not stop connect() on a socket, so
+# every directory where the host keeps them is an empty tmpfs inside: /tmp,
+# /run (with /var/run, the user's runtime directory /run/user/<uid>, the
+# docker, podman and containerd sockets, the system bus, /run/postgresql,
+# ssh and gpg agents), /var/tmp, the host's TMPDIR and $HOME. /dev is a
+# fresh one (no /dev/log), and the network namespace is new, which also
+# hides the host's abstract sockets (@/tmp/.X11-unix/X0 and the like). Bound
+# back: the PATH directories under those, the allow-listed $HOME paths, and
+# the test database's one socket file. Whatever other socket the host still
+# shows is found by a scan inside the sandbox before any candidate code
+# runs (`socket_masks` below), and hidden too.
 sandbox() {
     tree=$1
     shift
     count=$#
-    set -- "$@" bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+    set -- "$@" bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run \
         --unshare-pid --unshare-net --die-with-parent --new-session
-    runtime=/run/user/$(id -u)
-    [ -d "$runtime" ] && set -- "$@" --tmpfs "$runtime"
-    for socket in /run/docker.sock /var/run/docker.sock; do
-        [ -S "$socket" ] && set -- "$@" --ro-bind /dev/null "$socket"
-    done
+    if [ -d /var/run ] && [ ! -L /var/run ]; then set -- "$@" --tmpfs /var/run; fi
+    if [ -d /var/tmp ] && [ ! -L /var/tmp ]; then set -- "$@" --tmpfs /var/tmp; fi
     for name in credentials credentials.toml; do
         [ -e "$cargo_home/$name" ] && set -- "$@" --ro-bind /dev/null "$cargo_home/$name"
     done
@@ -444,6 +478,9 @@ sandbox() {
     old_ifs=$IFS
     IFS='
 '
+    for path in $hidden_path_dirs; do
+        set -- "$@" --ro-bind "$path" "$path"
+    done
     for path in $home_binds; do
         set -- "$@" --ro-bind "$path" "$path"
     done
@@ -466,6 +503,17 @@ sandbox() {
     for name in registry git config config.toml; do
         [ -e "$cargo_home/$name" ] && set -- "$@" --ro-bind "$cargo_home/$name" "/tmp/cargo-home/$name"
     done
+    # Last, so no bind above shows them again: the sockets the scan found.
+    old_ifs=$IFS
+    IFS='
+'
+    for mask in $socket_masks; do
+        case "$mask" in
+        "directory "*) set -- "$@" --tmpfs "${mask#directory }" ;;
+        "file "*) set -- "$@" --ro-bind /dev/null "${mask#file }" ;;
+        esac
+    done
+    IFS=$old_ifs
     set -- "$@" --clearenv --setenv HOME "$HOME" --setenv PATH "$PATH" --setenv TMPDIR /tmp \
         --setenv CARGO_HOME /tmp/cargo-home --setenv CARGO_NET_OFFLINE true \
         --setenv npm_config_cache /tmp/npm-cache \
@@ -489,6 +537,51 @@ extract() {
     mkdir -p "$2"
     git --git-dir="$repo" archive "$1" | tar -x -C "$2"
 }
+
+# The socket scan: every socket the sandbox still shows that its uid may
+# connect to (`find -writable`: connect() needs write permission, and a
+# read-only mount does not take it away), other than the test database's,
+# found inside the sandbox with the host's own find before any candidate
+# code runs. Each is hidden from then on: its directory under an empty
+# tmpfs when nothing the sandbox needs is in, above or below that directory
+# (a socket in /data/tmp/chrome.X when TMPDIR did not name /data/tmp), else
+# the socket file alone under /dev/null. The limit: a socket created after
+# the scan, in a directory no tmpfs covers, is reachable.
+mkdir "$work/socket-scan"
+sandbox "$work/socket-scan" find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o \
+    -type s -writable -print >"$work/sockets" 2>/dev/null || true
+# needed_by_sandbox <directory>: 0 when hiding the directory would hide
+# something the sandbox uses (a system directory, PATH, a bound path), or
+# the directory is one of those or above one.
+sandbox_paths=$(printf '%s\n' /bin /etc /lib /lib32 /lib64 /libx32 /nix /gnu /opt /sbin /usr \
+    "$work" "$scenarios" "$HOME" "$cargo_home" "$rustup_home" "$controller/scripts" \
+    "$controller/web/node_modules" "$scenario" "$db_socket" "$PATH" | tr ':' '\n'
+printf '%s%s' "$home_binds" "$hidden_path_dirs")
+needed_by_sandbox() {
+    [ "$1" = / ] && return 0
+    printf '%s\n' "$sandbox_paths" | awk -v dir="${1%/}" '
+        $0 == "" || $0 == "/" { next }
+        { sub(/\/$/, "") }
+        index(dir "/", $0 "/") == 1 || index($0 "/", dir "/") == 1 { found = 1; exit }
+        END { exit !found }'
+}
+while IFS= read -r found_socket; do
+    [ "$found_socket" = "$db_socket" ] && continue
+    found_dir=$(dirname "$found_socket")
+    if needed_by_sandbox "$found_dir"; then
+        mask="file $found_socket"
+    else
+        mask="directory $found_dir"
+    fi
+    case "
+$socket_masks" in *"
+$mask
+"*) continue ;; esac
+    socket_masks="$socket_masks$mask
+"
+done <"$work/sockets"
+[ -z "$socket_masks" ] ||
+    echo "| sockets hidden from the sandbox: $(printf '%s' "$socket_masks" | grep -c .)"
 
 # 0 = built (or nothing to build), 2 = did not build.
 build() {
