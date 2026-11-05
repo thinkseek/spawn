@@ -120,7 +120,9 @@ impl Settings {
             }
             (None, None) if workers.is_none() => None,
             (None, None) => {
-                return Err(format!("--workers goes with --backlog and --resident\n{USAGE}"));
+                return Err(format!(
+                    "--workers goes with --backlog and --resident\n{USAGE}"
+                ));
             }
             _ => return Err(format!("--backlog and --resident go together\n{USAGE}")),
         };
