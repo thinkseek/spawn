@@ -338,7 +338,16 @@ How the profile travels:
 - A running engine keeps the models it started with. A task for a live
   worker on another profile stops it at the moment typing would be safe
   (`switch-model-<task>-<revision>`); the next pass resumes it, context
-  kept, on the task's profile.
+  kept, on the task's profile. The Stop carries no task, which stays
+  waiting. A Stop that fails is retried like a failed delivery (under
+  `switch-model-<task>-<revision>-retry-<n>`, with the same doubling wait,
+  3 times), on the worker's last judgement of idle at its prompt: a failed
+  Stop changed nothing on the worker, but its own records are newer than
+  that judgement, which an Observer without a model judge does not write
+  again while nothing changes. Once the retries are spent no Stop goes, the
+  task stays `assigned`, and the supervisor's digest carries a
+  `delivery failed` escalation naming the task (its worker could not be
+  stopped to switch its model profile).
 - The Bridge passes the relay and the slots in the inline `--settings`
   `env` (`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`,
   `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`). Claude Code merges inline
