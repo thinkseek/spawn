@@ -282,6 +282,33 @@ fn activity_region<'a>(tail: &[&'a str], index: usize) -> Vec<&'a str> {
     region
 }
 
+/// The finished turn's line right above the prompt at `index` (below it
+/// only the status lines and mode tags), if the engine drew one there: a
+/// spinner glyph, then `· done`.
+fn finished_line<'a>(tail: &[&'a str], index: usize) -> Option<&'a str> {
+    let line = tail[..index]
+        .iter()
+        .rev()
+        .copied()
+        .filter(|line| !is_rule(line) && !line.trim().is_empty())
+        .find(|line| !is_status(line) && !is_mode_tag(line))?;
+    let trimmed = line.trim();
+    (trimmed.starts_with(SPINNERS) && trimmed.contains(FINISHED)).then_some(trimmed)
+}
+
+/// Whether a screen reading's evidence is a finished turn's line that says
+/// background shells still run (`✻ Sautéed for 6s · done 11:27 PM · 5 shells
+/// still running`). The engine sits at its prompt, but it is not idle: it
+/// resumes the agent when they finish. Read only from the line the engine
+/// draws right above its prompt ([`read_claude_screen`]), never from the
+/// transcript.
+pub fn shows_background_shells(evidence: &str) -> bool {
+    let trimmed = evidence.trim();
+    trimmed.starts_with(SPINNERS)
+        && trimmed.contains(FINISHED)
+        && (trimmed.contains("shells still running") || trimmed.contains("shell still running"))
+}
+
 /// The workspace trust dialog's last lines, as Claude Code draws them before
 /// its input box. Captured from Claude Code v2.1.317.
 const TRUST_FOOTER: [&str; 4] = [
@@ -351,7 +378,13 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
     }
 
     match prompt_body(prompt) {
-        Some("") => ScreenReading::new(ScreenState::Ready, prompt),
+        // A finished turn that left background shells running: the line
+        // that says so is the evidence, so the log records that the engine
+        // still works ([`shows_background_shells`]).
+        Some("") => match finished_line(&tail, index).filter(|line| shows_background_shells(line)) {
+            Some(line) => ScreenReading::new(ScreenState::Ready, line),
+            None => ScreenReading::new(ScreenState::Ready, prompt),
+        },
         Some(_) => ScreenReading::new(ScreenState::Drafted, prompt),
         None => ScreenReading::unknown(),
     }
