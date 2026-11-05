@@ -49,17 +49,6 @@ const KEPT_REPORTS: &str = ".spawn/reports";
 /// delivery's key, relative to the workspace ([`mark_delivery`]).
 const DELIVERY_MARKS: &str = ".spawn/deliveries";
 
-/// Retries of a delivery's start that failed because the task's source did
-/// not answer, after the first attempt.
-const START_RETRIES: usize = 8;
-
-/// Wait before the first retry; it doubles with every retry, up to
-/// [`START_RETRY_MAX_MS`].
-const START_RETRY_MS: i64 = 60_000;
-
-/// Longest wait between two retries.
-const START_RETRY_MAX_MS: i64 = 30 * 60_000;
-
 /// One task row from `delivery_rows`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct TaskRow {
@@ -339,75 +328,6 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
     }
 }
 
-/// The attempts at a task's current delivery into its session: the
-/// delivery's own command, then its retries (`<key>-retry-<n>`), in order.
-fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dispatch::Sent> {
-    let key = task.delivery_key();
-    let retry = format!("{key}-retry-");
-    facts
-        .dispatched
-        .iter()
-        .filter(|sent| sent.key == key || sent.key.starts_with(&retry))
-        .collect()
-}
-
-/// A delivered task whose start failed only because its source did not
-/// answer (`crate::sources::SOURCE_UNANSWERED`), into a session that never
-/// ran, with retries left: how many attempts were made and when the last
-/// one finished. Such a start is tried again ([`start_retries`]) instead of
-/// asking a person.
-fn retryable_start(task: &TaskRow, facts: &Facts) -> Option<(usize, i64)> {
-    if task.state != TaskState::Delivered
-        || facts.live
-        || facts.open_command
-        || facts.execution_id.is_some()
-    {
-        return None;
-    }
-    let attempts = delivery_attempts(task, facts);
-    let last = attempts.last()?;
-    let unanswered = last.succeeded == Some(false)
-        && last
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains(crate::sources::SOURCE_UNANSWERED));
-    (unanswered && attempts.len() <= START_RETRIES).then_some((
-        attempts.len(),
-        last.finished_at_ms.unwrap_or(last.created_at_ms),
-    ))
-}
-
-/// Starts to submit again: a delivery's start that failed because the
-/// source did not answer is retried, with a wait that doubles each time,
-/// [`START_RETRIES`] times. The retry carries the same start under a key of
-/// its own; it does not deliver the task again (the task stays delivered).
-pub(crate) fn start_retries(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
-    let mut orders = Vec::new();
-    for task in &work.tasks {
-        let Some(facts) = rows
-            .iter()
-            .find(|facts| facts.session_id == task.session_id)
-        else {
-            continue;
-        };
-        let Some((attempts, finished)) = retryable_start(task, facts) else {
-            continue;
-        };
-        let doublings = u32::try_from(attempts - 1).unwrap_or(u32::MAX).min(20);
-        let wait = START_RETRY_MS
-            .saturating_mul(1_i64 << doublings)
-            .min(START_RETRY_MAX_MS);
-        if now_ms.saturating_sub(finished) < wait {
-            continue;
-        }
-        if let Some(Order { action, .. }) = delivery(task, None, false) {
-            let key = format!("{}-retry-{attempts}", task.delivery_key());
-            orders.push(task.command(key, action));
-        }
-    }
-    orders
-}
-
 /// Delivery orders for the current facts.
 pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
     let facts: BTreeMap<&str, &Facts> = rows
@@ -606,15 +526,15 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         .filter(|task| task.state == TaskState::Delivered)
     {
         let key = task.delivery_key();
-        // The latest attempt failed, and no retry is coming.
+        // The delivery's command failed.
         let failed = rows
             .iter()
             .find(|facts| facts.session_id == task.session_id)
             .is_some_and(|facts| {
-                delivery_attempts(task, facts)
-                    .last()
-                    .is_some_and(|sent| sent.succeeded == Some(false))
-                    && retryable_start(task, facts).is_none()
+                facts
+                    .dispatched
+                    .iter()
+                    .any(|sent| sent.key == key && sent.succeeded == Some(false))
             });
         if failed {
             items.push(Escalation {
@@ -746,8 +666,8 @@ pub(crate) fn collect_reports(
 #[cfg(test)]
 mod tests {
     use super::{
-        News, REPORT, START_RETRIES, TaskRow, Work, delivery_mark, mark_delivery, news_items,
-        orders, report_contract, report_is_new, start_retries, task_prompt,
+        News, REPORT, TaskRow, Work, delivery_mark, mark_delivery, news_items, orders,
+        report_contract, report_is_new, task_prompt,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -1135,77 +1055,6 @@ mod tests {
             "a report after a revision is news again"
         );
         assert!(items[1].line.contains("## Outcome done"));
-    }
-
-    #[test]
-    fn a_start_the_source_did_not_answer_is_retried_then_escalated() {
-        let delivered = task(4, TaskState::Delivered, "ephemeral");
-        let tasks = work(vec![delivered]);
-        let mut facts = worker(false, false);
-        // A first start: the session never ran.
-        facts.execution_id = None;
-        let unanswered = format!(
-            "ensure branch agent_worker_x: workspace unavailable: could not ask the source; \
-             {}",
-            crate::sources::SOURCE_UNANSWERED
-        );
-        let failed = |key: String, finished: i64, error: &str| Sent {
-            key,
-            text: None,
-            created_at_ms: finished - 1,
-            finished_at_ms: Some(finished),
-            succeeded: Some(false),
-            error: Some(error.to_string()),
-        };
-        facts
-            .dispatched
-            .push(failed("deliver-4-0".to_string(), 1_000, &unanswered));
-        let rows = |facts: &Facts| vec![facts.clone()];
-
-        assert!(
-            news_items(&tasks, &rows(&facts)).is_empty(),
-            "a retry is coming: no one is asked yet"
-        );
-        assert!(start_retries(&tasks, &rows(&facts), 1_000 + 59_999).is_empty());
-        let retry = start_retries(&tasks, &rows(&facts), 1_000 + 60_000);
-        assert_eq!(retry.len(), 1);
-        assert_eq!(retry[0].key, "deliver-4-0-retry-1");
-        assert_eq!(retry[0].task, None, "the task stays delivered");
-        assert!(matches!(retry[0].action, CommandAction::Start { .. }));
-
-        // The wait doubles.
-        facts.dispatched.push(failed(
-            "deliver-4-0-retry-1".to_string(),
-            70_000,
-            &unanswered,
-        ));
-        assert!(start_retries(&tasks, &rows(&facts), 70_000 + 119_999).is_empty());
-        assert_eq!(
-            start_retries(&tasks, &rows(&facts), 70_000 + 120_000)[0].key,
-            "deliver-4-0-retry-2"
-        );
-
-        // Once the retries are spent, a person is asked.
-        for retry in 2..=START_RETRIES {
-            facts.dispatched.push(failed(
-                format!("deliver-4-0-retry-{retry}"),
-                100_000,
-                &unanswered,
-            ));
-        }
-        assert!(start_retries(&tasks, &rows(&facts), i64::MAX / 2).is_empty());
-        let items = news_items(&tasks, &rows(&facts));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].why, Why::DeliveryFailed);
-
-        // Any other failure asks at once and is not retried.
-        let mut refused = worker(false, false);
-        refused.execution_id = None;
-        refused
-            .dispatched
-            .push(failed("deliver-4-0".to_string(), 1_000, "mount: refused"));
-        assert!(start_retries(&tasks, &rows(&refused), i64::MAX / 2).is_empty());
-        assert_eq!(news_items(&tasks, &rows(&refused)).len(), 1);
     }
 
     #[test]

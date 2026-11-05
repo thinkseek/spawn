@@ -486,9 +486,8 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   retrying after a transient API error (both escalate), and the actions
   `restart` and `reassign`.
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
-- **The integrator judging an agent's work from its pushed branch**, and the
-  backlog, scenarios and gate versioned with the source, so work done on
-  another host lands too (docs/storage.md).
+- **The backlog, scenarios and gate versioned with the source**
+  (docs/storage.md).
 
 ## 10. One log, one landing path
 
