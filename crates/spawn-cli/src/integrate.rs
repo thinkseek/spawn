@@ -35,8 +35,13 @@
 //!    rejection is counted, nothing reaches the worker, and a later pass
 //!    judges again. An agent with neither a checkpoint nor a pushed branch
 //!    has no branch to land;
-//! 5. an objective mission with no open task gets its next objective
-//!    ([`objectives`]).
+//! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
+//!    up to its worker limit N (`--workers`, default 1) of its tasks in
+//!    flight, each on its own agent (its resident, then per-task workers),
+//!    and never two for one objective. Filling happens on every pass that
+//!    gets this far, before the judging of step 4, which stays one
+//!    candidate per pass, the lowest ready task first. A halted mission gets
+//!    no new task.
 //!
 //! Like the dispatcher, it keeps no state of its own: the control stream
 //! says what was judged and landed. An advisory lock allows one integrator
@@ -133,6 +138,9 @@ pub(crate) struct Task {
     pub(crate) scenario: Option<String>,
     #[serde(default)]
     pub(crate) delivered_at_ms: Option<i64>,
+    /// The backlog objective it pursues, for an objective mission's task.
+    #[serde(default)]
+    pub(crate) objective: Option<u32>,
 }
 
 impl Mission {
@@ -397,15 +405,26 @@ impl Integrator {
             )
             .map(|()| true);
         }
-        let Some(task) = mission.ready() else {
-            // An objective mission with nothing open gets its next task; a
-            // closed mission gets none.
-            if mission.state == "done" {
-                return Ok(false);
+        // An objective mission's free slots get their objectives; a closed
+        // mission gets none. An assignment that fails does not keep a ready
+        // task from its judging.
+        let assigned = if mission.state == "done" {
+            false
+        } else {
+            match objectives::assign_next(store, mission) {
+                Ok(assigned) => !assigned.is_empty(),
+                Err(error) if mission.ready().is_none() => return Err(error),
+                Err(error) => {
+                    eprintln!("integrate: mission {}: {error}", mission.id);
+                    false
+                }
             }
-            return Ok(objectives::assign_next(store, mission)?.is_some());
         };
-        self.judge(store, &mirror, source, &main, &scenarios, count, task)
+        let Some(task) = mission.ready() else {
+            return Ok(assigned);
+        };
+        let judged = self.judge(store, &mirror, source, &main, &scenarios, count, task)?;
+        Ok(judged || assigned)
     }
 
     /// Abort delivered tasks over budget. True when it aborted one.
