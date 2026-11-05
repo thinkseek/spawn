@@ -1007,7 +1007,7 @@ fn a_late_turn_end_of_an_earlier_execution_neither_closes_the_turn_nor_merges() 
         .expect("append succeeds");
     let commits_before = commits(&store);
     for _ in 0..3 {
-        clock.advance(std::time::Duration::from_secs(60));
+        clock.advance(std::time::Duration::from_mins(1));
         quiet(&bridge.tick().expect("the tool runs"));
     }
     assert_eq!(merges(&store), 1, "no merge while the tool runs");
@@ -1032,7 +1032,7 @@ fn the_earlier_executions_lines_read_again_on_resume_leave_the_turn_open() {
     // execution's turn, already recorded under that execution.
     transcript_in(&store, 2, &[prompt("1"), turn_end("1")]);
     for _ in 0..3 {
-        clock.advance(std::time::Duration::from_secs(60));
+        clock.advance(std::time::Duration::from_mins(1));
         quiet(&bridge.tick().expect("the typed prompt runs"));
     }
     assert_eq!(merges(&store), 1, "no merge while the typed prompt runs");
