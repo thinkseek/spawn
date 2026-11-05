@@ -755,7 +755,9 @@ impl Bridge {
                 if ended {
                     view.active = None;
                 } else if let Some(held) = view.active.as_mut() {
-                    held.checkpoint = None;
+                    // Cleared by `advance` only once committed: a failed
+                    // checkpoint stays due and is tried again next tick.
+                    held.checkpoint = active.checkpoint;
                     held.reported_end = active.reported_end;
                     held.follow = active.follow;
                 }
@@ -818,9 +820,12 @@ impl Bridge {
             return self.end(agent_id, session, active, cause, exit_code, false, report);
         }
         if let Some(reason) = active.checkpoint {
-            self.checkpoint(agent_id, session, active, reason, report)?;
-            if reason == CheckpointReason::TurnStopped {
-                self.archive_transcript(agent_id, session, active, report);
+            // A commit that failed was reported; the checkpoint stays due.
+            if self.checkpoint(agent_id, session, active, reason, report)? {
+                active.checkpoint = None;
+                if reason == CheckpointReason::TurnStopped {
+                    self.archive_transcript(agent_id, session, active, report);
+                }
             }
         }
         if active.follow.stale.is_some() {
