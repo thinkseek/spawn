@@ -522,15 +522,19 @@ impl Bridge {
                 view.native = Some(native_session_id.clone());
             }
             // A merge of main is no checkpoint of the agent's work: one
-            // still due stays due.
+            // still due stays due. Nor is a commit of an earlier execution.
             EventKind::ArtifactCommitted { reason, .. }
-                if *reason != CheckpointReason::BaseMerged =>
+                if current && *reason != CheckpointReason::BaseMerged =>
             {
                 if let Some(active) = view.active.as_mut() {
                     active.checkpoint = None;
                 }
             }
-            other => {
+            // Turns, tools and checkpoints are the current execution's own:
+            // an event of an earlier one that reaches the log late (or one
+            // with no execution) neither closes the running turn nor asks
+            // for a checkpoint and the merge after it.
+            other if current => {
                 if let Some(active) = view.active.as_mut() {
                     if let Some(open) = opens_turn(other) {
                         active.turn_open = open;
@@ -540,6 +544,7 @@ impl Bridge {
                     }
                 }
             }
+            _ => {}
         }
     }
 
@@ -813,19 +818,27 @@ impl Bridge {
             // A minute of slack for a log clock ahead of this host's: lines
             // already recorded are dropped by their keys anyway.
             for event in claude_line(&line, active.started_ms - CLOCK_SLACK_MS) {
-                let kind = event.kind;
-                if let Some(open) = opens_turn(&kind) {
+                let opens = opens_turn(&event.kind);
+                let checkpoint = event.kind.checkpoint_reason().is_some();
+                let stored = self.log.append(NewEvent {
+                    agent_id: agent_id.clone(),
+                    session_id: session.clone(),
+                    execution_id: Some(active.execution_id.clone()),
+                    source: Source::Claude,
+                    source_event_id: event.source_event_id,
+                    kind: event.kind,
+                })?;
+                // A resumed session's transcript holds the earlier
+                // executions' lines too, already recorded under them (the
+                // key finds that record): they say nothing about this
+                // execution's turn.
+                if stored.record.event.execution_id.as_ref() != Some(&active.execution_id) {
+                    continue;
+                }
+                if let Some(open) = opens {
                     active.turn_open = open;
                 }
-                active.follow.checkpoint_read |= kind.checkpoint_reason().is_some();
-                self.append(
-                    agent_id,
-                    session,
-                    Some(&active.execution_id),
-                    Source::Claude,
-                    event.source_event_id,
-                    kind,
-                )?;
+                active.follow.checkpoint_read |= checkpoint;
             }
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
