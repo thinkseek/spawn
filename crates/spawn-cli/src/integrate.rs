@@ -1013,9 +1013,38 @@ fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget};
+    use super::{
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree,
+        over_budget,
+    };
     use crate::gate::GateFailure;
     use serde_json::json;
+
+    /// Only exit 1 is a conflict: a merge-tree git cannot run (an unknown
+    /// option, a crash, a signal) is an error carrying git's message.
+    #[test]
+    fn a_merge_git_cannot_run_is_an_error_not_a_conflict() {
+        assert_eq!(
+            merged_tree(Some(0), "abc123\n", ""),
+            Ok(Some("abc123".to_string()))
+        );
+        assert_eq!(merged_tree(Some(1), "def456\nCONFLICT", ""), Ok(None));
+        let unknown = merged_tree(
+            Some(129),
+            "",
+            "error: unknown option `attr-source=abc'\nusage: git [-v | --version]",
+        )
+        .expect_err("exit 129 is no conflict");
+        assert!(unknown.contains("unknown option"), "{unknown}");
+        assert!(unknown.contains("exited 129"), "{unknown}");
+        assert!(unknown.contains("not a conflict"), "{unknown}");
+        assert!(unknown.contains("2.43"), "{unknown}");
+        let crash = merged_tree(None, "", "").expect_err("a signal is no conflict");
+        assert!(crash.contains("killed by a signal"), "{crash}");
+        assert!(merged_tree(Some(139), "", "Segmentation fault").is_err());
+        assert!(merged_tree(Some(128), "", "fatal: bad object").is_err());
+        assert!(merged_tree(Some(2), "", "").is_err());
+    }
 
     /// Commit everything in the checkout `directory`.
     pub(super) fn commit_in(directory: &str, message: &str) {
