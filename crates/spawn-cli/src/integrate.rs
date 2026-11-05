@@ -2178,11 +2178,12 @@ mod database_tests {
         std::fs::create_dir_all(&scenarios).expect("scenarios");
         let gate_path = base.join("gate.sh");
         std::fs::write(&gate_path, gate).expect("gate");
-        let integrator = Integrator {
-            root: base.join("host"),
-            gate: gate_path,
-            gate_env: Vec::new(),
-        };
+        let integrator = Integrator::new(
+            base.join("host"),
+            gate_path,
+            test_gate_env(),
+            super::DEFAULT_GATES,
+        );
         (base, source, scenarios, integrator)
     }
 
@@ -2227,7 +2228,7 @@ mod database_tests {
                           "verdict": "accepted", "base": b0, "candidate": c1}),
         );
         // The mirror exists, as it did when the push went out.
-        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror");
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
 
         integrator.pass_on(&db.store).expect("a pass");
         let waited = db.mission(waiting);
@@ -2263,7 +2264,7 @@ mod database_tests {
         let c2 = main_moves(&base, &source, "on-top.txt");
         db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
                           "verdict": "accepted", "base": b0, "candidate": c1}));
-        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror");
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
 
         integrator.pass_on(&db.store).expect("a pass");
         let after = db.mission(mission);
@@ -2282,7 +2283,7 @@ mod database_tests {
         use std::os::unix::fs::PermissionsExt;
         let (base, source, scenarios, integrator) = world("failed-fetch", "exit 1\n");
         let db = Db::new("failed_fetch");
-        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror at F");
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror at F");
         let mission = db.gated_mission(&source, &scenarios);
         let task = db.reported_task(mission, "w");
         let t = main_moves(&base, &source, "deploy.txt");
@@ -2323,11 +2324,12 @@ mod database_tests {
             .expect("a gate configured before the check");
         db.reported_task(mission, "w");
         let base = std::env::temp_dir().join(format!("spawn-db-remote-{}", std::process::id()));
-        let integrator = Integrator {
-            root: base.join("host"),
-            gate: base.join("gate.sh"),
-            gate_env: Vec::new(),
-        };
+        let integrator = Integrator::new(
+            base.join("host"),
+            base.join("gate.sh"),
+            Vec::new(),
+            super::DEFAULT_GATES,
+        );
         integrator.pass_on(&db.store).expect("a pass");
         let halted = db.mission(mission)["halted"].clone();
         assert!(
@@ -2382,6 +2384,7 @@ mod database_tests {
         let work = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work");
 
         integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
         let after = db.mission(mission);
         assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
         assert_eq!(source_main(&source), work);
