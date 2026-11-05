@@ -387,7 +387,6 @@ fn judged_next(stalls: &Stalls) -> BTreeSet<i64> {
 
 /// The step `task` waits on, measured, or none: it is queued, closed with
 /// no worker left, the halt's, or its delivery was given up.
-#[allow(clippy::too_many_lines)]
 fn measure(
     task: &OpenTask,
     record: &Record,
