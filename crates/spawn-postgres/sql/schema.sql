@@ -399,6 +399,9 @@ create or replace function spawn_submit(
 declare
     v_id bigint;
 begin
+    -- The id is taken under the append lock, which is held to commit:
+    -- commands commit in id order, the order `spawn_claim` relies on.
+    perform pg_advisory_xact_lock(1399957335);
     insert into spawn_commands
         (principal, idempotency_key, agent_id, session_id, action, state, created_at_ms)
     values
@@ -432,6 +435,9 @@ create or replace function spawn_claim(
     out_session text,
     out_action  jsonb
 ) language sql as $$
+    -- One command per session at a time: nothing earlier in the session
+    -- may be unfinished. "Earlier" is id order, which is commit order
+    -- because `spawn_submit` takes its id under the append lock.
     with candidate as (
         select c.id
         from spawn_commands c
