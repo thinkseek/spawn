@@ -32,6 +32,9 @@ hmac = "0.13"
 # Already linked through std's dependencies; opens agent-written files with
 # O_NOFOLLOW | O_NONBLOCK.
 libc = "0.2"
+# Descriptor-relative file calls (openat, mkdirat, renameat) without
+# unsafe code: files an agent can write are opened inside the workspace only.
+rustix = { version = "1", features = ["fs"] }
 
 [profile.dev]
 debug = "line-tables-only"
