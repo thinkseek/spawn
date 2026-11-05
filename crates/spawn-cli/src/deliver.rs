@@ -93,14 +93,24 @@ impl TaskRow {
         format!("deliver-{}-{}", self.id, self.revisions)
     }
 
-    /// A command to this task's session that delivers or retires it.
-    fn order(&self, key: String, action: CommandAction) -> Order {
+    /// A command to this task's session that carries the task to its
+    /// worker: submitting it marks the task delivered.
+    fn delivery(&self, key: String, action: CommandAction) -> Order {
+        Order {
+            task: Some(self.id),
+            ..self.command(key, action)
+        }
+    }
+
+    /// A command to this task's session that does not carry the task (a
+    /// stop before a model switch, a retirement): the task's state stays.
+    fn command(&self, key: String, action: CommandAction) -> Order {
         Order {
             agent_id: self.agent_id.clone(),
             session_id: self.session_id.clone(),
             key,
             action,
-            task: Some(self.id),
+            task: None,
         }
     }
 }
@@ -285,22 +295,25 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
                 return None;
             }
             if facts.model != task.model {
-                // Stopped at the same moment typing would be safe; the next
-                // pass resumes it, context kept, on the task's models.
+                // Stopped at the same moment typing would be safe. The stop
+                // does not carry the task, which stays waiting: once the
+                // stop has finished the worker is no longer live, and a
+                // later pass resumes it, context kept, on the task's models,
+                // with the resume that delivers the task.
                 let key = format!("switch-model-{}-{}", task.id, task.revisions);
-                return Some(task.order(key, CommandAction::Stop));
+                return Some(task.command(key, CommandAction::Stop));
             }
-            Some(task.order(key, CommandAction::Input { text: typed(task) }))
+            Some(task.delivery(key, CommandAction::Input { text: typed(task) }))
         }
         // Ran before: resume, so a resident keeps its context.
-        Some(facts) if facts.execution_id.is_some() => Some(task.order(
+        Some(facts) if facts.execution_id.is_some() => Some(task.delivery(
             key,
             CommandAction::Resume {
                 prompt: Some(resume_prompt(task)),
                 model,
             },
         )),
-        _ => Some(task.order(
+        _ => Some(task.delivery(
             key,
             CommandAction::Start {
                 engine: ENGINE.to_string(),
@@ -339,7 +352,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
                 && found.is_some_and(Facts::live_and_free) =>
             {
                 let key = format!("retire-task-{}", task.id);
-                orders.push(task.order(key, CommandAction::Stop));
+                orders.push(task.command(key, CommandAction::Stop));
             }
             TaskState::Accepted
             | TaskState::Cancelled
@@ -820,6 +833,65 @@ mod tests {
         };
         let plan = orders(&work(vec![cheap]), &[on_cheap]);
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+    }
+
+    /// What submitting `plan` does to the task rows: an order that carries
+    /// a task marks it delivered (`spawn_task_delivered` takes an assigned
+    /// or revised task only).
+    fn submitted(mut work: Work, plan: &[crate::dispatch::Order]) -> Work {
+        for order in plan {
+            if let Some(id) = order.task
+                && let Some(task) = work.tasks.iter_mut().find(|task| task.id == id)
+                && matches!(task.state, TaskState::Assigned | TaskState::Revise)
+            {
+                task.state = TaskState::Delivered;
+            }
+        }
+        work
+    }
+
+    #[test]
+    fn a_model_switch_stops_the_worker_then_resumes_it_with_the_task() {
+        let cheap = TaskRow {
+            model: ModelProfile::Cheap,
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        let mut work = work(vec![cheap]);
+
+        // Idle on the other profile: the stop, which carries no task.
+        let plan = orders(&work, &[worker(true, true)]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, CommandAction::Stop);
+        assert_eq!(plan[0].task, None, "a stop delivers nothing");
+        work = submitted(work, &plan);
+        assert_eq!(work.tasks[0].state, TaskState::Assigned, "still waiting");
+
+        // The stop runs: nothing else goes to the session meanwhile.
+        let stopping = Facts {
+            open_command: true,
+            ..worker(true, true)
+        };
+        assert!(orders(&work, &[stopping]).is_empty());
+
+        // The stop finished: the resume on the task's profile delivers it.
+        let stopped = worker(false, false);
+        let plan = orders(&work, std::slice::from_ref(&stopped));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].task, Some(4));
+        assert_eq!(plan[0].key, "deliver-4-0");
+        assert!(matches!(
+            plan[0].action,
+            CommandAction::Resume {
+                model: Some(ModelProfile::Cheap),
+                ..
+            }
+        ));
+        work = submitted(work, &plan);
+        assert_eq!(work.tasks[0].state, TaskState::Delivered);
+        assert!(
+            orders(&work, &[stopped]).is_empty(),
+            "delivered once, nothing more"
+        );
     }
 
     #[test]
