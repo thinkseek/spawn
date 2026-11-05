@@ -10,8 +10,11 @@
 #
 # - The candidate may not change a path listed in `<scenarios-dir>/protected`
 #   (one prefix per line, `#` comments): the controller's tasks, scenarios,
-#   gate and black-box tests.
-# - It may not add build-time code: a changed `build.rs` or `.cargo/`, or a
+#   gate and black-box tests. Paths are compared as git stores them (no
+#   rename detection, no quoting); a path with a newline is refused, and so
+#   is every candidate when the list is missing (an empty list protects
+#   nothing on purpose).
+# - It may not add build-time code: a changed `build.rs` or `.cargo/`, a
 #   `build =` key in any Cargo.toml of the tree (cargo would run the file it
 #   names as a build script).
 # - `<scenarios-dir>/build`, when present, builds each tree (run inside it).
@@ -623,14 +626,30 @@ run_scenario() {
     return "$(cat "$work/run.status" 2>/dev/null || echo 1)"
 }
 
-changed=$(git --git-dir="$repo" diff --name-only "$baseline" "$candidate")
-
-touched=""
-if [ -f "$scenarios/protected" ]; then
-    touched=$(printf '%s\n' "$changed" | awk -v list="$scenarios/protected" '
-        BEGIN { while ((getline line < list) > 0) if (line != "" && line !~ /^#/) prefix[++n] = line }
-        { for (i = 1; i <= n; i++) if (index($0, prefix[i]) == 1) { print; break } }')
+# The changed paths, as they are: no rename detection (a move lists the old
+# path too, so a protected file cannot be moved away), no quoting
+# (core.quotePath would print "scripts/\303\251.sh", quotes included, and a
+# quoted path matches no prefix), NUL-separated. A path holding a newline is
+# refused: one line per path is what the checks below read.
+git -c core.quotePath=false --git-dir="$repo" diff --no-renames --no-ext-diff --name-only -z \
+    "$base_commit" "$candidate_commit" | tr '\n\000' '\001\n' >"$work/changed"
+if grep -q "$(printf '\001')" "$work/changed"; then
+    echo "| a changed path holds a newline: $(grep "$(printf '\001')" "$work/changed" | tr '\001' '?' | head -n 3 | tr '\n' ' ')"
+    verdict rejected "a changed path holds a newline"
+    exit 0
 fi
+changed=$(cat "$work/changed")
+
+# Without a protected list nothing is protected, which is never meant: a
+# controller that lost its list (a candidate that moved it away once) judges
+# nothing. An owner who means "nothing protected" gives an empty list.
+if [ ! -f "$scenarios/protected" ]; then
+    verdict rejected "the scenarios directory has no protected list"
+    exit 0
+fi
+touched=$(printf '%s\n' "$changed" | awk -v list="$scenarios/protected" '
+    BEGIN { while ((getline line < list) > 0) if (line != "" && line !~ /^#/) prefix[++n] = line }
+    { for (i = 1; i <= n; i++) if (index($0, prefix[i]) == 1) { print; break } }')
 if [ -n "$touched" ]; then
     echo "| candidate touches protected paths:$(echo "$touched" | tr '\n' ' ')"
     verdict rejected "candidate touches protected paths"
@@ -837,9 +856,9 @@ empty_tests() {
 }
 # The candidate's added and changed lines per .rs file, from the diff (a
 # deletion touches the lines on both sides of it).
-git --git-dir="$repo" diff -U0 --no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ \
+git -c core.quotePath=false --git-dir="$repo" diff -U0 --no-renames --no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ \
     "$base_commit" "$candidate_commit" -- '*.rs' | awk '
-    /^\+\+\+ / { file = ($2 == "/dev/null") ? "" : substr($2, 3); next }
+    /^\+\+\+ / { file = ($0 == "+++ /dev/null") ? "" : substr($0, 7); next }
     /^@@ / && file != "" {
         split($3, added, ",")
         first = substr(added[1], 2) + 0
