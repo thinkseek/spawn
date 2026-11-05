@@ -614,6 +614,109 @@ fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
 }
 
 #[test]
+fn a_dropped_mission_lands_nothing_even_with_a_push_in_flight() {
+    let (store, schema) = store("control_dropped_landing");
+    // A gated mission whose task the gate passed: landing.
+    let landing_task = || {
+        let mission = store
+            .mission_add("Land", &json!(["/tmp/source.git"]), "human")
+            .expect("add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "review", None, None)
+            .expect("configure");
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "").expect("accept");
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                       "base": "b1", "candidate": "c1", "scenarios": 1}),
+            )
+            .expect("gate");
+        (mission, task)
+    };
+    let mut client = admin(&schema);
+    let state = |client: &mut Client, task: i64| -> String {
+        client
+            .query_one("select state from mission_tasks where id = $1", &[&task])
+            .expect("task")
+            .get(0)
+    };
+
+    // Dropping the mission cancels its landing.
+    let (mission, task) = landing_task();
+    assert_eq!(state(&mut client, task), "landing");
+    store
+        .mission_close(mission, "dropped", "gone")
+        .expect("drop");
+    assert_eq!(state(&mut client, task), "cancelled");
+    assert!(store.landing_hold(task).expect("hold").is_none());
+    assert!(
+        store
+            .integrator_record(
+                &json!({"type": "task.landed", "id": task, "from": "b1", "to": "c1"})
+            )
+            .is_err(),
+        "a cancelled landing records no landing"
+    );
+
+    // While the integrator holds a landing for its push, a drop waits.
+    let (mission, task) = landing_task();
+    let hold = store.landing_hold(task).expect("hold").expect("landing");
+    client
+        .batch_execute("set lock_timeout = '300ms'")
+        .expect("bound the wait");
+    let error = client
+        .execute(
+            "select spawn_mission_close($1, 'dropped', 'gone')",
+            &[&mission],
+        )
+        .expect_err("the drop waits for the push");
+    assert_eq!(
+        error.code(),
+        Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+    );
+    // The push landed; its record goes in before the hold is let go.
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": task, "from": "b1", "to": "c1"}))
+        .expect("landed");
+    drop(hold);
+    client
+        .execute(
+            "select spawn_mission_close($1, 'dropped', 'gone')",
+            &[&mission],
+        )
+        .expect("the drop goes through after the push");
+    assert_eq!(
+        state(&mut client, task),
+        "landed",
+        "landed work stays landed"
+    );
+
+    // A landing a fold from before left under a dropped mission is
+    // recorded cancelled instead of landed.
+    let (mission, task) = landing_task();
+    store
+        .mission_close(mission, "dropped", "gone")
+        .expect("drop");
+    client
+        .execute(
+            "update mission_tasks set state = 'landing' where id = $1",
+            &[&task],
+        )
+        .expect("the earlier fold's table");
+    assert!(store.landing_hold(task).expect("hold").is_none());
+    assert_eq!(state(&mut client, task), "cancelled");
+    assert_eq!(
+        control_types(&mut client).last().map(String::as_str),
+        Some("task.cancelled")
+    );
+}
+
+#[test]
 fn one_integrator_holds_the_lock() {
     let (first, schema) = store("control_integrator_lock");
     let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");

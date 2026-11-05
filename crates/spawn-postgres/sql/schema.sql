@@ -946,14 +946,17 @@ begin
                                     updated_at_ms = p_at
          where id = v_id;
         -- Work still queued for a closed mission is dropped. Accepted work
-        -- of a gated mission still lands when the mission is done, and is
-        -- dropped with the mission otherwise.
+        -- of a gated mission, and work the gate passed (landing), still
+        -- lands when the mission is done, and is dropped with the mission
+        -- otherwise.
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at
          where mission_id = v_id
            and (state in ('assigned', 'revise')
-                or (state = 'accepted' and p_record ->> 'state' = 'dropped'
-                    and exists (select 1 from mission_missions m
-                                 where m.id = v_id and m.gate is not null)));
+                or (p_record ->> 'state' = 'dropped'
+                    and (state = 'landing'
+                         or (state = 'accepted'
+                             and exists (select 1 from mission_missions m
+                                          where m.id = v_id and m.gate is not null)))));
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model,
@@ -1154,6 +1157,11 @@ end $$;
 create or replace function spawn_mission_close(p_mission bigint, p_state text, p_summary text)
 returns void language plpgsql security definer as $$
 begin
+    -- A drop waits for a landing push in flight (spawn_landing_hold), so
+    -- the push cannot land work of a mission dropped meanwhile.
+    if p_state = 'dropped' then
+        perform pg_advisory_xact_lock(1399957337);
+    end if;
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is null then
@@ -1473,6 +1481,39 @@ begin
     return spawn_control_record(p_record);
 end $$;
 
+-- The integrator's hold on one landing (owner only): taken right before its
+-- compare-and-swap push and released after it records what the push did
+-- (spawn_landing_release). Dropping a mission waits for the hold, so a push
+-- never lands work of a mission dropped meanwhile. True when the task is
+-- still landing for a mission that is not dropped. A landing task of a
+-- dropped mission (a fold from before drops cancelled landings) is
+-- recorded cancelled instead.
+create or replace function spawn_landing_hold(p_task bigint)
+returns boolean language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not land work', session_user using errcode = '42501';
+    end if;
+    perform pg_advisory_lock(1399957337);
+    if exists (select 1 from mission_tasks k join mission_missions m on m.id = k.mission_id
+                where k.id = p_task and k.state = 'landing' and m.state <> 'dropped') then
+        return true;
+    end if;
+    perform pg_advisory_xact_lock(1399957335);
+    if exists (select 1 from mission_tasks k join mission_missions m on m.id = k.mission_id
+                where k.id = p_task and k.state = 'landing' and m.state = 'dropped') then
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
+    end if;
+    perform pg_advisory_unlock(1399957337);
+    return false;
+end $$;
+
+create or replace function spawn_landing_release()
+returns void language plpgsql security definer as $$
+begin
+    perform pg_advisory_unlock(1399957337);
+end $$;
+
 -- A task's records in the control stream, found without reading the rest.
 create index if not exists spawn_events_control_record
     on spawn_events ((kind -> 'detail' -> 'record' ->> 'id'), session_seq)
@@ -1556,7 +1597,8 @@ begin
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)',
-        'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)'] loop
+        'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
+        'spawn_landing_hold(bigint)', 'spawn_landing_release()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
