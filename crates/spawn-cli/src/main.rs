@@ -28,6 +28,7 @@ mod commands;
 mod config;
 mod context;
 mod deliver;
+mod disk;
 mod dispatch;
 mod gate;
 mod integrate;
