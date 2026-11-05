@@ -612,14 +612,27 @@ impl Integrator {
             );
             return Ok(assigned);
         }
+        self.start_judging(store, mirror, source, main, scenarios, count, mission.id, task, running)?;
+        Ok(assigned)
+    }
+
+    /// Judge `task` on a thread of its own, under the gate cap.
+    #[allow(clippy::too_many_arguments)]
+    fn start_judging(
+        &self,
+        store: &Arc<PostgresStore>,
+        mirror: PathBuf,
+        source: &str,
+        main: String,
+        scenarios: PathBuf,
+        count: u32,
+        mission_id: i64,
+        task: &Task,
+        running: usize,
+    ) -> Result<(), String> {
         let judge = self.judge.clone();
         let task_id = task.id;
-        let (store, task, source_owned, mission_id) = (
-            Arc::clone(store),
-            task.clone(),
-            source.to_string(),
-            mission.id,
-        );
+        let (store, task, source_owned) = (Arc::clone(store), task.clone(), source.to_string());
         let handle = std::thread::Builder::new()
             .name(format!("gate-{}", task.id))
             .spawn(move || {
@@ -638,18 +651,18 @@ impl Integrator {
             .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
         println!(
             "integrate: mission {}: judging task {} ({} of {} gates)",
-            mission.id,
+            mission_id,
             task_id,
             running + 1,
             self.gates
         );
         self.running.borrow_mut().push(Running {
-            mission: mission.id,
+            mission: mission_id,
             source: source.to_string(),
             task: task_id,
             handle,
         });
-        Ok(assigned)
+        Ok(())
     }
 
     /// Abort delivered tasks over budget. True when it aborted one.
