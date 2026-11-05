@@ -51,17 +51,28 @@ from (
 /// - `closed_by` and `reason`: the task's last control record (`task.aborted`
 ///   carries the integrator's reason).
 pub(crate) const CANCELLED_DELIVERIES: &str = r"
+with latest as materialized (
+  -- At most one per resident: its latest delivery, when that is cancelled.
+  -- The log is read below for these alone.
+  select k.id, k.mission_id, k.agent_id, k.session_id, r.name
+    from mission_tasks k
+    join mission_residents r on r.agent_id = k.agent_id and r.state <> 'retired'
+   where k.state = 'cancelled' and k.kind = 'resident' and k.delivered_at_ms is not null
+     and not exists (select 1 from mission_tasks later
+                      where later.session_id = k.session_id and later.id <> k.id
+                        and later.delivered_at_ms is not null
+                        and (later.delivered_at_ms, later.id) > (k.delivered_at_ms, k.id))
+)
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
-  select k.id, k.mission_id, k.agent_id, k.session_id, r.name as resident,
+  select k.id, k.mission_id, k.agent_id, k.session_id, k.name as resident,
          start.commit as start, aside.commit as set_aside,
          exists (select 1 from spawn_commands c
                   where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
                     and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
                     and c.succeeded) as told,
          last.type as closed_by, last.reason
-    from mission_tasks k
-    join mission_residents r on r.agent_id = k.agent_id and r.state <> 'retired'
+    from latest k
     left join lateral (
       select e.id, (e.kind -> 'detail' -> 'record' ->> 'command_id')::bigint as command_id
         from spawn_events e
@@ -96,12 +107,7 @@ from (
          and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
          and e.kind -> 'detail' -> 'record' ->> 'type' like 'task.%'
        order by e.session_seq desc limit 1) last on true
-   where k.state = 'cancelled' and k.kind = 'resident' and k.delivered_at_ms is not null
-     and first.id is not null
-     and not exists (select 1 from mission_tasks later
-                      where later.session_id = k.session_id and later.id <> k.id
-                        and later.delivered_at_ms is not null
-                        and (later.delivered_at_ms, later.id) > (k.delivered_at_ms, k.id))
+   where first.id is not null
 ) t";
 
 /// What the supervisor should hear about, beyond worker states: open
