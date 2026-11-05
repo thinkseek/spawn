@@ -995,7 +995,10 @@ mod tests {
         facts.turn_ended = true;
         facts.checkpoint = Some("c1".to_string());
         facts.evidence_seq = Some(8);
-        assert!(facts.current_observation().is_none(), "the judgement is older");
+        assert!(
+            facts.current_observation().is_none(),
+            "the judgement is older"
+        );
         let rows = [facts];
         let due = report_due(&task, &rows).expect("the turn ended: the report is collected");
         assert_eq!(

@@ -939,11 +939,17 @@ impl Bridge {
             // reads the turn's end from the log also finds the checkpoint
             // of what it wrote. A commit that fails holds the line back: it
             // is read (and committed) again next tick.
-            let ends_turn = events.iter().any(|event| {
-                event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped)
-            });
+            let ends_turn = events
+                .iter()
+                .any(|event| event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped));
             if ends_turn
-                && !self.checkpoint(agent_id, session, active, CheckpointReason::TurnStopped, report)?
+                && !self.checkpoint(
+                    agent_id,
+                    session,
+                    active,
+                    CheckpointReason::TurnStopped,
+                    report,
+                )?
             {
                 active.follow.offset += u64::try_from(start).unwrap_or(u64::MAX);
                 return Ok(());
