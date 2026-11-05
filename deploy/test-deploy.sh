@@ -73,8 +73,11 @@ export SYSTEMCTL_LOG=$scratch/systemctl.log
 cat >"$scratch/fakebin/systemctl" <<'EOF'
 #!/bin/sh
 # SYSTEMCTL_FAIL="<arguments>=<status>": that one call fails with <status>.
+# This host has no spawn-model-relay unit (the README installs relays by
+# hand): systemctl says so with status 5, as it does for "Unit not found".
 echo "$*" >>"$SYSTEMCTL_LOG"
 case "${SYSTEMCTL_FAIL-}" in "$*="*) exit "${SYSTEMCTL_FAIL##*=}" ;; esac
+case "$*" in "--user try-restart spawn-model-relay") exit 5 ;; esac
 EOF
 real_git=$(command -v git)
 cat >"$scratch/fakebin/git" <<EOF
@@ -227,7 +230,7 @@ echo "== the next deploy completes it (the model relay's unit is not installed)"
 # Main is HEAD now: the operator runs the gate again, over it.
 verdict_over "$head"
 : >"$SYSTEMCTL_LOG"
-deploy SYSTEMCTL_FAIL="--user try-restart spawn-model-relay=5"
+deploy
 check "succeeded (status $status)" [ "$status" -eq 0 ]
 check "says the relay unit is not installed" grep -q "installed model-relay.py (unit spawn-model-relay is not installed" "$out"
 check "both relay scripts are installed" \
