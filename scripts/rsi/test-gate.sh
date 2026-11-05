@@ -177,6 +177,10 @@ expect "the reason names the floor and TMPDIR" "$(cat "$integrator/verdict")" \
 expect "and the free space, in KiB" \
     "$(grep -Ec '^\{"no_room":true,"free_kb":[0-9]+,"min_gb"' "$integrator/verdict")" 1
 refuse "with no verdict" "$(cat "$integrator/verdict")" '"verdict"'
+expect "a verdict file that cannot be written still exits 5" \
+    "exit=$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000
+            SPAWN_GATE_VERDICT=$work/no-such-dir/verdict sh "$gate" "$repo" "$base" "$good" "$scenarios" \
+                >/dev/null 2>&1 || echo $?)" 'exit=5'
 expect "and says why" "$(cat "$work/gate.out")" 'under SPAWN_GATE_MIN_FREE_GB=1000000000: not starting'
 refuse "and leaves no scratch" "$(ls -A "$roomless")" 'spawn-gate'
 expect "a floor that is not whole GiB is an abort (exit 3), not short room" \
