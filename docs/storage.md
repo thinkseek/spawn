@@ -39,6 +39,15 @@ head alone is the whole workspace, so everything below is a git operation.
 - **Checkpoint** (every tool call, turn end, exit): the Bridge commits the
   tree against the kept index (a stat cache: only changed files are hashed).
   Cost is proportional to what changed.
+- **A turn's checkpoint is part of the turn's end.** When the Bridge reads a
+  turn's end from the transcript, it commits the workspace and records the
+  `artifact.committed` first, then the `turn.stopped` (or `turn.failed`),
+  in the same tick. A commit that fails holds the line back: the end is
+  recorded only once the commit works. A turn that changed nothing has no
+  new commit and no `artifact.committed`: its checkpoint is the branch head
+  as it stands (the agent's latest `artifact.committed`). So whoever reads a
+  turn's end from the log, wherever it runs, also finds the checkpoint of
+  what the turn wrote.
 - **Branch**: `refs/heads/<agent>`, moved by compare-and-swap on the old
   commit. A checkpoint or merge removes git's own `<index>.lock` under the
   branch's lock before it runs git on the index: one that is there was
@@ -126,6 +135,29 @@ head alone is the whole workspace, so everything below is a git operation.
   `main`'s version (or delete it where `main` has none); recorded as
   `merge.conflicted {files, marked: false}`. An agent with no workspace on
   the integrator's host gets no merge, and its note says so.
+- **Work set aside**: a resident keeps its branch from task to task, so the
+  work of a task cancelled while it was delivered (by `spawn task cancel`,
+  the supervisor, the integrator's abort over budget, or the closure rule)
+  would otherwise stay in its workspace, the next task would start on top
+  of it, and in a gated mission the next task's candidate would carry it
+  into a landing under another objective's name. Before the resident gets
+  anything else, the dispatcher (spawn-cli's `set_aside`) puts a new commit
+  on top of its branch whose tree is the checkpoint the task started from:
+  the agent's latest `artifact.committed` before the task's first delivery
+  was accepted, the merge of `main` typed just before it included (and a
+  start's or resume's `base_merged`, recorded before `task.delivered`). It
+  runs only while nothing of the agent writes the branch, after the
+  dispatcher's Stop took the final checkpoint, under the branch's lock
+  (`set_aside`, routed like `merge_base`): a mounted directory holding
+  what no checkpoint took is committed first, the directory moves to the
+  start's tree the two-tree way, then the branch moves by compare-and-swap.
+  Nothing is rewound (pushes are never forced, and the integrator requires
+  the published branch to descend from the latest checkpoint), and nothing
+  is lost: the work is the set-aside commit's parent, and the worker's
+  notice names both commits. The set-aside is recorded as
+  `artifact.committed` (`set_aside`, key `set-aside:<task>`, so it is made
+  once) and pushed like any checkpoint. A merge pending its markers is set
+  aside with the work.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won by the same two-tree update
@@ -174,7 +206,24 @@ head alone is the whole workspace, so everything below is a git operation.
   back to `reported` (`accepted` under review), no rejection is counted,
   nothing reaches the worker, and a later pass judges again once the pusher
   has caught up. An agent with neither a checkpoint nor a pushed branch is
-  rejected ("the worker has no branch to land"). So only a source that is a
+  rejected ("the worker has no branch to land"). **A report is judged
+  against the checkpoint of the turn that produced it.** The dispatcher
+  collects a report only once the session's latest turn event in the log is
+  a turn's end (`turn.stopped` or `turn.failed`, not a newer
+  `message.received`; a ready screen alone is not enough), with the worker
+  live, no command open and its latest judgement `TurnStoppedIdle`. A
+  judgement with no model answer (no model judge, or the judge unavailable)
+  may be older than the turn's end, since the Observer writes it again only
+  when its verdict changes; a model's answer is written for every new
+  situation, so a stale one waits for the model's judgement of the turn. Its `task.reported`
+  record names in `commit` the agent's latest checkpoint read with that
+  turn's end (`spawn_task_reported(task, report, commit)`; null only when
+  the agent has no checkpoint at all, and from the two-argument form). The
+  pushed head must also be that commit or a descendant of it, or the task
+  is gated `stale` as above; a report that names a commit is never judged
+  for lack of a checkpoint (the branch pushed at the mount is only the
+  task's base). A report with a null commit is judged by the rule above
+  alone. So only a source that is a
   directory on this host has its agents' work landed: a gate on any other
   source is refused when it is configured, and a mission gated on one
   before that is halted by the integrator. The
@@ -187,7 +236,37 @@ head alone is the whole workspace, so everything below is a git operation.
   caught by the marker check wherever the integrator runs. The gate judges
   the candidate; the integrator moves `main` by a compare-and-swap push. A
   branch head an earlier version wrote with a `Spawn-Large` trailer lands
-  as a commit of the same tree without it.
+  without it: the landing commit's message is the integrator's.
+
+  **A landing is one commit per task on `main`'s first-parent line.** Every
+  landing, also of a branch that already contains `main`, moves `main` by
+  exactly one new merge commit C, never by a fast-forward to a worker's
+  commit: first parent the `main` the gate judged against (the task's base),
+  second parent the pushed head that was judged. C's tree is the head's when
+  `main` is its ancestor, and the merge by `main`'s merge rules otherwise.
+  C is built before the gate runs: the gate judges it, `task.gated` names it
+  in `candidate`, the push moves `main` to exactly it, and `task.landed`
+  names it in `to`. Its message is the integrator's, written from the record
+  alone (never from a workspace), and says what landed: the first line is
+  the objective's title (the brief's first line) with the objective and the
+  task, `Greet the harbour (objective 7, task 42)`, or, for a task without
+  an objective, the brief's first non-empty line and `(task <id>)`; after a
+  blank line, the report's `## What changed` section (the whole report when
+  it has none), at most 3000 characters, with any line of it that could
+  read as a `Spawn-` trailer indented; last, the trailers `Spawn-Task`,
+  `Spawn-Objective` and `Spawn-Head` (the judged head). Author and committer
+  are `spawn-integrate`, unsigned. So `git log --first-parent main` reads one
+  line per landed task, `git bisect start --first-parent` (git 2.29+) visits
+  only landings, each one gated (a plain bisect may stop on an ungated
+  checkpoint: the price of keeping the history), and `git revert -m 1 <C>`
+  undoes exactly one task. The worker's checkpoints stay reachable from
+  `main` through the second parents, off that line, so a reverted objective
+  comes back as a new task from the current `main` (or by reverting the
+  revert), never by merging the same branch again. It is a merge and not a
+  squash so that no other ref has to keep the history, and so that the
+  worker's head is in `main`: the next merge of `main` into its branch is
+  clean, where after a squash every later merge would see the same change
+  from both sides.
 
 ## Files over the cap
 

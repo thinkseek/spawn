@@ -51,6 +51,7 @@ fn heading(why: Why) -> &'static str {
         Why::StopFailed => "stop failed",
         Why::Disk => "disk space on this host",
         Why::GateRoom => "no room for the gate on this host",
+        Why::Stalled => "stalled",
     }
 }
 

@@ -282,6 +282,33 @@ fn activity_region<'a>(tail: &[&'a str], index: usize) -> Vec<&'a str> {
     region
 }
 
+/// The finished turn's line right above the prompt at `index` (below it
+/// only the status lines and mode tags), if the engine drew one there: a
+/// spinner glyph, then `· done`.
+fn finished_line<'a>(tail: &[&'a str], index: usize) -> Option<&'a str> {
+    let line = tail[..index]
+        .iter()
+        .rev()
+        .copied()
+        .filter(|line| !is_rule(line) && !line.trim().is_empty())
+        .find(|line| !is_status(line) && !is_mode_tag(line))?;
+    let trimmed = line.trim();
+    (trimmed.starts_with(SPINNERS) && trimmed.contains(FINISHED)).then_some(trimmed)
+}
+
+/// Whether a screen reading's evidence is a finished turn's line that says
+/// background shells still run (`✻ Sautéed for 6s · done 11:27 PM · 5 shells
+/// still running`). The engine sits at its prompt, but it is not idle: it
+/// resumes the agent when they finish. Read only from the line the engine
+/// draws right above its prompt ([`read_claude_screen`]), never from the
+/// transcript.
+pub fn shows_background_shells(evidence: &str) -> bool {
+    let trimmed = evidence.trim();
+    trimmed.starts_with(SPINNERS)
+        && trimmed.contains(FINISHED)
+        && (trimmed.contains("shells still running") || trimmed.contains("shell still running"))
+}
+
 /// The workspace trust dialog's last lines, as Claude Code draws them before
 /// its input box. Captured from Claude Code v2.1.317.
 const TRUST_FOOTER: [&str; 4] = [
@@ -351,7 +378,15 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
     }
 
     match prompt_body(prompt) {
-        Some("") => ScreenReading::new(ScreenState::Ready, prompt),
+        // A finished turn that left background shells running: the line
+        // that says so is the evidence, so the log records that the engine
+        // still works ([`shows_background_shells`]).
+        Some("") => {
+            match finished_line(&tail, index).filter(|line| shows_background_shells(line)) {
+                Some(line) => ScreenReading::new(ScreenState::Ready, line),
+                None => ScreenReading::new(ScreenState::Ready, prompt),
+            }
+        }
         Some(_) => ScreenReading::new(ScreenState::Drafted, prompt),
         None => ScreenReading::unknown(),
     }
@@ -421,5 +456,46 @@ $";
     fn an_api_error_still_reads_as_an_error() {
         let pane = "API Error: 529 overloaded_error\n$ \nbypass permissions on";
         assert_eq!(read_claude_screen(pane).state, ScreenState::Error);
+    }
+}
+
+#[cfg(test)]
+mod background_shell_tests {
+    use super::{ScreenState, read_claude_screen, shows_background_shells};
+
+    const STATUS: &str = "  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+    /// Live case (task 33): a resident ran clippy, the tests and the e2e in
+    /// background shells and sat at its prompt for over 15 minutes. The
+    /// reading is Ready (input is safe), and its evidence is the line that
+    /// says the shells still run.
+    #[test]
+    fn a_finished_turn_with_shells_running_is_ready_with_that_line_as_evidence() {
+        for line in [
+            "✻ Sautéed for 6s · done 11:27 PM · 5 shells still running",
+            "✻ Baked for 2m 3s · done 9:01 AM · 1 shell still running",
+        ] {
+            let reading =
+                read_claude_screen(&format!("claude: started them\n{line}\n❯ \n{STATUS}"));
+            assert_eq!(reading.state, ScreenState::Ready);
+            assert_eq!(reading.evidence, line);
+            assert!(shows_background_shells(&reading.evidence));
+        }
+        let done = read_claude_screen(&format!("✻ Sautéed for 6s · done 11:27 PM\n❯ \n{STATUS}"));
+        assert_eq!(done.state, ScreenState::Ready);
+        assert!(!shows_background_shells(&done.evidence));
+        assert!(!shows_background_shells("❯"));
+    }
+
+    /// Text the model printed is transcript: a line that quotes the engine's
+    /// above other output is not the engine's.
+    #[test]
+    fn a_quoted_shells_line_in_the_transcript_is_not_read() {
+        let pane = format!(
+            "claude: ✻ Sautéed for 6s · done 11:27 PM · 5 shells still running\n❯ \n{STATUS}"
+        );
+        let reading = read_claude_screen(&pane);
+        assert_eq!(reading.state, ScreenState::Ready);
+        assert!(!shows_background_shells(&reading.evidence));
     }
 }

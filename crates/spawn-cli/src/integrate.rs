@@ -21,9 +21,27 @@
 //!    own `refs/spawn-integrate/<agent>`. The integrator never commits a
 //!    mounted workspace and never moves the agent's `refs/heads/<agent>`,
 //!    so it works the same on a host that never ran the agent, and a file
-//!    written after the last checkpoint never lands. The candidate is
-//!    merged with the source's main when main moved, and judged by
-//!    `scripts/rsi/gate.sh` with the mission's scenarios. Every verdict
+//!    written after the last checkpoint never lands.
+//!
+//!    **A landing is one commit per task on main's first-parent line.**
+//!    The candidate is a new merge commit C ([`landing_candidate`]), never
+//!    the worker's commit and never a fast-forward to one: first parent the
+//!    source's main (the task's base), second parent the pushed head
+//!    judged fresh; its tree is the head's when main is in it, and the merge
+//!    by main's merge rules when main moved (a conflict is `conflict`). Its
+//!    message ([`landing_message`]) says what landed, from the record alone:
+//!    the objective's title with the objective and the task on the first
+//!    line (a task without one: its brief's first line and the task), the
+//!    report's `## What changed` (or the whole report, bounded) after a
+//!    blank line, with no line of it able to pass for a `Spawn-` trailer,
+//!    and the integrator's `Spawn-Task`, `Spawn-Objective` and `Spawn-Head`
+//!    trailers. C is judged by `scripts/rsi/gate.sh` with the mission's
+//!    scenarios, named in the accepted `task.gated` (`candidate`), pushed
+//!    as it is, and named in `task.landed` (`to`). So `git log
+//!    --first-parent` is one line per landed task, `git bisect start
+//!    --first-parent` visits only gated landings, `git revert -m 1 <C>`
+//!    undoes one task, and every checkpoint stays reachable from main
+//!    through the second parents. Every verdict
 //!    names the revision of the report it judged (the task's `revisions`),
 //!    and the store refuses it once the task has moved on. A pass records
 //!    the verdict before git moves, then moves the source's main with a
@@ -52,6 +70,17 @@
 //!    the supervisor once ([`crate::disk::gate_room_escalations`]). Every
 //!    other gate failure, the gate's own exit 3 included (a missing bind
 //!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
+//!
+//!    **A report is judged against the checkpoint of the turn that produced
+//!    it.** The dispatcher collects a report only after the turn that wrote
+//!    it ended in the log, and the Bridge records a turn's checkpoint before
+//!    its end; the `task.reported` record names that checkpoint in `commit`.
+//!    The pushed head must also be that commit or a descendant of it
+//!    ([`report_freshness`]); otherwise the verdict is `stale`, as above. A
+//!    report that names a commit is never judged for lack of a checkpoint
+//!    (the branch pushed when the workspace was mounted is only the task's
+//!    base). A report with a null commit (a record from before reports named
+//!    one) is judged by the rule above alone;
 //! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
@@ -64,6 +93,7 @@
 //! says what was judged and landed. An advisory lock allows one integrator
 //! per database, so two gates never run at once.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -188,6 +218,14 @@ pub(crate) struct Task {
     /// task has moved on to another.
     #[serde(default)]
     pub(crate) revisions: i32,
+    /// Its brief (`mission_tasks.brief`): an objective task's first line is
+    /// `Objective <id>: <title>`.
+    #[serde(default)]
+    pub(crate) brief: String,
+    /// The report the gate's verdict is for (`mission_tasks.report`), as the
+    /// record holds it: the landing's message summarises it.
+    #[serde(default)]
+    pub(crate) report: Option<String>,
 }
 
 impl Mission {
@@ -359,6 +397,46 @@ pub(crate) fn freshness(
             }
         }
     }
+}
+
+/// The stale rule for a reported task: the pushed head must be the
+/// report's commit (`reported`, the agent's checkpoint the report's turn
+/// ended with) or a descendant of it, and pass [`freshness`] against the
+/// agent's latest checkpoint as well. A report that names a commit is never
+/// judged for lack of a checkpoint: with no pushed branch, or one that lacks
+/// the commit, it is stale. A report that names none (a record from before
+/// reports named their checkpoint) is judged by [`freshness`] alone.
+pub(crate) fn report_freshness(
+    reported: Option<&str>,
+    checkpoint: Option<&str>,
+    pushed: Option<&str>,
+    contains: impl Fn(&str, &str) -> bool,
+) -> Freshness {
+    if let Some(reported) = reported {
+        match pushed {
+            None => {
+                return Freshness::Stale(format!(
+                    "the source has no spawn/<agent> yet, and the report's checkpoint is \
+                     {reported}"
+                ));
+            }
+            Some(pushed) if pushed != reported && !contains(reported, pushed) => {
+                return Freshness::Stale(if contains(pushed, reported) {
+                    format!(
+                        "the pushed branch ({pushed}) is behind the report's checkpoint \
+                         ({reported})"
+                    )
+                } else {
+                    format!(
+                        "the pushed branch ({pushed}) does not contain the report's checkpoint \
+                         ({reported})"
+                    )
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    freshness(checkpoint, pushed, contains)
 }
 
 /// The mirror's own copy of an agent's pushed branch: never
@@ -602,16 +680,21 @@ impl Integrator {
     }
 
     /// The agent's pushed branch, fetched into the mirror, checked against
-    /// its latest checkpoint. A lagging push is fetched again for up to
-    /// [`PUSH_WAIT`] before it counts as stale.
+    /// the checkpoint the task's report names and the agent's latest
+    /// checkpoint ([`report_freshness`]). A lagging push is fetched again for
+    /// up to [`PUSH_WAIT`] before it counts as stale.
     fn pushed_candidate(
         store: &PostgresStore,
         mirror: &Path,
         source: &str,
-        agent: &str,
+        task: &Task,
     ) -> Result<Freshness, String> {
+        let agent = task.agent_id.as_str();
         let checkpoint = store
             .latest_checkpoint(agent)
+            .map_err(|error| error.to_string())?;
+        let reported = store
+            .reported_commit(task.id)
             .map_err(|error| error.to_string())?;
         let mirror_path = mirror.to_string_lossy().to_string();
         let contains = |ancestor: &str, commit: &str| {
@@ -629,7 +712,12 @@ impl Integrator {
         loop {
             let pushed = sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
                 .map_err(|error| error.to_string())?;
-            let verdict = freshness(checkpoint.as_deref(), pushed.as_deref(), contains);
+            let verdict = report_freshness(
+                reported.as_deref(),
+                checkpoint.as_deref(),
+                pushed.as_deref(),
+                contains,
+            );
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
                 return Ok(verdict);
             }
@@ -651,7 +739,7 @@ impl Integrator {
         count: u32,
         task: &Task,
     ) -> Result<bool, String> {
-        let branch = match Self::pushed_candidate(store, mirror, source, &task.agent_id)? {
+        let branch = match Self::pushed_candidate(store, mirror, source, task)? {
             Freshness::Fresh(branch) => Some(branch),
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
@@ -728,7 +816,8 @@ impl Integrator {
         if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
             return gated("conflict", json!({ "note": note }));
         }
-        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, task.id)? else {
+        let message = landing_message(task, &branch);
+        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
             // The worker cannot merge main itself: merge it into the
             // workspace now, while the worker waits for this verdict, so
             // the note names what it has to resolve.
@@ -812,16 +901,23 @@ impl Integrator {
     }
 }
 
-/// The commit that would land `branch` (the agent's pushed head, in the
-/// mirror) on `main`, or `None` when the two conflict. Only objects are
-/// written, never a ref: the agent's `refs/heads/<agent>` stays the Bridge's,
-/// and `spawn/<agent>` catches up with a landing through the Bridge's next
-/// merge of main, which its pusher pushes like any checkpoint.
+/// The commit that lands `branch` (the agent's pushed head, in the mirror)
+/// on `main`, with `message` ([`landing_message`]), or `None` when the two
+/// conflict. Always one new merge commit: first parent `main` (the base the
+/// gate judges against), second parent `branch`, so main's first-parent line
+/// is one commit per landing and every checkpoint stays reachable through
+/// the second parents. Its tree is the branch's when main is in it, and the
+/// merge of both by main's merge rules otherwise. Never the branch head
+/// itself, so a head that names a large-file manifest lands without it.
+/// Only objects are written, never a ref: the agent's `refs/heads/<agent>`
+/// stays the Bridge's, and `spawn/<agent>` catches up with a landing through
+/// the Bridge's next merge of main, which its pusher pushes like any
+/// checkpoint.
 fn landing_candidate(
     mirror_path: &str,
     main: &str,
     branch: &str,
-    task: i64,
+    message: &str,
 ) -> Result<Option<String>, String> {
     let main_is_in = git(&[
         "--git-dir",
@@ -832,69 +928,142 @@ fn landing_candidate(
         branch,
     ])
     .is_ok();
-    if main_is_in {
-        // Large files are workspace state, never source: a branch head
-        // that names a large-file manifest lands as a commit of the same
-        // tree without it, so nothing forked from main inherits them.
-        let message = git(&[
-            "--git-dir",
-            mirror_path,
-            "show",
-            "-s",
-            "--format=%B",
-            branch,
-        ])?;
-        if !spawn_host::names_files_outside_git(&message) {
-            return Ok(Some(branch.to_string()));
-        }
-        let tree = git(&[
+    let tree = if main_is_in {
+        git(&[
             "--git-dir",
             mirror_path,
             "rev-parse",
             &format!("{branch}^{{tree}}"),
-        ])?;
-        return commit_landing(
-            mirror_path,
-            &[&tree, "-p", branch, "-m", &format!("Land task {task}")],
-        )
-        .map(Some);
-    }
-    // Main moved since the worker started: land the merge of both, by
-    // main's merge rules (a bare repository reads no in-tree
-    // .gitattributes otherwise), as main is merged into agents' branches.
-    let output = sources::controller_git()
-        .args([
-            "--git-dir",
-            mirror_path,
-            &format!("--attr-source={main}"),
-            "merge-tree",
-            "--write-tree",
-            main,
-            branch,
-        ])
-        .output()
-        .map_err(|error| format!("run git merge-tree: {error}"))?;
-    let Some(tree) = merged_tree(
-        output.status.code(),
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    )?
-    else {
-        return Ok(None);
+        ])?
+    } else {
+        // Main moved since the worker started: land the merge of both, by
+        // main's merge rules (a bare repository reads no in-tree
+        // .gitattributes otherwise), as main is merged into agents' branches.
+        let output = sources::controller_git()
+            .args([
+                "--git-dir",
+                mirror_path,
+                &format!("--attr-source={main}"),
+                "merge-tree",
+                "--write-tree",
+                main,
+                branch,
+            ])
+            .output()
+            .map_err(|error| format!("run git merge-tree: {error}"))?;
+        let Some(tree) = merged_tree(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )?
+        else {
+            return Ok(None);
+        };
+        tree
     };
     commit_landing(
         mirror_path,
-        &[
-            &tree,
-            "-p",
-            main,
-            "-p",
-            branch,
-            "-m",
-            &format!("Land task {task} (merged with main)"),
-        ],
+        &[&tree, "-p", main, "-p", branch, "-m", message],
     )
     .map(Some)
+}
+
+/// Characters of a report's summary a landing's message holds at most.
+const SUMMARY_CHARS: usize = 3000;
+
+/// Characters of a brief's first line a landing's first line holds at most.
+const TITLE_CHARS: usize = 100;
+
+/// The message of `task`'s landing of `head`: what landed, from the record
+/// alone (never a workspace). The first line holds the objective's title
+/// (the brief's first line, `Objective <id>: <title>`) and names the
+/// objective and the task, or, for a task without an objective, the brief's
+/// first non-empty line and the task. After a blank line, the report's
+/// `## What changed` section (the whole report when it has none), bounded,
+/// with every line that could read as a `Spawn-` trailer indented. Last, the
+/// integrator's own trailers.
+pub(crate) fn landing_message(task: &Task, head: &str) -> String {
+    let first = task
+        .brief
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut subject = match task.objective {
+        Some(objective) => {
+            let title = first
+                .strip_prefix(&format!("Objective {objective}:"))
+                .map_or(first, str::trim);
+            let title = cut(title, TITLE_CHARS);
+            if title.is_empty() {
+                format!("Land objective {objective}, task {}", task.id)
+            } else {
+                format!("{title} (objective {objective}, task {})", task.id)
+            }
+        }
+        None if first.is_empty() => format!("Land task {}", task.id),
+        None => format!("{} (task {})", cut(first, TITLE_CHARS), task.id),
+    };
+    if subject.to_ascii_lowercase().starts_with("spawn checkpoint") {
+        subject = format!("Land {subject}");
+    }
+    let mut message = subject;
+    message.push_str("\n\n");
+    let summary = report_summary(task.report.as_deref().unwrap_or_default());
+    if summary.is_empty() {
+        message.push_str("The task's report is empty.");
+    } else {
+        for line in summary.lines() {
+            if line.trim_start().to_ascii_lowercase().starts_with("spawn-") {
+                message.push_str("    ");
+            }
+            message.push_str(line);
+            message.push('\n');
+        }
+    }
+    let message = message.trim_end().to_string();
+    let mut trailers = format!("Spawn-Task: {}\n", task.id);
+    if let Some(objective) = task.objective {
+        let _ = writeln!(trailers, "Spawn-Objective: {objective}");
+    }
+    let _ = writeln!(trailers, "Spawn-Head: {head}");
+    format!("{message}\n\n{trailers}")
+}
+
+/// What a landing's message quotes of `report`: its `## What changed`
+/// section, or the whole report when it has none (or an empty one),
+/// trimmed and cut to [`SUMMARY_CHARS`].
+fn report_summary(report: &str) -> String {
+    fn heading(line: &str) -> Option<&str> {
+        let level = line.bytes().take_while(|&byte| byte == b'#').count();
+        (1..=2)
+            .contains(&level)
+            .then(|| line[level..].trim().trim_end_matches(':').trim())
+    }
+    let mut lines = report.lines();
+    let mut section = None;
+    if lines.any(|line| heading(line).is_some_and(|text| text.eq_ignore_ascii_case("what changed")))
+    {
+        let body: Vec<&str> = lines.take_while(|line| heading(line).is_none()).collect();
+        let body = body.join("\n");
+        if !body.trim().is_empty() {
+            section = Some(body);
+        }
+    }
+    let text = section.as_deref().unwrap_or(report).trim();
+    let summary = cut(text, SUMMARY_CHARS);
+    if summary.len() < text.len() {
+        format!("{summary}\n[the report continues]")
+    } else {
+        summary.to_string()
+    }
+}
+
+/// `text` cut to at most `limit` characters, on a character boundary.
+fn cut(text: &str, limit: usize) -> &str {
+    text.char_indices()
+        .nth(limit)
+        .map_or(text, |(at, _)| text[..at].trim_end())
 }
 
 /// What `git merge-tree --write-tree` said, from its exit code (`None`: no
@@ -1164,7 +1333,7 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, no_room,
-        over_budget, pinned, room_backoff, room_wait, task_scenario,
+        over_budget, pinned, report_freshness, room_backoff, room_wait, task_scenario,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
@@ -1261,7 +1430,8 @@ mod tests {
             .expect("fetch")
             .expect("pushed");
         let main = git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"]).expect("main");
-        let candidate = super::landing_candidate(&mirror_path, &main, &pushed, task)
+        let message = format!("Work (task {task})\n\nThe work.\n");
+        let candidate = super::landing_candidate(&mirror_path, &main, &pushed, &message)
             .expect("candidate")
             .expect("no conflict");
         assert_ne!(candidate, pushed, "a landing of its own");
@@ -1495,7 +1665,8 @@ mod tests {
         let main =
             crate::sources::git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
                 .expect("main");
-        super::landing_candidate(&mirror_path, &main, &pushed, 1).expect("candidate")
+        super::landing_candidate(&mirror_path, &main, &pushed, "Work (task 1)\n\nThe work.\n")
+            .expect("candidate")
     }
 
     /// The whole loop of a conflict: the verdict merges main into the idle
@@ -1604,9 +1775,23 @@ mod tests {
         );
         assert_eq!(super::markers_note(false, &[]), None);
 
-        // Judged again: it contains main, so it lands as it is.
+        // Judged again: it contains main, so it lands as a commit of its
+        // tree on top of main, with the resolution as its second parent.
         let candidate = judged(&mirror, &source, agent).expect("no conflict now");
-        assert_eq!(candidate, resolved.as_str());
+        assert_ne!(candidate, resolved.as_str(), "never the worker's commit");
+        let rev = |reference: String| {
+            git(&["--git-dir", &mirror_path, "rev-parse", &reference]).expect("rev-parse")
+        };
+        assert_eq!(
+            rev(format!("{candidate}^1")),
+            main,
+            "main is the first parent"
+        );
+        assert_eq!(rev(format!("{candidate}^2")), resolved.as_str());
+        assert_eq!(
+            rev(format!("{candidate}^{{tree}}")),
+            rev(format!("{resolved}^{{tree}}"))
+        );
         git(&[
             "--git-dir",
             &mirror_path,
@@ -1615,7 +1800,7 @@ mod tests {
             &source,
             &format!("{candidate}:refs/heads/main"),
         ])
-        .expect("lands with a fast-forward of main");
+        .expect("lands with one commit on top of main");
         assert_eq!(
             git(&["--git-dir", &source, "show", "main:README.md"]).expect("main's README"),
             "one\nTWO by the agent, on main\nthree"
@@ -1865,6 +2050,53 @@ mod tests {
     }
 
     #[test]
+    fn a_report_is_judged_against_its_own_checkpoint() {
+        assert_eq!(
+            report_freshness(Some("c2"), Some("c2"), Some("c2"), history),
+            Freshness::Fresh("c2".to_string()),
+            "equal"
+        );
+        assert_eq!(
+            report_freshness(Some("c2"), Some("c2"), Some("c3"), history),
+            Freshness::Fresh("c3".to_string()),
+            "descendant"
+        );
+        let behind = report_freshness(Some("c2"), None, Some("c1"), history);
+        assert!(
+            matches!(&behind, Freshness::Stale(reason)
+                if reason.contains("behind the report's checkpoint")),
+            "the base pushed at the mount, with no checkpoint recorded: {behind:?}"
+        );
+        let diverged = report_freshness(Some("c2"), Some("c2"), Some("d2"), history);
+        assert!(
+            matches!(&diverged, Freshness::Stale(reason)
+                if reason.contains("does not contain the report's checkpoint")),
+            "{diverged:?}"
+        );
+        let absent = report_freshness(Some("c2"), None, None, history);
+        assert!(
+            matches!(&absent, Freshness::Stale(reason) if reason.contains("no spawn/<agent>")),
+            "no pushed branch: {absent:?}"
+        );
+        // Past the report's checkpoint but behind a later one: the latest
+        // checkpoint still rules.
+        let lagging = report_freshness(Some("c1"), Some("c3"), Some("c2"), history);
+        assert!(
+            matches!(&lagging, Freshness::Stale(reason) if reason.contains("behind")),
+            "{lagging:?}"
+        );
+        // A report that names no commit is judged as before.
+        assert_eq!(
+            report_freshness(None, None, Some("c1"), history),
+            Freshness::Fresh("c1".to_string())
+        );
+        assert_eq!(
+            report_freshness(None, None, None, history),
+            Freshness::Nothing
+        );
+    }
+
+    #[test]
     fn no_checkpoint_and_no_pushed_branch_is_nothing_to_land() {
         assert_eq!(freshness(None, None, history), Freshness::Nothing);
     }
@@ -2029,6 +2261,247 @@ mod tests {
         assert_eq!(gated.ready().map(|task| task.id), Some(2));
     }
 
+    /// A task as `GATED` reads it, with a brief and a report.
+    fn task_of(id: i64, objective: Option<u32>, brief: &str, report: Option<&str>) -> super::Task {
+        serde_json::from_value(json!({
+            "id": id, "agent_id": "agent_a", "session_id": "session_a", "state": "landing",
+            "objective": objective, "brief": brief, "report": report,
+        }))
+        .expect("a task")
+    }
+
+    const REPORT: &str = "## Outcome\ndone\n\n## What changed\nsummary: HARBOUR.txt now holds \
+                          kestrel\n\n### Details\nOne file.\n\n## Open issues\nnone\n";
+
+    #[test]
+    fn an_objective_landing_names_its_title_objective_and_task_and_summarises_the_report() {
+        let task = task_of(
+            42,
+            Some(931),
+            "Objective 931: Greet the harbour with a kestrel\n\nWrite the file.\n\
+             Earlier gate verdicts on this objective, newest first:\n- task 41: rejected\n",
+            Some(REPORT),
+        );
+        let message = super::landing_message(&task, "abc123");
+        let mut lines = message.lines();
+        assert_eq!(
+            lines.next(),
+            Some("Greet the harbour with a kestrel (objective 931, task 42)")
+        );
+        assert_eq!(lines.next(), Some(""));
+        let body: String = lines.collect::<Vec<_>>().join("\n");
+        assert!(
+            body.starts_with("summary: HARBOUR.txt now holds kestrel\n\n### Details\nOne file."),
+            "{body}"
+        );
+        assert!(
+            !body.contains("## Outcome") && !body.contains("Open issues"),
+            "{body}"
+        );
+        assert!(!message.contains("task 41"), "no other task: {message}");
+        assert!(
+            message.ends_with("\n\nSpawn-Task: 42\nSpawn-Objective: 931\nSpawn-Head: abc123\n"),
+            "{message}"
+        );
+        assert!(!spawn_host::names_files_outside_git(&message));
+    }
+
+    #[test]
+    fn a_landing_without_an_objective_names_its_brief_and_task() {
+        let task = task_of(
+            5,
+            None,
+            "\n\n  Fix the parser's error messages  \nMore.\n",
+            Some(REPORT),
+        );
+        let message = super::landing_message(&task, "abc123");
+        assert_eq!(
+            message.lines().next(),
+            Some("Fix the parser's error messages (task 5)")
+        );
+        assert!(!message.contains("Spawn-Objective"), "{message}");
+        assert!(message.contains("\nsummary: HARBOUR.txt now holds kestrel\n"));
+        // A long first line is cut; an empty brief still names the task;
+        // nothing reads like a checkpoint.
+        let long = task_of(6, None, &"word ".repeat(100), None);
+        let first = super::landing_message(&long, "h")
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(first.len() < 120 && first.ends_with(" (task 6)"), "{first}");
+        assert!(
+            super::landing_message(&task_of(7, None, "", None), "h").starts_with("Land task 7\n\n")
+        );
+        let checkpoint = task_of(8, None, "spawn checkpoint exec_3", None);
+        assert!(super::landing_message(&checkpoint, "h").starts_with("Land spawn checkpoint"));
+    }
+
+    #[test]
+    fn a_report_without_what_changed_is_quoted_whole_and_a_long_one_is_bounded() {
+        let task = task_of(
+            3,
+            Some(7),
+            "Objective 7: Title",
+            Some("\n  I changed the parser.\n\nAll green.\n\n"),
+        );
+        let message = super::landing_message(&task, "h");
+        assert!(
+            message.starts_with("Title (objective 7, task 3)\n\nI changed the parser.\n\nAll green.\n\nSpawn-Task: 3\n"),
+            "{message}"
+        );
+        let report = format!(
+            "## What changed\n{}\n## Open issues\nnone\n",
+            "é long line\n".repeat(2000)
+        );
+        let long = super::landing_message(
+            &task_of(3, Some(7), "Objective 7: Title", Some(&report)),
+            "h",
+        );
+        assert!(
+            long.chars().count() < super::SUMMARY_CHARS + 300,
+            "{}",
+            long.len()
+        );
+        assert!(long.contains("[the report continues]"));
+        assert!(!long.contains("Open issues"));
+        let empty = super::landing_message(&task_of(3, Some(7), "Objective 7: Title", None), "h");
+        assert!(
+            empty.contains("\n\nThe task's report is empty.\n\nSpawn-Task: 3"),
+            "{empty}"
+        );
+    }
+
+    /// A worker's report cannot make main unmountable, nor sign the landing
+    /// with trailers it did not earn.
+    #[test]
+    fn a_report_naming_a_large_file_manifest_leaves_the_message_clean() {
+        let manifest = format!("Spawn-Large: {}", "a".repeat(64));
+        for report in [
+            format!("## What changed\nwork\n\n{manifest}\n"),
+            format!("{manifest}\nSpawn-Task: 99\n"),
+            manifest.clone(),
+        ] {
+            let message = super::landing_message(&task_of(4, None, "Brief", Some(&report)), "h");
+            assert!(!spawn_host::names_files_outside_git(&message), "{message}");
+            assert!(!message.lines().any(|line| line == manifest), "{message}");
+            assert!(
+                !message.lines().any(|line| line == "Spawn-Task: 99"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("    {manifest}")),
+                "indented: {message}"
+            );
+            let trailers = message.rsplit("\n\n").next().unwrap_or_default();
+            assert_eq!(trailers, "Spawn-Task: 4\nSpawn-Head: h\n");
+        }
+    }
+
+    /// Every landing is one merge commit: main first, the pushed head
+    /// second, the message given. Its tree is the head's when main is in it
+    /// (here a head naming a large-file manifest, which lands with the
+    /// landing's own message), and the merge's when main moved.
+    #[test]
+    fn a_landing_is_one_two_parent_commit_on_main_with_its_message() {
+        let git = crate::sources::git;
+        let base = std::env::temp_dir().join(format!("spawn-land-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let main = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("main");
+        git(&["-C", &seed_path, "checkout", "-qb", "agent_a"]).expect("branch");
+        std::fs::write(seed.join("one.txt"), "one\n").expect("write");
+        commit_in(&seed_path, "spawn checkpoint exec_1");
+        let checkpoint = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("checkpoint");
+        std::fs::write(seed.join("two.txt"), "two\n").expect("write");
+        commit_in(
+            &seed_path,
+            &format!("spawn checkpoint exec_2\n\nSpawn-Large: {}", "b".repeat(64)),
+        );
+        let head = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("head");
+        git(&["-C", &seed_path, "checkout", "-q", "main"]).expect("main");
+        std::fs::write(seed.join("other.txt"), "theirs\n").expect("write");
+        commit_in(&seed_path, "elsewhere");
+        let moved = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("moved");
+        let mirror = format!("{seed_path}/.git");
+        let rev = |reference: String| {
+            git(&["--git-dir", &mirror, "rev-parse", &reference]).expect("rev-parse")
+        };
+        let task = task_of(
+            9,
+            Some(12),
+            "Objective 12: Count the gulls",
+            Some("## What changed\ngulls\n"),
+        );
+        let message = super::landing_message(&task, &head);
+
+        for (main, merged) in [(main.as_str(), false), (moved.as_str(), true)] {
+            let landing = super::landing_candidate(&mirror, main, &head, &message)
+                .expect("a landing")
+                .expect("no conflict");
+            assert_eq!(rev(format!("{landing}^1")), main, "first parent: the base");
+            assert_eq!(rev(format!("{landing}^2")), head, "second parent: the head");
+            assert!(
+                git(&[
+                    "--git-dir",
+                    &mirror,
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("{landing}^3")
+                ])
+                .is_err(),
+                "two parents"
+            );
+            let said = git(&["--git-dir", &mirror, "show", "-s", "--format=%B", &landing])
+                .expect("message");
+            assert_eq!(said, message.trim_end());
+            assert!(
+                said.starts_with("Count the gulls (objective 12, task 9)\n\ngulls\n"),
+                "{said}"
+            );
+            assert!(
+                !spawn_host::names_files_outside_git(&said),
+                "the manifest stays off main"
+            );
+            let files =
+                git(&["--git-dir", &mirror, "ls-tree", "--name-only", &landing]).expect("tree");
+            if merged {
+                assert_eq!(files, "README.md\none.txt\nother.txt\ntwo.txt", "the merge");
+            } else {
+                assert_eq!(
+                    rev(format!("{landing}^{{tree}}")),
+                    rev(format!("{head}^{{tree}}"))
+                );
+            }
+            // One commit on the first-parent line; the checkpoints off it.
+            let line = git(&[
+                "--git-dir",
+                &mirror,
+                "rev-list",
+                "--first-parent",
+                &format!("{main}..{landing}"),
+            ])
+            .expect("first parents");
+            assert_eq!(line, landing);
+            git(&[
+                "--git-dir",
+                &mirror,
+                "merge-base",
+                "--is-ancestor",
+                &checkpoint,
+                &landing,
+            ])
+            .expect("the checkpoints stay reachable");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Both landing commits [`super::landing_candidate`] writes (a branch
     /// head with the large-file trailer, a merge with a main that moved) are
     /// by [`super::LANDING_IDENTITY`], as author and as committer. Run by
@@ -2070,10 +2543,15 @@ mod tests {
         let mirror = format!("{seed_path}/.git");
 
         for (main, branch) in [(main.as_str(), large.as_str()), (&moved, &late)] {
-            let landing = super::landing_candidate(&mirror, main, branch, 7)
+            let message = "Work (task 7)\n\nThe work.\n\nSpawn-Task: 7\n";
+            let landing = super::landing_candidate(&mirror, main, branch, message)
                 .expect("a landing")
                 .expect("no conflict");
             assert_ne!(landing, branch, "a commit of the integrator's own");
+            let said = git(&["--git-dir", &mirror, "show", "-s", "--format=%B", &landing])
+                .expect("message");
+            assert_eq!(said, message.trim_end(), "the integrator's message");
+            assert!(!spawn_host::names_files_outside_git(&said));
             let who = git(&[
                 "--git-dir",
                 &mirror,
@@ -2714,7 +3192,23 @@ mod database_tests {
         integrator.pass_on(&db.store).expect("a pass");
         let after = db.mission(mission);
         assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
-        assert_eq!(source_main(&source), work);
+        // One landing commit on top of the base, the work its second parent,
+        // its message from the record (the brief and the report).
+        let main = source_main(&source);
+        let rev = |reference: String| {
+            git(&["--git-dir", &source, "rev-parse", &reference]).expect("rev-parse")
+        };
+        assert_eq!(rev(format!("{main}^1")), b0);
+        assert_eq!(rev(format!("{main}^2")), work);
+        let message =
+            git(&["--git-dir", &source, "show", "-s", "--format=%B", &main]).expect("message");
+        assert!(
+            message.starts_with(&format!(
+                "brief (task {task})\n\nagain\n\nSpawn-Task: {task}\n"
+            )),
+            "{message}"
+        );
+        assert_eq!(after["baseline"], main.as_str());
         let revisions: Vec<Option<String>> = db
             .admin()
             .query(

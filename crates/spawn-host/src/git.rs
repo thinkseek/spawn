@@ -30,7 +30,7 @@ use std::process::{Command, Output, Stdio};
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    BaseMerge, Branch, Commit, ForkFrom, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, Commit, ForkFrom, SetAside, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
 };
 
 use crate::tree_path::{TreePath, nul_fields};
@@ -1026,6 +1026,15 @@ impl WorkspaceStore for GitWorkspace {
         self.merge_main_into_branch(branch.as_str())
     }
 
+    fn set_aside(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        self.set_aside_since(branch.as_str(), start, message)
+    }
+
     /// What checkpoints of the workspace left out and the agent was not
     /// told of yet ([`GitWorkspace::record_oversized`]).
     fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
@@ -1213,6 +1222,103 @@ impl GitWorkspace {
         }
         Ok(BaseMerge::Merged {
             commit: CommitId::new(commit)
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            files,
+        })
+    }
+
+    /// [`WorkspaceStore::set_aside`]: a new commit on top of `branch` whose
+    /// tree is `start`'s, so the work done since `start` leaves the branch's
+    /// tree but stays in its history. Under the branch's lock, like a
+    /// checkpoint. A mounted directory that holds what no checkpoint took is
+    /// committed first (its parent is the head), so nothing it holds is
+    /// lost; then the directory moves to `start`'s tree, the same two-tree
+    /// way a merge of main does; only then does the branch move, by
+    /// compare-and-swap. `start` must be an ancestor of the head: no foreign
+    /// tree is ever written. `None` is where the branch forked from `main`.
+    fn set_aside_since(
+        &self,
+        branch: &str,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        let _lock = self.lock_branch(branch)?;
+        self.refuse_stale(branch)?;
+        let reference = format!("refs/heads/{branch}");
+        let mut head = self.commit_id_of(&reference)?;
+        let start = if let Some(start) = start {
+            self.commit_id_of(&format!("{start}^{{commit}}"))?
+        } else {
+            let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
+            self.git_output(&["merge-base", &main, &head])?
+        };
+        if !self.is_ancestor(&start, &head)? {
+            return Err(WorkspaceError::Refused {
+                code: "NotAncestor".to_string(),
+                message: format!("{start} is not a commit of branch {branch} (head {head})"),
+            });
+        }
+        let directory = self.root.join(branch);
+        let mounted = directory.is_dir();
+        if mounted {
+            // What the workspace holds that no checkpoint took is kept first.
+            let index = self.root.join(".index").join(format!("{branch}.set-aside"));
+            if let Some(parent) = index.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+                })?;
+            }
+            let _ = std::fs::remove_file(&index);
+            let tree = self.tree_of(&directory, &index, &self.source_commits(branch));
+            let _ = std::fs::remove_file(&index);
+            let (tree, _) = tree?;
+            if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
+                let kept_message = format!(
+                    "spawn: the workspace of {branch} as it was, kept before its work is set aside"
+                );
+                let kept =
+                    self.git_output(&["commit-tree", &tree, "-p", &head, "-m", &kept_message])?;
+                self.git_output(&["update-ref", &reference, &kept, &head])
+                    .map_err(|error| {
+                        WorkspaceError::Unavailable(format!(
+                            "{error} (branch moved under the set-aside)"
+                        ))
+                    })?;
+                head = kept;
+            }
+        }
+        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
+        let start_tree = self.git_output(&["rev-parse", &format!("{start}^{{tree}}")])?;
+        if head_tree == start_tree {
+            return Ok(SetAside::Unchanged);
+        }
+        let changed = self.git_listing(&[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            &head_tree,
+            &start_tree,
+        ])?;
+        let files = shown_paths(&listed_paths(&changed));
+        if mounted {
+            self.update_directory(branch, &directory, &head_tree, &start_tree)?;
+        }
+        let commit = self.git_output(&["commit-tree", &start_tree, "-p", &head, "-m", message])?;
+        if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
+            if mounted {
+                return Err(self.follow_moved_branch(branch, &directory, &start_tree, &error));
+            }
+            return Err(WorkspaceError::Unavailable(format!(
+                "{error} (branch moved under the set-aside)"
+            )));
+        }
+        // A merge whose markers were in the work is set aside with it.
+        self.clear_pending(branch);
+        Ok(SetAside::Created {
+            commit: CommitId::new(commit)
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            kept: CommitId::new(head)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
             files,
         })
@@ -2364,5 +2470,134 @@ mod tests {
                 "{unset:?}"
             );
         }
+    }
+
+    /// A store with branch `agent_a` checkpointed once (`start`, holding
+    /// `kept.txt`) and once more with a cancelled task's work (`work`,
+    /// adding `one.txt` and changing `kept.txt`).
+    fn worked(tag: &str) -> (GitWorkspace, WorkspaceId, PathBuf, String, String) {
+        let (_, store, workspace, base) = capped(tag);
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("kept.txt"), "before\n").expect("write");
+        let Commit::Created(start) = store.commit(&workspace, "start").expect("commit") else {
+            panic!("a change");
+        };
+        std::fs::write(directory.join("kept.txt"), "during\n").expect("write");
+        std::fs::write(directory.join("one.txt"), "one\n").expect("write");
+        let Commit::Created(work) = store.commit(&workspace, "work").expect("commit") else {
+            panic!("a change");
+        };
+        (
+            store,
+            workspace,
+            base,
+            start.as_str().to_string(),
+            work.as_str().to_string(),
+        )
+    }
+
+    /// The set-aside is a new commit on top of the head: its tree is the
+    /// start's, it descends from the old head, and the old head (the work)
+    /// stays reachable from the branch. The mounted workspace follows it.
+    #[test]
+    fn a_set_aside_restores_the_start_tree_on_top_of_the_work() {
+        use spawn_core::port::SetAside;
+        let (store, workspace, base, start, work) = worked("set-aside");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let SetAside::Created {
+            commit,
+            kept,
+            files,
+        } = store
+            .set_aside(&branch, Some(&start), "spawn: set aside task #7")
+            .expect("set aside")
+        else {
+            panic!("the work differs from the start");
+        };
+        assert_eq!(kept.as_str(), work, "the old head holds the work");
+        assert_eq!(files, ["kept.txt", "one.txt"]);
+        let repo = base.join("repo");
+        let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
+        assert_eq!(tree(commit.as_str()), tree(&start), "the start's tree");
+        assert_eq!(git(&repo, &["rev-parse", "agent_a"]), commit.as_str());
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("{}^", commit.as_str())]),
+            work,
+            "it descends from the old head"
+        );
+        assert_eq!(git(&repo, &["show", "agent_a~1:one.txt"]), "one");
+        let directory = PathBuf::from(workspace.path());
+        assert!(!directory.join("one.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("kept.txt")).expect("read"),
+            "before\n"
+        );
+        assert_eq!(
+            store.commit(&workspace, "next").expect("commit"),
+            Commit::Unchanged,
+            "the workspace is the branch head"
+        );
+        assert_eq!(
+            store
+                .set_aside(&branch, Some(&start), "again")
+                .expect("again"),
+            SetAside::Unchanged,
+            "a second set-aside finds nothing to set aside"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What the workspace holds and no checkpoint took is committed before
+    /// the set-aside, so it is kept too; a branch not mounted moves alone;
+    /// a start that is no commit of the branch is refused.
+    #[test]
+    fn a_set_aside_keeps_what_no_checkpoint_took_and_refuses_a_foreign_start() {
+        use spawn_core::port::SetAside;
+        let (store, workspace, base, start, work) = worked("set-aside-unsaved");
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("late.txt"), "late\n").expect("write");
+        let repo = base.join("repo");
+        let foreign = git(
+            &repo,
+            &["commit-tree", "-m", "foreign", &format!("{start}^{{tree}}")],
+        );
+        assert!(matches!(
+            store.set_aside(&branch, Some(&foreign), "no"),
+            Err(WorkspaceError::Refused { .. })
+        ));
+        let SetAside::Created { kept, .. } = store
+            .set_aside(&branch, Some(&start), "spawn: set aside")
+            .expect("set aside")
+        else {
+            panic!("the work differs from the start");
+        };
+        assert_ne!(
+            kept.as_str(),
+            work,
+            "the unsaved state got a commit of its own"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("{}^", kept.as_str())]),
+            work
+        );
+        assert_eq!(
+            git(&repo, &["show", &format!("{}:late.txt", kept.as_str())]),
+            "late"
+        );
+        assert!(!directory.join("late.txt").exists());
+
+        // Not mounted: the branch moves, no directory is made.
+        std::fs::write(directory.join("two.txt"), "two\n").expect("write");
+        store.commit(&workspace, "more").expect("commit");
+        store.unmount(&workspace).expect("unmount");
+        assert!(matches!(
+            store.set_aside(&branch, Some(&start), "spawn: set aside"),
+            Ok(SetAside::Created { .. })
+        ));
+        assert!(!directory.exists());
+        let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
+        assert_eq!(tree("agent_a"), tree(&start));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

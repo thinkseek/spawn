@@ -290,6 +290,8 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 
 积分器（integrator）在评判前拒绝带待定合并（`<root>/.merge/<agent>`）或改动文件里有完整标记块（`GitWorkspace::conflict_markers`）的分支：记 `conflict`，附「先解决冲突标记」的说明。推上来的分支与 `main` 冲突时，积分器先经 `MissionWorkspaces::merge_base` 把 `main` 合进该 agent 空闲的工作区（内容冲突写标记、`main` 待定），再记 `conflict`，说明里点名带标记的文件；标记表达不了的冲突把 `main` 的版本复制到工作区的 `.spawn/main/`，说明逐个文件该怎么做。调度器给活着的 worker 键入任务前也这样合并一次，任务文本写明合并结果。
 
+落地提交：每次落地都让 `main` 恰好多一个新提交 C，`git commit-tree <树> -p <base> -p <推上来的分支头> -m <说明>`，作者与提交者都是 `spawn-integrate`，不签名；`main` 是分支头的祖先时也一样，从不快进到 worker 的提交。树：`main` 是分支头的祖先时取分支头的树，否则取 `--attr-source=<main> merge-tree --write-tree <main> <head>` 的合并树（冲突仍记 `conflict`）。C 在 gate 之前造好：gate 评判的就是它，`task.gated` 的 `candidate`、推送目标和 `task.landed` 的 `to` 都是它；`--force-with-lease=<main>:<base>` 不变，`main` 动过仍记 `stale`。说明只取自记录（任务的 brief 与 report），从不读工作区：首行为目标标题、目标号与任务号（`<标题> (objective <id>, task <id>)`；无目标的任务为 brief 第一行非空文本加 `(task <id>)`），空一行后是 report 的 `## What changed` 一节（没有这一节则取整份 report，至多 3000 字符；其中以 `Spawn-` 开头的行缩进，不会变成 trailer，`Spawn-Large` 也就不会让 `main` 无法挂载），最后是 `Spawn-Task`、`Spawn-Objective`、`Spawn-Head` trailer。于是 `git log --first-parent main` 每行一个落地的任务，`git bisect start --first-parent`（git 2.29+）只停在经过 gate 的落地上（普通 bisect 可能停在未经 gate 的 checkpoint 上，这是保留历史的代价），`git revert -m 1 <C>` 恰好撤销一个任务；worker 的 checkpoint 经第二父提交仍可从 `main` 到达，所以被撤销的目标以新任务从当前 `main` 重来（或撤销那次撤销），而不是再合并同一分支。用合并提交而不用 squash：历史不需要另一个 ref 来保留，分支头在 `main` 里，下一次把 `main` 合进该分支时干净。
+
 任务源（`spawn-cli` 的 `MissionWorkspaces`）在 git 存储外再包一层：每个任务源一个主机本地镜像 `<root>/.sources/<name>.git`。新分支前强制刷新镜像的 `main`，`merge_base` 前最多每 30 秒刷新一次。每次 checkpoint 产生新提交、合并或建分支后，分支被标记待推：后台线程把 `refs/heads/<agent>` 推到源的 `refs/heads/spawn/<agent>`，每个分支最多每 5 秒一次（推的是当时的分支头，中间丢的推送无所谓），从不强推（被拒说明分支被改写：警告，不覆盖），只推给本机目录形式的源（远端可能公开，推了每个提交都会离开本机），失败按指数退避重试，存储被丢弃时（`spawn tick` 退出）同步推完。推上去的 `spawn/<agent>` 供集成器落地。分支只在本机：启动时除 `main` 外不从源取任何东西，不从别的主机接手分支（所有者的决定：Spawn 只在一台主机上跑）。
 
 不用 FUSE，也不用 overlay：`git archive` 与 `tar` 在 macOS 和 Linux 上行为一致，无需 `SYS_ADMIN`。
@@ -366,5 +368,7 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 审计第 1、2、3、9、16、23 条已修复（分支 `audit-stops`）：失败的 Stop，不论谁发的，调度器都从命令队列读出当前执行的 Stop 及其结果，换新键重发、等待加倍，三次后升级给 supervisor（`dispatch/stops.rs`）；集成器先提交中止的 Stop 再记 `task.aborted`；没打进去的 nudge 不算催过；人发的命令完成后才算消息，失败的照实说；`done-<episode>` 看记下的 `end_cause`；`dispatched` 保留当前回合的 nudge 与当前执行的 resume，关闭的临时任务在工人仍在跑时留在投递行里，批准与人的消息直到告知为止都算消息：不再凭 24 小时窗口判断“没发过”或“不是消息”。
 
 所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
+
+停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
 
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。

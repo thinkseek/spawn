@@ -224,6 +224,62 @@ it, on the same ladder.
   told. An approval or a human command (once finished, with its outcome: one
   that failed is reported as failed) is news until it was told, however
   long that takes.
+
+  **Stalls: no task waits silently.** A stall is the absence of an event,
+  so the dispatcher also measures, for every open task, the step it waits
+  on and since which record, from the log alone (`dispatch/stall.rs`, the
+  query `stall_facts`), and escalates a step that has not moved within its
+  bound, once per stall:
+
+  | Step | The task | Measured from | Bound (default) |
+  | --- | --- | --- | --- |
+  | `delivery` | assigned or sent back, and its session's turn (a revision first, then the oldest new task; no earlier open task of the session holding it) | `task.assigned`, or the review or gate verdict that sent it back | `SPAWN_STALL_DELIVERY_SECS` (600) |
+  | `activity` | delivered, waiting for its worker (a worker idle at its prompt with no report collected included) | the later of `task.delivered` and the session's latest fact (a record of the session that is not the Observer's nor storage's) | `SPAWN_STALL_ACTIVITY_SECS` (900) |
+  | `judgement` | reported, under review | `task.reported` | `SPAWN_STALL_REVIEW_SECS` (1800) |
+  | `judgement` | in a gated mission, the task the integrator judges next (`Mission::ready`'s order) | the later of the record that made it ready and the mission's latest verdict that is not `stale` | `SPAWN_STALL_GATE_SECS` (3600) |
+  | `landing` | landing | its `task.gated` accepted | `SPAWN_STALL_LANDING_SECS` (600) |
+  | `stop` | an ephemeral task closed (accepted without a gate, landed, cancelled) whose worker still runs | the record that closed it | `SPAWN_STALL_STOP_SECS` (300) |
+  | `halted` | a halted mission with open tasks | its `mission.halted` | `SPAWN_STALL_HALTED_SECS` (0) |
+
+  A task queued behind another of its session, or behind the task its
+  mission's gate judges next, is not escalated: the one ahead of it is. The
+  tasks of a halted mission that wait for the gate or a landing are the
+  halt's, escalated once per halt about session `missions`
+  (`stall-mission-<mission>-halted-<record>`), with the reason and the open
+  tasks. A failed command (a delivery attempt, a model switch's or a
+  retirement's Stop, a resume) is the evidence of the step it blocks, not a
+  step of its own. A delivery whose retries are spent was escalated as
+  `delivery failed`, which is its stall's escalation; one that may have
+  typed the task is not retried, and its stall is escalated at its bound.
+  A worker at its prompt whose screen says background shells still run
+  (Claude Code's `· done … N shells still running`, read from the line the
+  engine draws right above its prompt) is treated as active: its `activity`
+  step is not escalated while that is its latest screen reading, since the
+  engine resumes the agent when the shells finish.
+
+  The item, heading `stalled`, is one line naming `task #<id>`, the step,
+  how long it stood still, the evidence (the record it is measured from and
+  its age, the latest judgement's state and whether it covers the latest
+  fact, every failed attempt with its key and error, the latest stale
+  verdict's reason) and what Spawn already tried and still will (each
+  delivery attempt and its outcome, a retry due, or due and held and why;
+  a nudge, a resume, the idle or report item already sent). Its tag is
+  `<session> stall-<task>-<step>-<n>`, `n` naming the record the step is
+  measured from (the control record's id; for `activity` the `session_seq`
+  of the latest fact, or the delivery record's id when no fact came after
+  it): `told` sends it once, and a step that moved and stalled anew has a
+  new record and a new tag. A failed retry, a stale verdict, a nudge or a
+  judgement moves no step. Every age is on the database's clock
+  (`spawn_now_ms()` against the records' times); nothing is inferred from
+  another loop's timing or absence; a restarted loop computes the same
+  stalls and tags. The stall layer acts on nothing: Spawn's own recoveries
+  (delivery retries, the resume of a lost ephemeral worker and the liveness
+  rule for residents, the integrator judging a `stale` report again, the
+  retire Stop) run on their own schedules, and every default bound is longer
+  than their first attempt. Typing into a worker, delivering again after an
+  attempt that may have typed, cancelling, reassigning, resuming a halted
+  mission, stopping a resident or extending a budget each need a decision:
+  the supervisor's.
 - **Supervisor**: one perpetual Claude Code session (`agent_supervisor`).
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
@@ -316,6 +372,35 @@ accept` /
 `reject`, `spawn resident propose` / `approve` / `retire`, `spawn mission
 close`. Every one is a checked SQL function that appends to the control
 stream (§10.1).
+
+**When a task closes.** A task closes by landing (or, without a gate,
+acceptance), or by a cancel: `spawn task cancel`, the supervisor's, the
+integrator's abort over budget (`task.aborted`), a gate rejection the
+closure rule turns into a cancel, or a mission closed or a resident retired
+under it (§10). A cancelled task's live work ends with it, at the source:
+
+- *Stopped.* When a delivered task is cancelled and it was its worker's
+  latest delivery, the dispatcher stops the worker at once, in the middle of
+  a turn or idle (a Stop takes a final checkpoint, which keeps what it did;
+  its turn for the task is never left to finish). An ephemeral worker is
+  stopped and nothing more; a retired resident is stopped and not told.
+- *Set aside.* Before a resident gets anything else, the task's work leaves
+  its branch's tree: a new commit on top of the branch head, whose tree is
+  the checkpoint the task started from ([storage.md](storage.md), "Work set
+  aside"). Nothing is rewound or lost, and the next task's candidate holds
+  none of it, so nothing rides into another objective's landing.
+- *Told.* The resident is then resumed with a notice that names the task,
+  says it is cancelled, and says where its work is (the commit that holds
+  it). Its next task waits until the notice reached it.
+- *Never collected.* A cancelled task's report is not collected, recorded
+  or judged; a report file it leaves is not the next task's (the delivery
+  mark rule).
+
+A task never delivered changes nothing for its worker, and a resident whose
+cancelled task is not its latest delivery is left alone. The dispatcher
+keeps no state for this either: `spawn_events`, `spawn_commands` and their
+keys (`cancel-stop-<task>-<execution>`, `cancel-notice-<task>-<n>`,
+`set-aside:<task>`) say what was done.
 
 **Storage.** Missions, tasks and the resident roster are the `mission_*`
 tables, folded from the control stream (§10.1): a mission has its text,
@@ -648,14 +733,27 @@ record of what was judged (§14 of design.md).
      agent's latest checkpoint is gated `stale` after a short wait: no gate
      run, no rejection, the task stays ready and is judged again later
      ([storage.md](storage.md), "Landing");
-  2. builds the candidate: the pushed branch itself, or a merge of it with `main`
-     when `main` has moved. A conflict first merges `main` into the agent's
+  2. builds the candidate, the landing commit C: one merge commit whose
+     first parent is `main` (the base) and second the pushed head, with the
+     head's tree when `main` is in it and the merge by `main`'s merge rules
+     when `main` has moved, never a fast-forward to a worker's commit. Its
+     message says what landed: the objective's title, the objective and the
+     task on the first line (for a task without an objective, the brief's
+     first line and the task), then the report's `## What changed` (the
+     whole report without one, bounded, a line that could read as a
+     `Spawn-` trailer indented), then `Spawn-Task`, `Spawn-Objective` and
+     `Spawn-Head` trailers. So `git log --first-parent main` is one line
+     per landed task, `git bisect start --first-parent` visits only gated
+     landings, `git revert -m 1 <C>` undoes one task, and every checkpoint
+     stays reachable through the second parents ([storage.md](storage.md),
+     "Landing"). A conflict first merges `main` into the agent's
      idle workspace, with conflict markers, then sends the task back with a
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate, with a 45-minute wall clock;
-  4. records `task.gated` (verdict, log, metric) before git moves. A gate
+  3. runs the gate on C, with a 45-minute wall clock;
+  4. records `task.gated` (verdict, log, metric, C as `candidate`) before
+     git moves. A gate
      that had no room (exit 5 with its fact, §10.2) is gated `no_room`. This
      is no verdict on the work. The task stays where it was, and the record
      names the reason, `free_kb`, `min_gb` and `tmpdir`. It moves neither
@@ -679,7 +777,7 @@ record of what was judged (§14 of design.md).
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
      record was lost), which is a landing;
-  6. records `task.landed` (`from`, `to`).
+  6. records `task.landed` (`from`, `to` = C).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
 - **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
@@ -704,7 +802,10 @@ record of what was judged (§14 of design.md).
   neither `task.cancelled` nor `task.aborted`. The
   integrator's selection uses the same rule, and no transition moves a task
   into a state the rule drops: a send-back is refused, a gate rejection
-  cancels the task, and deliveries and reports are not recorded.
+  cancels the task, and deliveries and reports are not recorded. A worker
+  still working on a task the rule cancels is stopped, and a resident gets
+  the task's work set aside and is told before anything else (§3.2, "When a
+  task closes").
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
   - three gate aborts in a row (`no_room` is not an abort);
