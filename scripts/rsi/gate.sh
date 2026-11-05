@@ -1000,7 +1000,8 @@ fi
 # - the scenarios directory's other files, but its scenarios and the lists
 #   only the gate reads (`protected`, `retired-tests`): the build hook, the
 #   `bind` list, helpers a scenario runs from beside it;
-# - the files the scenario names, and those they name in turn: a path
+# - the files the scenario names on its code lines, and those they name in
+#   turn: a path
 #   `scripts/...` is the controller's (the scenarios source
 #   `$controller/scripts/blackbox/assertions.sh` and
 #   `$controller/scripts/pg-url.sh`), a directory is all of its files, a
@@ -1021,10 +1022,14 @@ scenarios_key=$(cd "$scenarios" && find . -type f ! -path './protected' ! -path 
     grep -vE '^\./[^/]*\.sh$' | LC_ALL=C sort |
     while IFS= read -r file; do printf '%s %s\n' "$(blob "$file")" "$file"; done |
     sha256sum | cut -d' ' -f1)
-# named_by <file>: the paths a file names, one per line (see above).
+# named_by <file>: the paths a file names on its code lines, one per line
+# (see above). Comments do not count: this file's own comments name
+# scripts/blackbox, and a scenario that mentions the gate would otherwise
+# key every black-box suite.
 named_by() {
-    grep -oE 'scripts/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' "$1" 2>/dev/null | sed "s|^|$controller/|" || true
-    grep -oE '[A-Za-z0-9_-]+\.sh' "$1" 2>/dev/null | while IFS= read -r name; do
+    sed -e 's/^[[:space:]]*#.*//' -e 's/[[:space:]]#.*//' "$1" 2>/dev/null >"$work/deps.code" || :
+    grep -oE 'scripts/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' "$work/deps.code" | sed "s|^|$controller/|" || true
+    grep -oE '[A-Za-z0-9_-]+\.sh' "$work/deps.code" | while IFS= read -r name; do
         [ ! -f "$scenarios/$name" ] || printf '%s\n' "$scenarios/$name"
     done
 }
