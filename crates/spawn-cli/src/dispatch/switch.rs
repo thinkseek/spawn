@@ -89,7 +89,10 @@ fn state(task: &TaskRow, facts: &Facts) -> State {
 }
 
 /// Waiting tasks (assigned, or sent back) with their worker's facts.
-fn waiting<'a>(work: &'a Work, rows: &'a [Facts]) -> impl Iterator<Item = (&'a TaskRow, &'a Facts)> {
+fn waiting<'a>(
+    work: &'a Work,
+    rows: &'a [Facts],
+) -> impl Iterator<Item = (&'a TaskRow, &'a Facts)> {
     work.tasks
         .iter()
         .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
@@ -119,8 +122,8 @@ pub(crate) fn fit(orders: &mut Vec<Order>, work: &Work, rows: &[Facts], now_ms: 
             continue;
         };
         let session = task.session_id.as_str();
-        let free = !blocked.contains(session)
-            && !orders.iter().any(|order| order.session_id == session);
+        let free =
+            !blocked.contains(session) && !orders.iter().any(|order| order.session_id == session);
         if now_ms >= due_ms
             && free
             && facts.live
