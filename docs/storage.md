@@ -188,9 +188,11 @@ head alone is the whole workspace, so everything below is a git operation.
   collects a report only once the session's latest turn event in the log is
   a turn's end (`turn.stopped` or `turn.failed`, not a newer
   `message.received`; a ready screen alone is not enough), with the worker
-  live, no command open and its latest judgement `TurnStoppedIdle` (the
-  judgement may be older than the turn's end: an Observer with no model
-  judge writes again only when its verdict changes). Its `task.reported`
+  live, no command open and its latest judgement `TurnStoppedIdle`. A
+  judgement with no model answer (no model judge, or the judge unavailable)
+  may be older than the turn's end, since the Observer writes it again only
+  when its verdict changes; a model's answer is written for every new
+  situation, so a stale one waits for the model's judgement of the turn. Its `task.reported`
   record names in `commit` the agent's latest checkpoint read with that
   turn's end (`spawn_task_reported(task, report, commit)`; null only when
   the agent has no checkpoint at all, and from the two-argument form). The

@@ -28,9 +28,10 @@
 //!   `task.reported` record names in `commit` the agent's latest checkpoint
 //!   read with that turn's end (null only when the agent has none); a turn
 //!   that changed nothing leaves the branch head, the earlier checkpoint, as
-//!   its own. The idle judgement need not be newer than the turn's end: an
-//!   Observer with no model judge writes again only when its verdict
-//!   changes;
+//!   its own. An idle judgement with no model answer need not be newer than
+//!   the turn's end: such a judgement is written again only when its verdict
+//!   changes (a model's answer is written for every new situation, and a
+//!   stale one waits for the next);
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
@@ -1018,6 +1019,14 @@ mod tests {
         assert!(
             report_due(&task, &[busy]).is_none(),
             "a verdict that changed since holds it back"
+        );
+        let mut answered = rows[0].clone();
+        if let Some(observation) = answered.observation.as_mut() {
+            observation.fingerprint = Some("asked".to_string());
+        }
+        assert!(
+            report_due(&task, &[answered]).is_none(),
+            "a model's answer is written for every new situation: a stale one waits for the next"
         );
         let mut open = rows[0].clone();
         open.open_command = true;

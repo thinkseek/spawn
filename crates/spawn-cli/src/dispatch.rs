@@ -199,18 +199,28 @@ impl Facts {
     /// been taken ([`Self::checkpoint`]); the worker is live with no command
     /// open; and its latest judgement is [`Ambiguity::TurnStoppedIdle`].
     ///
-    /// The judgement need not be current: an Observer with no model judge
-    /// writes again only when its verdict changes, so a turn's end read after
-    /// the screen showed the prompt leaves the idle judgement older than the
-    /// latest fact. The log's own end of the turn is newer evidence than the
-    /// judgement, and is what the collection rests on; a turn that started
-    /// since (`message.received`) or a verdict that changed holds it back.
+    /// A judgement the Observer writes again only when its verdict changes
+    /// (one with no model answer: no model judge, or the judge unavailable)
+    /// need not be current: a turn's end read after the screen showed the
+    /// prompt leaves the idle judgement older than the latest fact, and
+    /// nobody judges again. The log's own end of the turn is newer evidence
+    /// than the judgement, and is what the collection rests on; a turn that
+    /// started since (`message.received`) or a verdict that changed holds it
+    /// back. A model's answer (it carries a fingerprint) is written for every
+    /// new situation, so a stale one waits for the model's judgement of the
+    /// turn, as before.
     pub(crate) fn report_due(&self) -> bool {
+        let idle =
+            |observation: &Observation| observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
         self.live_and_free()
             && self.turn_ended
-            && self.observation.as_ref().is_some_and(|observation| {
-                observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
-            })
+            && match self.current_observation() {
+                Some(current) => idle(current),
+                None => self
+                    .observation
+                    .as_ref()
+                    .is_some_and(|latest| latest.fingerprint.is_none() && idle(latest)),
+            }
     }
 
     pub(crate) fn idle_at_prompt(&self) -> bool {
