@@ -2972,6 +2972,16 @@ mod database_tests {
             .to_string()
     }
 
+    /// A landing commit's parent `n` (1: the main it lands on, 2: the agent's
+    /// head), read from the first of `repos` that has the commit: a gate is
+    /// given the landing commit, one new merge per landing.
+    fn parent(repos: &[&str], commit: &str, n: u8) -> String {
+        repos
+            .iter()
+            .find_map(|repo| git(&["--git-dir", repo, "rev-parse", &format!("{commit}^{n}")]).ok())
+            .unwrap_or_else(|| panic!("no parent {n} of {commit} in {repos:?}"))
+    }
+
     /// Gates run per mission, concurrently: mission A has two ready tasks,
     /// B one on a source of its own, and D one on A's source; three gates
     /// may run. The first pass starts A's first task and B's, and nothing
@@ -3021,7 +3031,18 @@ mod database_tests {
         };
 
         integrator.pass_on(&db.store).expect("the first pass");
-        let mut first = wait_started(&marks, 2);
+        let mirror = |source: &str| {
+            crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
+                .expect("mirror")
+                .to_string_lossy()
+                .to_string()
+        };
+        let (mirror_a, mirror_b) = (mirror(&source_a), mirror(&source_b));
+        let repos = [mirror_a.as_str(), mirror_b.as_str()];
+        let mut first: Vec<String> = wait_started(&marks, 2)
+            .iter()
+            .map(|commit| parent(&repos, commit, 2))
+            .collect();
         first.sort();
         let mut expected = vec![pushed_a_one.clone(), pushed_b.clone()];
         expected.sort();
@@ -3029,14 +3050,25 @@ mod database_tests {
         hold(2);
         assert_eq!(db.mission(d)["tasks"][0]["state"], "reported");
         release();
-        assert_eq!(source_main(&source_b), pushed_b, "B's landed");
-        assert_eq!(source_main(&source_a), pushed_a_one, "A's first landed");
+        assert_eq!(
+            parent(&[&source_b], &source_main(&source_b), 2),
+            pushed_b,
+            "B's landed"
+        );
+        let a_first_main = source_main(&source_a);
+        assert_eq!(
+            parent(&[&source_a], &a_first_main, 2),
+            pushed_a_one,
+            "A's first landed"
+        );
 
         integrator.pass_on(&db.store).expect("the next pass");
         let second = wait_started(&marks, 3);
-        assert_ne!(
-            second[2], pushed_a_two,
-            "A's second is merged with the main A's first left"
+        assert_eq!(parent(&repos, &second[2], 2), pushed_a_two, "A's second");
+        assert_eq!(
+            parent(&repos, &second[2], 1),
+            a_first_main,
+            "judged against the main A's first left"
         );
         hold(3);
         release();
@@ -3052,7 +3084,7 @@ mod database_tests {
 
         integrator.pass_on(&db.store).expect("the pass after");
         let third = wait_started(&marks, 4);
-        assert_ne!(third[3], pushed_d, "D's, merged with main");
+        assert_eq!(parent(&repos, &third[3], 2), pushed_d, "D's, after A's");
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
         assert_eq!(db.mission(d)["tasks"][0]["state"], "landed");
@@ -3081,19 +3113,30 @@ mod database_tests {
         let pushed_b = push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
 
         integrator.pass_on(&db.store).expect("a pass");
+        let mirror = |source: &str| {
+            crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
+                .expect("mirror")
+                .to_string_lossy()
+                .to_string()
+        };
+        let (mirror_a, mirror_b) = (mirror(&source_a), mirror(&source_b));
+        let repos = [mirror_a.as_str(), mirror_b.as_str()];
+        let heads = || -> Vec<String> {
+            started(&marks)
+                .iter()
+                .map(|commit| parent(&repos, commit, 2))
+                .collect()
+        };
         integrator.pass_on(&db.store).expect("another pass");
-        assert_eq!(wait_started(&marks, 1), vec![pushed_a_one.clone()]);
+        wait_started(&marks, 1);
+        assert_eq!(heads(), vec![pushed_a_one.clone()]);
         std::thread::sleep(std::time::Duration::from_millis(500));
-        assert_eq!(
-            started(&marks),
-            vec![pushed_a_one],
-            "B waits for the one gate"
-        );
+        assert_eq!(heads(), vec![pushed_a_one], "B waits for the one gate");
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
         integrator.pass_on(&db.store).expect("the pass after");
         integrator.settle();
-        assert_eq!(started(&marks).last(), Some(&pushed_b));
+        assert_eq!(heads().last(), Some(&pushed_b));
         assert_eq!(db.mission(b)["tasks"][0]["state"], "landed");
         for base in [base_a, base_b, marks] {
             let _ = std::fs::remove_dir_all(&base);
