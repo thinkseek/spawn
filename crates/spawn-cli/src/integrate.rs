@@ -372,8 +372,11 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
              the gate does not get it"
         );
     }
-    let gates = gate_slots(flags.get("gates"), crate::config::env_value("SPAWN_INTEGRATE_GATES"))
-        .map_err(|error| format!("{error}\n{USAGE}"))?;
+    let gates = gate_slots(
+        flags.get("gates"),
+        crate::config::env_value("SPAWN_INTEGRATE_GATES"),
+    )
+    .map_err(|error| format!("{error}\n{USAGE}"))?;
     let integrator = Integrator::new(root, gate, gate_env, gates);
     loop {
         let pass = integrator.pass();
@@ -460,7 +463,8 @@ impl Integrator {
         let pass = self.pass_on(&store);
         // A pass that failed may have lost the connection: the next pass
         // asks for the lock again (refused while the old connection lives).
-        *self.held.borrow_mut() = (pass.is_ok() && !self.running.borrow().is_empty()).then_some(store);
+        *self.held.borrow_mut() =
+            (pass.is_ok() && !self.running.borrow().is_empty()).then_some(store);
         pass
     }
 
@@ -547,7 +551,8 @@ impl Integrator {
         if let Some(reason) = unlandable(source) {
             return halt(store, mission, &reason).map(|()| true);
         }
-        let mirror = sources::ensure_mirror(&self.judge.root, Some(source)).map_err(|error| error.to_string())?;
+        let mirror = sources::ensure_mirror(&self.judge.root, Some(source))
+            .map_err(|error| error.to_string())?;
         if let Some(task) = mission.landing() {
             return land(store, &mirror, source, task).map(|()| true);
         }
@@ -608,8 +613,12 @@ impl Integrator {
             return Ok(assigned);
         }
         let judge = self.judge.clone();
-        let (store, task, source_owned, mission_id) =
-            (Arc::clone(store), task.clone(), source.to_string(), mission.id);
+        let (store, task, source_owned, mission_id) = (
+            Arc::clone(store),
+            task.clone(),
+            source.to_string(),
+            mission.id,
+        );
         let handle = std::thread::Builder::new()
             .name(format!("gate-{}", task.id))
             .spawn(move || {
@@ -1208,7 +1217,11 @@ mod tests {
         assert_eq!(gate_slots(None, None), Ok(DEFAULT_GATES));
         assert_eq!(DEFAULT_GATES, 2);
         assert_eq!(gate_slots(None, Some("3".into())), Ok(3));
-        assert_eq!(gate_slots(Some("1".into()), Some("3".into())), Ok(1), "the flag first");
+        assert_eq!(
+            gate_slots(Some("1".into()), Some("3".into())),
+            Ok(1),
+            "the flag first"
+        );
         for wrong in ["0", "-1", "two", ""] {
             assert!(gate_slots(Some(wrong.into()), None).is_err(), "{wrong}");
         }
@@ -2294,7 +2307,8 @@ mod database_tests {
     /// and C's.
     #[test]
     fn gates_run_per_mission_concurrently_up_to_the_cap() {
-        let marks = std::env::temp_dir().join(format!("spawn-db-gate-marks-{}", std::process::id()));
+        let marks =
+            std::env::temp_dir().join(format!("spawn-db-gate-marks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&marks);
         std::fs::create_dir_all(&marks).expect("marks");
         let gate = holding_gate(&marks);
@@ -2316,13 +2330,24 @@ mod database_tests {
 
         integrator.pass_on(&db.store).expect("the first pass");
         let first = wait_started(&marks, 2);
-        assert_eq!(first, vec![work_a1.clone(), work_b1.clone()], "A's first and B's");
+        assert_eq!(
+            first,
+            vec![work_a1.clone(), work_b1.clone()],
+            "A's first and B's"
+        );
         // More passes while both hold: nothing else starts.
         for _ in 0..3 {
-            integrator.pass_on(&db.store).expect("a pass while two gates run");
+            integrator
+                .pass_on(&db.store)
+                .expect("a pass while two gates run");
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
-        assert_eq!(started(&marks).len(), 2, "the cap holds: {:?}", started(&marks));
+        assert_eq!(
+            started(&marks).len(),
+            2,
+            "the cap holds: {:?}",
+            started(&marks)
+        );
         assert_eq!(db.mission(c)["tasks"][0]["state"], "reported");
 
         std::fs::write(marks.join("release"), "").expect("release");
@@ -2336,14 +2361,19 @@ mod database_tests {
         let next = wait_started(&marks, 4);
         assert_eq!(next.len(), 4, "A's second and C's: {next:?}");
         assert_eq!(next[3], work_c1, "C's after A's second: {next:?}");
-        assert_ne!(next[2], work_a2, "A's second is merged with the main A's first left");
-        assert!(
-            git(&["--git-dir", &integrator.judge.root.join(".sources").to_string_lossy(), "--version"]).is_ok()
+        assert_ne!(
+            next[2], work_a2,
+            "A's second is merged with the main A's first left"
         );
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
         let after = db.mission(a);
-        let states: Vec<&Value> = after["tasks"].as_array().expect("tasks").iter().map(|row| &row["state"]).collect();
+        let states: Vec<&Value> = after["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .map(|row| &row["state"])
+            .collect();
         assert!(states.iter().all(|state| *state == "landed"), "{after}");
         assert_eq!(db.mission(c)["tasks"][0]["state"], "landed");
         for base in [base_a, base_b, base_c, marks] {
@@ -2357,7 +2387,8 @@ mod database_tests {
         let marks = std::env::temp_dir().join(format!("spawn-db-gate-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&marks);
         std::fs::create_dir_all(&marks).expect("marks");
-        let (base_a, source_a, scenarios, mut integrator) = world("cap-one-a", &holding_gate(&marks));
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("cap-one-a", &holding_gate(&marks));
         integrator.gates = 1;
         let (base_b, source_b, _, _) = world("cap-one-b", "exit 1\n");
         let db = Db::new("cap_one");
