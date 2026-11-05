@@ -445,6 +445,7 @@ fn lineage_follows_links_to_every_ancestor() {
     for (child, parent) in [("session_b", "session_a"), ("session_c", "session_b")] {
         store
             .append(NewEvent {
+                agent_id: AgentId::new(child.replace("session_", "agent_")).expect("valid agent"),
                 session_id: SessionId::new(child).expect("valid session"),
                 ..message(EventKind::SessionLinked {
                     parent_session_id: SessionId::new(parent).expect("valid session"),
@@ -834,13 +835,16 @@ fn the_projection_follows_the_log_and_rebuilds_from_it() {
         .expect("append succeeds");
     projection_matches_fold(&mut client);
 
-    // Another agent's event does not move the session out of its owner.
-    store
-        .append(NewEvent {
-            agent_id: AgentId::new("agent_0").expect("valid agent"),
-            ..message(EventKind::MessageReceived)
-        })
-        .expect("append succeeds");
+    // Another agent's event is refused: the session stays its owner's.
+    assert!(
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new("agent_0").expect("valid agent"),
+                ..message(EventKind::MessageReceived)
+            })
+            .is_err(),
+        "a session has one agent"
+    );
     let owner: String = client
         .query_one("select agent_id from spawn_session_state", &[])
         .expect("projection row")
