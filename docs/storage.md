@@ -81,79 +81,26 @@ files, a chunk fetch.
   there would choose an agent's starting tree. A remote URL shares branches
   only when `SPAWN_PUSH_SOURCES` (comma-separated) names it exactly. Chunks
   are not shared between hosts (see "Not built").
-- **Main into branches automatically**: right after the checkpoint of a turn
-  end, and on an idle live execution (no turn open, nothing read that asks for
-  a checkpoint, the screen last read ready) at most every 30 s by the Bridge's
-  clock, so an agent already idle when the gate reports a conflict finds the
-  markers within about 30 s; never while a turn runs or a prompt is typed.
-  When the source's `main` moved (the mirror's
-  `main` is fetched at most every 30 s for this), it is merged into the
-  agent's branch (`merge-tree --attr-source=main`, so the rules come from
+- **Main at a start or resume**: main reaches an agent's branch only when an
+  execution starts or resumes, before its workspace is mounted, and never
+  while an execution runs: nothing changes files under a running agent.
+  When the source's `main` moved (the mirror's `main` is fetched at most
+  every 30 s for this), it is merged into the branch if, and only if, the
+  merge is clean (`merge-tree --attr-source=main`, so the rules come from
   `main`, which only the gate moves; the integrator lands with the same
-  rules). A clean merge updates the idle workspace in place first (`read-tree
-  -m -u` against a temporary index, which refuses if a file the merge changes
-  differs from the branch), then moves the branch by compare-and-swap to a
-  merge commit (parents: the head, `main`), recorded as `artifact.committed`
-  with reason `base_merged` and the files it changed. A merge changes files
-  under the agent, and an agent that rewrites one from stale context would
-  make its branch revert `main`; so the Bridge tells it, with the next prompt
-  it types for the session (an `Input` or a `Resume` prompt; never
-  unprompted): "Spawn merged main into your workspace since your last turn:
-  <files>. Re-read them before editing." (for conflicts: the files carry
-  conflict markers; edit the marked regions, do not rewrite the files from
-  memory). The notice is folded from the log, each file with the position
-  of the last merge event that named it. When the Bridge types a prompt that
-  carries it, it records `notice.typed {through}` (the last merge event the
-  notice told of); the notice clears only when that prompt reaches the
-  engine: the transcript line of a prompt that opens with the notice's
-  fixed opening gives `notice.received`. Only the files told of
-  are cleared, so a merge that lands between the typing and the receipt is
-  told next time. A prompt the Bridge did not type (someone at the pane, the
-  engine going on by itself) clears nothing, and neither does a restart: a
-  notice typed and not yet received is typed again with the next prompt. A
-  conflict in files' lines is made resolvable
-  the way `git merge` does it: the merge tree with conflict markers is written
-  into the idle workspace by the same safe procedure (a directory that differs
-  from the branch refuses, changing nothing), the branch stays where it is,
-  and `main` waits as the pending second parent under the store root
-  (`.merge/<agent>`, written atomically, with the branch head the merge was
-  written over), recorded once per conflict as
-  `merge.conflicted {files, marked}`. The agent hears of the conflict at
-  landing and with its next prompt, and finds the markers in its files.
-  Checkpoints keep single parents while any conflicted file the merge listed
-  still holds a whole marker block (a line of `n` `<` alone or before a
-  label, later one that is exactly `n` `=`, later one of `n` `>`, one `n`
-  per block: 7 or more, as git writes them by default, longer under
-  `conflict-marker-size` or for a conflict nested in a diff3 merge base, and
-  shorter only where main's `.gitattributes` sets `conflict-marker-size`
-  lower for the path; a lone `=======` heading underline is not one). Paths
-  are kept as git's bytes throughout, so a file name that is not UTF-8 or
-  holds a newline is checked under its own name. The first checkpoint
-  without a block commits with parents (head, pending `main`) and clears
-  it, after which the branch lands clean.
-  The integrator does not judge a branch with a pending merge, or with marker
-  blocks in the files it changes against `main`: it is gated `conflict` with
-  a note to resolve the markers first. Mount and unmount keep a pending
-  merge only when the branch carries it: a checkpoint was taken since it was
-  written (the head moved on from the head it was written over), so the
-  committed tree holds the markers and `main`'s other changes and the next
-  export shows them, and `main` is not yet an ancestor of the branch. The
-  checkpoint that resolves the markers, in that execution or a later one,
-  then takes `main` as its second parent, and the next merge of `main` does
-  not merge the markers again. Otherwise the pending merge goes: with the
-  head still the pre-merge one, a fresh export holds none of `main`'s
-  changes, so `main` must not become its parent (the next idle merge writes
-  the merge again). Either way main is never recorded as a parent over a
-  tree without its changes. A merge holds the branch's index lock, as a
-  checkpoint does. No later
-  `main` is merged on top of unresolved markers. A conflict markers cannot
-  show (modify/delete, renames, binary files) changes nothing; the
-  tick-report warning says so. Large files are not merged: the branch keeps
-  its own (a merge commit carries the head's `Spawn-Large` trailer), so a
-  merged tree must have room for them: a `main` that puts a file or a
-  symlink at a large file's path or at one of its parent directories makes
-  the merge a conflict markers cannot show (`marked: false`, the large
-  files' paths), and nothing moves.
+  rules). The branch then moves by compare-and-swap to a merge commit
+  (parents: the head, `main`), recorded as `artifact.committed` with reason
+  `base_merged` and the files it changed, and the mount exports it. Any
+  conflict leaves the branch as it is: the execution starts on it, and the
+  conflict is recorded as `merge.conflicted {files, marked: false}` (keyed by
+  the branch head and the files, so a retried start records it once) for the
+  supervisor and the integrator; the integrator's landing reports it as
+  before. Large files are not merged: the branch keeps its own (the merge
+  commit carries the head's `Spawn-Large` trailer), and a `main` that puts a
+  file or a symlink where a large file or its directory is counts as a
+  conflict. `notice.typed`, `notice.received` and `merge.conflicted` records
+  with `marked: true`, written while main was merged into running workspaces,
+  still decode and change nothing.
 - **A merge that loses the branch race**: when another writer moved the
   branch between the merge's directory update and its compare-and-swap,
   the directory follows the head that won: its text by the same two-tree

@@ -63,8 +63,8 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `session.native_ended` | 无；保留它以读取日志里已有的行 | reason |
 | `session.linked` | Bridge | parent_session_id |
 | `message.received` | 会话记录（transcript） | 无 |
-| `notice.typed` | Bridge（键入的提示以合并通知开头时） | through（通知覆盖到的最后一个合并事件的位置） |
-| `notice.received` | 会话记录（以合并通知固定开头的提示行） | 无 |
+| `notice.typed` | 无；保留它以读取日志里已有的行（主线不再合入运行中的工作区） | through |
+| `notice.received` | 无；保留它以读取日志里已有的行 | 无 |
 | `notification.received` | 无；保留它以读取日志里已有的行 | notification_type |
 | `tool.started` | 会话记录 | tool_name、tool_use_id |
 | `tool.completed` | 会话记录 | tool_use_id、duration_ms |
@@ -75,7 +75,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `execution.ended` | Bridge | cause、exit_code |
 | `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
 | `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
-| `merge.conflicted` | Bridge | files、marked |
+| `merge.conflicted` | Bridge（启动或恢复时合入 `main` 冲突） | files、marked（现在总是 false；为 true 的只在主线合入运行中工作区时写下的旧记录里） |
 | `command.accepted` | Gateway 事务 | command_id |
 | `command.finished` | Worker | command_id、succeeded、error |
 | `screen.observed` | Bridge | state、evidence |
@@ -122,7 +122,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 | 命令 | 行为 |
 | --- | --- |
-| `Start{engine,prompt,parent_session_id,from,model}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ mount → 写 `execution.started`（新分支带 fork）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
+| `Start{engine,prompt,parent_session_id,from,model}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ 干净时把 `main` 合入分支（`merge_main_clean`，冲突时分支不动并记 `merge.conflicted`）→ mount → 写 `execution.started`（新分支带 fork）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
 | `Input{text}` | 屏尾非 Ready 直接拒绝，Ready 才 `send-keys` |
 | `Stop` | 走结束流程，原因记为 `Stopped`；最后一次 checkpoint 失败时工作区不卸载 |
 | `Discard` | 同 `Stop`，但最后一次 checkpoint 失败也卸载工作区，未提交的内容丢失；只由人或 supervisor 在 `execution.end_stalled` 之后发出 |
@@ -142,7 +142,7 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
 
-合入基线：`turn_stopped` 的 checkpoint 成功（含 `Unchanged`）且没有进行中的回合时，Bridge 紧接着调用 `merge_base`。回合是否进行由折叠决定：`message.received`、`tool.started` 打开，`turn.stopped`、`turn.failed` 关闭；Bridge 自己投递 `Input` 时也立即打开，本 tick 刚读到的会话记录行同样计入。此外，空闲的活执行（没有进行中的回合、本 tick 没读到要求 checkpoint 的事件、屏幕最后读到 Ready）按 Bridge 自己的时钟每 30 秒（`IDLE_MERGE_MS`）至多调用一次 `merge_base`；Bridge 投递提示（`Start` 的首个提示、`Input`）时立即打开回合。`Merged` 写 `artifact.committed`（reason `base_merged`，带合并改动的 `files`，折叠时不清掉仍待做的 checkpoint）；冲突按状态记一次 `merge.conflicted{files,marked}`，同一冲突或失败的警告只报一次，状态变了才再报。每个会话有一份由这两种事件折叠出的提示，每个文件记着最后提到它的合并事件的位置：Bridge 下一次为该会话键入 `Input` 或 `Resume` 提示时把它放在最前（「Spawn merged main into your workspace since your last turn: <files>. Re-read them before editing.」；冲突时说明这些文件带冲突标记、编辑标记区域、不要凭记忆重写），从不主动键入。键入成功后写 `notice.typed{through}`；只有这条提示到达引擎时才清空：会话记录里以通知固定开头的提示行产生 `notice.received`，只清掉 `through` 及之前的文件。别人键入的回合、引擎自己继续的回合、重启都不清空；已键入未到达的通知随下一条提示再键入。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载；`Conflicted` 与失败只进 tick 报告的警告（区分「目录里已有冲突标记」与「标记表达不了，未合并」），冲突由落地告诉 agent。
+合入基线：只在执行启动或恢复时、挂载之前，Bridge 调用 `merge_main_clean`：`main` 能干净合入时分支按比较交换移到合并提交，写 `artifact.committed`（reason `base_merged`，带改动的 `files`）；有任何冲突时分支不动，执行照常在原分支上启动，写一次 `merge.conflicted{files, marked: false}`（键由分支头与文件决定，重试的启动只记一次），并在 tick 报告里告警。运行中的执行从不被合入，也不再给 agent 键入合并通知。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载。
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
 

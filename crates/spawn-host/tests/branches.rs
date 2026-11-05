@@ -187,6 +187,42 @@ fn a_branch_head_is_its_last_commit_and_a_missing_branch_has_none() {
 }
 
 #[test]
+fn main_merges_into_a_branch_only_when_clean_and_a_conflict_leaves_it() {
+    let fixture = Fixture::new("clean-merge", &[("README.md", "base\n"), ("x.rs", "one\n")]);
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    let work = fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    fixture.store.unmount(&workspace).expect("unmount");
+    assert_eq!(
+        fixture.store.merge_main_clean(&branch).expect("merge"),
+        BaseMerge::Current
+    );
+    // A clean main: the branch moves to a merge of both, nothing mounted.
+    let main = fixture.land(&[("README.md", "main\n")]);
+    let BaseMerge::Merged { commit, files } =
+        fixture.store.merge_main_clean(&branch).expect("merge")
+    else {
+        panic!("a clean main merges");
+    };
+    assert_eq!(files, ["README.md"]);
+    assert_eq!(fixture.head("agent_a"), commit.as_str());
+    assert_eq!(parents(&fixture, commit.as_str()), [work.clone(), main]);
+    assert!(!directory.exists(), "no directory is touched");
+    // A conflicting main: the branch stays where it is, marked false.
+    let workspace = fixture.store.mount(&branch).expect("mount");
+    let mine = fixture.work(&workspace, &[("x.rs", "mine\n")]);
+    fixture.store.unmount(&workspace).expect("unmount");
+    fixture.land(&[("x.rs", "theirs\n")]);
+    assert_eq!(
+        fixture.store.merge_main_clean(&branch).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec!["x.rs".to_string()],
+            marked: false
+        }
+    );
+    assert_eq!(fixture.head("agent_a"), mine, "the branch did not move");
+}
+
+#[test]
 fn a_branch_that_contains_main_is_current() {
     let fixture = Fixture::new("current", &[("README.md", "base\n")]);
     let (_, workspace, _) = fixture.mount("agent_a");

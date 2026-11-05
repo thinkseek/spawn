@@ -1312,6 +1312,10 @@ impl WorkspaceStore for GitWorkspace {
         self.merge_main(workspace)
     }
 
+    fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
+        self.merge_main_into_branch(branch.as_str())
+    }
+
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         let head = self.git_output(&[
             "for-each-ref",
@@ -1501,6 +1505,86 @@ impl GitWorkspace {
             commit: CommitId::new(commit)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
             files,
+        })
+    }
+
+    /// Merge `main` into `branch`, which is not mounted, only when the merge
+    /// is clean ([`WorkspaceStore::merge_main_clean`]): no directory is
+    /// touched; the branch moves by compare-and-swap. Any conflict leaves
+    /// the branch as it is.
+    fn merge_main_into_branch(&self, branch: &str) -> Result<BaseMerge, WorkspaceError> {
+        let _lock = self.lock_branch(branch)?;
+        let reference = format!("refs/heads/{branch}");
+        let head = self.commit_id_of(&reference)?;
+        let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
+        if self.is_ancestor(&main, &head)?
+            || self.git_output(&["merge-base", &main, &head]).is_err()
+        {
+            return Ok(BaseMerge::Current);
+        }
+        // `main` first, as the integrator lands it.
+        let output = self
+            .command()
+            .arg(format!("--attr-source={main}"))
+            .args([
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "-z",
+                &main,
+                &head,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
+        let (merged, files, _) = merge_tree_output(&output.stdout);
+        match output.status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Ok(BaseMerge::Conflicted {
+                    files: shown_paths(&files),
+                    marked: false,
+                });
+            }
+            _ => {
+                return Err(WorkspaceError::Unavailable(format!(
+                    "git merge-tree {main} {head}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        let (manifest, clashes) = self.manifest_over(&head, &merged)?;
+        if !clashes.is_empty() {
+            return Ok(BaseMerge::Conflicted {
+                files: shown_paths(&clashes),
+                marked: false,
+            });
+        }
+        let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
+        let changed =
+            self.git_listing(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
+        let message = crate::chunks::with_trailer(
+            &format!("spawn: merge main {main} into {branch}"),
+            manifest.as_deref(),
+        );
+        let commit = self.git_output(&[
+            "commit-tree",
+            &merged,
+            "-p",
+            &head,
+            "-p",
+            &main,
+            "-m",
+            &message,
+        ])?;
+        self.git_output(&["update-ref", &reference, &commit, &head])
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!("{error} (branch moved under the merge)"))
+            })?;
+        Ok(BaseMerge::Merged {
+            commit: CommitId::new(commit)
+                .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
+            files: shown_paths(&listed_paths(&changed)),
         })
     }
 

@@ -598,6 +598,18 @@ impl WorkspaceStore for MissionWorkspaces {
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         self.route(branch.as_str())?.store.branch_head(branch)
     }
+
+    fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
+        let routed = self.route(branch.as_str())?;
+        if let Some((repo, source)) = &routed.mirror {
+            self.refresh_main(repo, source, false);
+        }
+        let merged = routed.store.merge_main_clean(branch)?;
+        if let (BaseMerge::Merged { .. }, Some((repo, source))) = (&merged, &routed.mirror) {
+            self.mark(repo, source, branch.as_str());
+        }
+        Ok(merged)
+    }
 }
 
 impl Drop for MissionWorkspaces {

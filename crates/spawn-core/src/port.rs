@@ -149,7 +149,8 @@ impl ForkFrom {
     }
 }
 
-/// Result of [`WorkspaceStore::merge_base`].
+/// Result of [`WorkspaceStore::merge_main_clean`] (and of the mounted-workspace
+/// [`WorkspaceStore::merge_base`], which the Bridge no longer calls).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BaseMerge {
     /// The branch already contains the source's `main`.
@@ -199,9 +200,22 @@ pub trait WorkspaceStore: Send + Sync {
     /// Unmount the workspace. Committed state stays on the branch.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError>;
 
-    /// Merge the base (the source's `main`) into the branch of a mounted,
-    /// idle workspace whose state is committed: the directory first, then
-    /// the branch. A content conflict writes the merge with conflict markers
+    /// Merge `main` into `branch`, which is not mounted, only when the merge
+    /// is clean: the branch moves to the merge commit
+    /// ([`BaseMerge::Merged`]). A conflict of any kind changes nothing and
+    /// is answered as [`BaseMerge::Conflicted`] with `marked: false`. The
+    /// Bridge calls it when an execution starts or resumes, before the
+    /// mount: that is the only way main reaches an agent's branch. A store
+    /// without a moving base is always current.
+    fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
+        let _ = branch;
+        Ok(BaseMerge::Current)
+    }
+
+    /// Not called by the Bridge: main is merged only at a start or resume
+    /// ([`Self::merge_main_clean`]). Merge the base into the branch of a
+    /// mounted, idle workspace whose state is committed: the directory
+    /// first, then the branch. A content conflict writes the merge with conflict markers
     /// into the directory and leaves the branch where it is; the checkpoint
     /// after the markers are resolved commits the merge (see
     /// [`BaseMerge::Conflicted`]). A directory that differs from the branch,
