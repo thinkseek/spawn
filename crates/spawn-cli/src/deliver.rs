@@ -693,30 +693,31 @@ fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Ord
     if facts.open_command || facts.stopping() {
         return None;
     }
-    if facts.live {
-        let execution = facts.execution_id.as_deref().unwrap_or("none");
-        let key = format!("cancel-stop-{}-{execution}", cancelled.id);
-        return Some(cancelled.command(key, CommandAction::Stop));
-    }
-    facts.execution_id.as_ref()?;
     let prefix = cancelled.notice_prefix();
     let attempts: Vec<&crate::dispatch::Sent> = facts
         .dispatched
         .iter()
         .filter(|sent| sent.key.starts_with(&prefix))
         .collect();
-    if let Some(last) = attempts.last() {
-        match last.succeeded {
-            // Told: the next pass reads it from the log.
-            None | Some(true) => return None,
-            Some(false) => {
-                let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
-                if now_ms < finished.saturating_add(retry_wait_ms(attempts.len())) {
-                    return None;
-                }
-            }
+    let due = match attempts.last() {
+        None => true,
+        // Under way, or told (the log says so by the next pass): a worker
+        // its notice resumed is not stopped again.
+        Some(last) if last.succeeded != Some(false) => return None,
+        Some(last) => {
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            now_ms >= finished.saturating_add(retry_wait_ms(attempts.len()))
         }
+    };
+    if facts.live {
+        let execution = facts.execution_id.as_deref().unwrap_or("none");
+        let key = format!("cancel-stop-{}-{execution}", cancelled.id);
+        return Some(cancelled.command(key, CommandAction::Stop));
     }
+    if !due {
+        return None;
+    }
+    facts.execution_id.as_ref()?;
     Some(cancelled.command(
         format!("{prefix}{}", attempts.len()),
         CommandAction::Resume {
