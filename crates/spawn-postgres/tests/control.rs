@@ -1832,12 +1832,12 @@ fn a_task_cancelled_before_the_records_gets_its_record_once_on_migration() {
     assert_eq!(last_stage(&store, reported), "reported");
 
     store.migrate().expect("migrate");
-    // A dropped mission keeps nothing: all three are cancelled.
+    // The accepted task of a mission without a gate goes on, even dropped.
     assert_cancelled_once(
         &store,
         &mut client,
-        &[assigned, reported, accepted],
-        &[],
+        &[assigned, reported],
+        &[(accepted, "accepted")],
         "after migrating",
     );
     assert_eq!(
