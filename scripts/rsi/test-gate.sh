@@ -425,6 +425,31 @@ case "$plant" in
 *) expect "the scan hid what no tmpfs covers" "$(cat "$work/gate.out")" 'sockets hidden from the sandbox' ;;
 esac
 
+# 3d'. A socket directory the scan found and that then goes away (a host
+# process's temporary directory) does not break the sandbox: the gate does
+# not mount over it, and the verdict is the candidate's.
+vanish=$(mktemp -d "$work/vanish.XXXXXX")
+python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(900)' "$vanish/service.sock" &
+vanish_listener=$!
+background="$background $vanish_listener"
+while [ ! -S "$vanish/service.sock" ]; do sleep 0.1; done
+rm -f "$work/gate.out"
+(
+    until grep -q 'sockets hidden from the sandbox' "$work/gate.out" 2>/dev/null; do sleep 0.05; done
+    kill "$vanish_listener"
+    rm -rf "$vanish"
+) &
+vanish_watcher=$!
+expect "a hidden socket directory that goes away mid-gate changes no verdict" "$(
+    unset TMPDIR
+    judge "$good"
+)" 'exit=0 {"verdict":"accepted"}'
+kill "$vanish_watcher" 2>/dev/null || true
+[ ! -e "$vanish" ] || echo "note: $vanish was not under a scanned directory (TMPDIR covers it)"
+
 # 3e. A TCP test database URL works inside, through the gate's forwarder,
 # for 127.0.0.1, localhost and [::1] (when the host has it): the sandbox
 # reaches that server over a socket of the gate's, and still has no

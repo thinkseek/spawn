@@ -509,13 +509,20 @@ sandbox() {
         [ -e "$cargo_home/$name" ] && set -- "$@" --ro-bind "$cargo_home/$name" "/tmp/cargo-home/$name"
     done
     # Last, so no bind above shows them again: the sockets the scan found.
+    # One whose directory or file is gone since (a host process's temporary
+    # directory) is skipped: bwrap cannot mount over what is not there, and
+    # failing every later command would misjudge the candidate.
     old_ifs=$IFS
     IFS='
 '
     for mask in $socket_masks; do
         case "$mask" in
-        "directory "*) set -- "$@" --tmpfs "${mask#directory }" ;;
-        "file "*) set -- "$@" --ro-bind /dev/null "${mask#file }" ;;
+        "directory "*)
+            [ -d "${mask#directory }" ] && set -- "$@" --tmpfs "${mask#directory }"
+            ;;
+        "file "*)
+            [ -e "${mask#file }" ] && set -- "$@" --ro-bind /dev/null "${mask#file }"
+            ;;
         esac
     done
     IFS=$old_ifs
