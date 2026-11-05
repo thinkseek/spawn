@@ -872,7 +872,7 @@ pub(crate) fn collect_reports(
 mod tests {
     use super::{
         DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery,
-        new_report, news_items, put_aside, report_contract, task_prompt,
+        new_report, news_items, put_aside, report_contract, report_due, task_prompt,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -962,6 +962,73 @@ mod tests {
             tasks,
             ..Work::default()
         }
+    }
+
+    /// A worker at a ready screen, judged idle on it (`TurnStoppedIdle`),
+    /// whose turn's end the transcript has not given yet: the log's latest
+    /// turn event is the prompt (`message.received`).
+    fn ready_screen_before_the_turn_end() -> Facts {
+        let mut facts = worker(true, true);
+        facts.turn_ended = false;
+        facts.checkpoint = Some("c0".to_string());
+        facts
+    }
+
+    #[test]
+    fn no_report_is_collected_on_a_ready_screen_before_the_turns_end() {
+        let task = task(7, TaskState::Delivered, "ephemeral");
+        let facts = ready_screen_before_the_turn_end();
+        assert!(facts.turn_stopped_idle(), "the screen alone says idle");
+        assert!(
+            report_due(&task, std::slice::from_ref(&facts)).is_none(),
+            "the turn that wrote the report has not ended in the log: its checkpoint may not exist"
+        );
+    }
+
+    #[test]
+    fn a_report_is_collected_after_the_turns_end_with_its_checkpoint() {
+        let task = task(7, TaskState::Delivered, "ephemeral");
+        let mut facts = ready_screen_before_the_turn_end();
+        // The Bridge recorded the turn's checkpoint, then its end: both are
+        // newer than the idle judgement, which the Observer (no model judge,
+        // the same verdict) does not write again.
+        facts.turn_ended = true;
+        facts.checkpoint = Some("c1".to_string());
+        facts.evidence_seq = Some(8);
+        assert!(facts.current_observation().is_none(), "the judgement is older");
+        let rows = [facts];
+        let due = report_due(&task, &rows).expect("the turn ended: the report is collected");
+        assert_eq!(
+            due.checkpoint.as_deref(),
+            Some("c1"),
+            "the report names the checkpoint of its turn"
+        );
+
+        let mut busy = rows[0].clone();
+        busy.observation = Some(Observation::basic(
+            SemanticState::Working,
+            None,
+            SessionSeq(9),
+            Confidence::new(0.9).expect("valid"),
+            "rules",
+        ));
+        assert!(
+            report_due(&task, &[busy]).is_none(),
+            "a verdict that changed since holds it back"
+        );
+        let mut open = rows[0].clone();
+        open.open_command = true;
+        assert!(report_due(&task, &[open]).is_none(), "a command in flight");
+        let mut gone = rows[0].clone();
+        gone.live = false;
+        assert!(report_due(&task, &[gone]).is_none(), "not live");
+        let mut none = rows[0].clone();
+        none.checkpoint = None;
+        assert_eq!(
+            report_due(&task, std::slice::from_ref(&none)).map(|facts| facts.checkpoint.clone()),
+            Some(None),
+            "an agent with no checkpoint at all reports a null commit"
+        );
     }
 
     #[test]
