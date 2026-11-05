@@ -86,6 +86,8 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 
 去重：`(session_id, source, source_event_id)` 唯一。Bridge 重读同一会话记录行返回既有记录，`inserted = false`。
 
+脱敏：日志保存的自由文本（`tool.failed`、`turn.failed`、`execution.end_stalled`、`command.finished` 的 error，`screen.observed` 的 evidence，`observation.recorded` 里 observation 的 human_question、attention_reason 与 evidence 中的字符串）在追加前经 `spawn_core::redact::redact_event` 处理：`sk-…`、`ghp_…`（及 GitHub 其他 `gh?_` token）、`github_pat_…`、`AKIA…` 形状的密钥，`Bearer <token>` 的 token，`x-api-key` 头的值，URL userinfo 里的密码（`scheme://user:[redacted]@`），以及名字以 `PASSWORD`、`PASSWD`、`TOKEN`、`SECRET`、`KEY` 结尾（不分大小写）的赋值的值，都换成 `[redacted]`。两个存储（PostgreSQL 与内存实现）都在 `append` 与 `finish` 里做，任何写入方都绕不过去；标识符、路径和 `control.recorded`（任务源 URL、提示词会被折叠读回）不动。
+
 ## 4. 端口契约
 
 `spawn-core::port` 定义五个 trait 与错误类型。

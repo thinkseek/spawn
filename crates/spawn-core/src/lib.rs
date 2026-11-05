@@ -14,6 +14,7 @@ pub mod mission;
 pub mod observation;
 pub mod observe;
 pub mod port;
+pub mod redact;
 pub mod screen;
 pub mod shell;
 pub mod time;
