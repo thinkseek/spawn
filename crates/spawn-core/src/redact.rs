@@ -45,8 +45,8 @@ pub fn redact_event(kind: &mut EventKind) {
     match kind {
         EventKind::ToolFailed { error, .. }
         | EventKind::TurnFailed { error }
-        | EventKind::ExecutionEndStalled { error, .. } => clean(error),
-        EventKind::CommandFinished {
+        | EventKind::ExecutionEndStalled { error, .. }
+        | EventKind::CommandFinished {
             error: Some(error), ..
         } => clean(error),
         EventKind::ScreenObserved { evidence, .. } => clean(evidence),
