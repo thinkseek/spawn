@@ -429,8 +429,9 @@ enum Attempts {
     /// goes at `due_ms`.
     Retry { number: usize, due_ms: i64 },
     /// The latest attempt failed and is not tried again: why, for the
-    /// supervisor.
-    Failed(&'static str),
+    /// supervisor, and whether its retries are spent (`false`: it may have
+    /// typed the task, so it is not tried again).
+    Failed { why: &'static str, spent: bool },
 }
 
 /// Where `task`'s current delivery into `facts`' session stands. A failure
@@ -462,10 +463,11 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
         Some(false) => {
             let error = last.error.as_deref().unwrap_or_default();
             if error.contains(MAY_HAVE_TYPED) {
-                return Attempts::Failed(
-                    "may or may not have reached its worker; ask the worker before assigning it \
-                     again",
-                );
+                return Attempts::Failed {
+                    why: "may or may not have reached its worker; ask the worker before assigning \
+                          it again",
+                    spent: false,
+                };
             }
             let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
             if not_ready(last) && refusals <= NOT_READY_FREE {
@@ -475,7 +477,10 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
                 };
             }
             if failures > DELIVERY_RETRIES {
-                return Attempts::Failed("never reached its worker; cancel it and assign it again");
+                return Attempts::Failed {
+                    why: "never reached its worker; cancel it and assign it again",
+                    spent: true,
+                };
             }
             Attempts::Retry {
                 number: sent.len(),
@@ -511,6 +516,21 @@ pub(crate) fn delivered(work: &Work, rows: &[Facts]) -> Vec<(i64, i64)> {
         .collect()
 }
 
+/// The waiting tasks (assigned, or sent back) that are their session's
+/// turn ([`Turns`]: a revision first, then the oldest new task) with no
+/// open task of the session holding it ([`Work::blocked`]): the ones
+/// delivery tries now. Every other waiting task is queued behind one.
+pub(crate) fn next_up(work: &Work) -> BTreeSet<i64> {
+    let blocked = work.blocked();
+    let mut turns = Turns::new(work);
+    work.tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
+        .filter(|task| turns.take(task) && !blocked.contains(task.session_id.as_str()))
+        .map(|task| task.id)
+        .collect()
+}
+
 /// Delivery orders for the current facts: a task's delivery, or its retry
 /// once due ([`attempts`]).
 pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
@@ -518,16 +538,14 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
         .iter()
         .map(|facts| (facts.session_id.as_str(), facts))
         .collect();
-    let blocked = work.blocked();
-    let mut turns = Turns::new(work);
+    let next = next_up(work);
     let mut orders = Vec::new();
     for task in &work.tasks {
         let session = task.session_id.as_str();
         let found = facts.get(session).copied();
         match task.state {
             TaskState::Assigned | TaskState::Revise => {
-                let turn = turns.take(task);
-                if !turn || blocked.contains(session) {
+                if !next.contains(&task.id) {
                     continue;
                 }
                 let key = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
@@ -538,7 +556,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                     Attempts::Retry { .. }
                     | Attempts::Open
                     | Attempts::Delivered(_)
-                    | Attempts::Failed(_) => continue,
+                    | Attempts::Failed { .. } => continue,
                 };
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
                 orders.extend(delivery(task, found, settled, key));
@@ -725,7 +743,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         });
     }
     for (task, attempts) in waiting_attempts(work, rows) {
-        if let Attempts::Failed(why) = attempts {
+        if let Attempts::Failed { why, .. } = attempts {
             items.push(Escalation {
                 session_id: task.session_id.clone(),
                 id: task.delivery_key(),
