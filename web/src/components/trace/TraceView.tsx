@@ -1,36 +1,35 @@
-import { scaleTime } from "d3-scale";
-import { timeFormat } from "d3-time-format";
-import { AlertTriangle, ChevronRight, Maximize2, Minus, Plus } from "lucide-react";
-import { AnimatePresence, animate, useReducedMotion } from "motion/react";
-import type { AnimationPlaybackControls } from "motion/react";
-import {
-  useCallback,
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { AlertTriangle, ChevronRight } from "lucide-react";
+import { AnimatePresence, useReducedMotion } from "motion/react";
+import { useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 
 import type { TimelineEvent } from "../../api";
 import { pairs } from "../../eventFormat";
 import { clockTime, formatDuration } from "../../format";
+import { fitDomain } from "../../timeWindow";
+import { chainOf, deriveTrace, spanEnd, visibleSpans } from "../../trace";
+import type { Span, SpanKind, TraceMarker } from "../../trace";
+import { Overview } from "../timeaxis/Overview";
+import type { OverviewLine } from "../timeaxis/Overview";
 import {
-  chainOf,
-  clampDomain,
-  deriveTrace,
-  fitDomain,
-  panDomain,
-  spanEnd,
-  tickPattern,
-  visibleSpans,
-  zoomDomain,
-} from "../../trace";
-import type { Domain, Span, SpanKind, TraceMarker } from "../../trace";
+  AxisRow,
+  FloatingTip,
+  Gridlines,
+  LIVE_TAIL_PX,
+  LiveTail,
+  NowLine,
+  TailGradient,
+  ZoomControls,
+  useTicks,
+} from "../timeaxis/TimeAxis";
+import {
+  useDragPan,
+  useNowWhile,
+  useTimeWindow,
+  useWheelZoom,
+  useWidth,
+} from "../timeaxis/useTimeWindow";
 import { cx } from "../ui";
-import { Overview } from "./Overview";
 import { SpanDetail } from "./SpanDetail";
 import { KIND_COLOR, KIND_LABEL, KIND_ORDER, markerColor } from "./style";
 
@@ -42,11 +41,7 @@ const BAR_H: Record<SpanKind, number> = {
   tool: 10,
 };
 const INDENT_PX = 14;
-/** Width of the fading tail on a span that is still running. */
-const LIVE_TAIL_PX = 28;
 const BOTTOM_SLACK_PX = 56;
-/** Pointer travel that turns a press into a drag. */
-const DRAG_PX = 3;
 
 /** A visible row: a span, or the session row for events no span owns. */
 interface Row {
@@ -54,13 +49,6 @@ interface Row {
   span: Span | null;
   markers: TraceMarker[];
 }
-
-/** What the visible window follows: the whole trace, the live end with a
- * fixed width, or a fixed range. */
-type Follow =
-  | { mode: "fit" }
-  | { mode: "tail"; width: number }
-  | { mode: "fixed"; domain: Domain };
 
 interface Hover {
   rowKey: string;
@@ -81,27 +69,12 @@ export function TraceView({
   const trace = useMemo(() => deriveTrace(events, 0), [events]);
 
   // Open spans run to now; the clock only ticks while one is open.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (trace.openCount === 0) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [trace.openCount]);
+  const now = useNowWhile(trace.openCount > 0);
   const traceEnd = trace.openCount > 0 ? Math.max(trace.end, now) : trace.end;
   const extent = useMemo(
     () => fitDomain({ start: trace.start, end: traceEnd }),
     [trace.start, traceEnd],
   );
-
-  const [follow, setFollow] = useState<Follow>({ mode: "fit" });
-  const domain = useMemo(() => {
-    if (follow.mode === "fit") return extent;
-    if (follow.mode === "tail") {
-      return clampDomain({ from: extent.to - follow.width, to: extent.to }, extent);
-    }
-    return clampDomain(follow.domain, extent);
-  }, [follow, extent]);
 
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const [selected, setSelected] = useState<string | null>(null);
@@ -127,110 +100,17 @@ export function TraceView({
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const rowsRef = useRef<HTMLDivElement>(null);
-  const [width, setWidth] = useState(0);
-  useLayoutEffect(() => {
-    const element = scrollRef.current;
-    if (!element) return;
-    const observer = new ResizeObserver(() => setWidth(element.clientWidth));
-    observer.observe(element);
-    setWidth(element.clientWidth);
-    return () => observer.disconnect();
-  }, []);
+  const width = useWidth(scrollRef);
   const labelW = width < 640 ? 150 : 264;
   const plotW = Math.max(0, width - labelW - 20);
-  const scale = (domain.to - domain.from) / Math.max(plotW, 1);
-  const px = useCallback(
-    (time: number) => (time - domain.from) / scale,
-    [domain.from, scale],
-  );
-
-  // Latest values for the native listeners and animations.
-  const latest = useRef({ domain, extent, plotW, labelW, scale });
-  latest.current = { domain, extent, plotW, labelW, scale };
-
-  const setDomain = useCallback((next: Domain) => {
-    const { extent: full } = latest.current;
-    const fullWidth = full.to - full.from;
-    const nextWidth = next.to - next.from;
-    if (nextWidth >= fullWidth * 0.999) setFollow({ mode: "fit" });
-    else if (next.to >= full.to - nextWidth * 0.01) {
-      setFollow({ mode: "tail", width: nextWidth });
-    } else setFollow({ mode: "fixed", domain: next });
-  }, []);
-
-  // Glide to a window: buttons, double-click, the overview. Wheel and drag
-  // set the window directly so the axis tracks the hand.
-  const glide = useRef<AnimationPlaybackControls | null>(null);
-  const glideTo = useCallback(
-    (target: Domain) => {
-      glide.current?.stop();
-      const from = latest.current.domain;
-      if (reduceMotion) {
-        setDomain(target);
-        return;
-      }
-      glide.current = animate(0, 1, {
-        duration: 0.32,
-        ease: [0.2, 0.8, 0.2, 1],
-        onUpdate: (t) =>
-          setDomain({
-            from: from.from + (target.from - from.from) * t,
-            to: from.to + (target.to - from.to) * t,
-          }),
-      });
-    },
-    [reduceMotion, setDomain],
-  );
-  useEffect(() => () => glide.current?.stop(), []);
-
-  const zoomBy = useCallback(
-    (factor: number) => {
-      const { domain: current, extent: full } = latest.current;
-      const middle = (current.from + current.to) / 2;
-      glideTo(zoomDomain(current, factor, middle, full));
-    },
-    [glideTo],
-  );
-
+  const view = useTimeWindow(extent, plotW, reduceMotion);
+  const { domain, px, glideTo, zoomBy } = view;
+  useWheelZoom(scrollRef, view, labelW);
+  const pan = useDragPan(view);
   const zoomToSpan = useCallback(
-    (span: Span) => {
-      const from = span.start;
-      const to = spanEnd(span, latest.current.extent.to);
-      const pad = Math.max((to - from) * 0.15, 500);
-      glideTo(clampDomain({ from: from - pad, to: to + pad }, latest.current.extent));
-    },
-    [glideTo],
+    (span: Span) => view.zoomTo(span.start, spanEnd(span, view.latest.current.extent.to)),
+    [view],
   );
-
-  // Wheel: ⌘/Ctrl (and trackpad pinch, which arrives as ctrl+wheel) zooms
-  // around the pointer; sideways scroll and Shift pan; plain vertical
-  // scroll moves through the rows. Native listener: React's is passive.
-  useEffect(() => {
-    const element = scrollRef.current;
-    if (!element) return;
-    const onWheel = (event: WheelEvent) => {
-      const { domain: current, extent: full, labelW: left, scale: msPerPx } =
-        latest.current;
-      const x = event.clientX - element.getBoundingClientRect().left - left;
-      if (x < 0) return;
-      const lines = event.deltaMode === 1 ? 16 : 1;
-      const dx = event.deltaX * lines;
-      const dy = event.deltaY * lines;
-      if (event.ctrlKey || event.metaKey) {
-        event.preventDefault();
-        glide.current?.stop();
-        const factor = Math.exp(dy * (event.ctrlKey ? 0.01 : 0.002));
-        setDomain(zoomDomain(current, factor, current.from + x * msPerPx, full));
-      } else if (event.shiftKey || Math.abs(dx) > Math.abs(dy)) {
-        event.preventDefault();
-        glide.current?.stop();
-        const delta = event.shiftKey && dx === 0 ? dy : dx;
-        setDomain(panDomain(current, delta * msPerPx, full));
-      }
-    };
-    element.addEventListener("wheel", onWheel, { passive: false });
-    return () => element.removeEventListener("wheel", onWheel);
-  }, [setDomain]);
 
   // Stick to the newest rows while the reader is at the bottom.
   const stickToBottom = useRef(true);
@@ -241,7 +121,6 @@ export function TraceView({
   }, [rows.length]);
 
   // Pointer: hover, click to select, drag to pan, all on the row stack.
-  const drag = useRef<{ x: number; domain: Domain; moved: boolean } | null>(null);
   const locate = (event: PointerEvent | MouseEvent) => {
     const rect = rowsRef.current!.getBoundingClientRect();
     const index = Math.floor((event.clientY - rect.top) / ROW_H);
@@ -265,18 +144,12 @@ export function TraceView({
     if (event.button !== 0) return;
     const { x } = locate(event);
     if (x < 0) return;
-    glide.current?.stop();
-    drag.current = { x: event.clientX, domain, moved: false };
+    pan.begin(event.clientX);
     event.currentTarget.setPointerCapture(event.pointerId);
   };
   const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
-    const active = drag.current;
-    if (active) {
-      const dx = event.clientX - active.x;
-      if (!active.moved && Math.abs(dx) < DRAG_PX) return;
-      active.moved = true;
+    if (pan.move(event.clientX)) {
       setHover(null);
-      setDomain(panDomain(active.domain, -dx * scale, extent));
       return;
     }
     const { row, marker } = locate(event);
@@ -293,9 +166,7 @@ export function TraceView({
     );
   };
   const onPointerUp = (event: PointerEvent<HTMLDivElement>) => {
-    const active = drag.current;
-    drag.current = null;
-    if (!active || active.moved) return;
+    if (pan.end()) return;
     const { row, marker } = locate(event);
     if (!row) return;
     setSelected(row.key);
@@ -366,20 +237,17 @@ export function TraceView({
     [trace, focusKey],
   );
 
-  const ticks = useMemo(() => {
-    if (plotW <= 0) return [];
-    const time = scaleTime()
-      .domain([new Date(domain.from), new Date(domain.to)])
-      .range([0, plotW]);
-    const values = time.ticks(Math.max(3, Math.floor(plotW / 110)));
-    const step = values.length > 1 ? values[1].getTime() - values[0].getTime() : 1_000;
-    const format = timeFormat(tickPattern(step));
-    return values.map((value) => ({
-      x: time(value),
-      label: format(value),
-      key: value.getTime(),
+  const ticks = useTicks(domain, plotW);
+  const overviewLines = useMemo<OverviewLine[]>(() => {
+    const count = Math.max(trace.spans.length - 1, 1);
+    return trace.spans.map((span, index) => ({
+      id: span.id,
+      from: span.start,
+      to: spanEnd(span, traceEnd),
+      y: trace.spans.length === 1 ? 0.5 : index / count,
+      color: span.failed && span.kind === "tool" ? "var(--destructive)" : KIND_COLOR[span.kind],
     }));
-  }, [domain.from, domain.to, plotW]);
+  }, [trace, traceEnd]);
 
   const height = rows.length * ROW_H;
   const selectedRow = selected ? rows[rowIndex.get(selected) ?? -1] : undefined;
@@ -390,24 +258,7 @@ export function TraceView({
       <div className="flex h-11 shrink-0 items-center gap-3 px-4 sm:px-5">
         {header}
         <Legend />
-        <div className="ml-auto flex items-center gap-1">
-          <span className="mr-2 hidden text-caption text-faint-foreground xl:inline">
-            ⌘/Ctrl + scroll to zoom · drag to pan
-          </span>
-          <IconButton label="Zoom out (−)" onClick={() => zoomBy(2)}>
-            <Minus size={13} />
-          </IconButton>
-          <IconButton label="Zoom in (+)" onClick={() => zoomBy(0.5)}>
-            <Plus size={13} />
-          </IconButton>
-          <IconButton
-            label="Fit the whole session (0)"
-            onClick={() => glideTo(extent)}
-            active={follow.mode === "fit"}
-          >
-            <Maximize2 size={12} />
-          </IconButton>
-        </div>
+        <ZoomControls view={view} fitLabel="Fit the whole session" />
       </div>
 
       <div className="flex shrink-0 items-stretch px-4 sm:px-5">
@@ -424,40 +275,18 @@ export function TraceView({
           </span>
         </div>
         <Overview
-          trace={trace}
+          lines={overviewLines}
           extent={extent}
           domain={domain}
-          now={traceEnd}
           width={plotW}
-          onDomain={setDomain}
+          onDomain={view.setDomain}
           onGlide={glideTo}
         />
       </div>
 
       <div className="relative flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
-          {/* Axis */}
-          <div className="relative mt-2 h-7 shrink-0 border-b border-surface-border">
-            <span
-              className="absolute inset-y-0 left-4 flex items-center text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground sm:left-5"
-            >
-              Span
-            </span>
-            <div className="absolute inset-y-0 overflow-hidden" style={{ left: labelW, width: plotW }}>
-              {ticks.map((tick, index) => (
-                <span
-                  key={tick.key}
-                  className="tnum absolute top-1/2 -translate-y-1/2 whitespace-nowrap text-micro text-muted-foreground"
-                  style={{
-                    left: tick.x,
-                    transform: `translate(${index === 0 && tick.x < 30 ? "0" : "-50%"}, -50%)`,
-                  }}
-                >
-                  {tick.label}
-                </span>
-              ))}
-            </div>
-          </div>
+          <AxisRow ticks={ticks} labelW={labelW} plotW={plotW} caption="Span" />
 
           <div
             ref={scrollRef}
@@ -481,7 +310,7 @@ export function TraceView({
               onPointerDown={onPointerDown}
               onPointerMove={onPointerMove}
               onPointerUp={onPointerUp}
-              onPointerCancel={() => (drag.current = null)}
+              onPointerCancel={() => pan.cancel()}
               onPointerLeave={() => setHover(null)}
               onDoubleClick={(event) => {
                 const { row, x } = locate(event);
@@ -489,7 +318,7 @@ export function TraceView({
               }}
               className={cx(
                 "relative select-none outline-none",
-                drag.current?.moved ? "cursor-grabbing" : "cursor-default",
+                pan.dragging ? "cursor-grabbing" : "cursor-default",
               )}
               style={{ height }}
             >
@@ -518,40 +347,15 @@ export function TraceView({
               >
                 <defs>
                   {KIND_ORDER.map((kind) => (
-                    <linearGradient key={kind} id={`${gradientId}-${kind}`} x1="0" x2="1">
-                      <stop offset="0" stopColor={KIND_COLOR[kind]} stopOpacity="1" />
-                      <stop offset="1" stopColor={KIND_COLOR[kind]} stopOpacity="0.15" />
-                    </linearGradient>
+                    <TailGradient key={kind} id={`${gradientId}-${kind}`} color={KIND_COLOR[kind]} />
                   ))}
                   <clipPath id={`${gradientId}-plot`}>
                     <rect x={0} y={0} width={plotW} height={height} />
                   </clipPath>
                 </defs>
                 <g clipPath={`url(#${gradientId}-plot)`}>
-                  {ticks.map((tick) => (
-                    <line
-                      key={tick.key}
-                      x1={tick.x}
-                      x2={tick.x}
-                      y1={0}
-                      y2={height}
-                      stroke="var(--border)"
-                      strokeWidth={1}
-                      shapeRendering="crispEdges"
-                    />
-                  ))}
-                  {nowX !== null && nowX >= 0 && nowX <= plotW && (
-                    <line
-                      x1={nowX}
-                      x2={nowX}
-                      y1={0}
-                      y2={height}
-                      stroke="var(--faint-foreground)"
-                      strokeWidth={1}
-                      strokeDasharray="2 4"
-                      opacity={0.6}
-                    />
-                  )}
+                  <Gridlines ticks={ticks} height={height} />
+                  <NowLine x={nowX} height={height} plotW={plotW} />
                   <Connectors
                     rows={rows}
                     rowIndex={rowIndex}
@@ -615,7 +419,7 @@ export function TraceView({
         </AnimatePresence>
       </div>
 
-      {hover && !drag.current && (
+      {hover && !pan.dragging && (
         <Tooltip
           hover={hover}
           row={rows[rowIndex.get(hover.rowKey) ?? -1]}
@@ -673,33 +477,6 @@ function Legend() {
         Failed
       </li>
     </ul>
-  );
-}
-
-function IconButton({
-  label,
-  onClick,
-  active = false,
-  children,
-}: {
-  label: string;
-  onClick: () => void;
-  active?: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      onClick={onClick}
-      className={cx(
-        "grid size-7 place-items-center rounded-md transition-colors hover:bg-surface-hover hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring",
-        active ? "text-foreground" : "text-muted-foreground",
-      )}
-    >
-      {children}
-    </button>
   );
 }
 
@@ -949,22 +726,13 @@ function SpanBar({
             rx={radius}
             fill={color}
           />
-          <rect
-            x={x0 + Math.max(w - LIVE_TAIL_PX, 0)}
-            y={cy - h / 2}
-            width={Math.min(w, LIVE_TAIL_PX)}
-            height={h}
-            fill={span.failed ? color : `url(#${gradientId}-${span.kind})`}
-          />
-          <line
+          <LiveTail
+            x0={x0}
             x1={x1}
-            x2={x1}
-            y1={cy - h / 2 - 3}
-            y2={cy + h / 2 + 3}
-            stroke={color}
-            strokeWidth={2}
-            strokeLinecap="round"
-            className="animate-live-edge"
+            cy={cy}
+            h={h}
+            color={color}
+            gradient={`${gradientId}-${span.kind}`}
           />
         </>
       ) : (
@@ -1102,16 +870,8 @@ function Tooltip({
     body = <div>{row.markers.length} session events</div>;
   }
   return (
-    <div
-      role="tooltip"
-      className="pointer-events-none absolute z-20 max-w-80 rounded-md bg-[var(--tooltip)] px-2.5 py-1.5 text-caption text-white shadow-[var(--tooltip-shadow)]"
-      style={{
-        left: hover.x + 14,
-        top: hover.y + 16,
-        transform: flip ? "translateX(calc(-100% - 28px))" : undefined,
-      }}
-    >
+    <FloatingTip x={hover.x} y={hover.y} flip={flip}>
       {body}
-    </div>
+    </FloatingTip>
   );
 }
