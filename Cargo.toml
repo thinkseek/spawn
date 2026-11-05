@@ -30,6 +30,9 @@ sha2 = "0.11"
 # Already linked through std's dependencies; opens agent-written files with
 # O_NOFOLLOW | O_NONBLOCK.
 libc = "0.2"
+# Descriptor-relative file calls (openat, mkdirat, renameat) without
+# unsafe code: large files are written only inside the workspace.
+rustix = { version = "1", features = ["fs"] }
 # The chunk store (docs/storage.md): names chunks by hash, compresses them.
 blake3 = "1.8"
 zstd = "0.14"

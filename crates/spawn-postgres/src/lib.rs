@@ -60,6 +60,9 @@ pub struct PostgresStore {
     /// The password in the URL this store connected with: the owner's, when
     /// it migrates, and the key the logins' passwords are derived from.
     password: String,
+    /// The URL this store connected with, for the server-wide migration
+    /// lock ([`PostgresStore::migrate`]).
+    url: String,
 }
 
 /// The schema's restricted logins. Their passwords are derived from the
@@ -73,6 +76,7 @@ impl PostgresStore {
         Ok(Self {
             client: Mutex::new(client),
             password: url_password(url),
+            url: url.to_string(),
         })
     }
 
@@ -113,8 +117,13 @@ impl PostgresStore {
     pub fn migrate(&self) -> Result<(), StoreError> {
         // Roles and grants are cluster-wide, so migrations of two databases
         // (or schemas) on one server race on them ("tuple concurrently
-        // updated"). Every statement of the schema is idempotent, so the
-        // whole migration is simply run again, a bounded number of times.
+        // updated"). Advisory locks belong to one database, so migrations
+        // take theirs in the server's maintenance database, which every
+        // database on the server shares: one migration at a time per server.
+        // Where that database cannot be reached, a lost race is run again
+        // (every statement of the schema is idempotent), a bounded number of
+        // times.
+        let _server = server_migration_lock(&self.url);
         let mut attempt: u32 = 0;
         loop {
             match self.migrate_once() {
@@ -145,6 +154,43 @@ impl PostgresStore {
             }
         }
         Ok(())
+    }
+}
+
+/// Key of the server-wide migration lock (an arbitrary constant).
+const MIGRATION_LOCK_KEY: i64 = 1_399_957_400;
+
+/// The migration lock, held in the server's `postgres` database until the
+/// returned connection drops; `None` where that database cannot be reached.
+fn server_migration_lock(url: &str) -> Option<Client> {
+    let mut client = Client::connect(&maintenance_url(url), NoTls).ok()?;
+    client
+        .execute("select pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])
+        .ok()?;
+    Some(client)
+}
+
+/// `url` with its database replaced by the server's maintenance database
+/// `postgres`, keeping host, port, credentials and query parameters.
+fn maintenance_url(url: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let authority_start = base.find("://").map_or(0, |index| index + 3);
+    let base = match base[authority_start..].find('/') {
+        Some(slash) => &base[..authority_start + slash],
+        None => base,
+    };
+    let query = query.map(|query| {
+        query
+            .split('&')
+            .filter(|pair| !pair.starts_with("dbname="))
+            .collect::<Vec<_>>()
+            .join("&")
+    });
+    match query {
+        Some(query) if !query.is_empty() => format!("{base}/postgres?{query}"),
+        _ => format!("{base}/postgres"),
     }
 }
 
@@ -312,6 +358,27 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::{role_url, url_password};
+
+    #[test]
+    fn the_migration_lock_lives_in_the_servers_maintenance_database() {
+        use super::maintenance_url;
+        assert_eq!(
+            maintenance_url("postgres://u:p%40ss@db.local:5433/spawn"),
+            "postgres://u:p%40ss@db.local:5433/postgres"
+        );
+        assert_eq!(
+            maintenance_url("postgresql://u@localhost/spawn?sslmode=disable&dbname=x"),
+            "postgresql://u@localhost/postgres?sslmode=disable"
+        );
+        assert_eq!(
+            maintenance_url("postgres://u@%2Frun%2Fpostgresql/spawn"),
+            "postgres://u@%2Frun%2Fpostgresql/postgres"
+        );
+        assert_eq!(
+            maintenance_url("postgres://u@host"),
+            "postgres://u@host/postgres"
+        );
+    }
 
     #[test]
     fn every_spelling_of_the_owner_password_derives_the_same_logins() {
