@@ -257,6 +257,12 @@ create table if not exists spawn_grants (
     primary key (principal, agent_id)
 );
 
+-- Every start migrates in place: a table made by an earlier schema keeps its
+-- rows and gets each column added since, here, after its `create table`.
+-- tests/upgrade.rs builds the first shape of every table and checks that a
+-- migration over it matches a fresh schema.
+alter table spawn_grants add column if not exists scope text not null default 'all';
+
 
 create or replace function spawn_grant_matches(p_pattern text, p_agent text)
 returns boolean language sql immutable as $$
@@ -828,9 +834,41 @@ create table if not exists mission_tasks (
     model           text   not null default 'default' check (model in ('default', 'cheap'))
 );
 
--- Tables made before the column existed get it in place.
+-- Columns added since the first shape of these tables (see spawn_grants).
+alter table mission_missions add column if not exists gate text;
+alter table mission_missions add column if not exists accept text not null default 'review'
+    check (accept in ('review', 'gate'));
+alter table mission_missions add column if not exists budget jsonb;
+alter table mission_missions add column if not exists baseline text;
+alter table mission_missions add column if not exists halted text;
+alter table mission_missions add column if not exists scenario_floor integer not null default 0;
+alter table mission_missions add column if not exists gate_rejections integer not null default 0;
+alter table mission_missions add column if not exists gate_aborts integer not null default 0;
+alter table mission_missions add column if not exists objectives jsonb;
+alter table mission_tasks add column if not exists base text;
+alter table mission_tasks add column if not exists candidate text;
+alter table mission_tasks add column if not exists gate_log text;
+alter table mission_tasks add column if not exists metric text;
+alter table mission_tasks add column if not exists objective integer;
+alter table mission_tasks add column if not exists scenario text;
+alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
+
+-- The first task states had no landing: a check from then is replaced, once.
+do $$
+begin
+    if not exists (select 1 from pg_constraint
+                    where conrelid = 'mission_tasks'::regclass
+                      and conname = 'mission_tasks_state_check'
+                      and pg_get_constraintdef(oid) like '%''landed''%') then
+        alter table mission_tasks drop constraint if exists mission_tasks_state_check;
+        alter table mission_tasks add constraint mission_tasks_state_check
+            check (state in ('assigned', 'delivered', 'reported', 'revise',
+                             'accepted', 'cancelled', 'landing', 'landed'));
+    end if;
+end
+$$;
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
 
