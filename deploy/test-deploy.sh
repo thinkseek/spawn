@@ -53,6 +53,8 @@ live_url=${test_url%/*}/$db
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/spawn-deploy-test.XXXXXX")
 cleanup() {
   with_db "$test_url" psql -XAtq -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
+  # The controllers are read-only (deploy/controller.sh).
+  chmod -R u+w "$scratch" 2>/dev/null || true
   rm -rf "$scratch"
 }
 trap cleanup EXIT
