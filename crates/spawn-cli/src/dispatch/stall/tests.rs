@@ -46,6 +46,8 @@ fn worker(state: SemanticState, idle: bool) -> Facts {
         observation_event_id: Some(9),
         observation_at_ms: Some(NOW - 1_000),
         evidence_seq: Some(20),
+        turn_ended: idle,
+        checkpoint: None,
         episode: Some(4),
         stops: Vec::new(),
         open_command: false,
