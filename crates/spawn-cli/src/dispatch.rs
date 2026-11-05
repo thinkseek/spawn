@@ -84,6 +84,10 @@ pub(crate) struct Facts {
     pub(crate) open_command: bool,
     #[serde(default)]
     pub(crate) dispatched: Vec<Sent>,
+    /// Key of the latest delivery (`deliver-<task>-<revision>`) the
+    /// dispatcher sent into the session, however long ago.
+    #[serde(default)]
+    pub(crate) last_delivery: Option<String>,
     /// The model profile of the session's latest execution.
     #[serde(default)]
     pub(crate) model: ModelProfile,
@@ -394,6 +398,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            last_delivery: None,
             model: ModelProfile::Default,
         }
     }
@@ -428,6 +433,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            last_delivery: None,
             model: ModelProfile::Default,
         }
     }

@@ -261,12 +261,12 @@ impl<'a> Turns<'a> {
 /// the worker asked at the end of it (judged BLOCKED) is then settled by
 /// the close, and new work may be typed in.
 fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
+    // Not `dispatched`, which holds only the last day: a worker blocked
+    // over a quiet weekend would never take new work.
     facts
-        .dispatched
-        .iter()
-        .filter(|sent| sent.key.starts_with("deliver-"))
-        .max_by_key(|sent| sent.created_at_ms)
-        .and_then(|sent| sent.key.split('-').nth(1)?.parse::<i64>().ok())
+        .last_delivery
+        .as_deref()
+        .and_then(|key| key.split('-').nth(1)?.parse::<i64>().ok())
         // Open tasks are always among the rows; a closed resident task is not.
         .is_some_and(|id| {
             !work
@@ -719,6 +719,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            last_delivery: None,
             model: ModelProfile::Default,
         }
     }
@@ -758,13 +759,8 @@ mod tests {
         if let Some(observation) = blocked.observation.as_mut() {
             observation.state = SemanticState::Blocked;
         }
-        blocked.dispatched.push(Sent {
-            key: "deliver-7-1".to_string(),
-            text: None,
-            created_at_ms: 5,
-            finished_at_ms: Some(6),
-            succeeded: Some(true),
-        });
+        // Delivered more than a day ago: out of `dispatched`'s window.
+        blocked.last_delivery = Some("deliver-7-1".to_string());
         let waiting = |closed: TaskState| {
             orders(
                 &work(vec![
