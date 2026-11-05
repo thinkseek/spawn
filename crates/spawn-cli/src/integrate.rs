@@ -130,16 +130,28 @@ const PRINCIPAL: &str = "spawn-integrate";
 const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>] [--gates <n>]";
 
 /// Gates that run at once, across missions, unless `--gates` or
-/// `SPAWN_INTEGRATE_GATES` says otherwise.
-pub(crate) const DEFAULT_GATES: usize = 2;
+/// `SPAWN_INTEGRATE_GATES` says otherwise. One: concurrent gates share one
+/// test PostgreSQL server whose gate login is a superuser, so one gate's
+/// candidate code could disturb another gate's base runs (and an
+/// "unsolved" would be cached) or its candidate's checks.
+pub(crate) const DEFAULT_GATES: usize = 1;
+
+/// The opt-in that allows more than one gate: set to `1` only when each
+/// gate gets a test database server of its own.
+pub(crate) const PER_GATE_SERVER: &str = "SPAWN_TEST_DATABASE_PER_GATE";
 
 /// The most gates `--gates` allows: each holds two trees, their builds and
 /// a share of the test database.
 pub(crate) const MAX_GATES: usize = 8;
 
 /// How many gates may run at once: `--gates`, else `SPAWN_INTEGRATE_GATES`,
-/// else [`DEFAULT_GATES`]; a whole number from 1 to [`MAX_GATES`].
-pub(crate) fn gate_slots(flag: Option<String>, env: Option<String>) -> Result<usize, String> {
+/// else [`DEFAULT_GATES`]; a whole number from 1 to [`MAX_GATES`], and more
+/// than one only with [`PER_GATE_SERVER`]`=1` (`per_gate`).
+pub(crate) fn gate_slots(
+    flag: Option<String>,
+    env: Option<String>,
+    per_gate: Option<String>,
+) -> Result<usize, String> {
     let Some((name, text)) = flag
         .map(|text| ("--gates", text))
         .or_else(|| env.map(|text| ("SPAWN_INTEGRATE_GATES", text)))
@@ -147,7 +159,18 @@ pub(crate) fn gate_slots(flag: Option<String>, env: Option<String>) -> Result<us
         return Ok(DEFAULT_GATES);
     };
     match text.trim().parse::<usize>() {
-        Ok(slots) if (1..=MAX_GATES).contains(&slots) => Ok(slots),
+        Ok(1) => Ok(1),
+        Ok(slots) if (2..=MAX_GATES).contains(&slots) => {
+            if per_gate.as_deref().map(str::trim) == Some("1") {
+                Ok(slots)
+            } else {
+                Err(format!(
+                    "{name}={slots}: more than one gate at once is unsafe while the gates share \
+                     one test database server (its gate login is a superuser); set \
+                     {PER_GATE_SERVER}=1 only once each gate has a server of its own"
+                ))
+            }
+        }
         _ => Err(format!(
             "{name} is a whole number from 1 to {MAX_GATES}, not '{text}'"
         )),
@@ -426,6 +449,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let gates = gate_slots(
         flags.get("gates"),
         crate::config::env_value("SPAWN_INTEGRATE_GATES"),
+        crate::config::env_value(PER_GATE_SERVER),
     )
     .map_err(|error| format!("{error}\n{USAGE}"))?;
     let integrator = Integrator::new(root, gate, gate_env, gates);
@@ -457,6 +481,9 @@ struct Integrator {
     /// The store whose connection holds the integrator's lock, kept while
     /// a judging runs: its thread records through it.
     held: RefCell<Option<Arc<PostgresStore>>>,
+    /// Tasks already said to wait for a gate: said again only once they
+    /// have had one.
+    waiting: RefCell<std::collections::HashSet<i64>>,
 }
 
 /// What a judging needs, owned, so it runs on a thread of its own.
@@ -487,6 +514,7 @@ impl Integrator {
             gates,
             running: RefCell::new(Vec::new()),
             held: RefCell::new(None),
+            waiting: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -657,12 +685,15 @@ impl Integrator {
         };
         let running = self.running.borrow().len();
         if running >= self.gates {
-            println!(
-                "integrate: mission {}: task {} waits for a gate ({running} of {} running)",
-                mission.id, task.id, self.gates
-            );
+            if self.waiting.borrow_mut().insert(task.id) {
+                println!(
+                    "integrate: mission {}: task {} waits for a gate ({running} of {} running)",
+                    mission.id, task.id, self.gates
+                );
+            }
             return Ok(assigned);
         }
+        self.waiting.borrow_mut().remove(&task.id);
         self.start_judging(
             store, mirror, source, main, scenarios, count, mission.id, task, running,
         )?;
@@ -689,17 +720,17 @@ impl Integrator {
         let handle = std::thread::Builder::new()
             .name(format!("gate-{}", task.id))
             .spawn(move || {
-                if let Err(error) = judge.judge(
-                    &store,
-                    &mirror,
-                    &source_owned,
-                    &main,
-                    &scenarios,
-                    count,
-                    &task,
-                ) {
-                    eprintln!("integrate: mission {mission_id}: {error}");
-                }
+                judged_or_aborted(&store, &task, &main, mission_id, || {
+                    judge.judge(
+                        &store,
+                        &mirror,
+                        &source_owned,
+                        &main,
+                        &scenarios,
+                        count,
+                        &task,
+                    )
+                });
             })
             .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
         println!(
@@ -957,6 +988,67 @@ impl Judge {
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
+}
+
+/// Run a judging, and when it errs or panics, record its abort unless it
+/// recorded something already: a judging that ends without a record of its
+/// own would be judged again on every pass, forever; an abort counts toward
+/// the mission's three-aborts halt.
+fn judged_or_aborted(
+    store: &PostgresStore,
+    task: &Task,
+    main: &str,
+    mission: i64,
+    judging: impl FnOnce() -> Result<bool, String>,
+) {
+    let reason = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(judging)) {
+        Ok(Ok(_)) => return,
+        Ok(Err(error)) => format!("the judging failed before its verdict: {error}"),
+        Err(panic) => format!(
+            "the judging panicked: {}",
+            panic
+                .downcast_ref::<&str>()
+                .map(ToString::to_string)
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default()
+        ),
+    };
+    eprintln!("integrate: mission {mission}: task {}: {reason}", task.id);
+    match abort_unrecorded(store, task, main, &reason) {
+        Ok(true) => println!("integrate: task {} gated: aborted", task.id),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "integrate: mission {mission}: task {}: record the abort: {error}",
+            task.id
+        ),
+    }
+}
+
+/// Record `task.gated aborted` for a judging that ended in an error, when
+/// the log shows it recorded nothing: the task is still in the state and at
+/// the revision it was judged from. True when it recorded the abort.
+fn abort_unrecorded(
+    store: &PostgresStore,
+    task: &Task,
+    main: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    let missions: Vec<Mission> =
+        serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
+            .map_err(|error| format!("gated missions: {error}"))?;
+    let unrecorded = missions
+        .iter()
+        .flat_map(|mission| &mission.tasks)
+        .any(|now| now.id == task.id && now.state == task.state && now.revisions == task.revisions);
+    if !unrecorded {
+        return Ok(false);
+    }
+    record(
+        store,
+        &json!({"type": "task.gated", "id": task.id, "verdict": "aborted",
+                "revision": task.revisions, "base": main, "reason": reason}),
+    )?;
+    Ok(true)
 }
 
 /// The commit that would land `branch` (the agent's pushed head, in the
