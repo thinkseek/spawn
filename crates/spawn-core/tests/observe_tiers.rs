@@ -814,21 +814,32 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
     let judge = Scripted::new(Ok(blocked_answer()));
     let mut fixture = fixture(judge);
     started(&fixture.store);
-    let in_execution = |command: u64, kind: EventKind| {
+    let in_execution = |command: u64, source: Source, kind: EventKind| {
         fixture
             .store
             .append(NewEvent {
                 agent_id: agent(),
                 session_id: session(),
                 execution_id: Some(ExecutionId::for_command(CommandId(command))),
-                source: Source::Bridge,
+                source,
                 source_event_id: None,
                 kind,
             })
             .expect("append succeeds");
     };
+    // Execution 1 is ended as lost; its runner's exit report reaches the
+    // log only after execution 2 started.
+    in_execution(
+        1,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Lost,
+            exit_code: None,
+        },
+    );
     in_execution(
         2,
+        Source::Bridge,
         EventKind::ExecutionStarted {
             engine: ENGINE.to_string(),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
@@ -839,9 +850,10 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
     );
     in_execution(
         1,
+        Source::Claude,
         EventKind::ExecutionEnded {
-            cause: EndCause::Stopped,
-            exit_code: None,
+            cause: EndCause::Exited,
+            exit_code: Some(0),
         },
     );
     fixture.observer.tick().expect("tick");

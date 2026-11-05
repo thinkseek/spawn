@@ -21,14 +21,15 @@ use crate::event::{
     ModelProfile, NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, CommitId, ExecutionId, SessionId, TerminalName, WorkspaceId};
-use crate::ingest::{MERGE_NOTICE_OPENING, claude_line};
+use crate::ingest::{MERGE_NOTICE_OPENING, claude_line, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
-    TerminalHost, WorkspaceError, WorkspaceStore,
+    TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
 use crate::time::{Clock, SystemClock};
+use crate::transcripts;
 
 /// Transcript lines this much older than the execution's start are still
 /// read as its own.
@@ -231,6 +232,9 @@ struct Follow {
     /// so the execution is ended (and its workspace unmounted) instead of
     /// retried.
     stale: Option<String>,
+    /// The engine's version, once read from this execution's transcript
+    /// and recorded.
+    version: Option<String>,
 }
 
 /// What the Bridge knows about one session.
@@ -240,6 +244,9 @@ struct SessionView {
     /// The native session the latest execution ran, which a resume
     /// continues.
     native: Option<String>,
+    /// The log holds events read from that session's transcript: it
+    /// existed, and a resume must not start without it.
+    transcript_read: bool,
     /// The profile the session's last execution started with: what a start
     /// or resume that names none runs on.
     model: ModelProfile,
@@ -415,6 +422,8 @@ pub struct Bridge {
     /// took whose append failed: appended again first at the next tick
     /// ([`Bridge::record_commit`]).
     unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
+    /// Where the engines' transcripts are copied ([`crate::transcripts`]).
+    transcripts: Option<Arc<dyn TranscriptArchive>>,
 }
 
 impl Bridge {
@@ -436,7 +445,16 @@ impl Bridge {
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
             unrecorded_commits: std::sync::Mutex::default(),
+            transcripts: None,
         }
+    }
+
+    /// Copy every engine's transcript into `archive` at turn ends and
+    /// execution ends, and restore a missing one from it before a resume.
+    #[must_use]
+    pub fn with_transcript_archive(mut self, archive: Arc<dyn TranscriptArchive>) -> Self {
+        self.transcripts = Some(archive);
+        self
     }
 
     /// Use `clock` for screen refreshes instead of the system clock.
@@ -599,6 +617,7 @@ impl Bridge {
             .or_insert_with(|| SessionView {
                 agent_id: event.agent_id.clone(),
                 native: None,
+                transcript_read: false,
                 model: ModelProfile::Default,
                 active: None,
                 notice: Notice::default(),
@@ -607,6 +626,7 @@ impl Bridge {
             });
         view.notice.fold(record);
         view.fold_branch(record);
+        view.transcript_read |= transcripts::read_from_transcript(event);
         let current = view
             .active
             .as_ref()
@@ -657,6 +677,9 @@ impl Bridge {
             EventKind::NativeSessionStarted {
                 native_session_id, ..
             } => {
+                if view.native.as_ref() != Some(native_session_id) {
+                    view.transcript_read = false;
+                }
                 view.native = Some(native_session_id.clone());
             }
             // A merge of main is no checkpoint of the agent's work: one
@@ -775,6 +798,9 @@ impl Bridge {
         }
         if let Some(reason) = active.checkpoint {
             let committed = self.checkpoint(agent_id, session, active, reason, report)?;
+            if reason == CheckpointReason::TurnStopped {
+                self.archive_transcript(agent_id, session, active, report);
+            }
             // An idle workspace whose state is on its branch takes the
             // source's main. `turn_open` includes what was read just now.
             if committed
@@ -987,9 +1013,15 @@ impl Bridge {
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             let line = String::from_utf8_lossy(line);
+            let since = active.started_ms - CLOCK_SLACK_MS;
+            if active.follow.version.is_none()
+                && let Some(version) = claude_version(&line, since)
+            {
+                self.record_version(agent_id, session, native, active, &path, version)?;
+            }
             // A minute of slack for a log clock ahead of this host's: lines
             // already recorded are dropped by their keys anyway.
-            for event in claude_line(&line, active.started_ms - CLOCK_SLACK_MS) {
+            for event in claude_line(&line, since) {
                 let opens = opens_turn(&event.kind);
                 let checkpoint = event.kind.checkpoint_reason().is_some();
                 let stored = self.log.append(NewEvent {
@@ -1015,6 +1047,33 @@ impl Bridge {
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
         Ok(())
+    }
+
+    /// The engine's version, read from the execution's transcript: the
+    /// native session is recorded again with it, once per execution.
+    fn record_version(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        native: &str,
+        active: &mut Active,
+        path: &str,
+        version: String,
+    ) -> Result<(), StoreError> {
+        active.follow.version = Some(version.clone());
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Claude,
+            Some(format!("{}:engine_version", active.execution_id)),
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: native.to_string(),
+                transcript_path: Some(path.to_string()),
+                engine_version: Some(version),
+            },
+        )
     }
 
     /// Read the pane and record its state when it changes, or again after
@@ -1144,6 +1203,8 @@ impl Bridge {
                 .push(format!("terminate {}: {error}", active.terminal()));
             return Ok(false);
         }
+        // The transcript is whole now, and a container's copy goes next.
+        self.archive_transcript(agent_id, session, active, report);
         if let Err(error) = self.workspaces.unmount(&active.workspace) {
             report
                 .warnings
@@ -1396,6 +1457,9 @@ impl Bridge {
             from,
             model,
         } = *begin;
+        // Another Bridge may have started the session since this tick read
+        // the log; the log refuses a second start either way.
+        self.catch_up()?;
         if self.running(&claimed.session_id).is_some() {
             return Ok(Outcome::Failed(format!(
                 "{} already runs an execution",
@@ -1422,6 +1486,11 @@ impl Bridge {
             Ok(workspace) => workspace,
             Err(error) => return Ok(Outcome::Failed(format!("mount {branch}: {error}"))),
         };
+        if let Some(native) = native
+            && let Err(why) = self.ready_transcript(claimed, &workspace, native, report)
+        {
+            return Ok(self.give_up_mount(&workspace, why));
+        }
         if let Some(parent_session) = parent {
             self.append(
                 &claimed.agent_id,
@@ -1445,7 +1514,7 @@ impl Bridge {
         };
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
-        self.append(
+        let recorded = self.append(
             &claimed.agent_id,
             &claimed.session_id,
             Some(&active.execution_id),
@@ -1458,7 +1527,11 @@ impl Bridge {
                 fork,
                 model,
             },
-        )?;
+        );
+        if let Err(StoreError::Rejected(why)) = recorded {
+            return self.refused_start(claimed, &active.workspace, why);
+        }
+        recorded?;
         let fresh = self.name_session(claimed, native, &active)?;
         let launch = self.launch(
             claimed,
@@ -1485,6 +1558,98 @@ impl Bridge {
             return Ok(outcome);
         }
         Ok(Outcome::Succeeded)
+    }
+
+    /// Before a resume of `native`: its transcript is where the engine
+    /// reads it, put back from the archive when it went missing, or why the
+    /// resume cannot go on ([`transcripts::restore`]).
+    fn ready_transcript(
+        &self,
+        claimed: &Claimed,
+        workspace: &WorkspaceId,
+        native: &str,
+        report: &mut TickReport,
+    ) -> Result<(), String> {
+        let path = transcript_path(&self.config.claude_projects, workspace, native);
+        let read_before = self
+            .sessions
+            .get(&claimed.session_id)
+            .is_some_and(|view| view.transcript_read);
+        let restored = transcripts::restore(
+            self.terminals.as_ref(),
+            self.transcripts.as_deref(),
+            workspace,
+            &path,
+            &claimed.agent_id,
+            native,
+            read_before,
+        )?;
+        if let Some(bytes) = restored {
+            report.warnings.push(format!(
+                "{}: {path} was missing; restored {bytes} bytes from the transcript archive",
+                claimed.session_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// Copy what the engine appended to its transcript into the archive,
+    /// if there is one. A failure is warned; the next copy tries again.
+    fn archive_transcript(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        active: &Active,
+        report: &mut TickReport,
+    ) {
+        let native = self
+            .sessions
+            .get(session)
+            .and_then(|view| view.native.as_deref());
+        let (Some(archive), Some(native)) = (self.transcripts.as_deref(), native) else {
+            return;
+        };
+        let path = transcript_path(&self.config.claude_projects, &active.workspace, native);
+        if let Err(error) = transcripts::archive(
+            self.terminals.as_ref(),
+            archive,
+            &active.workspace,
+            &path,
+            agent_id,
+            native,
+        ) {
+            report
+                .warnings
+                .push(format!("{session}: archive the transcript: {error}"));
+        }
+    }
+
+    /// The log refused `execution.started`: the session runs an execution
+    /// another Bridge started. The mount goes, unless it is that
+    /// execution's own workspace.
+    fn refused_start(
+        &mut self,
+        claimed: &Claimed,
+        workspace: &WorkspaceId,
+        why: String,
+    ) -> Result<Outcome, StoreError> {
+        self.catch_up()?;
+        let theirs = self
+            .running(&claimed.session_id)
+            .is_some_and(|active| active.workspace == *workspace);
+        if theirs {
+            return Ok(Outcome::Failed(why));
+        }
+        Ok(self.give_up_mount(workspace, why))
+    }
+
+    /// A start that fails after its mount, before anything ran in it: the
+    /// mount goes, and the start fails with `why`.
+    fn give_up_mount(&self, workspace: &WorkspaceId, why: String) -> Outcome {
+        match self.workspaces.unmount(workspace) {
+            Ok(()) => Outcome::Failed(why),
+            Err(error) => Outcome::Failed(format!("{why}; unmount {workspace}: {error}")),
+        }
     }
 
     /// Claude Code's inline settings for an engine on `model`, or why it
@@ -1598,6 +1763,7 @@ impl Bridge {
                     &active.workspace,
                     &id,
                 )),
+                engine_version: None,
             },
         )?;
         self.catch_up()?;

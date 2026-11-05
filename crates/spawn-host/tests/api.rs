@@ -710,6 +710,42 @@ fn tmux_starts_in_the_launch_directory() {
     host.terminate(&name, &workspace()).expect("clean up");
 }
 
+/// `write_new` writes on this host, and inside a workspace through the
+/// container prefix (a fake `docker` that runs the command here), with the
+/// bytes on standard input.
+#[test]
+fn files_are_written_new_on_the_host_and_through_the_prefix() {
+    let directory = scratch().join("write-new");
+    let _ = fs::remove_dir_all(&directory);
+    let local = TmuxHost::local("tmux");
+    contract::terminal_files("local", &local, &directory.to_string_lossy());
+    let prefix_program = script(
+        "fake-docker-write",
+        "#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
+    );
+    let builder: std::sync::Arc<PrefixBuilder> = {
+        let words = docker_prefix(&prefix_program, "agent_test");
+        std::sync::Arc::new(move |_: &WorkspaceId| words.clone())
+    };
+    let inside = TmuxHost::in_workspaces("tmux", builder, None);
+    contract::terminal_files("inside", &inside, &directory.to_string_lossy());
+    // Bytes that are not text, and more than a pipe holds, arrive whole.
+    let big: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
+    let path = directory.join("inside/big.jsonl");
+    assert!(
+        inside
+            .write_new(&workspace(), &path.to_string_lossy(), &big)
+            .expect("write")
+    );
+    assert_eq!(fs::read(&path).expect("read back"), big);
+    let left: Vec<_> = fs::read_dir(directory.join("inside"))
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(left.len(), 2, "no temporary file is left: {left:?}");
+    fs::remove_dir_all(&directory).expect("clean up");
+}
+
 #[test]
 fn tmux_calls_go_through_the_container_prefix() {
     let _exclusive = exclusive();

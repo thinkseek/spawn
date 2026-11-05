@@ -54,7 +54,8 @@ impl CommandQueue for PostgresStore {
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError> {
         let (succeeded, error) = match outcome {
             Outcome::Succeeded => (true, None),
-            Outcome::Failed(reason) => (false, Some(reason.clone())),
+            // The failure is kept in the command and its `command.finished`.
+            Outcome::Failed(reason) => (false, Some(spawn_core::redact::redact(reason))),
         };
         let attempt = i32::try_from(claimed.attempt).unwrap_or(i32::MAX);
         let command = bigint(claimed.command_id.0);
