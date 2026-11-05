@@ -74,8 +74,10 @@ pub fn docker_prefix(docker: &str, branch: &str) -> Vec<String> {
     ]
 }
 
-/// Trimmed stdout of a git command, or the failure as an error.
-fn report(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
+/// Stdout of a git command exactly as written, or the failure as an error.
+/// A `-z` listing is read this way: a path may begin or end with
+/// whitespace, which trimming would cut off the first or the last path.
+fn report_listing(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
     let output =
         output.map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
     if !output.status.success() {
@@ -84,7 +86,18 @@ fn report(output: std::io::Result<Output>, word: &str) -> Result<String, Workspa
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Trimmed stdout of a git command that prints one value (a commit, a
+/// tree), or the failure as an error. Never for a listing of paths.
+fn report(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
+    report_listing(output, word).map(|stdout| stdout.trim().to_string())
+}
+
+/// The fields of a NUL-separated (`-z`) listing, the empty end dropped.
+fn nul_fields(listing: &str) -> impl Iterator<Item = &str> {
+    listing.split('\0').filter(|field| !field.is_empty())
 }
 
 /// First field of a pending merge's file.
@@ -222,7 +235,24 @@ impl GitWorkspace {
         report(output, &arguments.join(" "))
     }
 
+    /// Stdout of a `-z` listing of paths, untrimmed ([`report_listing`]).
+    fn git_listing(&self, arguments: &[&str]) -> Result<String, WorkspaceError> {
+        let output = self.command().args(arguments).stdin(Stdio::null()).output();
+        report_listing(output, &arguments.join(" "))
+    }
+
     fn output_in(
+        &self,
+        directory: &Path,
+        index: &Path,
+        arguments: &[&str],
+    ) -> Result<String, WorkspaceError> {
+        self.listing_in(directory, index, arguments)
+            .map(|stdout| stdout.trim().to_string())
+    }
+
+    /// Stdout of a `-z` listing of paths in a work tree, untrimmed.
+    fn listing_in(
         &self,
         directory: &Path,
         index: &Path,
@@ -233,7 +263,7 @@ impl GitWorkspace {
             .args(arguments)
             .stdin(Stdio::null())
             .output();
-        report(output, &arguments.join(" "))
+        report_listing(output, &arguments.join(" "))
     }
 
     fn has_base(&self) -> bool {
@@ -412,9 +442,8 @@ impl GitWorkspace {
 
     /// Blobs of `tree` larger than [`LARGE_FILE_BYTES`], with their sizes.
     fn large_blobs(&self, tree: &str) -> Result<Vec<(String, u64)>, WorkspaceError> {
-        let listed = self.git_output(&["ls-tree", "-r", "-l", "-z", tree])?;
-        Ok(listed
-            .split('\0')
+        let listed = self.git_listing(&["ls-tree", "-r", "-l", "-z", tree])?;
+        Ok(nul_fields(&listed)
             .filter_map(|entry| {
                 // `<mode> blob <id> <size>\t<path>`
                 let (meta, path) = entry.split_once('\t')?;
@@ -433,7 +462,7 @@ impl GitWorkspace {
         directory: &Path,
         index: &Path,
     ) -> Result<Vec<(String, u64)>, WorkspaceError> {
-        let listed = self.output_in(
+        let listed = self.listing_in(
             directory,
             index,
             &[
@@ -444,9 +473,7 @@ impl GitWorkspace {
                 "--exclude-standard",
             ],
         )?;
-        let mut large: Vec<(String, u64)> = listed
-            .split('\0')
-            .filter(|path| !path.is_empty())
+        let mut large: Vec<(String, u64)> = nul_fields(&listed)
             .filter_map(|path| {
                 let size = std::fs::symlink_metadata(directory.join(path))
                     .ok()
@@ -1085,12 +1112,8 @@ impl GitWorkspace {
         }
         self.update_directory(&branch, &directory, &head_tree, &merged)?;
         let changed =
-            self.git_output(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
-        let files = changed
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(str::to_string)
-            .collect();
+            self.git_listing(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
+        let files = nul_fields(&changed).map(str::to_string).collect();
         let message = crate::chunks::with_trailer(
             &format!("spawn: merge main {main} into {branch}"),
             manifest.as_deref(),
@@ -1288,7 +1311,7 @@ impl GitWorkspace {
         base: &str,
         commit: &str,
     ) -> Result<Vec<String>, WorkspaceError> {
-        let changed = self.git_output(&[
+        let changed = self.git_listing(&[
             "diff-tree",
             "-r",
             "--name-only",
@@ -1298,7 +1321,7 @@ impl GitWorkspace {
             commit,
         ])?;
         let mut marked = Vec::new();
-        for path in changed.split('\0').filter(|path| !path.is_empty()) {
+        for path in nul_fields(&changed) {
             let output = self
                 .command()
                 .args(["cat-file", "blob", &format!("{commit}:{path}")])

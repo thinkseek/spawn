@@ -730,3 +730,54 @@ fn committed_markers_are_found_against_main() {
     );
     assert!(!fixture.store.has_pending_merge("agent_a"));
 }
+
+/// A path that begins with a space: listings are read NUL-split, never
+/// trimmed, so the first path of one keeps its leading space.
+const SPACED: &str = " leading space.txt";
+
+#[test]
+fn a_path_with_a_leading_space_survives_a_clean_merge() {
+    let fixture = Fixture::new("spaced-clean", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    fixture.land(&[(SPACED, "theirs\n")]);
+    let BaseMerge::Merged { files, .. } = fixture.store.merge_base(&workspace).expect("merge")
+    else {
+        panic!("main moved: a merge");
+    };
+    assert_eq!(files, vec![SPACED]);
+    assert_eq!(read(&directory, SPACED), "theirs\n");
+    assert_eq!(
+        fixture.store.commit(&workspace, "after").expect("commit"),
+        Commit::Unchanged
+    );
+}
+
+#[test]
+fn a_path_with_a_leading_space_survives_a_conflicted_merge() {
+    let fixture = Fixture::new("spaced-conflict", &[(SPACED, "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[(SPACED, "mine\n")]);
+    let main = fixture.land(&[(SPACED, "theirs\n")]);
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec![SPACED.to_string()],
+            marked: true
+        }
+    );
+    assert!(has_conflict_block(read(&directory, SPACED).as_bytes()));
+    // The markers, committed, are found under the path's own name.
+    let Commit::Created(marked) = fixture.store.commit(&workspace, "wip").expect("commit") else {
+        panic!("the merge changed the workspace");
+    };
+    assert_eq!(
+        fixture
+            .store
+            .conflict_markers(&main, marked.as_str())
+            .expect("scan"),
+        vec![SPACED]
+    );
+    let resolved = fixture.work(&workspace, &[(SPACED, "both\n")]);
+    assert_eq!(parents(&fixture, &resolved)[1], main);
+}
