@@ -75,6 +75,9 @@ struct State {
     workspace_calls: Vec<String>,
     /// Commits fail while set.
     commit_fails: bool,
+    /// The next `submit_text` fails, after its text may have reached the
+    /// engine.
+    submit_fails: bool,
     /// Commits and merges answer `WorkspaceStale` while set.
     stale: bool,
     /// The next append of an `artifact.committed` event fails.
@@ -233,6 +236,12 @@ impl MemoryStore {
     /// Every terminal start so far, in order. Test helper.
     pub fn launches(&self) -> Vec<Launch> {
         self.lock().launches.clone()
+    }
+
+    /// Make the next text submitted to a terminal fail, as a send whose
+    /// keys may have gone before it broke. Test helper.
+    pub fn fail_next_submit(&self) {
+        self.lock().submit_fails = true;
     }
 
     /// Make every commit fail (`true`) or work again. Test helper.
@@ -660,6 +669,9 @@ impl TerminalHost for MemoryStore {
         let mut state = self.lock();
         if !state.terminals.contains(terminal) {
             return Err(TerminalError(format!("terminal {terminal} is gone")));
+        }
+        if std::mem::take(&mut state.submit_fails) {
+            return Err(TerminalError("send-keys broke midway".to_string()));
         }
         let pane = state.panes.entry(terminal.clone()).or_default();
         pane.push_str(text);

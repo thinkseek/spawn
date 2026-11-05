@@ -1095,3 +1095,40 @@ fn a_checkpoint_whose_commit_failed_stays_due_and_is_committed_next_tick() {
         "the turn's work reached its branch"
     );
 }
+
+/// A start whose prompt's typing began and then failed may have reached the
+/// engine: it is ended, but not discarded. Its final checkpoint failing
+/// keeps the workspace and the end stays due, until the commit works
+/// (causality audit #15).
+#[test]
+fn a_start_whose_prompt_may_have_been_typed_is_not_discarded() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    store.fail_next_submit();
+    store.fail_commits(true);
+    start(&store, None);
+    bridge.tick().expect("the start fails");
+    assert_eq!(unmounts(&store), 0, "the workspace and its work stay");
+    assert!(ended(&store).is_empty());
+    bridge.tick().expect("the end is tried again");
+    assert_eq!(unmounts(&store), 0);
+    store.fail_commits(false);
+    bridge.tick().expect("the final checkpoint works");
+    assert_eq!(ended(&store), vec![EndCause::Lost]);
+    assert_eq!(unmounts(&store), 1);
+}
+
+/// A start whose pane never got its prompt (nothing typed) is discarded at
+/// once, even when its checkpoint fails: nothing ran in it.
+#[test]
+fn a_start_that_typed_nothing_is_discarded() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    let execution = ExecutionId::for_command(CommandId(1));
+    store.set_pane(&TerminalName::for_execution(&execution), "loading…");
+    store.fail_commits(true);
+    start(&store, None);
+    bridge.tick().expect("the start fails");
+    assert_eq!(ended(&store), vec![EndCause::Lost]);
+    assert_eq!(unmounts(&store), 1);
+}
