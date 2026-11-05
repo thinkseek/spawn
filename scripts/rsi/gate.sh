@@ -85,9 +85,14 @@
 #   runs `cargo test --workspace -- --list --format terse`, and the same
 #   with `--ignored`; runnable = listed minus ignored. A test deleted,
 #   ignored, commented out, in a file no `mod` includes, or behind
-#   `#[cfg(any())]` is not listed. The listing comes from the trees' own
-#   test binaries, so code that forges libtest's output at start-up could
-#   inflate it: this stops weakening, not a forger.
+#   `#[cfg(any())]` is not listed. Every runnable test name of the base must
+#   be runnable on the candidate too: a renamed test, or one moved to
+#   another module path, is refused even when the count holds. A test the
+#   diff adds or edits may not have an empty body (`{}`, or only comments,
+#   `;` and `()`). The listing comes from the trees' own test binaries, so
+#   code that forges libtest's output at start-up could inflate it, and a
+#   body that asserts nothing real (`assert!(true)`) is not empty text: this
+#   stops weakening, not a forger.
 # - Lint configuration (text, before anything runs): a change to a
 #   `[lints]` / `[workspace.lints]` table (or `lints.` keys) in any
 #   Cargo.toml, any change to clippy.toml or .clippy.toml, a new crate-level
@@ -726,6 +731,120 @@ if [ -n "$relaxed" ]; then
     exit 0
 fi
 
+# A test function the diff adds or edits may not have an empty body: `{}`,
+# or nothing but comments, `;` and `()`. Text only, on the candidate's
+# files the diff touches, with comments and string literals blanked first
+# (a `"#[test] fn x() {}"` string is not a test). A test is any function
+# under an attribute whose last path segment is `test` (#[test],
+# #[tokio::test(..)], #[sqlx::test]). What it cannot see: a body that does
+# something and asserts nothing, `assert!(true)`, a test that returns
+# before its assertions; the base's own empty tests, untouched.
+#
+# rust_code <file>: the file with comments and the contents of string and
+# char literals replaced by spaces, line for line.
+rust_code() {
+    LC_ALL=C awk '
+        {
+            line = $0; out = ""; n = length(line); i = 1
+            while (i <= n) {
+                c = substr(line, i, 1)
+                if (depth > 0) {
+                    two = substr(line, i, 2)
+                    if (two == "/*") { depth++; out = out "  "; i += 2 }
+                    else if (two == "*/") { depth--; out = out "  "; i += 2 }
+                    else { out = out " "; i++ }
+                    continue
+                }
+                if (quote != "") {
+                    if (raw < 0 && c == "\\") { out = out "  "; i += 2; continue }
+                    if (c == "\"" && (raw < 0 || substr(line, i + 1, raw) == hashes)) {
+                        out = out "\"" hashes; i += 1 + (raw < 0 ? 0 : raw); quote = ""; continue
+                    }
+                    out = out " "; i++
+                    continue
+                }
+                two = substr(line, i, 2)
+                if (two == "//") break
+                if (two == "/*") { depth = 1; out = out "  "; i += 2; continue }
+                # A raw string starts at `r` (or `br`) that ends no identifier.
+                prev = i > 1 ? substr(line, i - 1, 1) : ""
+                if (prev == "b") prev = i > 2 ? substr(line, i - 2, 1) : ""
+                if (c == "r" && prev !~ /[A-Za-z0-9_]/ && match(substr(line, i), /^r#*"/)) {
+                    raw = RLENGTH - 2; hashes = substr(line, i + 1, raw)
+                    out = out substr(line, i, RLENGTH); i += RLENGTH; quote = "\""
+                    continue
+                }
+                if (c == "\"") { raw = -1; hashes = ""; quote = "\""; out = out c; i++; continue }
+                # A char literal (an escaped one, or one byte); else a lifetime.
+                if (c == "'\''") {
+                    if (substr(line, i + 1, 1) == "\\" && match(substr(line, i + 3), /'\''/)) {
+                        out = out "'\'' '\''"; i += 3 + RSTART; continue
+                    }
+                    if (substr(line, i + 2, 1) == "'\''") { out = out "'\'' '\''"; i += 3; continue }
+                }
+                out = out c; i++
+            }
+            print out
+        }' "$1"
+}
+# empty_tests <file> <touched ranges>: `<line> <name>` of each test with an
+# empty body whose lines (attribute to closing brace) meet a touched range
+# (`first-last`, space-separated).
+empty_tests() {
+    rust_code "$1" | LC_ALL=C awk -v ranges="$2" '
+        { code = code $0 "\n" }
+        END {
+            count = split(ranges, range, " ")
+            rest = code; offset = 0
+            attribute = "#[[:space:]]*\\[[[:space:]]*([A-Za-z_][A-Za-z0-9_]*[[:space:]]*::[[:space:]]*)*test[[:space:]]*[](]"
+            while (match(rest, attribute)) {
+                start = offset + RSTART
+                after = start + RLENGTH - 1
+                tail = substr(code, after + 1)
+                offset = after; rest = tail
+                if (!match(tail, /(^|[^A-Za-z0-9_])fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/)) continue
+                name = substr(tail, RSTART, RLENGTH); sub(/^.*fn[[:space:]]+/, "", name)
+                fn_end = RSTART + RLENGTH - 1
+                open = index(substr(tail, fn_end + 1), "{")
+                if (!open) continue
+                body = substr(tail, fn_end + open + 1)
+                if (!match(body, /[^[:space:];()]/) || substr(body, RSTART, 1) != "}") continue
+                first = lines(substr(code, 1, start))
+                last = lines(substr(code, 1, after + fn_end + open + RSTART))
+                for (r = 1; r <= count; r++) {
+                    split(range[r], bound, "-")
+                    if (bound[1] <= last && bound[2] >= first) { print first " " name; break }
+                }
+            }
+        }
+        function lines(text) { return gsub(/\n/, "", text) + 1 }'
+}
+# The candidate's added and changed lines per .rs file, from the diff (a
+# deletion touches the lines on both sides of it).
+git --git-dir="$repo" diff -U0 --no-color --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ \
+    "$base_commit" "$candidate_commit" -- '*.rs' | awk '
+    /^\+\+\+ / { file = ($2 == "/dev/null") ? "" : substr($2, 3); next }
+    /^@@ / && file != "" {
+        split($3, added, ",")
+        first = substr(added[1], 2) + 0
+        size = (2 in added) ? added[2] + 0 : 1
+        last = size == 0 ? first + 1 : first + size - 1
+        touched[file] = touched[file] " " first "-" last
+    }
+    END { for (file in touched) print file "\t" substr(touched[file], 2) }' >"$work/touched-rust"
+empty=""
+while IFS='	' read -r file ranges; do
+    [ -f "$work/candidate/$file" ] || continue
+    found=$(empty_tests "$work/candidate/$file" "$ranges" | sed "s|^|$file:|")
+    [ -n "$found" ] && empty="$empty$found
+"
+done <"$work/touched-rust"
+if [ -n "$empty" ]; then
+    echo "| tests with an empty body the candidate adds or edits: $(printf '%s' "$empty" | tr '\n' ' ')"
+    verdict rejected "candidate adds or edits a test with an empty body ($(printf '%s' "$empty" | head -n 1))"
+    exit 0
+fi
+
 # The base's result for each objective scenario and for the task scenario,
 # decided before any candidate code runs: the base shares the test server
 # with the candidate, which could otherwise sabotage the base's run and turn
@@ -822,40 +941,55 @@ if ! build "$work/candidate"; then
     exit 0
 fi
 
-# runnable_tests <writable dir> <tree> <target dir>: how many tests cargo
-# runs in the tree, from inside the sandbox: libtest's `<name>: test` lines
-# of `--list`, minus those of `--list --ignored`.
+# runnable_tests <writable dir> <tree> <target dir> <names file>: how many
+# tests cargo runs in the tree, from inside the sandbox: libtest's
+# `<name>: test` lines of `--list`, minus those of `--list --ignored`. Their
+# names go to <names file>, sorted, one line per test (a name two test
+# binaries share is there twice), a doctest's ` (line N)` dropped so that
+# an edit above it does not rename it.
 runnable_tests() {
     list_dir=$1
     list_tree=$2
     list_target=$3
+    list_names=$4
     for list_mode in all ignored; do
         set -- --list --format terse
         [ "$list_mode" = ignored ] && set -- "$@" --ignored
         sandbox "$list_dir" env CARGO_TARGET_DIR="$list_target" cargo test --quiet --workspace \
             --manifest-path "$list_tree/Cargo.toml" -- "$@" \
             >"$work/tests.$list_mode" 2>>"$work/tests.log" || return 1
+        sed -n 's/: test$//p' "$work/tests.$list_mode" | sed -E 's/ \(line [0-9]+\)$//' |
+            LC_ALL=C sort >"$work/names.$list_mode"
     done
-    echo $(($(grep -c ': test$' "$work/tests.all") - $(grep -c ': test$' "$work/tests.ignored")))
+    LC_ALL=C comm -23 "$work/names.all" "$work/names.ignored" >"$list_names"
+    grep -c . "$list_names" || true
 }
 
-# The candidate may not run fewer tests than the base. Counted from what
-# cargo runs, so a test deleted, ignored, commented out, left in a file no
-# `mod` includes, or behind `#[cfg(any())]` is gone. The base tree stays
+# The candidate may not run fewer tests than the base, nor stop running one
+# of the base's by name. Read from what cargo runs, so a test deleted,
+# ignored, commented out, left in a file no `mod` includes, or behind
+# `#[cfg(any())]` is gone; one renamed or moved to another module path is
+# gone too (its name is its module path; a move that keeps the path, the
+# same `mod tests` in another file, keeps the name). The base tree stays
 # read-only: its cargo writes to a target directory of its own. The
-# candidate's target directory is the one check-tests reuses.
+# candidate's target directory is the one check-tests reuses. What names
+# cannot see: a test kept by name whose body no longer tests anything (the
+# empty-body check above catches only an empty one), and one of two
+# same-named tests in different crates traded for a third.
 if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; then
     section "tests: what cargo runs, base and candidate"
     listing_started=$(date +%s)
     mkdir -p "$work/base-target"
     : >"$work/tests.log"
-    if ! base_tests=$(runnable_tests "$work/base-target" "$work/baseline" "$work/base-target"); then
+    if ! base_tests=$(runnable_tests "$work/base-target" "$work/baseline" "$work/base-target" \
+        "$work/tests.base-names"); then
         sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
         verdict rejected "base tests do not build"
         exit 0
     fi
     : >"$work/tests.log"
-    if ! candidate_tests=$(runnable_tests "$work/candidate" "$work/candidate" "$work/candidate/target"); then
+    if ! candidate_tests=$(runnable_tests "$work/candidate" "$work/candidate" "$work/candidate/target" \
+        "$work/tests.candidate-names"); then
         sed 's/^/| tests: /' "$work/tests.log" | tail -n 30
         verdict rejected "candidate tests do not build"
         exit 0
@@ -864,6 +998,12 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; th
         "(listed in $(($(date +%s) - listing_started)) s)"
     if [ "$candidate_tests" -lt "$base_tests" ]; then
         verdict rejected "candidate runs fewer tests ($base_tests -> $candidate_tests)"
+        exit 0
+    fi
+    dropped=$(LC_ALL=C comm -23 "$work/tests.base-names" "$work/tests.candidate-names")
+    if [ -n "$dropped" ]; then
+        echo "| base tests the candidate does not run by name: $(printf '%s\n' "$dropped" | head -n 20 | tr '\n' ' ')"
+        verdict rejected "candidate drops or renames base tests ($(printf '%s\n' "$dropped" | grep -c .): $(printf '%s\n' "$dropped" | head -n 3 | tr '\n' ' ' | sed 's/ $//'))"
         exit 0
     fi
 fi
