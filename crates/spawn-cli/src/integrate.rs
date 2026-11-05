@@ -1098,11 +1098,7 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree,
-<<<<<<< 3e2c08ed96e62ff27637f1cecdf29cb22e127b76
-        over_budget, pinned, task_scenario,
-=======
-        over_budget, report_freshness,
->>>>>>> a749f166a2eea6c141ed9d0ce15541daef878401
+        over_budget, pinned, report_freshness, task_scenario,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
