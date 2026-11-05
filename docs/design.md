@@ -53,7 +53,7 @@ spawn-core
 
 信封 `NewEvent { agent_id, session_id, execution_id, source, source_event_id, kind }`，写入返回 `EventRecord { position, session_seq, recorded_at, event }` 与 `Appended { record, inserted }`。
 
-`Source`：Claude、Bridge、Observer、Gateway、Control。
+`Source`：Claude、Bridge、Observer、Gateway、Control。读日志时，来源是本版本不认识的名字（已删除的写入方，例如 `layerfs`、`codex`）的记录被跳过，每个名字警告一次，读取不中断；`timeline` 照原样显示来源。
 
 | 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |

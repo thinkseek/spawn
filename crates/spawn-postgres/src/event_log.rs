@@ -61,14 +61,27 @@ impl EventLog for PostgresStore {
         })
     }
 
+    /// Records this build cannot read ([`event_record`]) are skipped, and
+    /// the read goes on past them: fewer than `limit` records still means
+    /// the end of the log, however long a run of skipped ones.
     fn read_global(
         &self,
         after: GlobalPosition,
         limit: usize,
     ) -> Result<Vec<EventRecord>, StoreError> {
-        self.query(READ_GLOBAL, &[&bigint(after.0), &bigint(limit)])?
-            .iter()
-            .map(event_record)
-            .collect()
+        let mut records = Vec::new();
+        let mut after = after;
+        while records.len() < limit {
+            let want = limit - records.len();
+            let rows = self.query(READ_GLOBAL, &[&bigint(after.0), &bigint(want)])?;
+            for row in &rows {
+                after = global_position(row, "id");
+                records.extend(event_record(row)?);
+            }
+            if rows.len() < want {
+                break;
+            }
+        }
+        Ok(records)
     }
 }

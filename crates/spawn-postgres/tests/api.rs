@@ -8,9 +8,11 @@
 //! Every case runs in a schema of its own, so a shared database cannot leak
 //! events or commands between cases or between runs.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use postgres::Client;
+use spawn_core::bridge::{Bridge, BridgeConfig};
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
@@ -21,8 +23,11 @@ use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
     TerminalName, WorkspaceId,
 };
+use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Confidence, Observation, SemanticState};
+use spawn_core::observe::{JudgeError, JudgeInput, Judgement, Observer, StateJudge};
 use spawn_core::port::{CommandQueue, EventLog};
+use spawn_core::time::SystemClock;
 
 mod common;
 use common::{admin, store};
@@ -750,6 +755,106 @@ fn a_global_read_returns_session_records_in_order() {
             .windows(2)
             .all(|pair| pair[0].position < pair[1].position)
     );
+}
+
+/// A judge that never answers: reading the log needs none.
+struct SilentJudge;
+
+impl StateJudge for SilentJudge {
+    fn name(&self) -> &'static str {
+        "silent"
+    }
+
+    fn judge(&self, _input: &JudgeInput) -> Result<Judgement, JudgeError> {
+        Err(JudgeError::Unavailable("silent".to_string()))
+    }
+}
+
+#[test]
+fn a_source_this_build_does_not_know_stops_no_reader() {
+    let (store, schema) = store("unknown_source");
+    let store = Arc::new(store);
+    let mut client = admin(&schema);
+    store
+        .append(message(EventKind::MessageReceived))
+        .expect("append succeeds");
+    // A writer since removed: a run of its records longer than any reader's
+    // batch, one of them with a kind this build does decode.
+    client
+        .batch_execute(
+            "do $$ begin
+               for n in 1..450 loop
+                 perform spawn_append('agent_one', 'session_one', null, 'layerfs',
+                   'layerfs:' || n,
+                   jsonb_build_object('name', 'layerfs.mounted', 'detail',
+                                      jsonb_build_object('n', n)));
+               end loop;
+               perform spawn_append('agent_one', 'session_one', null, 'codex', 'codex:1',
+                 '{\"name\": \"tool.started\", \"detail\": {\"tool_name\": \"x\", \"tool_use_id\": \"t1\"}}');
+             end $$",
+        )
+        .expect("append records of unknown sources");
+    // The first record of another session comes after the run.
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_two").expect("valid agent"),
+            session_id: SessionId::new("session_two").expect("valid session"),
+            ..message(EventKind::MessageReceived)
+        })
+        .expect("append succeeds");
+
+    let names = |records: &[spawn_core::event::EventRecord]| -> Vec<String> {
+        records
+            .iter()
+            .map(|record| record.event.session_id.to_string())
+            .collect()
+    };
+    let all = store
+        .read_global(GlobalPosition(0), 200)
+        .expect("a global read skips what it cannot read");
+    assert_eq!(names(&all), vec!["session_one", "session_two"]);
+    let past = store
+        .read_global(all[0].position, 1)
+        .expect("a read that starts at the run");
+    assert_eq!(
+        names(&past),
+        vec!["session_two"],
+        "the read goes past the run"
+    );
+
+    let timeline = store
+        .timeline(&session(), SessionSeq(0), 1000)
+        .expect("the timeline reads");
+    // The timeline leaves the Observer's records out and shows the rest as
+    // stored.
+    assert_eq!(timeline.len(), 451, "the timeline shows every record");
+    assert_eq!(timeline[0].source, "layerfs");
+    assert_eq!(timeline[450].source, "codex");
+    let tail = store.tail_json(&session(), 5).expect("tail reads");
+    assert_eq!(tail["events"].as_array().map(Vec::len), Some(5));
+    client
+        .batch_execute("select spawn_control_refold()")
+        .expect("the control stream refolds");
+
+    let host = Arc::new(MemoryStore::new("unknown_source", Arc::new(SystemClock)));
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        host.clone(),
+        host,
+        BridgeConfig::new("tester"),
+    );
+    bridge.recover().expect("the Bridge recovers");
+    assert_eq!(bridge.session_count(), 2, "the Bridge reads past the run");
+    bridge.tick().expect("the Bridge ticks");
+    let mut observer = Observer::new(store.clone(), Arc::new(SilentJudge));
+    observer.recover().expect("the Observer recovers");
+    assert_eq!(
+        observer.session_count(),
+        2,
+        "the Observer reads past the run"
+    );
+    observer.tick().expect("the Observer ticks");
 }
 
 #[test]
