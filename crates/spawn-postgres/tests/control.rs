@@ -1946,7 +1946,6 @@ fn a_review_lands_only_on_the_revision_it_read() {
     );
 }
 
-<<<<<<< 9e9fb4a59617dba0d7a8f8e1706d7fb7973714ef
 /// How many `task.cancelled` records the control stream holds for `task`.
 fn cancelled_records(client: &mut Client, task: i64) -> i64 {
     client
@@ -2188,7 +2187,8 @@ fn a_task_cancelled_before_the_records_gets_its_record_once_on_migration() {
         "the tables are the fold of the log"
     );
     assert_eq!(control_types(&mut client), types);
-=======
+}
+
 /// A report names the checkpoint its turn ended with (`commit` of the
 /// `task.reported` record); one recorded the first way names none.
 #[test]
@@ -2227,5 +2227,4 @@ fn a_report_names_the_checkpoint_of_its_turn() {
         None,
         "the latest report names no checkpoint"
     );
->>>>>>> c9741cad7a31d140c9591b6a379d77b98e0f4771
 }
