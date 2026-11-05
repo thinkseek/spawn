@@ -2048,7 +2048,8 @@ declare
 begin
     foreach v_function in array array[
         'spawn_task_may_continue(text, text, boolean, text)',
-        'spawn_task_may_move(bigint, text)'] loop
+        'spawn_task_may_move(bigint, text)',
+        'spawn_task_record_cancelled(bigint[])'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -2088,15 +2089,15 @@ declare
 begin
     perform pg_advisory_xact_lock(1399957335);
     for v_task in
-        select k.id from mission_tasks k
-          cross join lateral (
-              select e.kind -> 'detail' -> 'record' ->> 'type' as type
-                from spawn_events e
-               where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-                 and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
-                 and e.kind -> 'detail' -> 'record' ->> 'type' like 'task.%'
-               order by e.session_seq desc
-               limit 1) last
+        select k.id
+          from mission_tasks k
+          join (select distinct on (r.record ->> 'id') r.record ->> 'id' as id,
+                       r.record ->> 'type' as type
+                  from spawn_events e
+                 cross join lateral (select e.kind -> 'detail' -> 'record' as record) r
+                 where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                   and r.record ->> 'type' like 'task.%'
+                 order by r.record ->> 'id', e.session_seq desc) last on last.id = k.id::text
          where k.state = 'cancelled'
            and last.type not in ('task.cancelled', 'task.aborted')
          order by k.id
