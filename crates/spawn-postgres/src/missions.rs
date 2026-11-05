@@ -135,7 +135,8 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
 
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
-/// the integrator may judge, land, or hold to its budget.
+/// the integrator may judge, land, or hold to its budget, with the brief and
+/// the report a landing's message is written from.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
