@@ -257,6 +257,53 @@ files, a chunk fetch.
 - **Landing.** A branch head that names a manifest lands as a commit of the
   same tree without the trailer, so large files never reach `main`.
 
+## Disk room
+
+The host's disks are shared with other projects, so Spawn guards what it
+writes (the gate's scratch in `TMPDIR`, workspaces and mirrors under the
+workspace root, the chunk store, deploy dumps) so a full disk corrupts no
+state and wedges nothing:
+
+- **The gate refuses to start without room.** With less than
+  `SPAWN_GATE_MIN_FREE_GB` (default 10) GiB free in `TMPDIR`, `gate.sh`
+  exits 3 before it makes any scratch (`scripts/disk.sh`): an abort, which
+  the integrator records and retries, never a verdict on the candidate. The
+  integrator passes the variable through. The gate's scratch is
+  `$TMPDIR/spawn-gate.XXXXXX`, so cleanup can tell it from everyone else's.
+- **The loop watches free space.** Once a minute `spawn loop` reads the free
+  space of the workspace root and `TMPDIR` (`df`). A path that falls under
+  `SPAWN_DISK_WARN_GB` (default 20) GiB is recorded once as a control record
+  `host.disk {label, path, state: "low", free_bytes, warn_bytes,
+  floor_bytes}`, and once as `state: "recovered"` when it is back 1 GiB above
+  the threshold (so a path at the threshold does not flap). The latest
+  record per path is read back from the log on start, so a restart records
+  nothing twice. Each record of the last day reaches the supervisor's digest
+  once ("disk space on this host"); the fleet view's health carries `disk`:
+  per path its free space now (read by `spawn serve`), the thresholds and
+  its latest record, and the health strip shows it. A failure to read or
+  record is a line in the loop's log, never a failed pass.
+- **Under the floor no new execution starts.** While any of the paths was
+  under `SPAWN_DISK_FLOOR_GB` (default 2) GiB at the latest reading, the
+  dispatcher holds its `start` and `resume` orders (decided again every
+  pass, so nothing is lost; the loop logs `dispatch: held N new
+  execution(s)`) and residents are not revived. Running executions go on,
+  typed input, stops and digests still go, and the supervisor is still kept
+  alive so someone can act.
+- **Routine cleanup**, daily, by `spawn-maintenance.timer`
+  (`scripts/maintenance.sh`, [install](../deploy/systemd/README.md#disk-room)):
+  `spawn chunks gc --grace 120`; the gate's scratch directories (exactly
+  `spawn-gate.` plus six characters, a directory, owned by this user, not
+  modified for a day: a gate removes its own on exit and is killed after 45
+  minutes, so these are left by a killed gate); and deploy.sh's
+  `spawn-YYYYMMDD-HHMMSS.dump` files in the backups directory beyond the
+  newest 5. `pg-backup.sh` rotates its own `spawn-auto-*.dump`; every other
+  file is left alone. A dry run (`SPAWN_MAINTENANCE_DRY_RUN=1`) prints what
+  would go.
+
+Not guarded: the kache compiler cache (`~/.cache/kache`, size-bounded by
+kache's own settings) and the mirrors under `<root>/.sources`, which hold
+branches and are never pruned automatically.
+
 ## Not built
 
 - **Large files and chunks in R2**: an S3-compatible chunk-store adapter, so
