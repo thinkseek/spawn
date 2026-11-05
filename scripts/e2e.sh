@@ -457,6 +457,8 @@ git -C "$seed" push -q "$gated" main:main
 gate=$work/gate
 mkdir -p "$gate"
 printf '#!/bin/sh\n# Check: no file named BAD.\n[ ! -e BAD ]\n' >"$gate/check-no-bad.sh"
+# The gate refuses a scenarios directory without a protected list; this one protects nothing.
+printf '# nothing protected\n' >"$gate/protected"
 gm=$("$bin" mission add --text "E2E gated mission" --source "$gated" --gate "$gate" | jq -r .mission)
 if sup mission configure --id "$gm" --gate "$gate" --accept gate >/dev/null 2>&1; then
   fail "the supervisor set a mission's gate"
@@ -527,6 +529,7 @@ rsi_backlog=$work/rsi-backlog
 mkdir -p "$rsi_gate" "$rsi_backlog"
 printf '#!/bin/sh\n# Objective 1: the file exists.\n[ -e OBJECTIVE_DONE ]\n' >"$rsi_gate/001.sh"
 printf '#!/bin/sh\n# Check: no file named BAD.\n[ ! -e BAD ]\n' >"$rsi_gate/check-no-bad.sh"
+printf '# nothing protected\n' >"$rsi_gate/protected"
 printf '{"id": 1, "title": "Mark it done", "prompt": "E2E:REPORT E2E:WRITE=OBJECTIVE_DONE"}\n' >"$rsi_backlog/001.json"
 sup resident propose --name improver --charter "Pursues the backlog's objectives" >/dev/null
 "$bin" resident approve --name improver >/dev/null
