@@ -159,7 +159,8 @@ json_string() {
 # verdict <accepted|rejected> [reason]: the verdict names the commits it
 # judged, resolved, so a reader can check what it is about (deploy.sh does).
 verdict() {
-    stage_close "$1"
+    # The open section passed unless the verdict is a rejection of it.
+    if [ "$1" = accepted ]; then stage_close ok; else stage_close "$1"; fi
     stage_emit gate "$1" "$(($(stage_now) - gate_started))" total
     json="{\"verdict\":\"$1\""
     [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
