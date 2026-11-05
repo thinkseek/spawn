@@ -513,21 +513,23 @@ fn held(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<String> 
     if ready {
         return None;
     }
-    Some(match (facts.current_observation(), facts.observation.as_ref()) {
-        (None, Some(latest)) => format!(
-            "its worker has no judgement covering its latest fact (the latest, {}, is older)",
-            latest.state.key()
-        ),
-        (None, None) => "its worker has no judgement yet".to_string(),
-        (Some(current), _) if current.ambiguity != Some(Ambiguity::TurnStoppedIdle) => format!(
-            "its worker is not idle at its prompt (judged {})",
-            current.state.key()
-        ),
-        (Some(current), _) => format!(
-            "its worker stopped at its prompt judged {} and the task it last got is still open",
-            current.state.key()
-        ),
-    })
+    Some(
+        match (facts.current_observation(), facts.observation.as_ref()) {
+            (None, Some(latest)) => format!(
+                "its worker has no judgement covering its latest fact (the latest, {}, is older)",
+                latest.state.key()
+            ),
+            (None, None) => "its worker has no judgement yet".to_string(),
+            (Some(current), _) if current.ambiguity != Some(Ambiguity::TurnStoppedIdle) => format!(
+                "its worker is not idle at its prompt (judged {})",
+                current.state.key()
+            ),
+            (Some(current), _) => format!(
+                "its worker stopped at its prompt judged {} and the task it last got is still open",
+                current.state.key()
+            ),
+        },
+    )
 }
 
 /// What delivery did and does about one waiting task, for its stall
@@ -549,7 +551,9 @@ pub(crate) fn delivery_status(
     found: Option<&Facts>,
     now_ms: i64,
 ) -> DeliveryStatus {
-    let sent = found.map(|facts| delivery_attempts(task, facts)).unwrap_or_default();
+    let sent = found
+        .map(|facts| delivery_attempts(task, facts))
+        .unwrap_or_default();
     let mut parts = Vec::new();
     let mut last_error: Option<&str> = None;
     for attempt in &sent {
