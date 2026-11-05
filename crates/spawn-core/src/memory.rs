@@ -619,6 +619,13 @@ impl WorkspaceStore for MemoryStore {
         }
     }
 
+    /// The memory store leaves no file out of a checkpoint.
+    fn notices(&self, _workspace: &WorkspaceId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn notices_told(&self, _workspace: &WorkspaceId, _notices: &[String]) {}
+
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         Ok(self.lock().heads.get(branch).cloned())
     }

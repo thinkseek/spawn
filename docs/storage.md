@@ -199,9 +199,12 @@ head alone is the whole workspace, so everything below is a git operation.
   tracked path, which would fail every checkpoint while it is there).
 - **The agent is told once.** The checkpoint records the files it left out
   in `<root>/.oversized/<agent>` (NUL-separated: told or not, size, path);
-  `WorkspaceStore::take_notices` hands out each one not yet told and marks
-  it told. The Bridge logs each notice as a tick warning and puts it before
-  the next prompt it types for the session. A file that drops under the cap
+  `WorkspaceStore::notices` returns each one not yet told, changing
+  nothing. The Bridge logs each notice as a tick warning and puts it before
+  the next prompt it types for the session; once that typing is recorded it
+  marks them told (`WorkspaceStore::notices_told`). The record is on disk,
+  not in the Bridge's memory, so a restart between the checkpoint and the
+  prompt loses no notice (at worst one is told twice). A file that drops under the cap
   is forgotten, and told of again if it grows past it again.
 - **Old checkpoints.** An earlier version kept files over 8 MiB in a chunk
   store and named them with a `Spawn-Large: <hash>` trailer on the

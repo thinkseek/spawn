@@ -499,6 +499,18 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(branch.as_str())?.store.branch_head(branch)
     }
 
+    fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
+        self.route(workspace.sandbox())
+            .map(|routed| routed.store.notices(workspace))
+            .unwrap_or_default()
+    }
+
+    fn notices_told(&self, workspace: &WorkspaceId, notices: &[String]) {
+        if let Ok(routed) = self.route(workspace.sandbox()) {
+            routed.store.notices_told(workspace, notices);
+        }
+    }
+
     fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
         let routed = self.route(branch.as_str())?;
         if let Some((repo, source)) = &routed.mirror {

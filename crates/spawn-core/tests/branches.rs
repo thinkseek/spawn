@@ -869,6 +869,8 @@ fn a_forged_turn_end_mid_turn_does_not_merge_main() {
 struct Telling {
     inner: Arc<MemoryStore>,
     notice: std::sync::Mutex<Option<String>>,
+    /// Set by the first checkpoint: the notice exists from then on.
+    checkpointed: std::sync::atomic::AtomicBool,
 }
 
 impl WorkspaceStore for Telling {
@@ -893,6 +895,8 @@ impl WorkspaceStore for Telling {
         workspace: &spawn_core::id::WorkspaceId,
         message: &str,
     ) -> Result<spawn_core::port::Commit, spawn_core::port::WorkspaceError> {
+        self.checkpointed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.inner.commit(workspace, message)
     }
     fn unmount(
@@ -907,13 +911,22 @@ impl WorkspaceStore for Telling {
     ) -> Result<BaseMerge, spawn_core::port::WorkspaceError> {
         self.inner.merge_base(workspace)
     }
-    fn take_notices(&self, _workspace: &spawn_core::id::WorkspaceId) -> Vec<String> {
+    fn notices(&self, _workspace: &spawn_core::id::WorkspaceId) -> Vec<String> {
+        if !self.checkpointed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Vec::new();
+        }
         self.notice
             .lock()
             .expect("the notice")
-            .take()
+            .clone()
             .into_iter()
             .collect()
+    }
+    fn notices_told(&self, _workspace: &spawn_core::id::WorkspaceId, notices: &[String]) {
+        let mut notice = self.notice.lock().expect("the notice");
+        if notice.as_ref().is_some_and(|text| notices.contains(text)) {
+            *notice = None;
+        }
     }
 }
 
@@ -961,6 +974,7 @@ fn a_notice_of_the_workspace_store_is_logged_and_told_with_the_next_prompt_once(
     let telling = Arc::new(Telling {
         inner: store.clone(),
         notice: std::sync::Mutex::new(Some(LEFT_OUT.to_string())),
+        checkpointed: std::sync::atomic::AtomicBool::new(false),
     });
     let mut bridge = Bridge::new(
         store.clone(),
@@ -1003,6 +1017,47 @@ fn a_notice_of_the_workspace_store_is_logged_and_told_with_the_next_prompt_once(
     assert!(
         typed.contains("again") && !typed.contains(LEFT_OUT),
         "{typed}"
+    );
+}
+
+/// A notice the store handed over at a checkpoint is still told after a
+/// restart of the Bridge before any prompt carried it (causality audit #6):
+/// the store marks it told only once a prompt carried it.
+#[test]
+fn a_notice_not_typed_yet_survives_a_restart_of_the_bridge() {
+    let store = store();
+    let telling = Arc::new(Telling {
+        inner: store.clone(),
+        notice: std::sync::Mutex::new(Some(LEFT_OUT.to_string())),
+        checkpointed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let build = |telling: &Arc<Telling>| {
+        Bridge::new(
+            store.clone(),
+            store.clone(),
+            telling.clone(),
+            store.clone(),
+            BridgeConfig::new("tester"),
+        )
+        .with_transcript_archive(store.clone())
+    };
+    let mut bridge = build(&telling);
+    start(&store, None);
+    bridge.tick().expect("start");
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    for _ in 0..2 {
+        bridge.tick().expect("checkpoint");
+    }
+    drop(bridge);
+    let mut restarted = build(&telling);
+    restarted.recover().expect("recover");
+    reset_pane(&store, 1);
+    input(&store, "key_input_1", "next");
+    restarted.tick().expect("type");
+    assert!(
+        typed_last(&store).contains(LEFT_OUT),
+        "{}",
+        typed_last(&store)
     );
 }
 

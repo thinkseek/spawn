@@ -10,7 +10,8 @@
 //! Every file of the workspace is a blob of the checkpoint, up to a size cap
 //! (`SPAWN_MAX_FILE_MB`, [`DEFAULT_MAX_FILE_MB`]). A file over it is left out
 //! of the checkpoint, never failing it: the checkpoint goes on without it,
-//! and the agent is told once ([`WorkspaceStore::take_notices`]). The one
+//! and the agent is told once, by the prompt that carries it
+//! ([`WorkspaceStore::notices`], [`WorkspaceStore::notices_told`]). The one
 //! exception: a file git already holds as a blob in the branch head or in
 //! `main` (it came from the source) stays a blob, so a checkpoint never drops
 //! it from the tree. The branch head alone is the whole workspace
@@ -659,32 +660,47 @@ impl GitWorkspace {
         }
     }
 
+    /// The notice of one file over the cap.
+    fn oversized_notice(&self, path: &TreePath, size: u64) -> String {
+        format!(
+            "{path} ({} MiB) is over the {} MiB cap for one file in a checkpoint \
+             (SPAWN_MAX_FILE_MB), so checkpoints leave it out: it is not on your branch, \
+             and it is lost when this workspace is unmounted. Make it smaller, split it, \
+             or make sure it can be generated again from what is committed.",
+            size.div_ceil(1 << 20),
+            self.max_file_bytes >> 20
+        )
+    }
+
     /// One notice for each file over the cap that a checkpoint of `branch`
-    /// left out and the agent was not told of yet; each is marked told.
+    /// left out and the agent was not told of yet. Nothing is marked: the
+    /// prompt that carries them does ([`Self::oversized_told`]).
     fn untold_oversized(&self, branch: &str) -> Vec<String> {
+        self.read_oversized(branch)
+            .iter()
+            .filter(|(_, (_, told))| !*told)
+            .map(|(path, (size, _))| self.oversized_notice(path, *size))
+            .collect()
+    }
+
+    /// Mark told each file over the cap whose notice is in `notices`: a
+    /// prompt carried it. A file whose size changed since has another
+    /// notice, and stays untold.
+    fn oversized_told(&self, branch: &str, notices: &[String]) {
         let Ok(_lock) = self.lock_branch(branch) else {
-            return Vec::new();
+            return;
         };
         let mut record = self.read_oversized(branch);
-        let mut notices = Vec::new();
+        let mut changed = false;
         for (path, (size, told)) in &mut record {
-            if *told {
-                continue;
+            if !*told && notices.contains(&self.oversized_notice(path, *size)) {
+                *told = true;
+                changed = true;
             }
-            *told = true;
-            notices.push(format!(
-                "{path} ({} MiB) is over the {} MiB cap for one file in a checkpoint \
-                 (SPAWN_MAX_FILE_MB), so checkpoints leave it out: it is not on your branch, \
-                 and it is lost when this workspace is unmounted. Make it smaller, split it, \
-                 or make sure it can be generated again from what is committed.",
-                size.div_ceil(1 << 20),
-                self.max_file_bytes >> 20
-            ));
         }
-        if !notices.is_empty() {
+        if changed {
             self.write_oversized(branch, &record);
         }
-        notices
     }
 
     /// Where a mount is staged before it replaces a workspace, and where the
@@ -1011,9 +1027,13 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     /// What checkpoints of the workspace left out and the agent was not
-    /// told of yet ([`GitWorkspace::record_oversized`]), each once.
-    fn take_notices(&self, workspace: &WorkspaceId) -> Vec<String> {
+    /// told of yet ([`GitWorkspace::record_oversized`]).
+    fn notices(&self, workspace: &WorkspaceId) -> Vec<String> {
         self.untold_oversized(workspace.sandbox())
+    }
+
+    fn notices_told(&self, workspace: &WorkspaceId, notices: &[String]) {
+        self.oversized_told(workspace.sandbox(), notices);
     }
 
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
@@ -2218,16 +2238,22 @@ mod tests {
             files, "README.md\nat-cap.bin\nwork.txt",
             "over.bin is left out"
         );
-        let notices = store.take_notices(&workspace);
+        let notices = store.notices(&workspace);
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(
             notices[0].starts_with("over.bin (2 MiB) is over the 1 MiB cap"),
             "{notices:?}"
         );
-        assert!(store.take_notices(&workspace).is_empty(), "told once");
+        assert_eq!(
+            store.notices(&workspace),
+            notices,
+            "untold until a prompt carries it"
+        );
+        store.notices_told(&workspace, &notices);
+        assert!(store.notices(&workspace).is_empty(), "told once");
         std::fs::write(directory.join("work.txt"), "more\n").expect("write");
         store.commit(&workspace, "two").expect("commit");
-        assert!(store.take_notices(&workspace).is_empty(), "still told once");
+        assert!(store.notices(&workspace).is_empty(), "still told once");
 
         std::fs::write(directory.join("over.bin"), "small now\n").expect("write");
         store.commit(&workspace, "three").expect("commit");
@@ -2238,7 +2264,7 @@ mod tests {
         );
         std::fs::write(directory.join("over.bin"), vec![3u8; 3 << 20]).expect("write");
         store.commit(&workspace, "four").expect("commit");
-        assert_eq!(store.take_notices(&workspace).len(), 1, "told again");
+        assert_eq!(store.notices(&workspace).len(), 1, "told again");
         assert!(
             !git(&checkout, &["ls-tree", "--name-only", "agent_a"]).contains("over.bin"),
             "left out again"
@@ -2281,7 +2307,7 @@ mod tests {
             git(&checkout, &["cat-file", "-s", "agent_a:model.bin"]),
             (2u64 << 20).to_string()
         );
-        assert!(store.take_notices(&workspace).is_empty());
+        assert!(store.notices(&workspace).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
