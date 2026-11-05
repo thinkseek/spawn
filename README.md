@@ -69,7 +69,7 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `submit` | Writes one command to the queue. Flags: `--agent`, `--session`, `--key`, `--action`, `--principal` (default `spawn`). |
 | `tick` | Claims and runs queued commands, advances live executions, records observations. Flags: `--repo`, `--root`, `--judge-url`. |
 | `loop` | Runs the fleet until killed: Bridge, Observer, dispatcher, and (with `SPAWN_SUPERVISOR=1`) the supervisor's liveness rule. |
-| `integrate [--once] [--root <dir>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh`, lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog tasks, up to the mission's worker limit (`--workers`, default 1) in flight at once. |
+| `integrate [--once] [--root <dir>] [--gates <n>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh` (one gate at a time: `--gates` above 1 is refused until each gate has a test database server of its own, `SPAWN_TEST_DATABASE_PER_GATE=1`), lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog tasks, up to the mission's worker limit (`--workers`, default 1) in flight at once. |
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
 | `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
@@ -119,6 +119,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
+| `SPAWN_INTEGRATE_GATES` | `1` | Gates `spawn integrate` runs at once, across missions (one per mission; `--gates` overrides it). More than 1 (up to 8) is refused unless `SPAWN_TEST_DATABASE_PER_GATE=1`: the gates share one test database server today |
 | `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | Address `spawn serve` binds (`--address` overrides it) |
 | `SPAWN_SERVE_TOKEN` | unset | Token every `spawn serve` API request must carry; required off loopback |
 

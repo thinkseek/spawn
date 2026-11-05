@@ -70,7 +70,7 @@ spawn tail --session session_demo
 | `loop` | 常驻运行舰队：Bridge、Observer、派发，以及（`SPAWN_SUPERVISOR=1` 时）supervisor 的存活规则 |
 | `fleet` | 以 JSON 打印当前登录可读的每个会话及其判定 |
 | `tail --session <id>` | 以 JSON 打印单个会话的最新判定、近期事件、判定与命令 |
-| `integrate [--once] [--root <dir>]` | 唯一的落地路径：用 `scripts/rsi/gate.sh` 判定就绪的工作，以 compare-and-swap 推送落到来源，按停机规则暂停任务，并给目标任务（RSI）分配下一条 backlog |
+| `integrate [--once] [--root <dir>] [--gates <n>]` | 唯一的落地路径：用 `scripts/rsi/gate.sh` 判定就绪的工作（一次一个门禁：每个门禁有自己的测试数据库服务器之前，`--gates` 大于 1 会被拒绝，见 `SPAWN_TEST_DATABASE_PER_GATE=1`），以 compare-and-swap 推送落到来源，按停机规则暂停任务，并给目标任务（RSI）分配下一条 backlog |
 | `serve` | 以 `spawn_reader` 提供只读看板与 API；默认绑定 `127.0.0.1:8787`，其他地址需要 `SPAWN_SERVE_TOKEN` |
 | `mission`、`task`、`resident` | 任务层：添加、配置、关闭、恢复任务；分派、验收、退回子任务；提议、批准、退役常驻 worker。每条命令输出 JSON |
 | `run` | 在终端内运行引擎，把退出状态写入文件供 Bridge 读取。由 Spawn 配置，无需手动调用 |
