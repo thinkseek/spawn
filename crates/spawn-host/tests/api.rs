@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use spawn_core::contract;
@@ -374,6 +374,107 @@ fn a_large_file_named_like_a_pattern_drops_nothing_else() {
             "{large} out: {listed}"
         );
     }
+    store.unmount(&workspace).expect("unmount succeeds");
+}
+
+/// Every file under `directory`, recursively.
+fn files_under(directory: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![directory.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                fs::read_dir(&path)
+                    .expect("read")
+                    .flatten()
+                    .map(|e| e.path()),
+            );
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[test]
+fn a_mount_whose_chunks_do_not_verify_leaves_the_workspace_as_it_was() {
+    let _exclusive = exclusive();
+    let (repo, root) = repository("mount-verify");
+    let store = GitWorkspace::new(&repo, &root);
+    store
+        .ensure_branch(&branch(), None)
+        .expect("create the branch");
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    let size = usize::try_from(spawn_host::LARGE_FILE_BYTES).expect("fits") + 4096;
+    let original = noise(31, size);
+    fs::write(directory.join("model.bin"), &original).expect("write a large file");
+    assert!(matches!(
+        store.commit(&workspace, "work").expect("commit succeeds"),
+        Commit::Created(_)
+    ));
+    let manifest = git_out(
+        &repo,
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Spawn-Large,valueonly)",
+            &format!("refs/heads/{}", branch()),
+        ],
+    );
+    // Work the branch does not hold yet.
+    fs::write(directory.join("draft.txt"), "not committed\n").expect("write a draft");
+
+    // Every chunk corrupted, the manifest left sound.
+    let objects = files_under(&root.join(spawn_host::DEFAULT_CHUNK_DIRECTORY));
+    let chunks: Vec<(PathBuf, Vec<u8>)> = objects
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name != manifest.as_str())
+        })
+        .map(|path| {
+            let bytes = fs::read(&path).expect("read object");
+            (path, bytes)
+        })
+        .collect();
+    assert!(!chunks.is_empty());
+    for (path, bytes) in &chunks {
+        let mut corrupt = bytes.clone();
+        let middle = corrupt.len() / 2;
+        corrupt[middle] ^= 0xff;
+        fs::write(path, corrupt).expect("corrupt a chunk");
+    }
+    assert!(store.mount(&branch()).is_err(), "the chunks do not verify");
+    assert_eq!(
+        fs::read_to_string(directory.join("draft.txt")).expect("the draft is still there"),
+        "not committed\n"
+    );
+    assert_eq!(
+        fs::read(directory.join("model.bin")).expect("read"),
+        original
+    );
+    assert!(
+        files_under(&root.join(".mount")).is_empty(),
+        "the staged tree is gone"
+    );
+
+    // Sound again: the mount replaces the workspace with the branch head.
+    for (path, bytes) in &chunks {
+        fs::write(path, bytes).expect("restore a chunk");
+    }
+    let workspace = store.mount(&branch()).expect("mount succeeds");
+    let directory = PathBuf::from(workspace.path());
+    assert!(!directory.join("draft.txt").exists());
+    assert_eq!(
+        fs::read(directory.join("model.bin")).expect("read"),
+        original
+    );
+    assert!(files_under(&root.join(".mount")).is_empty());
+    assert_eq!(
+        store.commit(&workspace, "again").expect("commit succeeds"),
+        Commit::Unchanged
+    );
     store.unmount(&workspace).expect("unmount succeeds");
 }
 
