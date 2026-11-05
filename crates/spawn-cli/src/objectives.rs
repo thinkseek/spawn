@@ -193,7 +193,8 @@ fn is_open(task: &Task, landings: &[Landing]) -> bool {
     }
 }
 
-/// The lowest open objective.
+/// The lowest open objective: what one free slot gets with nothing in flight.
+#[cfg(test)]
 pub(crate) fn next_open<'a>(backlog: &'a [Task], landings: &[Landing]) -> Option<&'a Task> {
     backlog.iter().find(|task| is_open(task, landings))
 }
@@ -425,7 +426,11 @@ mod tests {
             objective(4, false),
         ];
         let none = BTreeSet::new();
-        assert_eq!(ids(&choose(&backlog, &[], &none, 3)), vec![1, 2, 3], "lowest first");
+        assert_eq!(
+            ids(&choose(&backlog, &[], &none, 3)),
+            vec![1, 2, 3],
+            "lowest first"
+        );
         // Solved objectives and those in flight are skipped.
         let solved = [landing(1, None)];
         let flying = BTreeSet::from([2]);
@@ -454,7 +459,10 @@ mod tests {
     #[test]
     fn the_worker_limit_defaults_to_one() {
         assert_eq!(workers(&json!({"backlog": "/b", "resident": "r"})), 1);
-        assert_eq!(workers(&json!({"backlog": "/b", "resident": "r", "workers": 3})), 3);
+        assert_eq!(
+            workers(&json!({"backlog": "/b", "resident": "r", "workers": 3})),
+            3
+        );
         assert_eq!(workers(&json!({"workers": 0})), 1, "never below one");
     }
 
