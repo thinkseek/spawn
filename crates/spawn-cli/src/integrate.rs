@@ -612,7 +612,9 @@ impl Integrator {
             );
             return Ok(assigned);
         }
-        self.start_judging(store, mirror, source, main, scenarios, count, mission.id, task, running)?;
+        self.start_judging(
+            store, mirror, source, main, scenarios, count, mission.id, task, running,
+        )?;
         Ok(assigned)
     }
 
