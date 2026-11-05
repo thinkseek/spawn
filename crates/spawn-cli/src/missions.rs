@@ -17,13 +17,14 @@ const USAGE: &str = "usage:
                 [--backlog <dir> --resident <name>]   (owner only)
   spawn mission resume --id N
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
-  spawn mission list [--limit N]
+  spawn mission list [--limit N]   (every task with its stages)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
                     [--model default|cheap]   (cheap: every model on DeepSeek)
   spawn task accept --id N
   spawn task reject --id N --note <what to fix>
   spawn task cancel --id N
+  spawn task stages --id N   (each stage with its verdict, time, and how long since the one before)
   spawn resident propose --name <name> --charter <text>
   spawn resident approve --name <name>
   spawn resident retire --name <name>";
@@ -246,6 +247,7 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
             store.task_cancel(task).map_err(err)?;
             print(&json!({ "task": task, "cancelled": true }));
         }
+        "stages" => print(&store.task_stages(id(&flags, "id")?).map_err(err)?),
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
