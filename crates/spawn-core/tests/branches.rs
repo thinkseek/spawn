@@ -1005,3 +1005,38 @@ fn a_notice_of_the_workspace_store_is_logged_and_told_with_the_next_prompt_once(
         "{typed}"
     );
 }
+
+/// A turn's checkpoint whose commit failed (a full disk, a store that is
+/// down) stays due: the idle worker asks for no other, so the next tick
+/// commits it (causality audit #5).
+#[test]
+fn a_checkpoint_whose_commit_failed_stays_due_and_is_committed_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn end"));
+    store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
+    store.fail_commits(true);
+    let report = bridge.tick().expect("the commit fails");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("commit unavailable")),
+        "{:?}",
+        report.warnings
+    );
+    assert!(checkpoints(&store).is_empty());
+    store.fail_commits(false);
+    quiet(&bridge.tick().expect("the commit works again"));
+    assert_eq!(
+        checkpoints(&store)
+            .into_iter()
+            .map(|(reason, _)| reason)
+            .collect::<Vec<_>>(),
+        [CheckpointReason::TurnStopped],
+        "the turn's work reached its branch"
+    );
+}
