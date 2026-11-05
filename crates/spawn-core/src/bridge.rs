@@ -1207,6 +1207,9 @@ impl Bridge {
             from,
             model,
         } = *begin;
+        // Another Bridge may have started the session since this tick read
+        // the log; the log refuses a second start either way.
+        self.catch_up()?;
         if self.running(&claimed.session_id).is_some() {
             return Ok(Outcome::Failed(format!(
                 "{} already runs an execution",
@@ -1256,7 +1259,7 @@ impl Bridge {
         };
         // The event goes first: a crash after it leaves a recorded execution
         // whose missing terminal the next tick ends as lost.
-        self.append(
+        let recorded = self.append(
             &claimed.agent_id,
             &claimed.session_id,
             Some(&active.execution_id),
@@ -1269,7 +1272,11 @@ impl Bridge {
                 fork,
                 model,
             },
-        )?;
+        );
+        if let Err(StoreError::Rejected(why)) = recorded {
+            return self.refused_start(claimed, &active.workspace, why);
+        }
+        recorded?;
         let fresh = self.name_session(claimed, native, &active)?;
         let launch = self.launch(
             claimed,
@@ -1296,6 +1303,27 @@ impl Bridge {
             return Ok(outcome);
         }
         Ok(Outcome::Succeeded)
+    }
+
+    /// The log refused `execution.started`: the session runs an execution
+    /// another Bridge started. The mount goes, unless it is that
+    /// execution's own workspace.
+    fn refused_start(
+        &mut self,
+        claimed: &Claimed,
+        workspace: &WorkspaceId,
+        why: String,
+    ) -> Result<Outcome, StoreError> {
+        self.catch_up()?;
+        let theirs = self
+            .running(&claimed.session_id)
+            .is_some_and(|active| active.workspace == *workspace);
+        if !theirs && let Err(error) = self.workspaces.unmount(workspace) {
+            return Ok(Outcome::Failed(format!(
+                "{why}; unmount {workspace}: {error}"
+            )));
+        }
+        Ok(Outcome::Failed(why))
     }
 
     /// Claude Code's inline settings for an engine on `model`, or why it

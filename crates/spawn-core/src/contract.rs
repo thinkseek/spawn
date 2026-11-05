@@ -110,6 +110,70 @@ pub fn event_log(tag: &str, log: &dyn EventLog) {
     }
 }
 
+/// One active execution per session, held by the log: `execution.started`
+/// is refused while the session's latest execution has no `execution.ended`
+/// the Bridge wrote. A runner's exit report frees nothing; the Bridge's end
+/// (of a lost execution too) does; a repeated start key is no second start.
+pub fn one_execution(tag: &str, log: &dyn EventLog) {
+    let execution = |name: &str| {
+        crate::id::ExecutionId::new(format!("exec_{tag}_{name}")).expect("valid execution")
+    };
+    let event = |name: &str, source: Source, key: &str, kind: EventKind| NewEvent {
+        execution_id: Some(execution(name)),
+        source,
+        source_event_id: Some(format!("exec_{tag}_{name}:{key}")),
+        kind,
+        ..message(tag, 3)
+    };
+    let started = |name: &str| {
+        event(
+            name,
+            Source::Bridge,
+            "started",
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("w:/workspaces/w").expect("valid workspace"),
+                command_id: crate::id::CommandId(1),
+                fork: None,
+                model: crate::event::ModelProfile::Default,
+            },
+        )
+    };
+    let ended = |name: &str, source: Source, cause| {
+        event(
+            name,
+            source,
+            "ended",
+            EventKind::ExecutionEnded {
+                cause,
+                exit_code: None,
+            },
+        )
+    };
+    let refused = |name: &str| {
+        matches!(
+            log.append(started(name)),
+            Err(crate::port::StoreError::Rejected(_))
+        )
+    };
+
+    let first = log.append(started("a")).expect("the first start is taken");
+    assert!(refused("b"), "a second start while a runs");
+    let again = log
+        .append(started("a"))
+        .expect("a repeated start key is no second start");
+    assert!(!again.inserted);
+    assert_eq!(again.record.position, first.record.position);
+    log.append(ended("a", Source::Claude, crate::event::EndCause::Exited))
+        .expect("a runner report");
+    assert!(refused("b"), "a runner's exit report is no end");
+    log.append(ended("a", Source::Bridge, crate::event::EndCause::Lost))
+        .expect("the Bridge ends a lost execution");
+    log.append(started("b"))
+        .expect("after the end, the next start (a resume) is taken");
+    assert!(refused("c"), "and b is the active one now");
+}
+
 /// Command queue rules: idempotent intake, one live lease per session,
 /// expired leases taken again, stale attempts rejected.
 pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {

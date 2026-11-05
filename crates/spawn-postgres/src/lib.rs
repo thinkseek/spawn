@@ -42,7 +42,9 @@ const SCHEMA: &str = include_str!("../sql/schema.sql");
 fn backend(error: &postgres::Error) -> StoreError {
     if let Some(db) = error.as_db_error() {
         return match db.code() {
-            &postgres::error::SqlState::INSUFFICIENT_PRIVILEGE => {
+            // Not allowed, or a second active execution of one session.
+            &postgres::error::SqlState::INSUFFICIENT_PRIVILEGE
+            | &postgres::error::SqlState::EXCLUSION_VIOLATION => {
                 StoreError::Rejected(db.message().to_string())
             }
             _ => StoreError::Backend(format!(
