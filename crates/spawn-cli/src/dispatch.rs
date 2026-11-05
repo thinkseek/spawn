@@ -15,9 +15,20 @@
 //!    gets reviewed).
 //!
 //! A Stop that failed, whoever sent it, is sent again and then escalated
-//! ([`stops`]): until then the worker gets no task, no nudge. Escalations
-//!    are coalesced into one digest typed into the supervisor's pane while it
-//!    is idle. Without a supervisor they stay in the attention queue.
+//! ([`stops`]): until then the worker gets no task, no nudge.
+//!
+//! No task waits silently ([`stall`]): every open task is at one step
+//! (`delivery`, `activity`, `judgement`, `landing`, `stop`, or its mission
+//! `halted`), measured from the record that started it on the database's
+//! clock, and a step that has not moved within its bound
+//! (`SPAWN_STALL_*_SECS`) is escalated once per stall, tagged
+//! `<session> stall-<task>-<step>-<n>` with `n` naming that record. That
+//! layer acts on nothing; the recoveries Spawn has run on their own
+//! schedules, and the item says what was tried and what is still due.
+//!
+//! Escalations are coalesced into one digest typed into the supervisor's
+//! pane while it is idle. Without a supervisor they stay in the attention
+//! queue.
 //!
 //! The dispatcher keeps no state. What it already did is read back from the
 //! command queue: idempotency keys and their commands' outcomes mark
@@ -33,8 +44,11 @@
 //! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
 
 mod digest;
+mod stall;
 mod stops;
 mod worker;
+
+pub(crate) use stall::Bounds;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -227,6 +241,8 @@ pub(crate) enum Why {
     StopFailed,
     /// Free disk on this host crossed the warning threshold (crate::disk).
     Disk,
+    /// An open task's step has not moved within its bound ([`stall`]).
+    Stalled,
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -365,6 +381,13 @@ fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     Ok((rows, Work::load(store)?))
 }
 
+/// What stalls are measured from, read after the facts and rows: a record
+/// newer than them only makes a step look younger.
+fn load_stalls(store: &PostgresStore) -> Result<stall::Stalls, String> {
+    serde_json::from_value(store.stall_facts().map_err(|error| error.to_string())?)
+        .map_err(|error| format!("stall facts: {error}"))
+}
+
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
@@ -385,7 +408,8 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
 }
 
 /// Run one dispatcher step against the store: collect reports from idle
-/// workers under `root`, then submit the plan, without its new executions
+/// workers under `root`, then submit the plan, with the stalls past their
+/// `bounds` among its escalations ([`stall`]), without its new executions
 /// while the disk is under its floor ([`crate::disk`]). Returns log lines.
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
@@ -393,6 +417,7 @@ pub(crate) fn step(
     spawn: &str,
     root: Option<&Path>,
     disk: &crate::disk::Monitor,
+    bounds: &Bounds,
 ) -> Result<Vec<String>, String> {
     let (mut rows, mut work) = load(store)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
@@ -403,7 +428,9 @@ pub(crate) fn step(
         (rows, work) = load(store)?;
     }
     let now = now_ms();
-    let mut plan = decide_with(&rows, &work, &disk.escalations(now), supervised, now, spawn);
+    let mut host = disk.escalations(now);
+    host.extend(stall::items(&rows, &work, &load_stalls(store)?, bounds));
+    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
         if held > 0 {
