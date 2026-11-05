@@ -9,6 +9,7 @@
 //! process.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{Launch, READ_LIMIT, TerminalError, TerminalHost};
@@ -74,6 +75,13 @@ impl TmuxHost {
         run_words(&self.words(arguments))
     }
 
+    /// [`Self::run`], killed and failed when it has not exited within
+    /// `limit`: a tmux server that stopped answering (stopped, swapping, a
+    /// pane that never yields) must not hold the caller's tick.
+    fn run_within(&self, arguments: &[String], limit: Duration) -> Result<Run, TerminalError> {
+        run_words_within(&self.words(arguments), limit)
+    }
+
     /// Session target with exact-name matching.
     fn target(terminal: &TerminalName) -> String {
         format!("={}", terminal.as_str())
@@ -90,8 +98,12 @@ impl TmuxHost {
     }
 }
 
-/// Run `words`: the program, then its arguments.
-fn run_words(words: &[String]) -> Result<Run, TerminalError> {
+/// How long a `capture-pane` may take.
+const CAPTURE_LIMIT: Duration = Duration::from_secs(5);
+
+/// The command that runs `words` (the program, then its arguments), with
+/// the controller's settings kept out of its environment.
+fn command_of(words: &[String]) -> Command {
     let mut command = Command::new(&words[0]);
     command.args(&words[1..]);
     // The first command starts the tmux server, whose global environment
@@ -101,12 +113,77 @@ fn run_words(words: &[String]) -> Result<Run, TerminalError> {
             command.env_remove(name);
         }
     }
+    command
+}
+
+/// Run `words`: the program, then its arguments.
+fn run_words(words: &[String]) -> Result<Run, TerminalError> {
     let failed = |error: std::io::Error| TerminalError(format!("run {}: {error}", words[0]));
-    let output = command.output().map_err(failed)?;
+    let output = command_of(words).output().map_err(failed)?;
     Ok(Run {
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// [`run_words`], killed and failed when it has not exited within `limit`.
+/// Its output is read while it runs, so a large one cannot fill a pipe and
+/// stall it.
+fn run_words_within(words: &[String], limit: Duration) -> Result<Run, TerminalError> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let failed = |error: std::io::Error| TerminalError(format!("run {}: {error}", words[0]));
+    let mut child = command_of(words)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(failed)?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(failed)? {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TerminalError(format!(
+                "{} {} did not answer within {} s",
+                words[0],
+                words.get(1).map_or("", String::as_str),
+                limit.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(Run {
+        code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
     })
 }
 
@@ -259,14 +336,17 @@ impl TerminalHost for TmuxHost {
         _workspace: &WorkspaceId,
         lines: usize,
     ) -> Result<String, TerminalError> {
-        let run = self.run(&[
-            "capture-pane".to_string(),
-            "-p".to_string(),
-            "-t".to_string(),
-            Self::pane(terminal),
-            "-S".to_string(),
-            format!("-{lines}"),
-        ])?;
+        let run = self.run_within(
+            &[
+                "capture-pane".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                Self::pane(terminal),
+                "-S".to_string(),
+                format!("-{lines}"),
+            ],
+            CAPTURE_LIMIT,
+        )?;
         if run.code == Some(0) {
             return Ok(run.stdout);
         }
