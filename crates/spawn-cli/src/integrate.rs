@@ -142,8 +142,11 @@ pub(crate) struct Mission {
     #[serde(default)]
     pub(crate) gate_aborts: u32,
     /// The mission's current run of `no_room` gate outcomes, folded by the
-    /// store: when it began, when the latest was recorded, how many, and
-    /// whether one carried `escalate`.
+    /// store: the task it is about (a run is one task's; it ends when that
+    /// task leaves the gate), when it began, when the latest was recorded,
+    /// how many, and whether one carried `escalate`.
+    #[serde(default)]
+    pub(crate) gate_room_task: Option<i64>,
     #[serde(default)]
     pub(crate) gate_room_since_ms: Option<i64>,
     #[serde(default)]
@@ -238,22 +241,28 @@ pub(crate) fn room_backoff(waits: u32) -> Duration {
         .min(ROOM_BACKOFF_MAX)
 }
 
-/// How long the mission's gate still waits for room at `now_ms`, read from
-/// the store's record of its latest `no_room` (never from memory). None when
-/// the gate may run.
-pub(crate) fn room_wait(mission: &Mission, now_ms: i64) -> Option<Duration> {
+/// How long `task`'s gate still waits for room at `now_ms`, read from the
+/// store's record of its latest `no_room` (never from memory). None when the
+/// gate may run: also when the mission's run is another task's, which never
+/// lends its backoff.
+pub(crate) fn room_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Duration> {
+    if mission.gate_room_task != Some(task) {
+        return None;
+    }
     let last = mission.gate_room_last_ms?;
     let backoff = i64::try_from(room_backoff(mission.gate_room_waits).as_millis()).ok()?;
     let left = last.saturating_add(backoff).saturating_sub(now_ms);
     (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
 }
 
-/// The record of a gate that had no room to judge, at `now_ms`: the reason
-/// with the free space and TMPDIR, the facts themselves, and `escalate`
-/// when the mission's run of them began more than [`ROOM_ESCALATE_AFTER`]
-/// ago and none escalated yet.
+/// The record of a gate that had no room to judge `task`, at `now_ms`: the
+/// reason with the free space and TMPDIR, the facts themselves, and
+/// `escalate` when the run of them on this task began more than
+/// [`ROOM_ESCALATE_AFTER`] ago and none escalated yet. Another task's run
+/// gives it no age.
 pub(crate) fn no_room(
     mission: &Mission,
+    task: i64,
     free_kb: u64,
     min_gb: u64,
     tmpdir: &str,
@@ -261,7 +270,8 @@ pub(crate) fn no_room(
     now_ms: i64,
 ) -> Value {
     let after = i64::try_from(ROOM_ESCALATE_AFTER.as_millis()).unwrap_or(i64::MAX);
-    let escalate = !mission.gate_room_escalated
+    let escalate = mission.gate_room_task == Some(task)
+        && !mission.gate_room_escalated
         && mission
             .gate_room_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) > after);
@@ -548,7 +558,7 @@ impl Integrator {
             return Ok(assigned);
         };
         // The gate had no room last time: wait out the backoff, then try.
-        if let Some(wait) = room_wait(mission, now_ms()) {
+        if let Some(wait) = room_wait(mission, task.id, now_ms()) {
             println!(
                 "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
                 mission.id,
@@ -795,7 +805,7 @@ impl Integrator {
                 log,
             }) => gated(
                 "no_room",
-                no_room(mission, free_kb, min_gb, &tmpdir, &log, now_ms()),
+                no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms()),
             ),
             Err(failure) => gated("aborted", aborted(&failure)),
         }
@@ -1873,21 +1883,27 @@ mod tests {
     #[test]
     fn the_gate_waits_out_its_backoff_from_the_recorded_no_room() {
         let mut waiting = mission(0, 0, 0);
-        assert_eq!(room_wait(&waiting, 0), None, "no run of no_room: judge now");
+        assert_eq!(room_wait(&waiting, 4, 0), None, "no run of no_room: judge now");
+        waiting.gate_room_task = Some(4);
         waiting.gate_room_since_ms = Some(100 * MINUTE);
         waiting.gate_room_last_ms = Some(110 * MINUTE);
         waiting.gate_room_waits = 2;
         assert_eq!(
-            room_wait(&waiting, 112 * MINUTE).map(|wait| wait.as_secs()),
+            room_wait(&waiting, 4, 112 * MINUTE).map(|wait| wait.as_secs()),
             Some(8 * 60)
         );
-        assert_eq!(room_wait(&waiting, 120 * MINUTE), None, "backoff over");
+        assert_eq!(room_wait(&waiting, 4, 120 * MINUTE), None, "backoff over");
+        assert_eq!(
+            room_wait(&waiting, 5, 112 * MINUTE),
+            None,
+            "another task does not inherit the backoff"
+        );
     }
 
     #[test]
     fn no_room_names_the_reason_and_the_free_space_and_escalates_once_after_two_hours() {
         let mut waiting = mission(0, 2, 0);
-        let first = no_room(&waiting, 3 * 1_048_576 + 104_858, 10, "/data/tmp", "log", 0);
+        let first = no_room(&waiting, 4, 3 * 1_048_576 + 104_858, 10, "/data/tmp", "log", 0);
         assert_eq!(
             first["reason"],
             "no room to judge now: 3.1 GiB free in /data/tmp (TMPDIR), under \
@@ -1897,10 +1913,16 @@ mod tests {
         assert_eq!(first["tmpdir"], "/data/tmp");
         assert_eq!(first["min_gb"], 10);
         assert_eq!(first["escalate"], false, "the first of a run");
+        waiting.gate_room_task = Some(4);
         waiting.gate_room_since_ms = Some(0);
         let at = |mission: &Mission, minutes: i64| {
-            no_room(mission, 1, 10, "/t", "", minutes * MINUTE)["escalate"].clone()
+            no_room(mission, 4, 1, 10, "/t", "", minutes * MINUTE)["escalate"].clone()
         };
+        assert_eq!(
+            no_room(&waiting, 5, 1, 10, "/t", "", 500 * MINUTE)["escalate"],
+            false,
+            "a later task's first no_room starts its own run"
+        );
         assert_eq!(
             at(&waiting, 120),
             false,
