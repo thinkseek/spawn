@@ -3060,6 +3060,14 @@ mod database_tests {
             .to_string()
     }
 
+    /// An empty directory for a holding gate's marks.
+    fn fresh_marks(name: &str) -> PathBuf {
+        let marks = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        marks
+    }
+
     /// The integrator's mirror of `source`.
     fn mirror_of(integrator: &Integrator, source: &str) -> String {
         crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
@@ -3089,10 +3097,7 @@ mod database_tests {
     /// first ended (the longest wait gets the gate). Then A's second.
     #[test]
     fn gates_run_per_mission_concurrently() {
-        let marks =
-            std::env::temp_dir().join(format!("spawn-db-gate-marks-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&marks);
-        std::fs::create_dir_all(&marks).expect("marks");
+        let marks = fresh_marks("spawn-db-gate-marks");
         let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) =
             world("concurrent-a", &holding_gate(&marks));
@@ -3205,10 +3210,7 @@ mod database_tests {
     /// gate behind the other.
     #[test]
     fn two_missions_always_ready_take_turns_at_one_gate() {
-        let marks =
-            std::env::temp_dir().join(format!("spawn-db-gate-turns-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&marks);
-        std::fs::create_dir_all(&marks).expect("marks");
+        let marks = fresh_marks("spawn-db-gate-turns");
         let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) = world("turns-a", &holding_gate(&marks));
         integrator.gates = 1;
@@ -3312,10 +3314,7 @@ mod database_tests {
     /// objective in the same pass, and again while A's gate runs.
     #[test]
     fn a_ready_mission_does_not_delay_another_missions_assignment() {
-        let marks =
-            std::env::temp_dir().join(format!("spawn-db-gate-assign-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&marks);
-        std::fs::create_dir_all(&marks).expect("marks");
+        let marks = fresh_marks("spawn-db-gate-assign");
         let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) =
             world("assign-a", &holding_gate(&marks));
@@ -3352,9 +3351,7 @@ mod database_tests {
     /// A cap of one is one gate at a time across missions, as before.
     #[test]
     fn a_cap_of_one_gates_one_mission_at_a_time() {
-        let marks = std::env::temp_dir().join(format!("spawn-db-gate-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&marks);
-        std::fs::create_dir_all(&marks).expect("marks");
+        let marks = fresh_marks("spawn-db-gate-cap");
         let _release = Release(marks.clone());
         let (base_a, source_a, scenarios, mut integrator) =
             world("cap-one-a", &holding_gate(&marks));
