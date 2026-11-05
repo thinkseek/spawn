@@ -16,7 +16,7 @@
 # per-session head rule is asserted at the claim level.
 
 worker=$SPAWN_WORKER
-agent=agent_queue
+# Each session is its own agent's (one session per agent).
 
 # Parse `command=<id>` from the last capture into $cmd_id.
 read_command_id() {
@@ -36,7 +36,7 @@ assert_eq "$status" 0 "init-db exit"
 assert_contains "$(out)" "schema installed" "init-db output"
 
 # --- a repeated idempotency key queues nothing -------------------------
-capture "$SPAWN_BIN" submit --principal spawn --agent "$agent" \
+capture "$SPAWN_BIN" submit --principal spawn --agent agent_q1 \
     --session session_q1 --key key_a1 --action '{"type":"stop"}'
 assert_eq "$status" 0 "first submit exit"
 read_command_id
@@ -48,7 +48,7 @@ assert_eq "$(scalar "select lease_attempt from spawn_commands where id = $cmd1")
 assert_eq "$(scalar "select coalesce(lease_worker, 'null') from spawn_commands where id = $cmd1")" \
     null "a fresh command has no lease worker"
 
-capture "$SPAWN_BIN" submit --principal spawn --agent "$agent" \
+capture "$SPAWN_BIN" submit --principal spawn --agent agent_q1 \
     --session session_q1 --key key_a1 --action '{"type":"stop"}'
 assert_eq "$status" 0 "repeated submit exit"
 read_command_id
@@ -59,7 +59,7 @@ assert_eq "$(scalar "select count(*) from spawn_events where event_name = 'comma
     1 "the repeated key writes no second accepted event"
 
 # The key wins even when the repeated call names another session.
-capture "$SPAWN_BIN" submit --principal spawn --agent "$agent" \
+capture "$SPAWN_BIN" submit --principal spawn --agent agent_q2 \
     --session session_q2 --key key_a1 --action '{"type":"stop"}'
 assert_eq "$status" 0 "repeat with another session exit"
 read_command_id
@@ -68,14 +68,14 @@ assert_eq "$(scalar "select count(*) from spawn_commands where session_id = 'ses
     0 "the rejected repeat queues nothing"
 
 # --- one claim takes one head, per session -----------------------------
-capture "$SPAWN_BIN" submit --principal spawn --agent "$agent" \
+capture "$SPAWN_BIN" submit --principal spawn --agent agent_q1 \
     --session session_q1 --key key_a2 --action '{"type":"stop"}'
 assert_eq "$status" 0 "second command of session_q1 exit"
 read_command_id
 cmd2=$cmd_id
 [ "$cmd2" != "$cmd1" ] || fail "the second submit reused the first command id"
 
-capture "$SPAWN_BIN" submit --principal spawn --agent "$agent" \
+capture "$SPAWN_BIN" submit --principal spawn --agent agent_q2 \
     --session session_q2 --key key_b1 --action '{"type":"stop"}'
 assert_eq "$status" 0 "command of session_q2 exit"
 read_command_id
@@ -113,12 +113,12 @@ assert_eq "$(scalar "select count(*) from spawn_claim('$worker', 3600000)")" \
     0 "live leases and a pending head leave nothing claimable"
 
 # --- one tick hands each open session to the worker --------------------
-capture "$SPAWN_BIN" submit --principal spawn --agent "$agent" \
+capture "$SPAWN_BIN" submit --principal spawn --agent agent_q3 \
     --session session_q3 --key key_c1 --action '{"type":"stop"}'
 assert_eq "$status" 0 "command of session_q3 exit"
 read_command_id
 cmd4=$cmd_id
-capture "$SPAWN_BIN" submit --principal spawn --agent "$agent" \
+capture "$SPAWN_BIN" submit --principal spawn --agent agent_q4 \
     --session session_q4 --key key_c2 --action '{"type":"stop"}'
 assert_eq "$status" 0 "command of session_q4 exit"
 read_command_id

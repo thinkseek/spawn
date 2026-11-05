@@ -784,6 +784,17 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
             &json!({"type": "task.gated", "id": task.id, "verdict": "stale"}),
         );
     };
+    // Held until the landing is recorded: dropping the mission waits for it.
+    let Some(_hold) = store
+        .landing_hold(task.id)
+        .map_err(|error| error.to_string())?
+    else {
+        println!(
+            "integrate: task {} is no longer landing (its mission was dropped)",
+            task.id
+        );
+        return Ok(());
+    };
     let (branch, _) = source_head(source)?;
     let mirror_path = mirror.to_string_lossy().to_string();
     let pushed = git(&[
