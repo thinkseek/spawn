@@ -1,6 +1,7 @@
 //! The supervisor digest: pending escalations coalesced into one message,
 //! typed into the supervisor's pane while it is idle. What the supervisor
-//! was already told is read back from the markers in delivered digests.
+//! was already told is read back from the tags delivered digests filed on
+//! their commands, never from their text: that quotes workers' reports.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -14,27 +15,11 @@ use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
 /// Escalations per digest; the rest wait for the next one.
 const DIGEST_ITEMS: usize = 8;
 
-/// Escalations the supervisor already received, from the markers in the
-/// digests that reached its pane.
+/// Escalations the supervisor already received: the tags of the digests
+/// that reached its pane.
 pub(super) fn told(supervisor: Option<&Facts>) -> BTreeSet<String> {
     supervisor
-        .map(|facts| {
-            facts
-                .dispatched
-                .iter()
-                .filter(|sent| sent.succeeded == Some(true))
-                .filter_map(|sent| sent.text.as_deref())
-                .flat_map(|text| {
-                    text.lines()
-                        .filter_map(|line| {
-                            let start = line.find("[spawn:esc ")?;
-                            let end = line[start..].find(']')? + start + 1;
-                            Some(line[start..end].to_string())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        })
+        .map(|facts| facts.told.clone())
         .unwrap_or_default()
 }
 
@@ -63,6 +48,7 @@ fn heading(why: Why) -> &'static str {
         Why::Approved => "resident approved",
         Why::Human => "human message",
         Why::DeliveryFailed => "delivery failed",
+        Why::Disk => "disk space on this host",
     }
 }
 
@@ -77,11 +63,10 @@ fn text(items: &[Escalation], spawn: &str) -> String {
     for item in items {
         let _ = writeln!(
             text,
-            "- {} — {}: {} {}",
+            "- {} — {}: {}",
             item.session_id,
             heading(item.why),
-            item.line,
-            item.marker()
+            item.line
         );
     }
     text
@@ -94,7 +79,7 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
         return None;
     }
     let items: Vec<Escalation> = pending.iter().take(DIGEST_ITEMS).cloned().collect();
-    let markers: String = items.iter().map(Escalation::marker).collect();
+    let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
     Some(Order {
         agent_id: SUPERVISOR_AGENT.to_string(),
         session_id: SUPERVISOR_SESSION.to_string(),
@@ -102,10 +87,11 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
         key: format!(
             "dispatch-digest-{}-{:016x}",
             supervisor.observation_event_id.unwrap_or(0),
-            crate::sources::fnv(&markers)
+            crate::sources::fnv(&tags.join("\n"))
         ),
         action: CommandAction::Input {
             text: text(&items, spawn),
+            tags,
         },
         task: None,
     })

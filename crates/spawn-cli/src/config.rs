@@ -26,23 +26,6 @@ pub(crate) fn open_store() -> Result<PostgresStore, String> {
     PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 
-/// The chunk store that keeps workspaces' large files (docs/storage.md):
-/// the directory `SPAWN_CHUNK_STORE` names, else `<root>/.chunks`, which
-/// mount and unmount never clear.
-pub(crate) fn chunk_store(root: &str) -> std::sync::Arc<dyn spawn_core::port::ChunkStore> {
-    std::sync::Arc::new(spawn_host::LocalChunkStore::new(resolve_chunk_store(
-        env_value("SPAWN_CHUNK_STORE"),
-        root,
-    )))
-}
-
-fn resolve_chunk_store(configured: Option<String>, root: &str) -> PathBuf {
-    configured.map_or_else(
-        || PathBuf::from(root).join(spawn_host::DEFAULT_CHUNK_DIRECTORY),
-        PathBuf::from,
-    )
-}
-
 /// Whether this host runs the supervisor (`SPAWN_SUPERVISOR` is set).
 pub(crate) fn supervised() -> bool {
     env_value("SPAWN_SUPERVISOR").is_some()
@@ -109,9 +92,8 @@ fn check_git_version(answer: &str) -> Result<(), String> {
 /// so an old git fails with a clear error instead of an unknown option in
 /// the middle of a merge.
 pub(crate) fn require_git() -> Result<(), String> {
-    let output = std::process::Command::new("git")
+    let output = crate::sources::controller_git()
         .arg("--version")
-        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("run git --version: {error}"))?;
     check_git_version(&String::from_utf8_lossy(&output.stdout))
@@ -131,18 +113,6 @@ pub(crate) fn loop_interval() -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_chunk_store_is_configurable_and_defaults_under_the_root() {
-        assert_eq!(
-            resolve_chunk_store(Some("/srv/chunks".into()), "/ws"),
-            PathBuf::from("/srv/chunks")
-        );
-        assert_eq!(
-            resolve_chunk_store(None, "/ws"),
-            PathBuf::from("/ws/.chunks")
-        );
-    }
 
     #[test]
     fn spawn_program_prefers_the_environment() {
@@ -251,20 +221,11 @@ impl Flags {
     }
 }
 
-/// The terminal host the environment describes: tmux on this machine, or
-/// inside each workspace's container when `SPAWN_EXEC_IMAGE` is set.
+/// The terminal host the environment describes: tmux on this machine, on
+/// the server of `SPAWN_TMUX_SOCKET` when it is set.
 pub(crate) fn terminal_host() -> spawn_host::TmuxHost {
-    use spawn_core::id::WorkspaceId;
-    let program = env_or("SPAWN_TMUX_PROGRAM", "tmux");
-    let socket = env_value("SPAWN_TMUX_SOCKET");
-    let prefix: std::sync::Arc<spawn_host::PrefixBuilder> = match env_value("SPAWN_EXEC_IMAGE") {
-        Some(_) => {
-            let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
-            std::sync::Arc::new(move |workspace: &WorkspaceId| {
-                spawn_host::docker_prefix(&docker, workspace.sandbox())
-            })
-        }
-        None => std::sync::Arc::new(|_: &WorkspaceId| Vec::new()),
-    };
-    spawn_host::TmuxHost::in_workspaces(&program, prefix, socket)
+    spawn_host::TmuxHost::on_socket(
+        &env_or("SPAWN_TMUX_PROGRAM", "tmux"),
+        env_value("SPAWN_TMUX_SOCKET"),
+    )
 }

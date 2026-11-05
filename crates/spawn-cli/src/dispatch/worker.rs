@@ -71,9 +71,19 @@ fn nudgeable(observation: &Observation) -> bool {
         && observation.stuck.is_none_or(|value| value < NUDGE_STUCK)
 }
 
-/// Rule: a lost execution is resumed once; a failed resume escalates.
+/// Rule: a lost execution is resumed once; a failed resume escalates, and
+/// so does a resume whose engine was lost again within a minute (a resumed
+/// execution has a new id, so its own key would resume it again forever).
 fn resume_lost(facts: &Facts) -> Decision {
     let execution = facts.execution_id.as_deref().unwrap_or("none");
+    if facts.resumed_young > 0 {
+        return Decision::Escalate(Escalation::about(
+            facts,
+            format!("resume-{execution}"),
+            Why::ResumeFailed,
+            "engine was lost again within a minute of its automatic resume".to_string(),
+        ));
+    }
     let key = format!("dispatch-resume-{execution}");
     match facts.sent(&key) {
         None => Decision::Act(Order::to(
@@ -124,6 +134,7 @@ fn nudge(facts: &Facts, observation: &Observation, now_ms: i64) -> Decision {
             key,
             CommandAction::Input {
                 text: "continue".to_string(),
+                tags: Vec::new(),
             },
         )),
         None => Decision::Escalate(Escalation::about(

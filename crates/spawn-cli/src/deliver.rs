@@ -32,9 +32,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Deserialize;
+use spawn_core::bridge::MAY_HAVE_TYPED;
 use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, ModelProfile};
 use spawn_core::mission::TaskState;
+use spawn_host::tree_path::TreePath;
 use spawn_postgres::PostgresStore;
 
 use crate::dispatch::{Escalation, Facts, Order, Why};
@@ -48,6 +50,16 @@ const KEPT_REPORTS: &str = ".spawn/reports";
 /// Where delivery leaves one empty file per delivery it sends, named by the
 /// delivery's key, relative to the workspace ([`mark_delivery`]).
 const DELIVERY_MARKS: &str = ".spawn/deliveries";
+
+/// Retries of a failed delivery, after the first attempt.
+const DELIVERY_RETRIES: usize = 3;
+
+/// Wait before the first retry; it doubles with every retry, up to
+/// [`RETRY_MAX_MS`].
+const RETRY_MS: i64 = 60_000;
+
+/// Longest wait between two retries.
+const RETRY_MAX_MS: i64 = 30 * 60_000;
 
 /// One task row from `delivery_rows`.
 #[derive(Debug, Clone, Deserialize)]
@@ -96,7 +108,7 @@ impl TaskRow {
     }
 
     /// A command to this task's session that carries the task to its
-    /// worker: submitting it marks the task delivered.
+    /// worker: the task is marked delivered once it succeeded.
     fn delivery(&self, key: String, action: CommandAction) -> Order {
         Order {
             task: Some(self.id),
@@ -261,12 +273,12 @@ impl<'a> Turns<'a> {
 /// the worker asked at the end of it (judged BLOCKED) is then settled by
 /// the close, and new work may be typed in.
 fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
+    // Not `dispatched`, which holds only the last day: a worker blocked
+    // over a quiet weekend would never take new work.
     facts
-        .dispatched
-        .iter()
-        .filter(|sent| sent.key.starts_with("deliver-"))
-        .max_by_key(|sent| sent.created_at_ms)
-        .and_then(|sent| sent.key.split('-').nth(1)?.parse::<i64>().ok())
+        .last_delivery
+        .as_deref()
+        .and_then(|key| key.split('-').nth(1)?.parse::<i64>().ok())
         // Open tasks are always among the rows; a closed resident task is not.
         .is_some_and(|id| {
             !work
@@ -278,9 +290,8 @@ fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
 
 /// How a waiting task reaches its worker, given the worker's facts.
 /// `settled`: the worker's last task is closed (see [`last_delivery_closed`]).
-fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Order> {
+fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -> Option<Order> {
     let model = Some(task.model);
-    let key = task.delivery_key();
     match found {
         Some(facts) if facts.open_command => None,
         // A revision answers the worker's own report, which may have asked
@@ -305,7 +316,13 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
                 let key = format!("switch-model-{}-{}", task.id, task.revisions);
                 return Some(task.command(key, CommandAction::Stop));
             }
-            Some(task.delivery(key, CommandAction::Input { text: typed(task) }))
+            Some(task.delivery(
+                key,
+                CommandAction::Input {
+                    text: typed(task),
+                    tags: Vec::new(),
+                },
+            ))
         }
         // Ran before: resume, so a resident keeps its context.
         Some(facts) if facts.execution_id.is_some() => Some(task.delivery(
@@ -328,8 +345,103 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
     }
 }
 
-/// Delivery orders for the current facts.
-pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
+/// The attempts at a task's current delivery into its session: the
+/// delivery's own command, then its retries (`<key>-retry-<n>`), in order.
+fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dispatch::Sent> {
+    let key = task.delivery_key();
+    let retry = format!("{key}-retry-");
+    facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key == key || sent.key.starts_with(&retry))
+        .collect()
+}
+
+/// Where a waiting task's current delivery stands, from its attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempts {
+    /// Nothing sent for it yet.
+    None,
+    /// The latest attempt has not finished.
+    Open,
+    /// The latest attempt (this command) succeeded: the task reached its
+    /// worker.
+    Delivered(i64),
+    /// The latest attempt failed, having typed nothing; attempt `number`
+    /// goes at `due_ms`.
+    Retry { number: usize, due_ms: i64 },
+    /// The latest attempt failed and is not tried again: why, for the
+    /// supervisor.
+    Failed(&'static str),
+}
+
+/// Where `task`'s current delivery into `facts`' session stands. A failure
+/// that typed nothing is tried again under a key of its own, with a wait
+/// that doubles each time, [`DELIVERY_RETRIES`] times. One that may have
+/// typed the task ([`MAY_HAVE_TYPED`]) is not.
+fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
+    let sent = delivery_attempts(task, facts);
+    let Some(last) = sent.last() else {
+        return Attempts::None;
+    };
+    match last.succeeded {
+        None => Attempts::Open,
+        Some(true) => last.id.map_or(Attempts::Open, Attempts::Delivered),
+        Some(false) => {
+            let error = last.error.as_deref().unwrap_or_default();
+            if error.contains(MAY_HAVE_TYPED) {
+                return Attempts::Failed(
+                    "may or may not have reached its worker; ask the worker before assigning it \
+                     again",
+                );
+            }
+            if sent.len() > DELIVERY_RETRIES {
+                return Attempts::Failed("never reached its worker; cancel it and assign it again");
+            }
+            let doublings = u32::try_from(sent.len() - 1).unwrap_or(u32::MAX).min(20);
+            let wait = RETRY_MS
+                .saturating_mul(1_i64 << doublings)
+                .min(RETRY_MAX_MS);
+            Attempts::Retry {
+                number: sent.len(),
+                due_ms: last
+                    .finished_at_ms
+                    .unwrap_or(last.created_at_ms)
+                    .saturating_add(wait),
+            }
+        }
+    }
+}
+
+/// Where each waiting task's delivery stands, with the task.
+fn waiting_attempts<'a>(work: &'a Work, rows: &[Facts]) -> Vec<(&'a TaskRow, Attempts)> {
+    work.tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
+        .filter_map(|task| {
+            let facts = rows
+                .iter()
+                .find(|facts| facts.session_id == task.session_id)?;
+            Some((task, attempts(task, facts)))
+        })
+        .collect()
+}
+
+/// Waiting tasks whose delivery command succeeded, as (task, command): the
+/// task is marked delivered now, not when the command was submitted.
+pub(crate) fn delivered(work: &Work, rows: &[Facts]) -> Vec<(i64, i64)> {
+    waiting_attempts(work, rows)
+        .into_iter()
+        .filter_map(|(task, attempts)| match attempts {
+            Attempts::Delivered(command) => Some((task.id, command)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Delivery orders for the current facts: a task's delivery, or its retry
+/// once due ([`attempts`]).
+pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
     let facts: BTreeMap<&str, &Facts> = rows
         .iter()
         .map(|facts| (facts.session_id.as_str(), facts))
@@ -343,10 +455,21 @@ pub(crate) fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
         match task.state {
             TaskState::Assigned | TaskState::Revise => {
                 let turn = turns.take(task);
-                if turn && !blocked.contains(session) {
-                    let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
-                    orders.extend(delivery(task, found, settled));
+                if !turn || blocked.contains(session) {
+                    continue;
                 }
+                let key = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
+                    Attempts::None => task.delivery_key(),
+                    Attempts::Retry { number, due_ms } if now_ms >= due_ms => {
+                        format!("{}-retry-{number}", task.delivery_key())
+                    }
+                    Attempts::Retry { .. }
+                    | Attempts::Open
+                    | Attempts::Delivered(_)
+                    | Attempts::Failed(_) => continue,
+                };
+                let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
+                orders.extend(delivery(task, found, settled, key));
             }
             // A finished ephemeral worker is stopped.
             _ if task.is_finished()
@@ -492,8 +615,10 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             session_id: report.session_id.clone(),
             id: format!("report-{}-{}", report.id, report.revisions),
             why: Why::Report,
+            // The report is the worker's text, not the dispatcher's: framed
+            // as a quote, so an instruction in it reads as the worker's.
             line: format!(
-                "task #{} ({}, mission #{}): {}",
+                "task #{} ({}, mission #{}); the worker's report, quoted: «{}»",
                 report.id,
                 report.kind,
                 report.mission_id,
@@ -520,26 +645,13 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             line: format!("a human told it: {}", one_line(&message.text, 200)),
         });
     }
-    for task in work
-        .tasks
-        .iter()
-        .filter(|task| task.state == TaskState::Delivered)
-    {
-        let key = task.delivery_key();
-        let failed = rows
-            .iter()
-            .find(|facts| facts.session_id == task.session_id)
-            .and_then(|facts| facts.sent(&key))
-            .is_some_and(|sent| sent.succeeded == Some(false));
-        if failed {
+    for (task, attempts) in waiting_attempts(work, rows) {
+        if let Attempts::Failed(why) = attempts {
             items.push(Escalation {
                 session_id: task.session_id.clone(),
-                id: key,
+                id: task.delivery_key(),
                 why: Why::DeliveryFailed,
-                line: format!(
-                    "task #{} never reached its worker; cancel it and assign it again",
-                    task.id
-                ),
+                line: format!("task #{} {why}", task.id),
             });
         }
     }
@@ -548,27 +660,26 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
 
 /// Move a collected report to `.spawn/reports/task-<id>.md` under the
 /// workspace, or delete it if it cannot be moved, so the next task starts
-/// clean.
-fn put_aside(path: &Path, workspace: &Path, task: i64) {
-    let kept = workspace.join(KEPT_REPORTS).join(format!("task-{task}.md"));
-    let moved = kept
-        .parent()
-        .map(std::fs::create_dir_all)
-        .and_then(Result::ok)
-        .and_then(|()| std::fs::rename(path, &kept).ok());
-    if moved.is_none() {
-        let _ = std::fs::remove_file(path);
+/// clean. Both inside the workspace only, never through a symlink
+/// ([`spawn_host::agent_files`]).
+fn put_aside(workspace: &Path, task: i64) {
+    use spawn_host::agent_files::{remove, rename_within};
+    let report = TreePath::from(REPORT);
+    let kept = TreePath::from(format!("{KEPT_REPORTS}/task-{task}.md").as_str());
+    if rename_within(workspace, &report, &kept).is_err() {
+        let _ = remove(workspace, &report);
     }
 }
 
-/// The mark of the delivery `key` in `workspace`.
-fn delivery_mark(workspace: &Path, key: &str) -> std::path::PathBuf {
-    workspace.join(DELIVERY_MARKS).join(key)
+/// The mark of the delivery `key`, relative to the workspace.
+fn delivery_mark(key: &str) -> TreePath {
+    TreePath::from(format!("{DELIVERY_MARKS}/{key}").as_str())
 }
 
 /// Mark in the worker's workspace under `root` that `order`, which carries
-/// a task, is about to be sent: an empty file named by the delivery's key,
-/// written once (a delivery planned again keeps its first mark). Its
+/// a task, is about to be sent: an empty file named by the delivery's key
+/// (a retry's too), written once (a delivery planned or tried again keeps
+/// its first mark). Its
 /// modification time is set by the clock of the filesystem the worker writes
 /// its report on, so [`report_is_new`] compares two times of one clock and
 /// never a file's time with the database's.
@@ -580,34 +691,42 @@ pub(crate) fn mark_delivery(root: &Path, order: &Order) -> Result<(), String> {
     if order.task.is_none() || !workspace.is_dir() {
         return Ok(());
     }
-    let mark = delivery_mark(&workspace, &order.key);
-    let created = mark
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&mark)
-        });
-    match created {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(format!("mark {}: {error}", mark.display())),
-    }
+    // Made inside the workspace only: no directory or mark is followed
+    // through a symlink the agent put there. One already there stays.
+    let key = order.key.split("-retry-").next().unwrap_or(&order.key);
+    let mark = delivery_mark(key);
+    spawn_host::agent_files::create_new(&workspace, &mark)
+        .map(|_| ())
+        .map_err(|error| format!("mark {}: {error}", workspace.join(mark.as_path()).display()))
 }
 
-/// Whether the report at `report` was written for the delivery whose mark
-/// is `mark`: at or after the mark, by the same filesystem clock. Without a
-/// mark the workspace was mounted after the delivery was sent (a start or
-/// resume mounts a fresh one), so everything in it is newer. A report that
-/// cannot be read is never new.
-fn report_is_new(report: &Path, mark: &Path) -> bool {
-    let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified());
-    let Ok(written) = modified(report) else {
-        return false;
+/// The most of a report [`new_report`] reads.
+const REPORT_LIMIT: u64 = 1 << 20;
+
+/// The report in `workspace` written for the delivery `key`, if there is
+/// one: written at or after the delivery's mark, by the same filesystem
+/// clock. Without a mark the workspace was mounted after the delivery was
+/// sent (a start or resume mounts a fresh one), so everything in it is
+/// newer. The agent writes both files, so each is opened the safe way
+/// ([`spawn_host::agent_files`]): a symlink is not followed, a FIFO is not
+/// waited on, the times are the opened files' own, and at most
+/// [`REPORT_LIMIT`] bytes are read. A report that cannot be read that way
+/// is never new.
+fn new_report(workspace: &Path, key: &str) -> Option<String> {
+    use spawn_host::agent_files::{open_regular, read_regular};
+    let (bytes, metadata, _) = read_regular(workspace, &TreePath::from(REPORT), REPORT_LIMIT)
+        .ok()
+        .flatten()?;
+    let written = metadata.modified().ok()?;
+    let sent = match open_regular(workspace, &delivery_mark(key)) {
+        Ok(None) => None,
+        Ok(Some(mark)) => Some(mark.metadata.modified().ok()?),
+        Err(_) => return None,
     };
-    modified(mark).map_or(true, |sent| written >= sent)
+    if sent.is_some_and(|sent| written < sent) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Collect the reports of delivered tasks whose worker's turn stopped at an
@@ -634,12 +753,8 @@ pub(crate) fn collect_reports(
             continue;
         }
         let workspace = root.join(&task.agent_id);
-        let path = workspace.join(REPORT);
-        let mark = delivery_mark(&workspace, &task.delivery_key());
-        if !report_is_new(&path, &mark) {
-            continue;
-        }
-        let Ok(report) = std::fs::read_to_string(&path) else {
+        let key = task.delivery_key();
+        let Some(report) = new_report(&workspace, &key) else {
             continue;
         };
         if report.trim().is_empty() {
@@ -647,8 +762,8 @@ pub(crate) fn collect_reports(
         }
         match store.task_reported(task.id, report.trim()) {
             Ok(true) => {
-                put_aside(&path, &workspace, task.id);
-                let _ = std::fs::remove_file(&mark);
+                put_aside(&workspace, task.id);
+                let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
                 lines.push(format!("deliver: task #{} reported", task.id));
             }
             Ok(false) => {}
@@ -661,8 +776,8 @@ pub(crate) fn collect_reports(
 #[cfg(test)]
 mod tests {
     use super::{
-        News, REPORT, TaskRow, Work, delivery_mark, mark_delivery, news_items, orders,
-        report_contract, report_is_new, task_prompt,
+        DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery,
+        new_report, news_items, put_aside, report_contract, task_prompt,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -719,7 +834,29 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            told: std::collections::BTreeSet::new(),
+            last_delivery: None,
             model: ModelProfile::Default,
+            resumed_young: 0,
+        }
+    }
+
+    /// The orders of a pass at a time no retry is due yet.
+    fn orders(work: &Work, rows: &[Facts]) -> Vec<Order> {
+        super::orders(work, rows, 0)
+    }
+
+    /// The dispatcher's command `key` into the worker, finished at
+    /// `finished`: succeeded, or failed with `error`.
+    fn sent(id: i64, key: &str, finished: i64, error: Option<&str>) -> Sent {
+        Sent {
+            id: Some(id),
+            key: key.to_string(),
+            text: None,
+            created_at_ms: finished - 1,
+            finished_at_ms: Some(finished),
+            succeeded: Some(error.is_none()),
+            error: error.map(str::to_string),
         }
     }
 
@@ -758,13 +895,8 @@ mod tests {
         if let Some(observation) = blocked.observation.as_mut() {
             observation.state = SemanticState::Blocked;
         }
-        blocked.dispatched.push(Sent {
-            key: "deliver-7-1".to_string(),
-            text: None,
-            created_at_ms: 5,
-            finished_at_ms: Some(6),
-            succeeded: Some(true),
-        });
+        // Delivered more than a day ago: out of `dispatched`'s window.
+        blocked.last_delivery = Some("deliver-7-1".to_string());
         let waiting = |closed: TaskState| {
             orders(
                 &work(vec![
@@ -874,21 +1006,6 @@ mod tests {
         assert!(matches!(plan[0].action, CommandAction::Input { .. }));
     }
 
-    /// What submitting `plan` does to the task rows: an order that carries
-    /// a task marks it delivered (`spawn_task_delivered` takes an assigned
-    /// or revised task only).
-    fn submitted(mut work: Work, plan: &[crate::dispatch::Order]) -> Work {
-        for order in plan {
-            if let Some(id) = order.task
-                && let Some(task) = work.tasks.iter_mut().find(|task| task.id == id)
-                && matches!(task.state, TaskState::Assigned | TaskState::Revise)
-            {
-                task.state = TaskState::Delivered;
-            }
-        }
-        work
-    }
-
     #[test]
     fn a_model_switch_stops_the_worker_then_resumes_it_with_the_task() {
         let cheap = TaskRow {
@@ -902,8 +1019,10 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].action, CommandAction::Stop);
         assert_eq!(plan[0].task, None, "a stop delivers nothing");
-        work = submitted(work, &plan);
-        assert_eq!(work.tasks[0].state, TaskState::Assigned, "still waiting");
+        let mut idle = worker(true, true);
+        idle.dispatched
+            .push(sent(10, "switch-model-4-0", 100, None));
+        assert!(delivered(&work, &[idle]).is_empty(), "still waiting");
 
         // The stop runs: nothing else goes to the session meanwhile.
         let stopping = Facts {
@@ -925,12 +1044,28 @@ mod tests {
                 ..
             }
         ));
-        work = submitted(work, &plan);
-        assert_eq!(work.tasks[0].state, TaskState::Delivered);
-        assert!(
-            orders(&work, &[stopped]).is_empty(),
-            "delivered once, nothing more"
+        // Submitted: nothing more while it runs, and the task still waits.
+        let mut resuming = Facts {
+            open_command: true,
+            ..stopped
+        };
+        resuming.dispatched.push(Sent {
+            finished_at_ms: None,
+            succeeded: None,
+            ..sent(11, "deliver-4-0", 200, None)
+        });
+        assert!(orders(&work, std::slice::from_ref(&resuming)).is_empty());
+        assert!(delivered(&work, std::slice::from_ref(&resuming)).is_empty());
+        // It succeeded: the task is delivered, by that command, once.
+        let mut resumed = worker(true, false);
+        resumed.dispatched.push(sent(11, "deliver-4-0", 200, None));
+        assert_eq!(
+            delivered(&work, std::slice::from_ref(&resumed)),
+            vec![(4, 11)]
         );
+        assert!(orders(&work, &[resumed]).is_empty(), "delivered once");
+        work.tasks[0].state = TaskState::Delivered;
+        assert!(orders(&work, &[worker(false, false)]).is_empty());
     }
 
     #[test]
@@ -978,7 +1113,7 @@ mod tests {
         revise.revisions = 1;
         let plan = orders(&work(vec![revise]), &[worker(true, true)]);
         assert_eq!(plan[0].key, "deliver-4-1");
-        let CommandAction::Input { text } = &plan[0].action else {
+        let CommandAction::Input { text, .. } = &plan[0].action else {
             panic!("typed");
         };
         assert!(text.contains("tests fail"));
@@ -1049,34 +1184,116 @@ mod tests {
             vec![Why::Mission, Why::Report, Why::Approved, Why::Human]
         );
         assert_eq!(
-            items[1].marker(),
-            "[spawn:esc session_worker_x_7 report-7-1]",
+            items[1].tag(),
+            "session_worker_x_7 report-7-1",
             "a report after a revision is news again"
         );
         assert!(items[1].line.contains("## Outcome done"));
     }
 
+    /// H1 and E: a delivery that failed typed nothing, so the task waits
+    /// and the delivery is planned again under a key of its own, with a
+    /// wait that doubles; once the retries are spent the supervisor hears.
     #[test]
-    fn a_failed_delivery_reaches_the_supervisor() {
-        let delivered = task(4, TaskState::Delivered, "resident");
-        let mut facts = worker(false, false);
-        facts.dispatched.push(Sent {
-            key: "deliver-4-0".to_string(),
-            text: None,
-            created_at_ms: 0,
-            finished_at_ms: Some(1),
-            succeeded: Some(true),
-        });
-        let tasks = work(vec![delivered]);
-        assert!(news_items(&tasks, std::slice::from_ref(&facts)).is_empty());
-        facts.dispatched[0].succeeded = Some(false);
-        let items = news_items(&tasks, &[facts]);
+    fn a_failed_delivery_waits_and_is_retried_then_escalated() {
+        let tasks = work(vec![task(4, TaskState::Assigned, "resident")]);
+        let mut facts = worker(true, true);
+        facts
+            .dispatched
+            .push(sent(10, "deliver-4-0", 1_000, Some("pane state Busy")));
+        let rows = |facts: &Facts| vec![facts.clone()];
+        assert!(delivered(&tasks, &rows(&facts)).is_empty(), "not delivered");
+        assert!(
+            news_items(&tasks, &rows(&facts)).is_empty(),
+            "a retry is coming: no one is asked yet"
+        );
+        assert!(super::orders(&tasks, &rows(&facts), 1_000 + 59_999).is_empty());
+        let retry = super::orders(&tasks, &rows(&facts), 1_000 + 60_000);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].key, "deliver-4-0-retry-1");
+        assert_eq!(retry[0].task, Some(4), "the retry delivers the task");
+        assert!(matches!(retry[0].action, CommandAction::Input { .. }));
+
+        // The wait doubles, and the retry fits what the worker is now.
+        facts.dispatched.push(sent(
+            11,
+            "deliver-4-0-retry-1",
+            70_000,
+            Some("pane state Busy"),
+        ));
+        let mut down = facts.clone();
+        down.live = false;
+        assert!(super::orders(&tasks, &rows(&down), 70_000 + 119_999).is_empty());
+        let retry = super::orders(&tasks, &rows(&down), 70_000 + 120_000);
+        assert_eq!(retry[0].key, "deliver-4-0-retry-2");
+        assert!(matches!(retry[0].action, CommandAction::Resume { .. }));
+
+        // A retry that succeeds delivers the task, by its own command.
+        let mut landed = facts.clone();
+        landed
+            .dispatched
+            .push(sent(12, "deliver-4-0-retry-2", 300_000, None));
+        assert_eq!(delivered(&tasks, &rows(&landed)), vec![(4, 12)]);
+
+        // Once the retries are spent, a person is asked, and nothing is sent.
+        for retry in 2..=DELIVERY_RETRIES {
+            facts.dispatched.push(sent(
+                20,
+                &format!("deliver-4-0-retry-{retry}"),
+                100_000,
+                Some("pane state Busy"),
+            ));
+        }
+        assert!(super::orders(&tasks, &rows(&facts), i64::MAX / 2).is_empty());
+        let items = news_items(&tasks, &rows(&facts));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
-        assert_eq!(
-            items[0].marker(),
-            "[spawn:esc session_resident_core deliver-4-0]"
+        assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
+    }
+
+    /// A delivery that may have typed the task is not sent again: the
+    /// supervisor is asked at once.
+    #[test]
+    fn a_delivery_that_may_have_typed_is_escalated_not_retried() {
+        let tasks = work(vec![task(4, TaskState::Assigned, "resident")]);
+        let mut facts = worker(true, true);
+        facts.dispatched.push(sent(
+            10,
+            "deliver-4-0",
+            1_000,
+            Some(&format!("the text {}", spawn_core::bridge::MAY_HAVE_TYPED)),
+        ));
+        let rows = vec![facts];
+        assert!(super::orders(&tasks, &rows, i64::MAX / 2).is_empty());
+        let items = news_items(&tasks, &rows);
+        assert_eq!(items[0].why, Why::DeliveryFailed);
+        assert!(
+            items[0].line.contains("may or may not"),
+            "{}",
+            items[0].line
         );
+    }
+
+    /// A retry keeps the delivery's first mark, which decides which report
+    /// is new.
+    #[test]
+    fn a_retry_keeps_the_deliverys_mark() {
+        let (root, workspace, order) = marked_workspace("retry");
+        let mark = workspace.join(delivery_mark(&order.key).as_path());
+        let first = std::fs::metadata(&mark).and_then(|meta| meta.modified());
+        let retry = Order {
+            key: format!("{}-retry-1", order.key),
+            ..order
+        };
+        mark_delivery(&root, &retry).expect("mark");
+        assert!(!workspace.join(delivery_mark(&retry.key).as_path()).exists());
+        assert_eq!(
+            std::fs::metadata(&mark)
+                .and_then(|meta| meta.modified())
+                .ok(),
+            first.ok()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A root with one worker's workspace in it, its report written, and
@@ -1110,14 +1327,22 @@ mod tests {
     fn a_report_older_than_its_delivery_is_not_collected() {
         let (root, workspace, _) = marked_workspace("older");
         let report = workspace.join(REPORT);
-        let mark = delivery_mark(&workspace, "deliver-4-0");
+        let mark = workspace.join(delivery_mark("deliver-4-0").as_path());
         let sent = std::time::SystemTime::now();
         set_modified(&mark, sent);
         set_modified(&report, sent - std::time::Duration::from_secs(10));
-        assert!(!report_is_new(&report, &mark), "left over from before");
+        assert_eq!(
+            new_report(&workspace, "deliver-4-0"),
+            None,
+            "left over from before"
+        );
         set_modified(&report, sent + std::time::Duration::from_secs(10));
-        assert!(report_is_new(&report, &mark));
-        assert!(!report_is_new(&workspace.join("missing.md"), &mark));
+        assert_eq!(
+            new_report(&workspace, "deliver-4-0").as_deref(),
+            Some("## Outcome\ndone")
+        );
+        std::fs::remove_file(&report).expect("remove the report");
+        assert_eq!(new_report(&workspace, "deliver-4-0"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1125,21 +1350,22 @@ mod tests {
     fn a_report_is_judged_by_its_filesystems_clock_never_the_databases() {
         let (root, workspace, order) = marked_workspace("skewed");
         let report = workspace.join(REPORT);
-        let mark = delivery_mark(&workspace, &order.key);
+        let mark = workspace.join(delivery_mark(&order.key).as_path());
+        let is_new = || new_report(&workspace, &order.key).is_some();
         // The host's clock is a day behind the database's (or ahead: the
         // database is never asked): the mark and the report share it.
         let host = std::time::SystemTime::now() - std::time::Duration::from_hours(24);
         set_modified(&mark, host);
         set_modified(&report, host + std::time::Duration::from_secs(5));
-        assert!(report_is_new(&report, &mark));
+        assert!(is_new());
         // A delivery planned again keeps its first mark.
         mark_delivery(&root, &order).expect("marked again");
         let kept = std::fs::metadata(&mark).and_then(|meta| meta.modified());
         assert_eq!(kept.ok(), Some(host));
-        assert!(report_is_new(&report, &mark));
+        assert!(is_new());
         // No mark: the workspace was mounted after the delivery.
         std::fs::remove_file(&mark).expect("remove the mark");
-        assert!(report_is_new(&report, &mark));
+        assert!(is_new());
         // A worker with no workspace yet gets none, and no error.
         let unmounted = Order {
             agent_id: "agent_worker_new".to_string(),
@@ -1147,6 +1373,57 @@ mod tests {
         };
         mark_delivery(&root, &unmounted).expect("nothing to mark");
         assert!(!root.join("agent_worker_new").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The agent writes the report and the marks: a report that is a
+    /// symlink (to an owner's file) or a FIFO with no writer, and a mark
+    /// whose directory is a symlink, are refused without reading through
+    /// them or waiting; the report is put aside inside the workspace only.
+    #[test]
+    fn a_report_or_mark_the_agent_planted_is_refused_without_following_or_waiting() {
+        let (root, workspace, order) = marked_workspace("planted");
+        let report = workspace.join(REPORT);
+        let secret = root.join("owner-secret.txt");
+        std::fs::write(&secret, "owner only\n").expect("secret");
+        std::fs::remove_file(&report).expect("remove the report");
+        std::os::unix::fs::symlink(&secret, &report).expect("symlink");
+        assert_eq!(new_report(&workspace, &order.key), None, "not followed");
+
+        std::fs::remove_file(&report).expect("remove the symlink");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&report)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        let started = std::time::Instant::now();
+        assert_eq!(
+            new_report(&workspace, &order.key),
+            None,
+            "a FIFO is no report"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the read waited on the FIFO"
+        );
+        std::fs::remove_file(&report).expect("remove the FIFO");
+
+        // Marks whose directory is a symlink to a directory outside.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let marks = workspace.join(".spawn/deliveries");
+        std::fs::remove_dir_all(&marks).expect("remove the marks");
+        std::os::unix::fs::symlink(&outside, &marks).expect("symlink");
+        assert!(mark_delivery(&root, &order).is_err(), "refused");
+        assert_eq!(std::fs::read_dir(&outside).expect("outside").count(), 0);
+
+        // A report put aside where `.spawn/reports` is a symlink outside:
+        // removed, never moved through it.
+        std::fs::write(&report, "## Outcome\ndone").expect("report");
+        std::os::unix::fs::symlink(&outside, workspace.join(".spawn/reports")).expect("symlink");
+        put_aside(&workspace, 4);
+        assert!(!report.exists(), "the report is gone from its place");
+        assert_eq!(std::fs::read_dir(&outside).expect("outside").count(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

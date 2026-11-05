@@ -1,5 +1,5 @@
 //! Assembly of the Bridge and the Observer over one store and the host
-//! adapters (git workspaces, tmux terminals, optional container, judge).
+//! adapters (git workspaces, tmux terminals, judge).
 
 use std::sync::Arc;
 
@@ -10,9 +10,7 @@ use spawn_host::GitWorkspace;
 use spawn_jev::{JevConfig, JevJudge};
 
 use crate::Flags;
-use crate::config::{
-    chunk_store, env_or, env_value, open_store, required_env, spawn_program, workspace_root,
-};
+use crate::config::{env_or, env_value, open_store, required_env, spawn_program, workspace_root};
 use crate::{context, sources, supervise};
 
 /// Build the Bridge and the Observer over one store.
@@ -30,23 +28,11 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
         .ok_or_else(|| "--repo or SPAWN_GIT_REPO is required".to_string())?;
     let root = workspace_root(flags)
         .ok_or_else(|| "--root or SPAWN_WORKSPACE_ROOT is required".to_string())?;
-    let docker = env_or("SPAWN_DOCKER_PROGRAM", "docker");
-    let image = env_value("SPAWN_EXEC_IMAGE");
-
-    // The engine runs in a container when an image is configured. That
-    // container also hosts tmux, so the terminal host needs the same image.
     // Every agent's workspace comes from its mission's source; agents no
     // mission owns use the default repository.
     let factory: sources::Factory = {
-        let (root, docker, image) = (root.clone(), docker.clone(), image.clone());
-        let chunks = chunk_store(&root);
-        Arc::new(move |repo: &std::path::Path| {
-            match image.as_ref() {
-                Some(image) => GitWorkspace::with_container(repo, &root, &docker, image),
-                None => GitWorkspace::new(repo, &root),
-            }
-            .with_chunks(Arc::clone(&chunks))
-        })
+        let root = root.clone();
+        Arc::new(move |repo: &std::path::Path| GitWorkspace::new(repo, &root))
     };
     let workspaces: Arc<dyn WorkspaceStore> = Arc::new(sources::MissionWorkspaces::new(
         factory(std::path::Path::new(&repo)),
@@ -59,13 +45,18 @@ pub(crate) fn runtime(flags: &Flags) -> Result<(Bridge, Observer), String> {
     let config = bridge_config()?;
     let log: Arc<dyn EventLog> = store.clone();
     let queue: Arc<dyn CommandQueue> = store.clone();
+    // Beside the workspaces: the transcripts are the agents' history.
+    let transcripts = spawn_host::LocalTranscriptArchive::new(
+        std::path::Path::new(&root).join(spawn_host::TRANSCRIPT_DIRECTORY),
+    );
     let mut bridge = Bridge::new(
         Arc::clone(&log),
         queue,
         workspaces,
         Arc::clone(&terminals),
         config,
-    );
+    )
+    .with_transcript_archive(Arc::new(transcripts));
     bridge.recover().map_err(|error| error.to_string())?;
 
     let context = context::HostContext::new(open_store()?, terminals);
@@ -119,33 +110,22 @@ fn model_relay() -> Option<ModelRelay> {
     let url = env_value("SPAWN_MODEL_RELAY").filter(|url| url != "off")?;
     Some(ModelRelay {
         url: url.trim_end_matches('/').to_string(),
-        cheap_model: env_or("SPAWN_CHEAP_MODEL", "deepseek-v4-pro"),
+        cheap_model: env_or("SPAWN_CHEAP_MODEL", "deepseek-flash"),
         small_model: env_or("SPAWN_SMALL_MODEL", "deepseek-flash"),
     })
 }
 
-/// Claude Code's transcript directory as the engine sees it, which is where
-/// the Bridge reads it (through the terminal host: inside the container in
-/// container mode).
+/// Claude Code's transcript directory, which is where the Bridge reads it.
 fn claude_projects() -> String {
-    resolve_claude_projects(env_value("SPAWN_EXEC_IMAGE").is_some(), env_value)
+    resolve_claude_projects(env_value)
 }
 
 /// [`claude_projects`] over the environment `lookup` reads:
-/// `SPAWN_CLAUDE_PROJECTS` always wins. In container mode the engine runs
-/// in `docker exec`, which passes none of this process's environment: its
-/// home is the container's, `SPAWN_EXEC_HOME` (`/root`, the home of an
-/// image's root user, by default), and the directory is
-/// `<that home>/.claude/projects`; the host's `HOME` and
-/// `CLAUDE_CONFIG_DIR` say nothing about it. On the host it is
-/// `$CLAUDE_CONFIG_DIR/projects`, else `$HOME/.claude/projects`.
-fn resolve_claude_projects(container: bool, lookup: impl Fn(&str) -> Option<String>) -> String {
+/// `SPAWN_CLAUDE_PROJECTS` always wins; else `$CLAUDE_CONFIG_DIR/projects`,
+/// else `$HOME/.claude/projects`.
+fn resolve_claude_projects(lookup: impl Fn(&str) -> Option<String>) -> String {
     if let Some(projects) = lookup("SPAWN_CLAUDE_PROJECTS") {
         return projects;
-    }
-    if container {
-        let home = lookup("SPAWN_EXEC_HOME").unwrap_or_else(|| "/root".to_string());
-        return format!("{}/.claude/projects", home.trim_end_matches('/'));
     }
     lookup("CLAUDE_CONFIG_DIR").map_or_else(
         || {
@@ -191,39 +171,20 @@ mod tests {
     fn on_the_host_the_transcripts_are_under_the_hosts_home() {
         let host = environment(&[("HOME", "/home/owner")]);
         assert_eq!(
-            resolve_claude_projects(false, &host),
+            resolve_claude_projects(&host),
             "/home/owner/.claude/projects"
         );
         let configured = environment(&[("HOME", "/home/owner"), ("CLAUDE_CONFIG_DIR", "/cc")]);
-        assert_eq!(resolve_claude_projects(false, configured), "/cc/projects");
+        assert_eq!(resolve_claude_projects(configured), "/cc/projects");
     }
 
     #[test]
-    fn in_a_container_the_transcripts_are_under_the_containers_home() {
-        // The host's home and Claude config never reach `docker exec`.
-        let host = environment(&[("HOME", "/home/owner"), ("CLAUDE_CONFIG_DIR", "/cc")]);
-        assert_eq!(
-            resolve_claude_projects(true, &host),
-            "/root/.claude/projects"
-        );
-        let image = environment(&[("HOME", "/home/owner"), ("SPAWN_EXEC_HOME", "/home/agent/")]);
-        assert_eq!(
-            resolve_claude_projects(true, image),
-            "/home/agent/.claude/projects"
-        );
-    }
-
-    #[test]
-    fn an_explicit_transcript_directory_wins_in_both_modes() {
+    fn an_explicit_transcript_directory_wins() {
         let explicit = environment(&[
             ("HOME", "/home/owner"),
-            ("SPAWN_EXEC_HOME", "/home/agent"),
+            ("CLAUDE_CONFIG_DIR", "/cc"),
             ("SPAWN_CLAUDE_PROJECTS", "/mnt/transcripts"),
         ]);
-        assert_eq!(resolve_claude_projects(true, &explicit), "/mnt/transcripts");
-        assert_eq!(
-            resolve_claude_projects(false, &explicit),
-            "/mnt/transcripts"
-        );
+        assert_eq!(resolve_claude_projects(&explicit), "/mnt/transcripts");
     }
 }

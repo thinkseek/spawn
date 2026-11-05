@@ -11,15 +11,22 @@
 //! `?token=<token>`), except, with `SPAWN_SERVE_LOCAL_OPEN=1`, from a loopback
 //! client that runs as the owner's uid (Linux: the uid of its socket in
 //! `/proc/net/tcp{,6}`; without `/proc`, no client is exempt).
+//! An API read served without the token (no token set, or the local-open
+//! exemption) also needs a `Host` naming this server (127.0.0.1, localhost,
+//! [::1] or the bound address, with its port) and no cross-origin `Origin`:
+//! a page that rebinds its own name to 127.0.0.1, or a proxy on this machine
+//! that forwards another name here, reads nothing without the token.
 //! The built UI's static files are served without it:
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
-use spawn_core::event::SessionSeq;
+use spawn_core::event::{GlobalPosition, SessionSeq};
 use spawn_core::id::SessionId;
 use tiny_http::{Header, Request, Response, Server};
 
@@ -71,17 +78,110 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         web.display()
     );
     let port = server.server_addr().to_ip().map(|address| address.port());
+    let hosts = port
+        .map(|port| server_hosts(&address, port))
+        .unwrap_or_default();
+    let shared = Arc::new(Shared {
+        web,
+        token,
+        port,
+        hosts,
+    });
+    serve_requests(&server, &shared, MAX_IN_FLIGHT);
+    Ok(0)
+}
+
+/// Requests served at once. Each runs on its own thread, so a client that
+/// stops reading, a slow query or a slow pane holds one of these, never the
+/// server; one past them is answered 503 at once.
+const MAX_IN_FLIGHT: usize = 16;
+
+/// Longest one dashboard statement runs on the reader's connection.
+const STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What every request's handler reads.
+struct Shared {
+    web: PathBuf,
+    token: Option<String>,
+    port: Option<u16>,
+    hosts: Vec<String>,
+}
+
+/// Requests in flight, at most `limit`.
+struct Slots {
+    taken: AtomicUsize,
+    limit: usize,
+}
+
+/// One request's place among [`Slots`], given back when it is dropped.
+struct Slot(Arc<Slots>);
+
+impl Slots {
+    fn take(slots: &Arc<Self>) -> Option<Slot> {
+        slots
+            .taken
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
+                (taken < slots.limit).then_some(taken + 1)
+            })
+            .ok()
+            .map(|_| Slot(Arc::clone(slots)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.taken.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serve `server`'s requests until it closes: each on a thread of its own,
+/// at most `limit` at once, and 503 past them.
+fn serve_requests(server: &Server, shared: &Arc<Shared>, limit: usize) {
+    let slots = Arc::new(Slots {
+        taken: AtomicUsize::new(0),
+        limit,
+    });
     for request in server.incoming_requests() {
-        if let Err(error) = handle(request, &web, token.as_deref(), port) {
-            eprintln!("serve: {error}");
+        let Some(slot) = Slots::take(&slots) else {
+            let busy = json_response(503, &json!({ "error": "busy: too many requests at once" }));
+            if let Err(error) = request.respond(busy) {
+                eprintln!("serve: {error}");
+            }
+            continue;
+        };
+        let shared = Arc::clone(shared);
+        let spawned = std::thread::Builder::new()
+            .name("serve-request".to_string())
+            .spawn(move || {
+                let _slot = slot;
+                if let Err(error) = handle(
+                    request,
+                    &shared.web,
+                    shared.token.as_deref(),
+                    shared.port,
+                    &shared.hosts,
+                ) {
+                    eprintln!("serve: {error}");
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("serve: no thread for a request: {error}");
         }
     }
-    Ok(0)
 }
 
 /// The token every API request must carry, if any: whatever
 /// `SPAWN_SERVE_TOKEN` holds. An address that is not loopback needs one.
 fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, String> {
+    if let Some(token) = &token
+        && !is_header_safe_token(token)
+    {
+        return Err(format!(
+            "refusing to serve with this SPAWN_SERVE_TOKEN: a token is 1 to {MAX_TOKEN_LEN} \
+             visible ASCII characters (no space, newline or other byte), so a browser can send \
+             it as a header (web/src/token.ts holds the same rule)"
+        ));
+    }
     if token.is_none() && !is_loopback(address) {
         return Err(format!(
             "refusing to serve on {address} without SPAWN_SERVE_TOKEN; \
@@ -207,6 +307,16 @@ fn owners_own_request(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
     local_exemption(true, peer, uid, owner_uid())
 }
 
+/// Longest token `serve` accepts, and the UI sends.
+const MAX_TOKEN_LEN: usize = 512;
+
+/// Whether `token` is one the UI can send as `Authorization: Bearer`:
+/// 1 to [`MAX_TOKEN_LEN`] visible ASCII characters (`web/src/token.ts`,
+/// `TOKEN_PATTERN`, is the same rule).
+fn is_header_safe_token(token: &str) -> bool {
+    (1..=MAX_TOKEN_LEN).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 /// Whether every address `address` resolves to is a loopback one. An
 /// address that does not resolve counts as public.
 fn is_loopback(address: &str) -> bool {
@@ -217,17 +327,79 @@ fn is_loopback(address: &str) -> bool {
     !resolved.is_empty() && resolved.iter().all(|socket| socket.ip().is_loopback())
 }
 
-/// Whether `request` carries `token`, as a bearer header or `?token=`.
-fn authorized(request: &Request, query: &str, token: &str) -> bool {
-    let header = request
+/// The `Host` values that name this server on `port`: the loopback names,
+/// and the address it was told to bind unless that is a wildcard. Each is
+/// lowercase `host:port`.
+fn server_hosts(address: &str, port: u16) -> Vec<String> {
+    let mut hosts: Vec<String> = ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .map(|host| format!("{host}:{port}"))
+        .collect();
+    let bound = address
+        .rsplit_once(':')
+        .map_or(address, |(host, _)| host)
+        .to_ascii_lowercase();
+    let wildcard = bound
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+    if !bound.is_empty() && !wildcard {
+        let named = format!("{bound}:{port}");
+        if !hosts.contains(&named) {
+            hosts.push(named);
+        }
+    }
+    hosts
+}
+
+/// `authority` (a `Host` value, or an origin without its scheme) as
+/// lowercase `host:port`, port 80 when it names none.
+fn authority(text: &str) -> String {
+    let text = text.trim().to_ascii_lowercase();
+    let has_port = match text.rfind(']') {
+        Some(close) => text[close..].contains(':'),
+        None => text.contains(':'),
+    };
+    if has_port { text } else { format!("{text}:80") }
+}
+
+/// Whether a request with these `Host` and `Origin` headers may be served
+/// without the token: its `Host` names this server (`hosts`, from
+/// [`server_hosts`]) and its `Origin`, if any, is that same host over http.
+/// A page that rebinds its own name to 127.0.0.1 sends its own name as the
+/// `Host`; a page on another origin sends that origin.
+fn tokenless_request(host: Option<&str>, origin: Option<&str>, hosts: &[String]) -> bool {
+    let Some(host) = host.map(authority) else {
+        return false;
+    };
+    if !hosts.contains(&host) {
+        return false;
+    }
+    origin.is_none_or(|origin| {
+        origin
+            .trim()
+            .strip_prefix("http://")
+            .is_some_and(|rest| authority(rest) == host)
+    })
+}
+
+/// The value of `request`'s header `name`, if it has one.
+fn header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
         .headers()
         .iter()
-        .find(|header| header.field.equiv("Authorization"))
-        .and_then(|header| {
-            let (scheme, rest) = header.value.as_str().split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
-        });
-    [header, parameter(query, "token")]
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
+}
+
+/// Whether `request` carries `token`, as a bearer header or `?token=`.
+fn authorized(request: &Request, query: &str, token: &str) -> bool {
+    let bearer = header(request, "Authorization").and_then(|value| {
+        let (scheme, rest) = value.split_once(' ')?;
+        scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+    });
+    [bearer, parameter(query, "token")]
         .into_iter()
         .flatten()
         .any(|given| same_secret(given.as_bytes(), token.as_bytes()))
@@ -252,7 +424,8 @@ fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
         Some(url) => url,
         None => spawn_postgres::role_url(&controller, "spawn_reader")?,
     };
-    spawn_postgres::PostgresStore::connect(&url).map_err(|error| error.to_string())
+    spawn_postgres::PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
+        .map_err(|error| error.to_string())
 }
 
 fn handle(
@@ -260,27 +433,31 @@ fn handle(
     web: &Path,
     token: Option<&str>,
     port: Option<u16>,
+    hosts: &[String],
 ) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((path, query)) => (path, query),
         None => (url.as_str(), ""),
     };
-    // With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
-    // needs no token: a client running as the owner's uid can read the
-    // token file anyway. Another user's loopback client still needs it.
-    // Off by default.
-    let local = owners_own_request(request.remote_addr().copied(), port);
-    if let Some(token) = token
-        && path.starts_with("/api/")
-        && !local
-        && !authorized(&request, query, token)
-    {
-        let challenge =
-            Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header is valid");
-        return request
-            .respond(json_response(401, &json!({ "error": "unauthorized" })).with_header(challenge))
-            .map_err(|error| error.to_string());
+    if path.starts_with("/api/") {
+        // Without the token a read needs a Host that names this server and
+        // no foreign Origin (DNS rebinding, a local proxy); with it, any.
+        // With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
+        // needs no token: a client running as the owner's uid can read the
+        // token file anyway. Another user's loopback client still needs it.
+        // Off by default.
+        let named = tokenless_request(header(&request, "Host"), header(&request, "Origin"), hosts);
+        let open = match token {
+            None => named,
+            Some(token) => {
+                authorized(&request, query, token)
+                    || (named && owners_own_request(request.remote_addr().copied(), port))
+            }
+        };
+        if !open {
+            return refuse(request, token.is_some());
+        }
     }
     let answer = match path {
         "/api/overview" => overview(),
@@ -288,6 +465,7 @@ fn handle(
         "/api/rsi/pane" => rsi_pane(query),
         "/api/fleet" => fleet(),
         "/api/missions" => missions(),
+        "/api/events" => events(query),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 session(id, query)
@@ -311,6 +489,23 @@ fn handle(
     request
         .respond(json_response(status, &body))
         .map_err(|error| error.to_string())
+}
+
+/// Answer a refused API request: 401 with a bearer challenge when a token
+/// would let it in, 403 when no token is set (its Host or Origin is not this
+/// server's).
+fn refuse(request: Request, token_set: bool) -> Result<(), String> {
+    let response = if token_set {
+        let challenge =
+            Header::from_bytes("WWW-Authenticate", "Bearer").expect("static header is valid");
+        json_response(401, &json!({ "error": "unauthorized" })).with_header(challenge)
+    } else {
+        json_response(
+            403,
+            &json!({ "error": "forbidden: the Host or Origin does not name this server" }),
+        )
+    };
+    request.respond(response).map_err(|error| error.to_string())
 }
 
 fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -664,12 +859,15 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 }
 
 /// The fleet board: every session with its judgement and activity, plus
-/// fleet health and the decision ladder. Computed by SQL from storage.
+/// fleet health and the decision ladder. Computed by SQL from storage,
+/// except the health's `disk`: free space read now ([`crate::disk::report`]).
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
+    let mut health = store.fleet_health().map_err(err)?;
+    health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
     Ok(json!({
         "agents": store.fleet_board().map_err(err)?,
-        "health": store.fleet_health().map_err(err)?,
+        "health": health,
     }))
 }
 
@@ -819,6 +1017,73 @@ fn session(id: &str, query: &str) -> Result<Value, String> {
     }))
 }
 
+/// Where a read of the whole log starts: after a position, or at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogStart {
+    After(u64),
+    Since(i64),
+}
+
+/// The start and page size of `/api/events`: `after=<position>` or
+/// `since_ms=<epoch ms>` (not both), and `limit`, capped. A number that does
+/// not parse is the caller's mistake.
+fn log_window(query: &str) -> Result<(LogStart, usize), String> {
+    let number = |name: &str| -> Result<Option<i64>, String> {
+        parameter(query, name)
+            .map(|text| {
+                text.parse::<i64>()
+                    .ok()
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| format!("{BAD_REQUEST}bad {name} {text}"))
+            })
+            .transpose()
+    };
+    let start = match (number("after")?, number("since_ms")?) {
+        (Some(_), Some(_)) => return Err(format!("{BAD_REQUEST}after or since_ms, not both")),
+        (_, Some(since)) => LogStart::Since(since),
+        (after, None) => LogStart::After(after.unwrap_or(0).unsigned_abs()),
+    };
+    let limit = number("limit")?
+        .map_or(DEFAULT_LIMIT, |limit| {
+            usize::try_from(limit).unwrap_or(MAX_LIMIT)
+        })
+        .min(MAX_LIMIT);
+    Ok((start, limit))
+}
+
+/// Events of the whole log in log order, for the Show view: a page after a
+/// position, and `next`, the position to read after next time (the last
+/// one returned, or the start when nothing is newer). Read-only, through
+/// the reader login like every other answer.
+fn events(query: &str) -> Result<Value, String> {
+    let (start, limit) = log_window(query)?;
+    let store = open_store()?;
+    let after = match start {
+        LogStart::After(after) => GlobalPosition(after),
+        LogStart::Since(since) => store
+            .position_before(spawn_core::time::Timestamp(since))
+            .map_err(err)?,
+    };
+    let entries = store.log_after(after, limit).map_err(err)?;
+    let next = entries.last().map_or(after, |entry| entry.position);
+    let events: Vec<Value> = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.position.0,
+                "agent_id": entry.agent_id,
+                "session_id": entry.session_id,
+                "execution_id": entry.execution_id,
+                "source": entry.source,
+                "event_name": entry.event_name,
+                "detail": entry.detail,
+                "recorded_at_ms": entry.recorded_at.0,
+            })
+        })
+        .collect();
+    Ok(json!({ "events": events, "next": next.0, "now_ms": now_ms() }))
+}
+
 fn parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
@@ -878,8 +1143,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ProcSocket, access_token, is_loopback, local_exemption, objective_json, owner_uid,
-        peer_uid, proc_sockets, rsi_summary, same_secret, with_last_gates,
+        Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_LIMIT, ProcSocket, Shared, access_token,
+        handle, is_loopback, local_exemption, log_window, objective_json, owner_uid, peer_uid,
+        proc_sockets, rsi_summary, same_secret, serve_requests, server_hosts, tokenless_request,
+        with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1114,6 +1381,292 @@ mod tests {
             access_token("0.0.0.0:8787", Some("t".to_string())),
             Ok(Some("t".to_string()))
         );
+    }
+
+    /// Audit L11: a token the browser could never send as a header is
+    /// refused at start, the same rule as the UI's (web/src/token.ts).
+    #[test]
+    fn serve_refuses_a_token_no_browser_can_send() {
+        for good in [
+            "t",
+            "bb-serve-token-1",
+            &"a".repeat(512),
+            "!~#%&*+-./:=?@^_|",
+        ] {
+            assert!(
+                access_token("0.0.0.0:8787", Some(good.to_string())).is_ok(),
+                "{good}"
+            );
+        }
+        for bad in [
+            "",
+            "a b",
+            "a\nb",
+            "a\rb",
+            "a\u{0}b",
+            "a\tb",
+            "令牌",
+            "café",
+            &"a".repeat(513),
+        ] {
+            let refused =
+                access_token("127.0.0.1:8787", Some(bad.to_string())).expect_err("not a token");
+            assert!(refused.contains("visible ASCII"), "{bad:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn the_server_is_named_by_loopback_and_its_bound_address() {
+        let loopback = ["127.0.0.1:8787", "localhost:8787", "[::1]:8787"];
+        assert_eq!(server_hosts("127.0.0.1:8787", 8787), loopback);
+        assert_eq!(
+            server_hosts("0.0.0.0:8787", 8787),
+            loopback,
+            "a wildcard names nothing"
+        );
+        assert_eq!(server_hosts("[::]:8787", 8787), loopback);
+        assert_eq!(
+            server_hosts("192.168.1.10:0", 41000)
+                .last()
+                .map(String::as_str),
+            Some("192.168.1.10:41000"),
+            "the bound port, not the requested 0"
+        );
+        assert_eq!(
+            server_hosts("Spawn-Box:8787", 8787)
+                .last()
+                .map(String::as_str),
+            Some("spawn-box:8787")
+        );
+    }
+
+    #[test]
+    fn only_this_servers_host_and_origin_read_without_the_token() {
+        let hosts = server_hosts("192.168.1.10:8787", 8787);
+        for host in [
+            "127.0.0.1:8787",
+            "localhost:8787",
+            "LOCALHOST:8787",
+            "[::1]:8787",
+            "192.168.1.10:8787",
+        ] {
+            assert!(tokenless_request(Some(host), None, &hosts), "{host}");
+        }
+        // DNS rebinding: the page's own name reaches 127.0.0.1.
+        assert!(!tokenless_request(
+            Some("attacker.example:8787"),
+            None,
+            &hosts
+        ));
+        assert!(!tokenless_request(Some("attacker.example"), None, &hosts));
+        // Another port is another origin; no Host at all is refused.
+        assert!(!tokenless_request(Some("127.0.0.1:9999"), None, &hosts));
+        assert!(!tokenless_request(Some("localhost"), None, &hosts));
+        assert!(!tokenless_request(None, None, &hosts));
+        // Origin: the same host over http, or none; anything else is foreign.
+        let same = Some("http://127.0.0.1:8787");
+        assert!(tokenless_request(Some("127.0.0.1:8787"), same, &hosts));
+        assert!(tokenless_request(
+            Some("localhost:8787"),
+            Some("http://localhost:8787"),
+            &hosts
+        ));
+        for origin in [
+            "http://attacker.example",
+            "http://attacker.example:8787",
+            "http://localhost:8787",
+            "https://127.0.0.1:8787",
+            "null",
+        ] {
+            assert!(
+                !tokenless_request(Some("127.0.0.1:8787"), Some(origin), &hosts),
+                "{origin}"
+            );
+        }
+        // Port 80 is implied on both sides.
+        let web = server_hosts("127.0.0.1:80", 80);
+        assert!(tokenless_request(
+            Some("localhost"),
+            Some("http://localhost"),
+            &web
+        ));
+    }
+
+    /// Status of one GET of `path` from `serve`'s request handler with no
+    /// token set, sending `headers` (each line ending in CRLF, `PORT` replaced
+    /// by the server's port) and no other.
+    fn tokenless_status(path: &str, headers: &str) -> u16 {
+        use std::io::{Read, Write};
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let hosts = server_hosts("127.0.0.1:0", port);
+        let web = std::env::temp_dir();
+        let worker = std::thread::spawn(move || {
+            let request = server.recv().expect("request");
+            handle(request, &web, None, Some(port), &hosts).expect("answered");
+        });
+        let headers = headers.replace("PORT", &port.to_string());
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "GET {path} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).expect("read");
+        worker.join().expect("handler");
+        answer
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status line")
+    }
+
+    /// A server running `serve`'s own loop ([`serve_requests`]) with at most
+    /// `limit` requests at once, over a web directory holding a 64 MiB
+    /// `big.bin`. Returns the port and the directory.
+    fn serving(tag: &str, limit: usize) -> (u16, std::path::PathBuf) {
+        let web = std::env::temp_dir().join(format!("spawn-serve-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&web).expect("web");
+        std::fs::write(web.join("big.bin"), vec![0u8; 64 << 20]).expect("big file");
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Arc::new(Shared {
+            web: web.clone(),
+            token: None,
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+        });
+        std::thread::spawn(move || serve_requests(&server, &shared, limit));
+        (port, web)
+    }
+
+    /// A client that asks for `big.bin` and never reads the answer.
+    fn stalled_client(port: u16) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut stalled = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            stalled,
+            "GET /big.bin HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .expect("send");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        stalled
+    }
+
+    /// The status of a request answered without the store (a malformed
+    /// session id is 400), or `None` when no answer came within 3 s.
+    fn quick_status(port: u16) -> Option<u16> {
+        use std::io::{Read, Write};
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .expect("timeout");
+        write!(
+            client,
+            "GET /api/session/not%20a%20session HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut answer = [0u8; 12];
+        let read = client.read(&mut answer).ok()?;
+        std::str::from_utf8(&answer[..read])
+            .ok()?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    /// Audit M2: a client that asks for a large file and never reads it
+    /// holds one request's thread, not the server.
+    #[test]
+    fn a_client_that_stops_reading_does_not_stall_the_others() {
+        let (port, web) = serving("stall", 2);
+        let stalled = stalled_client(port);
+        let status = quick_status(port);
+        let _ = std::fs::remove_dir_all(&web);
+        drop(stalled);
+        assert_eq!(
+            status,
+            Some(400),
+            "a second client is answered while the first does not read"
+        );
+    }
+
+    /// With every slot held, the next request is told 503 at once, not
+    /// left waiting.
+    #[test]
+    fn a_request_past_the_limit_is_answered_busy() {
+        let (port, web) = serving("busy", 1);
+        let stalled = stalled_client(port);
+        let status = quick_status(port);
+        drop(stalled);
+        // The slot comes back once the stalled request ends.
+        let mut freed = None;
+        for _ in 0..50 {
+            freed = quick_status(port);
+            if freed == Some(400) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(&web);
+        assert_eq!(status, Some(503));
+        assert_eq!(freed, Some(400), "a freed slot serves again");
+    }
+
+    #[test]
+    fn a_rebound_or_cross_origin_api_read_is_refused_before_it_reaches_the_store() {
+        // A malformed session id answers 400 without a store: the request
+        // passed the guard.
+        let path = "/api/session/not%20a%20session";
+        assert_eq!(tokenless_status(path, "Host: 127.0.0.1:PORT\r\n"), 400);
+        assert_eq!(
+            tokenless_status(
+                path,
+                "Host: localhost:PORT\r\nOrigin: http://localhost:PORT\r\n"
+            ),
+            400
+        );
+        assert_eq!(
+            tokenless_status(path, "Host: attacker.example:PORT\r\n"),
+            403
+        );
+        assert_eq!(
+            tokenless_status(path, "Host: 127.0.0.1\r\n"),
+            403,
+            "port missing"
+        );
+        assert_eq!(tokenless_status(path, ""), 403, "no Host");
+        assert_eq!(
+            tokenless_status(
+                path,
+                "Host: 127.0.0.1:PORT\r\nOrigin: http://attacker.example\r\n"
+            ),
+            403
+        );
+    }
+
+    #[test]
+    fn the_log_reads_after_a_position_or_from_a_time_with_a_capped_page() {
+        assert_eq!(log_window(""), Ok((LogStart::After(0), DEFAULT_LIMIT)));
+        assert_eq!(
+            log_window("after=42&limit=10"),
+            Ok((LogStart::After(42), 10))
+        );
+        assert_eq!(
+            log_window("since_ms=1700000000000"),
+            Ok((LogStart::Since(1_700_000_000_000), DEFAULT_LIMIT))
+        );
+        assert_eq!(
+            log_window("limit=999999999999"),
+            Ok((LogStart::After(0), MAX_LIMIT))
+        );
+        for bad in ["after=-1", "after=x", "limit=ten", "since_ms=1&after=2"] {
+            let error = log_window(bad).expect_err(bad);
+            assert!(error.starts_with(BAD_REQUEST), "{bad}: {error}");
+        }
     }
 
     #[test]

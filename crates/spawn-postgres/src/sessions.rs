@@ -48,9 +48,36 @@ pub(crate) const TIMELINE: &str =
                   order by session_seq
                   limit $3";
 
+/// Log entries after a position, store-wide, in log order. A screen
+/// observation's evidence (the pane's text) is left out: the readers of
+/// the whole log draw what happened, not what a pane said.
+/// `$1` after, `$2` limit.
+pub(crate) const LOG_AFTER: &str =
+    "select id, agent_id, session_id, execution_id, source, event_name,
+            case when event_name = 'screen.observed' then (kind->'detail') - 'evidence'
+                 else kind->'detail' end as detail,
+            recorded_at_ms
+       from spawn_events
+      where id > $1
+      order by id
+      limit $2";
+
+/// The first event at or after a position. `$1` position.
+pub(crate) const FIRST_FROM: &str =
+    "select id, recorded_at_ms from spawn_events where id >= $1 order by id limit 1";
+
+/// The last position in the log.
+pub(crate) const LAST_POSITION: &str = "select coalesce(max(id), 0) as id from spawn_events";
+
 /// Everything the supervisor's liveness rule decides from.
 /// `$1` session, `$2` principal of the reviver.
-pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
+///
+/// `failures` counts, since the latest execution that did not die young
+/// (`died_young!`), the reviver's failed commands and the executions its
+/// succeeded commands started that died young: a revival is judged by
+/// whether its engine stayed up, not by whether it launched.
+pub(crate) const LIVENESS_FACTS: &str = concat!(
+    "with last_exec as (
                     select e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause
                       from agent_executions e
                      where e.session_id = $1
@@ -59,6 +86,20 @@ pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
                     select c.action ->> 'type' as kind
                       from spawn_commands c where c.session_id = $1
                      order by c.id desc limit 1
+                 ), healthy as (
+                    select coalesce(max(x.started_at_ms), 0) as since
+                      from agent_executions x
+                     where x.session_id = $1 and not ",
+    died_young!("x"),
+    "
+                 ), died as (
+                    select x.ended_at_ms
+                      from agent_executions x
+                      join spawn_commands c on c.id = x.command_id
+                     where x.session_id = $1 and c.principal = $2 and c.succeeded
+                       and x.started_at_ms > (select since from healthy) and ",
+    died_young!("x"),
+    "
                  )
                  select
                     exists (select 1 from spawn_commands c
@@ -72,11 +113,14 @@ pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
                                and e.event_name = 'session.native_started') as native_bound,
                     (select count(*) from spawn_commands c
                       where c.session_id = $1 and c.principal = $2 and c.succeeded = false
-                        and c.created_at_ms > coalesce((select started_at_ms from last_exec), 0)
-                    ) as failures,
-                    (select max(c.finished_at_ms) from spawn_commands c
-                      where c.session_id = $1 and c.principal = $2 and c.succeeded = false
-                    ) as last_failure_ms";
+                        and c.created_at_ms > (select since from healthy)
+                    ) + (select count(*) from died) as failures,
+                    greatest(
+                      (select max(c.finished_at_ms) from spawn_commands c
+                        where c.session_id = $1 and c.principal = $2 and c.succeeded = false),
+                      (select max(ended_at_ms) from died)
+                    ) as last_failure_ms"
+);
 
 /// Commands one principal submitted, newest first, as one JSON array.
 /// `$1` principal, `$2` limit.
@@ -149,6 +193,27 @@ pub struct TimelineEntry {
     pub execution_id: Option<ExecutionId>,
     /// Writer of the event, as stored: a source this build no longer knows
     /// still shows.
+    pub source: String,
+    /// Dotted event name.
+    pub event_name: String,
+    /// Event payload without the name.
+    pub detail: Option<serde_json::Value>,
+    /// Time the event was recorded.
+    pub recorded_at: Timestamp,
+}
+
+/// One event of the whole log, from [`PostgresStore::log_after`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    /// Global position; the keyset cursor.
+    pub position: GlobalPosition,
+    /// Owning agent, as stored.
+    pub agent_id: String,
+    /// Owning session, as stored.
+    pub session_id: String,
+    /// Owning execution, as stored.
+    pub execution_id: Option<String>,
+    /// Writer of the event, as stored.
     pub source: String,
     /// Dotted event name.
     pub event_name: String,
@@ -282,6 +347,58 @@ impl PostgresStore {
             })
         })
         .collect()
+    }
+
+    /// Up to `limit` events of the whole log after `after`, in log order.
+    pub fn log_after(
+        &self,
+        after: GlobalPosition,
+        limit: usize,
+    ) -> Result<Vec<LogEntry>, StoreError> {
+        self.query(LOG_AFTER, &[&bigint(after.0), &bigint(limit)])?
+            .iter()
+            .map(|row| {
+                Ok(LogEntry {
+                    position: global_position(row, "id"),
+                    agent_id: row.get("agent_id"),
+                    session_id: row.get("session_id"),
+                    execution_id: row.get("execution_id"),
+                    source: row.get("source"),
+                    event_name: row
+                        .get::<_, Option<String>>("event_name")
+                        .unwrap_or_default(),
+                    detail: row.get("detail"),
+                    recorded_at: Timestamp(row.get("recorded_at_ms")),
+                })
+            })
+            .collect()
+    }
+
+    /// The position just before the first event recorded at or after `at`:
+    /// reading the log after it starts at that time. The last position when
+    /// nothing is that recent.
+    ///
+    /// Positions are assigned in record order, so record times rise with
+    /// them; a binary search over the primary key finds the boundary in a
+    /// few dozen index reads, with no index on the time.
+    pub fn position_before(&self, at: Timestamp) -> Result<GlobalPosition, StoreError> {
+        let last = self.query_one(LAST_POSITION, &[])?.get::<_, i64>("id");
+        // Every position below `low` was recorded before `at`; every one
+        // from `high` on at or after it.
+        let (mut low, mut high) = (0_i64, last.saturating_add(1));
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match self.query_opt(FIRST_FROM, &[&middle])? {
+                Some(row)
+                    if row.get::<_, i64>("id") < high
+                        && row.get::<_, i64>("recorded_at_ms") < at.0 =>
+                {
+                    low = row.get::<_, i64>("id") + 1;
+                }
+                _ => high = middle,
+            }
+        }
+        Ok(GlobalPosition((low - 1).max(0).unsigned_abs()))
     }
 
     /// Facts the supervisor's liveness rule decides from, all from storage.

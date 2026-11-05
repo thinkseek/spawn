@@ -42,7 +42,7 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 **其他场景。** `check-*` 是不变式，必须通过。标了 `# rsi: ratchet` 的场景和基线上也失败的目标场景跳过：没人解决的目标不算回归。
 
-**候选自己的测试和 lint 也判它。** `check-tests` 与 `check-clippy` 必须通过；可运行的测试数不得少于基线；lint 配置不得改（`[lints]` 表、`clippy.toml`、新增的 crate 级 `#![allow]`、删掉的 `#![deny]`）。任务的判据仍是它的场景，测试只防回归。
+**候选自己的测试和 lint 也判它。** `check-tests` 与 `check-clippy` 必须通过；可运行的测试数不得少于基线，基线的每个测试名在候选上仍须可运行（改名、移到别的模块路径都算删）；diff 新增或改动的测试函数体不得为空（`{}`、只有注释或 `;`；`assert!(true)` 这类不算空，查不出）；lint 配置不得改（`[lints]` 表、`clippy.toml`、新增的 crate 级 `#![allow]`、删掉的 `#![deny]`）。任务的判据仍是它的场景，测试只防回归。
 
 **指标。** 候选的任务运行在 stdout 恰好打印一行 `METRIC` 时，裁决带上它；积分器只从裁决里读指标，不读场景输出。
 
@@ -53,9 +53,9 @@ output=$("$SPAWN_BIN" version) || exit 1
 **门禁沙箱。** 候选控制的一切（构建钩子、场景、检查、对候选清单的 `cargo metadata`）都在 bubblewrap 里运行：
 
 - 根目录只读，`/tmp` 私有，新的 PID 命名空间（`/proc` 里看不到门禁和积分器）；
-- 被测树是唯一可写路径，基线树只读；用户运行时目录、docker socket、宿主的 `TMPDIR` 被遮住；
+- 被测树是唯一可写路径，基线树只读；`/run`（含用户运行时目录、docker socket、系统总线）、`/var/tmp`、宿主的 `TMPDIR` 是空 tmpfs；启动时在沙箱里扫一遍仍可 connect 的 Unix socket 并逐个遮住：除测试库那一个 socket 文件外，宿主的 socket 一个都连不到（只读挂载挡不住 connect）；
 - `$HOME` 是空 tmpfs，只读绑回 Rust 工具链、node/npm 的安装目录、控制器的 `scripts` 与 `web/node_modules`；
-- 新的网络命名空间，只有回环：线上数据库、`spawn serve`、Jev 中继都连不到；测试数据库只经它的 Unix socket 进入；
+- 新的网络命名空间，只有回环：线上数据库、`spawn serve`、Jev 中继都连不到；测试数据库只经一个 Unix socket 进入：socket 地址只绑那一个 `.s.PGSQL.<port>` 文件，TCP 地址（127.0.0.1、localhost、[::1]、主机名）由门禁在沙箱外转发到一个 socket；
 - 环境变量清空到白名单；cargo 用私有 `CARGO_HOME`，注册表缓存只读、离线构建；
 - 裁决写到积分器自己的目录（沙箱看不到），积分器只信那个文件，且只在门禁退出 0 时信。
 
@@ -63,7 +63,7 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 **剩余风险。** 沙箱与积分器同一个 uid，没有用户命名空间。门禁还拒绝改 `rsi/`、`scripts/rsi/`、`scripts/blackbox/`、`scripts/e2e.sh`、任何 `build.rs`、`.cargo/` 和 Cargo.toml 里的 `build` 键。落地只移动任务源的 `main`；线上二进制只在 owner 运行 `deploy/deploy.sh` 时更换。黑盒场景只证明被覆盖的行为正确，不证明无恶意，缓解只能是人审抽样。
 
-**agent 一侧。** RSI 的常驻 worker 是普通 worker，受同一 uid 的限制（fleet-architecture.md §8）；设置 `SPAWN_EXEC_IMAGE` 时在容器里运行。
+**agent 一侧。** RSI 的常驻 worker 是普通 worker，受同一 uid 的限制（fleet-architecture.md §8）。
 
 **不给 `SYS_ADMIN`，不用 FUSE，不用 overlay。** 工作区由 `git archive` 导出，已经够用。实测 `--device /dev/fuse --cap-add SYS_ADMIN` 在 `overlay2` 存储驱动上挂 overlay 返回 `Invalid argument`；而且 `SYS_ADMIN` 接近宿主 root，抵消隔离。
 

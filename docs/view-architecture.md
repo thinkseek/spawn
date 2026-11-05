@@ -12,7 +12,7 @@
 | 写入函数 | 同上，`spawn_append`、`spawn_submit`、`spawn_claim`、`spawn_finish` | 生产事件与命令状态 |
 | 授权表 | 同上，`spawn_grants` 与触发器 `spawn_gateway_insert` | 写入门禁 |
 | 投影与视图 | 同上，`spawn_session_state`、`agent_*`、`spawn_read_*` | 读模型 |
-| 端口定义 | [port.rs](../crates/spawn-core/src/port.rs) | `EventLog`、`CommandQueue`、`WorkspaceStore`、`ChunkStore`、`TerminalHost` |
+| 端口定义 | [port.rs](../crates/spawn-core/src/port.rs) | `EventLog`、`CommandQueue`、`WorkspaceStore`、`TerminalHost` |
 | 一致性套件 | [contract.rs](../crates/spawn-core/src/contract.rs) | 四个端口（日志、队列、工作区、终端）的共用断言，内存实现与 PG 实现都跑 |
 | 查询子命令 | [inspect.rs](../crates/spawn-cli/src/commands/inspect.rs) | `fleet`、`tail` 经 grant 过滤的 `spawn_read_*` 读舰队与单个会话 |
 | 门禁 | [gate.sh](../scripts/rsi/gate.sh) 与 [rsi/scenarios](../rsi/scenarios) | 构建、clippy、测试、e2e、黑盒、web |

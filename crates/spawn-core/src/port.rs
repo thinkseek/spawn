@@ -91,6 +91,13 @@ pub enum WorkspaceError {
     Unavailable(String),
 }
 
+/// The [`WorkspaceError::Refused`] code of a checkpoint of a workspace that
+/// can no longer follow its branch (another writer moved the branch under a
+/// merge, and the directory differs from both sides). The store has kept the
+/// directory's state off the branch before refusing, so nothing is lost by
+/// unmounting it; the execution cannot checkpoint again and is ended.
+pub const WORKSPACE_STALE: &str = "WorkspaceStale";
+
 /// Result of a workspace commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Commit {
@@ -142,7 +149,8 @@ impl ForkFrom {
     }
 }
 
-/// Result of [`WorkspaceStore::merge_base`].
+/// Result of [`WorkspaceStore::merge_main_clean`] (and of the mounted-workspace
+/// [`WorkspaceStore::merge_base`], which the Bridge no longer calls).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BaseMerge {
     /// The branch already contains the source's `main`.
@@ -192,9 +200,22 @@ pub trait WorkspaceStore: Send + Sync {
     /// Unmount the workspace. Committed state stays on the branch.
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError>;
 
-    /// Merge the base (the source's `main`) into the branch of a mounted,
-    /// idle workspace whose state is committed: the directory first, then
-    /// the branch. A content conflict writes the merge with conflict markers
+    /// Merge `main` into `branch`, which is not mounted, only when the merge
+    /// is clean: the branch moves to the merge commit
+    /// ([`BaseMerge::Merged`]). A conflict of any kind changes nothing and
+    /// is answered as [`BaseMerge::Conflicted`] with `marked: false`. The
+    /// Bridge calls it when an execution starts or resumes, before the
+    /// mount: that is the only way main reaches an agent's branch. A store
+    /// without a moving base is always current.
+    fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
+        let _ = branch;
+        Ok(BaseMerge::Current)
+    }
+
+    /// Not called by the Bridge: main is merged only at a start or resume
+    /// ([`Self::merge_main_clean`]). Merge the base into the branch of a
+    /// mounted, idle workspace whose state is committed: the directory
+    /// first, then the branch. A content conflict writes the merge with conflict markers
     /// into the directory and leaves the branch where it is; the checkpoint
     /// after the markers are resolved commits the merge (see
     /// [`BaseMerge::Conflicted`]). A directory that differs from the branch,
@@ -204,67 +225,22 @@ pub trait WorkspaceStore: Send + Sync {
         let _ = workspace;
         Ok(BaseMerge::Current)
     }
-}
 
-/// Chunk store failure.
-#[derive(Debug, Error)]
-pub enum ChunkError {
-    /// No object has this name.
-    #[error("chunk {0} is missing")]
-    Missing(String),
-    /// The object's bytes do not hash to its name, or the name is not a hash.
-    #[error("chunk {0} is corrupt")]
-    Corrupt(String),
-    /// The backend could not run.
-    #[error("chunk store unavailable: {0}")]
-    Unavailable(String),
-}
+    /// What the store must tell the agent of the workspace and has not yet
+    /// (a file a checkpoint left out), each notice once: a notice taken is
+    /// not returned again. A store with nothing to tell returns none.
+    fn take_notices(&self, workspace: &WorkspaceId) -> Vec<String> {
+        let _ = workspace;
+        Vec::new()
+    }
 
-/// One object a chunk store holds, as a collection sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredObject {
-    /// Its name: the hash of its bytes.
-    pub name: String,
-    /// Time since it was written or last used (a `put` of the same content,
-    /// a [`ChunkStore::touch`]).
-    pub age: Duration,
-    /// Bytes it takes in the store.
-    pub bytes: u64,
-}
-
-/// Content-addressed object store for large files (docs/storage.md).
-///
-/// An object is named by the hash of its bytes, written once and never
-/// changed. Every read is verified: bytes that do not hash to the name are an
-/// error, never an answer. A local directory first, any S3-compatible bucket
-/// later, behind this one port.
-///
-/// Objects are collected (`spawn chunks gc`) when no reachable commit names
-/// them and they are older than a grace period, so every use restarts an
-/// object's age: chunks are written before the commit that names them.
-pub trait ChunkStore: Send + Sync + std::fmt::Debug {
-    /// Store `bytes` unless a sound object of the same content exists; its
-    /// name. A corrupt object of that content is replaced; a sound one is
-    /// made young again.
-    fn put(&self, bytes: &[u8]) -> Result<String, ChunkError>;
-
-    /// The bytes of the object `name`, verified against the name.
-    fn get(&self, name: &str) -> Result<Vec<u8>, ChunkError>;
-
-    /// Whether an object `name` is stored (not verified).
-    fn contains(&self, name: &str) -> Result<bool, ChunkError>;
-
-    /// Make the object `name` young again, as a `put` of its content would;
-    /// false when the store does not hold it.
-    fn touch(&self, name: &str) -> Result<bool, ChunkError>;
-
-    /// Every object the store holds, with its age and size.
-    fn list(&self) -> Result<Vec<StoredObject>, ChunkError>;
-
-    /// Remove the object `name` only if it is still at least `older_than`
-    /// old, read again just before it goes: the bytes freed, or `None` when
-    /// it was kept (made young meanwhile, or already gone).
-    fn remove_if_older(&self, name: &str, older_than: Duration) -> Result<Option<u64>, ChunkError>;
+    /// The commit `branch` points at, `None` when the branch does not exist
+    /// (or the store cannot tell). The Bridge compares it at recovery with
+    /// the last commit the log recorded for the branch.
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        let _ = branch;
+        Ok(None)
+    }
 }
 
 /// Terminal failure.
@@ -347,10 +323,61 @@ pub trait TerminalHost: Send + Sync {
         offset: u64,
     ) -> Result<Option<Vec<u8>>, TerminalError>;
 
+    /// Create the file at `path`, as the terminal's process sees it, with
+    /// its missing parent directories, holding `bytes`, unless something is
+    /// at `path` already: whether it was written. Never replaces what is
+    /// there, and the file appears whole or not at all. How the Bridge puts
+    /// back an engine's transcript from the archive before a resume.
+    fn write_new(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<bool, TerminalError>;
+
     /// Kill the terminal and its process. A missing terminal is not an error.
     fn terminate(
         &self,
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<(), TerminalError>;
+}
+
+/// Transcript archive failure.
+#[derive(Debug, Error)]
+#[error("transcript archive: {0}")]
+pub struct ArchiveError(pub String);
+
+/// Durable copies of engines' native transcripts, beside the workspace
+/// store ([`crate::transcripts`]). Each native session of an agent has
+/// numbered copies, oldest first: copy 0 is the transcript as the Bridge
+/// first saw it, and a later copy holds the whole file again after it
+/// shrank or was replaced. A copy only grows; archived bytes never change.
+pub trait TranscriptArchive: Send + Sync {
+    /// The length of each copy of the transcript of `native`, oldest first;
+    /// empty when none is archived.
+    fn copies(&self, agent: &AgentId, native: &str) -> Result<Vec<u64>, ArchiveError>;
+
+    /// At most `limit` bytes of copy `copy` from byte `offset`.
+    fn read(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>, ArchiveError>;
+
+    /// Append `bytes` to copy `copy`, which must hold exactly `at` bytes (a
+    /// new copy: the next number, at 0), and make them durable. Any other
+    /// `at`, or a copy number past the next, is refused: nothing archived is
+    /// overwritten.
+    fn append(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        at: u64,
+        bytes: &[u8],
+    ) -> Result<(), ArchiveError>;
 }

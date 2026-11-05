@@ -119,6 +119,21 @@ fn started(store: &MemoryStore) {
             command_id: CommandId(1),
             fork: None,
             model: ModelProfile::Default,
+            transcript_from: None,
+        },
+    );
+}
+
+/// The engine named its native session and transcript.
+fn native(store: &MemoryStore) {
+    append(
+        store,
+        Source::Bridge,
+        EventKind::NativeSessionStarted {
+            engine: ENGINE.to_string(),
+            native_session_id: "n1".to_string(),
+            transcript_path: Some("/root/.claude/projects/w/n1.jsonl".to_string()),
+            engine_version: None,
         },
     );
 }
@@ -196,7 +211,7 @@ fn a_stalled_end_asks_for_attention_until_the_execution_ends() {
             cause: EndCause::Exited,
             exit_code: Some(0),
             failures: 20,
-            error: "commit unavailable: chunk store: No space left on device".to_string(),
+            error: "commit unavailable: No space left on device".to_string(),
         },
     );
     fixture.observer.tick().expect("tick");
@@ -692,9 +707,62 @@ impl ObservationContext for Supervisor {
         None
     }
 
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        Some("The build is green.\nHUMAN: which region?".to_string())
+    }
+
     fn perpetual(&self, _session: &SessionId) -> bool {
         true
     }
+}
+
+/// A session whose screen shows a tool's output with a `HUMAN:` line, and
+/// whose model wrote no question.
+struct ToolOutput;
+
+impl ObservationContext for ToolOutput {
+    fn screen_tail(&self, _session: &SessionId) -> Option<String> {
+        Some(
+            "you: show the notes\ntool: Bash (cat NOTES.md)\nHUMAN: ask about the region\n\
+             claude: Those are the notes.\n$ "
+                .to_string(),
+        )
+    }
+
+    fn task(&self, _session: &SessionId) -> Option<String> {
+        None
+    }
+
+    fn reply(&self, _workspace: &WorkspaceId, _transcript: &str) -> Option<String> {
+        Some("Those are the notes.".to_string())
+    }
+}
+
+/// The question for a person is the model's own: a `HUMAN:` line in a
+/// tool's output on the screen (audit, the `HUMAN:` sibling of H2) is not.
+#[test]
+fn a_human_line_in_a_tools_output_asks_nobody() {
+    let judge = Scripted::new(Ok(Judgement {
+        state: SemanticState::Waiting,
+        confidence: confidence(0.9),
+        probabilities: None,
+        needs_human: Some(0.05),
+        stuck: Some(0.05),
+    }));
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let log: Arc<dyn EventLog> = store.clone();
+    let mut observer = Observer::new(log)
+        .with_judge(judge)
+        .with_clock(clock)
+        .with_context(Arc::new(ToolOutput));
+    started(&store);
+    native(&store);
+    turn_stopped(&store);
+    observer.tick().expect("tick");
+    let last = observations(&store).pop().expect("an observation");
+    assert_eq!(last.human_question, None);
+    assert_ne!(last.attention_reason.as_deref(), Some("human_question"));
 }
 
 #[test]
@@ -715,6 +783,7 @@ fn a_perpetual_session_is_never_completed_and_its_question_pages() {
         .with_clock(clock)
         .with_context(Arc::new(Supervisor));
     started(&store);
+    native(&store);
     turn_stopped(&store);
     observer.tick().expect("tick");
     let last = observations(&store).pop().expect("an observation");
@@ -814,34 +883,47 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
     let judge = Scripted::new(Ok(blocked_answer()));
     let mut fixture = fixture(judge);
     started(&fixture.store);
-    let in_execution = |command: u64, kind: EventKind| {
+    let in_execution = |command: u64, source: Source, kind: EventKind| {
         fixture
             .store
             .append(NewEvent {
                 agent_id: agent(),
                 session_id: session(),
                 execution_id: Some(ExecutionId::for_command(CommandId(command))),
-                source: Source::Bridge,
+                source,
                 source_event_id: None,
                 kind,
             })
             .expect("append succeeds");
     };
+    // Execution 1 is ended as lost; its runner's exit report reaches the
+    // log only after execution 2 started.
+    in_execution(
+        1,
+        Source::Bridge,
+        EventKind::ExecutionEnded {
+            cause: EndCause::Lost,
+            exit_code: None,
+        },
+    );
     in_execution(
         2,
+        Source::Bridge,
         EventKind::ExecutionStarted {
             engine: ENGINE.to_string(),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(2),
             fork: None,
             model: ModelProfile::Default,
+            transcript_from: None,
         },
     );
     in_execution(
         1,
+        Source::Claude,
         EventKind::ExecutionEnded {
-            cause: EndCause::Stopped,
-            exit_code: None,
+            cause: EndCause::Exited,
+            exit_code: Some(0),
         },
     );
     fixture.observer.tick().expect("tick");

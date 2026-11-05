@@ -1,0 +1,17 @@
+[Unit]
+Description=Spawn: routine cleanup of what Spawn writes (the gate's leftover scratch, old deploy dumps)
+After=spawn-loop.service
+
+[Service]
+Type=oneshot
+# Run from the checkout, like the gate (scripts/ is protected: no candidate
+# changes it). It sources scripts/disk.sh beside it.
+WorkingDirectory=%h/projects/Spawn
+ExecStart=%h/projects/Spawn/scripts/maintenance.sh
+# TMPDIR (the integrator's, so the gate's scratch is found), SPAWN_BACKUP_DIR
+# and any SPAWN_MAINTENANCE_*.
+EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=1h
+Nice=10
+IOSchedulingClass=idle

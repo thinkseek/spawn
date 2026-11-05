@@ -99,6 +99,24 @@ impl ModelProfile {
     }
 }
 
+/// A step of a command's handling the Bridge records, so that a retried
+/// command (its lease expired, its tick failed) or a restarted Bridge knows
+/// which irreversible effects already happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStep {
+    /// The start mounted its workspace (`workspace` on the record). A mount
+    /// with no `execution.started` of the command and no
+    /// [`CommandStep::MountReleased`] is unmounted when the Bridge recovers.
+    Mounted,
+    /// That mount went again before an execution used it.
+    MountReleased,
+    /// The Bridge is about to type the command's prompt or input.
+    Typing,
+    /// The typing succeeded.
+    Typed,
+}
+
 /// Why a checkpoint commit was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,8 +127,8 @@ pub enum CheckpointReason {
     TurnStopped,
     /// The execution ended.
     ExecutionEnded,
-    /// The source's `main` moved and was merged into the idle branch after a
-    /// turn ended (docs/storage.md, "Main into branches automatically").
+    /// `main` was merged into the agent's branch: when an execution starts or
+    /// resumes, and only cleanly (older records: into an idle workspace).
     BaseMerged,
 }
 
@@ -152,7 +170,10 @@ pub struct Fork {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "detail")]
 pub enum EventKind {
-    /// A native engine session started or resumed.
+    /// A native engine session started or resumed. The Bridge records a
+    /// new session before its engine starts, without a version; each
+    /// execution's first transcript line that names the engine's version
+    /// records the session again with it (a resume included).
     #[serde(rename = "session.native_started")]
     NativeSessionStarted {
         /// Engine that owns the native session: [`ENGINE`].
@@ -161,6 +182,11 @@ pub enum EventKind {
         native_session_id: String,
         /// Transcript path when the engine reports one.
         transcript_path: Option<String>,
+        /// The engine's version, as its transcript names it (Claude Code's
+        /// `version` field); unset when not read yet, and in records from
+        /// before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine_version: Option<String>,
     },
     /// A native engine session ended.
     #[serde(rename = "session.native_ended")]
@@ -177,18 +203,18 @@ pub enum EventKind {
     /// A prompt reached the engine.
     #[serde(rename = "message.received")]
     MessageReceived,
-    /// The Bridge typed a prompt that opens with the merge notice
-    /// ([`crate::ingest::MERGE_NOTICE_OPENING`]): what merges of main changed
-    /// in the agent's workspace, up to and including the event at `through`.
-    /// The notice stays due until that prompt reaches the engine.
+    /// Read only, in records written before main stopped being merged into
+    /// running workspaces: nothing writes it, and folds ignore it. The
+    /// Bridge typed a prompt that opened with a merge notice, telling of
+    /// the merges up to and including the event at `through`.
     #[serde(rename = "notice.typed")]
     NoticeTyped {
         /// The last merge event the typed notice told of.
         through: GlobalPosition,
     },
-    /// A prompt that opens with the merge notice reached the engine: the
-    /// notice the Bridge typed last is delivered. Read from the engine's
-    /// transcript, never inferred from any prompt.
+    /// Read only, like [`EventKind::NoticeTyped`]: nothing writes it, and
+    /// folds ignore it. A prompt that opened with the merge notice reached
+    /// the engine: the notice the Bridge typed last was delivered.
     #[serde(rename = "notice.received")]
     NoticeReceived,
     /// The engine asked for attention, for example a permission prompt.
@@ -253,6 +279,13 @@ pub enum EventKind {
         /// Models the engine runs on; left out for the default profile.
         #[serde(default, skip_serializing_if = "ModelProfile::is_default")]
         model: ModelProfile,
+        /// The length of the engine's transcript when the execution started
+        /// (a resumed session's file holds the earlier executions' lines):
+        /// the execution's lines are the ones after it. Left out for a
+        /// transcript that did not exist yet, and by records made before it
+        /// was kept (read from the start of the file).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript_from: Option<u64>,
     },
     /// The execution ended.
     #[serde(rename = "execution.ended")]
@@ -261,6 +294,26 @@ pub enum EventKind {
         cause: EndCause,
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
+    },
+    /// An ending execution's final checkpoint committed and its terminal is
+    /// gone; the unmount comes next. An end recovered after this record
+    /// does not checkpoint again (the workspace may be gone already): it
+    /// unmounts and records `execution.ended`.
+    #[serde(rename = "execution.unmounting")]
+    ExecutionUnmounting,
+    /// A step of a command's handling ([`CommandStep`]), keyed
+    /// `cmd_<id>:<step>`: written before the effect for an intent
+    /// (`typing`), after it for a completion.
+    #[serde(rename = "command.step")]
+    CommandStepped {
+        /// The command.
+        command_id: CommandId,
+        /// The step.
+        step: CommandStep,
+        /// For [`CommandStep::Mounted`] and [`CommandStep::MountReleased`]:
+        /// the workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceId>,
     },
     /// The final checkpoint of an ending execution kept failing: the
     /// terminal is down, the workspace stays mounted with everything it
@@ -285,18 +338,19 @@ pub enum EventKind {
         reason: CheckpointReason,
         /// Commit reference.
         artifact: ArtifactRef,
-        /// For a merge of main (`base_merged`): the files it changed in the
-        /// workspace, under the agent.
+        /// For a merge of main (`base_merged`): the files it changed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
     },
-    /// Merging the source's `main` into an idle workspace conflicted.
+    /// Merging the source's `main` into an agent's branch at a start or
+    /// resume conflicted: the branch stayed as it was.
     #[serde(rename = "merge.conflicted")]
     MergeConflicted {
         /// Conflicting paths.
         files: Vec<String>,
-        /// The workspace now holds the merge, with conflict markers in
-        /// `files`; false: a conflict markers cannot show, nothing changed.
+        /// Always false now. True only in records written while main was
+        /// merged into running workspaces: that workspace held the merge with
+        /// conflict markers in `files`.
         marked: bool,
     },
     /// The SQL gateway accepted a command.
@@ -359,6 +413,8 @@ impl EventKind {
             Self::ExecutionStarted { .. } => "execution.started",
             Self::ExecutionEnded { .. } => "execution.ended",
             Self::ExecutionEndStalled { .. } => "execution.end_stalled",
+            Self::ExecutionUnmounting => "execution.unmounting",
+            Self::CommandStepped { .. } => "command.step",
             Self::ArtifactCommitted { .. } => "artifact.committed",
             Self::MergeConflicted { .. } => "merge.conflicted",
             Self::CommandAccepted { .. } => "command.accepted",

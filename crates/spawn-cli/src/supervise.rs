@@ -134,8 +134,7 @@ Tools (run them with Bash; they go through your restricted login):
 - `{spawn} submit --agent <agent> --session <session> --key <unique> --action '{{\"type\":\"stop\"}}'` \
 — stop a worker if you must (input to workers goes through tasks). An agent whose `fleet` \
 attention says `end_stalled` has ended but its final checkpoint keeps failing: its workspace \
-stays mounted and holds work that is on no branch. Fix the cause if you can (a full disk, the \
-chunk store); `{{\"type\":\"discard\"}}` unmounts it and loses that work, so send it only \
+stays mounted and holds work that is on no branch. Fix the cause if you can (a full disk); `{{\"type\":\"discard\"}}` unmounts it and loses that work, so send it only \
 when the work may go.
 
 Boundaries:
@@ -386,6 +385,29 @@ mod tests {
         };
         assert_eq!(
             decide(&exhausted, 10_000_000),
+            Revive::Start { handoff: true }
+        );
+    }
+
+    /// Revivals whose engines died at once count as failures
+    /// (`LIVENESS_FACTS`), though each resume command succeeded: they back
+    /// off, longer each time, and the third hands off to a new session.
+    #[test]
+    fn revivals_that_die_at_once_back_off_then_hand_off() {
+        let died = |failures: u32| LivenessFacts {
+            failures,
+            last_failure_ms: Some(100_000),
+            cause: Some("lost".to_string()),
+            last_kind: Some("resume".to_string()),
+            ..facts()
+        };
+        assert_eq!(decide(&died(1), 100_000 + 19_000), Revive::Nothing);
+        assert_eq!(decide(&died(1), 100_000 + 20_000), Revive::Resume);
+        assert_eq!(decide(&died(2), 100_000 + 20_000), Revive::Nothing);
+        assert_eq!(decide(&died(2), 100_000 + 40_000), Revive::Resume);
+        assert_eq!(decide(&died(3), 100_000 + 79_000), Revive::Nothing);
+        assert_eq!(
+            decide(&died(3), 100_000 + 80_000),
             Revive::Start { handoff: true }
         );
     }

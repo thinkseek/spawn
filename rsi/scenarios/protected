@@ -3,12 +3,16 @@
 # the backlog and scenarios, the gate and every helper it or its checks
 # source from the controller's checkout (scripts/), the deploy and backup
 # scripts, the relays and the systemd units (deploy/, scripts/*.py), and the
-# UI build's configuration, which deploy.sh executes (web/ config files).
+# UI build's configuration, which deploy.sh executes (all of web/ but its
+# sources: vite.config.js and postcss.config.js load on their own),
+# and what picks or configures the Rust toolchain that builds the candidate
+# as the owner at deploy (rust-toolchain files, .cargo/).
 rsi/
 scripts/
 deploy/
-web/vite.config.ts
-web/package.json
-web/pnpm-lock.yaml
-web/pnpm-workspace.yaml
-web/tsconfig.json
+web/
+!web/src/
+!web/index.html
+rust-toolchain
+rust-toolchain.toml
+.cargo/

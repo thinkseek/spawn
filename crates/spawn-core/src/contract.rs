@@ -90,6 +90,89 @@ pub fn event_log(tag: &str, log: &dyn EventLog) {
         tail.iter()
             .all(|record| record.position > second.record.position)
     );
+
+    // Free text is stored with its credentials redacted.
+    let mut failed = message(tag, 1);
+    failed.kind = EventKind::ToolFailed {
+        tool_use_id: format!("{tag}_tool_2"),
+        error: "psql postgres://spawn:hunter2@db/spawn: PGPASSWORD=hunter2".to_string(),
+    };
+    let stored = log.append(failed).expect("append succeeds");
+    let read = log
+        .read_global(GlobalPosition(stored.record.position.0 - 1), 1)
+        .expect("read succeeds");
+    for kind in [&stored.record.event.kind, &read[0].event.kind] {
+        assert!(
+            matches!(kind, EventKind::ToolFailed { error, .. }
+                if !error.contains("hunter2") && error.contains("[redacted]")),
+            "stored redacted: {kind:?}"
+        );
+    }
+}
+
+/// One active execution per session, held by the log: `execution.started`
+/// is refused while the session's latest execution has no `execution.ended`
+/// the Bridge wrote. A runner's exit report frees nothing; the Bridge's end
+/// (of a lost execution too) does; a repeated start key is no second start.
+pub fn one_execution(tag: &str, log: &dyn EventLog) {
+    let execution = |name: &str| {
+        crate::id::ExecutionId::new(format!("exec_{tag}_{name}")).expect("valid execution")
+    };
+    let event = |name: &str, source: Source, key: &str, kind: EventKind| NewEvent {
+        execution_id: Some(execution(name)),
+        source,
+        source_event_id: Some(format!("exec_{tag}_{name}:{key}")),
+        kind,
+        ..message(tag, 3)
+    };
+    let started = |name: &str| {
+        event(
+            name,
+            Source::Bridge,
+            "started",
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("w:/workspaces/w").expect("valid workspace"),
+                command_id: crate::id::CommandId(1),
+                fork: None,
+                model: crate::event::ModelProfile::Default,
+                transcript_from: None,
+            },
+        )
+    };
+    let ended = |name: &str, source: Source, cause| {
+        event(
+            name,
+            source,
+            "ended",
+            EventKind::ExecutionEnded {
+                cause,
+                exit_code: None,
+            },
+        )
+    };
+    let refused = |name: &str| {
+        matches!(
+            log.append(started(name)),
+            Err(crate::port::StoreError::Rejected(_))
+        )
+    };
+
+    let first = log.append(started("a")).expect("the first start is taken");
+    assert!(refused("b"), "a second start while a runs");
+    let again = log
+        .append(started("a"))
+        .expect("a repeated start key is no second start");
+    assert!(!again.inserted);
+    assert_eq!(again.record.position, first.record.position);
+    log.append(ended("a", Source::Claude, crate::event::EndCause::Exited))
+        .expect("a runner report");
+    assert!(refused("b"), "a runner's exit report is no end");
+    log.append(ended("a", Source::Bridge, crate::event::EndCause::Lost))
+        .expect("the Bridge ends a lost execution");
+    log.append(started("b"))
+        .expect("after the end, the next start (a resume) is taken");
+    assert!(refused("c"), "and b is the active one now");
 }
 
 /// Command queue rules: idempotent intake, one live lease per session,
@@ -162,17 +245,27 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
         "an old attempt must not finish the command"
     );
     queue
-        .finish(&renewed, &Outcome::Failed("worker stopped".to_string()))
+        .finish(
+            &renewed,
+            &Outcome::Failed("worker stopped: Bearer abcdefghijkl0123".to_string()),
+        )
         .expect("finish succeeds");
 
     let events = log
         .read_global(GlobalPosition(0), 100)
         .expect("read succeeds");
-    let finished = events
+    let finished: Vec<&EventKind> = events
         .iter()
-        .filter(|record| record.event.kind.name() == "command.finished")
-        .count();
-    assert_eq!(finished, 2);
+        .map(|record| &record.event.kind)
+        .filter(|kind| kind.name() == "command.finished")
+        .collect();
+    assert_eq!(finished.len(), 2);
+    assert!(
+        matches!(finished[1], EventKind::CommandFinished { error: Some(error), .. }
+            if error == "worker stopped: Bearer [redacted]"),
+        "a failure is stored redacted: {:?}",
+        finished[1]
+    );
 }
 
 /// Workspace rules: an unknown branch is refused; a new branch starts at
@@ -286,4 +379,89 @@ pub fn terminal(tag: &str, terminals: &dyn TerminalHost) {
     terminals
         .terminate(&terminal, &workspace)
         .expect("terminating a missing terminal is harmless");
+}
+
+/// Files through the terminal host: `write_new` creates a file (and its
+/// parent directories) that `read_from` then reads, and never replaces one
+/// that exists. `directory` is a scratch directory the host can write.
+pub fn terminal_files(tag: &str, terminals: &dyn TerminalHost, directory: &str) {
+    let workspace = WorkspaceId::new("1:/workspaces/1").expect("valid workspace");
+    let path = format!(
+        "{}/{tag}/projects/n1.jsonl",
+        directory.trim_end_matches('/')
+    );
+    assert!(
+        terminals
+            .read_from(&workspace, &path, 0)
+            .expect("read succeeds")
+            .is_none()
+    );
+    assert!(
+        terminals
+            .write_new(&workspace, &path, b"{\"a\":1}\n")
+            .expect("write succeeds"),
+        "a missing file is written"
+    );
+    assert!(
+        !terminals
+            .write_new(&workspace, &path, b"other")
+            .expect("write succeeds"),
+        "an existing file is not"
+    );
+    assert_eq!(
+        terminals
+            .read_from(&workspace, &path, 0)
+            .expect("read succeeds"),
+        Some(b"{\"a\":1}\n".to_vec()),
+        "and keeps what it held"
+    );
+}
+
+/// Transcript archive rules: copies are numbered from 0 and only grow; an
+/// append at any length but a copy's own, or past the next copy, is
+/// refused; reads return what was appended.
+pub fn transcript_archive(tag: &str, archive: &dyn crate::port::TranscriptArchive) {
+    let agent = agent(tag);
+    let native = "0b7c1d2e-0000-4000-8000-000000000001";
+    assert!(archive.copies(&agent, native).expect("copies").is_empty());
+    archive
+        .append(&agent, native, 0, 0, b"one\n")
+        .expect("a first copy");
+    archive
+        .append(&agent, native, 0, 4, b"two\n")
+        .expect("it grows");
+    assert!(
+        archive.append(&agent, native, 0, 4, b"again\n").is_err(),
+        "archived bytes are never overwritten"
+    );
+    assert!(
+        archive.append(&agent, native, 2, 0, b"x").is_err(),
+        "no copy past the next"
+    );
+    assert!(
+        archive.append(&agent, native, 1, 3, b"x").is_err(),
+        "a new copy starts at 0"
+    );
+    archive
+        .append(&agent, native, 1, 0, b"whole\n")
+        .expect("the next copy");
+    assert_eq!(archive.copies(&agent, native).expect("copies"), vec![8, 6]);
+    assert_eq!(
+        archive.read(&agent, native, 0, 2, 4).expect("read"),
+        b"e\ntw".to_vec()
+    );
+    assert_eq!(
+        archive.read(&agent, native, 1, 0, 100).expect("read"),
+        b"whole\n".to_vec()
+    );
+    assert!(
+        archive
+            .copies(
+                &crate::id::AgentId::new(format!("agent_{tag}_other")).expect("valid"),
+                native
+            )
+            .expect("copies")
+            .is_empty(),
+        "copies are per agent"
+    );
 }

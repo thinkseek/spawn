@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { chooseToken, type TokenChoice } from "./token";
 
 export type SessionState =
   "working" | "waiting" | "blocked" | "completed" | "unknown";
@@ -286,23 +287,35 @@ const TOKEN_KEY = "spawn.serve.token";
  * The token leaves the address bar (and so history and screenshots) before
  * storage is touched: a browser whose storage throws keeps it in memory
  * only, never in the URL. */
-const serveToken: string | null = (() => {
+const tokenChoice: TokenChoice = (() => {
   const fromUrl = new URLSearchParams(window.location.search).get("token");
-  if (fromUrl) {
+  if (fromUrl !== null) {
     try {
       window.history.replaceState(null, "", withoutToken(window.location.href));
     } catch {
       // No history API: nothing more can be done about the address bar.
     }
   }
+  let saved: string | null = null;
   try {
-    if (fromUrl) localStorage.setItem(TOKEN_KEY, fromUrl);
-    return localStorage.getItem(TOKEN_KEY) ?? fromUrl;
+    saved = localStorage.getItem(TOKEN_KEY);
   } catch {
     // Storage disabled: the token from the URL lives in this page only.
-    return fromUrl;
   }
+  const choice = chooseToken(fromUrl, saved);
+  try {
+    if (choice.save !== null) localStorage.setItem(TOKEN_KEY, choice.save);
+    else if (choice.clear) localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // As above: kept in this page only.
+  }
+  if (choice.problem) console.warn(`spawn: ${choice.problem}`);
+  return choice;
 })();
+
+/** The token every API read carries: always a header-safe credential
+ * ([`chooseToken`]), never a raw `?token=`. */
+const serveToken: string | null = tokenChoice.token;
 
 /** `href` without its `?token=` parameter; every other part is kept. */
 export function withoutToken(href: string): string {
@@ -314,10 +327,12 @@ export function withoutToken(href: string): string {
 /** The error of a failed API read. A 401 says how to give the token. */
 export function apiError(status: number, detail = ""): Error {
   if (status === 401) {
+    const problem = tokenChoice.problem ? `${tokenChoice.problem} ` : "";
     return new Error(
-      serveToken
+      problem +
+      (serveToken
         ? "HTTP 401: the saved token is wrong; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>"
-        : "HTTP 401: no token; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>, or from this machine at http://127.0.0.1:8787",
+        : "HTTP 401: no token; open this page once as /?token=<SPAWN_SERVE_TOKEN from spawn.env>, or from this machine at http://127.0.0.1:8787"),
     );
   }
   return new Error(detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`);
