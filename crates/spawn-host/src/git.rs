@@ -30,7 +30,7 @@ use std::process::{Command, Output, Stdio};
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    BaseMerge, Branch, Commit, ForkFrom, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, Commit, ForkFrom, SetAside, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
 };
 
 use crate::tree_path::{TreePath, nul_fields};
