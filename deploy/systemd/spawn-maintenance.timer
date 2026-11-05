@@ -1,11 +1,12 @@
 [Unit]
-Description=Spawn: daily routine cleanup (scripts/maintenance.sh)
+Description=Spawn: hourly routine cleanup (scripts/maintenance.sh)
 
 [Timer]
-# Local time, after the 03:30 backup window; a run missed while the host
-# was off happens at the next boot.
-OnCalendar=*-*-* 05:15:00
-RandomizedDelaySec=30min
+# Hourly: a gate killed outright (SIGKILL: a timeout, an interrupted run)
+# leaves its scratch, 1.6 GB each, which no trap can remove; a day of them
+# filled the disk. A run missed while the host was off happens at boot.
+OnCalendar=hourly
+RandomizedDelaySec=5min
 Persistent=true
 
 [Install]

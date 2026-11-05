@@ -19,7 +19,19 @@
 //! - a report (`.spawn/report.md`) is collected once its worker is idle, if
 //!   it was written after the delivery's mark in the workspace (one clock,
 //!   the filesystem's, sets both times), and moved aside so the next task
-//!   starts clean;
+//!   starts clean. **A report is judged against the checkpoint of the turn
+//!   that produced it.** The Bridge commits a turn's workspace and records
+//!   its `artifact.committed` before the turn's end (`turn.stopped`,
+//!   `turn.failed`), so a report is collected only once the worker's latest
+//!   turn event in the log is a turn's end, not a newer `message.received`,
+//!   and never on a ready screen alone ([`Facts::report_due`]). The
+//!   `task.reported` record names in `commit` the agent's latest checkpoint
+//!   read with that turn's end (null only when the agent has none); a turn
+//!   that changed nothing leaves the branch head, the earlier checkpoint, as
+//!   its own. An idle judgement with no model answer need not be newer than
+//!   the turn's end: such a judgement is written again only when its verdict
+//!   changes (a model's answer is written for every new situation, and a
+//!   stale one waits for the next);
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
@@ -959,6 +971,15 @@ fn new_report(workspace: &Path, key: &str) -> Option<String> {
 /// idle prompt, judged waiting, completed or blocked alike: the report
 /// contract asks for one when the task is done or the worker cannot go on.
 /// Returns log lines. The file is moved to `.spawn/reports/task-<id>.md`.
+/// The facts of `task`'s worker when a report of it may be collected now
+/// ([`Facts::report_due`]): the turn that wrote it has ended in the log,
+/// after its checkpoint, which the report then names.
+fn report_due<'a>(task: &TaskRow, rows: &'a [Facts]) -> Option<&'a Facts> {
+    rows.iter()
+        .find(|facts| facts.session_id == task.session_id)
+        .filter(|facts| facts.report_due())
+}
+
 pub(crate) fn collect_reports(
     store: &PostgresStore,
     work: &Work,
@@ -971,13 +992,9 @@ pub(crate) fn collect_reports(
         .iter()
         .filter(|task| task.state == TaskState::Delivered)
     {
-        let idle = rows
-            .iter()
-            .find(|facts| facts.session_id == task.session_id)
-            .is_some_and(Facts::turn_stopped_idle);
-        if !idle {
+        let Some(facts) = report_due(task, rows) else {
             continue;
-        }
+        };
         let workspace = root.join(&task.agent_id);
         let key = task.delivery_key();
         let Some(report) = new_report(&workspace, &key) else {
@@ -986,7 +1003,7 @@ pub(crate) fn collect_reports(
         if report.trim().is_empty() {
             continue;
         }
-        match store.task_reported(task.id, report.trim()) {
+        match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref()) {
             Ok(true) => {
                 put_aside(&workspace, task.id);
                 let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
@@ -1002,9 +1019,14 @@ pub(crate) fn collect_reports(
 #[cfg(test)]
 mod tests {
     use super::{
+<<<<<<< c6453bc8cf38a32f1691a9404d2ff6d8fcfbac65
+        DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery,
+        new_report, news_items, put_aside, report_contract, report_due, task_prompt,
+=======
         Cancelled, DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark,
         mark_delivery, new_report, news_items, notice_task, put_aside, report_contract,
         task_prompt,
+>>>>>>> 57c95766873b3c372bc3e394d052a0e252565003
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -1065,6 +1087,8 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            turn_ended: idle,
+            checkpoint: None,
         }
     }
 
@@ -1092,6 +1116,84 @@ mod tests {
             tasks,
             ..Work::default()
         }
+    }
+
+    /// A worker at a ready screen, judged idle on it (`TurnStoppedIdle`),
+    /// whose turn's end the transcript has not given yet: the log's latest
+    /// turn event is the prompt (`message.received`).
+    fn ready_screen_before_the_turn_end() -> Facts {
+        let mut facts = worker(true, true);
+        facts.turn_ended = false;
+        facts.checkpoint = Some("c0".to_string());
+        facts
+    }
+
+    #[test]
+    fn no_report_is_collected_on_a_ready_screen_before_the_turns_end() {
+        let task = task(7, TaskState::Delivered, "ephemeral");
+        let facts = ready_screen_before_the_turn_end();
+        assert!(facts.turn_stopped_idle(), "the screen alone says idle");
+        assert!(
+            report_due(&task, std::slice::from_ref(&facts)).is_none(),
+            "the turn that wrote the report has not ended in the log: its checkpoint may not exist"
+        );
+    }
+
+    #[test]
+    fn a_report_is_collected_after_the_turns_end_with_its_checkpoint() {
+        let task = task(7, TaskState::Delivered, "ephemeral");
+        let mut facts = ready_screen_before_the_turn_end();
+        // The Bridge recorded the turn's checkpoint, then its end: both are
+        // newer than the idle judgement, which the Observer (no model judge,
+        // the same verdict) does not write again.
+        facts.turn_ended = true;
+        facts.checkpoint = Some("c1".to_string());
+        facts.evidence_seq = Some(8);
+        assert!(
+            facts.current_observation().is_none(),
+            "the judgement is older"
+        );
+        let rows = [facts];
+        let due = report_due(&task, &rows).expect("the turn ended: the report is collected");
+        assert_eq!(
+            due.checkpoint.as_deref(),
+            Some("c1"),
+            "the report names the checkpoint of its turn"
+        );
+
+        let mut busy = rows[0].clone();
+        busy.observation = Some(Observation::basic(
+            SemanticState::Working,
+            None,
+            SessionSeq(9),
+            Confidence::new(0.9).expect("valid"),
+            "rules",
+        ));
+        assert!(
+            report_due(&task, &[busy]).is_none(),
+            "a verdict that changed since holds it back"
+        );
+        let mut answered = rows[0].clone();
+        if let Some(observation) = answered.observation.as_mut() {
+            observation.fingerprint = Some("asked".to_string());
+        }
+        assert!(
+            report_due(&task, &[answered]).is_none(),
+            "a model's answer is written for every new situation: a stale one waits for the next"
+        );
+        let mut open = rows[0].clone();
+        open.open_command = true;
+        assert!(report_due(&task, &[open]).is_none(), "a command in flight");
+        let mut gone = rows[0].clone();
+        gone.live = false;
+        assert!(report_due(&task, &[gone]).is_none(), "not live");
+        let mut none = rows[0].clone();
+        none.checkpoint = None;
+        assert_eq!(
+            report_due(&task, std::slice::from_ref(&none)).map(|facts| facts.checkpoint.clone()),
+            Some(None),
+            "an agent with no checkpoint at all reports a null commit"
+        );
     }
 
     #[test]

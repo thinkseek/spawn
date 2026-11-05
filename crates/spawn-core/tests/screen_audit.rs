@@ -155,13 +155,20 @@ Enter to confirm · Esc to cancel
         fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
             self.inner.start(launch)
         }
-        fn submit_text(
+        fn stage_text(
             &self,
             terminal: &TerminalName,
             workspace: &WorkspaceId,
             text: &str,
         ) -> Result<(), TerminalError> {
-            self.inner.submit_text(terminal, workspace, text)
+            self.inner.stage_text(terminal, workspace, text)
+        }
+        fn submit_staged(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.submit_staged(terminal, workspace)
         }
         fn send_keys(
             &self,

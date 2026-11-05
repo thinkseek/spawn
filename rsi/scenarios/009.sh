@@ -367,9 +367,17 @@ doubled() {
         where mission_id = $1 and objective is not null and state not in ('landed', 'cancelled')
         group by objective having count(*) > 1) d"
 }
-# Tasks delivered and not reported yet: the worker has them.
-working() {
-    q "select count(*) from mission_tasks where mission_id = $1 and state = 'delivered'"
+# Tasks of the mission ever delivered (a task.delivered record), whatever
+# their state now. The barrier releases three delivered tasks at once, and
+# each moves on to reported by itself, possibly between two polls: a wait
+# for three in state delivered at one poll can miss them. That they were in
+# flight together is checked after, from the records (the intervals overlap).
+delivered_ever() {
+    q "select count(distinct kind -> 'detail' -> 'record' ->> 'id') from spawn_events
+        where session_id = 'session_control'
+          and kind -> 'detail' -> 'record' ->> 'type' = 'task.delivered'
+          and (kind -> 'detail' -> 'record' ->> 'id')::bigint in
+              (select id from mission_tasks where mission_id = $1)"
 }
 landed() {
     q "select count(*) from mission_tasks where mission_id = $1 and state = 'landed'"
@@ -416,9 +424,9 @@ capture "$SPAWN_BIN" mission configure --id "$m3" --gate "$gate" --accept gate \
 
 peak=0
 deadline=$(($(now) + 90))
-until [ "$(working "$m3")" -ge 3 ]; do
+until [ "$(delivered_ever "$m3")" -ge 3 ]; do
     if [ "$(now)" -ge "$deadline" ]; then
-        fail "(1) three objective tasks were never delivered at once within 90 s (most open at once: $peak; tasks: $(mission_line "$m3"))"
+        fail "(1) three objective tasks were not all delivered within 90 s (most open at once: $peak; tasks: $(mission_line "$m3"))"
     fi
     integrate_once
     watch "$m3" 3

@@ -1600,7 +1600,12 @@ begin
     return true;
 end $$;
 
-create or replace function spawn_task_reported(p_task bigint, p_report text)
+-- Record a report. `p_commit` names the agent's checkpoint the report's
+-- turn ended with (its latest `artifact.committed` when the turn's end was
+-- recorded): the integrator judges the report against it, never against an
+-- older checkpoint. Null only when the agent has no checkpoint at all; the
+-- first version took none, and still records a null commit.
+create or replace function spawn_task_reported(p_task bigint, p_report text, p_commit text)
 returns boolean language plpgsql security definer as $$
 begin
     -- Check and record under the append lock, so no other change interleaves.
@@ -1614,8 +1619,14 @@ begin
         return false;
     end if;
     perform spawn_control_record(jsonb_build_object(
-        'type', 'task.reported', 'id', p_task, 'report', p_report));
+        'type', 'task.reported', 'id', p_task, 'report', p_report, 'commit', p_commit));
     return true;
+end $$;
+
+create or replace function spawn_task_reported(p_task bigint, p_report text)
+returns boolean language plpgsql security definer as $$
+begin
+    return spawn_task_reported(p_task, p_report, null);
 end $$;
 
 -- Review a report: accept, or send it back with a note. `p_revision` names
@@ -2196,6 +2207,7 @@ begin
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
+        'spawn_task_reported(bigint, text, text)',
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',

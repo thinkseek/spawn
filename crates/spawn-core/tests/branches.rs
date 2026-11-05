@@ -1132,3 +1132,104 @@ fn a_start_that_typed_nothing_is_discarded() {
     assert_eq!(ended(&store), vec![EndCause::Lost]);
     assert_eq!(unmounts(&store), 1);
 }
+
+/// The names of the session's turn and checkpoint events, in log order.
+fn turn_and_checkpoints(store: &MemoryStore) -> Vec<&'static str> {
+    events(store)
+        .into_iter()
+        .map(|event| event.kind.name())
+        .filter(|name| {
+            matches!(
+                *name,
+                "artifact.committed" | "turn.stopped" | "turn.failed" | "message.received"
+            )
+        })
+        .collect()
+}
+
+/// A turn's checkpoint is part of the turn's end: the tick that reads the
+/// turn's end from the transcript commits the workspace and records its
+/// `artifact.committed` first, then the `turn.stopped`. Whoever reads the
+/// turn's end from the log finds the checkpoint of what it wrote.
+#[test]
+fn a_turn_end_is_recorded_after_its_checkpoint() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    transcript(&store, &[prompt("1")]);
+    quiet(&bridge.tick().expect("read the prompt"));
+    store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
+    transcript(&store, &[turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn end"));
+    assert_eq!(
+        turn_and_checkpoints(&store),
+        ["message.received", "artifact.committed", "turn.stopped"],
+        "the checkpoint is recorded before the turn's end, in the same tick"
+    );
+    assert_eq!(
+        checkpoints(&store)
+            .into_iter()
+            .map(|(reason, _)| reason)
+            .collect::<Vec<_>>(),
+        [CheckpointReason::TurnStopped]
+    );
+    quiet(&bridge.tick().expect("idle"));
+    assert_eq!(checkpoints(&store).len(), 1, "nothing more to commit");
+}
+
+/// A turn that changes nothing still has its checkpoint taken (the branch
+/// head as it stands, no new `artifact.committed`) before its end is
+/// recorded.
+#[test]
+fn an_unchanged_turn_is_checkpointed_before_its_end_is_recorded() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    let before = commits(&store);
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn"));
+    assert_eq!(
+        turn_and_checkpoints(&store),
+        ["message.received", "turn.stopped"],
+        "no new commit, no artifact.committed"
+    );
+    assert!(
+        commits(&store) > before,
+        "the turn's checkpoint was taken in the tick that read its end"
+    );
+}
+
+/// A turn's checkpoint whose commit fails holds its end back: no
+/// `turn.stopped` is recorded before the checkpoint is.
+#[test]
+fn a_turn_end_waits_for_its_checkpoint_when_the_commit_fails() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    store.mark_dirty(&spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"));
+    store.fail_commits(true);
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    let report = bridge.tick().expect("the commit fails");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("commit unavailable")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(
+        turn_and_checkpoints(&store),
+        ["message.received"],
+        "the lines before the turn's end are read; the end waits"
+    );
+    store.fail_commits(false);
+    quiet(&bridge.tick().expect("the commit works again"));
+    assert_eq!(
+        turn_and_checkpoints(&store),
+        ["message.received", "artifact.committed", "turn.stopped"]
+    );
+}

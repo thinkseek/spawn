@@ -149,6 +149,11 @@ select jsonb_build_object(
 /// execution that did not; `stops` are the Stops and Discards anyone sent
 /// during the live execution (after the command that started it, so the
 /// Bridge ran them on it), with their outcomes: a failed one is pursued.
+/// `turn_ended`: the live execution's latest turn event (`message.received`,
+/// `turn.stopped`, `turn.failed`) is a turn's end; the Bridge records a
+/// turn's checkpoint before its end, so `checkpoint`, the agent's latest
+/// `artifact.committed`, read in the same statement, is then that turn's
+/// (or a later one).
 ///
 /// A delivery counts as the worker's (its `last_delivery`, and the episode)
 /// only when it reached the worker or may have: it succeeded, has not
@@ -174,6 +179,13 @@ from (
     (select max(e.session_seq) from spawn_events e
       where e.session_id = s.session_id and e.source <> 'observer'
         and e.event_name not in ('artifact.committed', 'merge.conflicted')) as evidence_seq,
+    coalesce((select e.event_name in ('turn.stopped', 'turn.failed') from spawn_events e
+               where e.session_id = s.session_id and e.execution_id = s.execution_id
+                 and e.event_name in ('message.received', 'turn.stopped', 'turn.failed')
+               order by e.session_seq desc limit 1), false) as turn_ended,
+    (select e.kind -> 'detail' -> 'artifact' ->> 'commit' from spawn_events e
+      where e.agent_id = s.agent_id and e.event_name = 'artifact.committed'
+      order by e.id desc limit 1) as checkpoint,
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
     exists (select 1 from spawn_commands c

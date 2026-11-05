@@ -365,4 +365,6 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 审计第 1、2、3、9、16、23 条已修复（分支 `audit-stops`）：失败的 Stop，不论谁发的，调度器都从命令队列读出当前执行的 Stop 及其结果，换新键重发、等待加倍，三次后升级给 supervisor（`dispatch/stops.rs`）；集成器先提交中止的 Stop 再记 `task.aborted`；没打进去的 nudge 不算催过；人发的命令完成后才算消息，失败的照实说；`done-<episode>` 看记下的 `end_cause`；`dispatched` 保留当前回合的 nudge 与当前执行的 resume，关闭的临时任务在工人仍在跑时留在投递行里，批准与人的消息直到告知为止都算消息：不再凭 24 小时窗口判断“没发过”或“不是消息”。
 
+所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
+
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。

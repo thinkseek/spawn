@@ -117,6 +117,23 @@ If Jev is down, the rules' best guess is written with
 to at most 10 min. While retries are pending they replace the 30 s recheck.
 It is never marked dead.
 
+The Observer writes an observation at once when the judgement changes
+(state, reason, attention, ambiguity). It also keeps a session's latest
+judgement covering its latest fact: when a later fact (any record of the
+session not the Observer's: a screen reading, a Bridge step, a checkpoint, a
+command) leaves the verdict as it was, the session is judged again and, once
+its facts have settled (no newer fact for 2 s), that verdict is written with
+`based_on_seq` at the latest fact. It is a judgement of those facts: the
+rules run again, and a Jev answer stands for them only when the evidence it
+was shown is the same (its fingerprint, which counts the engine's moves and
+what the facts say, not every record), with no second call. A session with no
+new fact gets no new observation; a burst of facts with an unchanged verdict
+(a busy turn) gets one, once it settles. A restarted Observer checks every
+session once, and covers one that lags with a single observation. The
+dispatcher acts only on a judgement that covers the latest fact, so this is
+what lets it act on a worker that ended its turn before the screen settled at
+its prompt.
+
 Every Jev answer is written, even when the state did not change, together
 with the evidence and a stable fingerprint of it. That makes the log the full
 record of what the model saw and said, and lets a restarted Observer (or a
@@ -597,10 +614,21 @@ the tree's own:
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
+The controller is the deployed commit's tree, never the owner's working
+checkout: `~/.local/share/spawn-rsi/controllers/<name>`, a symlink to
+`<name>-<commit>`, switched atomically by a deploy (`deploy/controller.sh`,
+deploy/systemd/README.md "The controller"). The integrator's `SPAWN_GATE`,
+each mission's scenarios and backlog, and the maintenance script are paths
+under it, and the integrator resolves the symlink once per step, so a gate
+judges with one commit's gate, scenarios and helpers. **An owner edit is
+live only after its deploy**: a change to the gate, a scenario or the backlog
+is judged like any other commit before anything runs it, and what runs is a
+record of what was judged (§14 of design.md).
+
 ### 10.3 Landing
 
 - **Mission settings** (`spawn mission configure`, owner only): a gate (a
-  scenarios directory in the controller's checkout), how tasks are accepted,
+  scenarios directory in the controller, the deployed tree), how tasks are accepted,
   and an optional budget:
   - `review`: the supervisor accepts, then the gate runs;
   - `gate`: the gate alone decides. The supervisor is not told of its
@@ -703,8 +731,11 @@ the tree's own:
   - acceptance: `gate`;
   - budget: 45 minutes and 60 tool calls;
   - worker: the resident `rsi`, approved by a human.
-- **Tasks come from the backlog** (`rsi/backlog/*.json`, in the controller's
-  checkout).
+- **Tasks come from the backlog** (`rsi/backlog/*.json`, in the controller:
+  an objective committed to the owner's checkout is assigned only once
+  deployed). A task in flight is judged with its objective's scenario in the
+  mission's scenarios directory as configured now, not the path recorded at
+  assignment.
 - **The worker limit** N (`--workers N`, 1 to 16, stored as `"workers": N`
   in the mission's objectives; default 1) is how many of the mission's
   tasks may be in flight at once. A task is in flight from `task.assigned`

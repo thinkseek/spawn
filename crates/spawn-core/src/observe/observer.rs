@@ -1,7 +1,22 @@
 //! The Observer loop: read the log, keep per-session facts, classify
-//! changed or due sessions and append an observation when the judgement
-//! changes. Also what the model is shown beyond the log (the
-//! [`ObservationContext`]) and how a repeated question is recognised.
+//! changed or due sessions and append an observation so that a session's
+//! latest judgement covers its latest fact. Also what the model is shown
+//! beyond the log (the [`ObservationContext`]) and how a repeated question is
+//! recognised.
+//!
+//! The coverage rule: an observation is written at once when the judgement
+//! changes (state, reason, attention, ambiguity) or a model answers. When a
+//! later fact of the session (any record not the Observer's: a screen
+//! reading, a Bridge step, a checkpoint, a command) leaves the verdict as it
+//! was, the session is judged again and, once its facts have settled (no
+//! newer fact for [`SETTLE`]), that verdict is written with `based_on_seq` at
+//! the latest fact. It is a judgement of those facts, not a copy stamped
+//! forward: the rules run again, and a model answer stands only for the same
+//! evidence (its fingerprint), so the model is not asked twice about it. A
+//! session with no new fact gets nothing new; a burst of facts with an
+//! unchanged verdict gets one observation once it settles. The dispatcher
+//! refuses a judgement older than the latest fact, so without this an idle
+//! worker whose last fact changed nothing would never be acted on.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -12,7 +27,7 @@ use super::classify::{
 };
 use super::judge::{JudgeInput, StateJudge};
 use super::snapshot::Snapshot;
-use super::{RECHECK_EVERY, RETRY_BASE, RETRY_MAX};
+use super::{RECHECK_EVERY, RETRY_BASE, RETRY_MAX, SETTLE};
 use crate::event::{EventKind, EventRecord, GlobalPosition, NewEvent, SessionSeq, Source};
 use crate::id::{AgentId, SessionId, WorkspaceId};
 use crate::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
@@ -32,7 +47,8 @@ const TASK_CHARS: usize = 1000;
 const QUESTION_CHARS: usize = 300;
 
 /// What the Observer last wrote for a session. A new observation is written
-/// only when this changes.
+/// at once when this changes; with it unchanged, only to cover newer facts
+/// once they settle.
 type WrittenKey = (SemanticState, Option<WaitReason>, bool, bool);
 
 fn key_of(observation: &Observation) -> WrittenKey {
@@ -63,8 +79,18 @@ struct Tracked {
     last: Option<WrittenKey>,
     judged_seq: SessionSeq,
     judged_at: Option<Timestamp>,
+    /// The latest fact the Observer's latest observation is based on.
+    covered: SessionSeq,
+    /// When the latest fact was recorded, by the log's clock.
+    fact_at: Option<Timestamp>,
+    /// When this process read the latest fact, by its own clock: a guard
+    /// against a log clock ahead of it.
+    fact_seen: Option<Timestamp>,
     /// Evidence of the last model answer; an identical one is not asked again.
     asked: Option<String>,
+    /// The last model answer, which stands for newer facts with the same
+    /// evidence.
+    answer: Option<Observation>,
     /// Consecutive judge failures; the next tick retries after a backoff.
     failures: u32,
 }
@@ -77,15 +103,36 @@ impl Tracked {
             last: None,
             judged_seq: SessionSeq(0),
             judged_at: None,
+            covered: SessionSeq(0),
+            fact_at: None,
+            fact_seen: None,
             asked: None,
+            answer: None,
             failures: 0,
         }
     }
 
-    /// Whether the session must be classified at `now`: it has new facts, or
-    /// a recheck or a judge retry is due.
+    /// Whether the latest observation is older than the latest fact.
+    fn lagging(&self) -> bool {
+        self.snapshot.evidence_seq > self.covered
+    }
+
+    /// Whether no new fact has come for [`SETTLE`]: by the log's clock (so a
+    /// one-shot `spawn tick` sees old facts as settled), or by this
+    /// process's (so a log clock ahead of it does not hold coverage back).
+    fn settled(&self, now: Timestamp) -> bool {
+        let quiet = |at: Option<Timestamp>| at.is_some_and(|at| now.since(at) >= SETTLE);
+        quiet(self.fact_at) || quiet(self.fact_seen)
+    }
+
+    /// Whether the session must be classified at `now`: it has new facts,
+    /// its settled facts are not covered yet, or a recheck or a judge retry
+    /// is due.
     fn is_due(&self, now: Timestamp) -> bool {
         if self.snapshot.evidence_seq > self.judged_seq {
+            return true;
+        }
+        if self.lagging() && self.settled(now) {
             return true;
         }
         let elapsed = |pause: Duration| self.judged_at.is_none_or(|at| now.since(at) >= pause);
@@ -108,6 +155,7 @@ impl Tracked {
         // instead of trusted forever.
         self.last = Some(key_of(observation));
         self.judged_at = Some(recorded_at);
+        self.covered = self.covered.max(observation.based_on_seq);
         // The live process also reads back its own rows, so this records that
         // the judge failed, not how often.
         if observation.reason == Some(WaitReason::JudgeUnavailable) {
@@ -117,20 +165,28 @@ impl Tracked {
         }
         if observation.fingerprint.is_some() {
             self.asked.clone_from(&observation.fingerprint);
+            self.answer = Some(observation.clone());
         }
     }
 
-    /// Fold one log record into the session.
-    fn apply(&mut self, record: &EventRecord) {
+    /// Fold one log record, read at `seen`, into the session.
+    fn apply(&mut self, record: &EventRecord, seen: Timestamp) {
         // Only the Observer's rows count as observations; anything else
-        // claiming to be one is ignored.
+        // claiming to be one is ignored as a judgement, but is still a fact
+        // of the session that the next judgement covers.
         if record.event.source == Source::Observer {
             if let EventKind::ObservationRecorded { observation } = &record.event.kind {
                 self.restore(observation, record.recorded_at);
             }
-        } else if !matches!(record.event.kind, EventKind::ObservationRecorded { .. }) {
+            return;
+        }
+        if matches!(record.event.kind, EventKind::ObservationRecorded { .. }) {
+            self.snapshot.note_seq(record);
+        } else {
             self.snapshot.apply(record);
         }
+        self.fact_at = Some(record.recorded_at);
+        self.fact_seen = Some(seen);
     }
 }
 
@@ -139,6 +195,8 @@ struct Classified {
     observation: Observation,
     /// Fingerprint of the last model answer after this classification.
     asked: Option<String>,
+    /// Whether a model answered now: every answer is written.
+    answered: bool,
     /// Consecutive judge failures after this classification.
     failures: u32,
 }
@@ -232,6 +290,7 @@ impl Observer {
             if batch.is_empty() {
                 return Ok(());
             }
+            let seen = self.clock.now();
             // The control stream is not an agent's session.
             for record in batch
                 .iter()
@@ -240,7 +299,7 @@ impl Observer {
                 self.sessions
                     .entry(record.event.session_id.clone())
                     .or_insert_with(|| Tracked::new(record.event.agent_id.clone()))
-                    .apply(record);
+                    .apply(record, seen);
             }
             if let Some(last) = batch.last() {
                 self.cursor = last.position;
@@ -262,48 +321,47 @@ impl Observer {
         let classified = match rules(&input) {
             RulesVerdict::Certain { state } => Self::certain(state, &input, seq),
             RulesVerdict::Ambiguous { ambiguity, guess } => {
-                let asked = self.ambiguous(tracked, session, input, ambiguity, guess, seq);
-                let Some(classified) = asked else {
-                    // Nothing new to show the model; keep the last answer.
-                    if let Some(tracked) = self.sessions.get_mut(session) {
-                        tracked.judged_seq = seq;
-                        tracked.judged_at = Some(now);
-                    }
-                    return Ok(0);
-                };
-                classified
+                self.ambiguous(tracked, session, input, ambiguity, guess, seq)
             }
         };
         let Classified {
             observation,
             asked,
+            answered,
             failures,
         } = classified;
 
         let key = key_of(&observation);
         // Every model answer is kept, with its evidence and fingerprint: it is
         // the record of what the model saw and said, and what a restarted
-        // Observer uses to avoid asking again.
-        let answered = observation.fingerprint.is_some();
-        let changed = answered
-            || self
-                .sessions
-                .get(session)
-                .is_none_or(|tracked| tracked.last != Some(key));
-        let written = if changed {
+        // Observer uses to avoid asking again. A verdict that did not change
+        // is written once the facts settle, if the latest observation is
+        // older than them (the coverage rule).
+        let (changed, covers) = self.sessions.get(session).map_or((true, false), |tracked| {
+            (
+                tracked.last != Some(key),
+                tracked.lagging() && tracked.settled(now),
+            )
+        });
+        let write = answered || changed || covers;
+        let answer = (write && observation.fingerprint.is_some()).then(|| observation.clone());
+        if write {
             self.append_observation(&agent, session, observation)?;
-            1
-        } else {
-            0
-        };
+        }
         if let Some(tracked) = self.sessions.get_mut(session) {
             tracked.last = Some(key);
             tracked.judged_seq = seq;
             tracked.judged_at = Some(now);
             tracked.asked = asked;
             tracked.failures = failures;
+            if write {
+                tracked.covered = tracked.covered.max(seq);
+            }
+            if answer.is_some() {
+                tracked.answer = answer;
+            }
         }
-        Ok(written)
+        Ok(usize::from(write))
     }
 
     /// A state the rules settle.
@@ -327,12 +385,15 @@ impl Observer {
         Classified {
             observation,
             asked: None,
+            answered: false,
             failures: 0,
         }
     }
 
     /// An ambiguous case: attach the context and ask the model, unless it
-    /// was already asked about exactly this evidence (then `None`).
+    /// was already asked about exactly this evidence. Then its answer stands
+    /// for the facts through `seq`, as it was given: same state, reason,
+    /// attention and evidence, with no new call.
     fn ambiguous(
         &self,
         tracked: &Tracked,
@@ -341,7 +402,7 @@ impl Observer {
         ambiguity: Ambiguity,
         guess: SemanticState,
         seq: SessionSeq,
-    ) -> Option<Classified> {
+    ) -> Classified {
         input.ambiguity = Some(ambiguity);
         attach_context(
             &mut input,
@@ -349,9 +410,24 @@ impl Observer {
             session,
             tracked.snapshot.transcript(),
         );
-        let fingerprint = fingerprint_of(&input);
+        let fingerprint = fingerprint_of(&input, tracked.snapshot.progress_seq);
         if tracked.failures == 0 && tracked.asked.as_deref() == Some(fingerprint.as_str()) {
-            return None;
+            let standing = tracked
+                .answer
+                .as_ref()
+                .filter(|answer| answer.fingerprint.as_deref() == Some(fingerprint.as_str()));
+            if let Some(answer) = standing {
+                let mut observation = answer.clone();
+                observation.based_on_seq = seq;
+                // No model was called for this one.
+                observation.latency_ms = None;
+                return Classified {
+                    observation,
+                    asked: tracked.asked.clone(),
+                    answered: false,
+                    failures: 0,
+                };
+            }
         }
         let (mut observation, failed) = self.ask_model(&input, ambiguity, guess, seq);
         if let Some(question) = input.reply.as_deref().and_then(human_question) {
@@ -359,10 +435,11 @@ impl Observer {
             observation.attention = true;
             observation.attention_reason = Some("human_question".to_string());
         }
-        Some(if failed {
+        if failed {
             Classified {
                 observation,
                 asked: tracked.asked.clone(),
+                answered: false,
                 failures: tracked.failures.saturating_add(1),
             }
         } else {
@@ -370,9 +447,10 @@ impl Observer {
             Classified {
                 observation,
                 asked: Some(fingerprint),
+                answered: true,
                 failures: 0,
             }
-        })
+        }
     }
 
     /// Ask the model judge about an ambiguous case and narrow its answer.
@@ -513,10 +591,12 @@ fn human_question(reply: &str) -> Option<String> {
 }
 
 /// Stable digest of what the model is shown (FNV-1a over its JSON), so a
-/// stored fingerprint still matches after a restart or a rebuild. Digits on
-/// the screen are left out: a ticking timer or token count is not a new
-/// situation, and must not ask the model again.
-fn fingerprint_of(input: &JudgeInput) -> String {
+/// stored fingerprint still matches after a restart. Digits on the screen are
+/// left out: a ticking timer or token count is not a new situation, and must
+/// not ask the model again. Nor is a fact that changes none of what is shown
+/// (a screen reading that confirms the last one, a checkpoint): the facts
+/// count by `progress`, the engine's latest move, and by what they say.
+fn fingerprint_of(input: &JudgeInput, progress: SessionSeq) -> String {
     let screen = input.screen_tail.as_deref().map(|tail| {
         tail.chars()
             .filter(|c| !c.is_ascii_digit())
@@ -524,11 +604,18 @@ fn fingerprint_of(input: &JudgeInput) -> String {
     });
     let shown = serde_json::json!([
         input.ambiguity,
-        input.evidence_seq.0,
+        progress.0,
         input.exit_code,
         screen,
         input.task,
         input.perpetual,
+        input.screen,
+        input.turn,
+        input.open_tools,
+        input.permission_pending,
+        input.execution_active,
+        input.stalled_end,
+        input.last_end,
     ]);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in shown.to_string().bytes() {
@@ -563,11 +650,17 @@ mod tests {
             screen_tail: Some("✽ Working… (12s · 1.2k tokens)".to_string()),
             ..crate::observe::JudgeInput::default()
         };
-        let first = super::fingerprint_of(&input);
+        let first = super::fingerprint_of(&input, crate::event::SessionSeq(1));
         input.screen_tail = Some("✽ Working… (47s · 3.9k tokens)".to_string());
-        assert_eq!(super::fingerprint_of(&input), first);
+        assert_eq!(
+            super::fingerprint_of(&input, crate::event::SessionSeq(1)),
+            first
+        );
         input.screen_tail = Some("HUMAN: which region?".to_string());
-        assert_ne!(super::fingerprint_of(&input), first);
+        assert_ne!(
+            super::fingerprint_of(&input, crate::event::SessionSeq(1)),
+            first
+        );
     }
 
     #[test]

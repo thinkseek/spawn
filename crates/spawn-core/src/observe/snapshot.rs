@@ -37,6 +37,9 @@ pub(super) struct Snapshot {
     /// When the engine last moved: its latest transcript fact, or the
     /// execution's start. Screen readings and commands do not move it.
     progress_at: Option<Timestamp>,
+    /// The engine's latest move, as a position: what the model judge's
+    /// fingerprint counts as new evidence beyond the facts shown.
+    pub(super) progress_seq: SessionSeq,
 }
 
 impl Snapshot {
@@ -48,7 +51,15 @@ impl Snapshot {
             || matches!(record.event.kind, EventKind::ExecutionStarted { .. })
         {
             self.progress_at = Some(record.recorded_at);
+            self.progress_seq = record.session_seq;
         }
+    }
+
+    /// A record of the session that adds nothing to its facts (an
+    /// observation claimed by another source): judgements made after it
+    /// still cover it.
+    pub(super) fn note_seq(&mut self, record: &EventRecord) {
+        self.evidence_seq = self.evidence_seq.max(record.session_seq);
     }
 
     /// Apply one event.
