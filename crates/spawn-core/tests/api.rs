@@ -527,9 +527,12 @@ fn bridge_starts_an_execution_and_types_the_prompt() {
         names(&store),
         vec![
             "command.accepted",
+            "command.step",
             "execution.started",
             "session.native_started",
             "screen.observed",
+            "command.step",
+            "command.step",
             "command.finished",
         ]
     );
