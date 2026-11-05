@@ -401,8 +401,8 @@ impl TerminalHost for TmuxHost {
         match run.code {
             Some(0) => Ok(true),
             Some(1) if gone(&run.stderr) => Ok(false),
-            // Anything else (a socket we may not open, a failing container
-            // runtime) says nothing about the terminal: ending its execution
+            // Anything else (a socket we may not open, a failing tmux)
+            // says nothing about the terminal: ending its execution
             // on it would unmount a workspace an agent may still be using.
             other => Err(TerminalError(format!(
                 "has-session returned {other:?}: {}",

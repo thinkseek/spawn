@@ -56,8 +56,9 @@ head alone is the whole workspace, so everything below is a git operation.
   head) or a full commit id in the mirror; anything else fails the start. An
   agent whose branch exists keeps it (the tick report warns that `from` was
   ignored). The start that creates a branch records where it began on
-  `execution.started` (`fork: {from, commit}`; `from` is `main`, the start's
-  `from`, or `spawn/<agent>`).
+  `execution.started` (`fork: {from, commit}`; `from` is `main` or the
+  start's `from`; only records from before the cross-host cut say
+  `spawn/<agent>`).
 - **One host**: a branch lives in this host's mirror, and a start takes
   nothing from the source but `main` (the owner's decision: Spawn runs on
   one host).

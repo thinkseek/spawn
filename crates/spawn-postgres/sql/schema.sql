@@ -631,8 +631,9 @@ select
     x.kind -> 'detail' ->> 'cause'     as cause,
     (x.kind -> 'detail' ->> 'exit_code')::integer as exit_code,
     x.recorded_at_ms as ended_at_ms,
-    -- The runner reports an engine exit with the engine as source; the
-    -- execution ends only when the Bridge writes its own end event.
+    -- The execution ends only when the Bridge writes its own end event. An
+    -- end from another source is an exit report of an old runner: runners
+    -- now write SPAWN_EXIT_FILE, so only old executions have one.
     exists (
         select 1 from spawn_events r
         where r.event_name = 'execution.ended'
