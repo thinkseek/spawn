@@ -895,6 +895,40 @@ expect "psql gets the decoded password" \
 refuse "no password, no PGPASSWORD" \
     "$(PGPASSWORD=stale; export PGPASSWORD; pg_url_export 'postgres://u@h/x'; printf '%s' "${PGPASSWORD-unset}")" 'stale'
 
+# 11. The changed paths are read as they are (no rename detection, no
+# quoting): a protected file moved away, a protected or build.rs path with a
+# quote or a non-ASCII name, and a name with a newline are all refused, and
+# a scenarios directory without a protected list judges nothing.
+branch renamed-protected
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/elsewhere"
+git -C "$seed" mv judge/rule elsewhere/rule
+renamed=$(commit renamed-protected)
+expect "a protected file moved away is refused" "$(judge "$renamed")" 'touches protected paths'
+branch quoted-protected
+printf 'two\n' >"$seed/value"
+printf 'x\n' >"$seed/judge/é.sh"
+printf 'x\n' >"$seed/judge/a\"b.sh"
+quoted=$(commit quoted-protected)
+expect "a protected path with a non-ASCII name or a quote is refused" "$(judge "$quoted")" 'touches protected paths'
+branch quoted-buildrs
+printf 'two\n' >"$seed/value"
+mkdir -p "$seed/crates/é"
+printf 'fn main() {}\n' >"$seed/crates/é/build.rs"
+quoted_build=$(commit quoted-buildrs)
+expect "a build.rs under a non-ASCII directory is refused" "$(judge "$quoted_build")" 'build-time'
+branch newline-path
+printf 'two\n' >"$seed/value"
+printf 'x\n' >"$seed/new
+line"
+newline=$(commit newline-path)
+expect "a path with a newline is refused" "$(judge "$newline")" 'a changed path holds a newline'
+unprotected_scenarios=$work/unprotected
+cp -r "$scenarios" "$unprotected_scenarios"
+rm "$unprotected_scenarios/protected"
+expect "a scenarios directory without a protected list judges nothing" \
+    "$(judge "$good" "" "$unprotected_scenarios")" 'no protected list'
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
