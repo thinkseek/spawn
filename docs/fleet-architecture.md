@@ -622,8 +622,33 @@ the tree's own:
   - budget: 45 minutes and 60 tool calls;
   - worker: the resident `rsi`, approved by a human.
 - **Tasks come from the backlog** (`rsi/backlog/*.json`, in the controller's
-  checkout). The integrator gives the lowest open objective to the resident,
-  one task at a time.
+  checkout).
+- **The worker limit** N (`--workers N`, 1 to 16, stored as `"workers": N`
+  in the mission's objectives; default 1) is how many of the mission's
+  tasks may be in flight at once. A task is in flight from `task.assigned`
+  until it lands or is cancelled (assigned, delivered, revise, reported,
+  accepted, landing).
+  - Each integrator pass fills the free slots with the lowest open
+    objectives that have no task in flight: an objective never has two
+    tasks in flight. `spawn_objective_assign` checks both rules again under
+    the append lock, so a second integrator or a stale read cannot
+    oversubscribe.
+  - Who gets which task: the resident takes a task whenever it has none
+    open in the mission; every other task goes to a new per-task worker
+    (kind `ephemeral`, agent `agent_worker_objective_<task>`, session
+    `session_worker_objective_<task>`). It needs no approval, starts from
+    the source's main as it is then, keeps no context, and is stopped by the
+    dispatcher once its task lands or is cancelled (`retire-task-<id>`). Its
+    report reaches the supervisor's digest like any report. With N = 1 this
+    is one task at a time on the resident, as before.
+  - Landing stays one at a time: one candidate judged per pass, the lowest
+    ready task first, main moved by compare-and-swap. A task whose base is
+    no longer main lands as the merge by main's rules; two in-flight
+    objectives on the same lines make the second a `conflict`.
+  - Budgets apply per task, from its delivery; the halt rules stay per
+    mission (three rejections in a row from any of its tasks halt it), and
+    a halted mission gets no new task and no judging until a human resumes
+    it.
   - The brief is the objective, the working rules, and the gate verdicts of
     its recent attempts, read from the log.
   - The task's scenario is `rsi/scenarios/<id>.sh`.
