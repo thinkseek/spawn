@@ -14,7 +14,9 @@ const USAGE: &str = "usage:
   spawn mission add --text <mission> [--source <git repo path or URL>] [<settings>]
   spawn mission configure --id N <settings>
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
-                [--backlog <dir> --resident <name>]   (owner only)
+                [--backlog <dir> --resident <name> [--workers N]]   (owner only)
+                (--workers: objective tasks in flight at once, 1 to 16, default 1: the
+                resident takes one, per-task workers the rest)
   spawn mission resume --id N
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
   spawn mission list [--limit N]   (every task with its stages)
@@ -105,11 +107,21 @@ impl Settings {
         if let Some(calls) = number("tool-calls")? {
             budget.insert("tool_calls".to_string(), json!(calls));
         }
+        let workers = number("workers")?;
         let objectives = match (directory(flags, "backlog")?, flags.get("resident")) {
             (Some(backlog), Some(resident)) => {
-                Some(json!({"backlog": backlog, "resident": resident}))
+                let mut objectives = json!({"backlog": backlog, "resident": resident});
+                // Absent means 1, the default: a mission configured without
+                // it stores exactly what it did before.
+                if let (Some(workers), Some(map)) = (workers, objectives.as_object_mut()) {
+                    map.insert("workers".to_string(), json!(workers));
+                }
+                Some(objectives)
             }
-            (None, None) => None,
+            (None, None) if workers.is_none() => None,
+            (None, None) => {
+                return Err(format!("--workers goes with --backlog and --resident\n{USAGE}"));
+            }
             _ => return Err(format!("--backlog and --resident go together\n{USAGE}")),
         };
         Ok(Self {
