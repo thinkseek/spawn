@@ -1542,7 +1542,7 @@ impl Bridge {
         match self.typing_of(claimed, &active.execution_id) {
             Typing::Done => Ok(Outcome::Succeeded),
             Typing::Unknown => {
-                self.abandon(claimed, active, format!("the prompt {MAY_HAVE_TYPED}"))
+                self.abandon(claimed, active, format!("the prompt {MAY_HAVE_TYPED}"), false)
             }
             Typing::Due => self.prompt_engine(claimed, active, prompt, fresh),
         }
@@ -1686,7 +1686,7 @@ impl Bridge {
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
-            return self.abandon(claimed, active, format!("start terminal: {error}"));
+            return self.abandon(claimed, active, format!("start terminal: {error}"), true);
         }
         if prompt.is_empty() {
             return Ok(Outcome::Succeeded);
@@ -1707,7 +1707,8 @@ impl Bridge {
     ) -> Result<Outcome, StoreError> {
         let outcome = self.type_prompt(claimed, active, prompt, fresh)?;
         if let Outcome::Failed(why) = outcome {
-            return self.abandon(claimed, active, why);
+            let discard = self.never_typed(claimed, active)?;
+            return self.abandon(claimed, active, why, discard);
         }
         self.catch_up()?;
         Ok(outcome)
@@ -1951,25 +1952,54 @@ impl Bridge {
     }
 
     /// End a start that failed as lost; the failure names `why` first.
+    /// `discard` only when the log shows its prompt was never typed
+    /// (nothing ran in it, so an unmount loses nothing). Otherwise the
+    /// prompt may have reached the engine: a final checkpoint that fails
+    /// keeps the workspace, and the end stays due, as a Stop's does.
     fn abandon(
-        &self,
+        &mut self,
         claimed: &Claimed,
         active: &Active,
         why: String,
+        discard: bool,
     ) -> Result<Outcome, StoreError> {
         let mut report = TickReport::default();
-        // Nothing ran in it yet: an unmount loses nothing.
-        self.end(
+        let mut ending = active.clone();
+        let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
-            &mut active.clone(),
+            &mut ending,
             EndCause::Lost,
             None,
-            true,
+            discard,
             &mut report,
         )?;
+        if !ended {
+            self.catch_up()?;
+            if let Some(held) = self
+                .sessions
+                .get_mut(&claimed.session_id)
+                .and_then(|view| view.active.as_mut())
+                .filter(|held| held.execution_id == ending.execution_id)
+            {
+                held.reported_end = ending.reported_end;
+                held.follow.end_failures = ending.follow.end_failures;
+                held.follow.end_tried_at = ending.follow.end_tried_at;
+            }
+        }
         report.warnings.insert(0, why);
         Ok(Outcome::Failed(report.warnings.join("; ")))
+    }
+
+    /// Whether the log shows this command's typing never began, after
+    /// folding what this tick appended: only then may its start be
+    /// discarded.
+    fn never_typed(&mut self, claimed: &Claimed, active: &Active) -> Result<bool, StoreError> {
+        self.catch_up()?;
+        Ok(matches!(
+            self.typing_of(claimed, &active.execution_id),
+            Typing::Due
+        ))
     }
 
     /// The agent's branch, created at `from` (else at the base) unless it
