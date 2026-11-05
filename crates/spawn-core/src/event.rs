@@ -159,9 +159,10 @@ pub struct ArtifactRef {
 /// Where an agent's branch started, recorded by the start that created it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Fork {
-    /// What it was created from: `main`, the start's `from` (another agent's
-    /// id, meaning its branch head, or a full commit id), or
-    /// `spawn/<agent>` when another host pushed the branch to the source.
+    /// What it was created from: `main`, or the start's `from` (another
+    /// agent's id, meaning its branch head, or a full commit id). Records
+    /// from before the cross-host cut may say `spawn/<agent>` (adopted from
+    /// another host's push).
     pub from: String,
     /// The commit the branch was created at.
     pub commit: CommitId,

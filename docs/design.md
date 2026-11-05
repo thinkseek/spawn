@@ -71,13 +71,13 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `tool.failed` | 会话记录 | tool_use_id、error |
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行） | error |
-| `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main`、启动的 `from` 或 `spawn/<agent>`；commit：分支起点） |
+| `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main` 或启动的 `from`，跨主机删除之前的旧记录里还可能是 `spawn/<agent>`；commit：分支起点） |
 | `execution.ended` | Bridge | cause、exit_code |
 | `execution.unmounting` | Bridge（结束流程过了最后一次 checkpoint 与 terminate、卸载之前；键 `<exec>:unmounting`） | — |
 | `command.step` | Bridge（命令处理的一步，键 `cmd_<id>:<step>`） | command_id、step（`mounted`、`mount_released`、`typing`、`typed`）、workspace（`mounted`/`mount_released` 带） |
 | `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
-| `artifact.committed` | Bridge | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
-| `merge.conflicted` | Bridge（启动或恢复时合入 `main` 冲突） | files、marked（现在总是 false；为 true 的只在主线合入运行中工作区时写下的旧记录里） |
+| `artifact.committed` | Bridge；`spawn-cli` 的 `main_merge.rs`（集成器的冲突裁决与投递前把 `main` 合入闲置工作区，source 记为 bridge） | reason（`tool_completed`、`turn_stopped`、`execution_ended`、`base_merged`）、artifact；`base_merged` 另带 files |
+| `merge.conflicted` | Bridge（启动或恢复时合入 `main` 冲突，marked 为 false：分支不动）；`main_merge.rs`（把 `main` 合入闲置工作区冲突，内容冲突处写下冲突标记时 marked 为 true） | files、marked |
 | `command.accepted` | Gateway 事务 | command_id |
 | `command.finished` | Worker | command_id、succeeded、error |
 | `screen.observed` | Bridge | state、evidence |
@@ -143,7 +143,7 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.committed`，`source_event_id` 使用 CommitId；`Unchanged` 不产生事件。
 
-合入基线：只在执行启动或恢复时、挂载之前，Bridge 调用 `merge_main_clean`：`main` 能干净合入时分支按比较交换移到合并提交，写 `artifact.committed`（reason `base_merged`，带改动的 `files`）；有任何冲突时分支不动，执行照常在原分支上启动，写一次 `merge.conflicted{files, marked: false}`（键由分支头与文件决定，重试的启动只记一次），并在 tick 报告里告警。运行中的执行从不被合入，也不再给 agent 键入合并通知。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载。
+合入基线：只在执行启动或恢复时、挂载之前，Bridge 调用 `merge_main_clean`：`main` 能干净合入时分支按比较交换移到合并提交，写 `artifact.committed`（reason `base_merged`，带改动的 `files`）；有任何冲突时分支不动，执行照常在原分支上启动，写一次 `merge.conflicted{files, marked: false}`（键由分支头与文件决定，重试的启动只记一次），并在 tick 报告里告警。Bridge 从不合入运行中的执行；闲置在提示符的工作区由 `main_merge.rs` 在集成器的冲突裁决和投递任务之前合入，投递的任务文本说明合并做了什么（storage.md，“Main into a workspace”）。结束流程里最后一次 checkpoint 失败时不 terminate、不 unmount，执行保持活跃，下一个 tick 以同一原因重试（`Stop` 也是）；连续失败 20 次（`END_ATTEMPTS`）后结束进入停滞：杀掉终端、工作区保持挂载、写一次 `execution.end_stalled` 并大声告警一次，之后按 Bridge 的时钟每 30 秒（`END_RETRY_MS`）重试，重启后照旧，直到提交成功；Observer 把会话判为 BLOCKED，attention 原因 `end_stalled`。只有 `Discard` 会在 checkpoint 失败时卸载。
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 之后、`unmount` 之前写 `execution.unmounting`；恢复出的结束若已有这条记录，就跳过 checkpoint，只再 terminate、unmount（工作区不在不算失败）并写 `execution.ended`。
 
@@ -157,7 +157,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 | `spawn run` | 引擎退出，runner 把退出码写进 `SPAWN_EXIT_FILE`，Bridge 下一个 tick 读到后走结束流程 | `Exited`，带退出码 |
 | tick 发现终端不在 | 进程崩溃或终端被外部杀掉 | `Lost` |
 
-折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行；其他来源的同名事件只是退出报告（`agent_executions.exit_reported`）。
+折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行。其他来源的同名事件只是退出报告（`agent_executions.exit_reported`），现在已无人写：runner 把退出码写进 `SPAWN_EXIT_FILE`，所以只有那之前的旧执行可能为真。
 
 每会话一个活跃执行由日志保证，不只靠 Bridge 的内存：`Start`/`Resume` 先追上日志再查内存，日志的追加再查一次（`spawn_append_trusted`，内存实现同样）：会话最近一次执行还没有 Bridge 写的结束时拒绝 `execution.started`。被拒的启动以日志给的原因失败，卸载自己刚挂的工作区（那正是另一个执行的工作区时不卸载），不启动终端。runner 的退出报告不算结束；丢失的执行由下一个 tick 写 `execution.ended`（cause `lost`）后，会话即可再启动或恢复。
 
@@ -261,7 +261,7 @@ Observer 每次 tick：
 
 投影：`spawn_session_state` 每会话一行（最后序号、最后 id、事件数、最新 observation），由 `spawn_append` 在同一事务内更新，`session_seq` 守卫：行恰好落后一个事件时步进，否则从日志重折；迁移持 append 锁重折不一致的会话。会话归属取首个事件的 agent。
 
-视图：`agent_state`（读投影，每会话最新 observation，带 `event_id`）、`agent_status`（判定加最近一次执行，`live` 标记未结束）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`（带 `prompt`）、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记 runner 已报告退出，带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。不用物化视图与 CDC：状态类视图读投影表，其余视图读时折叠。
+视图：`agent_state`（读投影，每会话最新 observation，带 `event_id`）、`agent_status`（判定加最近一次执行，`live` 标记未结束）、`agent_timeline`（不含 Observer 事件）、`agent_judgements`（只含 observation）、`agent_open_tools`、`agent_freshness`、`agent_lineage`（祖先链，深度上限 64）、`agent_task_events`（命令到事件）、`agent_tasks`（带 `prompt`）、`agent_executions`（只以 Bridge 的 `execution.ended` 为结束，`exit_reported` 标记旧 runner 以事件报告过退出（现在不再写，新执行总为假），带 `duration_ms`、`command_id`）、`agent_artifacts`、`agent_relations`、`agent_commands`。不用物化视图与 CDC：状态类视图读投影表，其余视图读时折叠。
 
 `agent_commands` 上挂 `instead of insert` 触发器 `spawn_gateway_insert`，`security definer`，查 `spawn_grants`，无授权 raise `42501`。
 
@@ -313,7 +313,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | crate | 覆盖 |
 | --- | --- |
 | `spawn-core` | ID 校验、事件往返、去重、双序号、租约过期、屏尾六态、Bridge 事件序、每 tick 新进程折叠下的 Start→Stop→Start→Lost、Observer 跨进程不重复写 |
-| `spawn-host` | git 分支创建、archive 导出、无变更判定、分支前移、容器前缀、tmux 精确名匹配与跨进程调用、真实 tmux 生命周期 |
+| `spawn-host` | git 分支创建、archive 导出、无变更判定、分支前移、tmux 精确名匹配与跨进程调用、真实 tmux 生命周期 |
 | `spawn-jev` | 请求体结构与 criteria 顺序、真实响应往返、缺失字段回退、错误降级、chunked |
 | `spawn-postgres` | schema 首次执行、幂等、稠密序号、单会话串行、租约重取、视图与读方法（列集快照、投影等于日志折叠、状态、时间线分页、判定、执行时长、未闭合工具、新鲜度、祖先链、命令事件、任务）、`spawn_finish` 四态、授权拒绝、非 owner 直查视图被拒、有授权写入与读函数过滤、共享一致性套件 |
 

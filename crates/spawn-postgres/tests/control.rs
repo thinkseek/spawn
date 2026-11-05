@@ -66,10 +66,12 @@ fn every_mission_change_is_an_event_and_the_tables_are_its_fold() {
         .expect("assign to an ephemeral worker");
     store.task_delivered(first, 41).expect("delivered");
     assert!(store.task_reported(first, "done once").expect("reported"));
-    store.task_review(first, false, "again").expect("send back");
+    store
+        .task_review(first, false, "again", None)
+        .expect("send back");
     store.task_delivered(first, 42).expect("delivered again");
     assert!(store.task_reported(first, "done twice").expect("reported"));
-    store.task_review(first, true, "").expect("accept");
+    store.task_review(first, true, "", None).expect("accept");
     assert!(
         !store.task_reported(first, "late").expect("a late report"),
         "an accepted task takes no report"
@@ -139,7 +141,10 @@ fn a_refused_change_records_nothing() {
     let task = store
         .task_assign(mission, "ephemeral", "w", "brief", "default")
         .expect("assign");
-    assert!(store.task_review(task, true, "").is_err(), "no report yet");
+    assert!(
+        store.task_review(task, true, "", None).is_err(),
+        "no report yet"
+    );
     assert!(store.resident_approve("nobody").is_err());
     assert!(
         store
@@ -189,7 +194,7 @@ fn rows_from_before_the_stream_are_imported_once() {
     // New work continues on the imported rows, and ids do not collide.
     let task: i64 = before["tasks"][0]["id"].as_i64().expect("task id");
     store
-        .task_review(task, true, "")
+        .task_review(task, true, "", None)
         .expect("accept the old report");
     let next = store
         .task_assign(mission, "ephemeral", "w", "more", "default")
@@ -272,10 +277,13 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
         .expect("assign");
     store.task_delivered(task, 1).expect("delivered");
     assert!(store.task_reported(task, "done").expect("reported"));
-    store.task_review(task, true, "").expect("accept");
+    store.task_review(task, true, "", None).expect("accept");
 
     let gated = |verdict: &str, extra: serde_json::Value| {
+        // Rejected once, so every later verdict judges revision 1.
+        let revision = i32::from(verdict != "rejected");
         let mut record = json!({"type": "task.gated", "id": task, "verdict": verdict,
+                                "revision": revision,
                                 "base": "b1", "log": format!("log {verdict}"), "scenarios": 7});
         record
             .as_object_mut()
@@ -299,7 +307,9 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
 
     store.task_delivered(task, 2).expect("delivered again");
     assert!(store.task_reported(task, "fixed").expect("reported"));
-    store.task_review(task, true, "").expect("accept again");
+    store
+        .task_review(task, true, "", None)
+        .expect("accept again");
     gated("aborted", json!({}));
     assert_eq!(row(&mut client)["missions"][0]["gate_aborts"], 1);
     assert_eq!(
@@ -416,7 +426,7 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
     assert!(store.task_reported(task, "done").expect("reported"));
     store
         .integrator_record(
-            &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+            &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "rejected",
                                    "reason": "scenario fails on the candidate", "base": "b"}),
         )
         .expect("a verdict");
@@ -608,7 +618,7 @@ fn a_landing_moves_the_baseline_of_every_mission_on_its_source() {
         assert!(store.task_reported(task, "done").expect("reported"));
         store
             .integrator_record(
-                &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+                &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "rejected",
                                        "base": "b0", "note": "no"}),
             )
             .expect("a first verdict sets the baselines");
@@ -618,7 +628,7 @@ fn a_landing_moves_the_baseline_of_every_mission_on_its_source() {
     assert!(store.task_reported(tasks[0], "done").expect("reported"));
     store
         .integrator_record(
-            &json!({"type": "task.gated", "id": tasks[0], "verdict": "accepted",
+            &json!({"type": "task.gated", "revision": 1, "id": tasks[0], "verdict": "accepted",
                                    "base": "b0", "candidate": "c1"}),
         )
         .expect("accepted");
@@ -665,7 +675,7 @@ fn a_verdict_does_not_bring_back_a_cancelled_task() {
     // The gate is running when the supervisor cancels the task.
     store.task_cancel(task).expect("cancel");
     for record in [
-        json!({"type": "task.gated", "id": task, "verdict": "accepted", "base": "b", "candidate": "c"}),
+        json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "accepted", "base": "b", "candidate": "c"}),
         json!({"type": "task.landed", "id": task, "from": "b", "to": "c"}),
         json!({"type": "task.aborted", "id": task, "reason": "budget"}),
     ] {
@@ -691,7 +701,7 @@ fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
             .expect("assign");
         store.task_delivered(task, 1).expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));
-        store.task_review(task, true, "").expect("accept");
+        store.task_review(task, true, "", None).expect("accept");
         (mission, task)
     };
     let gated_ids = || -> Vec<i64> {
@@ -726,7 +736,7 @@ fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
     assert_eq!(state(&mut client, dropped_task), "cancelled");
     store
         .integrator_record(
-            &json!({"type": "task.gated", "id": done_task, "verdict": "accepted",
+            &json!({"type": "task.gated", "revision": 0, "id": done_task, "verdict": "accepted",
                                    "base": "b1", "candidate": "c1", "scenarios": 1}),
         )
         .expect("gate");
@@ -765,7 +775,7 @@ fn a_halted_mission_keeps_its_baseline_when_the_owner_moves_its_source() {
         assert!(store.task_reported(task, "done").expect("reported"));
         store
             .integrator_record(
-                &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+                &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "rejected",
                                        "base": "b0", "note": "no"}),
             )
             .expect("a first verdict sets the baseline");
@@ -819,10 +829,10 @@ fn a_dropped_mission_lands_nothing_even_with_a_push_in_flight() {
             .expect("assign");
         store.task_delivered(task, 1).expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));
-        store.task_review(task, true, "").expect("accept");
+        store.task_review(task, true, "", None).expect("accept");
         store
             .integrator_record(
-                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "accepted",
                                        "base": "b1", "candidate": "c1", "scenarios": 1}),
             )
             .expect("gate");
@@ -926,10 +936,10 @@ fn a_done_missions_landing_that_stays_stale_is_aborted_after_three_tries() {
             .expect("assign");
         store.task_delivered(task, 1).expect("delivered");
         assert!(store.task_reported(task, "done").expect("reported"));
-        store.task_review(task, true, "").expect("accept");
+        store.task_review(task, true, "", None).expect("accept");
         store
             .integrator_record(
-                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "accepted",
                                        "base": "b1", "candidate": "c1", "scenarios": 1}),
             )
             .expect("gate");
@@ -944,7 +954,9 @@ fn a_done_missions_landing_that_stays_stale_is_aborted_after_three_tries() {
     };
     let gate_stale = |task: i64| {
         store
-            .integrator_record(&json!({"type": "task.gated", "id": task, "verdict": "stale"}))
+            .integrator_record(
+                &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "stale"}),
+            )
             .expect("stale")
     };
 
@@ -1107,13 +1119,15 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     );
     store.task_delivered(task, 1).expect("delivered");
     assert!(store.task_reported(task, "done").expect("reported"));
-    store.task_review(task, false, "again").expect("send back");
+    store
+        .task_review(task, false, "again", None)
+        .expect("send back");
     store.task_delivered(task, 2).expect("delivered again");
     assert!(store.task_reported(task, "fixed").expect("reported again"));
-    store.task_review(task, true, "").expect("accept");
+    store.task_review(task, true, "", None).expect("accept");
     store
         .integrator_record(
-            &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+            &json!({"type": "task.gated", "revision": 1, "id": task, "verdict": "accepted",
                                    "base": "b1", "candidate": "c1"}),
         )
         .expect("the gate accepts");
@@ -1326,7 +1340,7 @@ fn a_dropped_missions_delivered_task_is_cancelled() {
     let after_drop = task_state(&mut client, task);
     // Walk on, to show where it goes: a report, a send-back, a new delivery.
     let reported = store.task_reported(task, "done").expect("report");
-    let sent_back = reported && store.task_review(task, false, "again").is_ok();
+    let sent_back = reported && store.task_review(task, false, "again", None).is_ok();
     let redelivered = sent_back && store.task_delivered(task, 2).is_ok();
     let delivered_again = task_state(&mut client, task) == "delivered";
     assert!(
@@ -1368,13 +1382,29 @@ fn task_in(store: &PostgresStore, mission: i64, kind: &str, worker: &str, state:
     }
     assert!(store.task_reported(task, "done").expect("reported"));
     match state {
-        "reported" => {}
-        "revise" => store.task_review(task, false, "again").expect("send back"),
-        "accepted" => store.task_review(task, true, "").expect("accept"),
+        // A mission its gate alone accepts takes no review: its gate sends
+        // work back, and only a mission reviewed before it was switched to
+        // the gate holds accepted work (its gate is `/scenarios`).
+        "revise" if store.task_review(task, false, "again", None).is_err() => {
+            store
+                .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                           "verdict": "rejected", "note": "again"}))
+                .expect("the gate sends it back");
+        }
+        "accepted" if store.task_review(task, true, "", None).is_err() => {
+            store
+                .mission_configure(mission, Some("/scenarios"), "review", None, None)
+                .expect("review for a while");
+            store.task_review(task, true, "", None).expect("accept");
+            store
+                .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+                .expect("back to the gate");
+        }
+        "reported" | "revise" | "accepted" => {}
         "landing" | "landed" => {
             store
                 .integrator_record(
-                    &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                    &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "accepted",
                                            "base": "b", "candidate": format!("c{task}")}),
                 )
                 .expect("gate passed");
@@ -1467,15 +1497,23 @@ fn a_closed_missions_tasks_are_all_closed_or_handed_to_the_integrator() {
                 // Nothing new is asked of a worker: a send-back is refused,
                 // a gate rejection ends the task.
                 let reported = tasks[2].1;
-                assert!(store.task_review(reported, false, "again").is_err());
+                assert!(store.task_review(reported, false, "again", None).is_err());
                 store
-                    .integrator_record(&json!({"type": "task.gated", "id": reported,
+                    .integrator_record(&json!({"type": "task.gated", "revision": 0, "id": reported,
                                                "verdict": "rejected", "note": "no"}))
                     .expect("rejected");
                 assert_eq!(task_state(&mut client, reported), "cancelled");
-                // A report may still be accepted, and lands.
-                store.task_review(delivered, true, "").expect("accept");
-                assert_eq!(task_state(&mut client, delivered), "accepted");
+                // A report may still be accepted, and lands; under a gate
+                // alone, the gate accepts it, never a review.
+                if accept == "review" {
+                    store
+                        .task_review(delivered, true, "", None)
+                        .expect("accept");
+                    assert_eq!(task_state(&mut client, delivered), "accepted");
+                } else {
+                    assert!(store.task_review(delivered, true, "", None).is_err());
+                    assert_eq!(task_state(&mut client, delivered), "reported");
+                }
             }
         }
     }
@@ -1524,7 +1562,7 @@ fn a_retired_residents_work_is_cancelled_unless_it_only_has_to_land() {
     // A gate rejection of its accepted work ends it instead of sending it back.
     let accepted = tasks[3].1;
     store
-        .integrator_record(&json!({"type": "task.gated", "id": accepted,
+        .integrator_record(&json!({"type": "task.gated", "revision": 0, "id": accepted,
                                    "verdict": "rejected", "note": "no"}))
         .expect("rejected");
     assert_eq!(task_state(&mut client, accepted), "cancelled");
@@ -1617,5 +1655,293 @@ fn a_done_missions_running_task_is_still_held_to_its_budget() {
     assert!(
         gated_mission_ids(&store).is_empty(),
         "nothing is left to land or to hold to a budget"
+    );
+}
+
+/// A gate-mode mission with one task reported at revision 0.
+fn gate_mode_task(store: &PostgresStore, source: &str) -> (i64, i64) {
+    let mission = store
+        .mission_add("Gate alone", &json!([source]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            None,
+        )
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "rev0").expect("reported"));
+    (mission, task)
+}
+
+/// Audit #10: a gate verdict names the revision it judged. A verdict on
+/// revision 0 that arrives after the task went back and reported revision 1
+/// is refused: it would land revision 0's candidate over unjudged work.
+#[test]
+fn a_gate_verdict_lands_only_on_the_revision_it_judged() {
+    let (store, schema) = store("control_gate_revision");
+    let (_, task) = gate_mode_task(&store, "/tmp/source.git");
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+                                   "revision": 0, "base": "b0", "note": "redo"}),
+        )
+        .expect("a verdict on revision 0");
+    store.task_delivered(task, 2).expect("delivered again");
+    assert!(store.task_reported(task, "rev1").expect("reported again"));
+    let mut client = admin(&schema);
+    let before = tables(&mut client);
+    assert!(
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                       "revision": 0, "base": "b0", "candidate": "c0"})
+            )
+            .is_err(),
+        "a verdict on revision 0 does not land revision 1"
+    );
+    assert!(
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                       "base": "b0", "candidate": "c0"})
+            )
+            .is_err(),
+        "a verdict that names no revision is refused"
+    );
+    assert_eq!(tables(&mut client), before, "nothing moved");
+    assert_eq!(task_state(&mut client, task), "reported");
+
+    // The fold refuses a mismatch too: a record in the log that names
+    // another revision changes nothing, live or refolded.
+    client
+        .execute(
+            "select spawn_control_record($1)",
+            &[
+                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                      "revision": 0, "base": "b0", "candidate": "c0"}),
+            ],
+        )
+        .expect("record directly");
+    assert_eq!(tables(&mut client), before, "the fold skips a mismatch");
+    refold(&mut client);
+    assert_eq!(tables(&mut client), before);
+
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                   "revision": 1, "base": "b0", "candidate": "c1"}),
+        )
+        .expect("a verdict on revision 1");
+    let after = tables(&mut client);
+    assert_eq!(after["tasks"][0]["state"], "landing");
+    assert_eq!(after["tasks"][0]["candidate"], "c1");
+}
+
+/// Audit #10: the gate alone judges a gate-mode mission's reports. The
+/// supervisor is not told of them and may not review them, so no review
+/// can send back the revision the gate is judging.
+#[test]
+fn a_gate_mode_report_is_neither_news_nor_reviewed() {
+    let (store, _schema) = store("control_gate_no_review");
+    let (_, gated) = gate_mode_task(&store, "/tmp/source.git");
+    let reviewed = store
+        .mission_add("Reviewed", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(reviewed, "ephemeral", "v", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 3).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+
+    let news = store.mission_news().expect("news");
+    let ids: Vec<i64> = news["reports"]
+        .as_array()
+        .expect("reports")
+        .iter()
+        .map(|report| report["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(ids, vec![task], "only the reviewed mission's report");
+    assert!(
+        store.task_review(gated, false, "again", None).is_err(),
+        "a gate-mode report is not sent back by review"
+    );
+    assert!(
+        store.task_review(gated, true, "", None).is_err(),
+        "nor accepted by review"
+    );
+}
+
+/// Audit #11: a landing moves another mission's baseline only from where
+/// that mission's baseline is (the landing's `from`), and never a halted
+/// one's. Main moved b0 -> b1 outside the gate; mission A, with no baseline
+/// yet, gates on b1 and lands b1 -> c2. B, at b0, keeps b0 and halts on its
+/// next pass instead of taking c2 and laundering the move.
+#[test]
+fn a_landing_moves_only_the_missions_at_its_from() {
+    let (store, schema) = store("control_landing_from");
+    let source = json!(["/tmp/shared.git"]);
+    let missions: Vec<i64> = ["A", "B", "C", "D"]
+        .iter()
+        .map(|name| {
+            let mission = store.mission_add(name, &source, "human").expect("add");
+            store
+                .mission_configure(
+                    mission,
+                    Some("/controller/rsi/scenarios"),
+                    "gate",
+                    None,
+                    None,
+                )
+                .expect("configure");
+            mission
+        })
+        .collect();
+    let mut tasks = Vec::new();
+    for &mission in &missions {
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        tasks.push(task);
+    }
+    // B at b0, C at b1, D at b1 but halted; A has no baseline yet.
+    for (task, base) in [(tasks[1], "b0"), (tasks[2], "b1"), (tasks[3], "b1")] {
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "aborted",
+                                       "revision": 0, "base": base}),
+            )
+            .expect("a first verdict sets the baseline");
+    }
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": missions[3], "reason": "x"}))
+        .expect("halt D");
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "id": tasks[0], "verdict": "accepted",
+                                   "revision": 0, "base": "b1", "candidate": "c2"}),
+        )
+        .expect("accepted");
+    store
+        .integrator_record(
+            &json!({"type": "task.landed", "id": tasks[0], "from": "b1", "to": "c2"}),
+        )
+        .expect("landed");
+    let mut client = admin(&schema);
+    let live = tables(&mut client);
+    let baseline = |index: usize| live["missions"][index]["baseline"].clone();
+    assert_eq!(baseline(0), "c2", "its own mission");
+    assert_eq!(baseline(1), "b0", "B was not at the landing's from");
+    assert_eq!(baseline(2), "c2", "C was");
+    assert_eq!(baseline(3), "b1", "D is halted");
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live);
+}
+
+/// Audit #14: only a directory on the integrator's host receives agents'
+/// branches, so a gate on a remote source would wait for a push nobody
+/// makes. Configuring one is refused.
+#[test]
+fn a_gate_needs_a_source_that_receives_branches() {
+    let (store, _schema) = store("control_remote_gate");
+    for source in ["https://example.com/repo.git", "git@example.com:repo.git"] {
+        let mission = store
+            .mission_add("Remote", &json!([source]), "human")
+            .expect("add");
+        assert!(
+            store
+                .mission_configure(
+                    mission,
+                    Some("/controller/rsi/scenarios"),
+                    "gate",
+                    None,
+                    None
+                )
+                .is_err(),
+            "no gate on {source}"
+        );
+        assert!(
+            store
+                .mission_configure(mission, None, "review", None, None)
+                .is_ok(),
+            "settings without a gate are fine on {source}"
+        );
+    }
+}
+
+/// Audit #10, the review's half: a review names the revision of the report
+/// it judged. The supervisor reads revision 0; a human sends it back; the
+/// worker reports revision 1; the supervisor's accept of revision 0 is
+/// refused instead of accepting revision 1 unread.
+#[test]
+fn a_review_lands_only_on_the_revision_it_read() {
+    let (store, schema) = store("control_review_revision");
+    let mission = store
+        .mission_add("Reviewed", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "rev0").expect("reported"));
+    store
+        .task_review(task, false, "again", None)
+        .expect("a human sends it back");
+    store.task_delivered(task, 2).expect("delivered again");
+    assert!(store.task_reported(task, "rev1").expect("reported again"));
+    let mut client = admin(&schema);
+    let before = tables(&mut client);
+    assert!(
+        store.task_review(task, true, "", Some(0)).is_err(),
+        "an accept of revision 0 does not accept revision 1"
+    );
+    assert_eq!(tables(&mut client), before);
+
+    // The fold skips a review of another revision, live and refolded.
+    client
+        .execute(
+            "select spawn_control_record($1)",
+            &[
+                &json!({"type": "task.reviewed", "id": task, "accepted": true, "note": "",
+                      "revision": 0}),
+            ],
+        )
+        .expect("record directly");
+    assert_eq!(tables(&mut client), before);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), before);
+
+    store
+        .task_review(task, true, "", Some(1))
+        .expect("an accept of revision 1");
+    assert_eq!(task_state(&mut client, task), "accepted");
+    let named: Vec<Option<String>> = client
+        .query(
+            "select kind -> 'detail' -> 'record' ->> 'revision' from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'task.reviewed'
+              order by session_seq",
+            &[],
+        )
+        .expect("reviews")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("1".to_string())
+        ],
+        "every review names its revision (the human's, the current one)"
     );
 }

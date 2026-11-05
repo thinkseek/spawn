@@ -4,8 +4,7 @@
 //! projects directory) is the agent's history, and `--resume` needs it. It
 //! is not Spawn's to keep: Claude Code deletes old transcripts (its
 //! `cleanupPeriodDays` sweep runs at every engine start, over the shared
-//! projects directory), a container's copy goes with the container at
-//! unmount, and the format is the engine's. So the Bridge copies what the
+//! projects directory), and the format is the engine's. So the Bridge copies what the
 //! engine appended since the last copy into a [`TranscriptArchive`] at each
 //! turn end and at the end of the execution ([`archive`]), and before a
 //! resume puts a missing file back from it ([`restore`]).
