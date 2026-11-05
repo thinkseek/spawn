@@ -149,8 +149,8 @@ impl ForkFrom {
     }
 }
 
-/// Result of [`WorkspaceStore::merge_main_clean`] (and of the mounted-workspace
-/// [`WorkspaceStore::merge_base`], which the Bridge no longer calls).
+/// Result of [`WorkspaceStore::merge_main_clean`] and of the mounted-workspace
+/// [`WorkspaceStore::merge_base`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum BaseMerge {
     /// The branch already contains the source's `main`.
@@ -212,10 +212,12 @@ pub trait WorkspaceStore: Send + Sync {
         Ok(BaseMerge::Current)
     }
 
-    /// Not called by the Bridge: main is merged only at a start or resume
-    /// ([`Self::merge_main_clean`]). Merge the base into the branch of a
-    /// mounted, idle workspace whose state is committed: the directory
-    /// first, then the branch. A content conflict writes the merge with conflict markers
+    /// Not called by the Bridge, which merges main only at a start or resume
+    /// ([`Self::merge_main_clean`]): the integrator calls it on a `conflict`
+    /// verdict and the dispatcher before it types a task into a live
+    /// worker, both while the agent is idle between turns. Merge the base
+    /// into the branch of a mounted workspace whose state is committed: the
+    /// directory first, then the branch. A content conflict writes the merge with conflict markers
     /// into the directory and leaves the branch where it is; the checkpoint
     /// after the markers are resolved commits the merge (see
     /// [`BaseMerge::Conflicted`]). A directory that differs from the branch,

@@ -6,7 +6,9 @@
 //! - one task in flight per worker, oldest first;
 //! - a worker that never ran is started, one that ran before is resumed (its
 //!   context is the point of a resident), a live one gets the task typed in,
-//!   but only while it is idle at its prompt;
+//!   but only while it is idle at its prompt, after the source's main is
+//!   merged into its workspace ([`crate::main_merge`], done by
+//!   [`crate::dispatch::step`]);
 //! - a task sent back is delivered again with the reviewer's note;
 //! - a task runs on its own model profile: a start or resume names it, and a
 //!   live worker on another profile is stopped first, then resumed on the
