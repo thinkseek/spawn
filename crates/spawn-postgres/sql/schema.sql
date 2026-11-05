@@ -1697,13 +1697,29 @@ begin
     if p_objectives is not null and p_gate is null then
         raise exception 'objectives need a gate to land on';
     end if;
+    -- The worker limit: how many objective tasks may be in flight at once.
+    if p_objectives ? 'workers'
+       and (jsonb_typeof(p_objectives -> 'workers') is distinct from 'number'
+            or (p_objectives ->> 'workers')::numeric not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                                              11, 12, 13, 14, 15, 16)) then
+        raise exception 'an objective mission''s workers is a whole number from 1 to 16, not %',
+            p_objectives -> 'workers';
+    end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.configured', 'id', p_mission, 'gate', p_gate,
         'accept', coalesce(p_accept, 'review'), 'budget', p_budget, 'objectives', p_objectives));
 end $$;
 
--- The integrator assigns an objective mission's next task (owner only), to
--- the mission's resident, which must be approved.
+-- The integrator assigns one of an objective mission's open objectives
+-- (owner only). At most `objectives ->> 'workers'` (default 1) of the
+-- mission's tasks are in flight at once (assigned until landed or
+-- cancelled), and never two for one objective: both checked here, under the
+-- append lock, so a second integrator or a stale read cannot oversubscribe.
+-- The mission's resident, which must be approved, takes the task when it has
+-- none open in the mission; otherwise a new per-task worker does (kind
+-- ephemeral, agent `agent_worker_objective_<task>`), as `spawn_task_assign`
+-- makes one: no approval, a fresh workspace from the source's main, stopped
+-- by the dispatcher once its task lands or is cancelled.
 create or replace function spawn_objective_assign(p_mission bigint, p_objective integer,
                                                   p_scenario text, p_brief text)
 returns bigint language plpgsql security definer as $$
@@ -1711,21 +1727,44 @@ declare
     v_id bigint;
     v_agent text;
     v_session text;
+    v_kind text := 'resident';
+    v_workers integer;
+    v_open integer;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not assign objectives', session_user using errcode = '42501';
     end if;
-    select r.agent_id, r.session_id into v_agent, v_session
+    select r.agent_id, r.session_id, coalesce((m.objectives ->> 'workers')::numeric::integer, 1)
+      into v_agent, v_session, v_workers
       from mission_missions m join mission_residents r on r.name = m.objectives ->> 'resident'
      where m.id = p_mission and m.state in ('open', 'active') and r.state = 'approved';
     if v_agent is null then
         raise exception 'mission % has no open objectives with an approved resident', p_mission;
     end if;
+    if exists (select 1 from mission_tasks
+                where mission_id = p_mission and objective = p_objective
+                  and state not in ('landed', 'cancelled')) then
+        raise exception 'objective % of mission % already has a task in flight',
+            p_objective, p_mission;
+    end if;
+    select count(*) into v_open from mission_tasks
+     where mission_id = p_mission and state not in ('landed', 'cancelled');
+    if v_open >= v_workers then
+        raise exception 'mission % already has % tasks in flight (its workers: %)',
+            p_mission, v_open, v_workers;
+    end if;
     v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
+    if exists (select 1 from mission_tasks
+                where mission_id = p_mission and agent_id = v_agent
+                  and state not in ('landed', 'cancelled')) then
+        v_kind := 'ephemeral';
+        v_agent := format('agent_worker_objective_%s', v_id);
+        v_session := format('session_worker_objective_%s', v_id);
+    end if;
     perform spawn_control_record(jsonb_build_object(
-        'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', 'resident',
+        'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', v_kind,
         'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief,
         'created_by', 'spawn-integrate', 'objective', p_objective, 'scenario', p_scenario));
     return v_id;

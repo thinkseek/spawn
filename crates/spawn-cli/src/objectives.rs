@@ -1,12 +1,23 @@
 //! Objective missions (docs/fleet-architecture.md §10.4): the controller's
 //! backlog (`rsi/backlog/*.json`, in its checkout) turned into tasks.
 //!
-//! The integrator gives the mission's resident the lowest open objective,
-//! one task at a time. A one-shot objective is solved once a task for it
-//! lands; a recurring one stays open until the metric of its latest landing
-//! meets its target. The metric is the gate's verdict line, never scenario
-//! output, which candidate code controls.
+//! The integrator keeps up to N of the mission's tasks in flight, N being its
+//! worker limit (`objectives ->> 'workers'`, 1 to 16, default 1). A task is
+//! in flight from `task.assigned` until it lands or is cancelled. Each pass
+//! fills the free slots with the lowest open objectives that have no task in
+//! flight: an objective never has two. The mission's resident takes a task
+//! whenever it has none open in the mission; every other task goes to a new
+//! per-task worker (`agent_worker_objective_<task>`, ephemeral: no approval,
+//! a fresh workspace from the source's main, stopped once its task lands).
+//! `spawn_objective_assign` checks both limits again under the append lock.
+//! With N = 1 this is one task at a time on the resident.
+//!
+//! A one-shot objective is solved once a task for it lands; a recurring one
+//! stays open until the metric of its latest landing meets its target. The
+//! metric is the gate's verdict line, never scenario output, which candidate
+//! code controls.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -172,16 +183,46 @@ pub(crate) fn landed_value(task: &Task, landings: &[Landing]) -> Option<f64> {
         .find_map(|landing| candidate_value(landing.metric.as_deref()?, name))
 }
 
-/// The lowest open objective: a one-shot one with no landing, or a
+/// Whether an objective is open: a one-shot one with no landing, or a
 /// recurring one whose latest landed metric misses its target.
+fn is_open(task: &Task, landings: &[Landing]) -> bool {
+    if task.recurring {
+        !landed_value(task, landings).is_some_and(|value| task.meets(value))
+    } else {
+        !landings.iter().any(|landing| landing.objective == task.id)
+    }
+}
+
+/// The lowest open objective: what one free slot gets with nothing in flight.
+#[cfg(test)]
 pub(crate) fn next_open<'a>(backlog: &'a [Task], landings: &[Landing]) -> Option<&'a Task> {
-    backlog.iter().find(|task| {
-        if task.recurring {
-            !landed_value(task, landings).is_some_and(|value| task.meets(value))
-        } else {
-            !landings.iter().any(|landing| landing.objective == task.id)
-        }
-    })
+    backlog.iter().find(|task| is_open(task, landings))
+}
+
+/// The objectives that fill `free` slots: the lowest open ones without a
+/// task in flight (`in_flight`), at most `free` of them.
+pub(crate) fn choose<'a>(
+    backlog: &'a [Task],
+    landings: &[Landing],
+    in_flight: &BTreeSet<u32>,
+    free: usize,
+) -> Vec<&'a Task> {
+    backlog
+        .iter()
+        .filter(|task| is_open(task, landings) && !in_flight.contains(&task.id))
+        .take(free)
+        .collect()
+}
+
+/// An objective mission's worker limit: `objectives ->> 'workers'`, 1 when
+/// absent (every mission configured before the limit existed).
+pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
+    objectives
+        .get("workers")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|workers| usize::try_from(workers).ok())
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// The brief of an objective task: the objective, the working rules, and
@@ -239,15 +280,18 @@ pub(crate) fn brief(task: &Task, current: Option<f64>, history: &[GateRecord]) -
     brief
 }
 
-/// Give an objective mission's resident its next task, when the mission
-/// has none open. Returns the task id.
-pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Option<i64>, String> {
+/// Fill an objective mission's free slots: up to its worker limit, every
+/// open task of the mission taking one, with the lowest open objectives that
+/// have no task in flight. Returns the ids of the tasks assigned. A first
+/// assignment that fails is the error; a later one ends the filling, logged,
+/// keeping what was assigned.
+pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
     let Some(config) = &mission.objectives else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    if !mission.tasks.is_empty() {
-        // One task at a time: anything listed is still open.
-        return Ok(None);
+    let free = workers(config).saturating_sub(mission.tasks.len());
+    if free == 0 {
+        return Ok(Vec::new());
     }
     let backlog = config
         .get("backlog")
@@ -260,9 +304,35 @@ pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Op
             .map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("objective landings: {error}"))?;
-    let Some(task) = next_open(&objectives, &landings) else {
-        return Ok(None);
-    };
+    let in_flight: BTreeSet<u32> = mission
+        .tasks
+        .iter()
+        .filter_map(|task| task.objective)
+        .collect();
+    let mut assigned = Vec::new();
+    for task in choose(&objectives, &landings, &in_flight, free) {
+        match assign(store, mission, task, &landings) {
+            Ok(id) => assigned.push(id),
+            Err(error) if assigned.is_empty() => return Err(error),
+            Err(error) => {
+                eprintln!(
+                    "integrate: mission {} objective {}: {error}",
+                    mission.id, task.id
+                );
+                break;
+            }
+        }
+    }
+    Ok(assigned)
+}
+
+/// Assign one objective of `mission`; the task's id.
+fn assign(
+    store: &PostgresStore,
+    mission: &Mission,
+    task: &Task,
+    landings: &[Landing],
+) -> Result<i64, String> {
     let id = i32::try_from(task.id).map_err(|_| format!("objective {} is too large", task.id))?;
     let history: Vec<GateRecord> = serde_json::from_value(
         store
@@ -272,7 +342,7 @@ pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Op
     .map_err(|error| format!("objective history: {error}"))?;
     let scenario = Path::new(&mission.gate).join(format!("{:03}.sh", task.id));
     let scenario = scenario.is_file().then(|| scenario.display().to_string());
-    let text = brief(task, landed_value(task, &landings), &history);
+    let text = brief(task, landed_value(task, landings), &history);
     let assigned = store
         .objective_assign(mission.id, id, scenario.as_deref(), &text)
         .map_err(|error| error.to_string())?;
@@ -280,12 +350,14 @@ pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Op
         "integrate: mission {} objective {} -> task {assigned}",
         mission.id, task.id
     );
-    Ok(Some(assigned))
+    Ok(assigned)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Landing, Task, load_backlog, metric_lines, next_open};
+    use super::{Landing, Task, choose, load_backlog, metric_lines, next_open, workers};
+    use serde_json::json;
+    use std::collections::BTreeSet;
 
     fn objective(id: u32, recurring: bool) -> Task {
         Task {
@@ -339,6 +411,59 @@ mod tests {
         assert_eq!(next_open(&backlog, &met).map(|task| task.id), Some(3));
         let all = [landing(3, None), met[0].clone(), landing(1, None)];
         assert!(next_open(&backlog, &all).is_none());
+    }
+
+    fn ids(tasks: &[&Task]) -> Vec<u32> {
+        tasks.iter().map(|task| task.id).collect()
+    }
+
+    #[test]
+    fn free_slots_get_the_lowest_open_objectives_not_in_flight() {
+        let backlog = [
+            objective(1, false),
+            objective(2, false),
+            objective(3, false),
+            objective(4, false),
+        ];
+        let none = BTreeSet::new();
+        assert_eq!(
+            ids(&choose(&backlog, &[], &none, 3)),
+            vec![1, 2, 3],
+            "lowest first"
+        );
+        // Solved objectives and those in flight are skipped.
+        let solved = [landing(1, None)];
+        let flying = BTreeSet::from([2]);
+        assert_eq!(ids(&choose(&backlog, &solved, &flying, 3)), vec![3, 4]);
+        // No free slot, nothing.
+        assert!(choose(&backlog, &[], &none, 0).is_empty());
+        // Fewer open objectives than slots: only those.
+        let three_solved = [landing(1, None), landing(2, None), landing(3, None)];
+        assert_eq!(ids(&choose(&backlog, &three_solved, &none, 3)), vec![4]);
+    }
+
+    #[test]
+    fn a_recurring_objective_in_flight_is_not_chosen_twice() {
+        let backlog = [objective(1, true), objective(2, false)];
+        // Recurring and not met: open after every landing, but one task at a time.
+        let missed = [landing(
+            1,
+            Some("METRIC ingest_total_ns baseline=1500 candidate=1200"),
+        )];
+        let none = BTreeSet::new();
+        assert_eq!(ids(&choose(&backlog, &missed, &none, 2)), vec![1, 2]);
+        let flying = BTreeSet::from([1]);
+        assert_eq!(ids(&choose(&backlog, &missed, &flying, 2)), vec![2]);
+    }
+
+    #[test]
+    fn the_worker_limit_defaults_to_one() {
+        assert_eq!(workers(&json!({"backlog": "/b", "resident": "r"})), 1);
+        assert_eq!(
+            workers(&json!({"backlog": "/b", "resident": "r", "workers": 3})),
+            3
+        );
+        assert_eq!(workers(&json!({"workers": 0})), 1, "never below one");
     }
 
     #[test]

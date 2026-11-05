@@ -1,6 +1,6 @@
 # Spawn RSI
 
-结论：RSI 是一个目标任务（objective mission），没有单独的控制器。`spawn integrate` 从 `rsi/backlog` 取编号最小的未完成目标，交给常驻 worker，一次一个任务；黑盒门禁 `scripts/rsi/gate.sh` 判定；通过就在宿主侧提交，用 CAS 推送前移任务源的 `main`；被拒就带着门禁输出退回 worker。状态全在事件日志的控制流里，任务与落地的规则见 [fleet-architecture.md](fleet-architecture.md) §10。
+结论：RSI 是一个目标任务（objective mission），没有单独的控制器。`spawn integrate` 从 `rsi/backlog` 取编号最小的未完成目标，交给常驻 worker；任务的 worker 上限 N（`--workers`，默认 1）允许最多 N 个任务同时进行，每个目标最多一个，常驻 worker 空闲时接一个，其余交给每任务一个的临时 worker（`agent_worker_objective_<task>`）；黑盒门禁 `scripts/rsi/gate.sh` 判定；通过就在宿主侧提交，用 CAS 推送前移任务源的 `main`；被拒就带着门禁输出退回 worker。状态全在事件日志的控制流里，任务与落地的规则见 [fleet-architecture.md](fleet-architecture.md) §10。
 
 ## 1. 组成
 
