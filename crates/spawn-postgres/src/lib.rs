@@ -69,7 +69,18 @@ const LOGINS: [&str; 2] = ["spawn_supervisor", "spawn_reader"];
 impl PostgresStore {
     /// Connect to the database in the URL.
     pub fn connect(url: &str) -> Result<Self, StoreError> {
-        let client = Client::connect(url, NoTls).map_err(|error| backend(&error))?;
+        let mut config: postgres::Config = url
+            .parse()
+            .map_err(|error: postgres::Error| backend(&error))?;
+        // The schema warns (`raise warning`) about what a migration left for
+        // a human, such as tables it kept. The many notices of an idempotent
+        // migration ("already exists, skipping") stay quiet.
+        config.notice_callback(|notice| {
+            if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
+                eprintln!("spawn: database: {}", notice.message());
+            }
+        });
+        let client = config.connect(NoTls).map_err(|error| backend(&error))?;
         Ok(Self {
             client: Mutex::new(client),
             password: url_password(url),

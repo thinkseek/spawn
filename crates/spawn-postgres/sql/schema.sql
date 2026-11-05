@@ -717,8 +717,45 @@ drop function if exists spawn_read_task_events(text);
 drop function if exists spawn_read_lineage(text);
 drop function if exists spawn_read_open_tools(text);
 
--- The retired RSI controller's tables; its history is in the control stream.
-drop table if exists rsi_attempts, rsi_iterations, rsi_state;
+-- The retired RSI controller's tables. `spawn mission import-rsi` brought
+-- each landed attempt into the control stream as a `legacy.imported` task
+-- (created by `rsi`, its objective the attempt's task, created when the
+-- attempt was); nothing else of theirs was imported. They are dropped only
+-- when that loses nothing: every attempt has its record and no iteration or
+-- controller state is left. Otherwise they stay, with a warning.
+do $$
+declare
+    v_attempts bigint := 0;
+    v_rest bigint := 0;
+begin
+    if to_regclass('rsi_attempts') is not null then
+        select count(*) into v_attempts
+          from rsi_attempts a
+         where not exists (
+             select 1 from spawn_events e
+              cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+              where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                and x.r ->> 'type' = 'legacy.imported' and x.r ->> 'table' = 'mission_tasks'
+                and x.r -> 'row' ->> 'created_by' = 'rsi'
+                and (x.r -> 'row' ->> 'objective')::bigint = a.task_id
+                and (x.r -> 'row' ->> 'created_at_ms')::bigint = a.created_at_ms);
+    end if;
+    if to_regclass('rsi_iterations') is not null then
+        v_rest := v_rest + (select count(*) from rsi_iterations);
+    end if;
+    if to_regclass('rsi_state') is not null then
+        v_rest := v_rest + (select count(*) from rsi_state);
+    end if;
+    if v_attempts = 0 and v_rest = 0 then
+        drop table if exists rsi_attempts, rsi_iterations, rsi_state;
+    else
+        raise warning 'kept rsi_attempts, rsi_iterations and rsi_state: % attempts have no '
+                      'imported record and % iteration or state rows were never imported; '
+                      'dump them (pg_dump -t ''rsi_*'') and drop them to keep their history',
+                      v_attempts, v_rest;
+    end if;
+end
+$$;
 
 -- `spawn_terminal`, a login for engine terminals to append their own
 -- events, is unused: an existing one may not log in or call anything here.
