@@ -613,11 +613,18 @@ the tree's own:
   tools the scenarios run (`rustc -vV`, `cargo -V`, `node --version`,
   `psql -V`, `git --version`, `tmux -V`, `python3 -V`, `jq --version`, in
   the sandbox inside the base tree) and the test server's
-  `server_version_num`, the scenarios directory's build hook and helpers,
-  and the files the scenario names on its code lines (`scripts/...` of the
-  controller, transitively; a scenario that reaches into `scripts/`
-  through a variable or a `cd` keys all of it). A controller file no
-  scenario names (the black-box runner) changes no key. Only the gate
+  `server_version_num`, the scenarios directory's build hook and helpers
+  (and the `bind` list's text), a fingerprint of each directory the `bind`
+  list names (the blobs of pnpm's `.modules.yaml` and `.pnpm/lock.yaml`
+  when present, else a listing of the directory: path, type, size, mtime,
+  link target), and the files the scenario names on its code lines
+  (`scripts/...` of the controller, transitively; a scenario that reaches
+  into `scripts/` through a variable or a `cd` keys all of it). A
+  controller file no scenario names (the black-box runner) changes no key.
+  Not keyed: an edit inside a bound directory that has pnpm's install
+  record but was not installed, and the state candidate code leaves on the
+  shared test server (a disposable server per gate is GitHub issue #6;
+  until then one gate runs at a time). Only the gate
   writes an entry, after a completed base run; an entry it cannot read is
   a miss; candidate runs are never cached; the log lists which base
   results came from the cache, and the time spent on the base, the
