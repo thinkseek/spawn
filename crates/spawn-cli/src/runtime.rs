@@ -77,7 +77,6 @@ fn bridge_config() -> Result<BridgeConfig, String> {
     let mut config = BridgeConfig::new(&env_or("SPAWN_WORKER", "spawn-worker"));
     config.spawn_program = spawn_program();
     config.claude_program = env_or("SPAWN_CLAUDE_PROGRAM", "claude");
-    config.codex_program = env_or("SPAWN_CODEX_PROGRAM", "codex");
     config.claude_projects = claude_projects();
     config.model_relay = model_relay();
     // A worker's pane gets no database login: the Bridge reads what the

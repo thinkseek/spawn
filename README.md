@@ -2,11 +2,11 @@
 
 English · [简体中文](./README.zh-CN.md)
 
-Spawn runs Claude Code and Codex CLI agents in isolated workspaces and records everything they do in one PostgreSQL event log.
+Spawn runs Claude Code agents in isolated workspaces and records everything they do in one PostgreSQL event log.
 
 - A caller submits a command (start, input, resume, stop) to a queue in PostgreSQL.
 - `spawn tick` claims the command, forks a git branch, exports it into a working tree and starts the engine in a tmux session.
-- Claude Code's transcript, Codex JSON output, the terminal screen and the engine's exit status become typed events in the log. The engine's terminal holds no database login.
+- Claude Code's transcript, the terminal screen and the engine's exit status become typed events in the log. The engine's terminal holds no database login.
 - An Observer judges each session (ready, working, blocked, failed) and writes the result back as an event.
 
 The log is the only state. Each `spawn tick` is a new process that rebuilds its view from the log, so a crash loses no state.
@@ -19,7 +19,7 @@ The log is the only state. Each `spawn tick` is a new process that rebuilds its 
 | PostgreSQL | 16 or later | Event log, command queue, views |
 | tmux | 3.x | Terminals |
 | git | 2.30 or later | Branches and workspaces |
-| Claude Code and/or Codex CLI | current | Engines |
+| Claude Code | current | Engine |
 | docker | optional | Runs the engine in a container when `SPAWN_EXEC_IMAGE` is set |
 
 ## Install
@@ -87,9 +87,9 @@ Actions for `--action`:
 
 | `type` | Fields |
 | --- | --- |
-| `start` | `engine` (`claude` or `codex`), `prompt` (Codex requires a non-empty one), optional `parent_session_id`, optional `from` (another agent of the same mission source, meaning its branch head, or a full commit id: where a new branch starts instead of `main`) |
-| `input` | `text`; Claude only |
-| `resume` | optional `prompt`; Codex requires it |
+| `start` | `prompt`, optional `engine` (`claude`, the only engine), optional `parent_session_id`, optional `from` (another agent of the same mission source, meaning its branch head, or a full commit id: where a new branch starts instead of `main`) |
+| `input` | `text` |
+| `resume` | optional `prompt` |
 | `stop` | none |
 
 Missions: `spawn mission add --text ... [--source <repo>]` (a human), then the supervisor plans
@@ -121,7 +121,6 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_EXEC_IMAGE` | unset | When set, the engine and its tmux run in one container per branch |
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker path |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code path |
-| `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI path |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` | Where Claude Code writes its transcripts, as the Bridge sees that directory |
 | `SPAWN_PROGRAM` | current binary, else `spawn` | `spawn` path used inside the terminal, in the commands the dispatcher submits, and in the supervisor's charter. When unset: the path of the running executable, or plain `spawn` if that path cannot be determined |
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it a local heuristic judges |

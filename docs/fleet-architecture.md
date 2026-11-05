@@ -46,8 +46,8 @@ Three ideas carry the design:
  │               (queue), grants, views; the control stream (§10.1)      │
  ├──────────────────────────────────────────────────────────────────────┤
  │ 1 Runtime     Bridge: start / input / resume / stop                   │
- │               engines (Claude Code, Codex) in tmux + git workspaces   │
- │               transcripts, JSON lines, screen, exit files → events    │
+ │               Claude Code engines in tmux + git workspaces            │
+ │               transcripts, screen, exit files → events                │
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -399,7 +399,7 @@ Known edges, each with its rule:
 - The event log is the only state; every process is restartable.
 - `EventKind` stays closed; observation fields are additive.
 - Facts > rules > Jev; observation never acts; Jev alone triggers only reversible, bounded actions.
-- Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the runner's copy of Codex output, the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing; it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. The restricted logins' passwords are derived from the owner's (SHA-256 over the owner's password and the role name, `spawn_postgres::role_url`) and set by every migration, so nothing stores them and only a holder of the owner's credentials can form them. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration leaves the logins as they are (created `nologin`; enabled only by a migration that has the owner's password), never with a password derived from the empty string.
+- Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing; it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. The restricted logins' passwords are derived from the owner's (SHA-256 over the owner's password and the role name, `spawn_postgres::role_url`) and set by every migration, so nothing stores them and only a holder of the owner's credentials can form them. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration leaves the logins as they are (created `nologin`; enabled only by a migration that has the owner's password), never with a password derived from the empty string.
 - No model key in Spawn: the DeepSeek key stays in the model relay's process, the gateway token in Claude Code's own settings (§3.3).
 - Every landing goes through the black-box gate, a host-side commit, a compare-and-swap move of the baseline, and the halt rules (§10).
 
@@ -485,8 +485,6 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   on live runs. A `spawn dispatch --replay` for the playbook does not exist.
 - **A write endpoint in the UI** (an input box to the supervisor). Humans
   act with `spawn submit --principal human`.
-- **Codex workers for mission tasks.** Delivery starts every worker with
-  Claude Code; Codex runs only through `spawn submit`.
 - **More dispatcher rules:** stopping a COMPLETED one-shot task and
   retrying after a transient API error (both escalate), and the actions
   `restart` and `reassign`.

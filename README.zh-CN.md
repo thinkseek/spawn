@@ -2,11 +2,11 @@
 
 [English](./README.md) · 简体中文
 
-Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
+Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
 
 - 调用方向 PostgreSQL 中的队列提交命令（start、input、resume、stop）。
 - `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 tmux 会话中启动引擎。
-- Claude Code 的 transcript、Codex JSON 输出、终端屏幕与引擎退出状态转为日志中的类型化事件。引擎所在终端不持有数据库登录。
+- Claude Code 的 transcript、终端屏幕与引擎退出状态转为日志中的类型化事件。引擎所在终端不持有数据库登录。
 - Observer 判定每个会话的状态（可输入、运行中、阻塞、失败），并把结论作为事件写回。
 
 日志是唯一的状态。每次 `spawn tick` 是新进程，从日志重建视图，进程崩溃不丢状态。
@@ -20,7 +20,7 @@ Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它
 | tmux | 3.x | 终端 |
 | git | 2.30 及以上 | 分支与工作区 |
 | docker | 可选 | 设置 `SPAWN_EXEC_IMAGE` 时在容器内运行引擎 |
-| Claude Code 和/或 Codex CLI | 当前版本 | 引擎 |
+| Claude Code | 当前版本 | 引擎 |
 
 ## 安装
 
@@ -76,9 +76,9 @@ spawn status
 
 | `type` | 字段 |
 | --- | --- |
-| `start` | `engine`（`claude` 或 `codex`）、`prompt`（Codex 必须非空）、可选 `parent_session_id`、可选 `from`（同一任务源的另一个 agent，即其分支头，或完整 commit id：新分支从这里开始而不是 `main`） |
-| `input` | `text`；仅 Claude |
-| `resume` | 可选 `prompt`；Codex 必填 |
+| `start` | `prompt`、可选 `engine`（`claude`，唯一的引擎）、可选 `parent_session_id`、可选 `from`（同一任务源的另一个 agent，即其分支头，或完整 commit id：新分支从这里开始而不是 `main`） |
+| `input` | `text` |
+| `resume` | 可选 `prompt` |
 | `stop` | 无 |
 
 ## 配置
@@ -94,7 +94,6 @@ spawn status
 | `SPAWN_EXEC_IMAGE` | 未设置 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker 路径 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
-| `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI 路径 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录（Bridge 所见路径） |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
 | `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时用本地启发式判定 |

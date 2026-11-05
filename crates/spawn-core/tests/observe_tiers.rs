@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spawn_core::event::EndCause;
-use spawn_core::event::{Engine, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
+use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent, Source};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use spawn_core::memory::MemoryStore;
 use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState, WaitReason};
@@ -113,7 +113,7 @@ fn started(store: &MemoryStore) {
         store,
         Source::Bridge,
         EventKind::ExecutionStarted {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             terminal: TerminalName::new("spawn-exec_1").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(1),
@@ -758,7 +758,7 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
     in_execution(
         2,
         EventKind::ExecutionStarted {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             terminal: TerminalName::new("spawn-exec_2").expect("valid"),
             workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
             command_id: CommandId(2),

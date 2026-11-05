@@ -9,7 +9,7 @@ use spawn_core::bridge::{
 use spawn_core::command::{CommandAction, Outcome, Submission};
 use spawn_core::contract;
 use spawn_core::event::{
-    EndCause, Engine, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq, Source,
+    ENGINE, EndCause, EventKind, GlobalPosition, ModelProfile, NewEvent, SessionSeq, Source,
 };
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
@@ -103,7 +103,33 @@ fn events_round_trip_through_json() {
     assert_eq!(Source::parse("claude"), Some(Source::Claude));
     assert_eq!(Source::Gateway.as_str(), "gateway");
     assert!(Source::parse("nope").is_none());
-    assert_eq!(Engine::parse("codex"), Some(Engine::Codex));
+    // A record naming an engine this build does not run still reads; a
+    // command naming one does not parse, and its sender sees why.
+    let started = serde_json::json!({
+        "name": "execution.started",
+        "detail": {"engine": "codex", "terminal": "spawn-exec_1",
+                   "workspace": "1:/w", "command_id": 1},
+    });
+    assert!(matches!(
+        serde_json::from_value::<EventKind>(started),
+        Ok(EventKind::ExecutionStarted { engine, .. }) if engine == "codex"
+    ));
+    let start = |engine: &str| {
+        serde_json::from_value::<CommandAction>(
+            serde_json::json!({"type": "start", "engine": engine, "prompt": "x"}),
+        )
+    };
+    assert!(start(ENGINE).is_ok());
+    let refused = start("codex").expect_err("codex is not an engine");
+    assert!(
+        refused.to_string().contains("unknown engine codex"),
+        "{refused}"
+    );
+    let unnamed = serde_json::json!({"type": "start", "prompt": "x"});
+    assert!(matches!(
+        serde_json::from_value::<CommandAction>(unnamed),
+        Ok(CommandAction::Start { engine, .. }) if engine == ENGINE
+    ));
 }
 
 #[test]
@@ -228,7 +254,7 @@ fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
                 session_id: session(),
                 idempotency_key: IdempotencyKey::new("key_start").expect("valid key"),
                 action: CommandAction::Start {
-                    engine: Engine::Claude,
+                    engine: ENGINE.to_string(),
                     prompt: prompt.to_string(),
                     parent_session_id: None,
                     from: None,
@@ -301,7 +327,7 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
         &store,
         "key_again",
         CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "second".to_string(),
             parent_session_id: None,
             from: None,
@@ -662,7 +688,7 @@ fn bridge_resumes_the_stored_native_session() {
             source: Source::Claude,
             source_event_id: None,
             kind: EventKind::NativeSessionStarted {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 native_session_id: "native-7".to_string(),
                 transcript_path: None,
             },
@@ -729,7 +755,7 @@ fn observer_writes_only_on_change() {
             source: Source::Bridge,
             source_event_id: None,
             kind: EventKind::ExecutionStarted {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 terminal: TerminalName::new("spawn-exec_1").expect("valid"),
                 workspace: spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid"),
                 command_id: CommandId(1),
@@ -811,7 +837,7 @@ fn lease_ttl_expires_and_takes_the_command_again() {
         session_id: session(),
         idempotency_key: IdempotencyKey::new("key_1").expect("valid key"),
         action: CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "x".to_string(),
             parent_session_id: None,
             from: None,

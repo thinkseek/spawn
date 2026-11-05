@@ -8,7 +8,7 @@
 
 | 能力 | 实现方 | Spawn 做的事 |
 | --- | --- | --- |
-| 计算 | Claude Code、Codex CLI | 启动进程、投递提示、读取 transcript、屏幕与退出文件 |
+| 计算 | Claude Code | 启动进程、投递提示、读取 transcript、屏幕与退出文件 |
 | 工作区 | git | 裸仓库加每分支一份工作树，`git archive` 导出、`commit-tree` 收口 |
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
 | 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时用内置启发式判定） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
@@ -65,7 +65,7 @@ spawn_submit(principal, key, agent, session, action)
 
 两条链路互不依赖：数据链路是引擎到事件到 SQL，状态链路是事件到判定再回到事件。
 
-worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。Codex 的 `exec --json` 输出由 `spawn run` 复制到 `.spawn/codex-<execution>.jsonl`，Bridge 同样按行读取。
+worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。
 
 ## 4. 终端接入：尾行解析
 
@@ -146,7 +146,6 @@ spawn status
 | `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
-| `SPAWN_CODEX_PROGRAM` | `codex` | Codex 可执行文件 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录（Bridge 所见路径） |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件 |
 | `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket |

@@ -104,8 +104,7 @@ files, a chunk fetch.
   carries it, it records `notice.typed {through}` (the last merge event the
   notice told of); the notice clears only when that prompt reaches the
   engine: the transcript line of a prompt that opens with the notice's
-  fixed opening gives `notice.received` (for Codex, whose prompt is its
-  argument, the resumed execution's first prompt). Only the files told of
+  fixed opening gives `notice.received`. Only the files told of
   are cleared, so a merge that lands between the typing and the receipt is
   told next time. A prompt the Bridge did not type (someone at the pane, the
   engine going on by itself) clears nothing, and neither does a restart: a

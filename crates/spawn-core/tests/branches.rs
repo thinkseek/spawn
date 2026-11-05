@@ -8,7 +8,7 @@ use std::sync::Arc;
 use spawn_core::bridge::{Bridge, BridgeConfig, TickReport, claude_session_id};
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{
-    CheckpointReason, EndCause, Engine, EventKind, Fork, GlobalPosition, NewEvent,
+    CheckpointReason, ENGINE, EndCause, EventKind, Fork, GlobalPosition, NewEvent,
 };
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
@@ -62,7 +62,7 @@ fn start(store: &MemoryStore, from: Option<&str>) {
         store,
         "key_start",
         CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "work".to_string(),
             parent_session_id: None,
             from: from.map(str::to_string),

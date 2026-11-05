@@ -17,7 +17,7 @@
 //! the same revival twice.
 
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::Engine;
+use spawn_core::event::ENGINE;
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::mission::TaskState;
 use spawn_core::port::CommandQueue;
@@ -214,7 +214,7 @@ fn revive(
         ),
         Revive::Start { handoff } => (
             CommandAction::Start {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 prompt: start(handoff),
                 parent_session_id: None,
                 from: None,

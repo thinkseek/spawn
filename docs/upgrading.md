@@ -77,9 +77,8 @@ These are not about process lifetime. They break when two versions meet.
    to their meaning is not.
 4. **The runner's files.** A running runner is the binary it was started
    with. It writes the exit code to `SPAWN_EXIT_FILE` (`.spawn/exit-<execution>`
-   in the workspace) and, for Codex, a copy of the output to
-   `SPAWN_ENGINE_OUTPUT`; the Bridge reads both, so their paths and format
-   must stay the same across versions. An execution with no exit file is
+   in the workspace); the Bridge reads it, so its path and format must stay
+   the same across versions. An execution with no exit file is
    ended as `Lost` once its pane is gone.
 5. **The Claude transcript.** Its format is the engine's. `claude_line` skips
    lines it does not know, so an engine release that adds line types causes
