@@ -827,10 +827,10 @@ mod tests {
             BranchName::new("agent_x").expect("valid"),
             BranchName::new("agent_y").expect("valid"),
         );
-        let pushes = Cell::new(0);
+        let push_calls = Cell::new(0);
         let start = |branch: &BranchName, from: Option<&str>| {
             ensure_mirrored_branch(&host_b, &mirror_b, &source, branch, from, &[], || {
-                pushes.set(pushes.get() + 1);
+                push_calls.set(push_calls.get() + 1);
             })
         };
 
@@ -840,7 +840,7 @@ mod tests {
         assert!(start(&agent_y, Some("agent_x")).is_err(), "a fork");
         assert!(!super::has_branch(&mirror_b, "agent_x"));
         assert!(!super::has_branch(&mirror_b, "agent_y"));
-        assert_eq!(pushes.get(), 0);
+        assert_eq!(push_calls.get(), 0);
 
         // Back: the fork starts at the head the source holds, not main.
         std::fs::rename(&moved, &source_dir).expect("the source is back");
@@ -855,7 +855,7 @@ mod tests {
             panic!("taken from the source");
         };
         assert_eq!(resumed.commit.as_str(), pushed);
-        assert_eq!(pushes.get(), 1, "only the branch made here is pushed");
+        assert_eq!(push_calls.get(), 1, "only the branch made here is pushed");
 
         // A branch this host has keeps working while the source is gone.
         std::fs::rename(&source_dir, &moved).expect("the source goes again");
