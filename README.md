@@ -53,10 +53,11 @@ Run one pass of the Bridge and the Observer:
 spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws
 ```
 
-Print the latest observation for each session:
+Print every session with its latest judgement, and one session's events:
 
 ```bash
-spawn status
+spawn fleet
+spawn tail --session session_demo
 ```
 
 Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `spawn loop` running: it ticks the Bridge and the Observer and keeps the supervisor alive. Landing and RSI run separately as `spawn integrate` (docs/fleet-architecture.md §10): it lands gated missions' work through the gate, and RSI is an objective mission whose tasks come from `rsi/backlog`.
@@ -68,16 +69,13 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `init-db` | Installs or updates the SQL schema. Safe to run again. |
 | `submit` | Writes one command to the queue. Flags: `--agent`, `--session`, `--key`, `--action`, `--principal` (default `spawn`). |
 | `tick` | Claims and runs queued commands, advances live executions, records observations. Flags: `--repo`, `--root`, `--judge-url`. |
-| `status` | Prints the latest observation for each session. |
 | `loop` | Runs the fleet until killed: Bridge, Observer, dispatcher, and (with `SPAWN_SUPERVISOR=1`) the supervisor's liveness rule. |
 | `integrate [--once] [--root <dir>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh`, lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog task. |
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
-| `dispatch [--dry-run] [--root <dir>]` | One dispatcher step; `--dry-run` prints the plan and submits nothing. `--root` is the workspace root (default `SPAWN_WORKSPACE_ROOT`), as for `loop` and `tick`. |
 | `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
 | `mission`, `task`, `resident` | The mission layer: add, configure, close and resume missions; assign, accept and reject tasks; propose, approve and retire residents. Every command prints JSON. |
 | `task stages --id N` | A task's stages from the control stream, oldest first: `[{stage, verdict, at_ms, took_ms}]`, `took_ms` the time since the task's previous stage. `mission list` and the dashboard's missions page carry the same list on every task. |
-| `hook` | Accepts and ignores standard input. Spawn configures no hooks; it exists for engines whose settings call it. |
 | `run` | Runs the engine inside the terminal and writes its exit status to a file the Bridge reads. Spawn configures this; you do not call it. |
 | `version` | Prints `spawn <version>`. |
 
@@ -112,7 +110,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | required | PostgreSQL connection string |
 | `SPAWN_GIT_REPO` | required | Bare repository for agents no mission owns (the supervisor, ad hoc workers) |
-| `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick`, `loop` and `dispatch` |
+| `SPAWN_WORKSPACE_ROOT` | required | Directory holding one working tree per branch; `--root` overrides it for `tick` and `loop` |
 | `SPAWN_WORKER` | `spawn-worker` | Worker name on claimed commands |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux path |
 | `SPAWN_TMUX_SOCKET` | default socket | tmux `-L` socket name |

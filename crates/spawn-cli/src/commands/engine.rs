@@ -1,24 +1,12 @@
-//! `run`, the command an engine's terminal starts, and `hook`.
+//! `run`, the command an engine's terminal starts.
 //!
 //! The pane holds no database login: the runner writes what the Bridge
 //! cannot see for itself, the exit status, to a file the Bridge reads.
 //! Claude Code's own transcript and screen tell the Bridge the rest.
 
-use std::io::Read;
 use std::process::Command;
 
 use crate::config::env_value;
-
-/// `spawn hook`: accepted and ignored. Engines started by an older build
-/// still call it from their hook settings; their events come from the
-/// transcript now.
-// ponytail: delete once no execution started before the transcript reader
-// is still running.
-pub(crate) fn hook() -> i32 {
-    let mut payload = String::new();
-    let _ = std::io::stdin().read_to_string(&mut payload);
-    0
-}
 
 /// `spawn run -- <program> [args]`: start the engine, write its exit status
 /// to `SPAWN_EXIT_FILE`, and forward its exit code. The engine's output

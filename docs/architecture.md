@@ -121,7 +121,7 @@ spawn init-db
 spawn submit --agent agent_001 --session session_001 --key k1 \
   --action '{"type":"start","engine":"claude","prompt":"整理最近三个提交"}'
 spawn tick
-spawn status
+spawn fleet
 ```
 
 | 子命令 | 作用 |
@@ -129,13 +129,10 @@ spawn status
 | `init-db` | 安装或刷新 schema，可重复执行 |
 | `submit` | 写一条命令，幂等键重复则返回原命令 |
 | `tick` | 跑一轮 Bridge 与 Observer |
-| `status` | 扫描全部事件，打印每会话最新一条 observation |
-| `hook` | 读取并丢弃标准输入。Spawn 不配置 hook；它只为设置里写了它的引擎存在 |
 | `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
 | `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
 | `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
 | `serve` | 常驻：只读看板与 HTTP 查询 |
-| `dispatch` | 跑一轮派发：把消息、任务、新闻送给对应会话 |
 | `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
 | `fleet` / `tail` | 舰队概览（每个会话及其判定）、单个会话的判定与事件尾随 |
 | `version` | 打印 `spawn <版本>` |

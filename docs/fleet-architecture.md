@@ -473,7 +473,7 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   labelled outcome kept), Jev filtering (escalations to the supervisor down,
   outcome accuracy kept), playbook reach (interventions in the corpus the
   playbook would have resolved, up), and human interventions per agent-hour
-  on live runs. A `spawn dispatch --replay` for the playbook does not exist.
+  on live runs. Nothing replays the playbook over recorded episodes.
 - **A write endpoint in the UI** (an input box to the supervisor). Humans
   act with `spawn submit --principal human`.
 - **More dispatcher rules:** stopping a COMPLETED one-shot task and
