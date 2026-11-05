@@ -133,3 +133,105 @@ fn the_first_shape_of_every_table_migrates_to_the_current_columns() {
     upgraded.migrate().expect("migrate again");
     assert_eq!(columns(&mut client, &schema), before);
 }
+
+/// Run the schema over `schema` as the owner and return its warnings.
+fn migrate_warnings(schema: &str) -> Vec<String> {
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&warnings);
+    let mut config: postgres::Config = url().parse().expect("the test URL parses");
+    config.notice_callback(move |notice| {
+        if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
+            sink.lock()
+                .expect("warnings")
+                .push(notice.message().to_string());
+        }
+    });
+    let mut client = config.connect(postgres::NoTls).expect("owner connection");
+    client
+        .batch_execute(&format!(
+            "set search_path to {schema}; {}",
+            include_str!("../sql/schema.sql")
+        ))
+        .expect("migrate");
+    drop(client);
+    std::mem::take(&mut *warnings.lock().expect("warnings"))
+}
+
+fn exists(client: &mut Client, table: &str) -> bool {
+    client
+        .query_one("select to_regclass($1) is not null", &[&table])
+        .expect("look the table up")
+        .get(0)
+}
+
+#[test]
+fn the_retired_rsi_tables_are_dropped_only_when_nothing_in_them_is_lost() {
+    // Empty: dropped without a word.
+    let (schema, mut client) = first_shapes("rsi_empty");
+    assert!(migrate_warnings(&schema).is_empty());
+    for table in ["rsi_attempts", "rsi_iterations", "rsi_state"] {
+        assert!(!exists(&mut client, table), "{table} is dropped");
+    }
+
+    // Rows never imported: kept, and the migration says so.
+    let (schema, mut client) = first_shapes("rsi_rows");
+    client
+        .batch_execute(
+            "insert into rsi_attempts (task_id, attempt, iteration, gate_log, accept_ok, created_at_ms)
+                 values (3, 1, 1, 'METRIC x baseline=1 candidate=2', true, 5000);
+             insert into rsi_iterations (iteration, task_id, phase, agent_id, session_id, patch,
+                                         updated_at_ms)
+                 values (1, 3, 'landed', 'agent_resident_rsi', 'session_resident_rsi', 'diff', 5000);",
+        )
+        .expect("an attempt and its iteration");
+    let warnings = migrate_warnings(&schema);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("kept rsi_attempts")
+            && warnings[0].contains("1 attempts have no imported record")
+            && warnings[0].contains("1 iteration or state rows"),
+        "{warnings:?}"
+    );
+    for table in ["rsi_attempts", "rsi_iterations", "rsi_state"] {
+        assert!(exists(&mut client, table), "{table} is kept");
+    }
+    let kept: String = client
+        .query_one("select patch from rsi_iterations", &[])
+        .expect("the iteration is still there")
+        .get(0);
+    assert_eq!(kept, "diff");
+
+    // The attempt imported (as `spawn mission import-rsi` did) but the
+    // iteration not: still kept.
+    let mission: i64 = client
+        .query_one("select spawn_mission_add('RSI', '[]', 'human')", &[])
+        .expect("a mission")
+        .get(0);
+    client
+        .execute(
+            "select spawn_control_record(jsonb_build_object(
+                 'type', 'legacy.imported', 'table', 'mission_tasks', 'row', jsonb_build_object(
+                     'id', 90, 'mission_id', $1::bigint, 'kind', 'resident',
+                     'agent_id', 'agent_resident_rsi', 'session_id', 'session_resident_rsi',
+                     'brief', 'RSI attempt', 'state', 'landed', 'revisions', 0,
+                     'created_by', 'rsi', 'created_at_ms', 5000, 'updated_at_ms', 5000,
+                     'objective', 3)))",
+            &[&mission],
+        )
+        .expect("the attempt's import record");
+    let warnings = migrate_warnings(&schema);
+    assert!(
+        warnings.len() == 1 && warnings[0].contains("0 attempts have no imported record"),
+        "{warnings:?}"
+    );
+    assert!(exists(&mut client, "rsi_iterations"));
+
+    // Everything accounted for: dropped.
+    client
+        .batch_execute("delete from rsi_iterations")
+        .expect("the iteration goes");
+    assert!(migrate_warnings(&schema).is_empty());
+    for table in ["rsi_attempts", "rsi_iterations", "rsi_state"] {
+        assert!(!exists(&mut client, table), "{table} is dropped");
+    }
+}
