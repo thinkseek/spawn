@@ -12,6 +12,8 @@
 set -uo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source=scripts/stage.sh
+. "$root/scripts/stage.sh"
 bin=${SPAWN_BIN:-${CARGO_TARGET_DIR:-$root/target}/debug/spawn}
 pattern=${1:-*.sh}
 
@@ -53,7 +55,7 @@ for scenario in "$root"/scripts/blackbox/scenarios/$pattern; do
     work=$(mktemp -d)
 
     if ! $SPAWN_PSQL -d postgres -tA -c "create database $db" >/dev/null 2>&1; then
-        echo "FAIL $slug (create database)"
+        stage_emit blackbox fail 0 "$slug (create database)"
         failed=$((failed + 1))
         failed_names="$failed_names $slug"
         rm -rf "$work"
@@ -95,14 +97,15 @@ FAKE
     export SPAWN_BIN SPAWN_DATABASE_URL SPAWN_DB_NAME SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT \
         SPAWN_CLAUDE_PROGRAM SPAWN_CODEX_PROGRAM SPAWN_TMUX_SOCKET SPAWN_WORKER WORK
 
+    stage_open blackbox "$slug"
     if (
         . "$root/scripts/blackbox/assertions.sh"
         . "$scenario"
     ); then
-        echo "ok   $slug"
+        stage_close ok
         passed=$((passed + 1))
     else
-        echo "FAIL $slug"
+        stage_close fail
         failed=$((failed + 1))
         failed_names="$failed_names $slug"
     fi
