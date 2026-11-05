@@ -445,6 +445,129 @@ fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
     assert_eq!(tables(&mut client), live);
 }
 
+/// The error text of a refused call.
+fn refusal<T: std::fmt::Debug>(result: Result<T, spawn_core::port::StoreError>) -> String {
+    result.expect_err("refused").to_string()
+}
+
+#[test]
+fn an_objective_mission_keeps_up_to_its_workers_in_flight_each_on_its_own_agent() {
+    let (store, schema) = store("control_objective_workers");
+    let mission = store
+        .mission_add("Improve faster", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .resident_propose("wide", "Pursues objectives")
+        .expect("propose");
+    store.resident_approve("wide").expect("approve");
+    let objectives = json!({"backlog": "/controller/rsi/backlog", "resident": "wide",
+                            "workers": 2});
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, Some(&objectives))
+        .expect("configure with two workers");
+
+    // The resident has none open: it takes the first task.
+    let first = store
+        .objective_assign(mission, 1, None, "brief one")
+        .expect("first");
+    // A second task for the same objective is refused while one is in flight.
+    let doubled = refusal(store.objective_assign(mission, 1, None, "again"));
+    assert!(doubled.contains("already has a task in flight"), "{doubled}");
+    // The resident has one open: the next goes to a per-task worker.
+    let second = store
+        .objective_assign(mission, 2, None, "brief two")
+        .expect("second");
+    // At its limit, the mission is refused a third.
+    let full = refusal(store.objective_assign(mission, 3, None, "brief three"));
+    assert!(full.contains("2 tasks in flight"), "{full}");
+
+    let mut client = admin(&schema);
+    let task = |client: &mut Client, id: i64| -> serde_json::Value {
+        client
+            .query_one(
+                "select to_jsonb(t) from mission_tasks t where id = $1",
+                &[&id],
+            )
+            .expect("a task")
+            .get(0)
+    };
+    let one = task(&mut client, first);
+    assert_eq!(one["agent_id"], "agent_resident_wide");
+    assert_eq!(one["kind"], "resident");
+    let two = task(&mut client, second);
+    assert_eq!(two["kind"], "ephemeral");
+    assert_eq!(
+        two["agent_id"],
+        format!("agent_worker_objective_{second}").as_str()
+    );
+    assert_eq!(
+        two["session_id"],
+        format!("session_worker_objective_{second}").as_str()
+    );
+    assert_eq!(two["brief"], "brief two");
+    assert_eq!(two["created_by"], "spawn-integrate");
+    assert_eq!(two["objective"], 2);
+
+    // A task that ends frees its slot; the resident, free again, takes the
+    // next one, and the ended objective may be assigned again.
+    store.task_cancel(first).expect("cancel");
+    let third = store
+        .objective_assign(mission, 1, None, "brief one again")
+        .expect("a free slot");
+    assert_eq!(task(&mut client, third)["agent_id"], "agent_resident_wide");
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
+}
+
+#[test]
+fn a_mission_without_workers_keeps_one_task_in_flight() {
+    let (store, _schema) = store("control_objective_one");
+    let mission = store
+        .mission_add("Improve", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .resident_propose("narrow", "Pursues objectives")
+        .expect("propose");
+    store.resident_approve("narrow").expect("approve");
+    let objectives = json!({"backlog": "/controller/rsi/backlog", "resident": "narrow"});
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, Some(&objectives))
+        .expect("configure");
+    store
+        .objective_assign(mission, 1, None, "brief")
+        .expect("first");
+    let full = refusal(store.objective_assign(mission, 2, None, "brief"));
+    assert!(full.contains("its workers: 1"), "{full}");
+}
+
+#[test]
+fn a_mission_is_configured_with_one_to_sixteen_workers() {
+    let (store, _schema) = store("control_objective_limit");
+    let mission = store
+        .mission_add("Improve", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let with = |workers: serde_json::Value| {
+        json!({"backlog": "/controller/rsi/backlog", "resident": "r", "workers": workers})
+    };
+    for refused in [json!(0), json!(17), json!(2.5), json!("3"), json!(-1)] {
+        let error = refusal(store.mission_configure(
+            mission,
+            Some("/scenarios"),
+            "gate",
+            None,
+            Some(&with(refused.clone())),
+        ));
+        assert!(error.contains("from 1 to 16"), "{refused}: {error}");
+    }
+    for accepted in [1, 16] {
+        store
+            .mission_configure(mission, Some("/scenarios"), "gate", None, Some(&with(json!(accepted))))
+            .expect("in range");
+    }
+}
+
 #[test]
 fn a_landing_moves_the_baseline_of_every_mission_on_its_source() {
     let (store, schema) = store("control_shared_source");
