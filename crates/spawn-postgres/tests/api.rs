@@ -167,6 +167,103 @@ fn one_session_runs_one_command_at_a_time() {
     assert_eq!(next.command_id, younger);
 }
 
+/// `spawn_claim` leases a command only when nothing earlier (by id) in its
+/// session is unfinished, which holds only if commands commit in id order.
+/// A submission that waits for the append lock while another commits must
+/// not hold an id below the one that committed first: then both would be
+/// leased at once.
+#[test]
+fn two_commands_of_a_session_are_never_leased_at_once_when_their_submissions_race() {
+    let (_store, schema) = store("claim_order");
+    let submit = |key: &str| {
+        format!(
+            "select out_id from spawn_submit('human', '{key}', 'agent_one', 'session_one',
+                                             '{{\"type\":\"stop\"}}')"
+        )
+    };
+    let claim = |client: &mut Client| -> Option<i64> {
+        client
+            .query_opt("select out_id from spawn_claim('w1', 60000)", &[])
+            .expect("claim")
+            .map(|row| row.get(0))
+    };
+
+    // Another writer holds the append lock.
+    let mut holder = admin(&schema);
+    let mut holding = holder.transaction().expect("begin");
+    holding
+        .execute("select pg_advisory_xact_lock(1399957335)", &[])
+        .expect("hold the append lock");
+
+    // A submission starts and waits for it, in a transaction it keeps open.
+    let (submitted_tx, submitted) = std::sync::mpsc::channel::<(i32, Option<i64>)>();
+    let (commit_tx, commit) = std::sync::mpsc::channel::<()>();
+    let waiter_schema = schema.clone();
+    let waiter_submit = submit("key_waiter");
+    let waiter = std::thread::spawn(move || {
+        let mut client = admin(&waiter_schema);
+        let pid: i32 = client
+            .query_one("select pg_backend_pid()", &[])
+            .expect("pid")
+            .get(0);
+        submitted_tx.send((pid, None)).expect("send the pid");
+        let mut transaction = client.transaction().expect("begin");
+        let id: i64 = transaction
+            .query_one(&waiter_submit, &[])
+            .expect("the waiting submission")
+            .get(0);
+        submitted_tx.send((pid, Some(id))).expect("send the id");
+        commit.recv().expect("told to commit");
+        transaction.commit().expect("commit the waiting submission");
+        id
+    });
+    let (pid, _) = submitted.recv().expect("the waiter's pid");
+    let mut watcher = admin(&schema);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: bool = watcher
+            .query_one(
+                "select exists (select 1 from pg_locks
+                                 where pid = $1 and locktype = 'advisory' and not granted)",
+                &[&pid],
+            )
+            .expect("read the locks")
+            .get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the submission waits for the lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The holder submits a command of the same session and commits first.
+    let first: i64 = holding
+        .query_one(&submit("key_holder"), &[])
+        .expect("the holder's submission")
+        .get(0);
+    holding.commit().expect("commit the holder");
+    let (_, second) = submitted.recv().expect("the waiting submission returns");
+    let second = second.expect("its id");
+    assert!(
+        first < second,
+        "the command that committed first has the lower id ({first}, {second})"
+    );
+
+    // While the second is uncommitted, the first is leased; once it is
+    // committed, it waits for the first to finish.
+    assert_eq!(claim(&mut watcher), Some(first));
+    commit_tx.send(()).expect("commit the waiter");
+    assert_eq!(waiter.join().expect("the waiter"), second);
+    assert_eq!(
+        claim(&mut watcher),
+        None,
+        "one command of the session is leased at a time"
+    );
+}
+
 #[test]
 fn an_expired_lease_is_taken_again_with_a_new_attempt() {
     let (store, schema) = store("lease");
@@ -1243,6 +1340,7 @@ fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
             "spawn_read_status EXECUTE",
             "spawn_read_tasks EXECUTE",
             "spawn_read_timeline EXECUTE",
+            "spawn_source_allowed EXECUTE",
         ]
     );
 }

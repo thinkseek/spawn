@@ -271,8 +271,6 @@ pub(crate) fn decide_with(
         orders: deliver::orders(work, rows),
         pending: Vec::new(),
     };
-    plan.orders
-        .extend(deliver::start_retries(work, rows, now_ms));
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
         // A managed worker between tasks is not news: its report already
