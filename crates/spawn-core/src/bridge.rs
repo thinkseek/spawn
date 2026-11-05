@@ -22,6 +22,7 @@ use crate::event::{
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
 use crate::ingest::{MERGE_NOTICE_OPENING, claude_line};
+use crate::port::WORKSPACE_STALE;
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
     TerminalHost, WorkspaceError, WorkspaceStore,
@@ -225,6 +226,11 @@ struct Follow {
     /// When the end's final checkpoint was last tried, by the Bridge's
     /// clock: a stalled end retries every [`END_RETRY_MS`].
     end_tried_at: Option<i64>,
+    /// The workspace answered [`WORKSPACE_STALE`] with this message: it
+    /// cannot checkpoint to its branch again, and its state is kept off it,
+    /// so the execution is ended (and its workspace unmounted) instead of
+    /// retried.
+    stale: Option<String>,
 }
 
 /// What the Bridge knows about one session.
@@ -633,11 +639,26 @@ impl Bridge {
             let committed = self.checkpoint(agent_id, session, active, reason, report)?;
             // An idle workspace whose state is on its branch takes the
             // source's main. `turn_open` includes what was read just now.
-            if committed && reason == CheckpointReason::TurnStopped && !active.turn_open {
+            if committed
+                && active.follow.stale.is_none()
+                && reason == CheckpointReason::TurnStopped
+                && !active.turn_open
+            {
                 self.merge_base(agent_id, session, active, report)?;
             }
         } else if self.idle_merge_due(active) {
             self.merge_base(agent_id, session, active, report)?;
+        }
+        if active.follow.stale.is_some() {
+            return self.end(
+                agent_id,
+                session,
+                active,
+                EndCause::Stopped,
+                None,
+                false,
+                report,
+            );
         }
         Ok(false)
     }
@@ -695,6 +716,13 @@ impl Bridge {
                 None
             }
             Ok(BaseMerge::Conflicted { files, marked }) => Some((files, marked)),
+            Err(WorkspaceError::Refused { code, message }) if code == WORKSPACE_STALE => {
+                report.warnings.push(format!(
+                    "{session}: merge main refused {code}: {message} The execution ends."
+                ));
+                active.follow.stale = Some(message);
+                return Ok(());
+            }
             Err(error) => {
                 let text = format!("{session}: merge main: {error}");
                 if active.follow.merge_warning.as_ref() != Some(&text) {
@@ -1029,13 +1057,14 @@ impl Bridge {
     }
 
     /// Commit the workspace and record a new commit. Returns whether the
-    /// workspace's state is now on its branch (false: the commit failed and
-    /// was reported).
+    /// workspace's state is now on its branch, or kept off it by a store
+    /// that answered [`WORKSPACE_STALE`] (`follow.stale` then holds why and the
+    /// execution ends); false: the commit failed and was reported.
     fn checkpoint(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
-        active: &Active,
+        active: &mut Active,
         reason: CheckpointReason,
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
@@ -1060,6 +1089,16 @@ impl Bridge {
                         files: Vec::new(),
                     },
                 )?;
+            }
+            // The store kept the workspace's state off its branch: an
+            // unmount loses nothing, and the execution ends.
+            Err(WorkspaceError::Refused { code, message }) if code == WORKSPACE_STALE => {
+                if active.follow.stale.is_none() {
+                    report.warnings.push(format!(
+                        "{session}: commit refused {code}: {message} The execution ends."
+                    ));
+                }
+                active.follow.stale = Some(message);
             }
             Err(WorkspaceError::Refused { code, message }) => {
                 report
