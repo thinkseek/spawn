@@ -288,6 +288,8 @@ fn memory_backend_passes_the_contract() {
     contract::command_queue("mem_cmd", concrete, concrete);
     contract::workspace_store("mem_ws", concrete);
     contract::terminal("mem_tty", concrete);
+    contract::terminal_files("mem_files", concrete, "/scratch");
+    contract::transcript_archive("mem_archive", concrete);
 }
 
 fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
@@ -691,6 +693,178 @@ fn the_engine_version_is_read_from_the_transcript_once_per_execution() {
             (Source::Bridge, None),
             (Source::Claude, Some("2.1.318".to_string()))
         ]
+    );
+}
+
+/// The transcript `session.native_started` names for the latest execution.
+fn transcript_of_latest(store: &MemoryStore) -> (String, String) {
+    let events = events(store);
+    let native = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::NativeSessionStarted {
+                native_session_id, ..
+            } => Some(native_session_id.clone()),
+            _ => None,
+        })
+        .expect("a native session");
+    let workspace = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            EventKind::ExecutionStarted { workspace, .. } => Some(workspace.clone()),
+            _ => None,
+        })
+        .expect("an execution");
+    let path = spawn_core::bridge::transcript_path(
+        &BridgeConfig::new("tester").claude_projects,
+        &workspace,
+        &native,
+    );
+    (native, path)
+}
+
+fn archiving_bridge(store: &Arc<MemoryStore>) -> Bridge {
+    Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    )
+    .with_transcript_archive(store.clone())
+}
+
+#[test]
+fn a_resume_restores_a_deleted_transcript_from_the_archive() {
+    use spawn_core::port::TranscriptArchive;
+    let store = store();
+    for command in 1..=3 {
+        let execution = ExecutionId::for_command(CommandId(command));
+        store.set_pane(&TerminalName::for_execution(&execution), READY);
+    }
+    let mut bridge = archiving_bridge(&store);
+    submit_start(&store, "first");
+    bridge.tick().expect("start");
+    let (native, first) = transcript_of_latest(&store);
+    let at = r#""timestamp":"2099-01-01T00:00:00.000Z""#;
+    store.append_file(
+        &first,
+        &format!(
+            "{{\"type\":\"user\",\"uuid\":\"u1\",{at},\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"s1\",{at}}}\n"
+        ),
+    );
+    bridge.tick().expect("read the turn");
+    bridge
+        .tick()
+        .expect("checkpoint the turn end, and copy the transcript");
+    let lengths = store.copies(&agent(), &native).expect("copies");
+    assert_eq!(lengths.len(), 1, "copied at the turn end");
+
+    // The engine rewrites its file (a format change, a compaction): the
+    // copy taken at the execution's end is a new one, the old one stays.
+    let rewritten =
+        format!("{{\"type\":\"user\",\"uuid\":\"u1\",{at},\"message\":{{\"content\":\"GO\"}}}}\n");
+    store.replace_file(&first, rewritten.as_bytes());
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(
+        store.copies(&agent(), &native).expect("copies"),
+        vec![lengths[0], u64::try_from(rewritten.len()).expect("fits")]
+    );
+
+    // Claude Code's cleanup deletes the transcript; the resume puts the
+    // latest copy back where the engine reads it.
+    store.remove_file(&first);
+    submit(
+        &store,
+        "key_resume",
+        CommandAction::Resume {
+            prompt: Some("go on".to_string()),
+            model: None,
+        },
+    );
+    let report = bridge.tick().expect("resume");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("restored")),
+        "{:?}",
+        report.warnings
+    );
+    let (_, resumed) = transcript_of_latest(&store);
+    assert_eq!(
+        store
+            .read_from(&any_workspace(), &resumed, 0)
+            .expect("read"),
+        Some(rewritten.into_bytes())
+    );
+    let launch = store.launches().pop().expect("a launch");
+    assert!(
+        launch
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == native),
+        "{:?}",
+        launch.arguments
+    );
+}
+
+#[test]
+fn a_resume_whose_transcript_is_gone_without_a_copy_fails_and_starts_nothing() {
+    let store = store();
+    store.set_pane(
+        &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+        READY,
+    );
+    // No archive.
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        BridgeConfig::new("tester"),
+    );
+    submit_start(&store, "first");
+    bridge.tick().expect("start");
+    let (_, first) = transcript_of_latest(&store);
+    store.append_file(
+        &first,
+        "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":\"go\"}}\n",
+    );
+    bridge.tick().expect("read the prompt");
+    submit(&store, "key_stop", CommandAction::Stop);
+    bridge.tick().expect("stop");
+    submit(
+        &store,
+        "key_resume",
+        CommandAction::Resume {
+            prompt: None,
+            model: None,
+        },
+    );
+    bridge.tick().expect("resume");
+    let failure = events(&store)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::CommandFinished {
+                succeeded: false,
+                error,
+                ..
+            } => error,
+            _ => None,
+        })
+        .expect("the resume failed");
+    assert!(failure.contains("start the agent blank"), "{failure}");
+    assert_eq!(store.launches().len(), 1, "no engine was started blank");
+    let calls = store.workspace_calls();
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("unmount"),
+        "{calls:?}"
     );
 }
 

@@ -33,6 +33,9 @@ fn store() -> Arc<MemoryStore> {
     store
 }
 
+/// A Bridge as `spawn` builds it: with a transcript archive, which puts a
+/// resumed session's transcript where the next mount's engine reads it
+/// (each memory mount is a new directory).
 fn bridge(store: &Arc<MemoryStore>) -> Bridge {
     Bridge::new(
         store.clone(),
@@ -41,6 +44,7 @@ fn bridge(store: &Arc<MemoryStore>) -> Bridge {
         store.clone(),
         BridgeConfig::new("tester"),
     )
+    .with_transcript_archive(store.clone())
 }
 
 fn submit(store: &MemoryStore, key: &str, action: CommandAction) {
@@ -979,7 +983,17 @@ fn resumed(clock: &Arc<ManualClock>) -> (Arc<MemoryStore>, Bridge) {
             model: None,
         },
     );
-    quiet(&bridge.tick().expect("resume and type the prompt"));
+    let report = bridge.tick().expect("resume and type the prompt");
+    // Each memory mount is a new directory: the transcript is put back
+    // there, and said so.
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| warning.contains("restored")),
+        "{:?}",
+        report.warnings
+    );
     (store, bridge)
 }
 
@@ -1028,9 +1042,9 @@ fn a_late_turn_end_of_an_earlier_execution_neither_closes_the_turn_nor_merges() 
 fn the_earlier_executions_lines_read_again_on_resume_leave_the_turn_open() {
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let (store, mut bridge) = resumed(&clock);
-    // The resumed engine has not written yet; its file holds the first
-    // execution's turn, already recorded under that execution.
-    transcript_in(&store, 2, &[prompt("1"), turn_end("1")]);
+    // The resumed engine has not written yet; its file (put back from the
+    // archive) holds the first execution's turn, already recorded under
+    // that execution.
     for _ in 0..3 {
         clock.advance(std::time::Duration::from_mins(1));
         quiet(&bridge.tick().expect("the typed prompt runs"));

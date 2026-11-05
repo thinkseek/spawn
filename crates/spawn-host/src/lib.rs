@@ -8,6 +8,7 @@ pub mod chunks;
 pub mod gc;
 pub mod git;
 pub mod tmux;
+pub mod transcripts;
 pub mod tree_path;
 
 pub use chunks::LocalChunkStore;
@@ -16,3 +17,4 @@ pub use git::{
     has_conflict_block, has_conflict_block_sized,
 };
 pub use tmux::{PrefixBuilder, TmuxHost};
+pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
