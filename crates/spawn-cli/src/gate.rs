@@ -234,9 +234,8 @@ fn judge_in(
     env: &[(String, String)],
     limit: Duration,
 ) -> Result<Verdict, GateFailure> {
-    let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB").map_or(Some(DEFAULT_MIN_FREE_GB), |text| {
-        text.parse::<u64>().ok()
-    });
+    let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB")
+        .map_or(Some(DEFAULT_MIN_FREE_GB), |text| text.parse::<u64>().ok());
     // The gate's own TMPDIR, as gate.sh reads it.
     let tmpdir = PathBuf::from(env_value(env, "TMPDIR").unwrap_or("/tmp"));
     let short = |path: &Path, log: &str, why: &str| -> Option<GateFailure> {
@@ -296,10 +295,12 @@ fn judge_in(
         // Exit 5 with no readable fact: the gate said "no room" but could
         // not write it down. Measure; believe it only under the floor.
         Err(GateFailure::Aborted { reason, log }) if run.status.code() == Some(NO_ROOM_EXIT) => {
-            Err(
-                short(&tmpdir, &log, "the gate exited 5 with no readable no-room fact")
-                    .unwrap_or(GateFailure::Aborted { reason, log }),
+            Err(short(
+                &tmpdir,
+                &log,
+                "the gate exited 5 with no readable no-room fact",
             )
+            .unwrap_or(GateFailure::Aborted { reason, log }))
         }
         other => other,
     }
@@ -739,7 +740,10 @@ mod tests {
         };
         assert_eq!((free_kb, min_gb), (0, 10), "the default floor");
         assert_eq!(tmpdir, "/nonexistent/full-tmp");
-        assert!(log.contains("cannot create the gate's private directory"), "{log}");
+        assert!(
+            log.contains("cannot create the gate's private directory"),
+            "{log}"
+        );
         // The same failure with room to spare, or unmeasurable: an abort.
         for measured in [Some(11 * 1_048_576), None] {
             assert!(
