@@ -2314,84 +2314,90 @@ mod database_tests {
             .to_string()
     }
 
-    /// Gates run per mission, concurrently, under the cap: mission A has two
-    /// ready tasks, B and C one each, all on sources of their own, and the
-    /// cap is 2. The first pass starts A's first task and B's; A's second
-    /// waits for A's first (a mission's tasks stay serial), and C waits for
-    /// a free gate, through any number of passes. Once both land, the next
-    /// pass starts A's second task, judged against the main A's first left,
-    /// and C's.
+    /// Gates run per mission, concurrently: mission A has two ready tasks,
+    /// B one on a source of its own, and D one on A's source; three gates
+    /// may run. The first pass starts A's first task and B's, and nothing
+    /// else through any number of passes although a gate is free: A's second
+    /// waits for A's first (a mission's tasks stay serial, each judged
+    /// against the main the one before left), and D for A's (they share the
+    /// mirror and main). Then A's second runs, merged with the main A's first
+    /// left, D still waiting; then D's.
     #[test]
-    fn gates_run_per_mission_concurrently_up_to_the_cap() {
+    fn gates_run_per_mission_concurrently() {
         let marks =
             std::env::temp_dir().join(format!("spawn-db-gate-marks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&marks);
         std::fs::create_dir_all(&marks).expect("marks");
-        let gate = holding_gate(&marks);
-        let (base_a, source_a, scenarios, integrator) = world("concurrent-a", &gate);
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("concurrent-a", &holding_gate(&marks));
+        integrator.gates = 3;
         let (base_b, source_b, _, _) = world("concurrent-b", "exit 1\n");
-        let (base_c, source_c, _, _) = world("concurrent-c", "exit 1\n");
         let db = Db::new("concurrent_gates");
         let a = db.gated_mission(&source_a, &scenarios);
         let b = db.gated_mission(&source_b, &scenarios);
-        let c = db.gated_mission(&source_c, &scenarios);
+        let d = db.gated_mission(&source_a, &scenarios);
         let a_one = db.reported_task(a, "a1");
         let a_two = db.reported_task(a, "a2");
         let b_task = db.reported_task(b, "b1");
-        let c_task = db.reported_task(c, "c1");
+        let d_task = db.reported_task(d, "d1");
         let pushed_a_one = push_work(&base_a, &source_a, &agent_of(&db, a, a_one), "a1.txt");
         let pushed_a_two = push_work(&base_a, &source_a, &agent_of(&db, a, a_two), "a2.txt");
         let pushed_b = push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
-        let pushed_c = push_work(&base_c, &source_c, &agent_of(&db, c, c_task), "c1.txt");
+        let pushed_d = push_work(&base_a, &source_a, &agent_of(&db, d, d_task), "d1.txt");
+        let hold = |count: usize| {
+            for _ in 0..3 {
+                integrator
+                    .pass_on(&db.store)
+                    .expect("a pass while gates run");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let now = started(&marks);
+            assert_eq!(now.len(), count, "nothing else starts: {now:?}");
+            now
+        };
+        let release = || {
+            std::fs::write(marks.join("release"), "").expect("release");
+            integrator.settle();
+            std::fs::remove_file(marks.join("release")).expect("hold again");
+        };
 
         integrator.pass_on(&db.store).expect("the first pass");
         let mut first = wait_started(&marks, 2);
         first.sort();
         let mut expected = vec![pushed_a_one.clone(), pushed_b.clone()];
         expected.sort();
-        assert_eq!(first, expected, "A's first and B's");
-        // More passes while both hold: nothing else starts.
-        for _ in 0..3 {
-            integrator
-                .pass_on(&db.store)
-                .expect("a pass while two gates run");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        assert_eq!(
-            started(&marks).len(),
-            2,
-            "the cap holds: {:?}",
-            started(&marks)
-        );
-        assert_eq!(db.mission(c)["tasks"][0]["state"], "reported");
-
-        std::fs::write(marks.join("release"), "").expect("release");
-        integrator.settle();
-        assert_eq!(source_main(&source_a), pushed_a_one, "A's first landed");
+        assert_eq!(first, expected, "A's first and B's, at once");
+        hold(2);
+        assert_eq!(db.mission(d)["tasks"][0]["state"], "reported");
+        release();
         assert_eq!(source_main(&source_b), pushed_b, "B's landed");
-        std::fs::remove_file(marks.join("release")).expect("hold again");
+        assert_eq!(source_main(&source_a), pushed_a_one, "A's first landed");
 
-        integrator.reap();
         integrator.pass_on(&db.store).expect("the next pass");
-        let next = wait_started(&marks, 4);
-        assert_eq!(next.len(), 4, "A's second and C's: {next:?}");
-        assert!(next[2..].contains(&pushed_c), "C's: {next:?}");
-        assert!(
-            !next.contains(&pushed_a_two),
-            "A's second is merged with the main A's first left: {next:?}"
+        let second = wait_started(&marks, 3);
+        assert_ne!(
+            second[2], pushed_a_two,
+            "A's second is merged with the main A's first left"
         );
+        hold(3);
+        release();
+        assert!(
+            db.mission(a)["tasks"]
+                .as_array()
+                .expect("tasks")
+                .iter()
+                .all(|row| row["state"] == "landed"),
+            "{}",
+            db.mission(a)
+        );
+
+        integrator.pass_on(&db.store).expect("the pass after");
+        let third = wait_started(&marks, 4);
+        assert_ne!(third[3], pushed_d, "D's, merged with main");
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
-        let after = db.mission(a);
-        let states: Vec<&Value> = after["tasks"]
-            .as_array()
-            .expect("tasks")
-            .iter()
-            .map(|row| &row["state"])
-            .collect();
-        assert!(states.iter().all(|state| *state == "landed"), "{after}");
-        assert_eq!(db.mission(c)["tasks"][0]["state"], "landed");
-        for base in [base_a, base_b, base_c, marks] {
+        assert_eq!(db.mission(d)["tasks"][0]["state"], "landed");
+        for base in [base_a, base_b, marks] {
             let _ = std::fs::remove_dir_all(&base);
         }
     }
