@@ -1,7 +1,7 @@
-//! Reproductions of audit findings (PR #2, `/tmp/spawn-review/audit.md`)
-//! that are still real at this commit. Each is ignored so the suite stays
-//! green; run one with `cargo test -p spawn-host --lib <name> -- --ignored`.
-//! Each asserts the behaviour the code should have, so it fails today.
+//! The audit findings of PR #2 (`/tmp/spawn-review/audit.md`) that outlived
+//! the removal of the chunk store and container mode, each pinned by the
+//! behaviour the code now has: files an agent can swap are opened the safe
+//! way, and a git that died mid-checkpoint wedges nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,7 +11,6 @@ use spawn_core::id::BranchName;
 use spawn_core::port::{BaseMerge, Commit, WorkspaceStore};
 
 use crate::git::GitWorkspace;
-
 fn scratch(tag: &str) -> PathBuf {
     let directory = std::env::temp_dir().join(format!("spawn-audit-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
@@ -84,11 +83,11 @@ fn release_fifo(path: &Path) {
 
 /// M14: with a merge of main pending (conflict markers in README.md), the
 /// agent puts a FIFO at README.md; the next merge of main (the Bridge's
-/// idle offer, under the branch lock) reads it with `std::fs::read` in
-/// `unresolved` and blocks until something writes to the FIFO.
+/// idle offer, under the branch lock) used to read it with `std::fs::read`
+/// in `unresolved` and block until something wrote to the FIFO. It opens it
+/// the safe way now, and returns.
 #[test]
-#[ignore = "audit M14 repro"]
-fn audit_m14_a_fifo_at_a_conflicted_path_blocks_the_merge_repro() {
+fn audit_m14_a_fifo_at_a_conflicted_path_does_not_block_the_merge() {
     let base = scratch("m14");
     let (checkout, store, workspace) = mounted(&base);
     let directory = PathBuf::from(workspace.path());

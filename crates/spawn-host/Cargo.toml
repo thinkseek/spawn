@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 spawn-core.workspace = true
 libc.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 spawn-core = { workspace = true, features = ["testing"] }

@@ -1661,14 +1661,25 @@ fn merge_tree_output(stdout: &[u8]) -> (String, Vec<TreePath>, Vec<String>) {
 
 /// Whether any of `files` (the ones the merge listed) in `directory` still
 /// holds a whole conflict marker block whose markers are at least as long
-/// as the path's shortest ([`GitWorkspace::shortest_markers`]). A deleted
-/// file holds none.
+/// as the path's shortest ([`GitWorkspace::shortest_markers`]). Each is
+/// opened the safe way ([`crate::agent_files::read_regular`]): a deleted
+/// file holds none, and neither does something that is not a regular file
+/// (a symlink is not followed, a FIFO is not waited on: the merge holds the
+/// branch's lock). A file with more than [`CONFLICT_READ_LIMIT`] bytes, or
+/// one that cannot be read, counts as unresolved.
 fn unresolved(directory: &Path, files: &[(TreePath, usize)]) -> bool {
-    files.iter().any(|(file, shortest)| {
-        std::fs::read(directory.join(file.as_path()))
-            .is_ok_and(|bytes| has_conflict_block_sized(&bytes, *shortest))
-    })
+    use crate::agent_files::{AgentFileError, read_regular};
+    files.iter().any(
+        |(file, shortest)| match read_regular(directory, file, CONFLICT_READ_LIMIT) {
+            Ok(Some((bytes, _, more))) => more || has_conflict_block_sized(&bytes, *shortest),
+            Ok(None) | Err(AgentFileError::NotRegular(_) | AgentFileError::Unsafe(_)) => false,
+            Err(AgentFileError::Failed(_)) => true,
+        },
+    )
 }
+
+/// The most of one conflicted file [`unresolved`] reads.
+const CONFLICT_READ_LIMIT: u64 = 64 << 20;
 
 /// The length of the conflict markers git writes by default.
 pub const CONFLICT_MARKER_SIZE: usize = 7;
