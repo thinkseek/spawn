@@ -36,6 +36,9 @@ use spawn_core::port::{
 use crate::chunks::{LargeFile, LocalChunkStore, Manifest, materialize, mode_of, store_file};
 use crate::tree_path::{TreePath, nul_fields};
 
+/// Distinguishes the staged mounts of one process ([`GitWorkspace::staging_path`]).
+static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Ref a new branch is forked from.
 const BASE: &str = "main";
 
@@ -856,16 +859,21 @@ impl GitWorkspace {
         Ok((Some(name), clashes))
     }
 
-    /// Write the large files the branch head names into a fresh mount, and
-    /// remember their stat so the next checkpoint does not chunk them again.
-    /// Every chunk is verified; a file is written whole or not at all, and
-    /// only inside the workspace ([`materialize`]). A manifest the head's
-    /// tree has no room for ([`Self::large_clashes`]) fails the mount.
-    fn materialize_large(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
+    /// Write the large files the branch head names into `directory` (a
+    /// mount being staged), and their stat-cache entries, so the next
+    /// checkpoint does not chunk them again. Every chunk is fetched and
+    /// verified; a file is written whole or not at all, and only inside the
+    /// directory ([`materialize`]). A manifest the head's tree has no room
+    /// for ([`Self::large_clashes`]) fails.
+    fn materialize_large(
+        &self,
+        branch: &str,
+        directory: &Path,
+    ) -> Result<BTreeMap<TreePath, Known>, WorkspaceError> {
         let head = format!("refs/heads/{branch}");
+        let mut known = BTreeMap::new();
         let Some(name) = self.manifest_of(&head)? else {
-            self.write_cache(branch, &BTreeMap::new());
-            return Ok(());
+            return Ok(known);
         };
         let manifest = self.manifest(&name)?;
         let clashes = self.large_clashes(&manifest, &format!("{head}^{{tree}}"))?;
@@ -876,7 +884,6 @@ impl GitWorkspace {
                 shown_paths(&clashes).join(", ")
             )));
         }
-        let mut known = BTreeMap::new();
         for file in &manifest.files {
             materialize(self.chunks.as_ref(), directory, file).map_err(|error| {
                 WorkspaceError::Unavailable(format!("large file {}: {error}", file.path))
@@ -895,7 +902,141 @@ impl GitWorkspace {
                 );
             }
         }
-        self.write_cache(branch, &known);
+        Ok(known)
+    }
+
+    /// Where a mount is staged before it replaces a workspace, and where the
+    /// replaced one goes until it is removed: `<root>/.mount/`, on the
+    /// workspace's file system, so each step is one rename. A branch name
+    /// holds no `.`, so `<branch>.` starts this branch's entries only.
+    fn staging_directory(&self) -> PathBuf {
+        self.root.join(".mount")
+    }
+
+    /// A fresh path under [`Self::staging_directory`] for `branch`, and the
+    /// leftovers of an earlier mount of it (one that died midway) removed.
+    fn staging_path(&self, branch: &str, what: &str) -> Result<PathBuf, WorkspaceError> {
+        let staging = self.staging_directory();
+        std::fs::create_dir_all(&staging).map_err(|error| {
+            WorkspaceError::Unavailable(format!("create {}: {error}", staging.display()))
+        })?;
+        let prefix = format!("{branch}.");
+        let ours = format!("{branch}.{}.", std::process::id());
+        if let Ok(entries) = std::fs::read_dir(&staging) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && !name.starts_with(&ours) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        Ok(staging.join(format!(
+            "{ours}{what}.{}",
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )))
+    }
+
+    /// Export the branch head into a new directory beside the workspaces,
+    /// large files and all: everything a mount needs, fetched and verified
+    /// before the workspace is touched. Its path and the large files'
+    /// stat-cache entries; on any error the directory is removed.
+    fn stage_mount(
+        &self,
+        branch: &str,
+    ) -> Result<(PathBuf, BTreeMap<TreePath, Known>), WorkspaceError> {
+        let staged = self.staging_path(branch, "staged")?;
+        let built = std::fs::create_dir(&staged)
+            .map_err(|error| {
+                WorkspaceError::Unavailable(format!("create {}: {error}", staged.display()))
+            })
+            .and_then(|()| self.export(branch, &staged))
+            .and_then(|()| self.materialize_large(branch, &staged));
+        match built {
+            Ok(known) => Ok((staged, known)),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                Err(error)
+            }
+        }
+    }
+
+    /// Write the tree of the branch head into `directory` (`git archive`).
+    fn export(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
+        let mut archive = self
+            .command()
+            .args(["archive", &format!("refs/heads/{branch}")])
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
+        let stdout = archive
+            .stdout
+            .take()
+            .ok_or_else(|| WorkspaceError::Unavailable("archive produced no output".to_string()))?;
+        let extracted = Command::new("tar")
+            .arg("-x")
+            .arg("-C")
+            .arg(directory)
+            .stdin(Stdio::from(stdout))
+            .status();
+        let archived = archive.wait();
+        if !archived.is_ok_and(|status| status.success()) {
+            return Err(WorkspaceError::Unavailable(format!(
+                "archive {branch} failed"
+            )));
+        }
+        let extracted =
+            extracted.map_err(|error| WorkspaceError::Unavailable(format!("extract: {error}")))?;
+        if !extracted.success() {
+            return Err(WorkspaceError::Unavailable(format!(
+                "extract {branch}: tar exited {extracted}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Put the staged mount `staged` where the workspace `directory` is: the
+    /// old workspace is renamed aside, the staged one renamed into place,
+    /// then the old one removed. A failed second rename puts the old one
+    /// back.
+    fn replace_workspace(
+        &self,
+        branch: &str,
+        staged: &Path,
+        directory: &Path,
+    ) -> Result<(), WorkspaceError> {
+        let replaced = match std::fs::symlink_metadata(directory) {
+            Ok(_) => {
+                let aside = self.staging_path(branch, "replaced")?;
+                std::fs::rename(directory, &aside).map_err(|error| {
+                    WorkspaceError::Unavailable(format!(
+                        "move {} aside: {error}",
+                        directory.display()
+                    ))
+                })?;
+                Some(aside)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(WorkspaceError::Unavailable(format!(
+                    "stat {}: {error}",
+                    directory.display()
+                )));
+            }
+        };
+        if let Err(error) = std::fs::rename(staged, directory) {
+            if let Some(aside) = &replaced {
+                let _ = std::fs::rename(aside, directory);
+            }
+            return Err(WorkspaceError::Unavailable(format!(
+                "move the new tree to {}: {error}",
+                directory.display()
+            )));
+        }
+        if let Some(aside) = replaced {
+            let _ = std::fs::remove_dir_all(aside);
+        }
         Ok(())
     }
 }
@@ -943,9 +1084,14 @@ impl WorkspaceStore for GitWorkspace {
         }))
     }
 
+    /// Export the branch head as the workspace. The whole new tree, its
+    /// large files fetched and verified chunk by chunk, is built beside the
+    /// workspace first ([`GitWorkspace::stage_mount`]): a mount that fails
+    /// (no commit, a chunk missing or corrupt, a clash) leaves the existing
+    /// workspace, uncommitted files and all, as it was. Only then is the
+    /// workspace replaced, by renames.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
         self.exclude_build_output()?;
-        // Verify first: a failed mount must not destroy the previous tree.
         self.git_output(&[
             "rev-parse",
             "--verify",
@@ -953,50 +1099,17 @@ impl WorkspaceStore for GitWorkspace {
             &format!("refs/heads/{branch}"),
         ])
         .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
+        let (staged, known) = self.stage_mount(branch.as_str())?;
+
         // A pending merge stays only when the branch carries its markers.
         self.settle_pending(branch.as_str());
-
         let directory = self.root.join(branch.as_str());
-        if directory.exists() {
-            std::fs::remove_dir_all(&directory).map_err(|error| {
-                WorkspaceError::Unavailable(format!("clear {}: {error}", directory.display()))
-            })?;
+        if let Err(error) = self.replace_workspace(branch.as_str(), &staged, &directory) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
         }
-        std::fs::create_dir_all(&directory).map_err(|error| {
-            WorkspaceError::Unavailable(format!("create {}: {error}", directory.display()))
-        })?;
-
-        let mut archive = self
-            .command()
-            .args(["archive", &format!("refs/heads/{branch}")])
-            .stdout(Stdio::piped())
-            .stdin(Stdio::null())
-            .spawn()
-            .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
-        let stdout = archive
-            .stdout
-            .take()
-            .ok_or_else(|| WorkspaceError::Unavailable("archive produced no output".to_string()))?;
-        let extracted = Command::new("tar")
-            .arg("-x")
-            .arg("-C")
-            .arg(&directory)
-            .stdin(Stdio::from(stdout))
-            .status();
-        let archived = archive.wait();
-        if !archived.is_ok_and(|status| status.success()) {
-            return Err(WorkspaceError::Unavailable(format!(
-                "archive {branch} failed"
-            )));
-        }
-        let extracted =
-            extracted.map_err(|error| WorkspaceError::Unavailable(format!("extract: {error}")))?;
-        if !extracted.success() {
-            return Err(WorkspaceError::Unavailable(format!(
-                "extract {branch}: tar exited {extracted}"
-            )));
-        }
-        self.materialize_large(branch.as_str(), &directory)?;
+        // A rename keeps each file's inode and times: the entries hold.
+        self.write_cache(branch.as_str(), &known);
         // A fresh export is the branch head: nothing stale is left.
         self.clear_stale(branch.as_str());
 
