@@ -31,6 +31,7 @@ mod missions;
 mod row;
 mod sessions;
 
+pub use missions::LandingHold;
 pub use sessions::{ExecutionRow, Freshness, LivenessFacts, OpenTool, SessionState, TimelineEntry};
 
 /// Schema installed by [`PostgresStore::migrate`].
@@ -65,14 +66,26 @@ pub struct PostgresStore {
     url: String,
 }
 
-/// The schema's restricted logins. Their passwords are derived from the
-/// owner's ([`role_url`]) and set on every migration.
+/// The restricted logins, by the principal they act as; each database has
+/// its own role for each (`spawn_login_role`). Their passwords derive from
+/// the owner's ([`role_url`]) and are set on every migration.
 const LOGINS: [&str; 2] = ["spawn_supervisor", "spawn_reader"];
 
 impl PostgresStore {
     /// Connect to the database in the URL.
     pub fn connect(url: &str) -> Result<Self, StoreError> {
-        let client = Client::connect(url, NoTls).map_err(|error| backend(&error))?;
+        let mut config: postgres::Config = url
+            .parse()
+            .map_err(|error: postgres::Error| backend(&error))?;
+        // The schema warns (`raise warning`) about what a migration left for
+        // a human, such as tables it kept. The many notices of an idempotent
+        // migration ("already exists, skipping") stay quiet.
+        config.notice_callback(|notice| {
+            if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
+                eprintln!("spawn: database: {}", notice.message());
+            }
+        });
+        let client = config.connect(NoTls).map_err(|error| backend(&error))?;
         Ok(Self {
             client: Mutex::new(client),
             password: url_password(url),
@@ -136,24 +149,35 @@ impl PostgresStore {
         }
     }
 
+    /// One migration, in one transaction: the schema takes the append lock
+    /// first, so the migrations of one database (which share its logins)
+    /// set the logins one at a time. Dropped on failure, it rolls back.
     fn migrate_once(&self) -> Result<(), postgres::Error> {
         let mut client = self.lock();
-        client.batch_execute(SCHEMA)?;
+        let mut transaction = client.transaction()?;
+        transaction.batch_execute(SCHEMA)?;
         // No owner password (peer or trust login, PGPASSWORD): a password
-        // derived from "" would be a constant anyone can compute. Such a
-        // migration leaves the logins as they are: created `nologin`, or as
-        // the last migration with a password set them (so processes with
-        // and without one do not flip them back and forth).
-        if !self.password.is_empty() {
-            for role in LOGINS {
-                // Hex only, so the literal needs no quoting beyond the quotes.
-                let password = role_password(&self.password, role);
-                client.batch_execute(&format!(
-                    "alter role {role} with login password '{password}'"
+        // derived from "" would be a constant anyone can compute, and a
+        // password an earlier migration set (or a fixed one from an older
+        // install) would outlive the owner's choice to have none. Such a
+        // migration turns the logins off (spawn_logins_off warns).
+        if self.password.is_empty() {
+            transaction.batch_execute("select spawn_logins_off()")?;
+        } else {
+            for base in LOGINS {
+                // The schema above made the login and its salt, in this
+                // transaction: it is there.
+                let Some((role, salt)) = login_row(&mut transaction, base)? else {
+                    continue;
+                };
+                // Hex only, and the role [a-z0-9_]: nothing needs quoting.
+                let password = role_password(&self.password, &salt, &role);
+                transaction.batch_execute(&format!(
+                    "alter role \"{role}\" with login password '{password}'"
                 ))?;
             }
         }
-        Ok(())
+        transaction.commit()
     }
 }
 
@@ -192,6 +216,32 @@ fn maintenance_url(url: &str) -> String {
         Some(query) if !query.is_empty() => format!("{base}/postgres?{query}"),
         _ => format!("{base}/postgres"),
     }
+}
+
+/// One restricted login of the database `client` is in: its role name
+/// (`spawn_login_role`) and the salt in its comment, or `None` before the
+/// schema made it. The schema must be on the connection's search path.
+fn login_row(
+    client: &mut impl postgres::GenericClient,
+    base: &str,
+) -> Result<Option<(String, String)>, postgres::Error> {
+    let row = client.query_opt(
+        "select r.rolname::text,
+                substring(shobj_description(r.oid, 'pg_authid')
+                          from '^spawn login salt ([0-9a-f]{64})$')
+           from pg_roles r where r.rolname = spawn_login_role($1)",
+        &[&base],
+    )?;
+    Ok(row.and_then(|row| {
+        let salt: Option<String> = row.get(1);
+        salt.map(|salt| (row.get(0), salt))
+    }))
+}
+
+fn no_login(base: &str) -> StoreError {
+    StoreError::Backend(format!(
+        "{base}: this database has no such login yet; run spawn init-db"
+    ))
 }
 
 /// How often a migration that lost a race on the cluster's catalogs is run
@@ -254,29 +304,78 @@ fn url_password(url: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// The password of one restricted login: SHA-256 over the owner's password
-/// and the role name. Only a holder of the owner's credentials can form it,
-/// and nothing has to be stored to agree on it.
-fn role_password(owner_password: &str, role: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("spawn-login-v1\0{owner_password}\0{role}").as_bytes());
-    digest.iter().fold(String::new(), |mut hex, byte| {
+/// PBKDF2-HMAC-SHA256 rounds of a login password: a guess at the owner's
+/// password from a login's password costs this many HMACs.
+const ROLE_PASSWORD_ROUNDS: u32 = 600_000;
+
+/// The password of one restricted login: PBKDF2-HMAC-SHA256 of the owner's
+/// password, salted with the login's random salt (in its role comment) and
+/// its name, [`ROLE_PASSWORD_ROUNDS`] rounds, in hex. Only a holder of the
+/// owner's password can form it, nothing secret is stored to agree on it,
+/// and a login that knows its own password and salt still needs the rounds
+/// for every guess at the owner's. Computed once per process.
+fn role_password(owner_password: &str, salt: &str, role: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+    type Key = (String, String, String);
+    static DERIVED: OnceLock<Mutex<HashMap<Key, Arc<OnceLock<String>>>>> = OnceLock::new();
+    let key = (
+        owner_password.to_string(),
+        salt.to_string(),
+        role.to_string(),
+    );
+    // One cell per login: threads asking for one login at once derive it
+    // once, and different logins derive side by side.
+    let cell = Arc::clone(
+        DERIVED
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default(),
+    );
+    cell.get_or_init(|| pbkdf2_hex(owner_password, salt, role))
+        .clone()
+}
+
+fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let keyed = Hmac::<sha2::Sha256>::new_from_slice(owner_password.as_bytes())
+        .expect("HMAC takes a key of any length");
+    let mut round = keyed.clone();
+    round.update(format!("spawn-login-v2\0{salt}\0{role}").as_bytes());
+    round.update(&1u32.to_be_bytes());
+    let mut previous = round.finalize().into_bytes();
+    let mut output = previous;
+    for _ in 1..ROLE_PASSWORD_ROUNDS {
+        let mut round = keyed.clone();
+        round.update(&previous);
+        previous = round.finalize().into_bytes();
+        for (out, byte) in output.iter_mut().zip(previous.iter()) {
+            *out ^= byte;
+        }
+    }
+    output.iter().fold(String::new(), |mut hex, byte| {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
         hex
     })
 }
 
-/// The owner's URL with its credentials replaced by one of the schema's
-/// restricted logins (`spawn_supervisor`, `spawn_reader`). The boundary is
-/// the login's privileges; its password keeps anyone who lacks the owner's
+/// The owner's URL with its credentials replaced by one of the database's
+/// restricted logins (`spawn_supervisor`, `spawn_reader`: the role of that
+/// name for this database, see `spawn_login_role`). It reads the login's
+/// name and salt through the owner's URL, which must be the one that
+/// migrated (its search path finds the schema). The boundary is the
+/// login's privileges; its password keeps anyone who lacks the owner's
 /// credentials from using it, which matters once the database is reachable
 /// from elsewhere.
 ///
 /// # Errors
 ///
-/// When the owner's URL is not `scheme://...` or carries no password: the
-/// logins' passwords derive from it, and from nothing they would be public.
+/// When the owner's URL is not `scheme://...` or carries no password (the
+/// logins' passwords derive from it, and from nothing they would be
+/// public), or the database is unreachable or not migrated.
 pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
     let password = url_password(owner);
     let Some((scheme, rest)) = owner.split_once("://").filter(|_| !password.is_empty()) else {
@@ -285,11 +384,29 @@ pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
              (the restricted logins' passwords derive from the owner's)"
         ));
     };
-    let host = rest.rsplit_once('@').map_or(rest, |(_, tail)| tail);
-    Ok(format!(
-        "{scheme}://{role}:{}@{host}",
-        role_password(&password, role)
+    let mut config: postgres::Config = owner
+        .parse()
+        .map_err(|error: postgres::Error| format!("{role}: {error}"))?;
+    config.connect_timeout(std::time::Duration::from_secs(5));
+    let mut client = config
+        .connect(NoTls)
+        .map_err(|error| format!("{role}: {}", backend(&error)))?;
+    let (name, salt) = login_row(&mut client, role)
+        .map_err(|error| format!("{role}: {}", backend(&error)))?
+        .ok_or_else(|| no_login(role).to_string())?;
+    Ok(login_url(
+        scheme,
+        rest,
+        &name,
+        &role_password(&password, &salt, &name),
     ))
+}
+
+/// `scheme://role:password@` and the host part of `rest` (what follows the
+/// owner's `user:password@`).
+fn login_url(scheme: &str, rest: &str, role: &str, password: &str) -> String {
+    let host = rest.rsplit_once('@').map_or(rest, |(_, tail)| tail);
+    format!("{scheme}://{role}:{password}@{host}")
 }
 
 /// The identity of the server `url` reaches: its `system_identifier`, set
@@ -357,7 +474,7 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{role_url, url_password};
+    use super::{login_url, role_password, role_url, url_password};
 
     #[test]
     fn the_migration_lock_lives_in_the_servers_maintenance_database() {
@@ -381,13 +498,9 @@ mod tests {
     }
 
     #[test]
-    fn every_spelling_of_the_owner_password_derives_the_same_logins() {
+    fn every_spelling_of_the_owner_password_is_one_password() {
         assert_eq!(url_password("postgres://o:p%40ss@h/db"), "p@ss");
         assert_eq!(url_password("postgres://o:p@ss@h/db"), "p@ss");
-        assert_eq!(
-            role_url("postgres://o:p%40ss@h:5432/db", "spawn_reader"),
-            role_url("postgres://o:p@ss@h:5432/db", "spawn_reader")
-        );
         assert_eq!(
             url_password("postgres://o:100%@h/db"),
             "100%",
@@ -396,11 +509,41 @@ mod tests {
     }
 
     #[test]
+    fn a_login_password_is_salted_per_login_and_derived_slowly() {
+        let salt = "ab".repeat(32);
+        let password = role_password("owner", &salt, "spawn_reader_db");
+        assert_eq!(password.len(), 64);
+        assert_eq!(password, role_password("owner", &salt, "spawn_reader_db"));
+        assert_ne!(
+            password,
+            role_password("owner", &"cd".repeat(32), "spawn_reader_db")
+        );
+        assert_ne!(
+            password,
+            role_password("owner", &salt, "spawn_supervisor_db")
+        );
+        assert_ne!(password, role_password("other", &salt, "spawn_reader_db"));
+        // PBKDF2-HMAC-SHA256, checked against Python's hashlib.pbkdf2_hmac
+        // ('sha256', b'owner', b'spawn-login-v2\0' + salt + b'\0spawn_reader_db',
+        // 600000).hex().
+        assert_eq!(
+            password,
+            "f4e769b999554a01831a49183a5a9ffe13646043436172744f18a3fed9cc7185"
+        );
+    }
+
+    #[test]
     fn no_owner_password_means_no_login_url() {
         assert!(role_url("postgres://spawn@localhost/spawn", "spawn_reader").is_err());
         assert!(role_url("host=/run/postgresql dbname=spawn", "spawn_reader").is_err());
-        let url = role_url("postgres://o:pw@h:1/db?sslmode=disable", "spawn_reader").unwrap();
-        assert!(url.starts_with("postgres://spawn_reader:"));
-        assert!(url.ends_with("@h:1/db?sslmode=disable"));
+        assert_eq!(
+            login_url(
+                "postgres",
+                "o:pw@h:1/db?sslmode=disable",
+                "spawn_reader_db",
+                "secret"
+            ),
+            "postgres://spawn_reader_db:secret@h:1/db?sslmode=disable"
+        );
     }
 }

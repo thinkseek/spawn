@@ -449,6 +449,7 @@ fn lineage_follows_links_to_every_ancestor() {
     for (child, parent) in [("session_b", "session_a"), ("session_c", "session_b")] {
         store
             .append(NewEvent {
+                agent_id: AgentId::new(child.replace("session_", "agent_")).expect("valid agent"),
                 session_id: SessionId::new(child).expect("valid session"),
                 ..message(EventKind::SessionLinked {
                     parent_session_id: SessionId::new(parent).expect("valid session"),
@@ -670,16 +671,12 @@ fn a_granted_principal_inserts_and_reads_only_its_agents() {
         "the owner reads every agent"
     );
 
-    // Another login reads only the agents it holds a grant for.
-    client
-        .batch_execute(
-            "grant execute on function spawn_read_freshness(), spawn_read_timeline(text) \
-             to spawn_reader",
-        )
-        .expect("the reader may call the readers");
+    // Another login reads only the agents its principal holds a grant for:
+    // this database's reader login acts as `spawn_reader`.
+    let reader = common::login(&schema, "spawn_reader");
     let as_reader = |client: &mut Client| {
         client
-            .batch_execute("set session authorization spawn_reader")
+            .batch_execute(&format!("set session authorization {reader}"))
             .expect("become the reader");
     };
     as_reader(&mut client);
@@ -924,13 +921,16 @@ fn the_projection_follows_the_log_and_rebuilds_from_it() {
         .expect("append succeeds");
     projection_matches_fold(&mut client);
 
-    // Another agent's event does not move the session out of its owner.
-    store
-        .append(NewEvent {
-            agent_id: AgentId::new("agent_0").expect("valid agent"),
-            ..message(EventKind::MessageReceived)
-        })
-        .expect("append succeeds");
+    // Another agent's event is refused: the session stays its owner's.
+    assert!(
+        store
+            .append(NewEvent {
+                agent_id: AgentId::new("agent_0").expect("valid agent"),
+                ..message(EventKind::MessageReceived)
+            })
+            .is_err(),
+        "a session has one agent"
+    );
     let owner: String = client
         .query_one("select agent_id from spawn_session_state", &[])
         .expect("projection row")
@@ -1082,6 +1082,105 @@ fn views_are_closed_to_other_roles() {
         .expect("clean up the role");
 }
 
+#[test]
+fn a_login_without_grants_reads_no_command_ids() {
+    let (store, schema) = store("public_ids");
+    store
+        .submit(
+            &Principal::new("human").expect("valid principal"),
+            &start(session(), "someone_elses"),
+        )
+        .expect("a command");
+    let mut client = admin(&schema);
+    let role = common::schema_name("plain").replace("spawn_test_", "spawn_plain_");
+    client
+        .batch_execute(&format!(
+            "create role {role}; grant usage on schema {schema} to {role}; \
+             set session authorization {role}"
+        ))
+        .expect("become a login with no grants");
+    for query in [
+        "select id from agent_commands",
+        "select count(*) from agent_commands",
+        "select max(id) from spawn_commands",
+        "select last_value from spawn_commands_id_seq",
+    ] {
+        let error = client.query(query, &[]).expect_err(query);
+        assert_eq!(
+            error.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{query}"
+        );
+    }
+    let tasks = client
+        .query("select command_id from spawn_read_tasks()", &[])
+        .expect("the reader answers");
+    assert!(tasks.is_empty(), "no grant lists no command");
+    let error = client
+        .query(
+            "select spawn_gateway_submit('agent_one', 'session_one', 'k', '{\"type\":\"stop\"}')",
+            &[],
+        )
+        .expect_err("no grant submits nothing");
+    assert_eq!(
+        error.code(),
+        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+    );
+    client
+        .batch_execute(&format!(
+            "reset session authorization; drop owned by {role}; drop role {role}"
+        ))
+        .expect("clean up the role");
+}
+
+/// What every role may do in the schema, from the access lists themselves
+/// (a function without one is executable by PUBLIC): the gateway's insert
+/// and submit, the grant-filtered readers, and pure helpers.
+#[test]
+fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
+    let (_store, schema) = store("public_acl");
+    let granted: Vec<String> = admin(&schema)
+        .query(
+            "select format('%s %s', o.name, a.privilege_type)
+               from (select c.relname::text as name,
+                            coalesce(c.relacl, acldefault(case c.relkind when 'S' then 's'::\"char\"
+                                                          else 'r'::\"char\" end, c.relowner)) as acl
+                       from pg_class c
+                      where c.relnamespace = $1::text::regnamespace and c.relkind in ('r', 'v', 'S')
+                     union all
+                     select p.proname::text, coalesce(p.proacl, acldefault('f'::\"char\", p.proowner))
+                       from pg_proc p
+                      where p.pronamespace = $1::text::regnamespace) o
+              cross join lateral aclexplode(o.acl) a
+              where a.grantee = 0
+              order by 1",
+            &[&schema],
+        )
+        .expect("read the access lists")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        granted,
+        [
+            "agent_commands INSERT",
+            "spawn_gateway_insert EXECUTE",
+            "spawn_gateway_submit EXECUTE",
+            "spawn_grant_matches EXECUTE",
+            "spawn_login_role EXECUTE",
+            "spawn_mission_caller EXECUTE",
+            "spawn_now_ms EXECUTE",
+            "spawn_principal EXECUTE",
+            "spawn_read_freshness EXECUTE",
+            "spawn_read_judgements EXECUTE",
+            "spawn_read_state EXECUTE",
+            "spawn_read_status EXECUTE",
+            "spawn_read_tasks EXECUTE",
+            "spawn_read_timeline EXECUTE",
+        ]
+    );
+}
+
 /// Column names and types of every read view. A change here breaks SQL
 /// readers; update the snapshot on purpose.
 #[test]
@@ -1211,20 +1310,25 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
 #[test]
 fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
     let (_store, schema) = store("logins");
-    for role in ["spawn_supervisor", "spawn_reader"] {
+    for base in ["spawn_supervisor", "spawn_reader"] {
+        let role = common::login(&schema, base);
+        assert_ne!(role, base, "the login is this database's own");
         let fixed = format!(
             "postgres://{role}:{role}@{}",
             common::url().rsplit_once('@').expect("a host").1
         );
         assert!(
             postgres::Client::connect(&fixed, postgres::NoTls).is_err(),
-            "{role}'s old fixed password is refused"
+            "{role} has no fixed password"
         );
-        let mut client = postgres::Client::connect(
-            &spawn_postgres::role_url(&common::url(), role).expect("a password in the test URL"),
-            postgres::NoTls,
-        )
-        .expect("the derived password logs in");
+        let url = spawn_postgres::role_url(&common::schema_url(&schema), base)
+            .expect("a password in the test URL");
+        assert!(
+            url.contains(&format!("://{role}:")),
+            "{base} logs in as {role}"
+        );
+        let mut client =
+            postgres::Client::connect(&url, postgres::NoTls).expect("the derived password logs in");
         client
             .batch_execute(&format!("set search_path to {schema}"))
             .expect("schema");
