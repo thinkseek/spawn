@@ -1135,7 +1135,7 @@ toolchain() {
     echo "| base cache: toolchain $(sed -n 's/^release: /rustc /p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(cargo [^ ]*\).*/\1/p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(psql\) (PostgreSQL) \([^ ]*\).*/\1 \2/p' "$work/toolchain" | head -n 1)" \
-        "server $(grep -B1 '^server: ' "$work/toolchain" | head -n 1)"
+        "server $(sed -n 's/^\([0-9]\{5,6\}\)$/\1/p' "$work/toolchain" | head -n 1 | grep . || echo none)"
 }
 : >"$work/base-results"
 from_cache=""
