@@ -56,8 +56,9 @@ head alone is the whole workspace, so everything below is a git operation.
   head) or a full commit id in the mirror; anything else fails the start. An
   agent whose branch exists keeps it (the tick report warns that `from` was
   ignored). The start that creates a branch records where it began on
-  `execution.started` (`fork: {from, commit}`; `from` is `main`, the start's
-  `from`, or `spawn/<agent>`).
+  `execution.started` (`fork: {from, commit}`; `from` is `main` or the
+  start's `from`; only records from before the cross-host cut say
+  `spawn/<agent>`).
 - **One host**: a branch lives in this host's mirror, and a start takes
   nothing from the source but `main` (the owner's decision: Spawn runs on
   one host).
@@ -67,7 +68,10 @@ head alone is the whole workspace, so everything below is a git operation.
   from a background pusher off the Bridge's loop: at most one push per
   branch every 5 s, carrying the head as it is then, failures retried with
   backoff, and what still waits pushed when the store drops (a one-shot
-  `spawn tick`). Only a source that is a directory on this host receives
+  `spawn tick`, or `spawn loop` ending on SIGTERM after its pass). The
+  queue is in memory, so a new Bridge queues again the branch of every
+  agent with an open task: a push lost with a killed process is made after
+  the restart (a branch the source already has is a no-op push). Only a source that is a directory on this host receives
   branches: a remote may be public, and every agent commit would leave the
   host.
 - **Main at a start or resume**: the Bridge merges main into an agent's
@@ -98,10 +102,17 @@ head alone is the whole workspace, so everything below is a git operation.
     its note names the files that now carry markers;
   - the dispatcher's delivery of a task typed into a live worker, so the
     task starts from main and its text says what the merge did. (A start or
-    resume mounts later; the Bridge's clean merge above covers it.)
+    resume mounts later; the Bridge's clean merge above covers it.) The
+    text names the files of every `base_merged` record since the last
+    delivery the worker was typed, not only this attempt's merge: a
+    delivery refused before typing (a pane not ready) is retried, and the
+    retry's merge finds main already in.
 
   A clean merge is a merge commit recorded as `artifact.committed`
-  (`base_merged`, its files) and pushed. A content conflict writes the merge
+  (`base_merged`, its files) and then pushed. A record whose append failed
+  is written at the agent's next merge, read back from the branch head (a
+  two-parent "spawn: merge main" commit; the record's key makes a repeat a
+  no-op). A content conflict writes the merge
   with conflict markers into the directory and leaves `main` pending under
   `<root>/.merge/<agent>`: the checkpoint after the last marker is gone
   takes `main` as its second parent (a checkpoint with markers still in is a
@@ -164,7 +175,9 @@ head alone is the whole workspace, so everything below is a git operation.
   nothing reaches the worker, and a later pass judges again once the pusher
   has caught up. An agent with neither a checkpoint nor a pushed branch is
   rejected ("the worker has no branch to land"). So only a source that is a
-  directory on this host has its agents' work landed. The
+  directory on this host has its agents' work landed: a gate on any other
+  source is refused when it is configured, and a mission gated on one
+  before that is halted by the integrator. The
   rest is unchanged: a branch behind a moved `main` lands as the merge by
   `main`'s merge rules; one that conflicts with it is gated `conflict` after
   `main` is merged into its workspace (above); marker blocks in the files
@@ -196,9 +209,12 @@ head alone is the whole workspace, so everything below is a git operation.
   tracked path, which would fail every checkpoint while it is there).
 - **The agent is told once.** The checkpoint records the files it left out
   in `<root>/.oversized/<agent>` (NUL-separated: told or not, size, path);
-  `WorkspaceStore::take_notices` hands out each one not yet told and marks
-  it told. The Bridge logs each notice as a tick warning and puts it before
-  the next prompt it types for the session. A file that drops under the cap
+  `WorkspaceStore::notices` returns each one not yet told, changing
+  nothing. The Bridge logs each notice as a tick warning and puts it before
+  the next prompt it types for the session; once that typing is recorded it
+  marks them told (`WorkspaceStore::notices_told`). The record is on disk,
+  not in the Bridge's memory, so a restart between the checkpoint and the
+  prompt loses no notice (at worst one is told twice). A file that drops under the cap
   is forgotten, and told of again if it grows past it again.
 - **Old checkpoints.** An earlier version kept files over 8 MiB in a chunk
   store and named them with a `Spawn-Large: <hash>` trailer on the
@@ -312,7 +328,7 @@ holds the agents' history; none of them is pruned automatically.
 | What an engine did | read by the Bridge from transcript and pane into the log | Yes: in the log |
 | Full transcript text | `~/.claude/projects/...` on the compute host, copied to `<root>/.transcripts/<agent>/` at turn ends and execution ends | From the archive, on the same host (restored before a resume when missing); **no** on another host |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
-| Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed to the source as `spawn/<agent>` | Yes for missions with a source; no for scratch missions and the default repository |
+| Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed as `spawn/<agent>` to a source that is a directory on this host (a remote source receives none) | Yes for missions with a directory source; no for remote sources, scratch missions and the default repository |
 | Work a task lands | the source's `spawn/<agent>`, fetched by the integrator into its mirror's `refs/spawn-integrate/<agent>`; judged only when it contains the agent's latest checkpoint (its `artifact.committed` in the event log) | Yes: the source holds it; nothing on the host that ran the agent is needed |
 | Large files in workspaces | git blobs on the agent's branch, up to `SPAWN_MAX_FILE_MB`; larger ones only in the workspace | Up to the cap, as code; **no** over it |
 | Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host (versioning them with the source is not built) |

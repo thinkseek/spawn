@@ -380,9 +380,10 @@ pub struct Bridge {
     /// took whose append failed: appended again first at the next tick
     /// ([`Bridge::record_commit`]).
     unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
-    /// Per session, what the workspace store had to tell the agent
-    /// ([`WorkspaceStore::take_notices`]) and no prompt carried yet.
-    untold: std::sync::Mutex<HashMap<SessionId, Vec<String>>>,
+    /// Per session, the store's notices this Bridge already logged as a
+    /// warning. Only the log: whether the agent was told is the store's
+    /// record ([`WorkspaceStore::notices_told`]).
+    warned: std::sync::Mutex<HashMap<SessionId, HashSet<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
 }
@@ -406,7 +407,7 @@ impl Bridge {
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
             unrecorded_commits: std::sync::Mutex::default(),
-            untold: std::sync::Mutex::default(),
+            warned: std::sync::Mutex::default(),
             transcripts: None,
         }
     }
@@ -681,6 +682,8 @@ impl Bridge {
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
                 view.active = None;
             }
+            // An exit report of an old runner (engine-sourced; runners now
+            // write SPAWN_EXIT_FILE): only old logs hold one.
             EventKind::ExecutionEnded { cause, exit_code } if current => {
                 if let Some(active) = view.active.as_mut() {
                     active.reported_end = Some((*cause, *exit_code));
@@ -755,7 +758,9 @@ impl Bridge {
                 if ended {
                     view.active = None;
                 } else if let Some(held) = view.active.as_mut() {
-                    held.checkpoint = None;
+                    // Cleared by `advance` only once committed: a failed
+                    // checkpoint stays due and is tried again next tick.
+                    held.checkpoint = active.checkpoint;
                     held.reported_end = active.reported_end;
                     held.follow = active.follow;
                 }
@@ -818,9 +823,12 @@ impl Bridge {
             return self.end(agent_id, session, active, cause, exit_code, false, report);
         }
         if let Some(reason) = active.checkpoint {
-            self.checkpoint(agent_id, session, active, reason, report)?;
-            if reason == CheckpointReason::TurnStopped {
-                self.archive_transcript(agent_id, session, active, report);
+            // A commit that failed was reported; the checkpoint stays due.
+            if self.checkpoint(agent_id, session, active, reason, report)? {
+                active.checkpoint = None;
+                if reason == CheckpointReason::TurnStopped {
+                    self.archive_transcript(agent_id, session, active, report);
+                }
             }
         }
         if active.follow.stale.is_some() {
@@ -1249,14 +1257,17 @@ impl Bridge {
                 return Ok(false);
             }
         }
-        // Logged, and carried by the next prompt the Bridge types.
-        let notices = self.workspaces.take_notices(&active.workspace);
-        if !notices.is_empty() {
-            for notice in &notices {
-                report.warnings.push(format!("{session}: {notice}"));
-            }
-            if let Ok(mut untold) = self.untold.lock() {
-                untold.entry(session.clone()).or_default().extend(notices);
+        // Logged once, and carried by the next prompt the Bridge types.
+        let notices = self.workspaces.notices(&active.workspace);
+        if !notices.is_empty()
+            && let Ok(mut warned) = self.warned.lock()
+        {
+            let seen = warned.entry(session.clone()).or_default();
+            for notice in notices {
+                if !seen.contains(&notice) {
+                    report.warnings.push(format!("{session}: {notice}"));
+                    seen.insert(notice);
+                }
             }
         }
         Ok(true)
@@ -1532,9 +1543,12 @@ impl Bridge {
         }
         match self.typing_of(claimed, &active.execution_id) {
             Typing::Done => Ok(Outcome::Succeeded),
-            Typing::Unknown => {
-                self.abandon(claimed, active, format!("the prompt {MAY_HAVE_TYPED}"))
-            }
+            Typing::Unknown => self.abandon(
+                claimed,
+                active,
+                format!("the prompt {MAY_HAVE_TYPED}"),
+                false,
+            ),
             Typing::Due => self.prompt_engine(claimed, active, prompt, fresh),
         }
     }
@@ -1616,21 +1630,23 @@ impl Bridge {
     /// Text into the engine's input box, at most once: the intent is
     /// recorded before the keys go and the completion after, so a retried
     /// command or a restarted Bridge can tell whether it was typed. What the
-    /// workspace store told and no prompt carried yet goes before it.
+    /// workspace store has to tell and no prompt carried yet goes before
+    /// it, and is marked told in the store once the typing is recorded.
     fn type_once(
         &self,
         claimed: &Claimed,
         active: &Active,
         text: &str,
     ) -> Result<Result<(), TerminalError>, StoreError> {
-        // What the workspace store had to tell the agent goes first, and is
-        // told once: it clears when the typing is recorded.
-        let untold = self.untold.lock().ok().and_then(|untold| {
-            untold
-                .get(&claimed.session_id)
-                .map(|notices| notices.join("\n\n"))
-        });
-        let text = untold.map_or_else(|| text.to_string(), |told| format!("{told}\n\n{text}"));
+        // What the workspace store has to tell the agent goes first. It is
+        // the store's record, not this process's memory, so a restart
+        // between the checkpoint and this prompt loses none of it.
+        let notices = self.workspaces.notices(&active.workspace);
+        let text = if notices.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}\n\n{text}", notices.join("\n\n"))
+        };
         self.step(
             claimed,
             Some(&active.execution_id),
@@ -1647,8 +1663,8 @@ impl Bridge {
                 CommandStep::Typed,
                 None,
             )?;
-            if let Ok(mut untold) = self.untold.lock() {
-                untold.remove(&claimed.session_id);
+            if !notices.is_empty() {
+                self.workspaces.notices_told(&active.workspace, &notices);
             }
         }
         Ok(typed)
@@ -1675,7 +1691,7 @@ impl Bridge {
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
-            return self.abandon(claimed, active, format!("start terminal: {error}"));
+            return self.abandon(claimed, active, format!("start terminal: {error}"), true);
         }
         if prompt.is_empty() {
             return Ok(Outcome::Succeeded);
@@ -1696,7 +1712,8 @@ impl Bridge {
     ) -> Result<Outcome, StoreError> {
         let outcome = self.type_prompt(claimed, active, prompt, fresh)?;
         if let Outcome::Failed(why) = outcome {
-            return self.abandon(claimed, active, why);
+            let discard = self.never_typed(claimed, active)?;
+            return self.abandon(claimed, active, why, discard);
         }
         self.catch_up()?;
         Ok(outcome)
@@ -1940,25 +1957,54 @@ impl Bridge {
     }
 
     /// End a start that failed as lost; the failure names `why` first.
+    /// `discard` only when the log shows its prompt was never typed
+    /// (nothing ran in it, so an unmount loses nothing). Otherwise the
+    /// prompt may have reached the engine: a final checkpoint that fails
+    /// keeps the workspace, and the end stays due, as a Stop's does.
     fn abandon(
-        &self,
+        &mut self,
         claimed: &Claimed,
         active: &Active,
         why: String,
+        discard: bool,
     ) -> Result<Outcome, StoreError> {
         let mut report = TickReport::default();
-        // Nothing ran in it yet: an unmount loses nothing.
-        self.end(
+        let mut ending = active.clone();
+        let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
-            &mut active.clone(),
+            &mut ending,
             EndCause::Lost,
             None,
-            true,
+            discard,
             &mut report,
         )?;
+        if !ended {
+            self.catch_up()?;
+            if let Some(held) = self
+                .sessions
+                .get_mut(&claimed.session_id)
+                .and_then(|view| view.active.as_mut())
+                .filter(|held| held.execution_id == ending.execution_id)
+            {
+                held.reported_end = ending.reported_end;
+                held.follow.end_failures = ending.follow.end_failures;
+                held.follow.end_tried_at = ending.follow.end_tried_at;
+            }
+        }
         report.warnings.insert(0, why);
         Ok(Outcome::Failed(report.warnings.join("; ")))
+    }
+
+    /// Whether the log shows this command's typing never began, after
+    /// folding what this tick appended: only then may its start be
+    /// discarded.
+    fn never_typed(&mut self, claimed: &Claimed, active: &Active) -> Result<bool, StoreError> {
+        self.catch_up()?;
+        Ok(matches!(
+            self.typing_of(claimed, &active.execution_id),
+            Typing::Due
+        ))
     }
 
     /// The agent's branch, created at `from` (else at the base) unless it
@@ -2176,7 +2222,7 @@ impl Bridge {
         )?;
         if !reading.state.accepts_input() {
             return Ok(Outcome::Failed(format!(
-                "pane state {:?} does not accept input",
+                "pane state {:?} {PANE_NOT_READY}",
                 reading.state
             )));
         }
@@ -2274,6 +2320,13 @@ impl Bridge {
         )
     }
 }
+
+/// How an input fails when the pane does not show a prompt that takes
+/// text (`pane state <state> does not accept input`): refused before
+/// anything was typed, so nothing reached the engine. The pane may be a
+/// moment from ready: a turn's end reaches the transcript before the screen
+/// settles at the prompt.
+pub const PANE_NOT_READY: &str = "does not accept input";
 
 /// How a command that may or may not have typed its text fails (the log
 /// shows typing began and nothing shows it arrived): it is not typed again,

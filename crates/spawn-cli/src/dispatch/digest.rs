@@ -44,10 +44,11 @@ fn heading(why: Why) -> &'static str {
         Why::Completed => "completed, review it",
         Why::Idle => "idle, give it the next step or review it",
         Why::Mission => "new mission, plan it and assign tasks",
-        Why::Report => "report, review it (`task accept` or `task reject`)",
+        Why::Report => "report, review it (name its revision)",
         Why::Approved => "resident approved",
         Why::Human => "human message",
         Why::DeliveryFailed => "delivery failed",
+        Why::StopFailed => "stop failed",
         Why::Disk => "disk space on this host",
     }
 }

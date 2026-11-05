@@ -13,6 +13,9 @@
 //! - a task runs on its own model profile: a start or resume names it, and a
 //!   live worker on another profile is stopped first, then resumed on the
 //!   task's (a running engine keeps the models it started with);
+//! - a worker whose stop is under way gets nothing typed in; a Stop that
+//!   fails (this module's, or anyone's) is pursued and escalated by the
+//!   dispatcher (`dispatch::stops`), and the task keeps waiting;
 //! - a report (`.spawn/report.md`) is collected once its worker is idle, if
 //!   it was written after the delivery's mark in the workspace (one clock,
 //!   the filesystem's, sets both times), and moved aside so the next task
@@ -22,8 +25,8 @@
 //!   the end: the worker's workspace is the candidate, so it stays (and its
 //!   next task waits) until the work lands or the gate sends it back.
 //!
-//! Missions, reports, approvals, human messages to workers and failed
-//! deliveries become digest items for the supervisor ([`news_items`]). Like
+//! Missions, reports, approvals, human commands to workers (with their
+//! outcome) and failed deliveries become digest items for the supervisor ([`news_items`]). Like
 //! the dispatcher, delivery keeps no state: idempotency keys and the task
 //! rows say what was already done.
 //!
@@ -34,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Deserialize;
-use spawn_core::bridge::MAY_HAVE_TYPED;
+use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
 use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, ModelProfile};
 use spawn_core::mission::TaskState;
@@ -53,15 +56,37 @@ const KEPT_REPORTS: &str = ".spawn/reports";
 /// delivery's key, relative to the workspace ([`mark_delivery`]).
 const DELIVERY_MARKS: &str = ".spawn/deliveries";
 
-/// Retries of a failed delivery, after the first attempt.
-const DELIVERY_RETRIES: usize = 3;
+/// Retries of a failed delivery, after the first attempt; a failed Stop
+/// gets as many ([`crate::dispatch`]'s stop pursuit).
+pub(crate) const DELIVERY_RETRIES: usize = 3;
 
 /// Wait before the first retry; it doubles with every retry, up to
 /// [`RETRY_MAX_MS`].
 const RETRY_MS: i64 = 60_000;
 
+/// Wait before a delivery refused because the pane was not ready
+/// ([`PANE_NOT_READY`]) is tried again: nothing was typed, and the pane is
+/// usually a moment from ready.
+const NOT_READY_RETRY_MS: i64 = 5_000;
+
+/// Refusals for a pane not ready that are not counted as failed attempts;
+/// past them each counts like any failure, so a pane that never shows its
+/// prompt still ends in an escalation.
+const NOT_READY_FREE: usize = 10;
+
 /// Longest wait between two retries.
 const RETRY_MAX_MS: i64 = 30 * 60_000;
+
+/// The wait after the `failures`-th failed attempt before the next:
+/// [`RETRY_MS`], doubling with each failure, at most [`RETRY_MAX_MS`].
+pub(crate) fn retry_wait_ms(failures: usize) -> i64 {
+    let doublings = u32::try_from(failures.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(20);
+    RETRY_MS
+        .saturating_mul(1_i64 << doublings)
+        .min(RETRY_MAX_MS)
+}
 
 /// One task row from `delivery_rows`.
 #[derive(Debug, Clone, Deserialize)]
@@ -157,13 +182,37 @@ pub(crate) struct ApprovedNote {
     pub(crate) name: String,
 }
 
-/// Something a human typed to a worker.
+/// A command a human sent to a worker, once it finished.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct HumanNote {
     pub(crate) command_id: i64,
     pub(crate) session_id: String,
+    /// The command's type (`input`, `stop`, ...).
+    #[serde(default)]
+    pub(crate) action: String,
     #[serde(default)]
     pub(crate) text: String,
+    /// What it did: a failed one told the worker nothing.
+    #[serde(default)]
+    pub(crate) succeeded: Option<bool>,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
+impl HumanNote {
+    /// The digest line: what the human told the worker, or what failed.
+    fn line(&self) -> String {
+        let text = one_line(&self.text, 200);
+        if self.succeeded == Some(true) {
+            return format!("a human told it: {text}");
+        }
+        let error = one_line(self.error.as_deref().unwrap_or("no error recorded"), 200);
+        if self.action == "input" {
+            format!("a human's message could not be delivered ({error}): {text}")
+        } else {
+            format!("a human's `{}` failed ({error})", self.action)
+        }
+    }
 }
 
 /// What the supervisor should hear about besides worker states.
@@ -273,7 +322,11 @@ impl<'a> Turns<'a> {
 
 /// Whether the last task typed into `facts`' session is closed. A question
 /// the worker asked at the end of it (judged BLOCKED) is then settled by
-/// the close, and new work may be typed in.
+/// the close, and new work may be typed in. The last task typed in is the
+/// last delivery that reached the worker or may have
+/// ([`Facts::last_delivery`]): a delivery refused before typing, such as a
+/// waiting task's own first attempt, told the worker nothing, so it neither
+/// is the question nor holds back its own retry.
 fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
     // Not `dispatched`, which holds only the last day: a worker blocked
     // over a quiet weekend would never take new work.
@@ -295,7 +348,10 @@ fn last_delivery_closed(work: &Work, facts: &Facts) -> bool {
 fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -> Option<Order> {
     let model = Some(task.model);
     match found {
-        Some(facts) if facts.open_command => None,
+        // A worker whose stop is under way (a model switch's included) gets
+        // nothing typed: the stop is pursued, and escalated if it keeps
+        // failing ([`crate::dispatch`]), whatever its judgement says.
+        Some(facts) if facts.open_command || facts.stopping() => None,
         // A revision answers the worker's own report, which may have asked
         // a question (judged BLOCKED): a stopped turn is enough. New work
         // waits for a worker that is not blocked, unless what it asked about
@@ -380,12 +436,26 @@ enum Attempts {
 /// Where `task`'s current delivery into `facts`' session stands. A failure
 /// that typed nothing is tried again under a key of its own, with a wait
 /// that doubles each time, [`DELIVERY_RETRIES`] times. One that may have
-/// typed the task ([`MAY_HAVE_TYPED`]) is not.
+/// typed the task ([`MAY_HAVE_TYPED`]) is not. A refusal because the pane
+/// was not ready ([`PANE_NOT_READY`]) is no failed attempt: nothing was
+/// tried on the worker, so it goes again after [`NOT_READY_RETRY_MS`], once
+/// the worker is ready by the delivery rules, and counts only past
+/// [`NOT_READY_FREE`] of them.
 fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
     let sent = delivery_attempts(task, facts);
     let Some(last) = sent.last() else {
         return Attempts::None;
     };
+    let not_ready = |sent: &&crate::dispatch::Sent| {
+        sent.succeeded == Some(false)
+            && sent
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(PANE_NOT_READY))
+    };
+    let refusals = sent.iter().filter(|sent| not_ready(sent)).count();
+    // Failed attempts: every failure but the refusals still free.
+    let failures = sent.len() - refusals.min(NOT_READY_FREE);
     match last.succeeded {
         None => Attempts::Open,
         Some(true) => last.id.map_or(Attempts::Open, Attempts::Delivered),
@@ -397,19 +467,19 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
                      again",
                 );
             }
-            if sent.len() > DELIVERY_RETRIES {
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            if not_ready(last) && refusals <= NOT_READY_FREE {
+                return Attempts::Retry {
+                    number: sent.len(),
+                    due_ms: finished.saturating_add(NOT_READY_RETRY_MS),
+                };
+            }
+            if failures > DELIVERY_RETRIES {
                 return Attempts::Failed("never reached its worker; cancel it and assign it again");
             }
-            let doublings = u32::try_from(sent.len() - 1).unwrap_or(u32::MAX).min(20);
-            let wait = RETRY_MS
-                .saturating_mul(1_i64 << doublings)
-                .min(RETRY_MAX_MS);
             Attempts::Retry {
                 number: sent.len(),
-                due_ms: last
-                    .finished_at_ms
-                    .unwrap_or(last.created_at_ms)
-                    .saturating_add(wait),
+                due_ms: finished.saturating_add(retry_wait_ms(failures)),
             }
         }
     }
@@ -473,10 +543,11 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
                 orders.extend(delivery(task, found, settled, key));
             }
-            // A finished ephemeral worker is stopped.
+            // A finished ephemeral worker is stopped, once: a stop that
+            // fails is pursued from then on ([`crate::dispatch`]).
             _ if task.is_finished()
                 && task.kind == "ephemeral"
-                && found.is_some_and(Facts::live_and_free) =>
+                && found.is_some_and(|facts| facts.live_and_free() && !facts.stopping()) =>
             {
                 let key = format!("retire-task-{}", task.id);
                 orders.push(task.command(key, CommandAction::Stop));
@@ -492,6 +563,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
     for (agent, session) in &work.retired {
         if let Some(facts) = facts.get(session.as_str())
             && facts.live_and_free()
+            && !facts.stopping()
         {
             orders.push(Order {
                 agent_id: agent.clone(),
@@ -584,7 +656,7 @@ fn resume_prompt(task: &TaskRow) -> String {
 }
 
 /// `text` on one line, cut to `limit` characters.
-fn one_line(text: &str, limit: usize) -> String {
+pub(crate) fn one_line(text: &str, limit: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= limit {
         flat
@@ -619,12 +691,17 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             why: Why::Report,
             // The report is the worker's text, not the dispatcher's: framed
             // as a quote, so an instruction in it reads as the worker's.
+            // The review names the revision read here: one that arrives after
+            // the task moved on is refused, not applied to a newer report.
             line: format!(
-                "task #{} ({}, mission #{}); the worker's report, quoted: «{}»",
-                report.id,
+                "task #{id} revision {revision} ({}, mission #{}): `task accept --id {id} \
+                 --revision {revision}` or `task reject --id {id} --revision {revision} --note \
+                 ...`; the worker's report, quoted: «{}»",
                 report.kind,
                 report.mission_id,
-                one_line(&report.report, 400)
+                one_line(&report.report, 400),
+                id = report.id,
+                revision = report.revisions,
             ),
         });
     }
@@ -644,7 +721,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             session_id: message.session_id.clone(),
             id: format!("human-{}", message.command_id),
             why: Why::Human,
-            line: format!("a human told it: {}", one_line(&message.text, 200)),
+            line: message.line(),
         });
     }
     for (task, attempts) in waiting_attempts(work, rows) {
@@ -833,7 +910,7 @@ mod tests {
             observation_at_ms: Some(0),
             evidence_seq: Some(5),
             episode: Some(1),
-            episode_action: Some("start".to_string()),
+            stops: Vec::new(),
             open_command: false,
             dispatched: Vec::new(),
             told: std::collections::BTreeSet::new(),
@@ -1191,6 +1268,203 @@ mod tests {
             "a report after a revision is news again"
         );
         assert!(items[1].line.contains("## Outcome done"));
+        assert!(
+            items[1].line.contains("`task accept --id 7 --revision 1`"),
+            "the review names the revision it read: {}",
+            items[1].line
+        );
+    }
+
+    /// Audit #9: a human command is news once it finished, with what it
+    /// did: one that failed told the worker nothing, and says so.
+    #[test]
+    fn a_human_command_that_failed_is_not_reported_as_said() {
+        let news: News = serde_json::from_value(json!({
+            "human": [
+                {"command_id": 40, "session_id": "session_worker_x_7", "action": "input",
+                 "text": "use eu", "succeeded": false,
+                 "error": "pane state Busy does not accept input"},
+                {"command_id": 41, "session_id": "session_worker_x_7", "action": "stop",
+                 "text": "stop", "succeeded": false, "error": "kill-session refused"},
+                {"command_id": 42, "session_id": "session_worker_x_7", "action": "input",
+                 "text": "use us", "succeeded": true},
+            ],
+        }))
+        .expect("the shape mission_news returns");
+        let lines: Vec<String> = news_items(
+            &Work {
+                news,
+                ..Work::default()
+            },
+            &[],
+        )
+        .into_iter()
+        .map(|item| item.line)
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                "a human's message could not be delivered (pane state Busy does not accept \
+                 input): use eu",
+                "a human's `stop` failed (kill-session refused)",
+                "a human told it: use us",
+            ]
+        );
+    }
+
+    /// The whole dispatcher pass for `work` and the resident's `facts`,
+    /// with an idle supervisor, at `now`.
+    fn pass(work: &Work, facts: &Facts, now: i64) -> crate::dispatch::Plan {
+        let mut supervisor = worker(true, true);
+        supervisor.session_id = "session_supervisor".to_string();
+        supervisor.agent_id = "agent_supervisor".to_string();
+        crate::dispatch::decide_with(&[facts.clone(), supervisor], work, &[], true, now, "spawn")
+    }
+
+    /// The switch Stop `key` of the live worker, as `dispatch_facts` lists
+    /// it, failed at `finished`.
+    fn failed_switch(key: &str, finished: i64) -> crate::dispatch::StopSent {
+        crate::dispatch::StopSent {
+            id: 10,
+            key: key.to_string(),
+            principal: "spawn-dispatch".to_string(),
+            action: "stop".to_string(),
+            created_at_ms: finished - 100,
+            finished_at_ms: Some(finished),
+            succeeded: Some(false),
+            error: Some("terminate spawn-exec_3: kill-session refused".to_string()),
+        }
+    }
+
+    /// Audit #2, GitHub issue #3, objective 006: a model switch's Stop that
+    /// fails leaves the worker live on the wrong profile. The task stays
+    /// waiting; the Stop is sent again under a new key once due, though the
+    /// worker's judgement went stale with the Stop's own records (it changed
+    /// nothing on the worker); after the retries no Stop goes out, and the
+    /// supervisor hears, with the task named.
+    #[test]
+    fn a_failed_switch_stop_is_retried_under_a_new_key_then_escalated() {
+        let cheap = TaskRow {
+            model: ModelProfile::Cheap,
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        let work = work(vec![cheap]);
+        let mut facts = worker(true, true);
+        // The Stop's records are newer than the judgement.
+        facts.evidence_seq = Some(8);
+        facts.stops.push(failed_switch("switch-model-4-0", 1_000));
+        facts.dispatched.push(sent(
+            10,
+            "switch-model-4-0",
+            1_000,
+            Some("kill-session refused"),
+        ));
+
+        let early = pass(&work, &facts, 1_000 + 59_999);
+        assert!(early.orders.is_empty(), "{:?}", early.orders);
+        assert!(
+            early.pending.is_empty(),
+            "a retry is coming: {:?}",
+            early.pending
+        );
+        assert!(early.delivered.is_empty());
+        let due = pass(&work, &facts, 1_000 + 60_000);
+        assert_eq!(due.orders.len(), 1, "{:?}", due.orders);
+        assert_eq!(due.orders[0].key, "stop-exec_3-retry-1");
+        assert_eq!(due.orders[0].session_id, "session_resident_core");
+        assert_eq!(due.orders[0].action, CommandAction::Stop);
+        assert_eq!(due.orders[0].task, None, "a stop delivers nothing");
+
+        // Every retry fails: at most four Stops in all, then none.
+        let mut at = 70_000;
+        for retry in 1..=DELIVERY_RETRIES {
+            facts
+                .stops
+                .push(failed_switch(&format!("stop-exec_3-retry-{retry}"), at));
+            at += 2 * 3_600_000;
+        }
+        assert_eq!(facts.stops.len(), 4);
+        let spent = pass(&work, &facts, at);
+        assert!(spent.delivered.is_empty(), "never delivered");
+        assert_eq!(spent.orders.len(), 1, "only the digest: {:?}", spent.orders);
+        assert_eq!(spent.orders[0].session_id, "session_supervisor");
+        let CommandAction::Input { text, tags } = &spent.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(tags, &["session_resident_core stop-exec_3"]);
+        assert!(text.contains("task #4"), "{text}");
+        assert!(text.contains("stop failed"), "{text}");
+        assert_eq!(spent.pending[0].why, Why::StopFailed);
+
+        // Told: nothing more, and the task still waits.
+        let told = pass(&work, &facts, at + 3_600_000);
+        assert!(
+            told.orders
+                .iter()
+                .all(|order| order.session_id != "session_resident_core"),
+            "{:?}",
+            told.orders
+        );
+        // A fresh idle judgement does not plan the switch again either.
+        facts.evidence_seq = Some(5);
+        assert!(super::orders(&work, &[facts], at).is_empty());
+    }
+
+    /// Before the fix the retry waited for the planned Stop's own key: the
+    /// same key every pass, deduplicated to the finished command, forever.
+    /// A switch Stop that succeeds still ends in the Resume that delivers.
+    #[test]
+    fn a_switch_stop_that_succeeds_leads_to_the_resume_that_delivers() {
+        let cheap = TaskRow {
+            model: ModelProfile::Cheap,
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        let work = work(vec![cheap]);
+        let first = pass(&work, &worker(true, true), 0);
+        assert_eq!(first.orders[0].key, "switch-model-4-0");
+        // Stopped: no execution is live, so no stop is under way.
+        let mut stopped = worker(false, false);
+        stopped
+            .dispatched
+            .push(sent(10, "switch-model-4-0", 1_000, None));
+        let resume = pass(&work, &stopped, 2_000);
+        assert_eq!(resume.orders.len(), 1, "{:?}", resume.orders);
+        assert_eq!(resume.orders[0].key, "deliver-4-0");
+        assert_eq!(resume.orders[0].task, Some(4));
+        assert!(matches!(
+            resume.orders[0].action,
+            CommandAction::Resume {
+                model: Some(ModelProfile::Cheap),
+                ..
+            }
+        ));
+    }
+
+    /// Audit #3: a closed task's worker, or a retired resident, whose Stop
+    /// failed is not planned the same Stop again: the pursuit owns it.
+    #[test]
+    fn a_retirement_stop_is_sent_once_then_pursued() {
+        let mut done = task(4, TaskState::Cancelled, "ephemeral");
+        done.resident = None;
+        let work = work(vec![done]);
+        assert_eq!(orders(&work, &[worker(true, true)])[0].key, "retire-task-4");
+        let mut failed = worker(true, true);
+        failed.stops.push(failed_switch("retire-task-4", 1_000));
+        assert!(orders(&work, &[failed.clone()]).is_empty());
+        let plan = pass(&work, &failed, 1_000 + 60_000);
+        assert_eq!(plan.orders[0].key, "stop-exec_3-retry-1");
+        let retired = Work {
+            retired: vec![(
+                "agent_resident_core".to_string(),
+                "session_resident_core".to_string(),
+            )],
+            ..Work::default()
+        };
+        assert_eq!(
+            orders(&retired, &[worker(true, true)])[0].key,
+            "retire-session_resident_core-exec_3"
+        );
+        assert!(orders(&retired, &[failed]).is_empty());
     }
 
     /// H1 and E: a delivery that failed typed nothing, so the task waits
@@ -1202,7 +1476,7 @@ mod tests {
         let mut facts = worker(true, true);
         facts
             .dispatched
-            .push(sent(10, "deliver-4-0", 1_000, Some("pane state Busy")));
+            .push(sent(10, "deliver-4-0", 1_000, Some("terminal disappeared")));
         let rows = |facts: &Facts| vec![facts.clone()];
         assert!(delivered(&tasks, &rows(&facts)).is_empty(), "not delivered");
         assert!(
@@ -1221,7 +1495,7 @@ mod tests {
             11,
             "deliver-4-0-retry-1",
             70_000,
-            Some("pane state Busy"),
+            Some("terminal disappeared"),
         ));
         let mut down = facts.clone();
         down.live = false;
@@ -1243,7 +1517,7 @@ mod tests {
                 20,
                 &format!("deliver-4-0-retry-{retry}"),
                 100_000,
-                Some("pane state Busy"),
+                Some("terminal disappeared"),
             ));
         }
         assert!(super::orders(&tasks, &rows(&facts), i64::MAX / 2).is_empty());
@@ -1251,6 +1525,115 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
         assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
+    }
+
+    /// The live sequence of task 25: the worker's turn on task 24 ended,
+    /// task 25 was typed in at that instant and refused (the pane still
+    /// showed the turn: `pane state Busy does not accept input`), and then
+    /// the model judge read the idle worker's report on task 24, which asked
+    /// a question, as BLOCKED. The retry must still go out: the refused
+    /// delivery told the worker nothing, so its last delivery is task 24's,
+    /// which is closed, and a stopped turn is enough.
+    #[test]
+    fn a_delivery_refused_by_a_busy_pane_is_retried_to_a_blocked_worker_at_its_prompt() {
+        let tasks = work(vec![
+            task(24, TaskState::Accepted, "resident"),
+            task(25, TaskState::Assigned, "resident"),
+        ]);
+        let mut facts = worker(true, true);
+        if let Some(observation) = facts.observation.as_mut() {
+            observation.state = SemanticState::Blocked;
+        }
+        facts.dispatched = vec![
+            sent(30, "deliver-24-0", 500, None),
+            sent(
+                31,
+                "deliver-25-0",
+                1_000,
+                Some("pane state Busy does not accept input"),
+            ),
+        ];
+        // What `dispatch_facts` names now: the refused delivery is not the
+        // worker's.
+        facts.last_delivery = Some("deliver-24-0".to_string());
+        let rows = vec![facts.clone()];
+        assert!(delivered(&tasks, &rows).is_empty(), "task 25 never arrived");
+        assert!(
+            news_items(&tasks, &rows).is_empty(),
+            "a retry is coming: no one is asked"
+        );
+        assert!(super::orders(&tasks, &rows, 1_000 + 4_999).is_empty());
+        let retry = super::orders(&tasks, &rows, 1_000 + 5_000);
+        assert_eq!(retry.len(), 1, "the retry goes out: {retry:?}");
+        assert_eq!(retry[0].key, "deliver-25-0-retry-1");
+        assert_eq!(retry[0].task, Some(25));
+        let CommandAction::Input { text, .. } = &retry[0].action else {
+            panic!("typed into the live worker");
+        };
+        assert!(text.contains("New task #25"), "{text}");
+
+        // As the facts named it before the fix: the refused delivery as the
+        // worker's last, so task 25 itself was "the open task it asked
+        // about", and the BLOCKED worker never got its retry.
+        let mut before = facts.clone();
+        before.last_delivery = Some("deliver-25-0".to_string());
+        assert!(super::orders(&tasks, &[before], 1_000 + 600_000).is_empty());
+
+        // The retry succeeds: task 25 is delivered by it.
+        facts
+            .dispatched
+            .push(sent(32, "deliver-25-0-retry-1", 6_500, None));
+        assert_eq!(delivered(&tasks, &[facts]), vec![(25, 32)]);
+    }
+
+    /// A pane not ready refuses before anything is typed: tried again soon,
+    /// without spending the retries a real failure gets, and escalated only
+    /// once refusals keep coming.
+    #[test]
+    fn a_pane_not_ready_is_not_a_failed_attempt() {
+        let tasks = work(vec![task(4, TaskState::Assigned, "resident")]);
+        let busy = "pane state Busy does not accept input";
+        let mut facts = worker(true, true);
+        let mut at = 1_000;
+        for n in 0..5 {
+            let key = if n == 0 {
+                "deliver-4-0".to_string()
+            } else {
+                format!("deliver-4-0-retry-{n}")
+            };
+            facts.dispatched.push(sent(10 + n, &key, at, Some(busy)));
+            let retry = super::orders(&tasks, &[facts.clone()], at + 5_000);
+            assert_eq!(retry.len(), 1, "refusal {n} is retried after 5 s");
+            assert_eq!(retry[0].key, format!("deliver-4-0-retry-{}", n + 1));
+            at += 6_000;
+        }
+        // A real failure after them is the first failed attempt: one minute.
+        facts.dispatched.push(sent(
+            20,
+            "deliver-4-0-retry-5",
+            at,
+            Some("terminal disappeared"),
+        ));
+        assert!(super::orders(&tasks, &[facts.clone()], at + 59_999).is_empty());
+        assert_eq!(
+            super::orders(&tasks, &[facts.clone()], at + 60_000)[0].key,
+            "deliver-4-0-retry-6"
+        );
+
+        // Refusals without end count once past the free ones: escalated.
+        let mut stuck = worker(true, true);
+        for n in 0..=(super::NOT_READY_FREE + DELIVERY_RETRIES) {
+            let key = if n == 0 {
+                "deliver-4-0".to_string()
+            } else {
+                format!("deliver-4-0-retry-{n}")
+            };
+            stuck.dispatched.push(sent(40, &key, 1_000, Some(busy)));
+        }
+        assert!(super::orders(&tasks, &[stuck.clone()], i64::MAX / 2).is_empty());
+        let items = news_items(&tasks, &[stuck]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::DeliveryFailed);
     }
 
     /// A delivery that may have typed the task is not sent again: the

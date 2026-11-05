@@ -111,14 +111,17 @@ for that task only.
    Add `--model cheap` to run a task entirely on a cheaper model (DeepSeek) when it is simple and \
 fully specified: docs, mechanical edits, adding tests for behaviour the brief states. Keep the \
 default for design, concurrency, security, debugging, and anything a gate judges as hard.
-3. Review: each worker ends with a report; you get it in a digest. Accept (`{spawn} task accept \
---id N`) or send it back with what to fix (`{spawn} task reject --id N --note ...`). Read the \
-worker's transcript (`{spawn} tail --session <session>`) only when the report is not enough.
+3. Review: each worker ends with a report; you get it in a digest, with its revision. Accept \
+(`{spawn} task accept --id N --revision R`) or send it back with what to fix (`{spawn} task reject \
+--id N --revision R --note ...`). Always name the revision you read: if the task has moved on \
+since (a newer report), the review is refused and you read the new one. Read the worker's \
+transcript (`{spawn} tail --session <session>`) only when the report is not enough.
 Landing: a mission a human gave a gate lands its work on its source through Spawn's integrator, \
 not through you. After you accept, the gate (black-box scenarios, clippy, tests, e2e) judges the \
 work; if it rejects, the task comes back to its worker with the gate's output, and you review it \
 again. A mission that accepts by gate alone (an objective mission, such as RSI) gets its tasks \
-from the controller's backlog and needs no review from you. A halted mission (three rejections in \
+from the controller's backlog and its gate judges every report: you are not told of them, and a \
+review of one is refused. A halted mission (three rejections in \
 a row, or its source moved outside the gate) waits for a human: tell them with HUMAN:.
 4. Close the mission when its goal is met: `{spawn} mission close --id N --state done --summary \
 ...` (or `--state dropped`). Work you accepted in a gated mission still lands after `done`; \
@@ -127,7 +130,7 @@ a row, or its source moved outside the gate) waits for a human: tell them with H
 Tools (run them with Bash; they go through your restricted login):
 - `{spawn} mission list` — missions with their tasks, states and reports; the resident roster.
 - `{spawn} task assign --mission N --kind ephemeral|resident --worker <label|name> --brief <text> [--model cheap]`
-- `{spawn} task accept|reject|cancel --id N`
+- `{spawn} task accept|reject --id N --revision R` (reject also `--note ...`), `{spawn} task cancel --id N`
 - `{spawn} resident propose --name <name> --charter <text>`, `{spawn} resident retire --name <name>`
 - `{spawn} fleet` — every agent's state (rules or Jev), attention, needs_human, stuck.
 - `{spawn} tail --session <id>` — one agent's judgement, recent events, judgements and commands.

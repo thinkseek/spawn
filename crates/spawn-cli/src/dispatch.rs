@@ -10,13 +10,18 @@
 //!    [`NUDGES_PER_HOUR`](worker::NUDGES_PER_HOUR) times per agent-hour.
 //!    Jev's judgement is an input, never the chooser of the action, and the
 //!    action is reversible.
-//! 3. Everything else escalates: attention, a nudge that did not help, a
-//!    resume that failed, and completions (so work gets reviewed). Escalations
+//! 3. Everything else escalates: attention, a nudge that did not help (or
+//!    could not be typed), a resume that failed, and completions (so work
+//!    gets reviewed).
+//!
+//! A Stop that failed, whoever sent it, is sent again and then escalated
+//! ([`stops`]): until then the worker gets no task, no nudge. Escalations
 //!    are coalesced into one digest typed into the supervisor's pane while it
 //!    is idle. Without a supervisor they stay in the attention queue.
 //!
 //! The dispatcher keeps no state. What it already did is read back from the
-//! command queue: idempotency keys mark nudges and resumes, and the tags a
+//! command queue: idempotency keys and their commands' outcomes mark
+//! nudges, resumes and stops, and the tags a
 //! delivered digest files on its command (one per escalation, never in its
 //! text) mark what the supervisor was told.
 //! It commands only `agent_worker_*` sessions, plus digests to the supervisor.
@@ -28,6 +33,7 @@
 //! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
 
 mod digest;
+mod stops;
 mod worker;
 
 use std::collections::BTreeSet;
@@ -63,6 +69,24 @@ pub(crate) struct Sent {
     pub(crate) error: Option<String>,
 }
 
+/// A Stop or Discard sent into a session during its current execution, by
+/// anyone: one that failed is pursued and escalated ([`stops`]).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub(crate) struct StopSent {
+    pub(crate) id: i64,
+    pub(crate) key: String,
+    pub(crate) principal: String,
+    /// `stop` or `discard`.
+    pub(crate) action: String,
+    pub(crate) created_at_ms: i64,
+    #[serde(default)]
+    pub(crate) finished_at_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) succeeded: Option<bool>,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
 /// Facts about one session, as `dispatch_facts` returns them.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Facts {
@@ -89,9 +113,6 @@ pub(crate) struct Facts {
     pub(crate) evidence_seq: Option<u64>,
     #[serde(default)]
     pub(crate) episode: Option<i64>,
-    /// Action of that command (`start`, `input`, `resume`, `stop`).
-    #[serde(default)]
-    pub(crate) episode_action: Option<String>,
     #[serde(default)]
     pub(crate) open_command: bool,
     #[serde(default)]
@@ -101,8 +122,10 @@ pub(crate) struct Facts {
     /// carried ([`Escalation::tag`]).
     #[serde(default)]
     pub(crate) told: BTreeSet<String>,
-    /// Key of the latest delivery (`deliver-<task>-<revision>`) the
-    /// dispatcher sent into the session, however long ago.
+    /// Key of the latest delivery (`deliver-<task>-<revision>`, or one of
+    /// its retries) the dispatcher sent into the session that reached the
+    /// worker or may have, however long ago. One refused before anything was
+    /// typed is not the worker's: it told the worker nothing.
     #[serde(default)]
     pub(crate) last_delivery: Option<String>,
     /// The model profile of the session's latest execution.
@@ -113,6 +136,10 @@ pub(crate) struct Facts {
     /// that stayed up.
     #[serde(default)]
     pub(crate) resumed_young: u32,
+    /// Every Stop and Discard sent into the session since its live
+    /// execution started (none when it is not live), oldest first.
+    #[serde(default)]
+    pub(crate) stops: Vec<StopSent>,
 }
 
 impl Facts {
@@ -131,6 +158,12 @@ impl Facts {
             self.evidence_seq
                 .is_none_or(|latest| observation.based_on_seq.0 >= latest)
         })
+    }
+
+    /// Live, and someone has asked for its execution to end: no task is
+    /// typed into it, and its stop is pursued ([`stops`]).
+    pub(crate) fn stopping(&self) -> bool {
+        self.live && !self.stops.is_empty()
     }
 
     /// Live, with no command in flight.
@@ -186,6 +219,8 @@ pub(crate) enum Why {
     Human,
     /// The command that delivered a task failed.
     DeliveryFailed,
+    /// A Stop of a live execution kept failing.
+    StopFailed,
     /// Free disk on this host crossed the warning threshold (crate::disk).
     Disk,
 }
@@ -270,7 +305,8 @@ pub(crate) fn decide(rows: &[Facts], supervised: bool, now_ms: i64, spawn: &str)
 
 /// The whole policy as a pure function of the facts, the mission rows and
 /// the host's news (disk records): delivery orders first, then the worker
-/// ladder, then at most one digest.
+/// ladder (a worker whose stop is under way gets only its pursuit,
+/// [`stops`]), then at most one digest.
 pub(crate) fn decide_with(
     rows: &[Facts],
     work: &Work,
@@ -290,12 +326,18 @@ pub(crate) fn decide_with(
     };
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
-        // A managed worker between tasks is not news: its report already
-        // was, and the supervisor decides what comes next.
-        if work.managed(&facts.session_id) && !in_flight.contains(facts.session_id.as_str()) {
+        let decision = if facts.stopping() {
+            // Whoever asked for the stop, and whatever the worker's task.
+            stops::pursue(facts, now_ms)
+        } else if work.managed(&facts.session_id) && !in_flight.contains(facts.session_id.as_str())
+        {
+            // A managed worker between tasks is not news: its report
+            // already was, and the supervisor decides what comes next.
             continue;
-        }
-        match worker::decide_worker(facts, now_ms) {
+        } else {
+            worker::decide_worker(facts, now_ms)
+        };
+        match decision {
             worker::Decision::Nothing => {}
             worker::Decision::Act(order) => plan.orders.push(order),
             worker::Decision::Escalate(escalation) => plan.pending.push(escalation),
@@ -410,7 +452,13 @@ fn merge_main_before(
     };
     let task = order.task?;
     let merge = crate::main_merge::merge_main(store, root, &order.agent_id, &order.session_id);
-    if let Some(note) = crate::main_merge::delivery_note(&merge) {
+    // What earlier merges changed and no typed delivery told yet, from
+    // their records: this attempt's merge may find main already in.
+    let untold = store
+        .untold_merges(&order.session_id)
+        .map_err(|error| eprintln!("deliver: untold merges of {}: {error}", order.session_id))
+        .unwrap_or_default();
+    if let Some(note) = crate::main_merge::delivery_note(&merge, &untold) {
         text.push_str("\n\n");
         text.push_str(&note);
     }
@@ -458,7 +506,7 @@ mod tests {
             observation_at_ms: Some(NOW - 1_000),
             evidence_seq: Some(9),
             episode: Some(7),
-            episode_action: Some("start".to_string()),
+            stops: Vec::new(),
             open_command: false,
             dispatched: Vec::new(),
             told: std::collections::BTreeSet::new(),
@@ -466,6 +514,60 @@ mod tests {
             model: ModelProfile::Default,
             resumed_young: 0,
         }
+    }
+
+    /// The whole pass for the live sequence of task 25 (a resident's
+    /// delivery refused by a pane still busy at its turn's end, then the
+    /// idle worker judged BLOCKED): the plan holds the retry that delivers
+    /// task 25, and the worker is not escalated as blocked or idle meanwhile,
+    /// since it is between tasks the mission layer manages.
+    #[test]
+    fn a_refused_delivery_is_retried_by_the_whole_pass_to_a_blocked_idle_worker() {
+        let mut resident = worker(judged(SemanticState::Blocked, 0.9));
+        resident.session_id = "session_resident_core".to_string();
+        resident.agent_id = "agent_resident_core".to_string();
+        let sent = |id: i64, key: &str, finished: i64, error: Option<&str>| Sent {
+            id: Some(id),
+            key: key.to_string(),
+            text: None,
+            created_at_ms: finished - 1,
+            finished_at_ms: Some(finished),
+            succeeded: Some(error.is_none()),
+            error: error.map(str::to_string),
+        };
+        resident.dispatched = vec![
+            sent(30, "deliver-24-0", NOW - 600_000, None),
+            sent(
+                31,
+                "deliver-25-0",
+                NOW - 10_000,
+                Some("pane state Busy does not accept input"),
+            ),
+        ];
+        resident.last_delivery = Some("deliver-24-0".to_string());
+        let row = |id: i64, state: &str| {
+            serde_json::json!({
+                "id": id, "mission_id": 1, "kind": "resident",
+                "agent_id": "agent_resident_core", "session_id": "session_resident_core",
+                "brief": format!("brief {id}"), "state": state, "revisions": 0,
+                "mission_text": "m", "resident": "core", "charter": "c",
+            })
+        };
+        let work = Work {
+            tasks: serde_json::from_value(serde_json::json!([
+                row(24, "accepted"),
+                row(25, "assigned")
+            ]))
+            .expect("task rows"),
+            ..Work::default()
+        };
+        let plan = decide_with(&[resident], &work, &[], false, NOW, "spawn");
+        assert!(plan.delivered.is_empty());
+        assert_eq!(plan.orders.len(), 1, "{:?}", plan.orders);
+        assert_eq!(plan.orders[0].key, "deliver-25-0-retry-1");
+        assert_eq!(plan.orders[0].task, Some(25));
+        assert!(matches!(plan.orders[0].action, CommandAction::Input { .. }));
+        assert!(plan.pending.is_empty(), "{:?}", plan.pending);
     }
 
     /// The digest `order` reached the supervisor: the tags it filed are
@@ -504,7 +606,7 @@ mod tests {
             observation_at_ms: Some(NOW - 5_000),
             evidence_seq: Some(9),
             episode: Some(1),
-            episode_action: Some("start".to_string()),
+            stops: Vec::new(),
             open_command: false,
             dispatched: Vec::new(),
             told: std::collections::BTreeSet::new(),
@@ -764,7 +866,6 @@ mod tests {
         ));
         stopped.live = false;
         stopped.end_cause = Some("stopped".to_string());
-        stopped.episode_action = Some("stop".to_string());
         let plan = decide(&[stopped, idle_supervisor()], true, NOW, "spawn");
         assert_eq!(plan, super::Plan::default());
     }
@@ -790,6 +891,205 @@ mod tests {
         let plan = decide(&[worker(blocked), busy], true, NOW, "spawn");
         assert!(plan.orders.is_empty());
         assert_eq!(plan.pending.len(), 1);
+    }
+
+    /// Audit #1: a nudge that typed nothing (the pane was not ready) did
+    /// not reach the worker, so a later idle judgement is no sign that
+    /// `continue` did not help: it is sent again, and only once the retries
+    /// are spent is the supervisor told, that it could not be typed.
+    #[test]
+    fn a_nudge_that_typed_nothing_is_sent_again_not_reported_as_unhelpful() {
+        let refused = |key: &str, finished: i64| Sent {
+            key: key.to_string(),
+            succeeded: Some(false),
+            error: Some("pane state Busy does not accept input".to_string()),
+            ..nudge_sent(finished)
+        };
+        let mut facts = worker(judged(SemanticState::Waiting, 0.9));
+        facts
+            .dispatched
+            .push(refused("dispatch-nudge-session_worker_a-7", NOW - 5_000));
+        let plan = decide(&[facts.clone()], false, NOW, "spawn");
+        assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+        assert_eq!(plan.orders.len(), 1, "{:?}", plan.orders);
+        assert_eq!(
+            plan.orders[0].key,
+            "dispatch-nudge-session_worker_a-7-retry-1"
+        );
+        // Not before a judgement made after the refusal.
+        let mut early = facts.clone();
+        early.observation_at_ms = Some(NOW - 6_000);
+        assert_eq!(
+            decide(&[early], false, NOW, "spawn"),
+            super::Plan::default()
+        );
+        // Failed nudges do not use up the hour's limit.
+        let mut other = facts.clone();
+        for episode in 1..=3 {
+            other.dispatched.insert(
+                0,
+                refused(
+                    &format!("dispatch-nudge-session_worker_a-{episode}"),
+                    NOW - 60_000,
+                ),
+            );
+        }
+        assert_eq!(
+            decide(&[other], false, NOW, "spawn").orders[0].key,
+            "dispatch-nudge-session_worker_a-7-retry-1"
+        );
+        // The retry reached it and the worker stopped again: that is a nudge
+        // that did not help.
+        let mut landed = facts.clone();
+        landed.dispatched.push(nudge_sent(NOW - 4_000));
+        landed.dispatched[1].key = "dispatch-nudge-session_worker_a-7-retry-1".to_string();
+        let plan = decide(&[landed], false, NOW, "spawn");
+        assert!(plan.orders.is_empty());
+        assert!(
+            plan.pending[0]
+                .line
+                .contains("stopped again after `continue`")
+        );
+        // Refused every time: someone is told it was never typed.
+        for retry in 1..=2 {
+            facts.dispatched.push(refused(
+                &format!("dispatch-nudge-session_worker_a-7-retry-{retry}"),
+                NOW - 4_000,
+            ));
+        }
+        let plan = decide(&[facts], false, NOW, "spawn");
+        assert!(plan.orders.is_empty(), "{:?}", plan.orders);
+        assert_eq!(plan.pending.len(), 1);
+        assert_eq!(plan.pending[0].why, Why::NudgeFailed);
+        assert!(
+            plan.pending[0]
+                .line
+                .contains("could not be typed in 3 attempts"),
+            "{}",
+            plan.pending[0].line
+        );
+    }
+
+    /// Audit #23: whether someone stopped the execution is how it ended,
+    /// not whether a Stop was sent. A Stop that failed, then the engine
+    /// exiting by itself, is a finished execution to review.
+    #[test]
+    fn a_worker_that_exited_by_itself_after_a_failed_stop_is_reported() {
+        let mut exited = worker(Observation::basic(
+            SemanticState::Completed,
+            None,
+            SessionSeq(9),
+            Confidence::new(1.0).expect("valid"),
+            "rules",
+        ));
+        exited.live = false;
+        exited.end_cause = Some("exited".to_string());
+        let plan = decide(&[exited, idle_supervisor()], true, NOW, "spawn");
+        assert_eq!(plan.pending.len(), 1, "{:?}", plan.pending);
+        assert_eq!(plan.pending[0].why, Why::Completed);
+        assert_eq!(plan.pending[0].tag(), "session_worker_a done-7");
+    }
+
+    /// A Stop of the live execution, sent by `principal` under `key`, that
+    /// failed at `finished`.
+    fn failed_stop(id: i64, principal: &str, key: &str, finished: i64) -> super::StopSent {
+        super::StopSent {
+            id,
+            key: key.to_string(),
+            principal: principal.to_string(),
+            action: "stop".to_string(),
+            created_at_ms: finished - 100,
+            finished_at_ms: Some(finished),
+            succeeded: Some(false),
+            error: Some("terminate spawn-exec_5: kill-session refused".to_string()),
+        }
+    }
+
+    /// Audit #3: a Stop that failed leaves the worker running; whoever sent
+    /// it (the integrator's budget abort, a person, the dispatcher retiring
+    /// a closed task's worker), the dispatcher sends it again under a key of
+    /// its own once the wait is over, without waiting for a fresh judgement,
+    /// and escalates once the retries are spent. Nothing rests on memory:
+    /// the plan is the same after any restart, from the command queue.
+    #[test]
+    fn a_failed_stop_is_pursued_then_escalated_whoever_sent_it() {
+        for (principal, key, says) in [
+            (
+                "spawn-integrate",
+                "integrate-abort-9",
+                "task #9 was aborted over its mission's budget",
+            ),
+            ("human", "key_stop", "`human` asked to stop it"),
+            (
+                "spawn-dispatch",
+                "retire-task-9",
+                "task #9 is closed, so its worker is stopped",
+            ),
+        ] {
+            // Its judgement went stale with the Stop's own records.
+            let mut facts = worker(judged(SemanticState::Waiting, 0.9));
+            facts.evidence_seq = Some(12);
+            facts
+                .stops
+                .push(failed_stop(40, principal, key, NOW - 30_000));
+            let rows = [facts.clone(), idle_supervisor()];
+            let plan = decide(&rows, true, NOW, "spawn");
+            assert_eq!(plan, super::Plan::default(), "a minute's wait first");
+            let plan = decide(&rows, true, NOW + 30_000, "spawn");
+            assert_eq!(plan.orders.len(), 1, "{key}: {:?}", plan.orders);
+            assert_eq!(plan.orders[0].key, "stop-exec_5-retry-1");
+            assert_eq!(plan.orders[0].session_id, "session_worker_a");
+            assert_eq!(plan.orders[0].action, CommandAction::Stop);
+            // Each retry fails too: the wait doubles, then it is escalated.
+            let mut at = NOW + 31_000;
+            for retry in 1..=crate::deliver::DELIVERY_RETRIES {
+                facts.stops.push(failed_stop(
+                    41,
+                    "spawn-dispatch",
+                    &format!("stop-exec_5-retry-{retry}"),
+                    at,
+                ));
+                at += 3_600_000;
+            }
+            let rows = [facts.clone(), idle_supervisor()];
+            let plan = decide(&rows, true, at, "spawn");
+            assert_eq!(plan.orders.len(), 1, "only the digest: {:?}", plan.orders);
+            assert_eq!(plan.orders[0].session_id, "session_supervisor");
+            assert_eq!(plan.pending.len(), 1);
+            assert_eq!(plan.pending[0].why, Why::StopFailed);
+            assert_eq!(plan.pending[0].tag(), "session_worker_a stop-exec_5");
+            assert!(
+                plan.pending[0].line.starts_with(says),
+                "{}",
+                plan.pending[0].line
+            );
+            assert!(plan.pending[0].line.contains("4 attempts"));
+            assert!(plan.pending[0].line.contains("kill-session refused"));
+        }
+    }
+
+    /// A worker whose stop is under way is not nudged, and its stop in
+    /// flight is waited for.
+    #[test]
+    fn a_worker_being_stopped_is_left_to_its_stop() {
+        let mut facts = worker(judged(SemanticState::Waiting, 0.9));
+        facts.stops.push(super::StopSent {
+            succeeded: None,
+            finished_at_ms: None,
+            ..failed_stop(40, "human", "key_stop", NOW)
+        });
+        assert_eq!(
+            decide(&[facts.clone()], false, NOW, "spawn"),
+            super::Plan::default()
+        );
+        // A Discard is retried as a Discard.
+        facts.stops[0] = super::StopSent {
+            action: "discard".to_string(),
+            ..failed_stop(40, "human", "key_discard", NOW - 600_000)
+        };
+        let plan = decide(&[facts], false, NOW, "spawn");
+        assert_eq!(plan.orders.len(), 1);
+        assert_eq!(plan.orders[0].action, CommandAction::Discard);
     }
 
     /// Audit M1: a worker's report reaches the digest's text, and may hold
