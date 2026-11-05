@@ -558,7 +558,10 @@ mod tests {
         else {
             panic!("no room is its own outcome");
         };
-        assert_eq!((free_kb, min_gb, tmpdir.as_str()), (2_097_152, 10, "/data/tmp"));
+        assert_eq!(
+            (free_kb, min_gb, tmpdir.as_str()),
+            (2_097_152, 10, "/data/tmp")
+        );
         assert!(log.contains("! gate: 2.0 GiB free"), "{log}");
     }
 
