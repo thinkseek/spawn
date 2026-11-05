@@ -75,8 +75,9 @@ struct State {
     workspace_calls: Vec<String>,
     /// Commits fail while set.
     commit_fails: bool,
-    /// How many of the next `submit_text` calls fail, after their text may
-    /// have reached the engine.
+    /// How many of the next `submit_staged` calls fail (the keys broke
+    /// midway), after their text may have reached the engine; the staged
+    /// text stays for a retry.
     submit_failures: u32,
     /// Commits and merges answer `WorkspaceStale` while set.
     stale: bool,
