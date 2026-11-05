@@ -653,12 +653,17 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             why: Why::Report,
             // The report is the worker's text, not the dispatcher's: framed
             // as a quote, so an instruction in it reads as the worker's.
+            // The review names the revision read here: one that arrives after
+            // the task moved on is refused, not applied to a newer report.
             line: format!(
-                "task #{} ({}, mission #{}); the worker's report, quoted: «{}»",
-                report.id,
+                "task #{id} revision {revision} ({}, mission #{}): `task accept --id {id} \
+                 --revision {revision}` or `task reject --id {id} --revision {revision} --note \
+                 ...`; the worker's report, quoted: «{}»",
                 report.kind,
                 report.mission_id,
-                one_line(&report.report, 400)
+                one_line(&report.report, 400),
+                id = report.id,
+                revision = report.revisions,
             ),
         });
     }
@@ -1225,6 +1230,11 @@ mod tests {
             "a report after a revision is news again"
         );
         assert!(items[1].line.contains("## Outcome done"));
+        assert!(
+            items[1].line.contains("`task accept --id 7 --revision 1`"),
+            "the review names the revision it read: {}",
+            items[1].line
+        );
     }
 
     /// H1 and E: a delivery that failed typed nothing, so the task waits

@@ -234,7 +234,10 @@ impl MissionWorkspaces {
             }
             refreshed.insert(mirror.to_path_buf(), now);
         }
-        refresh(mirror, source);
+        // A workspace still starts from the last copy of main.
+        if let Err(error) = refresh(mirror, source) {
+            eprintln!("sources: {error}");
+        }
     }
 
     /// The store for one agent's workspace.
@@ -315,15 +318,13 @@ pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf
 }
 
 /// Bring a mirror's `main` up to its source's default branch. A source that
-/// cannot be reached leaves the mirror as it was: the worker still starts,
-/// from the last copy, and the reason is logged.
-pub(crate) fn refresh(mirror: &Path, source: &str) {
+/// cannot be reached leaves the mirror as it was, and says so: the mirror's
+/// `main` is then only the last copy, not the source's main. A workspace
+/// may start from it; the integrator may not judge or halt by it.
+pub(crate) fn refresh(mirror: &Path, source: &str) -> Result<(), String> {
     let path = mirror.to_string_lossy();
-    if let Err(error) = MissionSource::parse(source) {
-        eprintln!("sources: not refreshing {path}: {error}");
-        return;
-    }
-    if let Err(error) = git(&[
+    MissionSource::parse(source).map_err(|error| format!("not refreshing {path}: {error}"))?;
+    git(&[
         "--git-dir",
         &path,
         "fetch",
@@ -331,9 +332,9 @@ pub(crate) fn refresh(mirror: &Path, source: &str) {
         "--",
         source,
         "+HEAD:refs/heads/main",
-    ]) {
-        eprintln!("sources: could not refresh {path} from {source}: {error}");
-    }
+    ])
+    .map(|_| ())
+    .map_err(|error| format!("could not refresh {path} from {source}: {error}"))
 }
 
 /// The commit a ref of a bare repository points at, if it exists.
