@@ -1,15 +1,17 @@
 import {
-  ArrowUpRight,
   Ban,
   Check,
   ChevronRight,
+  GanttChart,
   Hourglass,
+  LayoutList,
   OctagonAlert,
   RotateCcw,
   Target,
   Terminal,
   Users,
 } from "lucide-react";
+import { Suspense, lazy } from "react";
 import type { ReactNode } from "react";
 
 import { usePoll } from "../../api";
@@ -34,6 +36,22 @@ import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
 import { Markdown } from "./Markdown";
+import { AgentLink, Collapsible } from "./parts";
+import { ViewToggle, useStoredChoice } from "../ViewToggle";
+import type { ViewOption } from "../ViewToggle";
+
+// The timeline carries Motion and d3: loaded when first shown, so the first
+// page stays light.
+const MissionTimeline = lazy(() =>
+  import("./MissionTimeline").then((module) => ({ default: module.MissionTimeline })),
+);
+
+type Mode = "timeline" | "cards";
+const MODES = ["timeline", "cards"] as const;
+const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
+  { id: "timeline", label: "Timeline", icon: <GanttChart size={13} /> },
+  { id: "cards", label: "Cards", icon: <LayoutList size={13} /> },
+];
 
 /**
  * Missions and the residents that work them. Strictly read-only: the only
@@ -81,9 +99,40 @@ export function MissionsView() {
 
 /** The page body for one snapshot of /api/missions. */
 export function MissionsBody({ data }: { data: Missions }) {
+  const [mode, choose] = useStoredChoice<Mode>("spawn.missions.mode", MODES, "timeline");
+  const toggle = (
+    <ViewToggle label="Missions view" options={MODE_OPTIONS} value={mode} onChange={choose} />
+  );
+  if (mode === "timeline") {
+    const proposed = data.residents.some((resident) => resident.state === "proposed");
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        {proposed && (
+          <div className="shrink-0 px-3 pt-3 sm:px-4 sm:pt-4">
+            <ApprovalQueue residents={data.residents} />
+          </div>
+        )}
+        {data.missions.length === 0 ? (
+          <div className="flex flex-col">
+            <div className="px-4 pt-2 sm:px-5">{toggle}</div>
+            <EmptyState
+              icon={<Target size={20} />}
+              title="No missions yet"
+              hint="Missions appear here once the supervisor records one."
+            />
+          </div>
+        ) : (
+          <Suspense fallback={<div className="min-h-0 flex-1" />}>
+            <MissionTimeline missions={data.missions} header={toggle} />
+          </Suspense>
+        )}
+      </div>
+    );
+  }
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
+        <div>{toggle}</div>
         <ApprovalQueue residents={data.residents} />
         <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="flex min-w-0 flex-col gap-3">
@@ -813,59 +862,6 @@ function StepItem({
 
 // ---------------------------------------------------------------------------
 // Shared bits
-
-function AgentLink({
-  sessionId,
-  agentId,
-}: {
-  sessionId: string | null;
-  agentId: string | null;
-}) {
-  const label = agentId ?? sessionId;
-  if (!label) return null;
-  if (!sessionId) {
-    return (
-      <span className="truncate font-mono text-caption text-muted-foreground">
-        {label}
-      </span>
-    );
-  }
-  return (
-    <a
-      href={`#/fleet/${encodeURIComponent(sessionId)}`}
-      title={`Open ${sessionId} in the fleet view`}
-      className="inline-flex min-w-0 items-center gap-0.5 truncate font-mono text-caption text-info hover:underline"
-    >
-      {label}
-      <ArrowUpRight size={12} className="shrink-0" />
-    </a>
-  );
-}
-
-function Collapsible({
-  label,
-  children,
-  defaultOpen = false,
-}: {
-  label: string;
-  children: ReactNode;
-  defaultOpen?: boolean;
-}) {
-  return (
-    <details open={defaultOpen} className="group min-w-0">
-      <summary className="flex cursor-pointer list-none items-center gap-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground select-none hover:text-muted-foreground [&::-webkit-details-marker]:hidden">
-        <ChevronRight
-          size={12}
-          className="transition-transform group-open:rotate-90"
-        />
-        {label}
-      </summary>
-      <div className="mt-1.5 rounded-md border border-surface-border bg-page-canvas/60 px-3 py-2">
-        {children}
-      </div>
-    </details>
-  );
-}
 
 function firstLine(text: string | null): string | null {
   if (!text) return null;
