@@ -1077,9 +1077,13 @@ depends_on() {
         cmp -s "$work/deps.next" "$work/deps.files" && break
         mv "$work/deps.next" "$work/deps.files"
     done
+    # Named relative to the scenarios directory or the controller: content
+    # decides, not where the checkout lies.
     while IFS= read -r file; do
-        if [ -f "$file" ]; then printf '%s %s\n' "$(blob "$file")" "$file"; else printf 'missing %s\n' "$file"; fi
-    done <"$work/deps.files"
+        name=${file#"$scenarios"/}
+        [ "$name" != "$file" ] || name=${file#"$controller"/}
+        if [ -f "$file" ]; then printf '%s %s\n' "$(blob "$file")" "$name"; else printf 'missing %s\n' "$name"; fi
+    done <"$work/deps.files" | LC_ALL=C sort
 }
 # The toolchain, asked once, when the first objective needs a key.
 toolchain_key=""
