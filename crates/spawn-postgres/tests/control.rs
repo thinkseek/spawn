@@ -963,8 +963,9 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["missions"][0]["tasks"][0]["stages"], expected);
     for login in ["spawn_supervisor", "spawn_reader"] {
+        let role = common::login(&schema, login);
         client
-            .batch_execute(&format!("set session authorization {login}"))
+            .batch_execute(&format!("set session authorization {role}"))
             .expect("become the login");
         let stages: serde_json::Value = client
             .query_one("select spawn_task_stages($1)", &[&task])
