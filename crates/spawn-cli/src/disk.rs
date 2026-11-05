@@ -40,7 +40,7 @@ pub(crate) const RECOVERY_MARGIN: u64 = GIB;
 /// The window in which a record reaches the supervisor's digest: the same
 /// day the dispatcher reads delivered digests back over, so a record told
 /// once is not told again.
-pub(crate) const DIGEST_WINDOW_MS: i64 = 86_400_000;
+const DIGEST_WINDOW_MS: i64 = 86_400_000;
 
 /// The thresholds, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,18 +220,14 @@ no new executions start; free space (old workspaces, build output) or tell the o
 }
 
 /// The digest items for `records`, the integrator's `no_room` gate records
-/// that carry `escalate` (`PostgresStore::gate_room_escalations`): a
-/// mission's gate has had no room in TMPDIR for more than two hours. One
-/// item per record of the last day; the integrator writes one per run of
-/// them, so the supervisor is told once.
-pub(crate) fn gate_room_escalations(records: &[Value], now_ms: i64) -> Vec<Escalation> {
+/// that carry `escalate` and that no delivered digest told yet
+/// (`PostgresStore::gate_room_escalations`): a mission's gate has had no
+/// room in TMPDIR for more than two hours. No time window: a record stays
+/// an item until a digest carrying its tag reaches the supervisor, and the
+/// integrator writes one per run, so the supervisor is told once.
+pub(crate) fn gate_room_escalations(records: &[Value]) -> Vec<Escalation> {
     records
         .iter()
-        .filter(|record| {
-            record["at_ms"]
-                .as_i64()
-                .is_some_and(|at| now_ms - at < DIGEST_WINDOW_MS)
-        })
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
             let free = gib(record["free_kb"].as_u64()?.saturating_mul(1024));
@@ -589,7 +585,7 @@ mod tests {
 
     #[test]
     fn a_gate_without_room_for_hours_is_told_with_the_free_space_and_tmpdir() {
-        let day = 86_400_000;
+        let day: i64 = 86_400_000;
         let records = [
             json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 4,
                    "free_kb": 3 * 1_048_576, "min_gb": 10, "tmpdir": "/data/tmp",
@@ -598,8 +594,10 @@ mod tests {
                    "free_kb": 1, "min_gb": 10, "tmpdir": "/old", "event_id": 2,
                    "at_ms": 8 * day, "mission": 3}),
         ];
-        let items = gate_room_escalations(&records, 10 * day + 5);
-        assert_eq!(items.len(), 1, "a record older than a day is not told");
+        // The store returns only the untold ones; their age does not matter.
+        let items = gate_room_escalations(&records);
+        assert_eq!(items.len(), 2, "a record older than a day is still told");
+        assert_eq!(items[1].tag(), "host gate-room-2");
         assert_eq!(items[0].why, Why::GateRoom);
         assert_eq!(items[0].tag(), "host gate-room-12");
         assert!(

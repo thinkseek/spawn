@@ -405,11 +405,10 @@ pub(crate) fn step(
     let mut host = disk.escalations(now);
     host.extend(crate::disk::gate_room_escalations(
         store
-            .gate_room_escalations(now - crate::disk::DIGEST_WINDOW_MS)
+            .gate_room_escalations()
             .map_err(|error| format!("gate room records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
-        now,
     ));
     let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
     if disk.below_floor() {
