@@ -314,7 +314,7 @@ Every task runs on one of two **profiles**:
 | Profile | Main model (and sonnet, opus slots) | Small model (haiku slot: titles, summaries, background work) | For |
 | --- | --- | --- | --- |
 | `default` | Claude Code's own (`claude-opus-5-5` on the gateway) | `deepseek-flash` | everything not listed below |
-| `cheap` | `deepseek-v4-pro` (`SPAWN_CHEAP_MODEL`) | `deepseek-flash` (`SPAWN_SMALL_MODEL`) | simple, well-specified work: docs, mechanical edits, tests for stated behaviour |
+| `cheap` | `deepseek-flash` (`SPAWN_CHEAP_MODEL`) | `deepseek-flash` (`SPAWN_SMALL_MODEL`) | simple, well-specified work: docs, mechanical edits, tests for stated behaviour |
 
 Design, concurrency, security, debugging and anything a gate judges as hard
 stay on `default`; the supervisor's charter says so.
