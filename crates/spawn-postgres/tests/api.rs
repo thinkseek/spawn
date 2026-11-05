@@ -990,6 +990,103 @@ fn views_are_closed_to_other_roles() {
         .expect("clean up the role");
 }
 
+#[test]
+fn a_login_without_grants_reads_no_command_ids() {
+    let (store, schema) = store("public_ids");
+    store
+        .submit(
+            &Principal::new("human").expect("valid principal"),
+            &start(session(), "someone_elses"),
+        )
+        .expect("a command");
+    let mut client = admin(&schema);
+    let role = common::schema_name("plain").replace("spawn_test_", "spawn_plain_");
+    client
+        .batch_execute(&format!(
+            "create role {role}; grant usage on schema {schema} to {role}; \
+             set session authorization {role}"
+        ))
+        .expect("become a login with no grants");
+    for query in [
+        "select id from agent_commands",
+        "select count(*) from agent_commands",
+        "select max(id) from spawn_commands",
+        "select last_value from spawn_commands_id_seq",
+    ] {
+        let error = client.query(query, &[]).expect_err(query);
+        assert_eq!(
+            error.code(),
+            Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{query}"
+        );
+    }
+    let tasks = client
+        .query("select command_id from spawn_read_tasks()", &[])
+        .expect("the reader answers");
+    assert!(tasks.is_empty(), "no grant lists no command");
+    let error = client
+        .query(
+            "select spawn_gateway_submit('agent_one', 'session_one', 'k', '{\"type\":\"stop\"}')",
+            &[],
+        )
+        .expect_err("no grant submits nothing");
+    assert_eq!(
+        error.code(),
+        Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
+    );
+    client
+        .batch_execute(&format!(
+            "reset session authorization; drop owned by {role}; drop role {role}"
+        ))
+        .expect("clean up the role");
+}
+
+/// What every role may do in the schema, from the access lists themselves
+/// (a function without one is executable by PUBLIC): the gateway's insert
+/// and submit, the grant-filtered readers, and pure helpers.
+#[test]
+fn public_holds_only_the_gateway_the_readers_and_pure_helpers() {
+    let (_store, schema) = store("public_acl");
+    let granted: Vec<String> = admin(&schema)
+        .query(
+            "select format('%s %s', o.name, a.privilege_type)
+               from (select c.relname::text as name,
+                            coalesce(c.relacl, acldefault(case c.relkind when 'S' then 's'::\"char\"
+                                                          else 'r'::\"char\" end, c.relowner)) as acl
+                       from pg_class c
+                      where c.relnamespace = $1::text::regnamespace and c.relkind in ('r', 'v', 'S')
+                     union all
+                     select p.proname::text, coalesce(p.proacl, acldefault('f'::\"char\", p.proowner))
+                       from pg_proc p
+                      where p.pronamespace = $1::text::regnamespace) o
+              cross join lateral aclexplode(o.acl) a
+              where a.grantee = 0
+              order by 1",
+            &[&schema],
+        )
+        .expect("read the access lists")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        granted,
+        [
+            "agent_commands INSERT",
+            "spawn_gateway_insert EXECUTE",
+            "spawn_gateway_submit EXECUTE",
+            "spawn_grant_matches EXECUTE",
+            "spawn_mission_caller EXECUTE",
+            "spawn_now_ms EXECUTE",
+            "spawn_read_freshness EXECUTE",
+            "spawn_read_judgements EXECUTE",
+            "spawn_read_state EXECUTE",
+            "spawn_read_status EXECUTE",
+            "spawn_read_tasks EXECUTE",
+            "spawn_read_timeline EXECUTE",
+        ]
+    );
+}
+
 /// Column names and types of every read view. A change here breaks SQL
 /// readers; update the snapshot on purpose.
 #[test]

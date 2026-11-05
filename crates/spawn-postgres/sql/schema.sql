@@ -726,9 +726,22 @@ revoke select on agent_state, agent_status, agent_timeline, agent_judgements, ag
     agent_lineage, agent_open_tools, agent_freshness
     from public;
 grant insert on agent_commands to public;
--- RETURNING id gives the caller the command it made; the id column is all
--- a caller can read back, never another agent's commands.
-grant select (id) on agent_commands to public;
+-- No select, not even of `id` (older schemas granted it for RETURNING):
+-- that would list every command's id. A caller learns the id of the command
+-- it made from `spawn_gateway_submit` below.
+revoke select on agent_commands from public;
+revoke select (id) on agent_commands from public;
+
+-- Submit through the gateway and return the command made: a new one, or
+-- the one an earlier call of this principal with this key made. The
+-- trigger checks `session_user`'s grants, which SECURITY DEFINER keeps.
+create or replace function spawn_gateway_submit(p_agent text, p_session text, p_key text,
+                                                p_action jsonb)
+returns bigint language sql security definer as $$
+    insert into agent_commands (agent_id, session_id, idempotency_key, action)
+    values (p_agent, p_session, p_key, p_action)
+    returning id
+$$;
 
 revoke execute on function spawn_append(text, text, text, text, text, jsonb) from public;
 revoke execute on function spawn_append_trusted(text, text, text, text, text, jsonb) from public;
@@ -744,6 +757,10 @@ do $$
 begin
     execute format(
         'alter function spawn_gateway_insert() set search_path = %I, pg_temp',
+        current_schema()
+    );
+    execute format(
+        'alter function spawn_gateway_submit(text, text, text, jsonb) set search_path = %I, pg_temp',
         current_schema()
     );
 end
