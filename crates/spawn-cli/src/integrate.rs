@@ -3181,6 +3181,161 @@ mod database_tests {
         }
     }
 
+    /// The gate goes to the ready task that has waited longest, across
+    /// missions, not to the lowest mission id: A and B are always ready
+    /// (two tasks each, reported A1, A2, B1, B2) and there is one gate. A2
+    /// waits from the end of A1's judging, after B1 was reported, so the
+    /// missions take turns: A1, B1, A2, B2. Neither waits more than one
+    /// gate behind the other.
+    #[test]
+    fn two_missions_always_ready_take_turns_at_one_gate() {
+        let marks =
+            std::env::temp_dir().join(format!("spawn-db-gate-turns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) = world("turns-a", &holding_gate(&marks));
+        integrator.gates = 1;
+        let (base_b, source_b, _, _) = world("turns-b", "exit 1\n");
+        let db = Db::new("turns");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let mut pushed = Vec::new();
+        for (mission, base, source, worker) in [
+            (a, &base_a, &source_a, "a1"),
+            (a, &base_a, &source_a, "a2"),
+            (b, &base_b, &source_b, "b1"),
+            (b, &base_b, &source_b, "b2"),
+        ] {
+            let task = db.reported_task(mission, worker);
+            pushed.push(push_work(
+                base,
+                source,
+                &agent_of(&db, mission, task),
+                &format!("{worker}.txt"),
+            ));
+            // Reported at distinct times.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for turn in 1..=4 {
+            integrator.pass_on(&db.store).expect("a pass");
+            assert_eq!(
+                wait_started(&marks, turn).len(),
+                turn,
+                "gate {turn} started"
+            );
+            integrator.pass_on(&db.store).expect("a pass while it runs");
+            std::fs::write(marks.join("release"), "").expect("release");
+            integrator.settle();
+            std::fs::remove_file(marks.join("release")).expect("hold again");
+        }
+        let mirror = |source: &str| {
+            crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
+                .expect("mirror")
+                .to_string_lossy()
+                .to_string()
+        };
+        let (mirror_a, mirror_b) = (mirror(&source_a), mirror(&source_b));
+        let repos = [mirror_a.as_str(), mirror_b.as_str()];
+        let judged: Vec<String> = started(&marks)
+            .iter()
+            .map(|commit| parent(&repos, commit, 2))
+            .collect();
+        let order =
+            |heads: &[&String]| heads.iter().map(|head| (*head).clone()).collect::<Vec<_>>();
+        assert_eq!(
+            judged,
+            order(&[&pushed[0], &pushed[2], &pushed[1], &pushed[3]]),
+            "A1, B1, A2, B2"
+        );
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// An objective mission with a ready backlog, its resident, and up to
+    /// `workers` tasks in flight.
+    fn objective_mission(
+        db: &Db,
+        base: &Path,
+        source: &str,
+        scenarios: &Path,
+        name: &str,
+        workers: u32,
+    ) -> i64 {
+        let backlog = base.join(format!("backlog-{name}"));
+        std::fs::create_dir_all(&backlog).expect("backlog");
+        std::fs::write(
+            backlog.join("001.json"),
+            r#"{"id": 1, "title": "One", "prompt": "Do one."}"#,
+        )
+        .expect("objective");
+        db.store
+            .resident_propose(name, "Pursues objectives")
+            .expect("propose");
+        db.store.resident_approve(name).expect("approve");
+        let mission = db
+            .store
+            .mission_add(name, &json!([source]), "human")
+            .expect("add");
+        db.store
+            .mission_configure(
+                mission,
+                Some(&scenarios.to_string_lossy()),
+                "gate",
+                None,
+                Some(
+                    &json!({"backlog": backlog.to_string_lossy(), "resident": name,
+                             "workers": workers}),
+                ),
+            )
+            .expect("configure");
+        mission
+    }
+
+    /// A mission with a ready task does not delay another mission's
+    /// objective assignment: A (the lower id) assigns an objective and has a
+    /// task to judge, whose gate holds; B, on another source, gets its
+    /// objective in the same pass, and again while A's gate runs.
+    #[test]
+    fn a_ready_mission_does_not_delay_another_missions_assignment() {
+        let marks =
+            std::env::temp_dir().join(format!("spawn-db-gate-assign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("assign-a", &holding_gate(&marks));
+        integrator.gates = 1;
+        let (base_b, source_b, _, _) = world("assign-b", "exit 1\n");
+        let db = Db::new("assign_not_delayed");
+        let a = objective_mission(&db, &base_a, &source_a, &scenarios, "ra", 2);
+        let ready = db.reported_task(a, "w");
+        let pushed = push_work(&base_a, &source_a, &agent_of(&db, a, ready), "w.txt");
+        let b = objective_mission(&db, &base_b, &source_b, &scenarios, "rb", 1);
+        let tasks = |mission: i64| db.mission(mission)["tasks"].as_array().map_or(0, Vec::len);
+        assert_eq!((tasks(a), tasks(b)), (1, 0));
+
+        integrator.pass_on(&db.store).expect("one pass");
+        assert_eq!(tasks(a), 2, "A assigned its objective");
+        assert_eq!(tasks(b), 1, "B assigned its objective in the same pass");
+        let mirror = crate::sources::ensure_mirror(&integrator.judge.root, Some(&source_a))
+            .expect("mirror")
+            .to_string_lossy()
+            .to_string();
+        let started = wait_started(&marks, 1);
+        assert_eq!(parent(&[&mirror], &started[0], 2), pushed, "A's gate runs");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass while A's gate holds");
+        assert_eq!(tasks(b), 1, "B's one slot stays filled, nothing doubled");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
     /// A cap of one is one gate at a time across missions, as before.
     #[test]
     fn a_cap_of_one_gates_one_mission_at_a_time() {
