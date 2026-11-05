@@ -28,7 +28,6 @@
 //! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
 
 mod digest;
-mod switch;
 mod worker;
 
 use std::collections::BTreeSet;
@@ -148,21 +147,6 @@ impl Facts {
         self.live_and_free()
             && self.current_observation().is_some_and(|observation| {
                 observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
-            })
-    }
-
-    /// Whether the worker's latest judgement, current or not, has it idle at
-    /// its prompt, with nothing in flight. For a command that failed having
-    /// changed nothing on the worker, whose own records made that judgement
-    /// stale ([`Self::current_observation`]).
-    pub(crate) fn last_judged_idle(&self) -> bool {
-        self.live_and_free()
-            && self.observation.as_ref().is_some_and(|observation| {
-                observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
-                    && matches!(
-                        observation.state,
-                        SemanticState::Waiting | SemanticState::Completed
-                    )
             })
     }
 
@@ -304,10 +288,6 @@ pub(crate) fn decide_with(
         orders: deliver::orders(work, rows, now_ms),
         pending: Vec::new(),
     };
-    // A model-switch Stop that failed is retried, then given up and
-    // escalated.
-    switch::fit(&mut plan.orders, work, rows, now_ms);
-    plan.pending.extend(switch::news(work, rows));
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
         // A managed worker between tasks is not news: its report already
