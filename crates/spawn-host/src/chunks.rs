@@ -608,6 +608,24 @@ pub fn store_file(store: &dyn ChunkStore, path: &Path) -> Result<(Vec<String>, u
     Ok((chunks, size))
 }
 
+/// The names of the chunks the file at `path` cuts into, and the number of
+/// bytes read: what [`store_file`] would store, with nothing written.
+pub fn chunk_names_of(path: &Path) -> Result<(Vec<String>, u64), ChunkError> {
+    let file = File::open(path).map_err(|error| unavailable("open", path, &error))?;
+    let mut chunks = Vec::new();
+    let mut size = 0u64;
+    chunk_stream(
+        file,
+        |chunk| {
+            size += chunk.len() as u64;
+            chunks.push(hash_of(chunk));
+            Ok(())
+        },
+        |error| unavailable("read", path, &error),
+    )?;
+    Ok((chunks, size))
+}
+
 /// A directory held open, reached without following any symlink, and the
 /// path that names its entries: through the open descriptor
 /// (`/proc/self/fd/<n>/<entry>`) where /proc shows it, so a component
