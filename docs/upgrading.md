@@ -31,9 +31,6 @@ These hold no state that is not rebuildable.
 - **Integrator.** Its state is the control stream of the event log (task and
   mission rows are folds of it). It records a verdict before it moves git, so
   a killed integrator resumes from the recorded state.
-- **`spawn hook`.** A no-op that reads and discards standard input. Spawn
-  configures no hooks; an engine whose settings name it calls it by absolute
-  path, and its events come from the transcript.
 - **UI server.** Read-only. No writes exist in `spawn serve`.
 - **Model relay.** `scripts/model-relay.py` keeps nothing between requests.
   Install the new script over the old one
@@ -66,7 +63,11 @@ These are not about process lifetime. They break when two versions meet.
 1. **`EventKind` is a closed enum.** An event name written by one version of the
    Bridge or Observer and read by a version without it produces `StoreError::Corrupt`.
    The next tick exits 1. Every process that reads the log must therefore
-   carry the same enum.
+   carry the same enum. A writer is different: a record whose `source` a
+   reader does not know (a source since removed, such as `layerfs` or
+   `codex`) is skipped with one warning per name, and the timeline shows it
+   as stored, so removing a writer stops no reader. An `engine` field is
+   text, read whatever it names.
 2. **The schema.** `migrate()` runs `create or replace` on every connect. An
    additive column or view is safe for a reader built before it. A removed or renamed
    column is not. `spawn loop` holds one connection, so a migrated schema takes
@@ -77,9 +78,8 @@ These are not about process lifetime. They break when two versions meet.
    to their meaning is not.
 4. **The runner's files.** A running runner is the binary it was started
    with. It writes the exit code to `SPAWN_EXIT_FILE` (`.spawn/exit-<execution>`
-   in the workspace) and, for Codex, a copy of the output to
-   `SPAWN_ENGINE_OUTPUT`; the Bridge reads both, so their paths and format
-   must stay the same across versions. An execution with no exit file is
+   in the workspace); the Bridge reads it, so its path and format must stay
+   the same across versions. An execution with no exit file is
    ended as `Lost` once its pane is gone.
 5. **The Claude transcript.** Its format is the engine's. `claude_line` skips
    lines it does not know, so an engine release that adds line types causes
@@ -88,7 +88,12 @@ These are not about process lifetime. They break when two versions meet.
    fields, so a binary from before `model` fails a `start` or `resume` that
    names one (delivery always does). `execution.started` carries `model` only
    for the cheap profile, and readers ignore fields they do not know.
-7. **The prompt contract.** Delivery writes the task prompt and the
+7. **Hooks.** Spawn configures none (the Bridge's inline `--settings` has no
+   `hooks`) and has no `spawn hook` command. An engine whose own settings
+   still name `spawn hook` gets exit status 1 from it, which Claude Code
+   reports as a non-blocking hook error; its events still come from the
+   transcript.
+8. **The prompt contract.** Delivery writes the task prompt and the
    `.spawn/report.md` convention. The engine reads them as plain text. A
    change here is hot for the dispatcher and cold for the engine only in that
    the running turn keeps the old instruction.

@@ -31,6 +31,12 @@ capture "$SPAWN_BIN" submit --agent agent_ws --session session_ws --key k_bad \
     --action '{"type":"start","engine":"nope","prompt":"x"}'
 assert_eq "$status" 1 "unknown engine exit"
 assert_contains "$(err)" "--action is not a command action" "unknown engine message"
+
+# Claude Code is the only engine: a start naming codex is refused the same way.
+capture "$SPAWN_BIN" submit --agent agent_ws --session session_ws --key k_codex \
+    --action '{"type":"start","engine":"codex","prompt":"x"}'
+assert_eq "$status" 1 "codex engine exit"
+assert_contains "$(err)" "unknown engine codex" "codex engine message"
 assert_eq "$(scalar 'select count(*) from spawn_commands')" 0 "no command was written"
 
 # tick needs a repository and a root; the environment supplies both, so a

@@ -17,11 +17,11 @@ use serde_json::json;
 
 use crate::command::{Claimed, CommandAction, Outcome};
 use crate::event::{
-    ArtifactRef, CheckpointReason, EndCause, Engine, EventKind, EventRecord, Fork, GlobalPosition,
+    ArtifactRef, CheckpointReason, ENGINE, EndCause, EventKind, EventRecord, Fork, GlobalPosition,
     ModelProfile, NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
-use crate::ingest::{MERGE_NOTICE_OPENING, claude_line, codex_line};
+use crate::ingest::{MERGE_NOTICE_OPENING, claude_line};
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
     TerminalHost, WorkspaceError, WorkspaceStore,
@@ -50,15 +50,13 @@ pub const END_ATTEMPTS: u32 = 20;
 /// clock.
 pub const END_RETRY_MS: i64 = 30_000;
 
-/// Engine choice and prompt of one launch.
+/// The session and settings of one launch.
 ///
 /// Grouped so that [`Bridge::launch`] keeps a readable parameter list.
 struct Run<'a> {
-    engine: Engine,
     native: Option<&'a str>,
     /// `native` names an earlier session to resume, not a new one.
     resume: bool,
-    prompt: &'a str,
     /// Claude Code's inline settings ([`claude_settings`]).
     settings: &'a str,
 }
@@ -66,7 +64,6 @@ struct Run<'a> {
 /// What one start asks for. Grouped so that [`Bridge::start`] keeps a
 /// readable parameter list.
 struct Begin<'a> {
-    engine: Engine,
     prompt: &'a str,
     parent: Option<&'a SessionId>,
     /// A session to resume.
@@ -117,8 +114,6 @@ pub struct BridgeConfig {
     pub spawn_program: String,
     /// Claude Code executable.
     pub claude_program: String,
-    /// Codex executable.
-    pub codex_program: String,
     /// Extra environment for the engine process, for example the database
     /// URL that the hook and the runner need.
     pub environment: Vec<(String, String)>,
@@ -151,7 +146,6 @@ impl BridgeConfig {
         Self {
             spawn_program: "spawn".to_string(),
             claude_program: "claude".to_string(),
-            codex_program: "codex".to_string(),
             environment: Vec::new(),
             session_environment: Vec::new(),
             worker: worker.to_string(),
@@ -170,9 +164,7 @@ impl BridgeConfig {
 #[derive(Debug, Clone)]
 struct Active {
     execution_id: ExecutionId,
-    terminal: TerminalName,
     workspace: WorkspaceId,
-    engine: Engine,
     /// A tool or turn finished after the last commit.
     // ponytail: an `Unchanged` commit writes no event, so after a refold an
     // idle session repeats one no-op commit per tick; record attempts if
@@ -191,15 +183,21 @@ struct Active {
     follow: Follow,
 }
 
+impl Active {
+    /// The terminal that hosts the execution: always `spawn-<execution>`,
+    /// so it is derived, never stored.
+    fn terminal(&self) -> TerminalName {
+        TerminalName::for_execution(&self.execution_id)
+    }
+}
+
 /// The Bridge's own view of a running engine, rebuilt after a restart: read
 /// positions start at zero (event keys make a second read a no-op), and the
 /// last recorded screen is folded from the log.
 #[derive(Debug, Clone, Default)]
 struct Follow {
-    /// Bytes of the transcript (Claude) or output copy (Codex) read so far.
+    /// Bytes of the transcript read so far.
     offset: u64,
-    /// Codex output lines read so far, which key their events.
-    lines: u64,
     /// The last screen state recorded, and when.
     screen: Option<(ScreenState, i64)>,
     /// A state read once and not recorded yet: a screen is recorded when
@@ -233,7 +231,9 @@ struct Follow {
 #[derive(Debug, Clone)]
 struct SessionView {
     agent_id: AgentId,
-    native: Option<(Engine, String)>,
+    /// The native session the latest execution ran, which a resume
+    /// continues.
+    native: Option<String>,
     /// The profile the session's last execution started with: what a start
     /// or resume that names none runs on.
     model: ModelProfile,
@@ -247,8 +247,7 @@ struct SessionView {
 /// not been told of yet, each with the position of the last merge event that
 /// named it. Folded from the log: a merge adds its files; `notice.typed`
 /// records which of them a prompt the Bridge typed carried; the
-/// `notice.received` read from the engine's transcript (for Codex, whose
-/// prompt is its argument, the execution's first prompt) clears those. No
+/// `notice.received` read from the engine's transcript clears those. No
 /// other prompt clears anything: a turn someone else typed told the agent
 /// nothing.
 #[derive(Debug, Clone, Default)]
@@ -264,11 +263,6 @@ struct Notice {
 struct Typed {
     /// What it told of: merge events up to this position.
     through: GlobalPosition,
-    /// The execution it was typed into.
-    execution: Option<ExecutionId>,
-    /// Typed as a Codex prompt (an argument): the execution's first prompt
-    /// is that prompt.
-    codex: bool,
 }
 
 impl Notice {
@@ -318,8 +312,7 @@ impl Notice {
 
     /// Fold one event of the session: merges add files, the Bridge's
     /// `notice.typed` records what a prompt carried, its receipt clears it.
-    /// `active` is the session's running execution.
-    fn fold(&mut self, record: &EventRecord, active: Option<&Active>) {
+    fn fold(&mut self, record: &EventRecord) {
         let event = &record.event;
         match &event.kind {
             EventKind::ArtifactCommitted {
@@ -340,28 +333,9 @@ impl Notice {
                 }
             }
             EventKind::NoticeTyped { through } if event.source == Source::Bridge => {
-                let codex = active.is_some_and(|active| {
-                    active.engine == Engine::Codex
-                        && event.execution_id.as_ref() == Some(&active.execution_id)
-                });
-                self.typed = Some(Typed {
-                    through: *through,
-                    execution: event.execution_id.clone(),
-                    codex,
-                });
+                self.typed = Some(Typed { through: *through });
             }
             EventKind::NoticeReceived => self.received(),
-            // A Codex execution's first prompt is the argument it started
-            // with, which carried the notice.
-            EventKind::MessageReceived
-                if self.typed.as_ref().is_some_and(|typed| {
-                    typed.codex
-                        && typed.execution.is_some()
-                        && typed.execution == event.execution_id
-                }) =>
-            {
-                self.received();
-            }
             _ => {}
         }
     }
@@ -394,6 +368,10 @@ pub struct Bridge {
     cursor: GlobalPosition,
     sessions: HashMap<SessionId, SessionView>,
     clock: Arc<dyn Clock>,
+    /// Per session, the `artifact.committed` of a commit the branch already
+    /// took whose append failed: appended again first at the next tick
+    /// ([`Bridge::record_commit`]).
+    unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
 }
 
 impl Bridge {
@@ -414,6 +392,7 @@ impl Bridge {
             cursor: GlobalPosition(0),
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
+            unrecorded_commits: std::sync::Mutex::default(),
         }
     }
 
@@ -492,26 +471,20 @@ impl Bridge {
                 active: None,
                 notice: Notice::default(),
             });
-        view.notice.fold(record, view.active.as_ref());
+        view.notice.fold(record);
         let current = view
             .active
             .as_ref()
             .is_some_and(|active| event.execution_id.as_ref() == Some(&active.execution_id));
         match &event.kind {
             EventKind::ExecutionStarted {
-                engine,
-                terminal,
-                workspace,
-                model,
-                ..
+                workspace, model, ..
             } => {
                 view.model = *model;
                 if let Some(execution_id) = event.execution_id.clone() {
                     view.active = Some(Active {
                         execution_id,
-                        terminal: terminal.clone(),
                         workspace: workspace.clone(),
-                        engine: *engine,
                         checkpoint: None,
                         turn_open: false,
                         reported_end: None,
@@ -547,22 +520,24 @@ impl Bridge {
                 }
             }
             EventKind::NativeSessionStarted {
-                engine,
-                native_session_id,
-                ..
+                native_session_id, ..
             } => {
-                view.native = Some((*engine, native_session_id.clone()));
+                view.native = Some(native_session_id.clone());
             }
             // A merge of main is no checkpoint of the agent's work: one
-            // still due stays due.
+            // still due stays due. Nor is a commit of an earlier execution.
             EventKind::ArtifactCommitted { reason, .. }
-                if *reason != CheckpointReason::BaseMerged =>
+                if current && *reason != CheckpointReason::BaseMerged =>
             {
                 if let Some(active) = view.active.as_mut() {
                     active.checkpoint = None;
                 }
             }
-            other => {
+            // Turns, tools and checkpoints are the current execution's own:
+            // an event of an earlier one that reaches the log late (or one
+            // with no execution) neither closes the running turn nor asks
+            // for a checkpoint and the merge after it.
+            other if current => {
                 if let Some(active) = view.active.as_mut() {
                     if let Some(open) = opens_turn(other) {
                         active.turn_open = open;
@@ -572,6 +547,7 @@ impl Bridge {
                     }
                 }
             }
+            _ => {}
         }
     }
 
@@ -581,8 +557,12 @@ impl Bridge {
             .iter()
             .filter_map(|(session, view)| {
                 let active = view.active.clone()?;
-                let native = view.native.as_ref().map(|(_, id)| id.clone());
-                Some((session.clone(), view.agent_id.clone(), native, active))
+                Some((
+                    session.clone(),
+                    view.agent_id.clone(),
+                    view.native.clone(),
+                    active,
+                ))
             })
             .collect();
         for (session, agent_id, native, mut active) in running {
@@ -614,13 +594,17 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         active.follow.checkpoint_read = false;
+        self.record_unrecorded_commit(session)?;
         self.follow_output(agent_id, session, native, active, report)?;
         let end = match active
             .reported_end
             .or_else(|| self.exit_status(session, active, report))
         {
             Some(end) => Some(end),
-            None => match self.terminals.is_alive(&active.terminal, &active.workspace) {
+            None => match self
+                .terminals
+                .is_alive(&active.terminal(), &active.workspace)
+            {
                 Ok(true) => {
                     self.follow_screen(agent_id, session, active)?;
                     None
@@ -635,7 +619,7 @@ impl Bridge {
                 Err(error) => {
                     report
                         .warnings
-                        .push(format!("is_alive {}: {error}", active.terminal));
+                        .push(format!("is_alive {}: {error}", active.terminal()));
                     None
                 }
             },
@@ -696,7 +680,7 @@ impl Bridge {
                     branch: BranchName::for_agent(agent_id),
                     commit,
                 };
-                self.append(
+                self.record_commit(
                     agent_id,
                     session,
                     Some(&active.execution_id),
@@ -781,9 +765,9 @@ impl Bridge {
         Some((EndCause::Exited, text.trim().parse().ok()))
     }
 
-    /// Append the events in what the engine wrote since the last read: the
-    /// Claude transcript, or the runner's copy of the Codex output. Only
-    /// whole lines are read; a line being written waits for the next tick.
+    /// Append the events in what the engine wrote to its transcript since
+    /// the last read. Only whole lines are read; a line being written waits
+    /// for the next tick.
     fn follow_output(
         &self,
         agent_id: &AgentId,
@@ -792,15 +776,10 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
-        let path = match active.engine {
-            Engine::Claude => match native {
-                Some(native) => {
-                    transcript_path(&self.config.claude_projects, &active.workspace, native)
-                }
-                None => return Ok(()),
-            },
-            Engine::Codex => codex_output(active),
+        let Some(native) = native else {
+            return Ok(());
         };
+        let path = transcript_path(&self.config.claude_projects, &active.workspace, native);
         let bytes = match self
             .terminals
             .read_from(&active.workspace, &path, active.follow.offset)
@@ -842,39 +821,30 @@ impl Bridge {
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             let line = String::from_utf8_lossy(line);
-            let events = match active.engine {
-                // A minute of slack for a log clock ahead of this host's:
-                // lines already recorded are dropped by their keys anyway.
-                Engine::Claude => claude_line(&line, active.started_ms - CLOCK_SLACK_MS)
-                    .into_iter()
-                    .map(|event| (event.source_event_id, event.kind))
-                    .collect(),
-                Engine::Codex => {
-                    active.follow.lines += 1;
-                    let key = format!("{}:codex:{}", active.execution_id, active.follow.lines);
-                    codex_line(&line)
-                        .map(|kind| (Some(key), kind))
-                        .into_iter()
-                        .collect::<Vec<_>>()
+            // A minute of slack for a log clock ahead of this host's: lines
+            // already recorded are dropped by their keys anyway.
+            for event in claude_line(&line, active.started_ms - CLOCK_SLACK_MS) {
+                let opens = opens_turn(&event.kind);
+                let checkpoint = event.kind.checkpoint_reason().is_some();
+                let stored = self.log.append(NewEvent {
+                    agent_id: agent_id.clone(),
+                    session_id: session.clone(),
+                    execution_id: Some(active.execution_id.clone()),
+                    source: Source::Claude,
+                    source_event_id: event.source_event_id,
+                    kind: event.kind,
+                })?;
+                // A resumed session's transcript holds the earlier
+                // executions' lines too, already recorded under them (the
+                // key finds that record): they say nothing about this
+                // execution's turn.
+                if stored.record.event.execution_id.as_ref() != Some(&active.execution_id) {
+                    continue;
                 }
-            };
-            let source = match active.engine {
-                Engine::Claude => Source::Claude,
-                Engine::Codex => Source::Codex,
-            };
-            for (key, kind) in events {
-                if let Some(open) = opens_turn(&kind) {
+                if let Some(open) = opens {
                     active.turn_open = open;
                 }
-                active.follow.checkpoint_read |= kind.checkpoint_reason().is_some();
-                self.append(
-                    agent_id,
-                    session,
-                    Some(&active.execution_id),
-                    source,
-                    key,
-                    kind,
-                )?;
+                active.follow.checkpoint_read |= checkpoint;
             }
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
@@ -882,20 +852,16 @@ impl Bridge {
     }
 
     /// Read the pane and record its state when it changes, or again after
-    /// [`BridgeConfig::screen_refresh`] while a turn keeps it busy. Only a
-    /// Claude pane has a layout the Bridge knows.
+    /// [`BridgeConfig::screen_refresh`] while a turn keeps it busy.
     fn follow_screen(
         &self,
         agent_id: &AgentId,
         session: &SessionId,
         active: &mut Active,
     ) -> Result<(), StoreError> {
-        if active.engine != Engine::Claude {
-            return Ok(());
-        }
-        let Ok(pane) = self
-            .terminals
-            .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+        let Ok(pane) =
+            self.terminals
+                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
         else {
             return Ok(());
         };
@@ -997,11 +963,11 @@ impl Bridge {
         }
         if let Err(error) = self
             .terminals
-            .terminate(&active.terminal, &active.workspace)
+            .terminate(&active.terminal(), &active.workspace)
         {
             report
                 .warnings
-                .push(format!("terminate {}: {error}", active.terminal));
+                .push(format!("terminate {}: {error}", active.terminal()));
             return Ok(false);
         }
         if let Err(error) = self.workspaces.unmount(&active.workspace) {
@@ -1033,11 +999,11 @@ impl Bridge {
     ) -> Result<(), StoreError> {
         if let Err(error) = self
             .terminals
-            .terminate(&active.terminal, &active.workspace)
+            .terminate(&active.terminal(), &active.workspace)
         {
             report
                 .warnings
-                .push(format!("terminate {}: {error}", active.terminal));
+                .push(format!("terminate {}: {error}", active.terminal()));
         }
         report.warnings.push(format!(
             "{session}: FINAL CHECKPOINT FAILED {END_ATTEMPTS} TIMES; the terminal is down, \
@@ -1082,7 +1048,7 @@ impl Bridge {
                     branch: BranchName::for_agent(agent_id),
                     commit,
                 };
-                self.append(
+                self.record_commit(
                     agent_id,
                     session,
                     Some(&active.execution_id),
@@ -1129,6 +1095,66 @@ impl Bridge {
         Ok(())
     }
 
+    /// Append the `artifact.committed` of a commit the branch already took.
+    /// The branch moved first, so an append that fails must not lose the
+    /// record: it waits in `unrecorded_commits` and the session's next tick
+    /// appends it before anything else ([`Self::record_unrecorded_commit`]).
+    /// Its key (`commit:<id>`) makes a second append of one that did land
+    /// a no-op.
+    fn record_commit(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        execution: Option<&ExecutionId>,
+        source: Source,
+        key: Option<String>,
+        kind: EventKind,
+    ) -> Result<(), StoreError> {
+        let event = NewEvent {
+            agent_id: agent_id.clone(),
+            session_id: session.clone(),
+            execution_id: execution.cloned(),
+            source,
+            source_event_id: key,
+            kind,
+        };
+        self.unrecorded_commits_lock()
+            .entry(session.clone())
+            .or_default()
+            .push(event.clone());
+        self.record_unrecorded_commit(session)
+    }
+
+    /// Append, in order, the commit records of `session` whose append
+    /// failed; each leaves the list once the log took it.
+    fn record_unrecorded_commit(&self, session: &SessionId) -> Result<(), StoreError> {
+        loop {
+            let Some(event) = self
+                .unrecorded_commits_lock()
+                .get(session)
+                .and_then(|waiting| waiting.first().cloned())
+            else {
+                return Ok(());
+            };
+            self.log.append(event)?;
+            let mut unrecorded = self.unrecorded_commits_lock();
+            if let Some(waiting) = unrecorded.get_mut(session) {
+                waiting.remove(0);
+                if waiting.is_empty() {
+                    unrecorded.remove(session);
+                }
+            }
+        }
+    }
+
+    fn unrecorded_commits_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<SessionId, Vec<NewEvent>>> {
+        self.unrecorded_commits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn handle(
         &mut self,
         claimed: &Claimed,
@@ -1139,7 +1165,7 @@ impl Bridge {
         };
         match action {
             CommandAction::Start {
-                engine,
+                engine: _,
                 prompt,
                 parent_session_id,
                 from,
@@ -1147,7 +1173,6 @@ impl Bridge {
             } => self.start(
                 claimed,
                 &Begin {
-                    engine,
                     prompt: &prompt,
                     parent: parent_session_id.as_ref(),
                     native: None,
@@ -1176,7 +1201,6 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
         let Begin {
-            engine,
             prompt,
             parent,
             native,
@@ -1194,7 +1218,7 @@ impl Bridge {
                 .get(&claimed.session_id)
                 .map_or(ModelProfile::Default, |view| view.model)
         });
-        let settings = match self.engine_settings(claimed, engine, model, report) {
+        let settings = match self.engine_settings(claimed, model, report) {
             Ok(settings) => settings,
             Err(why) => return Ok(Outcome::Failed(why)),
         };
@@ -1221,12 +1245,9 @@ impl Bridge {
                 },
             )?;
         }
-        let execution = ExecutionId::for_command(claimed.command_id);
         let active = Active {
-            terminal: TerminalName::for_execution(&execution),
-            execution_id: execution,
+            execution_id: ExecutionId::for_command(claimed.command_id),
             workspace,
-            engine,
             checkpoint: None,
             turn_open: false,
             reported_end: None,
@@ -1242,30 +1263,27 @@ impl Bridge {
             Source::Bridge,
             Some(format!("{}:started", active.execution_id)),
             EventKind::ExecutionStarted {
-                engine,
-                terminal: active.terminal.clone(),
+                engine: ENGINE.to_string(),
                 workspace: active.workspace.clone(),
                 command_id: claimed.command_id,
                 fork,
                 model,
             },
         )?;
-        let fresh = self.name_session(claimed, engine, native, &active)?;
+        let fresh = self.name_session(claimed, native, &active)?;
         let launch = self.launch(
             claimed,
             &active,
             &Run {
-                engine,
                 native: fresh.as_deref().or(native),
                 resume: native.is_some(),
-                prompt,
                 settings: &settings,
             },
         );
         if let Err(error) = self.terminals.start(&launch) {
             return self.abandon(claimed, &active, format!("start terminal: {error}"));
         }
-        if engine == Engine::Claude && !prompt.is_empty() {
+        if !prompt.is_empty() {
             let outcome = self.type_prompt(claimed, &active, prompt)?;
             if let Outcome::Failed(why) = outcome {
                 // An engine that never got its prompt must not look alive:
@@ -1288,16 +1306,9 @@ impl Bridge {
     fn engine_settings(
         &self,
         claimed: &Claimed,
-        engine: Engine,
         model: ModelProfile,
         report: &mut TickReport,
     ) -> Result<String, String> {
-        if engine != Engine::Claude {
-            return match model {
-                ModelProfile::Default => Ok(String::new()),
-                ModelProfile::Cheap => Err("the cheap profile runs Claude Code only".to_string()),
-            };
-        }
         let relay = self.config.model_relay.as_ref();
         let reachable = relay.filter(|relay| relay.reachable());
         match (model, relay, reachable) {
@@ -1377,11 +1388,10 @@ impl Bridge {
     fn name_session(
         &mut self,
         claimed: &Claimed,
-        engine: Engine,
         native: Option<&str>,
         active: &Active,
     ) -> Result<Option<String>, StoreError> {
-        if engine != Engine::Claude || native.is_some() {
+        if native.is_some() {
             return Ok(None);
         }
         let id = claude_session_id(&active.execution_id);
@@ -1392,7 +1402,7 @@ impl Bridge {
             Source::Bridge,
             Some(format!("{}:native", active.execution_id)),
             EventKind::NativeSessionStarted {
-                engine,
+                engine: ENGINE.to_string(),
                 native_session_id: id.clone(),
                 transcript_path: Some(transcript_path(
                     &self.config.claude_projects,
@@ -1407,21 +1417,16 @@ impl Bridge {
 
     fn launch(&self, claimed: &Claimed, active: &Active, run: &Run<'_>) -> Launch {
         let Run {
-            engine,
             native,
             resume,
-            prompt,
             settings,
         } = *run;
-        let mut arguments = vec!["run".to_string(), "--".to_string()];
-        arguments.push(match engine {
-            Engine::Claude => self.config.claude_program.clone(),
-            Engine::Codex => self.config.codex_program.clone(),
-        });
-        arguments.extend(match engine {
-            Engine::Claude => claude_arguments(native, resume, settings),
-            Engine::Codex => codex_arguments(native.filter(|_| resume), prompt),
-        });
+        let mut arguments = vec![
+            "run".to_string(),
+            "--".to_string(),
+            self.config.claude_program.clone(),
+        ];
+        arguments.extend(claude_arguments(native, resume, settings));
         let mut environment = self.config.environment.clone();
         for (session, overrides) in &self.config.session_environment {
             if session != claimed.session_id.as_str() {
@@ -1441,15 +1446,11 @@ impl Bridge {
             "SPAWN_EXECUTION_ID".to_string(),
             active.execution_id.to_string(),
         ));
-        environment.push(("SPAWN_ENGINE".to_string(), engine.as_str().to_string()));
-        // The runner writes the exit status, and a copy of Codex output,
-        // where the Bridge reads them: the pane needs no login of its own.
+        // The runner writes the exit status where the Bridge reads it: the
+        // pane needs no login of its own.
         environment.push(("SPAWN_EXIT_FILE".to_string(), exit_file(active)));
-        if engine == Engine::Codex {
-            environment.push(("SPAWN_ENGINE_OUTPUT".to_string(), codex_output(active)));
-        }
         Launch {
-            terminal: active.terminal.clone(),
+            terminal: active.terminal(),
             workspace: active.workspace.clone(),
             cwd: active.workspace.path().to_string(),
             program: self.config.spawn_program.clone(),
@@ -1476,7 +1477,7 @@ impl Bridge {
             attempt += 1;
             let Ok(pane) =
                 self.terminals
-                    .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+                    .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
             else {
                 return Ok(Outcome::Failed("terminal disappeared".to_string()));
             };
@@ -1486,7 +1487,7 @@ impl Bridge {
                 trusted = true;
                 if let Err(error) =
                     self.terminals
-                        .send_keys(&active.terminal, &active.workspace, &TRUST_KEYS)
+                        .send_keys(&active.terminal(), &active.workspace, &TRUST_KEYS)
                 {
                     return Ok(Outcome::Failed(format!("answer trust dialog: {error}")));
                 }
@@ -1511,7 +1512,7 @@ impl Bridge {
             )?;
             return match self
                 .terminals
-                .submit_text(&active.terminal, &active.workspace, prompt)
+                .submit_text(&active.terminal(), &active.workspace, prompt)
             {
                 Ok(()) => Ok(Outcome::Succeeded),
                 Err(error) => Ok(Outcome::Failed(format!("submit prompt: {error}"))),
@@ -1529,14 +1530,9 @@ impl Bridge {
                 claimed.session_id
             )));
         };
-        if active.engine != Engine::Claude {
-            return Ok(Outcome::Failed(
-                "only a Claude execution accepts typed input".to_string(),
-            ));
-        }
-        let Ok(pane) = self
-            .terminals
-            .capture_tail(&active.terminal, &active.workspace, TAIL_LINES)
+        let Ok(pane) =
+            self.terminals
+                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
         else {
             return Ok(Outcome::Failed("terminal disappeared".to_string()));
         };
@@ -1561,7 +1557,7 @@ impl Bridge {
         let (typed, through) = self.with_notice(&claimed.session_id, text);
         match self
             .terminals
-            .submit_text(&active.terminal, &active.workspace, &typed)
+            .submit_text(&active.terminal(), &active.workspace, &typed)
         {
             Ok(()) => {
                 // A turn starts now, before its transcript says so.
@@ -1648,7 +1644,7 @@ impl Bridge {
                 claimed.session_id
             )));
         }
-        let Some((engine, native)) = self
+        let Some(native) = self
             .sessions
             .get(&claimed.session_id)
             .and_then(|view| view.native.clone())
@@ -1656,9 +1652,6 @@ impl Bridge {
             return Ok(Outcome::Failed("no native session to resume".to_string()));
         };
         let prompt = prompt.unwrap_or("");
-        if engine == Engine::Codex && prompt.is_empty() {
-            return Ok(Outcome::Failed("codex resume needs a prompt".to_string()));
-        }
         // What merges changed goes with the prompt; nothing is typed
         // unprompted.
         let (prompt, through) = if prompt.is_empty() {
@@ -1669,7 +1662,6 @@ impl Bridge {
         let outcome = self.start(
             claimed,
             &Begin {
-                engine,
                 prompt: &prompt,
                 parent: None,
                 native: Some(native.as_str()),
@@ -1678,8 +1670,7 @@ impl Bridge {
             },
             report,
         )?;
-        // The execution the prompt went to, folded (a Codex start does not
-        // fold it itself).
+        // The execution the prompt went to, folded.
         self.catch_up()?;
         if outcome == Outcome::Succeeded
             && let Some(active) = self.running(&claimed.session_id)
@@ -1848,25 +1839,4 @@ fn exit_file(active: &Active) -> String {
         active.workspace.path(),
         active.execution_id
     )
-}
-
-/// Where the runner copies Codex's `exec --json` output.
-fn codex_output(active: &Active) -> String {
-    format!(
-        "{}/.spawn/codex-{}.jsonl",
-        active.workspace.path(),
-        active.execution_id
-    )
-}
-
-/// Codex arguments. `exec --json` prints one JSON object per line.
-pub fn codex_arguments(native: Option<&str>, prompt: &str) -> Vec<String> {
-    let mut arguments = vec!["exec".to_string(), "--json".to_string()];
-    if let Some(native) = native {
-        arguments.push("resume".to_string());
-        arguments.push(native.to_string());
-    }
-    arguments.push("--".to_string());
-    arguments.push(prompt.to_string());
-    arguments
 }

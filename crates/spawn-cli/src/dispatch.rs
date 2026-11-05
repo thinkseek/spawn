@@ -282,12 +282,6 @@ fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     Ok((rows, Work::load(store)?))
 }
 
-/// The plan for the current facts, without submitting anything.
-pub(crate) fn plan(store: &PostgresStore, supervised: bool, spawn: &str) -> Result<Plan, String> {
-    let (rows, work) = load(store)?;
-    Ok(decide_with(&rows, &work, supervised, now_ms(), spawn))
-}
-
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
@@ -332,6 +326,13 @@ pub(crate) fn step(
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for order in plan.orders {
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
+        // Before the command exists, so the worker's report for it comes
+        // after the mark (the mark decides which report is new).
+        if let Some(root) = root
+            && let Err(error) = deliver::mark_delivery(root, &order)
+        {
+            lines.push(format!("deliver: {error}"));
+        }
         submit(store, &principal, order)?;
         lines.push(line);
     }

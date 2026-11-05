@@ -51,7 +51,11 @@ files, a chunk fetch.
   text against the kept index (a stat cache: only changed files are hashed)
   and chunks only the large files whose size or mtime changed. A checkpoint
   where only a large file changed is a commit with the same tree and a new
-  trailer. Cost is proportional to what changed.
+  trailer. Cost is proportional to what changed. A large file git already
+  holds as a blob in the branch head, in `main` or in a pending merge's
+  `main` (main may get one from outside Spawn, and a merge brings it in)
+  stays a blob: leaving it out of the tree would delete it from the branch,
+  and from `main` when the branch lands.
 - **Branch**: `refs/heads/<agent>`, moved by compare-and-swap on the old
   commit.
 - **Fork from any commit**: a new branch at an existing commit. No data is
@@ -104,8 +108,7 @@ files, a chunk fetch.
   carries it, it records `notice.typed {through}` (the last merge event the
   notice told of); the notice clears only when that prompt reaches the
   engine: the transcript line of a prompt that opens with the notice's
-  fixed opening gives `notice.received` (for Codex, whose prompt is its
-  argument, the resumed execution's first prompt). Only the files told of
+  fixed opening gives `notice.received`. Only the files told of
   are cleared, so a merge that lands between the typing and the receipt is
   told next time. A prompt the Bridge did not type (someone at the pane, the
   engine going on by itself) clears nothing, and neither does a restart: a
@@ -120,10 +123,16 @@ files, a chunk fetch.
   `merge.conflicted {files, marked}`. The agent hears of the conflict at
   landing and with its next prompt, and finds the markers in its files.
   Checkpoints keep single parents while any conflicted file the merge listed
-  still holds a whole marker block (a line starting `<<<<<<< `, later one
-  that is exactly `=======`, later one starting `>>>>>>> `; a lone `=======`
-  heading underline is not one); the first one without commits with parents
-  (head, pending `main`) and clears it, after which the branch lands clean.
+  still holds a whole marker block (a line of `n` `<` alone or before a
+  label, later one that is exactly `n` `=`, later one of `n` `>`, one `n`
+  per block: 7 or more, as git writes them by default, longer under
+  `conflict-marker-size` or for a conflict nested in a diff3 merge base, and
+  shorter only where main's `.gitattributes` sets `conflict-marker-size`
+  lower for the path; a lone `=======` heading underline is not one). Paths
+  are kept as git's bytes throughout, so a file name that is not UTF-8 or
+  holds a newline is checked under its own name. The first checkpoint
+  without a block commits with parents (head, pending `main`) and clears
+  it, after which the branch lands clean.
   The integrator does not judge a branch with a pending merge, or with marker
   blocks in the files it changes against `main`: it is gated `conflict` with
   a note to resolve the markers first. Mount and unmount keep a pending
@@ -186,7 +195,8 @@ files, a chunk fetch.
   the integrator's host, and its markers, once checkpointed and pushed, are
   caught by the marker check wherever the integrator runs. The gate judges
   the candidate; the integrator moves `main` by a compare-and-swap push.
-  Large files are workspace state, not source, and never land.
+  Large files are workspace state, not source, and never land (one main
+  already holds as a blob is source: it stays a blob and lands as one).
 
 ## The chunk store
 
@@ -205,21 +215,31 @@ files, a chunk fetch.
   that object young again (its modification time is set to now). Objects
   are removed only by a collection (below).
 - **Manifest.** The large-file manifest is a chunk-store object, and the
-  checkpoint commit names it in a `Spawn-Large` trailer. Only large files
-  whose size, mtime or mode changed are chunked again (a stat cache in
-  `<root>/.large/<branch>`). A checkpoint that takes chunk names from that
+  checkpoint commit names it in a `Spawn-Large` trailer. A path that is not
+  UTF-8 is written as `path_hex`, so any name round-trips. Only large files
+  whose size, mtime, ctime, inode or mode changed are chunked again (a stat
+  cache in `<root>/.large/<branch>`); an entry whose file changed within
+  3 s of its stat ("racily clean", as git says) is hashed again before its
+  chunks are trusted, so a same-size rewrite in the same timestamp tick, or
+  one whose mtime was put back, is never committed with the old chunks. A
+  checkpoint that takes chunk names from that
   cache touches each one (makes it young again) and chunks the file again
   when the store no longer holds one, so it never names a collected chunk.
 - **Mount.** Mount materializes the large files again, each atomically, and
   fails rather than write bytes that do not verify, or write outside the
-  workspace. A manifest whose large file the head's tree has no room for (a
+  workspace. The whole new tree, large files included, is built in
+  `<root>/.mount/` first; only when every chunk was fetched and verified is
+  the workspace renamed aside and the new tree renamed into its place, so
+  a mount that fails leaves the workspace, uncommitted files and all, as it
+  was. A manifest whose large file the head's tree has no room for (a
   tracked entry at its path, a file or a symlink at a parent directory)
   fails the mount. Parent directories are walked one component at a time,
   each opened with `O_NOFOLLOW` through the open descriptor of the one above
-  (`/proc/self/fd`) and made with `mkdir` when missing, so a symlink or a
-  file where the manifest has a directory fails the write; the temporary
-  file is created exclusively without following a symlink and renamed
-  inside the directory that was verified.
+  (`openat`, made with `mkdirat` when missing; no `/proc`, the same on Linux
+  and macOS), so a symlink or a file where the manifest has a directory
+  fails the write, and one swapped in after the walk is never followed; the
+  temporary file is created exclusively without following a symlink and
+  renamed (`renameat`) inside the directory that was opened.
 - **Where.** The store is the directory `SPAWN_CHUNK_STORE` names, else
   `<root>/.chunks`. It is host-local: a branch with large files resumed on a
   host without its chunks fails to mount rather than lose them.

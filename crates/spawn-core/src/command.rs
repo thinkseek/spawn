@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::event::{Engine, ModelProfile};
+use crate::event::{ENGINE, ModelProfile};
 use crate::id::{AgentId, CommandId, IdempotencyKey, SessionId};
 
 /// Command vocabulary accepted by the SQL gateway.
@@ -11,9 +11,11 @@ use crate::id::{AgentId, CommandId, IdempotencyKey, SessionId};
 pub enum CommandAction {
     /// Start a new execution with a fresh native session.
     Start {
-        /// Engine to launch.
-        engine: Engine,
-        /// First prompt. Codex requires a non-empty prompt.
+        /// Engine to launch: [`ENGINE`], the only one, which a command may
+        /// leave out. A command naming another engine does not parse.
+        #[serde(default = "engine", deserialize_with = "claude_only")]
+        engine: String,
+        /// First prompt.
         prompt: String,
         /// Parent session when this agent works for another agent.
         #[serde(default)]
@@ -44,7 +46,7 @@ pub enum CommandAction {
     Discard,
     /// Start a new execution that resumes the latest native session.
     Resume {
-        /// Prompt for the resumed session. Codex requires one.
+        /// Prompt for the resumed session.
         #[serde(default)]
         prompt: Option<String>,
         /// Models the resumed engine runs on. Unset: the profile the session
@@ -52,6 +54,23 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelProfile>,
     },
+}
+
+/// The `engine` a start names when it names none.
+fn engine() -> String {
+    ENGINE.to_string()
+}
+
+/// The `engine` of a start: [`ENGINE`] only.
+fn claude_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let engine = String::deserialize(deserializer)?;
+    if engine == ENGINE {
+        Ok(engine)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unknown engine {engine}: Claude Code ({ENGINE}) is the only engine"
+        )))
+    }
 }
 
 /// Command submission as a store receives it.
