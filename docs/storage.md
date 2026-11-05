@@ -67,7 +67,10 @@ head alone is the whole workspace, so everything below is a git operation.
   from a background pusher off the Bridge's loop: at most one push per
   branch every 5 s, carrying the head as it is then, failures retried with
   backoff, and what still waits pushed when the store drops (a one-shot
-  `spawn tick`). Only a source that is a directory on this host receives
+  `spawn tick`, or `spawn loop` ending on SIGTERM after its pass). The
+  queue is in memory, so a new Bridge queues again the branch of every
+  agent with an open task: a push lost with a killed process is made after
+  the restart (a branch the source already has is a no-op push). Only a source that is a directory on this host receives
   branches: a remote may be public, and every agent commit would leave the
   host.
 - **Main at a start or resume**: the Bridge merges main into an agent's

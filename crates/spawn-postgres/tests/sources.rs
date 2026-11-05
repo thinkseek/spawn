@@ -83,3 +83,42 @@ fn a_mission_source_is_a_checked_shape_and_the_supervisor_names_only_listed_ones
         .get(0);
     assert_eq!(listed, 0);
 }
+
+/// The branches a restarted Bridge publishes again: every agent with an
+/// open task, with its first task's source (causality audit #4).
+#[test]
+fn agents_with_an_open_task_are_published_again_from_their_first_source() {
+    let (store, schema) = store("publishing_agents");
+    let widget = store
+        .mission_add("widget", &json!(["/srv/widget.git"]), "human")
+        .expect("add");
+    let scratch = store
+        .mission_add("scratch", &json!([]), "human")
+        .expect("add");
+    let open = store
+        .task_assign(widget, "ephemeral", "a", "brief", "default")
+        .expect("assign");
+    let cancelled = store
+        .task_assign(widget, "ephemeral", "b", "brief", "default")
+        .expect("assign");
+    store.task_cancel(cancelled).expect("cancel");
+    let elsewhere = store
+        .task_assign(scratch, "ephemeral", "c", "brief", "default")
+        .expect("assign");
+    let mut client = admin(&schema);
+    let agent = |client: &mut postgres::Client, task: i64| -> String {
+        client
+            .query_one("select agent_id from mission_tasks where id = $1", &[&task])
+            .expect("the task")
+            .get(0)
+    };
+    let mut expected = vec![
+        (
+            agent(&mut client, open),
+            Some("/srv/widget.git".to_string()),
+        ),
+        (agent(&mut client, elsewhere), None),
+    ];
+    expected.sort();
+    assert_eq!(store.publishing_agents().expect("agents"), expected);
+}
