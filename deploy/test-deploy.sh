@@ -144,15 +144,19 @@ check "before any backup" [ -z "$(ls "$live/backups")" ]
 check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
 
 echo "== the deploy lock"
-flock "$live/deploy.lock" sleep 120 &
+# -o: the lock stays with flock itself, not with sleep, so killing flock
+# releases it.
+flock -o "$live/deploy.lock" sleep 120 &
 holder=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   flock -n "$live/deploy.lock" true || break
   sleep 0.2
 done
 deploy
+pkill -P "$holder" 2>/dev/null || true
 kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
+check "the lock is free again" flock -n "$live/deploy.lock" true
 check "refused while another deploy holds the lock" [ "$status" -ne 0 ]
 check "says so" grep -q "another deploy holds $live/deploy.lock" "$out"
 check "before any backup" [ -z "$(ls "$live/backups")" ]
@@ -160,7 +164,7 @@ check "before touching a service" [ ! -s "$SYSTEMCTL_LOG" ]
 
 echo "== a HEAD that tracks files under node_modules/"
 planted=$scratch/planted
-git clone -q --shared "$checkout" "$planted"
+git -c advice.detachedHead=false clone -q --shared "$checkout" "$planted"
 mkdir -p "$planted/web/node_modules/.bin"
 printf '#!/bin/sh\necho planted tsc\n' >"$planted/web/node_modules/.bin/tsc"
 git -C "$planted" add -f web/node_modules/.bin/tsc
