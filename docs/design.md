@@ -287,7 +287,7 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 
 积分器（integrator）在评判前拒绝带待定合并（`<root>/.merge/<agent>`）或改动文件里有完整标记块（`GitWorkspace::conflict_markers`）的分支：记 `conflict`，附「先解决冲突标记」的说明。
 
-任务源（`spawn-cli` 的 `MissionWorkspaces`）在 git 存储外再包一层：每个任务源一个主机本地镜像 `<root>/.sources/<name>.git`。新分支前强制刷新镜像的 `main`，`merge_base` 前最多每 30 秒刷新一次。每次 checkpoint 产生新提交、合并或建分支后，分支被标记待推：后台线程把 `refs/heads/<agent>` 推到源的 `refs/heads/spawn/<agent>`，每个分支最多每 5 秒一次（推的是当时的分支头，中间丢的推送无所谓），从不强推（被拒说明有另一个写者：警告，不覆盖），只推给本机目录形式的源（中心存储）或 `SPAWN_PUSH_SOURCES` 逐字列出的远端（采用 `spawn/<agent>` 同此限制），失败按指数退避重试，存储被丢弃时（`spawn tick` 退出）同步推完。启动时镜像没有该分支则先从源取 `spawn/<agent>`，有就从它建（在另一台主机上续跑）；镜像里的分支落后于源上的则快进，分叉则警告并保留本地的。
+任务源（`spawn-cli` 的 `MissionWorkspaces`）在 git 存储外再包一层：每个任务源一个主机本地镜像 `<root>/.sources/<name>.git`。新分支前强制刷新镜像的 `main`，`merge_base` 前最多每 30 秒刷新一次。每次 checkpoint 产生新提交、合并或建分支后，分支被标记待推：后台线程把 `refs/heads/<agent>` 推到源的 `refs/heads/spawn/<agent>`，每个分支最多每 5 秒一次（推的是当时的分支头，中间丢的推送无所谓），从不强推（被拒说明分支被改写：警告，不覆盖），只推给本机目录形式的源（远端可能公开，推了每个提交都会离开本机），失败按指数退避重试，存储被丢弃时（`spawn tick` 退出）同步推完。推上去的 `spawn/<agent>` 供集成器落地。分支只在本机：启动时除 `main` 外不从源取任何东西，不从别的主机接手分支（所有者的决定：Spawn 只在一台主机上跑）。
 
 容器把工作树挂到**同一绝对路径**，所以两侧路径一致，不需要任何翻译。
 

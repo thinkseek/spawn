@@ -1,13 +1,14 @@
-//! Agents' branches pushed to their mission's source (docs/storage.md,
-//! "Central").
+//! Agents' branches published to their mission's source for the integrator
+//! to land (docs/storage.md, "Published for landing").
 //!
 //! A checkpoint marks its branch dirty; a background thread pushes the
 //! branch's head as it is then, `refs/heads/<agent>` to the source's
 //! `refs/heads/spawn/<agent>`, at most once per [`INTERVAL`] per branch, so a
 //! burst of checkpoints costs one push and the Bridge's loop never waits on
 //! the network. A push carries the head, so pushes that never happened in
-//! between lose nothing. It is never forced: a rejection means another
-//! writer moved `spawn/<agent>`, which is reported, not overwritten. A push
+//! between lose nothing. It is never forced: a rejection means
+//! `spawn/<agent>` is not an ancestor of the head (a rewritten branch), which
+//! is reported, not overwritten. A push
 //! that failed (an unreachable source) is retried with a growing pause.
 
 use std::collections::{HashMap, HashSet};

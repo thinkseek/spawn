@@ -488,10 +488,10 @@ impl Integrator {
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
                 // Not a verdict on the work: the pusher has not caught up.
-                if !sources::shares_branches(source, &sources::push_sources()) {
+                if !sources::receives_branches(source) {
                     eprintln!(
-                        "integrate: {source} does not receive agents' branches; list it in \
-                         SPAWN_PUSH_SOURCES for its work to land"
+                        "integrate: {source} receives no agents' branches (only a directory \
+                         on this host does), so its work never lands"
                     );
                 }
                 record(
