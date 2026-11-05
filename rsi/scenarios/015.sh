@@ -34,13 +34,13 @@
 #       held behind the waiting input), and the input finishes failed with
 #       an error that says the session was stopped (`stopped`), was never
 #       typed (no `typing` step) and never reached the engine.
-#   (4) the dispatcher's contract holds: a task assigned to the resident
-#       while a human's input waits behind another long turn (the session resumed
-#       after the stop) is delivered exactly once (an input from spawn-dispatch keyed `deliver-<task>-...`
-#       that succeeded; the task is `delivered`), after the waiting input;
-#       every one of its attempts that failed was refused at once as not
-#       ready (`does not accept input`), and no input of the dispatcher is
-#       ever recorded `waiting`.
+#   (4) the dispatcher's contract holds: the session resumed after the
+#       stop, a task assigned to the resident while a human's input waits
+#       behind another long turn is delivered exactly once (an input from
+#       spawn-dispatch keyed `deliver-<task>-...` that succeeded; the task
+#       is `delivered`), after the waiting input; every one of its attempts
+#       that failed was refused at once as not ready (`does not accept
+#       input`), and no input of the dispatcher is ever recorded `waiting`.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -218,7 +218,7 @@ run_turn() {
   while [ "$(date +%s)" -lt "$end" ]; do
     if [ "$(date +%s)" -ge "$next" ]; then
       calls=$((calls + 1))
-      tool "toolu_$2_$calls"
+      tool "toolu_${SPAWN_EXECUTION_ID}_$2_$calls"
       printf '\n✻ Churning… (esc to interrupt)\n❯ '
       next=$(($(date +%s) + 2))
     fi
