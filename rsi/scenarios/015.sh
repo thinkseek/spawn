@@ -29,18 +29,18 @@
 #       first only after the long turn ended and the second only after the
 #       first's own turn ended; nothing is ever typed into a busy pane; each
 #       has exactly one `typed` step.
-#   (3) the dispatcher's contract holds: a task assigned to the resident
-#       while a human's input waits behind another long turn is delivered
-#       exactly once (an input from spawn-dispatch keyed `deliver-<task>-...`
-#       that succeeded; the task is `delivered`), after the waiting input;
-#       every one of its attempts that failed was refused at once as not
-#       ready (`does not accept input`), and no input of the dispatcher is
-#       ever recorded `waiting`.
-#   (4) stopped first: an input waiting behind a 120 s turn, then a `stop`
+#   (3) stopped first: an input waiting behind a 120 s turn, then a `stop`
 #       of the session: the stop is handled while the turn still runs (not
 #       held behind the waiting input), and the input finishes failed with
 #       an error that says the session was stopped (`stopped`), was never
 #       typed (no `typing` step) and never reached the engine.
+#   (4) the dispatcher's contract holds: a task assigned to the resident
+#       while a human's input waits behind another long turn (the session resumed
+#       after the stop) is delivered exactly once (an input from spawn-dispatch keyed `deliver-<task>-...`
+#       that succeeded; the task is `delivered`), after the waiting input;
+#       every one of its attempts that failed was refused at once as not
+#       ready (`does not accept input`), and no input of the dispatcher is
+#       ever recorded `waiting`.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -442,9 +442,35 @@ before "$(read_at note-end 'one$')" "$(read_at got 'BB:NOTE two')" ||
     fail "(2) the second input reached the engine before the first one's turn ended"
 no_typing_into_busy "(2)"
 
-# --- (3) the dispatcher's deliveries still land ----------------------------------------
+# --- (3) a stop first: the waiting input fails with the reason ---------------------------
 
 wait_until 60 judged_waiting || harness "the resident was not judged waiting after the notes"
+open_turn bb-busy-third 120 third
+three=$(say human bb-note-three "BB:NOTE three")
+wait_until 15 is_waiting "$three" ||
+    fail "(1) input $three, sent during turn third, was not recorded waiting ($(state_of "$three") $(error_of "$three"))"
+stop=$(send human bb-stop '{"type":"stop"}')
+wait_until 60 finished "$stop" ||
+    fail "(3) the stop was not handled within 60 s while an input waited ($(state_of "$stop"))"
+succeeded "$stop" || fail "(3) the stop finished $(state_of "$stop"): $(error_of "$stop")"
+logged busy-end "third\$" && harness "turn third ended before the stop: the stop proves nothing"
+wait_until 30 finished "$three" ||
+    fail "(3) input $three still waits ($(state_of "$three")) after its session was stopped"
+succeeded "$three" && fail "(3) input $three succeeded though its session was stopped before its turn"
+error=$(error_of "$three")
+printf '%s' "$error" | grep -qi stopped ||
+    fail "(3) input $three failed without saying the session was stopped: [$error]"
+assert_eq "$(steps "$three" typing)" 0 "(3) the 'typing' records of input $three"
+assert_eq "$(read_count got 'BB:NOTE three')" 0 "(3) times the engine read input three"
+no_typing_into_busy "(3)"
+
+# The session again, for the dispatcher's part (resumed by the harness, not
+# as `human`).
+send bb-harness bb-resume '{"type":"resume"}' >/dev/null
+wait_until 120 judged_waiting || harness "the resumed resident was never judged waiting at its prompt"
+
+# --- (4) the dispatcher's deliveries still land ----------------------------------------
+
 open_turn bb-busy-second 30 second
 four=$(say human bb-note-four "BB:NOTE four")
 wait_until 15 is_waiting "$four" || fail "(1) input $four, sent during turn second, was not recorded waiting ($(state_of "$four") $(error_of "$four"))"
@@ -456,48 +482,26 @@ task=$(jq -r .task "$WORK/out.txt")
 delivered() { [ "$(q "select state from mission_tasks where id = $task")" = delivered ]; }
 wait_until 60 logged busy-end "second\$" || harness "turn second never ended"
 wait_until 240 delivered ||
-    fail "(3) task #$task was not delivered within 240 s of the turn's end (state $(q "select state from mission_tasks where id = $task"); input four $(state_of "$four"))"
-succeeded "$four" || fail "(3) waiting input $four finished $(state_of "$four"): $(error_of "$four")"
+    fail "(4) task #$task was not delivered within 240 s of the turn's end (state $(q "select state from mission_tasks where id = $task"); input four $(state_of "$four"))"
+succeeded "$four" || fail "(4) waiting input $four finished $(state_of "$four"): $(error_of "$four")"
 wait_until 30 logged note-end "task\$" || harness "the task's turn never ended"
-assert_eq "$(read_count got 'BB:NOTE four')" 1 "(3) times the engine read input four"
-assert_eq "$(read_count got 'BB:NOTE task')" 1 "(3) times the engine read the task"
+assert_eq "$(read_count got 'BB:NOTE four')" 1 "(4) times the engine read input four"
+assert_eq "$(read_count got 'BB:NOTE task')" 1 "(4) times the engine read the task"
 [ "$(line_of got 'BB:NOTE four')" -lt "$(line_of got 'BB:NOTE task')" ] ||
-    fail "(3) the task, sent after input four, reached the engine before it"
+    fail "(4) the task, sent after input four, reached the engine before it"
 DELIVERIES="from spawn_commands where session_id = '$SESSION' and principal = 'spawn-dispatch'
               and action ->> 'type' = 'input' and idempotency_key like 'deliver-$task-%'"
 assert_eq "$(q "select count(*) $DELIVERIES and state = 'finished' and succeeded")" 1 \
-    "(3) deliveries of task #$task that succeeded"
+    "(4) deliveries of task #$task that succeeded"
 refused=$(q "select count(*) $DELIVERIES and state = 'finished' and not succeeded
               and coalesce(error, '') not like '%does not accept input%'")
 [ "$refused" -eq 0 ] ||
-    fail "(3) a delivery attempt of task #$task failed otherwise than as refused at once: $(q "select string_agg(idempotency_key || ': ' || error, '; ') $DELIVERIES and not succeeded")"
+    fail "(4) a delivery attempt of task #$task failed otherwise than as refused at once: $(q "select string_agg(idempotency_key || ': ' || error, '; ') $DELIVERIES and not succeeded")"
 dispatcher_waiting=$(q "select count(*) from spawn_events e join spawn_commands c
                          on c.id = (e.kind -> 'detail' ->> 'command_id')::bigint
                         where e.event_name = 'command.step' and e.kind -> 'detail' ->> 'step' = 'waiting'
                           and c.principal = 'spawn-dispatch'")
-assert_eq "$dispatcher_waiting" 0 "(3) inputs of the dispatcher recorded waiting"
-no_typing_into_busy "(3)"
-
-# --- (4) a stop first: the waiting input fails with the reason ---------------------------
-
-wait_until 60 judged_waiting || harness "the resident was not judged waiting after its task"
-open_turn bb-busy-third 120 third
-three=$(say human bb-note-three "BB:NOTE three")
-wait_until 15 is_waiting "$three" ||
-    fail "(1) input $three, sent during turn third, was not recorded waiting ($(state_of "$three") $(error_of "$three"))"
-stop=$(send human bb-stop '{"type":"stop"}')
-wait_until 60 finished "$stop" ||
-    fail "(4) the stop was not handled within 60 s while an input waited ($(state_of "$stop"))"
-succeeded "$stop" || fail "(4) the stop finished $(state_of "$stop"): $(error_of "$stop")"
-logged busy-end "third\$" && harness "turn third ended before the stop: the stop proves nothing"
-wait_until 30 finished "$three" ||
-    fail "(4) input $three still waits ($(state_of "$three")) after its session was stopped"
-succeeded "$three" && fail "(4) input $three succeeded though its session was stopped before its turn"
-error=$(error_of "$three")
-printf '%s' "$error" | grep -qi stopped ||
-    fail "(4) input $three failed without saying the session was stopped: [$error]"
-assert_eq "$(steps "$three" typing)" 0 "(4) the 'typing' records of input $three"
-assert_eq "$(read_count got 'BB:NOTE three')" 0 "(4) times the engine read input three"
+assert_eq "$dispatcher_waiting" 0 "(4) inputs of the dispatcher recorded waiting"
 no_typing_into_busy "(4)"
 
 echo "015: inputs sent to a busy session waited, were typed once each in order after the turn (across a restart), did not disturb the dispatcher's delivery, and failed with the reason when the session was stopped first"
