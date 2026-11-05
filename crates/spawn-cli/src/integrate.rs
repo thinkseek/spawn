@@ -609,7 +609,7 @@ impl Integrator {
             finished
         };
         for gate in finished {
-            Self::join(gate);
+            self.join(gate);
         }
     }
 
@@ -617,11 +617,14 @@ impl Integrator {
     fn settle(&self) {
         let running: Vec<Running> = self.running.borrow_mut().drain(..).collect();
         for gate in running {
-            Self::join(gate);
+            self.join(gate);
         }
     }
 
-    fn join(gate: Running) {
+    fn join(&self, gate: Running) {
+        // The mission's next task waits for a gate from now.
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        self.last_judged.borrow_mut().insert(gate.mission, now);
         if gate.handle.join().is_err() {
             eprintln!(
                 "integrate: mission {}: the judging of task {} panicked; it is judged again",
@@ -630,8 +633,8 @@ impl Integrator {
         }
     }
 
-    /// The judging in flight that keeps `mission` out of this pass: its
-    /// own, or one on its source.
+    /// Whether a judging in flight keeps `mission` from the mirror this
+    /// pass: its own, or one on its source.
     fn busy(&self, mission: &Mission) -> bool {
         self.running.borrow().iter().any(|gate| {
             gate.mission == mission.id || mission.source.as_deref() == Some(gate.source.as_str())
@@ -790,9 +793,10 @@ impl Integrator {
         };
         ready.sort_by_key(|candidate| (since(candidate), candidate.task.id));
         for candidate in ready {
-            let taken = self.running.borrow().iter().any(|gate| {
-                gate.mission == candidate.mission || gate.source == candidate.source
-            });
+            let taken =
+                self.running.borrow().iter().any(|gate| {
+                    gate.mission == candidate.mission || gate.source == candidate.source
+                });
             if taken {
                 continue;
             }
