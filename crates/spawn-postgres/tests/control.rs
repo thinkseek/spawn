@@ -1945,6 +1945,8 @@ fn a_review_lands_only_on_the_revision_it_read() {
         "every review names its revision (the human's, the current one)"
     );
 }
+<<<<<<< 3339192930b2dbf62a470093409eed486003bb4d
+=======
 
 /// How many `task.cancelled` records the control stream holds for `task`.
 fn cancelled_records(client: &mut Client, task: i64) -> i64 {
@@ -2188,3 +2190,4 @@ fn a_task_cancelled_before_the_records_gets_its_record_once_on_migration() {
     );
     assert_eq!(control_types(&mut client), types);
 }
+>>>>>>> 816a91b099b87f2504a60e3f6d4706d7ccce0e7a

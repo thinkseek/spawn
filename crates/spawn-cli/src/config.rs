@@ -56,8 +56,10 @@ fn resolve_workspace_root(flag: Option<String>, environment: Option<String>) -> 
 /// The oldest git Spawn runs on. Merges of main into a branch, the Bridge's
 /// and the integrator's, take main's merge rules from its `.gitattributes`
 /// with the global option `git --attr-source=<main>` (a bare repository
-/// reads no in-tree attributes otherwise), which Git 2.40 introduced.
-pub(crate) const MIN_GIT: (u32, u32) = (2, 40);
+/// reads no in-tree attributes otherwise). Git 2.41 introduced that option,
+/// and `git merge-tree` crashed when given it until Git 2.43 fixed that, so
+/// 2.43 is the first git whose merges work.
+pub(crate) const MIN_GIT: (u32, u32) = (2, 43);
 
 /// Major and minor version of `git --version`'s answer (`git version
 /// 2.56.0`, `git version 2.39.5 (Apple Git-154)`, `git version
@@ -78,8 +80,8 @@ fn check_git_version(answer: &str) -> Result<(), String> {
         Some(found) if found >= MIN_GIT => Ok(()),
         Some((found_major, found_minor)) => Err(format!(
             "git {found_major}.{found_minor} is too old: Spawn needs git {major}.{minor} or later \
-             (merges take main's .gitattributes through `git --attr-source`, added in \
-             {major}.{minor})"
+             (merges take main's .gitattributes through `git --attr-source`, which \
+             `git merge-tree` runs without crashing since {major}.{minor})"
         )),
         None => Err(format!(
             "cannot read the git version from {:?}; Spawn needs git {major}.{minor} or later",
@@ -163,12 +165,16 @@ mod tests {
 
     #[test]
     fn git_older_than_the_attr_source_option_is_refused_clearly() {
-        assert!(check_git_version("git version 2.40.0").is_ok());
+        assert!(check_git_version("git version 2.43.0").is_ok());
+        assert!(check_git_version("git version 2.43.7").is_ok());
         assert!(check_git_version("git version 2.56.0").is_ok());
         assert!(check_git_version("git version 3.1.0").is_ok());
-        let old = check_git_version("git version 2.39.5").expect_err("too old");
-        assert!(old.contains("git 2.39 is too old"), "{old}");
-        assert!(old.contains("2.40 or later"), "{old}");
+        let old = check_git_version("git version 2.42.0").expect_err("too old");
+        assert!(old.contains("git 2.42 is too old"), "{old}");
+        assert!(old.contains("2.43 or later"), "{old}");
+        assert!(check_git_version("git version 2.41.0").is_err());
+        assert!(check_git_version("git version 2.40.1").is_err());
+        assert!(check_git_version("git version 2.39.5").is_err());
         assert!(old.contains("--attr-source"), "{old}");
         assert!(check_git_version("git version 2.30.2").is_err());
         assert!(check_git_version("not git").is_err());
