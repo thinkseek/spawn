@@ -160,6 +160,8 @@ pub(crate) enum Why {
     Human,
     /// The command that delivered a task failed.
     DeliveryFailed,
+    /// Free disk on this host crossed the warning threshold (crate::disk).
+    Disk,
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -232,14 +234,16 @@ fn is_worker(facts: &Facts) -> bool {
 /// The whole policy as a pure function of the facts, without missions.
 #[cfg(test)]
 pub(crate) fn decide(rows: &[Facts], supervised: bool, now_ms: i64, spawn: &str) -> Plan {
-    decide_with(rows, &Work::default(), supervised, now_ms, spawn)
+    decide_with(rows, &Work::default(), &[], supervised, now_ms, spawn)
 }
 
-/// The whole policy as a pure function of the facts and the mission rows:
-/// delivery orders first, then the worker ladder, then at most one digest.
+/// The whole policy as a pure function of the facts, the mission rows and
+/// the host's news (disk records): delivery orders first, then the worker
+/// ladder, then at most one digest.
 pub(crate) fn decide_with(
     rows: &[Facts],
     work: &Work,
+    host: &[Escalation],
     supervised: bool,
     now_ms: i64,
     spawn: &str,
@@ -266,6 +270,7 @@ pub(crate) fn decide_with(
         }
     }
     plan.pending.extend(deliver::news_items(work, rows));
+    plan.pending.extend_from_slice(host);
     plan.pending.retain(|item| !told.contains(&item.marker()));
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
@@ -307,12 +312,14 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
 }
 
 /// Run one dispatcher step against the store: collect reports from idle
-/// workers under `root`, then submit the plan. Returns log lines.
+/// workers under `root`, then submit the plan, without its new executions
+/// while the disk is under its floor ([`crate::disk`]). Returns log lines.
 pub(crate) fn step(
     store: &PostgresStore,
     supervised: bool,
     spawn: &str,
     root: Option<&Path>,
+    disk: &crate::disk::Monitor,
 ) -> Result<Vec<String>, String> {
     let (mut rows, mut work) = load(store)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
@@ -322,7 +329,16 @@ pub(crate) fn step(
         // Collecting a report changed a task's state.
         (rows, work) = load(store)?;
     }
-    let plan = decide_with(&rows, &work, supervised, now_ms(), spawn);
+    let now = now_ms();
+    let mut plan = decide_with(&rows, &work, &disk.escalations(now), supervised, now, spawn);
+    if disk.below_floor() {
+        let held = crate::disk::hold_new_executions(&mut plan.orders);
+        if held > 0 {
+            lines.push(format!(
+                "dispatch: held {held} new execution(s): free disk is under SPAWN_DISK_FLOOR_GB"
+            ));
+        }
+    }
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for order in plan.orders {
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
@@ -334,7 +350,8 @@ pub(crate) fn step(
 
 #[cfg(test)]
 mod tests {
-    use super::{Facts, Sent, Why, decide};
+    use super::{Escalation, Facts, Sent, Why, decide, decide_with};
+    use crate::deliver::Work;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
     use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
@@ -515,6 +532,37 @@ mod tests {
         let plan = decide(&rows, true, NOW, "spawn");
         assert!(plan.orders.is_empty());
         assert!(plan.pending.is_empty());
+    }
+
+    #[test]
+    fn a_disk_record_reaches_an_idle_supervisor_once() {
+        let host = [Escalation {
+            session_id: "host".to_string(),
+            id: "disk-7".to_string(),
+            why: Why::Disk,
+            line: "tmpdir /tmp has 5.0 GiB free".to_string(),
+        }];
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
+        let CommandAction::Input { text } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert!(text.contains(
+            "- host — disk space on this host: tmpdir /tmp has 5.0 GiB free [spawn:esc host disk-7]"
+        ));
+        let mut supervisor = idle_supervisor();
+        supervisor.dispatched.push(Sent {
+            key: plan.orders[0].key.clone(),
+            text: Some(text.clone()),
+            created_at_ms: NOW,
+            finished_at_ms: Some(NOW),
+            succeeded: Some(true),
+        });
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty(),
+            "told once"
+        );
     }
 
     #[test]
