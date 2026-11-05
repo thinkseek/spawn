@@ -20,6 +20,8 @@
 #      resumed, a resident stopped by the supervisor stays down.
 #
 # Usage: SPAWN_DATABASE_URL=postgres://... scripts/e2e.sh
+# With SPAWN_TIMING=adversarial it runs under perturbed timing
+# (scripts/timing/timing.sh); SPAWN_TIMING_OUT keeps the perturbation log.
 # Runs in its own schema (dropped afterwards when psql is installed) and its own tmux socket.
 set -euo pipefail
 
@@ -43,6 +45,14 @@ socket="spawn-e2e-$run"
 schema="e2e_$run"
 loop_pid=""
 jev_pid=""
+timing_out=""
+if [ "${SPAWN_TIMING:-}" = adversarial ]; then
+  # shellcheck source=scripts/timing/timing.sh
+  . "$root/scripts/timing/timing.sh"
+  timing_out=${SPAWN_TIMING_OUT:-$work}/timing-e2e
+  timing_enable "$timing_out" "$bin" || { echo "e2e: timing: cannot enable" >&2; exit 2; }
+  bin=$TIMING_SPAWN
+fi
 
 case "$base_url" in
 *\?*) url="$base_url&options=-csearch_path%3D$schema" ;;
@@ -83,6 +93,7 @@ print(hashlib.pbkdf2_hmac("sha256", owner.encode(), salt, 600000).hex())' "$salt
 }
 
 cleanup() {
+  [ -n "$timing_out" ] && timing_report "$timing_out"
   [ -n "$loop_pid" ] && kill "$loop_pid" 2>/dev/null || true
   [ -n "$jev_pid" ] && kill "$jev_pid" 2>/dev/null || true
   "$tmux" -L "$socket" kill-server 2>/dev/null || true
@@ -94,7 +105,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Under adversarial timing a failure keeps its evidence beside the
+# perturbation log: the loop's and the integrator's logs, the engines'
+# argv, and the event log. psql gets its connection from PG* variables
+# (pg_url_parse below), never from a URL on its command line.
+keep_evidence() {
+  [ -n "$timing_out" ] || return 0
+  cp "$work/loop.log" "$work/integrate.log" "$work/argv.log" "$timing_out/" 2>/dev/null || true
+  command -v psql >/dev/null || return 0
+  (
+    export PGHOST=$pg_url_host PGPORT=$pg_url_port PGUSER=$pg_url_user
+    export PGPASSWORD=$pg_url_password PGDATABASE=$pg_url_database
+    export PGOPTIONS="-csearch_path=$schema"
+    psql -X -q -At -F ' | ' -c "select id, to_char(to_timestamp(recorded_at_ms / 1000.0), 'HH24:MI:SS.MS'),
+        session_id, session_seq, source, event_name, left(kind::text, 400)
+        from spawn_events order by id" >"$timing_out/events.txt" 2>&1
+    psql -X -q -At -F ' | ' -c "select id, idempotency_key, session_id, state, succeeded, left(coalesce(error, ''), 200)
+        from spawn_commands order by id" >"$timing_out/commands.txt" 2>&1
+  ) || true
+}
+
 fail() {
+  keep_evidence
   stage_mark e2e fail "$*" >&2
   echo "e2e: FAIL: $*" >&2
   echo "--- loop log (tail)" >&2
