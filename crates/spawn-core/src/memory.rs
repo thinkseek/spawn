@@ -60,7 +60,14 @@ struct State {
     heads: HashMap<BranchName, CommitId>,
     /// Every commit the store issued.
     known: HashSet<CommitId>,
+    /// Every commit each branch contains (the head and its ancestors), so a
+    /// merge the branch already holds is current, like `merge-base
+    /// --is-ancestor main head`.
+    history: HashMap<BranchName, HashSet<CommitId>>,
     mounts: HashMap<WorkspaceId, MountState>,
+    /// Mounts issued so far: each mount's id is new, never one a mounted
+    /// or an unmounted workspace had.
+    mounts_issued: u64,
     commits: u64,
     /// What `merge_base` answers.
     base_merge: BaseMerge,
@@ -68,6 +75,8 @@ struct State {
     workspace_calls: Vec<String>,
     /// Commits fail while set.
     commit_fails: bool,
+    /// The next append of an `artifact.committed` event fails.
+    branch_record_fails: bool,
     terminals: HashSet<TerminalName>,
     /// Every terminal start, in order.
     launches: Vec<Launch>,
@@ -177,6 +186,12 @@ impl MemoryStore {
         self.lock().commit_fails = fail;
     }
 
+    /// Make the next append of an `artifact.committed` or `merge.conflicted`
+    /// event fail, as a log that is down would. Test helper.
+    pub fn fail_next_branch_record(&self) {
+        self.lock().branch_record_fails = true;
+    }
+
     /// Mark a workspace as holding uncommitted changes. Test helper.
     pub fn mark_dirty(&self, workspace: &WorkspaceId) {
         if let Some(mount) = self.lock().mounts.get_mut(workspace) {
@@ -188,7 +203,16 @@ impl MemoryStore {
 impl EventLog for MemoryStore {
     fn append(&self, event: NewEvent) -> Result<Appended, StoreError> {
         let now = self.clock.now();
-        let (record, inserted) = self.lock().insert(event, now);
+        let mut state = self.lock();
+        let branch_record = matches!(
+            event.kind,
+            EventKind::ArtifactCommitted { .. } | EventKind::MergeConflicted { .. }
+        );
+        if state.branch_record_fails && branch_record {
+            state.branch_record_fails = false;
+            return Err(StoreError::Backend("the log is down".to_string()));
+        }
+        let (record, inserted) = state.insert(event, now);
         Ok(Appended { record, inserted })
     }
 
@@ -352,16 +376,21 @@ impl WorkspaceStore for MemoryStore {
         if state.heads.contains_key(branch) {
             return Ok(Branch::Existing);
         }
-        let commit = match from.map(ForkFrom::parse).transpose()? {
-            None => base_commit(),
-            Some(ForkFrom::Agent(agent)) => state
-                .heads
-                .get(&BranchName::for_agent(&agent))
-                .cloned()
-                .ok_or_else(|| WorkspaceError::Refused {
-                    code: "NoSuchFrom".to_string(),
-                    message: format!("{agent} has no branch"),
-                })?,
+        let (commit, mut history) = match from.map(ForkFrom::parse).transpose()? {
+            None => (base_commit(), HashSet::new()),
+            Some(ForkFrom::Agent(agent)) => {
+                let fork = BranchName::for_agent(&agent);
+                let head =
+                    state
+                        .heads
+                        .get(&fork)
+                        .cloned()
+                        .ok_or_else(|| WorkspaceError::Refused {
+                            code: "NoSuchFrom".to_string(),
+                            message: format!("{agent} has no branch"),
+                        })?;
+                (head, state.history.get(&fork).cloned().unwrap_or_default())
+            }
             Some(ForkFrom::Commit(commit)) => {
                 if commit != base_commit() && !state.known.contains(&commit) {
                     return Err(WorkspaceError::Refused {
@@ -369,9 +398,11 @@ impl WorkspaceStore for MemoryStore {
                         message: format!("no commit {commit}"),
                     });
                 }
-                commit
+                (commit, HashSet::new())
             }
         };
+        history.insert(commit.clone());
+        state.history.insert(branch.clone(), history);
         state.heads.insert(branch.clone(), commit.clone());
         Ok(Branch::Created(Fork {
             from: from.unwrap_or("main").to_string(),
@@ -388,7 +419,8 @@ impl WorkspaceStore for MemoryStore {
                 message: branch.to_string(),
             });
         }
-        let number = state.mounts.len() + 1;
+        state.mounts_issued += 1;
+        let number = state.mounts_issued;
         let workspace = WorkspaceId::new(format!("{number}:/workspaces/{number}"))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
         state.mounts.insert(
@@ -422,6 +454,11 @@ impl WorkspaceStore for MemoryStore {
         let commit = CommitId::new(format!("{:040x}", state.commits))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?;
         state.known.insert(commit.clone());
+        state
+            .history
+            .entry(branch.clone())
+            .or_default()
+            .insert(commit.clone());
         state.heads.insert(branch, commit.clone());
         Ok(Commit::Created(commit))
     }
@@ -448,6 +485,12 @@ impl WorkspaceStore for MemoryStore {
         };
         let merge = state.base_merge.clone();
         if let BaseMerge::Merged { commit, .. } = &merge {
+            // A merge the branch already holds is current: asked again, it
+            // never moves a branch that went on back to the merge.
+            let history = state.history.entry(branch.clone()).or_default();
+            if !history.insert(commit.clone()) {
+                return Ok(BaseMerge::Current);
+            }
             state.known.insert(commit.clone());
             state.heads.insert(branch, commit.clone());
         }
@@ -561,5 +604,75 @@ impl TerminalHost for MemoryStore {
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::MemoryStore;
+    use crate::id::{BranchName, CommitId};
+    use crate::port::{BaseMerge, Commit, WorkspaceStore};
+    use crate::time::SystemClock;
+
+    fn store_with(branches: &[&str]) -> MemoryStore {
+        let store = MemoryStore::new("shop", Arc::new(SystemClock));
+        for branch in branches {
+            let branch = BranchName::new(*branch).expect("valid branch");
+            store.ensure_branch(&branch, None).expect("branch");
+        }
+        store
+    }
+
+    #[test]
+    fn a_remount_never_takes_the_id_of_another_branchs_mount() {
+        let store = store_with(&["agent_a", "agent_b", "agent_c"]);
+        let branch = |name: &str| BranchName::new(name).expect("valid branch");
+        let a = store.mount(&branch("agent_a")).expect("mount a");
+        let b = store.mount(&branch("agent_b")).expect("mount b");
+        store.unmount(&a).expect("unmount a");
+        let c = store.mount(&branch("agent_c")).expect("mount c");
+        assert_ne!(c, b, "a new mount has a new id");
+        assert_ne!(c, a, "not even the id of an unmounted one");
+
+        // b's work still goes to b's branch, c's to c's.
+        store.mark_dirty(&b);
+        let Commit::Created(on_b) = store.commit(&b, "b").expect("commit b") else {
+            panic!("b is dirty");
+        };
+        store.mark_dirty(&c);
+        let Commit::Created(on_c) = store.commit(&c, "c").expect("commit c") else {
+            panic!("c is dirty");
+        };
+        let heads = &store.lock().heads;
+        assert_eq!(heads.get(&branch("agent_b")), Some(&on_b));
+        assert_eq!(heads.get(&branch("agent_c")), Some(&on_c));
+    }
+
+    #[test]
+    fn a_repeated_merge_never_moves_a_branch_back() {
+        let store = store_with(&["agent_a"]);
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let workspace = store.mount(&branch).expect("mount");
+        let merged = CommitId::new("e".repeat(40)).expect("valid commit");
+        store.set_base_merge(BaseMerge::Merged {
+            commit: merged.clone(),
+            files: Vec::new(),
+        });
+        assert!(matches!(
+            store.merge_base(&workspace).expect("merge"),
+            BaseMerge::Merged { .. }
+        ));
+        store.mark_dirty(&workspace);
+        let Commit::Created(after) = store.commit(&workspace, "work").expect("commit") else {
+            panic!("dirty");
+        };
+        // The same main again: the branch holds it, so it is current.
+        assert_eq!(
+            store.merge_base(&workspace).expect("again"),
+            BaseMerge::Current
+        );
+        assert_eq!(store.lock().heads.get(&branch), Some(&after));
     }
 }
