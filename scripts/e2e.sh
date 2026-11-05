@@ -25,6 +25,9 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/stage.sh
+. "$root/scripts/stage.sh"
+stage_start
 bin=${SPAWN_BIN:-}
 if [ -z "$bin" ]; then
   (cd "$root" && cargo build --quiet -p spawn-cli)
@@ -68,12 +71,13 @@ cleanup() {
 trap cleanup EXIT
 
 fail() {
+  stage_mark e2e fail "$*" >&2
   echo "e2e: FAIL: $*" >&2
   echo "--- loop log (tail)" >&2
   tail -n 40 "$work/loop.log" >&2 || true
   exit 1
 }
-pass() { echo "e2e: ok: $*"; }
+pass() { stage_mark e2e ok "$*"; }
 
 # wait_for <seconds> <description> <command...>
 wait_for() {
@@ -262,6 +266,7 @@ start_loop() {
   loop_pid=$!
 }
 start_loop
+pass "setup: build, schema, repositories, stub Jev, loop started"
 
 # Small SQL helpers through the owner login, via the fleet JSON.
 fleet() { SPAWN_DATABASE_URL=$sup_url "$bin" fleet; }
