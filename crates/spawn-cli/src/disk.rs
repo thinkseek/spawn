@@ -396,7 +396,7 @@ impl Monitor {
 mod tests {
     use super::{
         GIB, Monitor, Place, RECOVERY_MARGIN, Reading, Thresholds, escalations,
-        hold_new_executions, parse_df, places,
+        gate_room_escalations, hold_new_executions, parse_df, places,
     };
     use crate::dispatch::{Order, Why};
     use serde_json::json;
@@ -585,5 +585,30 @@ mod tests {
                 .contains("Under 2.0 GiB no new executions start")
         );
         assert_eq!(items[1].line, "workspace /ws has 30.0 GiB free again");
+    }
+
+    #[test]
+    fn a_gate_without_room_for_hours_is_told_with_the_free_space_and_tmpdir() {
+        let day = 86_400_000;
+        let records = [
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 4,
+                   "free_kb": 3 * 1_048_576, "min_gb": 10, "tmpdir": "/data/tmp",
+                   "event_id": 12, "at_ms": 10 * day, "mission": 7}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 5,
+                   "free_kb": 1, "min_gb": 10, "tmpdir": "/old", "event_id": 2,
+                   "at_ms": 8 * day, "mission": 3}),
+        ];
+        let items = gate_room_escalations(&records, 10 * day + 5);
+        assert_eq!(items.len(), 1, "a record older than a day is not told");
+        assert_eq!(items[0].why, Why::GateRoom);
+        assert_eq!(items[0].tag(), "host gate-room-12");
+        assert!(
+            items[0].line.contains(
+                "the gate of mission 7 has had no room to judge for over two hours: 3.0 GiB \
+free in TMPDIR /data/tmp, under SPAWN_GATE_MIN_FREE_GB=10"
+            ),
+            "{}",
+            items[0].line
+        );
     }
 }
