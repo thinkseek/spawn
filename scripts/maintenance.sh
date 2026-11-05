@@ -15,6 +15,12 @@
 #               SPAWN_MAINTENANCE_KEEP_DUMPS (default 5) stay. pg-backup.sh's
 #               `spawn-auto-*.dump` are its own to rotate (it keeps the
 #               newest); every other file there is left alone.
+#   3. cache    the gate's base cache, ${XDG_CACHE_HOME:-~/.cache}/spawn/
+#               gate-base (scripts/rsi/gate.sh): entries (files named by
+#               their 64-hex key, and `<key>.<pid>` a gate never finished
+#               writing) no gate used for SPAWN_MAINTENANCE_CACHE_AGE_DAYS
+#               (default 14). A gate touches an entry on every hit, so only
+#               the results of bases and keys nobody judges any more go.
 #
 # Every step runs even when an earlier one failed; the exit status is 1
 # when any did. SPAWN_MAINTENANCE_DRY_RUN=1 prints what would go and
@@ -92,6 +98,26 @@ if whole SPAWN_MAINTENANCE_KEEP_DUMPS "$keep" && [ -d "$backups" ]; then
         fi
     done
     say "dumps: removed $pruned, kept the newest $keep deploy dumps in $backups$note"
+fi
+
+# 3. the gate's base cache
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-base
+days=${SPAWN_MAINTENANCE_CACHE_AGE_DAYS:-14}
+if whole SPAWN_MAINTENANCE_CACHE_AGE_DAYS "$days" && [ -d "$cache" ]; then
+    expired=0
+    for entry in $(find "$cache" -mindepth 1 -maxdepth 1 -type f -user "$(id -u)" \
+        -regextype posix-extended -regex '.*/[0-9a-f]{64}(\.[0-9]+)?' -mtime +"$days" | sort); do
+        if [ "$dry" = 1 ]; then
+            say "cache: would remove $entry"
+            continue
+        fi
+        if rm -f -- "$entry"; then
+            expired=$((expired + 1))
+        else
+            fail "cache: could not remove $entry"
+        fi
+    done
+    say "cache: removed $expired base results no gate used for $days days from $cache$note"
 fi
 
 exit "$failed"

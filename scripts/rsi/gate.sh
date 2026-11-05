@@ -39,13 +39,13 @@
 # candidate could otherwise sabotage the base's run: 0 = solved, 1 (twice,
 # from two runs that agree) = unsolved, anything else aborts the gate (exit
 # 4, no verdict: the integrator records an abort, never a skip). Results are
-# cached per (base commit, sha256 of the scenario, of the build hook, of the
-# controller's scripts/blackbox helpers, of this file) in
-# ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-base, written outside the sandbox
-# and hidden from it (a tmpfs over it, and the gate refuses to run when the
-# directory lies under anything the sandbox binds back); the base moves only
-# on landings, so most runs build and run nothing on the base. The base is
-# built only on a cache miss.
+# cached in ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-base, keyed by everything
+# that decides them (the base commit, the scenario's blob, this file's, the
+# toolchain, and the files the scenario names: "The base cache" below),
+# written outside the sandbox and hidden from it (a tmpfs over it, and the
+# gate refuses to run when the directory lies under anything the sandbox
+# binds back); the base moves only on landings, so most runs build and run
+# nothing on the base. The base is built only on a cache miss.
 #
 # The cache's limit is the same-uid limit: candidate code in the sandbox
 # can neither see nor write it, but any process outside the sandbox that
@@ -180,12 +180,43 @@ STAGE_PREFIX="| "
 # shellcheck source=scripts/stage.sh
 . "$(dirname "$0")/../stage.sh"
 gate_started=$(stage_now)
+# Where the time goes, said once at the end (`gate_times`): the base's
+# stages (its build and scenario runs, all skipped on a cache hit), the
+# candidate's (its build, the test listing of both trees, its scenarios),
+# and the rest, the setup (exports, the socket scan, the static checks).
+# stage_emit is stage.sh's, with the sum kept.
+base_ms=0
+candidate_ms=0
+base_runs=0
+stage_emit() { # <suite> <result> <ms> <name>
+    case "$4" in
+    total) ;;
+    "base: build") base_ms=$((base_ms + $3)) ;;
+    base:*) base_ms=$((base_ms + $3)) base_runs=$((base_runs + 1)) ;;
+    *) candidate_ms=$((candidate_ms + $3)) ;;
+    esac
+    printf '%sstage %s %s %sms %s\n' "${STAGE_PREFIX-}" "$1" "$2" "$3" "$4"
+    if [ -n "${SPAWN_STAGE_LOG-}" ]; then
+        printf '{"suite":"%s","stage":"%s","result":"%s","ms":%s}\n' \
+            "$(stage_json "$1")" "$(stage_json "$4")" "$(stage_json "$2")" "$3" >>"$SPAWN_STAGE_LOG"
+    fi
+}
+times_said=""
+gate_times() {
+    [ -z "$times_said" ] || return 0
+    times_said=1
+    total_ms=$(($(stage_now) - gate_started))
+    echo "| gate time: base $((base_ms / 1000)) s ($base_runs scenario runs," \
+        "$(printf '%s' "${from_cache-}" | wc -w | tr -d ' ') results from the cache)," \
+        "candidate $((candidate_ms / 1000)) s, setup $(((total_ms - base_ms - candidate_ms) / 1000)) s" \
+        "(exports, socket scan, static checks), total $((total_ms / 1000)) s"
+}
 # section <name>: a gate stage starts (and the one before it ends as ok).
 section() {
     stage_open gate "$1"
     echo "| == $1"
 }
-trap 'stage_close aborted; rm -rf "$work"' EXIT
+trap 'stage_close aborted; gate_times; rm -rf "$work"' EXIT
 # A signal ends the gate through its EXIT trap, so the work directory goes
 # too, whatever the shell (bash runs EXIT on a fatal signal, dash does not).
 # SIGKILL leaves the directory: spawn-maintenance.timer removes it.
@@ -220,6 +251,7 @@ json_string() {
 verdict() {
     # The open section passed unless the verdict is a rejection of it.
     if [ "$1" = accepted ]; then stage_close ok; else stage_close "$1"; fi
+    gate_times
     stage_emit gate "$1" "$(($(stage_now) - gate_started))" total
     json="{\"verdict\":\"$1\""
     [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
@@ -475,7 +507,7 @@ EOF
     # shellcheck disable=SC2086 # host and port
     python3 "$work/test-db-forward.py" "$db_socket" $db_forward </dev/null >/dev/null 2>"$work/test-db-forward.log" &
     db_forwarder=$!
-    trap 'stage_close aborted; kill "$db_forwarder" 2>/dev/null; rm -rf "$work"' EXIT
+    trap 'stage_close aborted; gate_times; kill "$db_forwarder" 2>/dev/null; rm -rf "$work"' EXIT
     waited=0
     while [ ! -S "$db_socket" ]; do
         if ! kill -0 "$db_forwarder" 2>/dev/null || [ "$waited" -ge 100 ]; then
@@ -1030,29 +1062,141 @@ fi
 # with the candidate, which could otherwise sabotage the base's run and turn
 # a solved objective into "unsolved". Exit 0 = solved, 1 = unsolved; any
 # other exit is a harness error and aborts the gate (no verdict). An
-# unsolved result needs two runs that agree. Results are cached per (base
-# commit, scenario, build hook, gate) in $base_cache, which the sandbox
-# cannot see, so a base that did not move costs nothing.
-sha() { sha256sum "$1" | cut -d' ' -f1; }
-gate_sha=$(sha "$0")
-build_sha=$([ -f "$scenarios/build" ] && sha "$scenarios/build" || echo none)
-# What scenarios source from the controller: a changed helper is a changed
-# scenario.
-if [ -d "$controller/scripts/blackbox" ]; then
-    helpers_sha=$(cd "$controller/scripts/blackbox" && find . -type f | LC_ALL=C sort |
-        while IFS= read -r helper; do printf '%s %s\n' "$(sha "$helper")" "$helper"; done |
-        sha256sum | cut -d' ' -f1)
-else
-    helpers_sha=none
+# unsolved result needs two runs that agree.
+#
+# The base cache. A result is cached in $base_cache (which the sandbox
+# cannot see, let alone write), keyed by everything that decides it:
+# - the base commit;
+# - the scenario's blob (`git hash-object`);
+# - the gate: this file's blob and that of the URL parser it sources (it
+#   shapes the sandbox's database URL);
+# - the scenarios directory's other files, but its scenarios and the lists
+#   only the gate reads (`protected`, `retired-tests`): the build hook, the
+#   `bind` list's text, helpers a scenario runs from beside it;
+# - each directory the `bind` list names, by a fingerprint of what is
+#   installed there: the blobs of its `.modules.yaml` and `.pnpm/lock.yaml`
+#   (pnpm's record of an install) when either is present, and otherwise a
+#   listing of everything under it, symlinks not followed (path, type, size,
+#   modification time, link target). A `pnpm install` rewrites those, so the
+#   next gate judges the base again; a file edited inside a directory that
+#   has the markers, without an install, is not seen;
+# - the files the scenario names on its code lines, and those they name in
+#   turn: a path `scripts/...` is the controller's (the scenarios source
+#   `$controller/scripts/blackbox/assertions.sh` and
+#   `$controller/scripts/pg-url.sh`), a directory is all of its files, a
+#   `<name>.sh` is a sibling scenario; one that does not exist is keyed as
+#   missing. A controller file no scenario names (the black-box runner,
+#   the e2e) changes no objective's key. A code line that reaches into
+#   scripts/ indirectly (`scripts/$name`, `cd "$controller/scripts"` and a
+#   relative path after it) keys all of the controller's scripts/;
+# - the tools the scenarios run, asked in the sandbox inside the base tree
+#   (whose rust-toolchain.toml picks the Rust toolchain): `rustc -vV`,
+#   `cargo -V`, `node --version`, `psql -V`, `git --version`, `tmux -V`,
+#   `python3 -V`, `jq --version`, and the test server's
+#   `server_version_num`, asked over its socket.
+# An entry is written only here, after a completed base run, and only
+# "solved" or "unsolved"; an entry that cannot be read, or holds anything
+# else, is a miss, judged again and rewritten. Candidate runs are never
+# cached. A hit touches its entry: spawn-maintenance removes entries no
+# gate used for 14 days (scripts/maintenance.sh). The log says which
+# results came from the cache.
+#
+# Not keyed: the state candidate code leaves on the shared test server
+# (roles, databases, settings). A disposable test server per gate is
+# GitHub issue #6; until then one gate runs at a time (integrate.rs).
+blob() { git hash-object --no-filters -- "$1"; }
+gate_key="gate $(blob "$0")"
+[ -f "$(dirname "$0")/../pg-url.sh" ] && gate_key="$gate_key $(blob "$(dirname "$0")/../pg-url.sh")"
+scenarios_key=$(cd "$scenarios" && find . -type f ! -path './protected' ! -path './retired-tests' |
+    grep -vE '^\./[^/]*\.sh$' | LC_ALL=C sort |
+    while IFS= read -r file; do printf '%s %s\n' "$(blob "$file")" "$file"; done |
+    sha256sum | cut -d' ' -f1)
+# bind_fingerprint <dir>: what is installed in a bound directory (above).
+bind_fingerprint() {
+    bind_marked=""
+    for bind_marker in .modules.yaml .pnpm/lock.yaml; do
+        if [ -f "$1/$bind_marker" ]; then
+            printf '%s %s\n' "$bind_marker" "$(blob "$1/$bind_marker")"
+            bind_marked=1
+        fi
+    done
+    [ -n "$bind_marked" ] ||
+        printf 'listing %s\n' "$(find "$1" -printf '%P %y %s %T@ %l\n' 2>/dev/null | LC_ALL=C sort |
+            sha256sum | cut -d' ' -f1)"
+}
+binds_key=none
+if [ -f "$scenarios/bind" ]; then
+    binds_key=$(while IFS= read -r path || [ -n "$path" ]; do
+        case "$path" in '' | '#'*) continue ;; esac
+        printf '%s\n%s\n' "$path" "$(bind_fingerprint "$path")"
+    done <"$scenarios/bind" | sha256sum | cut -d' ' -f1)
 fi
-# The stage helper is sourced by the black-box runner too, the URL parser
-# by the scenarios (and by this gate, whose own copy is keyed as well).
-for helper in "$controller/scripts/stage.sh" "$controller/scripts/pg-url.sh" \
-    "$(dirname "$0")/../pg-url.sh"; do
-    [ -f "$helper" ] || continue
-    helpers_sha=$(printf '%s %s\n' "$helpers_sha" "$(sha "$helper")" | sha256sum | cut -d' ' -f1)
-done
+# named_by <file>: the paths a file names on its code lines, one per line
+# (see above). Comments do not count: this file's own comments name
+# scripts/blackbox, and a scenario that mentions the gate would otherwise
+# key every black-box suite.
+named_by() {
+    sed -e 's/^[[:space:]]*#.*//' -e 's/[[:space:]]#.*//' "$1" 2>/dev/null >"$work/deps.code" || :
+    grep -oE 'scripts/[A-Za-z0-9_./-]*[A-Za-z0-9_-]' "$work/deps.code" | sed "s|^|$controller/|" || true
+    grep -oE '[A-Za-z0-9_-]+\.sh' "$work/deps.code" | while IFS= read -r name; do
+        [ ! -f "$scenarios/$name" ] || printf '%s\n' "$scenarios/$name"
+    done
+    # scripts/ as a bare directory, or a scripts/ path that goes on in a
+    # variable: what it reaches cannot be read off the text.
+    if grep -qE 'scripts/?([^A-Za-z0-9_./-]|$)|scripts/[A-Za-z0-9_./-]*[$`{]' "$work/deps.code"; then
+        printf '%s\n' "$controller/scripts"
+    fi
+}
+# depends_on <scenario>: `<blob> <path>` (or `missing <path>`) of the
+# scenario and everything it names, transitively, sorted.
+depends_on() {
+    printf '%s\n' "$1" >"$work/deps.files"
+    while :; do
+        while IFS= read -r file; do
+            [ -f "$file" ] && named_by "$file"
+        done <"$work/deps.files" | while IFS= read -r path; do
+            if [ -d "$path" ]; then find "$path" -type f; else printf '%s\n' "$path"; fi
+        done | cat "$work/deps.files" - | LC_ALL=C sort -u >"$work/deps.next"
+        cmp -s "$work/deps.next" "$work/deps.files" && break
+        mv "$work/deps.next" "$work/deps.files"
+    done
+    # Named relative to the scenarios directory or the controller: content
+    # decides, not where the checkout lies.
+    while IFS= read -r file; do
+        name=${file#"$scenarios"/}
+        [ "$name" != "$file" ] || name=${file#"$controller"/}
+        if [ -f "$file" ]; then printf '%s %s\n' "$(blob "$file")" "$name"; else printf 'missing %s\n' "$name"; fi
+    done <"$work/deps.files" | LC_ALL=C sort
+}
+# The toolchain, asked once, when the first objective needs a key.
+toolchain_key=""
+toolchain() {
+    [ -z "$toolchain_key" ] || return 0
+    # The server's version through libpq's variables (pg-url.sh), never a
+    # URL on psql's command line: it holds the password.
+    sandbox "$work/baseline" sh -c '
+        for tool in "rustc -vV" "cargo -V" "node --version" "psql -V" "git --version" \
+            "tmux -V" "python3 -V" "jq --version"; do
+            $tool 2>&1
+            echo "${tool%% *}: $?"
+        done
+        if [ -z "${SPAWN_TEST_DATABASE_URL-}" ]; then
+            echo "server: none"
+        elif [ -f "$1" ] && . "$1" && pg_url_export "$SPAWN_TEST_DATABASE_URL"; then
+            PGDATABASE=$pg_url_database PGCONNECT_TIMEOUT=10 psql -XtAc "show server_version_num" 2>&1
+            echo "server: $?"
+        else
+            echo "server: unreadable"
+        fi' toolchain "$(cd "$(dirname "$0")/.." && pwd)/pg-url.sh" >"$work/toolchain" 2>&1 || true
+    toolchain_key=$(sha256sum <"$work/toolchain" | cut -d' ' -f1)
+    echo "| base cache: toolchain $(sed -n 's/^release: /rustc /p' "$work/toolchain" | head -n 1)" \
+        "$(sed -n 's/^\(cargo [^ ]*\).*/\1/p' "$work/toolchain" | head -n 1)" \
+        "$(sed -n 's/^\(psql\) (PostgreSQL) \([^ ]*\).*/\1 \2/p' "$work/toolchain" | head -n 1)" \
+        "server $(sed -n 's/^\([0-9]\{5,6\}\)$/\1/p' "$work/toolchain" | head -n 1 | grep . || echo none)"
+}
 : >"$work/base-results"
+from_cache=""
+run_on_base=""
 for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     [ -f "$objective" ] || continue
     if [ "$objective" != "$scenario" ]; then
@@ -1062,11 +1206,29 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     grep -qxF "$objective" "$work/base-results.seen" 2>/dev/null && continue
     printf '%s\n' "$objective" >>"$work/base-results.seen"
     objective_name=$(basename "$objective")
-    key=$(printf '%s %s %s %s %s\n' "$base_commit" "$(sha "$objective")" "$build_sha" \
-        "$helpers_sha" "$gate_sha" | sha256sum | cut -d' ' -f1)
-    if [ -f "$base_cache/$key" ]; then
-        result=$(cat "$base_cache/$key")
+    toolchain
+    key=$( {
+        printf 'base %s\nscenario %s\n%s\ntoolchain %s\nscenarios %s\nbinds %s\n' "$base_commit" \
+            "$(blob "$objective")" "$gate_key" "$toolchain_key" "$scenarios_key" "$binds_key"
+        depends_on "$objective"
+    } | sha256sum | cut -d' ' -f1)
+    entry=$base_cache/$key
+    result=""
+    if [ -e "$entry" ] || [ -L "$entry" ]; then
+        result=$(cat -- "$entry" 2>/dev/null) || result=""
+        case "$result" in
+        solved | unsolved) ;;
+        *)
+            echo "| == base: $objective_name: its cache entry cannot be read; judged again"
+            result=""
+            ;;
+        esac
+    fi
+    if [ -n "$result" ]; then
+        # A used entry stays: maintenance removes the ones untouched.
+        touch -c -- "$entry" 2>/dev/null || :
         echo "| == base: $objective_name: $result (cached)"
+        from_cache="$from_cache $objective_name"
     else
         if [ -z "${base_built-}" ]; then
             section "base: build"
@@ -1079,7 +1241,6 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
         section "base: $objective_name"
         first=0
         run_scenario "$work/baseline" "$objective" || first=$?
-        result=""
         case "$first" in
         0) result=solved ;;
         1)
@@ -1096,13 +1257,22 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
             stage_close aborted
             exit 4
         fi
-        printf '%s\n' "$result" >"$base_cache/$key.$$"
-        mv "$base_cache/$key.$$" "$base_cache/$key"
+        # A completed run, and only one, writes its entry. One that cannot
+        # be written costs the next gate a run, not this one its verdict.
+        if [ -d "$entry" ] && [ ! -L "$entry" ]; then rm -rf -- "$entry"; fi
+        if ! { printf '%s\n' "$result" >"$entry.$$" && mv -fT -- "$entry.$$" "$entry"; } 2>/dev/null; then
+            rm -f -- "$entry.$$"
+            echo "| base cache: could not write the entry of $objective_name"
+        fi
         echo "| == base: $objective_name: $result"
+        run_on_base="$run_on_base $objective_name"
         stage_close "$result"
     fi
     printf '%s|%s\n' "$result" "$objective" >>"$work/base-results"
 done
+if [ -n "$from_cache$run_on_base" ]; then
+    echo "| base results from the cache:${from_cache:- none}; run on the base:${run_on_base:- none}"
+fi
 # base_result <scenario>: solved, unsolved, or none (not judged on the base).
 base_result() {
     awk -F'|' -v want="$1" '

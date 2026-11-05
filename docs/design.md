@@ -331,6 +331,8 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 
 缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 
+门禁在 base 上的 objective 结果（solved，或两次一致的 unsolved）缓存在沙箱看不到的 `~/.cache/spawn/gate-base`，键恰好是这些：base commit；场景文件的 blob；`gate.sh` 与它引入的 `pg-url.sh` 的 blob；场景目录里除场景（`*.sh`）、`protected`、`retired-tests` 以外的文件（构建钩子、`bind` 列表的文本、场景旁的帮助脚本）；`bind` 列表里每个目录的指纹（有 `.modules.yaml` 或 `.pnpm/lock.yaml` 时取它们的 blob，否则取目录下全部条目的路径、类型、大小、修改时间与链接目标，不跟随符号链接）；场景代码行（不含注释）点名的文件及它们再点名的文件（控制器的 `scripts/...`、同目录的 `<name>.sh`；经变量或 `cd` 间接进入 `scripts/` 时取整个 `scripts/`）；沙箱里在 base 树内问到的 `rustc -vV`、`cargo -V`、`node --version`、`psql -V`、`git --version`、`tmux -V`、`python3 -V`、`jq --version` 与测试服务器的 `server_version_num`。不在键里的：有安装记录的目录里未经安装的单个文件改动；候选代码留在共享测试服务器上的状态（角色、库、设置）——每个门禁一个一次性测试服务器是 GitHub issue #6，在那之前集成器一次只跑一个门禁。只有门禁在一次完整的 base 运行后写条目；读不出的条目算未命中；候选的运行从不缓存；命中会 touch 条目，`spawn-maintenance` 删除 14 天没用过的条目。
+
 ## 13. 已知限制
 
 | 项 | 限制 | 改法 |
@@ -370,5 +372,7 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
 
 停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
+
+集成器的门禁按任务组并发（每个任务组、每个来源同一时刻至多一个判定，全局至多 `--gates` 个，默认 1）。每个判定在自己的线程里跑完取分支、门禁与落地，各自记下 `task.gated`、`task.landed`；主循环不读线程的返回值，只读日志。结束的线程只在一轮开始、读任务组之前回收，所以一轮看到的任务组快照不会早于任何已结束判定的记录；每一轮都给每个任务组走完停机、预算、落地与目标分派，不因别的任务组的门禁而等；只有落地会让同一来源的其余任务组等下一轮（落地移动了 main 与它们的基线）。在途判定的来源不做镜像上的事（落地、拉取、判定）。空出的门禁给等得最久的就绪任务：从它报告时起，或从它所在任务组上一次判定结束时起，取较晚者；任务组编号不决定先后。进程重启时门禁随进程一起被杀，没有记录，下一个集成器重新判定。
 
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。

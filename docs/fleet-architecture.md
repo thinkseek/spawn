@@ -663,10 +663,31 @@ the tree's own:
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
-- objective results on the base are cached outside the sandbox, keyed by
-  the base commit and the scenario, build hook, controller helpers and gate
-  hashes; candidate code cannot see or write the cache, but any process of
-  the same uid outside the sandbox can (the same-uid limit).
+- objective results on the base (solved, or unsolved after two runs that
+  agree) are cached outside the sandbox, keyed by everything that decides
+  them: the base commit, the blobs of the scenario and of the gate, the
+  tools the scenarios run (`rustc -vV`, `cargo -V`, `node --version`,
+  `psql -V`, `git --version`, `tmux -V`, `python3 -V`, `jq --version`, in
+  the sandbox inside the base tree) and the test server's
+  `server_version_num`, the scenarios directory's build hook and helpers
+  (and the `bind` list's text), a fingerprint of each directory the `bind`
+  list names (the blobs of pnpm's `.modules.yaml` and `.pnpm/lock.yaml`
+  when present, else a listing of the directory: path, type, size, mtime,
+  link target), and the files the scenario names on its code lines
+  (`scripts/...` of the controller, transitively; a scenario that reaches
+  into `scripts/` through a variable or a `cd` keys all of it). A
+  controller file no scenario names (the black-box runner) changes no key.
+  Not keyed: an edit inside a bound directory that has pnpm's install
+  record but was not installed, and the state candidate code leaves on the
+  shared test server (a disposable server per gate is GitHub issue #6;
+  until then one gate runs at a time). Only the gate
+  writes an entry, after a completed base run; an entry it cannot read is
+  a miss; candidate runs are never cached; the log lists which base
+  results came from the cache, and the time spent on the base, the
+  candidate and the setup. A hit touches its entry; spawn-maintenance
+  removes entries no gate used for 14 days.
+  Candidate code cannot see or write the cache, but any process of the
+  same uid outside the sandbox can (the same-uid limit).
 - **Exit status.** The gate exits 0 with a verdict. It exits 5 when it has
   no room to judge now: `TMPDIR` has less than `SPAWN_GATE_MIN_FREE_GB`
   free (`scripts/disk.sh` `gate_room`). In that case it first writes the
@@ -726,7 +747,14 @@ record of what was judged (§14 of design.md).
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
   another mission's task in `landing` waits for it (the push may have moved
-  `main` before its `task.landed`). For each task that is ready, it:
+  `main` before its `task.landed`). Every pass visits every mission (its
+  halts, budget, landing and objective assignment never wait for another
+  mission's gate); only a landing makes the rest of its source wait for the
+  next pass. A free gate goes to the ready task that has waited longest,
+  across missions, counted from its report or from the end of its
+  mission's previous judging, whichever is later; the mission id decides
+  nothing. For a mission's lowest ready task (one per mission at a time:
+  §10.4, "One gate at a time, for now"), on a thread of its own, it:
   1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into
      its mirror's `refs/spawn-integrate/<agent>` (it never commits a
      workspace and never moves `refs/heads/<agent>`). A push that lags the
@@ -856,8 +884,10 @@ record of what was judged (§14 of design.md).
     dispatcher once its task lands or is cancelled (`retire-task-<id>`). Its
     report reaches the supervisor's digest like any report. With N = 1 this
     is one task at a time on the resident, as before.
-  - Landing stays one at a time: one candidate judged per pass, the lowest
-    ready task first, main moved by compare-and-swap. A task whose base is
+  - Landing stays one at a time per mission: one candidate judged at a
+    time, the lowest ready task first, main moved by compare-and-swap.
+    Across missions the gate goes to the longest wait (§10.3), so a
+    mission that is always ready does not starve another's. A task whose base is
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
   - Budgets apply per task, from its delivery; the halt rules stay per
@@ -877,5 +907,25 @@ record of what was judged (§14 of design.md).
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
   `/api/rsi/task/<id>` answers one task; `/api/rsi/pane` shows the
   resident's terminal.
-- **One gate at a time.** Integrator passes hold an advisory lock, so two
-  gates never run at once.
+- **One gate at a time, for now.** A judging (fetch, gate, landing) runs
+  on a thread of its own. A mission has at most one in flight, and so does
+  a source (missions on one source share its mirror and its main); while
+  it runs, the integrator's passes leave that source's mirror alone (no
+  landing, fetch or judging on it), but every mission still gets its
+  halts, budget and objective assignments. At
+  most `--gates N` (`SPAWN_INTEGRATE_GATES`) run at once across missions,
+  and **N is 1**: more than one gate is unsafe until each gate has a test
+  database server of its own (GitHub issue #6, which also covers the
+  server state candidate code leaves behind). Today every gate reaches the
+  same test PostgreSQL server, and its gate login is a superuser, so one
+  gate's candidate code can disturb another gate's base runs (an
+  "unsolved" is cached, and a regression then lands) or flake another
+  mission's candidate toward its halt. The integrator refuses N > 1 (up to
+  8) unless `SPAWN_TEST_DATABASE_PER_GATE=1` states that the server is per
+  gate. Each judging records its own verdict and landing, which the next
+  pass reads; finished judgings are reaped before a pass reads the
+  missions. A judging that errs or panics before any record of its own is
+  recorded `aborted` with the reason, so the three-aborts halt bounds it.
+  A restart mid-gate kills the gate with the process (no record), and the
+  next integrator judges the task again. One integrator per database: its
+  advisory lock belongs to the connection, kept while any gate runs.
