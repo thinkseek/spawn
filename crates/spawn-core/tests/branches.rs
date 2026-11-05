@@ -1041,3 +1041,62 @@ fn the_earlier_executions_lines_read_again_on_resume_leave_the_turn_open() {
     quiet(&bridge.tick().expect("checkpoint and merge"));
     assert_eq!(merges(&store), 2);
 }
+
+#[test]
+fn a_stale_workspace_ends_its_execution_instead_of_retrying_its_checkpoint() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.make_stale(true);
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    let mut warnings = bridge.tick().expect("read the turn").warnings;
+    warnings.extend(
+        bridge
+            .tick()
+            .expect("the checkpoint is kept off the branch")
+            .warnings,
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("WorkspaceStale") && warning.contains("execution ends")),
+        "{warnings:?}"
+    );
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1, "the store kept its state: unmounted");
+    assert!(stalls(&store).is_empty(), "no stalled end");
+    assert!(
+        !store
+            .workspace_calls()
+            .iter()
+            .any(|call| call == "merge_base"),
+        "no merge into a stale workspace"
+    );
+    bridge.tick().expect("ended");
+    assert_eq!(ended(&store).len(), 1, "ended once");
+}
+
+#[test]
+fn an_idle_stale_workspace_ends_its_execution_when_main_is_offered() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(1)));
+    store.set_pane(&terminal, READY);
+    let mut bridge = bridge(&store).with_clock(clock.clone());
+    start(&store, None);
+    bridge.tick().expect("start");
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint the turn, and merge");
+    let merges_before = merges(&store);
+    store.make_stale(true);
+    for _ in 0..4 {
+        clock.advance(std::time::Duration::from_secs(30));
+        bridge.tick().expect("idle");
+    }
+    assert_eq!(merges(&store), merges_before + 1, "main was offered once");
+    assert_eq!(ended(&store), vec![EndCause::Stopped]);
+    assert_eq!(unmounts(&store), 1);
+    assert!(stalls(&store).is_empty());
+}
