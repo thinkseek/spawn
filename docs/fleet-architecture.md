@@ -75,7 +75,7 @@ execution runs, it classifies:
 | execution ended by Stop | rules | COMPLETED |
 | no execution yet | rules | WAITING |
 | turn stopped, prompt idle: finished, asking a question, or waiting? | **Jev** | WAITING / BLOCKED / COMPLETED |
-| execution live, no open tool, no fact for 2 min (or a tool open and silent for 10 min): thinking or hung? | **Jev** | WORKING / WAITING / BLOCKED |
+| execution live, no open tool, no fact for 2 min (or a tool open for 10 min with no transcript progress, however busy the screen looks): thinking or hung? | **Jev** | WORKING / WAITING / BLOCKED |
 | failed turn or an error on screen: progressing or stuck? | **Jev** | WORKING / WAITING / BLOCKED |
 | process exited on its own (a non-zero exit code makes BLOCKED the rules' guess and always asks for attention) | **Jev** | COMPLETED / BLOCKED |
 | process lost | **Jev** | UNKNOWN / BLOCKED / COMPLETED |
