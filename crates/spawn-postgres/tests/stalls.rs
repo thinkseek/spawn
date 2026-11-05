@@ -9,9 +9,7 @@
 
 use postgres::Client;
 use serde_json::{Value, json};
-use spawn_core::event::{
-    ArtifactRef, CheckpointReason, EventKind, NewEvent, Source, ToolName, ToolUseId,
-};
+use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
 use spawn_core::port::EventLog;
 use spawn_core::screen::ScreenState;
@@ -119,8 +117,8 @@ fn each_open_task_comes_with_its_steps_record_and_its_age_on_the_databases_clock
         "tool-1",
         Source::Transcript,
         EventKind::ToolStarted {
-            tool_use_id: ToolUseId::new("toolu_1").expect("valid tool use"),
-            tool: ToolName::new("Bash").expect("valid tool"),
+            tool_name: "Bash".to_string(),
+            tool_use_id: "toolu_1".to_string(),
         },
     );
     let shells = "✻ Sautéed for 6s · done 11:27 PM · 2 shells still running";
