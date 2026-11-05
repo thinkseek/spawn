@@ -361,6 +361,10 @@ pub struct Bridge {
     cursor: GlobalPosition,
     sessions: HashMap<SessionId, SessionView>,
     clock: Arc<dyn Clock>,
+    /// Per session, the `artifact.committed` of a commit the branch already
+    /// took whose append failed: appended again first at the next tick
+    /// ([`Bridge::record_commit`]).
+    unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
 }
 
 impl Bridge {
@@ -381,6 +385,7 @@ impl Bridge {
             cursor: GlobalPosition(0),
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
+            unrecorded_commits: std::sync::Mutex::default(),
         }
     }
 
@@ -581,6 +586,7 @@ impl Bridge {
         report: &mut TickReport,
     ) -> Result<bool, StoreError> {
         active.follow.checkpoint_read = false;
+        self.record_unrecorded_commit(session)?;
         self.follow_output(agent_id, session, native, active, report)?;
         let end = match active
             .reported_end
@@ -663,7 +669,7 @@ impl Bridge {
                     branch: BranchName::for_agent(agent_id),
                     commit,
                 };
-                self.append(
+                self.record_commit(
                     agent_id,
                     session,
                     Some(&active.execution_id),
@@ -1023,7 +1029,7 @@ impl Bridge {
                     branch: BranchName::for_agent(agent_id),
                     commit,
                 };
-                self.append(
+                self.record_commit(
                     agent_id,
                     session,
                     Some(&active.execution_id),
@@ -1068,6 +1074,66 @@ impl Bridge {
             kind,
         })?;
         Ok(())
+    }
+
+    /// Append the `artifact.committed` of a commit the branch already took.
+    /// The branch moved first, so an append that fails must not lose the
+    /// record: it waits in `unrecorded_commits` and the session's next tick
+    /// appends it before anything else ([`Self::record_unrecorded_commit`]).
+    /// Its key (`commit:<id>`) makes a second append of one that did land
+    /// a no-op.
+    fn record_commit(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        execution: Option<&ExecutionId>,
+        source: Source,
+        key: Option<String>,
+        kind: EventKind,
+    ) -> Result<(), StoreError> {
+        let event = NewEvent {
+            agent_id: agent_id.clone(),
+            session_id: session.clone(),
+            execution_id: execution.cloned(),
+            source,
+            source_event_id: key,
+            kind,
+        };
+        self.unrecorded_commits_lock()
+            .entry(session.clone())
+            .or_default()
+            .push(event.clone());
+        self.record_unrecorded_commit(session)
+    }
+
+    /// Append, in order, the commit records of `session` whose append
+    /// failed; each leaves the list once the log took it.
+    fn record_unrecorded_commit(&self, session: &SessionId) -> Result<(), StoreError> {
+        loop {
+            let Some(event) = self
+                .unrecorded_commits_lock()
+                .get(session)
+                .and_then(|waiting| waiting.first().cloned())
+            else {
+                return Ok(());
+            };
+            self.log.append(event)?;
+            let mut unrecorded = self.unrecorded_commits_lock();
+            if let Some(waiting) = unrecorded.get_mut(session) {
+                waiting.remove(0);
+                if waiting.is_empty() {
+                    unrecorded.remove(session);
+                }
+            }
+        }
+    }
+
+    fn unrecorded_commits_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<SessionId, Vec<NewEvent>>> {
+        self.unrecorded_commits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn handle(
