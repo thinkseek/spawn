@@ -714,7 +714,8 @@ mod tests {
             let gate = FakeGate::new(&body);
             assert!(
                 matches!(
-                    gate.judge(&path_only()),
+                    // Room to spare, whatever this host has.
+                    gate.judge_room(&path_only(), &std::env::temp_dir(), Some(u64::MAX)),
                     Err(GateFailure::Aborted { ref reason, .. }) if reason.contains("exit status: 5")
                 ),
                 "{body}"
