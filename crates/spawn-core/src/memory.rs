@@ -14,12 +14,12 @@ use crate::event::{
     Appended, EventKind, EventRecord, Fork, GlobalPosition, NewEvent, SessionSeq, Source,
 };
 use crate::id::{
-    BranchName, CommandId, CommitId, IdempotencyKey, Principal, SessionId, TerminalName,
-    WorkspaceId,
+    AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
+    TerminalName, WorkspaceId,
 };
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT, StoreError,
-    TerminalError, TerminalHost, WorkspaceError, WorkspaceStore,
+    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT,
+    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -90,9 +90,46 @@ struct State {
     /// Engines that exit at the next liveness check: the file is written
     /// and the terminal closes then, between the Bridge's two reads.
     exits_on_check: HashMap<TerminalName, (String, Vec<u8>)>,
+    /// The transcript archive: per agent and native session, its copies.
+    transcripts: HashMap<(AgentId, String), Vec<Vec<u8>>>,
 }
 
 impl State {
+    /// The session's latest execution when it has no end the Bridge wrote:
+    /// a start of another is refused, as `spawn_append_trusted` refuses it.
+    fn open_execution(&self, session: &SessionId) -> Option<ExecutionId> {
+        let (index, started) =
+            self.events
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, record)| {
+                    let event = &record.event;
+                    let started = event.execution_id.as_ref()?;
+                    (event.session_id == *session
+                        && matches!(event.kind, EventKind::ExecutionStarted { .. }))
+                    .then_some((index, started))
+                })?;
+        let ended = self.events[index + 1..].iter().any(|record| {
+            record.event.session_id == *session
+                && record.event.source == Source::Bridge
+                && record.event.execution_id.as_ref() == Some(started)
+                && matches!(record.event.kind, EventKind::ExecutionEnded { .. })
+        });
+        (!ended).then(|| started.clone())
+    }
+
+    /// Whether `event` repeats a stored `(session, source, key)`.
+    fn repeats(&self, event: &NewEvent) -> bool {
+        event.source_event_id.as_deref().is_some_and(|key| {
+            self.events.iter().any(|record| {
+                record.event.session_id == event.session_id
+                    && record.event.source == event.source
+                    && record.event.source_event_id.as_deref() == Some(key)
+            })
+        })
+    }
+
     fn insert(&mut self, event: NewEvent, now: Timestamp) -> (EventRecord, bool) {
         if let Some(key) = event.source_event_id.as_deref() {
             let repeated = self.events.iter().find(|record| {
@@ -168,6 +205,18 @@ impl MemoryStore {
             .extend_from_slice(bytes.as_bytes());
     }
 
+    /// Replace a file the terminal host can read, as an engine that
+    /// rewrites or truncates it would. Test helper.
+    pub fn replace_file(&self, path: &str, bytes: &[u8]) {
+        self.lock().files.insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// Delete a file the terminal host can read, as Claude Code's cleanup
+    /// would. Test helper.
+    pub fn remove_file(&self, path: &str) {
+        self.lock().files.remove(path);
+    }
+
     /// What `merge_base` answers from now on (a merge moves the branch to
     /// its commit). Test helper.
     pub fn set_base_merge(&self, merge: BaseMerge) {
@@ -224,7 +273,8 @@ impl MemoryStore {
 }
 
 impl EventLog for MemoryStore {
-    fn append(&self, event: NewEvent) -> Result<Appended, StoreError> {
+    fn append(&self, mut event: NewEvent) -> Result<Appended, StoreError> {
+        crate::redact::redact_event(&mut event.kind);
         let now = self.clock.now();
         let mut state = self.lock();
         let branch_record = matches!(
@@ -239,6 +289,15 @@ impl EventLog for MemoryStore {
             return Err(StoreError::Backend(
                 "the log refuses this record".to_string(),
             ));
+        }
+        if matches!(event.kind, EventKind::ExecutionStarted { .. })
+            && !state.repeats(&event)
+            && let Some(open) = state.open_execution(&event.session_id)
+        {
+            return Err(StoreError::Rejected(format!(
+                "session {} already runs execution {open}",
+                event.session_id
+            )));
         }
         let (record, inserted) = state.insert(event, now);
         Ok(Appended { record, inserted })
@@ -343,7 +402,7 @@ impl CommandQueue for MemoryStore {
         let mut state = self.lock();
         let failure = match outcome {
             Outcome::Succeeded => None,
-            Outcome::Failed(reason) => Some(reason.clone()),
+            Outcome::Failed(reason) => Some(crate::redact::redact(reason)),
         };
         let (agent_id, session_id) = {
             let row = state
@@ -633,6 +692,20 @@ impl TerminalHost for MemoryStore {
         }))
     }
 
+    fn write_new(
+        &self,
+        _workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<bool, TerminalError> {
+        let mut state = self.lock();
+        if state.files.contains_key(path) {
+            return Ok(false);
+        }
+        state.files.insert(path.to_string(), bytes.to_vec());
+        Ok(true)
+    }
+
     fn terminate(
         &self,
         terminal: &TerminalName,
@@ -650,6 +723,71 @@ fn stale_refusal() -> WorkspaceError {
     WorkspaceError::Refused {
         code: crate::port::WORKSPACE_STALE.to_string(),
         message: "kept off the branch".to_string(),
+    }
+}
+
+impl TranscriptArchive for MemoryStore {
+    fn copies(&self, agent: &AgentId, native: &str) -> Result<Vec<u64>, ArchiveError> {
+        Ok(self
+            .lock()
+            .transcripts
+            .get(&(agent.clone(), native.to_string()))
+            .map(|copies| {
+                copies
+                    .iter()
+                    .map(|copy| u64::try_from(copy.len()).unwrap_or(u64::MAX))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn read(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>, ArchiveError> {
+        let state = self.lock();
+        let bytes = state
+            .transcripts
+            .get(&(agent.clone(), native.to_string()))
+            .and_then(|copies| copies.get(copy))
+            .ok_or_else(|| ArchiveError(format!("no copy {copy} of {native}")))?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        Ok(bytes[start..bytes.len().min(start.saturating_add(limit))].to_vec())
+    }
+
+    fn append(
+        &self,
+        agent: &AgentId,
+        native: &str,
+        copy: usize,
+        at: u64,
+        bytes: &[u8],
+    ) -> Result<(), ArchiveError> {
+        let mut state = self.lock();
+        let copies = state
+            .transcripts
+            .entry((agent.clone(), native.to_string()))
+            .or_default();
+        if copy == copies.len() {
+            copies.push(Vec::new());
+        }
+        let held = copies
+            .get_mut(copy)
+            .ok_or_else(|| ArchiveError(format!("copy {copy} of {native} is past the next")))?;
+        if u64::try_from(held.len()).unwrap_or(u64::MAX) != at {
+            return Err(ArchiveError(format!(
+                "copy {copy} of {native} holds {} bytes, not {at}",
+                held.len()
+            )));
+        }
+        held.extend_from_slice(bytes);
+        Ok(())
     }
 }
 

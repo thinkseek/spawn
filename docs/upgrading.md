@@ -67,7 +67,10 @@ These are not about process lifetime. They break when two versions meet.
    reader does not know (a source since removed, such as `layerfs` or
    `codex`) is skipped with one warning per name, and the timeline shows it
    as stored, so removing a writer stops no reader. An `engine` field is
-   text, read whatever it names.
+   text, read whatever it names. A field added to a variant is optional
+   (`serde(default)`, left out when unset), so a record from before it
+   reads, and a reader from before it ignores it: `session.native_started`
+   gained `engine_version` this way.
 2. **The schema.** `migrate()` runs `create or replace` on every connect. An
    additive column or view is safe for a reader built before it. A removed or renamed
    column is not. `spawn loop` holds one connection, so a migrated schema takes
@@ -75,7 +78,12 @@ These are not about process lifetime. They break when two versions meet.
 3. **The SQL functions.** `spawn_append`, `spawn_submit`, `spawn_claim` and
    `spawn_finish` keep the ordering guarantees. A running transaction sees one
    version of a function, so replacing them mid-transaction is safe; a change
-   to their meaning is not.
+   to their meaning is not. `spawn_append` refuses an `execution.started`
+   while the session's latest execution has no Bridge-written end
+   (`StoreError::Rejected`): a Bridge that handles the refusal fails that
+   start; one built before it would fail the whole tick, but it never
+   starts a second execution of a session it knows runs one, so it meets
+   the refusal only when two Bridges race.
 4. **The runner's files.** A running runner is the binary it was started
    with. It writes the exit code to `SPAWN_EXIT_FILE` (`.spawn/exit-<execution>`
    in the workspace); the Bridge reads it, so its path and format must stay
