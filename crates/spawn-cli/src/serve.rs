@@ -582,14 +582,16 @@ fn rsi_summary(mission: &Value) -> Value {
             .filter(|objective| objective["status"] == status)
             .count()
     };
+    // In a mission with a gate, accepted work still waits for the gate and
+    // then lands: the task is open until it landed (or was cancelled).
+    let gated = !mission["gate"].is_null();
     let open_task = mission["tasks"].as_array().and_then(|tasks| {
         tasks
             .iter()
-            .find(|task| {
-                !matches!(
-                    task["state"].as_str(),
-                    Some("landed" | "cancelled" | "accepted") | None
-                )
+            .find(|task| match task["state"].as_str() {
+                Some("landed" | "cancelled") | None => false,
+                Some("accepted") => gated,
+                Some(_) => true,
             })
             .map(|task| {
                 json!({
@@ -1136,10 +1138,31 @@ mod tests {
         let summary = rsi_summary(&mission);
         assert_eq!(summary["mission"], 4);
         assert_eq!(summary["open_task"]["id"], 13);
+        assert_eq!(summary["open_task"]["session_id"], "session_resident_rsi");
         assert_eq!(summary["open_task"]["last_verdict"], "rejected");
         assert_eq!(
             summary["objectives"],
             json!({"open": 1, "solved": 1, "met": 1})
         );
+    }
+
+    #[test]
+    fn accepted_work_waiting_for_the_gate_is_the_open_task() {
+        let mission = |gate: serde_json::Value, state: &str| {
+            json!({
+                "id": 4, "halted": null, "gate": gate, "objectives": [],
+                "tasks": [task(14, 3, state, 50, None), task(12, 2, "landed", 30, None)],
+            })
+        };
+        for state in ["accepted", "landing"] {
+            let summary = rsi_summary(&mission(json!("/srv/rsi/scenarios"), state));
+            assert_eq!(summary["open_task"]["id"], 14, "{state}");
+            assert_eq!(summary["open_task"]["state"], state);
+        }
+        // Without a gate, acceptance is the end.
+        let summary = rsi_summary(&mission(serde_json::Value::Null, "accepted"));
+        assert!(summary["open_task"].is_null());
+        let summary = rsi_summary(&mission(json!("/srv/rsi/scenarios"), "cancelled"));
+        assert!(summary["open_task"].is_null());
     }
 }
