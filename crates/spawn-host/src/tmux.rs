@@ -118,6 +118,15 @@ impl TmuxHost {
 
 /// Run `words`, inside the workspace when `prefix` is not empty.
 fn run_words(prefix: &[String], words: &[String]) -> Result<Run, TerminalError> {
+    run_words_with_input(prefix, words, None)
+}
+
+/// [`run_words`], with `input` on the command's standard input.
+fn run_words_with_input(
+    prefix: &[String],
+    words: &[String],
+    input: Option<&[u8]>,
+) -> Result<Run, TerminalError> {
     let mut command = match prefix.split_first() {
         None => {
             let mut command = Command::new(&words[0]);
@@ -137,9 +146,26 @@ fn run_words(prefix: &[String], words: &[String]) -> Result<Run, TerminalError> 
             command.env_remove(name);
         }
     }
-    let output = command
-        .output()
-        .map_err(|error| TerminalError(format!("run {}: {error}", words[0])))?;
+    let failed = |error: std::io::Error| TerminalError(format!("run {}: {error}", words[0]));
+    let output = match input {
+        None => command.output().map_err(failed)?,
+        Some(input) => {
+            use std::io::Write;
+            let mut child = command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(failed)?;
+            let written = child
+                .stdin
+                .take()
+                .map_or(Ok(()), |mut stdin| stdin.write_all(input));
+            let output = child.wait_with_output().map_err(failed)?;
+            written.map_err(failed)?;
+            output
+        }
+    };
     Ok(Run {
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -392,6 +418,81 @@ impl TerminalHost for TmuxHost {
                 run.stderr.trim()
             ))),
         }
+    }
+
+    fn write_new(
+        &self,
+        workspace: &WorkspaceId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<bool, TerminalError> {
+        let prefix = self.prefix(workspace);
+        if prefix.is_empty() {
+            return write_local(path, bytes);
+        }
+        // Inside the workspace's container, as `write_local` does it: a
+        // file already there exits 3; the bytes come on standard input.
+        let script = format!(
+            "test -e {path} || test -L {path} && exit 3; \
+             d=$(dirname {path}) && mkdir -p \"$d\" || exit 1; \
+             t=\"$d/.spawn-write-$$\"; rm -f \"$t\"; \
+             cat >\"$t\" && ln \"$t\" {path}; s=$?; rm -f \"$t\"; exit $s",
+            path = spawn_core::shell::shell_quote(path)
+        );
+        let words = vec!["sh".to_string(), "-c".to_string(), script];
+        let bounded: Vec<String> = ["timeout", "60"]
+            .into_iter()
+            .map(String::from)
+            .chain(prefix)
+            .collect();
+        let run = run_words_with_input(&bounded, &words, Some(bytes))?;
+        match run.code {
+            Some(0) => Ok(true),
+            Some(3) => Ok(false),
+            other => Err(TerminalError(format!(
+                "write {path} returned {other:?}: {}",
+                run.stderr.trim()
+            ))),
+        }
+    }
+}
+
+/// Create `path` holding `bytes` unless something is there: whether it was
+/// written. The bytes go to a temporary file beside it first, made durable,
+/// and a hard link puts it in place, which never replaces an existing file:
+/// the file appears whole or not at all.
+fn write_local(path: &str, bytes: &[u8]) -> Result<bool, TerminalError> {
+    use std::io::Write;
+    let target = std::path::Path::new(path);
+    if target.symlink_metadata().is_ok() {
+        return Ok(false);
+    }
+    let failed =
+        |what: &str, error: std::io::Error| TerminalError(format!("{what} {path}: {error}"));
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(TerminalError(format!("{path} names no file")));
+    };
+    std::fs::create_dir_all(parent).map_err(|error| failed("create the directory of", error))?;
+    let temporary = parent.join(format!(
+        ".{}.spawn-write-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temporary);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        });
+    let linked = written.and_then(|()| std::fs::hard_link(&temporary, target));
+    let _ = std::fs::remove_file(&temporary);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(failed("write", error)),
     }
 }
 

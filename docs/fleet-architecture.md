@@ -217,7 +217,8 @@ the system. Its continuity is a design requirement, not a best effort:
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
 | The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff |
 | The machine reboots | tmux is gone, so the execution is `Lost`; the same rule resumes it from the native transcript |
-| The native session cannot be resumed (transcript lost, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
+| A transcript Claude Code deleted (or a container took with it) | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
+| The native session cannot be resumed (transcript lost with no copy, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
 | The supervisor hangs or loops | Its own observations (rules, then Jev) flag `stuck`; that goes to a human, never to an automatic stop |
 
@@ -388,7 +389,7 @@ Known edges, each with its rule:
 | Edge | Rule |
 | --- | --- |
 | The UI's live terminal reads tmux | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
-| The supervisor's native transcript lives on the host (`~/.claude`) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
+| The supervisor's native transcript lives on the host (`~/.claude`, copied to the host's transcript archive) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
 | Code lives in git | Artifact storage; every commit is referenced from an event |
 
 - The event log is the only state; every process is restartable.

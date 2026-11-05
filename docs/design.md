@@ -22,7 +22,7 @@ spawn-core
         ↑ 只有 spawn-cli 依赖全部实现层
 ```
 
-`spawn-core` 的 14 个模块：`bridge`、`command`、`contract`、`event`、`id`、`ingest`、`memory`、`mission`、`observation`、`observe`、`port`、`screen`、`shell`、`time`。
+`spawn-core` 的 16 个模块：`bridge`、`command`、`contract`、`event`、`id`、`ingest`、`memory`、`mission`、`observation`、`observe`、`port`、`redact`、`screen`、`shell`、`time`、`transcripts`。
 
 ## 2. 身份与 ID
 
@@ -59,7 +59,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 
 | 事件名 | 产生方 | 载荷 |
 | --- | --- | --- |
-| `session.native_started` | Bridge（新会话由它命名） | engine、native_session_id、transcript_path |
+| `session.native_started` | Bridge（新会话由它命名，引擎启动前记，不带版本）；会话记录（每个执行读到的第一行带 `version` 的会话记录行，键 `<exec>:engine_version`，恢复也记） | engine、native_session_id、transcript_path；可选 engine_version（引擎版本，取自 Claude Code 写在会话记录行上的 `version`；旧记录没有它照样能读，未设时不写） |
 | `session.native_ended` | 无；保留它以读取日志里已有的行 | reason |
 | `session.linked` | Bridge | parent_session_id |
 | `message.received` | 会话记录（transcript） | 无 |
@@ -86,9 +86,11 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 
 去重：`(session_id, source, source_event_id)` 唯一。Bridge 重读同一会话记录行返回既有记录，`inserted = false`。
 
+脱敏：日志保存的自由文本（`tool.failed`、`turn.failed`、`execution.end_stalled`、`command.finished` 的 error，`screen.observed` 的 evidence，`observation.recorded` 里 observation 的 human_question、attention_reason 与 evidence 中的字符串）在追加前经 `spawn_core::redact::redact_event` 处理：`sk-…`、`ghp_…`（及 GitHub 其他 `gh?_` token）、`github_pat_…`、`AKIA…` 形状的密钥，`Bearer <token>` 的 token，`x-api-key` 头的值，URL userinfo 里的密码（`scheme://user:[redacted]@`），以及名字以 `PASSWORD`、`PASSWD`、`TOKEN`、`SECRET`、`KEY` 结尾（不分大小写）的赋值的值，都换成 `[redacted]`。两个存储（PostgreSQL 与内存实现）都在 `append` 与 `finish` 里做，任何写入方都绕不过去；标识符、路径和 `control.recorded`（任务源 URL、提示词会被折叠读回）不动。
+
 ## 4. 端口契约
 
-`spawn-core::port` 定义五个 trait 与错误类型。
+`spawn-core::port` 定义六个 trait 与错误类型。
 
 | trait | 方法 | 语义 |
 | --- | --- | --- |
@@ -100,7 +102,8 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进空闲工作区的分支：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
 | `ChunkStore` | `put`、`get`、`contains` | 按内容寻址的大文件对象存储：对象以其字节的哈希命名，写一次、不改，读时校验；`put` 遇到已有对象先校验，损坏的原子替换（修复，不是修改）（见 [storage.md](./storage.md)） |
-| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`capture_tail`、`read_from`、`terminate` | 终端生命周期、屏尾读取与读取引擎写的文件；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
+| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`capture_tail`、`read_from`、`write_new`、`terminate` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
+| `TranscriptArchive` | `copies`、`read`、`append(copy, at, bytes)` | 原生会话记录的存档（见 [storage.md](./storage.md#the-transcript-archive)）：每个 agent 的每个原生会话有编号的副本，副本只增长，`at` 不等于副本当前长度的追加被拒，已存的字节从不改写；本地实现在 `<root>/.transcripts` |
 
 错误类型：
 
@@ -109,6 +112,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `StoreError` | `LeaseLost{command,attempt}`、`Rejected`、`Corrupt`、`Backend` |
 | `WorkspaceError` | `Refused{code,message}`、`Unavailable` |
 | `TerminalError` | 单字段消息 |
+| `ArchiveError` | 单字段消息 |
 
 并发规则：`append` 串行化；PG 实现用 `pg_advisory_xact_lock` 保证同库写入顺序，并用唯一索引兜底。
 
@@ -152,7 +156,11 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行；其他来源的同名事件只是退出报告（`agent_executions.exit_reported`）。
 
+每会话一个活跃执行由日志保证，不只靠 Bridge 的内存：`Start`/`Resume` 先追上日志再查内存，日志的追加再查一次（`spawn_append_trusted`，内存实现同样）：会话最近一次执行还没有 Bridge 写的结束时拒绝 `execution.started`。被拒的启动以日志给的原因失败，卸载自己刚挂的工作区（那正是另一个执行的工作区时不卸载），不启动终端。runner 的退出报告不算结束；丢失的执行由下一个 tick 写 `execution.ended`（cause `lost`）后，会话即可再启动或恢复。
+
 恢复：每次 `spawn tick` 是新进程，从位置 0 折叠全部事件得到活跃执行、原生会话 id 与待提交的 checkpoint。`Resume` 复用最新原生会话 id，新开 Execution 与 mount，优先 `--resume`；逻辑 Session 不变。
+
+会话记录存档（`spawn_core::transcripts`）：每次 `turn_stopped` 的 checkpoint 之后、结束流程里 `terminate` 之后 `unmount` 之前，Bridge 把会话记录自上次复制以来新增的字节追加进 `TranscriptArchive`；最后复制的 4 KiB 与文件同一位置不一致（被截短、改写或替换）时整份复制成下一个副本，旧副本不动。`Resume` 在 mount 之后、启动终端之前检查会话记录：缺失时从最新副本恢复（tick 报告里警告）；缺失且没有副本、而日志里有从它读出的事件时，恢复失败并卸载，不在旧 id 下空白启动。日志不存会话记录内容，也不记复制。
 
 ## 6. 屏尾判定
 
@@ -241,7 +249,7 @@ Observer 每次 tick：
 | 函数 | 返回 | 说明 |
 | --- | --- | --- |
 | `spawn_now_ms()` | `bigint` | 单一时间源 |
-| `spawn_append(...)` | `out_id`、`out_seq`、`out_at`、`out_inserted` | 事务内取序号并插入，`pg_advisory_xact_lock(1399957335)` 串行化 |
+| `spawn_append(...)` | `out_id`、`out_seq`、`out_at`、`out_inserted` | 事务内取序号并插入，`pg_advisory_xact_lock(1399957335)` 串行化；会话最近一次 `execution.started` 之后还没有 Bridge 写的同一执行的 `execution.ended` 时，再一条 `execution.started` 被拒（`23P01`，`StoreError::Rejected`），同键重放照旧返回既有记录 |
 | `spawn_submit(...)` | `out_id` | 幂等插入并写 `command.accepted` |
 | `spawn_claim(worker, ttl_ms)` | `out_id`、`out_attempt`、`out_agent`、`out_session`、`out_action` | `for update skip locked`，单会话串行，过期租约 attempt+1 |
 | `spawn_finish(command, attempt, succeeded, error)` | `done`、`already`、`stale`、`missing` | 旧 attempt 结束被拒 |

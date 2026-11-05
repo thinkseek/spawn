@@ -220,6 +220,8 @@ declare
     v_id  bigint;
     v_at  bigint;
     v_owned text;
+    v_open text;
+    v_open_id bigint;
     -- Only the Observer's judgement is the projected state.
     v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded' and p_source = 'observer';
 begin
@@ -255,6 +257,27 @@ begin
         if v_owned is distinct from p_agent then
             raise exception 'session % belongs to agent %, not %', p_session, v_owned, p_agent
                 using errcode = '42501';
+        end if;
+    end if;
+
+    -- One active execution per session, held here and not only in a
+    -- Bridge's memory: a start is refused while the session's latest
+    -- execution has no end the Bridge wrote (a runner's exit report is no
+    -- end; a lost execution gets its end from the next tick).
+    if p_kind ->> 'name' = 'execution.started' then
+        select e.id, e.execution_id into v_open_id, v_open
+          from spawn_events e
+         where e.session_id = p_session and e.event_name = 'execution.started'
+           and e.execution_id is not null
+         order by e.id desc
+         limit 1;
+        if v_open is not null and not exists (
+            select 1 from spawn_events x
+             where x.session_id = p_session and x.event_name = 'execution.ended'
+               and x.execution_id = v_open and x.source = 'bridge' and x.id > v_open_id
+        ) then
+            raise exception 'session % already runs execution %', p_session, v_open
+                using errcode = '23P01';
         end if;
     end if;
 

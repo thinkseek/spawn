@@ -152,7 +152,10 @@ pub struct Fork {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "detail")]
 pub enum EventKind {
-    /// A native engine session started or resumed.
+    /// A native engine session started or resumed. The Bridge records a
+    /// new session before its engine starts, without a version; each
+    /// execution's first transcript line that names the engine's version
+    /// records the session again with it (a resume included).
     #[serde(rename = "session.native_started")]
     NativeSessionStarted {
         /// Engine that owns the native session: [`ENGINE`].
@@ -161,6 +164,11 @@ pub enum EventKind {
         native_session_id: String,
         /// Transcript path when the engine reports one.
         transcript_path: Option<String>,
+        /// The engine's version, as its transcript names it (Claude Code's
+        /// `version` field); unset when not read yet, and in records from
+        /// before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine_version: Option<String>,
     },
     /// A native engine session ended.
     #[serde(rename = "session.native_ended")]

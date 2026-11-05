@@ -34,7 +34,8 @@ pub(crate) const READ_GLOBAL: &str = concat!(
 );
 
 impl EventLog for PostgresStore {
-    fn append(&self, event: NewEvent) -> Result<Appended, StoreError> {
+    fn append(&self, mut event: NewEvent) -> Result<Appended, StoreError> {
+        spawn_core::redact::redact_event(&mut event.kind);
         let kind = serde_json::to_value(&event.kind).map_err(corrupt)?;
         let row = self.query_one(
             APPEND,
