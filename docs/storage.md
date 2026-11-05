@@ -39,6 +39,15 @@ head alone is the whole workspace, so everything below is a git operation.
 - **Checkpoint** (every tool call, turn end, exit): the Bridge commits the
   tree against the kept index (a stat cache: only changed files are hashed).
   Cost is proportional to what changed.
+- **A turn's checkpoint is part of the turn's end.** When the Bridge reads a
+  turn's end from the transcript, it commits the workspace and records the
+  `artifact.committed` first, then the `turn.stopped` (or `turn.failed`),
+  in the same tick. A commit that fails holds the line back: the end is
+  recorded only once the commit works. A turn that changed nothing has no
+  new commit and no `artifact.committed`: its checkpoint is the branch head
+  as it stands (the agent's latest `artifact.committed`). So whoever reads a
+  turn's end from the log, wherever it runs, also finds the checkpoint of
+  what the turn wrote.
 - **Branch**: `refs/heads/<agent>`, moved by compare-and-swap on the old
   commit. A checkpoint or merge removes git's own `<index>.lock` under the
   branch's lock before it runs git on the index: one that is there was
@@ -174,7 +183,22 @@ head alone is the whole workspace, so everything below is a git operation.
   back to `reported` (`accepted` under review), no rejection is counted,
   nothing reaches the worker, and a later pass judges again once the pusher
   has caught up. An agent with neither a checkpoint nor a pushed branch is
-  rejected ("the worker has no branch to land"). So only a source that is a
+  rejected ("the worker has no branch to land"). **A report is judged
+  against the checkpoint of the turn that produced it.** The dispatcher
+  collects a report only once the session's latest turn event in the log is
+  a turn's end (`turn.stopped` or `turn.failed`, not a newer
+  `message.received`; a ready screen alone is not enough), with the worker
+  live, no command open and its latest judgement `TurnStoppedIdle` (the
+  judgement may be older than the turn's end: an Observer with no model
+  judge writes again only when its verdict changes). Its `task.reported`
+  record names in `commit` the agent's latest checkpoint read with that
+  turn's end (`spawn_task_reported(task, report, commit)`; null only when
+  the agent has no checkpoint at all, and from the two-argument form). The
+  pushed head must also be that commit or a descendant of it, or the task
+  is gated `stale` as above; a report that names a commit is never judged
+  for lack of a checkpoint (the branch pushed at the mount is only the
+  task's base). A report with a null commit is judged by the rule above
+  alone. So only a source that is a
   directory on this host has its agents' work landed: a gate on any other
   source is refused when it is configured, and a mission gated on one
   before that is halted by the integrator. The
