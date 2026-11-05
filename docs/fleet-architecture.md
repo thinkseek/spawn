@@ -189,8 +189,9 @@ it, on the same ladder.
   attention, and a finished execution nobody stopped all
   escalate. Escalations coalesce into one digest typed into the supervisor
   while it is idle. The dispatcher keeps no state: idempotency keys mark its
-  nudges and resumes, and a `[spawn:esc <session> <id>]` marker per item in
-  each delivered digest marks what the supervisor was told.
+  nudges and resumes, and the tags a delivered digest files on its command
+  (`<session> <id>` per item, never in the text, which quotes workers'
+  reports) mark what the supervisor was told.
 - **Supervisor**: one perpetual Claude Code session (`agent_supervisor`).
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
@@ -289,10 +290,15 @@ tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
 kind, assignee, model profile, state and report.
 
-**Mission sources.** A mission names its source: any git repository (a path
-or a URL), mirrored into `$SPAWN_WORKSPACE_ROOT/.sources/`, or none (an empty
-scratch repository). Each worker's workspace is a branch of that mirror.
-`SPAWN_GIT_REPO` is the repository of agents no mission owns.
+**Mission sources.** A mission names its source: a git repository, as an
+absolute path, an `https://` or `ssh://` URL, or ssh's `user@host:path`,
+mirrored into `$SPAWN_WORKSPACE_ROOT/.sources/`, or none (an empty scratch
+repository). Each worker's workspace is a branch of that mirror.
+`SPAWN_GIT_REPO` is the repository of agents no mission owns. A source is
+git run as the owner, so `spawn_mission_add` refuses any other shape (an
+`ext::` command, a relative path, an option), the supervisor may name only a
+source a human already gave a mission, and every git the controller runs
+allows only file, https and ssh (`GIT_ALLOW_PROTOCOL`).
 
 **Limits.** None fixed. The supervisor decides fleet size; humans stop what
 overreaches, and the UI shows the live workers.
@@ -482,9 +488,8 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
   retrying after a transient API error (both escalate), and the actions
   `restart` and `reassign`.
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
-- **The integrator judging an agent's work from its pushed branch**, and the
-  backlog, scenarios and gate versioned with the source, so work done on
-  another host lands too (docs/storage.md).
+- **The backlog, scenarios and gate versioned with the source**
+  (docs/storage.md).
 
 ## 10. One log, one landing path
 
@@ -577,6 +582,19 @@ the tree's own:
   6. records `task.landed`.
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
+- **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
+  mission is closed, or a task's resident retired, work goes on only where
+  it asks nothing new of a worker:
+  - a done mission with a gate keeps its delivered, reported, accepted and
+    landing tasks: reports still come in, are judged or reviewed, and land,
+    and a delivered task is still held to the budget;
+  - a retired resident's accepted and landing tasks still land;
+  - a dropped mission keeps nothing.
+
+  Every other open task is cancelled by the close or the retirement. The
+  integrator's selection uses the same rule, and no transition moves a task
+  into a state the rule drops: a send-back is refused, a gate rejection
+  cancels the task, and deliveries and reports are not recorded.
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
   - three gate aborts in a row;

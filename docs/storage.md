@@ -64,23 +64,18 @@ files, a chunk fetch.
   ignored). The start that creates a branch records where it began on
   `execution.started` (`fork: {from, commit}`; `from` is `main`, the start's
   `from`, or `spawn/<agent>`).
-- **Resume anywhere**: a host that starts an agent whose branch its mirror
-  lacks takes `spawn/<agent>` from the source when it is there; a local
-  branch another host moved on since is fast-forwarded (diverged: warned, the
-  local one stays). The chunk store is host-local, so a branch with large
-  files fails to mount on a host without its chunks (see "Not built").
-- **Central**: every branch that moved (a checkpoint commit, a merge, a new
-  branch) is pushed to the mission's source as `spawn/<agent>` without force
-  (two writers of one branch are caught: the push is refused and warned, not
-  overwritten), from a background pusher off the Bridge's loop: at most one
-  push per branch every 5 s, carrying the head as it is then, failures
-  retried with backoff, and what still waits pushed when the store drops (a
-  one-shot `spawn tick`). Only a source that is a directory on this host (the
-  central store) shares branches by default, both ways (pushes and adopting
-  `spawn/<agent>`): a remote may be public, and whoever can push `spawn/*`
-  there would choose an agent's starting tree. A remote URL shares branches
-  only when `SPAWN_PUSH_SOURCES` (comma-separated) names it exactly. Chunks
-  are not shared between hosts (see "Not built").
+- **One host**: a branch lives in this host's mirror. A start takes nothing
+  from the source but `main`; an agent's branch is never adopted from
+  another host (the owner's decision: Spawn runs on one host).
+- **Published for landing**: every branch that moved (a checkpoint commit, a
+  merge, a new branch) is pushed to the mission's source as `spawn/<agent>`
+  without force (a rewritten branch is refused and warned, not overwritten),
+  from a background pusher off the Bridge's loop: at most one push per
+  branch every 5 s, carrying the head as it is then, failures retried with
+  backoff, and what still waits pushed when the store drops (a one-shot
+  `spawn tick`). Only a source that is a directory on this host receives
+  branches: a remote may be public, and every agent commit would leave the
+  host.
 - **Main at a start or resume**: main reaches an agent's branch only when an
   execution starts or resumes, before its workspace is mounted, and never
   while an execution runs: nothing changes files under a running agent.
@@ -153,8 +148,8 @@ files, a chunk fetch.
   back to `reported` (`accepted` under review), no rejection is counted,
   nothing reaches the worker, and a later pass judges again once the pusher
   has caught up. An agent with neither a checkpoint nor a pushed branch is
-  rejected ("the worker has no branch to land"). So a remote source must
-  share branches (`SPAWN_PUSH_SOURCES`) for its agents' work to land. The
+  rejected ("the worker has no branch to land"). So only a source that is a
+  directory on this host has its agents' work landed. The
   rest is unchanged: a branch behind a moved `main` lands as the merge by
   `main`'s merge rules, marker blocks in the files the branch changes are
   gated `conflict`, a pending merge of `main` (it lives with the workspace

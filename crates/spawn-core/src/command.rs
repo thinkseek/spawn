@@ -35,6 +35,12 @@ pub enum CommandAction {
     Input {
         /// Text to submit.
         text: String,
+        /// What the sender files with this input to find it again (the
+        /// dispatcher: the escalations a digest delivers). Never typed: the
+        /// Bridge ignores them, and no reader takes them from the text, which
+        /// may quote anyone.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     /// Stop the running execution after a final checkpoint. While the
     /// checkpoint fails the workspace stays mounted and the stop is retried.

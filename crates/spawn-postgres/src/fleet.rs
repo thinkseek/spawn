@@ -138,9 +138,11 @@ select jsonb_build_object(
 /// What the dispatcher decides from: every worker session and the
 /// supervisor, with the latest judgement, the episode (latest command from
 /// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
-/// model profile of its latest execution, and what the dispatcher already
-/// sent there in the last day (its deliveries, however old: a delivery is
-/// confirmed from its command); `resumed_young` counts the executions its
+/// model profile of its latest execution, what the dispatcher already sent
+/// there in the last day (its deliveries, however old: a delivery is
+/// confirmed from its command), the tags of every input it delivered there
+/// (`told`: the escalations its digests carried, however long ago);
+/// `resumed_young` counts the executions its
 /// resumes started that died young (`died_young!`) since the session's last
 /// execution that did not.
 pub(crate) const DISPATCH_FACTS: &str = concat!(
@@ -178,6 +180,10 @@ from (
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and (c.created_at_ms > spawn_now_ms() - 86400000
              or c.idempotency_key like 'deliver-%')) as dispatched,
+    (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
+       from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
+      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array') as told,
     (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'

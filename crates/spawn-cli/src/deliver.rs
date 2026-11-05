@@ -53,10 +53,6 @@ const DELIVERY_MARKS: &str = ".spawn/deliveries";
 /// Retries of a failed delivery, after the first attempt.
 const DELIVERY_RETRIES: usize = 3;
 
-/// Retries of a delivery whose start failed because the task's source did
-/// not answer (an outage can last hours), after the first attempt.
-const SOURCE_RETRIES: usize = 8;
-
 /// Wait before the first retry; it doubles with every retry, up to
 /// [`RETRY_MAX_MS`].
 const RETRY_MS: i64 = 60_000;
@@ -319,7 +315,13 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 let key = format!("switch-model-{}-{}", task.id, task.revisions);
                 return Some(task.command(key, CommandAction::Stop));
             }
-            Some(task.delivery(key, CommandAction::Input { text: typed(task) }))
+            Some(task.delivery(
+                key,
+                CommandAction::Input {
+                    text: typed(task),
+                    tags: Vec::new(),
+                },
+            ))
         }
         // Ran before: resume, so a resident keeps its context.
         Some(facts) if facts.execution_id.is_some() => Some(task.delivery(
@@ -374,9 +376,8 @@ enum Attempts {
 
 /// Where `task`'s current delivery into `facts`' session stands. A failure
 /// that typed nothing is tried again under a key of its own, with a wait
-/// that doubles each time, [`DELIVERY_RETRIES`] times ([`SOURCE_RETRIES`]
-/// when the task's source did not answer). One that may have typed the
-/// task ([`MAY_HAVE_TYPED`]) is not.
+/// that doubles each time, [`DELIVERY_RETRIES`] times. One that may have
+/// typed the task ([`MAY_HAVE_TYPED`]) is not.
 fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
     let sent = delivery_attempts(task, facts);
     let Some(last) = sent.last() else {
@@ -393,12 +394,7 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
                      again",
                 );
             }
-            let retries = if error.contains(crate::sources::SOURCE_UNANSWERED) {
-                SOURCE_RETRIES
-            } else {
-                DELIVERY_RETRIES
-            };
-            if sent.len() > retries {
+            if sent.len() > DELIVERY_RETRIES {
                 return Attempts::Failed("never reached its worker; cancel it and assign it again");
             }
             let doublings = u32::try_from(sent.len() - 1).unwrap_or(u32::MAX).min(20);
@@ -618,8 +614,10 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             session_id: report.session_id.clone(),
             id: format!("report-{}-{}", report.id, report.revisions),
             why: Why::Report,
+            // The report is the worker's text, not the dispatcher's: framed
+            // as a quote, so an instruction in it reads as the worker's.
             line: format!(
-                "task #{} ({}, mission #{}): {}",
+                "task #{} ({}, mission #{}); the worker's report, quoted: «{}»",
                 report.id,
                 report.kind,
                 report.mission_id,
@@ -776,8 +774,8 @@ pub(crate) fn collect_reports(
 #[cfg(test)]
 mod tests {
     use super::{
-        DELIVERY_RETRIES, News, REPORT, SOURCE_RETRIES, TaskRow, Work, delivered, delivery_mark,
-        mark_delivery, news_items, report_contract, report_is_new, task_prompt,
+        DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery,
+        news_items, report_contract, report_is_new, task_prompt,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -834,6 +832,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            told: std::collections::BTreeSet::new(),
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
@@ -1112,7 +1111,7 @@ mod tests {
         revise.revisions = 1;
         let plan = orders(&work(vec![revise]), &[worker(true, true)]);
         assert_eq!(plan[0].key, "deliver-4-1");
-        let CommandAction::Input { text } = &plan[0].action else {
+        let CommandAction::Input { text, .. } = &plan[0].action else {
             panic!("typed");
         };
         assert!(text.contains("tests fail"));
@@ -1183,8 +1182,8 @@ mod tests {
             vec![Why::Mission, Why::Report, Why::Approved, Why::Human]
         );
         assert_eq!(
-            items[1].marker(),
-            "[spawn:esc session_worker_x_7 report-7-1]",
+            items[1].tag(),
+            "session_worker_x_7 report-7-1",
             "a report after a revision is news again"
         );
         assert!(items[1].line.contains("## Outcome done"));
@@ -1247,49 +1246,7 @@ mod tests {
         let items = news_items(&tasks, &rows(&facts));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
-        assert_eq!(
-            items[0].marker(),
-            "[spawn:esc session_resident_core deliver-4-0]"
-        );
-    }
-
-    /// A start the source did not answer is retried longer: an outage can
-    /// last hours.
-    #[test]
-    fn a_start_the_source_did_not_answer_is_retried_longer() {
-        let tasks = work(vec![task(4, TaskState::Assigned, "ephemeral")]);
-        let mut facts = worker(false, false);
-        facts.execution_id = None;
-        let unanswered = format!(
-            "ensure branch agent_worker_x: workspace unavailable: could not ask the source; {}",
-            crate::sources::SOURCE_UNANSWERED
-        );
-        facts
-            .dispatched
-            .push(sent(10, "deliver-4-0", 1_000, Some(&unanswered)));
-        for retry in 1..=DELIVERY_RETRIES {
-            facts.dispatched.push(sent(
-                10,
-                &format!("deliver-4-0-retry-{retry}"),
-                1_000,
-                Some(&unanswered),
-            ));
-        }
-        let rows = vec![facts.clone()];
-        let retry = super::orders(&tasks, &rows, i64::MAX / 2);
-        assert!(matches!(retry[0].action, CommandAction::Start { .. }));
-        assert!(news_items(&tasks, &rows).is_empty());
-        for retry in DELIVERY_RETRIES + 1..=SOURCE_RETRIES {
-            facts.dispatched.push(sent(
-                10,
-                &format!("deliver-4-0-retry-{retry}"),
-                1_000,
-                Some(&unanswered),
-            ));
-        }
-        let rows = vec![facts];
-        assert!(super::orders(&tasks, &rows, i64::MAX / 2).is_empty());
-        assert_eq!(news_items(&tasks, &rows)[0].why, Why::DeliveryFailed);
+        assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
     }
 
     /// A delivery that may have typed the task is not sent again: the

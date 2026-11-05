@@ -1358,7 +1358,7 @@ impl Bridge {
                 },
                 report,
             ),
-            CommandAction::Input { text } => self.input(claimed, &text),
+            CommandAction::Input { text, .. } => self.input(claimed, &text),
             CommandAction::Stop => self.stop(claimed, false, report),
             CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt, model } => {
@@ -1387,7 +1387,7 @@ impl Bridge {
         // Another Bridge may have started the session since this tick read
         // the log; the log refuses a second start either way.
         self.catch_up()?;
-        if let Some(outcome) = self.started_before(claimed, prompt) {
+        if let Some(outcome) = self.started_before(claimed, prompt, native.is_none()) {
             return outcome;
         }
         let model = model.unwrap_or_else(|| {
@@ -1493,6 +1493,7 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
+        fresh: bool,
     ) -> Result<Outcome, StoreError> {
         match self
             .terminals
@@ -1520,7 +1521,7 @@ impl Bridge {
             Typing::Unknown => {
                 self.abandon(claimed, active, format!("the prompt {MAY_HAVE_TYPED}"))
             }
-            Typing::Due => self.prompt_engine(claimed, active, prompt),
+            Typing::Due => self.prompt_engine(claimed, active, prompt, fresh),
         }
     }
 
@@ -1532,10 +1533,11 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         prompt: &str,
+        fresh: bool,
     ) -> Option<Result<Outcome, StoreError>> {
         if let Some(active) = self.running(&claimed.session_id) {
             if active.execution_id == ExecutionId::for_command(claimed.command_id) {
-                return Some(self.go_on_starting(claimed, &active, prompt));
+                return Some(self.go_on_starting(claimed, &active, prompt, fresh));
             }
             return Some(Ok(Outcome::Failed(format!(
                 "{} already runs an execution",
@@ -1652,19 +1654,21 @@ impl Bridge {
         if prompt.is_empty() {
             return Ok(Outcome::Succeeded);
         }
-        self.prompt_engine(claimed, active, prompt)
+        self.prompt_engine(claimed, active, prompt, native.is_none())
     }
 
-    /// Type a started engine's prompt. An engine that never got it must not
-    /// look alive (whoever started it would wait on it forever): it is
+    /// Type a started engine's prompt (`fresh`: a new native session, whose
+    /// directory may be new to the engine). An engine that never got it must
+    /// not look alive (whoever started it would wait on it forever): it is
     /// abandoned.
     fn prompt_engine(
         &mut self,
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
+        fresh: bool,
     ) -> Result<Outcome, StoreError> {
-        let outcome = self.type_prompt(claimed, active, prompt)?;
+        let outcome = self.type_prompt(claimed, active, prompt, fresh)?;
         if let Outcome::Failed(why) = outcome {
             return self.abandon(claimed, active, why);
         }
@@ -2040,9 +2044,17 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
+        fresh: bool,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
-        let mut trusted = false;
+        // Only a fresh session's directory can be new to the engine: a
+        // resume runs where its session ran, which was trusted then.
+        let mut trusted = !fresh;
+        // The trust dialog comes before the engine draws any prompt: once a
+        // prompt was seen, nothing on the pane is that dialog any more.
+        let mut prompt_seen = false;
+        // A dialog frame is answered only when the next read shows it again.
+        let mut dialog: Option<String> = None;
         // The trust dialog comes before the engine starts up, so answering it
         // restarts the budget instead of spending it.
         let mut attempt = 0;
@@ -2057,9 +2069,16 @@ impl Bridge {
             else {
                 return Ok(Outcome::Failed("terminal disappeared".to_string()));
             };
+            let reading = read_claude_screen(&pane);
+            prompt_seen |= reading.state != ScreenState::Unknown;
             // The Bridge exported this directory itself, so it trusts it.
-            // Answer once: a second answer would land in the input box.
-            if !trusted && is_trust_dialog(&pane) {
+            // Answer once (a second answer would land in the input box), and
+            // only the dialog itself: on two equal reads, before any prompt.
+            if !trusted && !prompt_seen && is_trust_dialog(&pane) {
+                if dialog.as_deref() != Some(pane.as_str()) {
+                    dialog = Some(pane);
+                    continue;
+                }
                 trusted = true;
                 if let Err(error) =
                     self.terminals
@@ -2070,7 +2089,7 @@ impl Bridge {
                 attempt = 1;
                 continue;
             }
-            let reading = read_claude_screen(&pane);
+            dialog = None;
             last = reading.state;
             if !reading.state.accepts_input() {
                 continue;

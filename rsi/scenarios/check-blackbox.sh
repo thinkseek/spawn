@@ -4,19 +4,14 @@
 set -eu
 : "${SPAWN_TEST_DATABASE_URL:?the black-box scenarios need SPAWN_TEST_DATABASE_URL}"
 controller=$(cd "$(dirname "$0")/../.." && pwd)
-url=$SPAWN_TEST_DATABASE_URL
-rest=${url#*://}
-credentials=${rest%%@*}
-address=${rest#*@}
-address=${address%%/*}
-PGUSER=${credentials%%:*}
-PGPASSWORD=${credentials#*:}
-# The host is an address or, in the gate's sandbox, a percent-encoded socket
-# directory (postgres://u:p@%2Fpath%2Fto%2Fdir/db); the port is optional.
-case "$address" in
-*:*) host=${address%:*} PGPORT=${address##*:} ;;
-*) host=$address PGPORT=5432 ;;
-esac
-PGHOST=$(printf '%s' "$host" | sed 's/%2[Ff]/\//g')
-export PGUSER PGPASSWORD PGHOST PGPORT
-SPAWN_PSQL=psql SPAWN_PG_BASE="${url%/*}" bash "$controller/scripts/blackbox/run-scenarios.sh"
+# psql's parameters and the server's URL, read from the test URL as libpq
+# reads it (scripts/pg-url.sh): a socket directory or an address (a name,
+# 127.0.0.1, [::1]), an optional port, a percent-encoded password.
+# shellcheck source=scripts/pg-url.sh
+. "$controller/scripts/pg-url.sh"
+if ! pg_url_export "$SPAWN_TEST_DATABASE_URL"; then
+    echo "check-blackbox: SPAWN_TEST_DATABASE_URL is not a single-host postgres:// URL" >&2
+    exit 2
+fi
+SPAWN_PSQL=psql SPAWN_PG_BASE=$(pg_url_server "$SPAWN_TEST_DATABASE_URL") \
+    bash "$controller/scripts/blackbox/run-scenarios.sh"

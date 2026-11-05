@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use super::SCREEN_STALE;
 use super::judge::{JudgeInput, TurnFact};
 use crate::event::{EndCause, EventKind, EventRecord, SessionSeq, Source};
-use crate::id::{AgentId, ExecutionId, SessionId};
+use crate::id::{AgentId, ExecutionId, SessionId, WorkspaceId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
 
@@ -15,6 +15,10 @@ pub(super) struct Snapshot {
     engine: Option<String>,
     /// The newest execution started.
     execution: Option<ExecutionId>,
+    /// Its workspace.
+    workspace: Option<WorkspaceId>,
+    /// The session's transcript, as its engine reported it.
+    transcript: Option<String>,
     pub(super) execution_active: bool,
     /// The current execution's end, whose final checkpoint keeps failing:
     /// its workspace stays mounted until someone acts.
@@ -65,18 +69,9 @@ impl Snapshot {
             self.permission_pending = false;
         }
         match &record.event.kind {
-            EventKind::ExecutionStarted { engine, .. } => {
-                self.engine = Some(engine.clone());
-                self.execution.clone_from(&record.event.execution_id);
-                self.execution_active = true;
-                self.stalled_end = None;
-                self.last_end = None;
-                self.exit_code = None;
-                self.open_tools.clear();
-                self.permission_pending = false;
-                self.screen = None;
-                self.turn = None;
-            }
+            EventKind::ExecutionStarted {
+                engine, workspace, ..
+            } => self.started(engine, workspace, record.event.execution_id.as_ref()),
             // A late end report of an older execution says nothing about
             // the current one.
             EventKind::ExecutionEnded { .. }
@@ -103,8 +98,15 @@ impl Snapshot {
                 self.screen = None;
                 self.permission_pending = false;
             }
-            EventKind::NativeSessionStarted { engine, .. } => {
+            EventKind::NativeSessionStarted {
+                engine,
+                transcript_path,
+                ..
+            } => {
                 self.engine = Some(engine.clone());
+                if let Some(path) = transcript_path {
+                    self.transcript = Some(path.clone());
+                }
             }
             EventKind::ToolStarted {
                 tool_name,
@@ -159,6 +161,30 @@ impl Snapshot {
         }
     }
 
+    /// A new execution: what the previous one showed is gone.
+    fn started(&mut self, engine: &str, workspace: &WorkspaceId, execution: Option<&ExecutionId>) {
+        self.engine = Some(engine.to_string());
+        self.workspace = Some(workspace.clone());
+        self.execution = execution.cloned();
+        self.execution_active = true;
+        self.stalled_end = None;
+        self.last_end = None;
+        self.exit_code = None;
+        self.open_tools.clear();
+        self.permission_pending = false;
+        self.screen = None;
+        self.turn = None;
+    }
+
+    /// The running execution's workspace and the session's transcript:
+    /// where the model's latest reply is read.
+    pub(super) fn transcript(&self) -> Option<(&WorkspaceId, &str)> {
+        if !self.execution_active {
+            return None;
+        }
+        Some((self.workspace.as_ref()?, self.transcript.as_deref()?))
+    }
+
     /// The judge input these facts make at `now`, before any context is
     /// attached.
     pub(super) fn input(
@@ -195,6 +221,7 @@ impl Snapshot {
             progress_ms: self.progress_at.map(since),
             task: None,
             screen_tail: None,
+            reply: None,
             perpetual: false,
         }
     }

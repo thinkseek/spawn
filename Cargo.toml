@@ -25,6 +25,7 @@ serde_json = "1"
 thiserror = "2"
 # Blocking client: Spawn has no async code path, so no runtime is linked.
 postgres = { version = "0.19", default-features = false, features = ["with-serde_json-1"] }
+postgres-protocol = { version = "0.6", default-features = false }
 # Already linked through the driver's SCRAM login; derive the role passwords
 # (PBKDF2-HMAC-SHA256).
 sha2 = "0.11"

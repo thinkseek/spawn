@@ -22,6 +22,8 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use spawn_core::event::SessionSeq;
@@ -79,17 +81,107 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
     let hosts = port
         .map(|port| server_hosts(&address, port))
         .unwrap_or_default();
+    let shared = Arc::new(Shared {
+        web,
+        token,
+        port,
+        hosts,
+    });
+    serve_requests(&server, &shared, MAX_IN_FLIGHT);
+    Ok(0)
+}
+
+/// Requests served at once. Each runs on its own thread, so a client that
+/// stops reading, a slow query or a slow pane holds one of these, never the
+/// server; one past them is answered 503 at once.
+const MAX_IN_FLIGHT: usize = 16;
+
+/// Longest one dashboard statement runs on the reader's connection.
+const STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What every request's handler reads.
+struct Shared {
+    web: PathBuf,
+    token: Option<String>,
+    port: Option<u16>,
+    hosts: Vec<String>,
+}
+
+/// Requests in flight, at most `limit`.
+struct Slots {
+    taken: AtomicUsize,
+    limit: usize,
+}
+
+/// One request's place among [`Slots`], given back when it is dropped.
+struct Slot(Arc<Slots>);
+
+impl Slots {
+    fn take(slots: &Arc<Self>) -> Option<Slot> {
+        slots
+            .taken
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
+                (taken < slots.limit).then_some(taken + 1)
+            })
+            .ok()
+            .map(|_| Slot(Arc::clone(slots)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.taken.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serve `server`'s requests until it closes: each on a thread of its own,
+/// at most `limit` at once, and 503 past them.
+fn serve_requests(server: &Server, shared: &Arc<Shared>, limit: usize) {
+    let slots = Arc::new(Slots {
+        taken: AtomicUsize::new(0),
+        limit,
+    });
     for request in server.incoming_requests() {
-        if let Err(error) = handle(request, &web, token.as_deref(), port, &hosts) {
-            eprintln!("serve: {error}");
+        let Some(slot) = Slots::take(&slots) else {
+            let busy = json_response(503, &json!({ "error": "busy: too many requests at once" }));
+            if let Err(error) = request.respond(busy) {
+                eprintln!("serve: {error}");
+            }
+            continue;
+        };
+        let shared = Arc::clone(shared);
+        let spawned = std::thread::Builder::new()
+            .name("serve-request".to_string())
+            .spawn(move || {
+                let _slot = slot;
+                if let Err(error) = handle(
+                    request,
+                    &shared.web,
+                    shared.token.as_deref(),
+                    shared.port,
+                    &shared.hosts,
+                ) {
+                    eprintln!("serve: {error}");
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("serve: no thread for a request: {error}");
         }
     }
-    Ok(0)
 }
 
 /// The token every API request must carry, if any: whatever
 /// `SPAWN_SERVE_TOKEN` holds. An address that is not loopback needs one.
 fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, String> {
+    if let Some(token) = &token
+        && !is_header_safe_token(token)
+    {
+        return Err(format!(
+            "refusing to serve with this SPAWN_SERVE_TOKEN: a token is 1 to {MAX_TOKEN_LEN} \
+             visible ASCII characters (no space, newline or other byte), so a browser can send \
+             it as a header (web/src/token.ts holds the same rule)"
+        ));
+    }
     if token.is_none() && !is_loopback(address) {
         return Err(format!(
             "refusing to serve on {address} without SPAWN_SERVE_TOKEN; \
@@ -215,6 +307,16 @@ fn owners_own_request(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
     local_exemption(true, peer, uid, owner_uid())
 }
 
+/// Longest token `serve` accepts, and the UI sends.
+const MAX_TOKEN_LEN: usize = 512;
+
+/// Whether `token` is one the UI can send as `Authorization: Bearer`:
+/// 1 to [`MAX_TOKEN_LEN`] visible ASCII characters (`web/src/token.ts`,
+/// `TOKEN_PATTERN`, is the same rule).
+fn is_header_safe_token(token: &str) -> bool {
+    (1..=MAX_TOKEN_LEN).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 /// Whether every address `address` resolves to is a loopback one. An
 /// address that does not resolve counts as public.
 fn is_loopback(address: &str) -> bool {
@@ -322,7 +424,8 @@ fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
         Some(url) => url,
         None => spawn_postgres::role_url(&controller, "spawn_reader")?,
     };
-    spawn_postgres::PostgresStore::connect(&url).map_err(|error| error.to_string())
+    spawn_postgres::PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
+        .map_err(|error| error.to_string())
 }
 
 fn handle(
@@ -972,9 +1075,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ProcSocket, access_token, handle, is_loopback, local_exemption, objective_json, owner_uid,
-        peer_uid, proc_sockets, rsi_summary, same_secret, server_hosts, tokenless_request,
-        with_last_gates,
+        Arc, ProcSocket, Shared, access_token, handle, is_loopback, local_exemption,
+        objective_json, owner_uid, peer_uid, proc_sockets, rsi_summary, same_secret,
+        serve_requests, server_hosts, tokenless_request, with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1211,6 +1314,38 @@ mod tests {
         );
     }
 
+    /// Audit L11: a token the browser could never send as a header is
+    /// refused at start, the same rule as the UI's (web/src/token.ts).
+    #[test]
+    fn serve_refuses_a_token_no_browser_can_send() {
+        for good in [
+            "t",
+            "bb-serve-token-1",
+            &"a".repeat(512),
+            "!~#%&*+-./:=?@^_|",
+        ] {
+            assert!(
+                access_token("0.0.0.0:8787", Some(good.to_string())).is_ok(),
+                "{good}"
+            );
+        }
+        for bad in [
+            "",
+            "a b",
+            "a\nb",
+            "a\rb",
+            "a\u{0}b",
+            "a\tb",
+            "令牌",
+            "café",
+            &"a".repeat(513),
+        ] {
+            let refused =
+                access_token("127.0.0.1:8787", Some(bad.to_string())).expect_err("not a token");
+            assert!(refused.contains("visible ASCII"), "{bad:?}: {refused}");
+        }
+    }
+
     #[test]
     fn the_server_is_named_by_loopback_and_its_bound_address() {
         let loopback = ["127.0.0.1:8787", "localhost:8787", "[::1]:8787"];
@@ -1316,6 +1451,100 @@ mod tests {
             .nth(1)
             .and_then(|code| code.parse().ok())
             .expect("status line")
+    }
+
+    /// A server running `serve`'s own loop ([`serve_requests`]) with at most
+    /// `limit` requests at once, over a web directory holding a 64 MiB
+    /// `big.bin`. Returns the port and the directory.
+    fn serving(tag: &str, limit: usize) -> (u16, std::path::PathBuf) {
+        let web = std::env::temp_dir().join(format!("spawn-serve-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&web).expect("web");
+        std::fs::write(web.join("big.bin"), vec![0u8; 64 << 20]).expect("big file");
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let shared = Arc::new(Shared {
+            web: web.clone(),
+            token: None,
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+        });
+        std::thread::spawn(move || serve_requests(&server, &shared, limit));
+        (port, web)
+    }
+
+    /// A client that asks for `big.bin` and never reads the answer.
+    fn stalled_client(port: u16) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut stalled = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            stalled,
+            "GET /big.bin HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .expect("send");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        stalled
+    }
+
+    /// The status of a request answered without the store (a malformed
+    /// session id is 400), or `None` when no answer came within 3 s.
+    fn quick_status(port: u16) -> Option<u16> {
+        use std::io::{Read, Write};
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .expect("timeout");
+        write!(
+            client,
+            "GET /api/session/not%20a%20session HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut answer = [0u8; 12];
+        let read = client.read(&mut answer).ok()?;
+        std::str::from_utf8(&answer[..read])
+            .ok()?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    /// Audit M2: a client that asks for a large file and never reads it
+    /// holds one request's thread, not the server.
+    #[test]
+    fn a_client_that_stops_reading_does_not_stall_the_others() {
+        let (port, web) = serving("stall", 2);
+        let stalled = stalled_client(port);
+        let status = quick_status(port);
+        let _ = std::fs::remove_dir_all(&web);
+        drop(stalled);
+        assert_eq!(
+            status,
+            Some(400),
+            "a second client is answered while the first does not read"
+        );
+    }
+
+    /// With every slot held, the next request is told 503 at once, not
+    /// left waiting.
+    #[test]
+    fn a_request_past_the_limit_is_answered_busy() {
+        let (port, web) = serving("busy", 1);
+        let stalled = stalled_client(port);
+        let status = quick_status(port);
+        drop(stalled);
+        // The slot comes back once the stalled request ends.
+        let mut freed = None;
+        for _ in 0..50 {
+            freed = quick_status(port);
+            if freed == Some(400) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(&web);
+        assert_eq!(status, Some(503));
+        assert_eq!(freed, Some(400), "a freed slot serves again");
     }
 
     #[test]

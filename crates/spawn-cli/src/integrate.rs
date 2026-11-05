@@ -1,7 +1,8 @@
 //! `spawn integrate`: the one landing path (docs/fleet-architecture.md
 //! §10.3).
 //!
-//! For every open mission with a gate, one pass:
+//! For every open mission with a gate, and every done one while the closure
+//! rule (`spawn_task_may_continue`) lets its work go on, one pass:
 //!
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row, the
@@ -11,9 +12,9 @@
 //!    stopped;
 //! 3. a task whose gate passed is landed (again, after a crash);
 //! 4. otherwise the next ready task is judged: accepted by the supervisor
-//!    (`accept` = review) or just reported (`gate`). The candidate is what
-//!    the agent published: the source's `refs/heads/spawn/<agent>` (pushed
-//!    by the Bridge's pusher, [`crate::push`]), fetched into this mirror's
+//!    (`accept` = review), or also just reported (`gate`). The candidate is
+//!    what the agent published: the source's `refs/heads/spawn/<agent>`
+//!    (pushed by the Bridge's pusher, [`crate::push`]), fetched into this mirror's
 //!    own `refs/spawn-integrate/<agent>`. The integrator never commits a
 //!    mounted workspace and never moves the agent's `refs/heads/<agent>`,
 //!    so it works the same on a host that never ran the agent, and a file
@@ -84,11 +85,12 @@ const PRINCIPAL: &str = "spawn-integrate";
 
 const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>]";
 
-/// One open mission with a gate, from `gated_missions`.
+/// One mission with a gate the integrator visits, from `gated_missions`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Mission {
     pub(crate) id: i64,
-    /// `open` or `active`; `done` while accepted work still lands.
+    /// `open` or `active`; `done` while the closure rule lets its work go
+    /// on (`spawn_task_may_continue`).
     #[serde(default)]
     pub(crate) state: String,
     pub(crate) gate: String,
@@ -109,8 +111,8 @@ pub(crate) struct Mission {
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
     pub(crate) source: Option<String>,
-    /// Its open tasks (assigned, delivered, reported, revise, accepted,
-    /// landing).
+    /// Its tasks the closure rule lets go on: every open task of an open
+    /// mission; of a done one, delivered, reported, accepted and landing.
     #[serde(default)]
     pub(crate) tasks: Vec<Task>,
 }
@@ -133,14 +135,13 @@ pub(crate) struct Task {
 }
 
 impl Mission {
-    /// The task the gate judges next.
+    /// The task the gate judges next: one the supervisor accepted, or, when
+    /// the gate alone accepts, also one just reported.
     fn ready(&self) -> Option<&Task> {
-        let wanted = if self.accept == "gate" {
-            TaskState::Reported
-        } else {
-            TaskState::Accepted
-        };
-        self.tasks.iter().find(|task| task.state == wanted)
+        self.tasks.iter().find(|task| {
+            task.state == TaskState::Accepted
+                || (self.accept == "gate" && task.state == TaskState::Reported)
+        })
     }
 
     /// A task whose gate passed and whose landing is not recorded yet.
@@ -256,7 +257,8 @@ fn git(arguments: &[&str]) -> Result<String, String> {
 
 /// The source's default branch and its commit, as `git ls-remote` sees it.
 fn source_head(source: &str) -> Result<(String, String), String> {
-    let listing = git(&["ls-remote", "--symref", "--", source, "HEAD"])?;
+    let source = sources::MissionSource::parse(source)?;
+    let listing = git(&["ls-remote", "--symref", "--", source.as_str(), "HEAD"])?;
     let mut branch = "refs/heads/main".to_string();
     let mut commit = String::new();
     for line in listing.lines() {
@@ -269,7 +271,7 @@ fn source_head(source: &str) -> Result<(String, String), String> {
         }
     }
     if commit.is_empty() {
-        return Err(format!("{source} has no HEAD"));
+        return Err(format!("{} has no HEAD", source.as_str()));
     }
     Ok((branch, commit))
 }
@@ -487,10 +489,10 @@ impl Integrator {
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
                 // Not a verdict on the work: the pusher has not caught up.
-                if !sources::shares_branches(source, &sources::push_sources()) {
+                if !sources::receives_branches(source) {
                     eprintln!(
-                        "integrate: {source} does not receive agents' branches; list it in \
-                         SPAWN_PUSH_SOURCES for its work to land"
+                        "integrate: {source} receives no agents' branches (only a directory \
+                         on this host does), so its work never lands"
                     );
                 }
                 record(
@@ -724,14 +726,13 @@ const LANDING_IDENTITY: (&str, &str) = ("spawn-integrate", "integrate@localhost"
 /// which git takes over any configuration.
 fn commit_landing(mirror_path: &str, arguments: &[&str]) -> Result<String, String> {
     let (name, email) = LANDING_IDENTITY;
-    let output = std::process::Command::new("git")
+    let output = sources::controller_git()
         .args(["--git-dir", mirror_path, "commit-tree", "--no-gpg-sign"])
         .args(arguments)
         .env("GIT_AUTHOR_NAME", name)
         .env("GIT_AUTHOR_EMAIL", email)
         .env("GIT_COMMITTER_NAME", name)
         .env("GIT_COMMITTER_EMAIL", email)
-        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("run git: {error}"))?;
     if !output.status.success() {
@@ -1153,6 +1154,10 @@ mod tests {
         assert_eq!(gated.ready().map(|task| task.id), Some(2));
         gated.accept = "gate".to_string();
         assert_eq!(gated.ready().map(|task| task.id), Some(1));
+        // A report the supervisor accepted anyway is judged too, not left
+        // accepted forever.
+        gated.tasks.remove(0);
+        assert_eq!(gated.ready().map(|task| task.id), Some(2));
     }
 
     /// Both landing commits [`super::landing_candidate`] writes (a branch

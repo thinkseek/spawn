@@ -650,6 +650,84 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     );
 }
 
+/// Audit G: a launch's environment (a database login among it) never goes
+/// on tmux's command line, which every local user reads in /proc. The pane
+/// still gets every value exactly, and the file that carried them is gone.
+#[test]
+fn a_launchs_environment_never_reaches_a_command_line() {
+    let _exclusive = exclusive();
+    let tmux = isolated_tmux("environment");
+    let argv = scratch().join("environment-argv.log");
+    let out = scratch().join("environment-out.txt");
+    let _ = fs::remove_file(&argv);
+    let _ = fs::remove_file(&out);
+    // A tmux that records every command line it is given.
+    let logging = script(
+        "logging-tmux-environment",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec '{}' \"$@\"\n",
+            argv.display(),
+            tmux.program
+        ),
+    );
+    let host = TmuxHost::local(&logging);
+    let name = terminal("environment");
+    let mut launched = launch(&name);
+    let secret = "postgres://spawn_supervisor_x:s3cret-0f9a@127.0.0.1:5432/spawn";
+    let awkward = "a b 'quoted' $HOME `x`\nsecond line";
+    launched.environment = vec![
+        ("SPAWN_DATABASE_URL".to_string(), secret.to_string()),
+        ("AWKWARD".to_string(), awkward.to_string()),
+    ];
+    launched.program = "/bin/sh".to_string();
+    launched.arguments = vec![
+        "-c".to_string(),
+        format!(
+            "printf '%s|%s' \"$SPAWN_DATABASE_URL\" \"$AWKWARD\" >'{}'; exec cat",
+            out.display()
+        ),
+    ];
+    start_session(&host, &launched).expect("start succeeds");
+    let mut seen = String::new();
+    for _ in 0..100 {
+        seen = fs::read_to_string(&out).unwrap_or_default();
+        if !seen.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    host.terminate(&name, &workspace()).expect("clean up");
+    assert_eq!(
+        seen,
+        format!("{secret}|{awkward}"),
+        "the pane got every value"
+    );
+    let lines = fs::read_to_string(&argv).expect("the command lines");
+    assert!(
+        !lines.contains("s3cret-0f9a"),
+        "a secret on tmux's command line"
+    );
+    assert!(
+        !lines.contains("second line"),
+        "a value on tmux's command line"
+    );
+    let directory = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let left: Vec<_> = fs::read_dir(&directory)
+        .expect("read the directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("spawn-launch-{}-", name.as_str()))
+        })
+        .collect();
+    assert!(left.is_empty(), "the environment file outlived the start");
+}
+
 #[test]
 fn tmux_rejects_a_duplicate_terminal() {
     let _exclusive = exclusive();

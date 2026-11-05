@@ -174,6 +174,60 @@ fn run_words_with_input(
     })
 }
 
+/// Write `environment` as `NAME='value'` lines to a new file only this uid
+/// can read (created exclusively, mode 600, in `XDG_RUNTIME_DIR` when there
+/// is one, else the temporary directory), for a pane's shell to source.
+fn write_environment(
+    terminal: &TerminalName,
+    environment: &[(String, String)],
+) -> Result<std::path::PathBuf, TerminalError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut text = String::new();
+    for (key, value) in environment {
+        let name_ok = key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !name_ok {
+            return Err(TerminalError(format!(
+                "{key} is not an environment variable name"
+            )));
+        }
+        text.push_str(key);
+        text.push('=');
+        text.push_str(&spawn_core::shell::shell_quote(value));
+        text.push('\n');
+    }
+    let directory = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let path = directory.join(format!(
+        "spawn-launch-{}-{}-{nanos}.env",
+        terminal.as_str(),
+        std::process::id()
+    ));
+    let failed = |error: std::io::Error| {
+        TerminalError(format!("write the environment of {terminal}: {error}"))
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(failed)?;
+    if let Err(error) = file.write_all(text.as_bytes()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(failed(error));
+    }
+    Ok(path)
+}
+
 impl TerminalHost for TmuxHost {
     fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
         let prefix = self.prefix(&launch.workspace);
@@ -190,17 +244,48 @@ impl TerminalHost for TmuxHost {
             "-c".to_string(),
             launch.cwd.clone(),
         ];
-        for (key, value) in &launch.environment {
-            arguments.push("-e".to_string());
-            arguments.push(format!("{key}={value}"));
+        // The environment (a database login among it) never goes on a
+        // command line, which every local user reads in /proc: on this
+        // machine it goes through a file only this uid reads, which the
+        // pane's shell sources and removes before it runs the program.
+        let mut environment_file = None;
+        if prefix.is_empty() && !launch.environment.is_empty() {
+            let file = write_environment(&launch.terminal, &launch.environment)?;
+            arguments.extend(
+                [
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "set -a; . \"$0\"; rm -f -- \"$0\"; set +a; exec \"$@\"",
+                ]
+                .map(str::to_string),
+            );
+            arguments.push(file.to_string_lossy().into_owned());
+            environment_file = Some(file);
+        } else {
+            for (key, value) in &launch.environment {
+                arguments.push("-e".to_string());
+                arguments.push(format!("{key}={value}"));
+            }
+            arguments.push("--".to_string());
         }
-        arguments.push("--".to_string());
         arguments.push(launch.program.clone());
         arguments.extend(launch.arguments.iter().cloned());
 
-        let run = self.run(&prefix, &arguments)?;
-        if run.code == Some(0) {
-            return Ok(());
+        let run = self.run(&prefix, &arguments);
+        let run = match run {
+            Ok(run) if run.code == Some(0) => return Ok(()),
+            Ok(run) => run,
+            Err(error) => {
+                if let Some(file) = &environment_file {
+                    let _ = std::fs::remove_file(file);
+                }
+                return Err(error);
+            }
+        };
+        // No pane ran to remove it.
+        if let Some(file) = &environment_file {
+            let _ = std::fs::remove_file(file);
         }
         let stderr = run.stderr.trim();
         if stderr.contains("duplicate session") {
