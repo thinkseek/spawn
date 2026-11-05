@@ -254,13 +254,11 @@ export function taskBar(
   }
 
   if (end === null) {
-    // A task closed without a record of its own (its mission cancelled, its
-    // resident retired) ends at its last update; anything else is open.
+    // A landed task without a record of its own ends at its last update.
+    // Every cancelled task has its record (the writer of a retirement or a
+    // close appends one): a missing record shows as open, not hidden.
     const closedAt = Math.max(task.updated_at_ms ?? since, since);
-    if (task.state === "cancelled") {
-      outcome = "cancelled";
-      end = closedAt;
-    } else if (task.state === "landed") {
+    if (task.state === "landed") {
       outcome = "landed";
       end = closedAt;
     }
