@@ -1077,12 +1077,8 @@ fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-<<<<<<< 3339192930b2dbf62a470093409eed486003bb4d
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, over_budget,
-=======
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, over_budget,
-        report_freshness,
->>>>>>> 153fa031d209862432b795dddd8e84da777be385
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree,
+        over_budget, report_freshness,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
