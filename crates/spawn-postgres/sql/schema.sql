@@ -1480,8 +1480,28 @@ begin
     return v_id;
 end $$;
 
+-- A close or a retirement cancels, in its fold, the work the closure rule
+-- does not let go on. Its writer then gives each task of `p_open` (the ones
+-- open before the close) that the fold cancelled its own `task.cancelled`
+-- record, so the task's stages end with `cancelled`. The record repeats what
+-- the fold did; the fold itself never appends, so replaying the log gives
+-- the same tables and adds nothing. Called under the append lock.
+create or replace function spawn_task_record_cancelled(p_open bigint[])
+returns void language plpgsql as $$
+declare
+    v_task bigint;
+begin
+    for v_task in
+        select id from mission_tasks where id = any(p_open) and state = 'cancelled' order by id
+    loop
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+    end loop;
+end $$;
+
 create or replace function spawn_mission_close(p_mission bigint, p_state text, p_summary text)
 returns void language plpgsql security definer as $$
+declare
+    v_open bigint[];
 begin
     -- A drop waits for a landing push in flight (spawn_landing_hold), so
     -- the push cannot land work of a mission dropped meanwhile.
@@ -1499,8 +1519,11 @@ begin
     if not exists (select 1 from mission_missions where id = p_mission and state in ('open', 'active')) then
         raise exception 'mission % is not open', p_mission;
     end if;
+    select coalesce(array_agg(id), '{}') into v_open
+      from mission_tasks where mission_id = p_mission and state <> 'cancelled';
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.closed', 'id', p_mission, 'state', p_state, 'summary', p_summary));
+    perform spawn_task_record_cancelled(v_open);
 end $$;
 
 -- Assign one task. A resident must be approved; an ephemeral worker gets a
@@ -1577,7 +1600,12 @@ begin
     return true;
 end $$;
 
-create or replace function spawn_task_reported(p_task bigint, p_report text)
+-- Record a report. `p_commit` names the agent's checkpoint the report's
+-- turn ended with (its latest `artifact.committed` when the turn's end was
+-- recorded): the integrator judges the report against it, never against an
+-- older checkpoint. Null only when the agent has no checkpoint at all; the
+-- first version took none, and still records a null commit.
+create or replace function spawn_task_reported(p_task bigint, p_report text, p_commit text)
 returns boolean language plpgsql security definer as $$
 begin
     -- Check and record under the append lock, so no other change interleaves.
@@ -1591,8 +1619,14 @@ begin
         return false;
     end if;
     perform spawn_control_record(jsonb_build_object(
-        'type', 'task.reported', 'id', p_task, 'report', p_report));
+        'type', 'task.reported', 'id', p_task, 'report', p_report, 'commit', p_commit));
     return true;
+end $$;
+
+create or replace function spawn_task_reported(p_task bigint, p_report text)
+returns boolean language plpgsql security definer as $$
+begin
+    return spawn_task_reported(p_task, p_report, null);
 end $$;
 
 -- Review a report: accept, or send it back with a note. `p_revision` names
@@ -1698,6 +1732,8 @@ end $$;
 
 create or replace function spawn_resident_retire(p_name text)
 returns void language plpgsql security definer as $$
+declare
+    v_open bigint[];
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -1707,7 +1743,11 @@ begin
     if not exists (select 1 from mission_residents where name = p_name and state <> 'retired') then
         raise exception 'resident % is already retired', p_name;
     end if;
+    select coalesce(array_agg(k.id), '{}') into v_open
+      from mission_tasks k join mission_residents r on r.agent_id = k.agent_id
+     where r.name = p_name and k.state <> 'cancelled';
     perform spawn_control_record(jsonb_build_object('type', 'resident.retired', 'name', p_name));
+    perform spawn_task_record_cancelled(v_open);
 end $$;
 
 -- Landing settings and halts are a human's (§10.3): the owner's login only.
@@ -2093,7 +2133,8 @@ declare
 begin
     foreach v_function in array array[
         'spawn_task_may_continue(text, text, boolean, text)',
-        'spawn_task_may_move(bigint, text)'] loop
+        'spawn_task_may_move(bigint, text)',
+        'spawn_task_record_cancelled(bigint[])'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -2120,6 +2161,37 @@ begin
 end
 $$;
 
+-- Closes and retirements from before their writers recorded what they
+-- cancelled (spawn_task_record_cancelled) left tasks the fold cancelled with
+-- no record of it: their stages end at `assigned`, `delivered` or
+-- `reported`. Each cancelled task whose last `task.%` record closes nothing
+-- is recorded cancelled, once: a task that ends with `task.cancelled` or
+-- `task.aborted` (cancelled over budget) gets none, and neither does a row
+-- from before the control stream (`legacy.imported`, no `task.%` records).
+do $$
+declare
+    v_task bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    for v_task in
+        select k.id
+          from mission_tasks k
+          join (select distinct on (r.record ->> 'id') r.record ->> 'id' as id,
+                       r.record ->> 'type' as type
+                  from spawn_events e
+                 cross join lateral (select e.kind -> 'detail' -> 'record' as record) r
+                 where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                   and r.record ->> 'type' like 'task.%'
+                 order by r.record ->> 'id', e.session_seq desc) last on last.id = k.id::text
+         where k.state = 'cancelled'
+           and last.type not in ('task.cancelled', 'task.aborted')
+         order by k.id
+    loop
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+    end loop;
+end
+$$;
+
 revoke all on mission_missions, mission_residents, mission_tasks from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
@@ -2135,6 +2207,7 @@ begin
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
+        'spawn_task_reported(bigint, text, text)',
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',

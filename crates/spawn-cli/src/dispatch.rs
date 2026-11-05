@@ -111,6 +111,16 @@ pub(crate) struct Facts {
     /// ([`crate::main_merge`]); a judgement older than one still holds.
     #[serde(default)]
     pub(crate) evidence_seq: Option<u64>,
+    /// The live execution's latest turn event in the log is a turn's end
+    /// (`turn.stopped` or `turn.failed`), not a newer `message.received`.
+    /// The Bridge records a turn's checkpoint before its end.
+    #[serde(default)]
+    pub(crate) turn_ended: bool,
+    /// The commit of the agent's latest `artifact.committed`, read with the
+    /// rest of these facts: once `turn_ended`, the checkpoint of the turn
+    /// that ended (or a later one).
+    #[serde(default)]
+    pub(crate) checkpoint: Option<String>,
     #[serde(default)]
     pub(crate) episode: Option<i64>,
     #[serde(default)]
@@ -152,7 +162,11 @@ impl Facts {
     ///
     /// A judgement older than the latest fact describes a moment that has
     /// passed (for example the ready screen just before the prompt was
-    /// typed); the Observer is about to judge again.
+    /// typed). The Observer judges again, and once the session's facts
+    /// settle its latest observation covers its latest fact, whether or not
+    /// the verdict changed (the coverage rule in `spawn_core::observe`): an
+    /// idle worker whose last fact changed nothing still gets a current
+    /// judgement, a few seconds later.
     pub(crate) fn current_observation(&self) -> Option<&Observation> {
         self.observation.as_ref().filter(|observation| {
             self.evidence_seq
@@ -181,6 +195,36 @@ impl Facts {
             && self.current_observation().is_some_and(|observation| {
                 observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
             })
+    }
+
+    /// Whether a report written in the worker's workspace may be collected
+    /// now: the turn that wrote it has ended in the log (the transcript's
+    /// end of the turn, not only a ready screen), and so its checkpoint has
+    /// been taken ([`Self::checkpoint`]); the worker is live with no command
+    /// open; and its latest judgement is [`Ambiguity::TurnStoppedIdle`].
+    ///
+    /// A judgement the Observer writes again only when its verdict changes
+    /// (one with no model answer: no model judge, or the judge unavailable)
+    /// need not be current: a turn's end read after the screen showed the
+    /// prompt leaves the idle judgement older than the latest fact, and
+    /// nobody judges again. The log's own end of the turn is newer evidence
+    /// than the judgement, and is what the collection rests on; a turn that
+    /// started since (`message.received`) or a verdict that changed holds it
+    /// back. A model's answer (it carries a fingerprint) is written for every
+    /// new situation, so a stale one waits for the model's judgement of the
+    /// turn, as before.
+    pub(crate) fn report_due(&self) -> bool {
+        let idle =
+            |observation: &Observation| observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
+        self.live_and_free()
+            && self.turn_ended
+            && match self.current_observation() {
+                Some(current) => idle(current),
+                None => self
+                    .observation
+                    .as_ref()
+                    .is_some_and(|latest| latest.fingerprint.is_none() && idle(latest)),
+            }
     }
 
     pub(crate) fn idle_at_prompt(&self) -> bool {
@@ -513,6 +557,8 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            turn_ended: true,
+            checkpoint: None,
         }
     }
 
@@ -613,6 +659,8 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            turn_ended: true,
+            checkpoint: None,
         }
     }
 

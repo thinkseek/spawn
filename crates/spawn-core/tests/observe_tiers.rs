@@ -979,3 +979,185 @@ fn a_late_end_of_an_older_execution_does_not_end_the_current_one() {
         "execution 2 is still running"
     );
 }
+
+// --- Coverage: the latest judgement covers the latest fact ---------------------
+
+/// An Observer that judges by the rules alone, on the fixture's log and clock.
+fn rules_only(fixture: &Fixture) -> Observer {
+    let log: Arc<dyn EventLog> = fixture.store.clone();
+    Observer::new(log).with_clock(fixture.clock.clone())
+}
+
+/// The session's latest fact: its latest record that is not the Observer's.
+fn latest_fact(store: &MemoryStore) -> u64 {
+    store
+        .read_global(GlobalPosition(0), 500)
+        .expect("read succeeds")
+        .into_iter()
+        .filter(|record| record.event.source != Source::Observer)
+        .map(|record| record.session_seq.0)
+        .max()
+        .unwrap_or(0)
+}
+
+fn tool_started(store: &MemoryStore, id: &str) {
+    append(
+        store,
+        Source::Claude,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: id.to_string(),
+        },
+    );
+}
+
+fn tool_completed(store: &MemoryStore, id: &str) {
+    append(
+        store,
+        Source::Claude,
+        EventKind::ToolCompleted {
+            tool_use_id: id.to_string(),
+            duration_ms: None,
+        },
+    );
+}
+
+fn busy(store: &MemoryStore) {
+    append(
+        store,
+        Source::Bridge,
+        EventKind::ScreenObserved {
+            state: ScreenState::Busy,
+            evidence: "✽ Working…".to_string(),
+        },
+    );
+}
+
+#[test]
+fn an_unchanged_verdict_is_written_again_once_the_facts_settle() {
+    let fixture = fixture(Scripted::new(Ok(blocked_answer())));
+    let mut observer = rules_only(&fixture);
+    started(&fixture.store);
+    tool_started(&fixture.store, "t1");
+    assert_eq!(observer.tick().expect("tick"), 1);
+
+    // The screen confirms the work: the verdict stays WORKING.
+    busy(&fixture.store);
+    let reading = latest_fact(&fixture.store);
+    assert_eq!(observer.tick().expect("tick"), 0, "not settled yet");
+    fixture.clock.advance(Duration::from_secs(1));
+    assert_eq!(observer.tick().expect("tick"), 0, "still not settled");
+    fixture.clock.advance(Duration::from_secs(2));
+    assert_eq!(observer.tick().expect("settled"), 1);
+    let all = observations(&fixture.store);
+    assert_eq!(all.len(), 2);
+    let last = all.last().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert_eq!(last.based_on_seq.0, reading, "covers the screen reading");
+    assert_eq!(last.judge, "rules");
+}
+
+#[test]
+fn a_session_without_new_facts_gets_no_new_observation() {
+    let fixture = fixture(Scripted::new(Ok(blocked_answer())));
+    let mut observer = rules_only(&fixture);
+    started(&fixture.store);
+    tool_started(&fixture.store, "t1");
+    busy(&fixture.store);
+    observer.tick().expect("tick");
+    fixture.clock.advance(Duration::from_secs(3));
+    observer.tick().expect("settled");
+    let before = observations(&fixture.store).len();
+    for _ in 0..5 {
+        fixture.clock.advance(Duration::from_secs(31));
+        assert_eq!(observer.tick().expect("recheck"), 0);
+    }
+    assert_eq!(observations(&fixture.store).len(), before);
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.based_on_seq.0, latest_fact(&fixture.store));
+}
+
+#[test]
+fn a_burst_of_facts_with_an_unchanged_verdict_is_covered_once() {
+    let fixture = fixture(Scripted::new(Ok(blocked_answer())));
+    let mut observer = rules_only(&fixture);
+    started(&fixture.store);
+    tool_started(&fixture.store, "t0");
+    assert_eq!(observer.tick().expect("tick"), 1);
+    let mut written = 0;
+    for n in 1..=20 {
+        // A tool stays open across the burst: the verdict stays WORKING.
+        tool_started(&fixture.store, &format!("t{n}"));
+        fixture.clock.advance(Duration::from_millis(200));
+        written += observer.tick().expect("tick");
+        tool_completed(&fixture.store, &format!("t{n}"));
+        fixture.clock.advance(Duration::from_millis(200));
+        written += observer.tick().expect("tick");
+    }
+    assert_eq!(written, 0, "no observation per fact while the facts come");
+    fixture.clock.advance(Duration::from_secs(3));
+    assert_eq!(observer.tick().expect("settled"), 1, "one once it settles");
+    fixture.clock.advance(Duration::from_secs(31));
+    assert_eq!(observer.tick().expect("recheck"), 0);
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert_eq!(last.based_on_seq.0, latest_fact(&fixture.store));
+}
+
+#[test]
+fn a_model_answer_covers_newer_facts_with_the_same_evidence_without_a_call() {
+    let judge = Scripted::new(Ok(blocked_answer()));
+    let mut fixture = fixture(judge.clone());
+    started(&fixture.store);
+    turn_stopped(&fixture.store);
+    ready(&fixture.store);
+    fixture.observer.tick().expect("tick");
+    assert_eq!(judge.calls(), 1);
+    let answer = observations(&fixture.store).pop().expect("an answer");
+
+    // A second, equal reading of the prompt: nothing new to show the model.
+    ready(&fixture.store);
+    let reading = latest_fact(&fixture.store);
+    assert_eq!(fixture.observer.tick().expect("tick"), 0, "not settled yet");
+    fixture.clock.advance(Duration::from_secs(3));
+    assert_eq!(fixture.observer.tick().expect("settled"), 1);
+    assert_eq!(judge.calls(), 1, "the model is not asked again");
+    let covering = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(covering.based_on_seq.0, reading);
+    assert_eq!(covering.state, answer.state);
+    assert_eq!(covering.judge, answer.judge);
+    assert_eq!(covering.ambiguity, answer.ambiguity);
+    assert_eq!(covering.attention, answer.attention);
+    assert_eq!(covering.fingerprint, answer.fingerprint);
+    assert_eq!(covering.evidence, answer.evidence);
+    assert_eq!(covering.latency_ms, None, "no model call was made for it");
+
+    fixture.clock.advance(Duration::from_secs(31));
+    assert_eq!(fixture.observer.tick().expect("recheck"), 0);
+    assert_eq!(judge.calls(), 1);
+}
+
+#[test]
+fn a_restarted_observer_covers_a_lagging_session_once() {
+    let fixture = fixture(Scripted::new(Ok(blocked_answer())));
+    let mut first = rules_only(&fixture);
+    started(&fixture.store);
+    tool_started(&fixture.store, "t1");
+    assert_eq!(first.tick().expect("tick"), 1);
+    // The Observer stops; a fact that changes nothing lands meanwhile.
+    drop(first);
+    busy(&fixture.store);
+    let reading = latest_fact(&fixture.store);
+    fixture.clock.advance(Duration::from_secs(3));
+
+    let mut restarted = rules_only(&fixture);
+    assert_eq!(restarted.tick().expect("tick"), 1);
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.based_on_seq.0, reading);
+    assert_eq!(last.state, SemanticState::Working);
+    fixture.clock.advance(Duration::from_secs(31));
+    assert_eq!(restarted.tick().expect("recheck"), 0);
+
+    let mut again = rules_only(&fixture);
+    assert_eq!(again.tick().expect("tick"), 0, "covered: nothing to write");
+}
