@@ -139,12 +139,16 @@ select jsonb_build_object(
 /// supervisor, with the latest judgement, the episode (latest command from
 /// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
 /// model profile of its latest execution, what the dispatcher already sent
-/// there in the last day (its deliveries, however old: a delivery is
-/// confirmed from its command), the tags of every input it delivered there
+/// there in the last day, and however old what a decision still rests on:
+/// its deliveries (a delivery is confirmed from its command), the nudges of
+/// the current episode and the resume of the current execution (an old one
+/// is not "not sent"); the tags of every input it delivered there
 /// (`told`: the escalations its digests carried, however long ago);
 /// `resumed_young` counts the executions its
 /// resumes started that died young (`died_young!`) since the session's last
-/// execution that did not.
+/// execution that did not; `stops` are the Stops and Discards anyone sent
+/// during the live execution (after the command that started it, so the
+/// Bridge ran them on it), with their outcomes: a failed one is pursued.
 ///
 /// A delivery counts as the worker's (its `last_delivery`, and the episode)
 /// only when it reached the worker or may have: it succeeded, has not
@@ -188,7 +192,27 @@ from (
        from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and (c.created_at_ms > spawn_now_ms() - 86400000
-             or c.idempotency_key like 'deliver-%')) as dispatched,
+             or c.idempotency_key like 'deliver-%'
+             or c.idempotency_key = 'dispatch-resume-' || coalesce(s.execution_id, 'none')
+             or c.idempotency_key = 'dispatch-nudge-' || s.session_id || '-' || coalesce(ep.id, 0)
+             or starts_with(c.idempotency_key,
+                            'dispatch-nudge-' || s.session_id || '-' || coalesce(ep.id, 0)
+                            || '-retry-'))) as dispatched,
+    (select coalesce(jsonb_agg(jsonb_build_object(
+              'id', c.id,
+              'key', c.idempotency_key,
+              'principal', c.principal,
+              'action', c.action ->> 'type',
+              'created_at_ms', c.created_at_ms,
+              'finished_at_ms', c.finished_at_ms,
+              'succeeded', c.succeeded,
+              'error', c.error) order by c.id), '[]'::jsonb)
+       from spawn_commands c
+      where s.live and c.session_id = s.session_id
+        and c.action ->> 'type' in ('stop', 'discard')
+        and c.id > (select x.command_id from agent_executions x
+                     where x.session_id = s.session_id
+                       and x.execution_id = s.execution_id)) as stops,
     (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
        from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
