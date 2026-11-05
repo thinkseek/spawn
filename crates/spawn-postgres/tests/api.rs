@@ -70,6 +70,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
 fn postgres_passes_the_shared_contract() {
     let (store, _schema) = store("contract");
     contract::event_log("pg_evt", &store);
+    contract::one_execution("pg_one", &store);
     contract::command_queue("pg_cmd", &store, &store);
 }
 
@@ -389,6 +390,71 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
         .duration_ms
         .expect("an ended execution has a duration");
     assert!(duration >= 0);
+}
+
+#[test]
+fn two_connections_racing_to_start_one_session_record_one_execution() {
+    let (first, schema) = store("one_execution");
+    let second = spawn_postgres::PostgresStore::connect_in_schema(&url(), &schema)
+        .expect("a second Bridge's connection");
+    let started = |name: &str| {
+        lifecycle(
+            &ExecutionId::new(name).expect("valid execution"),
+            Source::Bridge,
+            &format!("{name}:started"),
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("9:/workspaces/9").expect("valid workspace"),
+                command_id: CommandId(1),
+                fork: None,
+                model: ModelProfile::Default,
+            },
+        )
+    };
+    let outcomes: Vec<Result<_, _>> = std::thread::scope(|scope| {
+        let a = scope.spawn(|| first.append(started("exec_a")));
+        let b = scope.spawn(|| second.append(started("exec_b")));
+        vec![a.join().expect("thread a"), b.join().expect("thread b")]
+    });
+    let taken = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(taken, 1, "{outcomes:?}");
+    assert!(
+        outcomes.iter().any(|outcome| matches!(
+            outcome,
+            Err(spawn_core::port::StoreError::Rejected(why)) if why.contains("already runs")
+        )),
+        "{outcomes:?}"
+    );
+    let live: i64 = admin(&schema)
+        .query_one(
+            "select count(*) from agent_executions where ended_at_ms is null",
+            &[],
+        )
+        .expect("executions read")
+        .get(0);
+    assert_eq!(live, 1);
+
+    // The lost-execution path: the Bridge's end frees the session, and the
+    // next start (a resume) is taken on either connection.
+    let winner = if outcomes[0].is_ok() {
+        "exec_a"
+    } else {
+        "exec_b"
+    };
+    first
+        .append(lifecycle(
+            &ExecutionId::new(winner).expect("valid execution"),
+            Source::Bridge,
+            &format!("{winner}:ended"),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Lost,
+                exit_code: None,
+            },
+        ))
+        .expect("the end of a lost execution");
+    second
+        .append(started("exec_c"))
+        .expect("a start after the end");
 }
 
 fn tool_event(execution: &ExecutionId, key: &str, kind: EventKind) -> NewEvent {
@@ -1374,6 +1440,22 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
             })
             .expect("append succeeds");
         assert_eq!(model().as_deref(), Some(profile.as_str()));
+        // One execution at a time: this one ends before the next starts.
+        store
+            .append(NewEvent {
+                agent_id: worker.clone(),
+                session_id: session.clone(),
+                ..lifecycle(
+                    &execution,
+                    Source::Bridge,
+                    &format!("exec_{number}:ended"),
+                    EventKind::ExecutionEnded {
+                        cause: EndCause::Stopped,
+                        exit_code: None,
+                    },
+                )
+            })
+            .expect("append succeeds");
     }
 }
 
