@@ -2,7 +2,7 @@
 //!
 //! The Bridge asks for a workspace by branch, which is the agent id. This
 //! store looks up the agent's mission and materializes the workspace from
-//! that mission's source: any git repository (path or URL), mirrored once
+//! that mission's source: a git repository (path or URL), mirrored once
 //! into `<root>/.sources/`, or an empty scratch repository when the mission
 //! names none. Agents no mission owns (the supervisor, the RSI agent, ad hoc
 //! workers) use the default repository.
@@ -21,6 +21,12 @@
 //! asked, such a start fails (the failure escalates, and a later start
 //! tries again): it never makes a fresh branch from `main` beside the
 //! pushed one ([`adopt_for_branch`]).
+//!
+//! A source is git run as the owner, so it is checked before git sees it
+//! ([`MissionSource`]: an absolute path, `https://` or `ssh://`), and every
+//! git the controller runs allows only those transports
+//! ([`controller_git`]), whatever the host's git or its configuration
+//! would allow.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,11 +79,88 @@ fn unavailable(text: String) -> WorkspaceError {
     WorkspaceError::Unavailable(text)
 }
 
+/// Transports the controller's git may use: local paths, https and ssh.
+/// `ext::` (a command), `fd::` and anything a later git adds are refused by
+/// git itself, before any helper runs.
+pub(crate) const ALLOWED_PROTOCOLS: &str = "file:https:ssh";
+
+/// `git`, as every controller-side call runs it: only
+/// [`ALLOWED_PROTOCOLS`], whatever the installed git defaults to or the
+/// host's configuration allows (`GIT_ALLOW_PROTOCOL` overrides
+/// `protocol.*.allow`), and no standard input.
+pub(crate) fn controller_git() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .stdin(Stdio::null());
+    command
+}
+
+/// A mission's source as git may be given it: an absolute path, an
+/// `https://` or `ssh://` URL, or ssh's `user@host:path`. Nothing that names
+/// another transport (`ext::`, `fd::`, `file://`), nothing relative, nothing
+/// that begins like an option; no whitespace or control character in a URL.
+/// `spawn_source_allowed` in the schema is the same rule, where a mission is
+/// added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissionSource(String);
+
+impl MissionSource {
+    /// Longest source accepted.
+    const MAX_LEN: usize = 4096;
+
+    /// `text` as a source, or why it is not one.
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+        let refused =
+            || format!("a source is an absolute path or an https:// or ssh:// URL, not {text:?}");
+        let plain = |rest: &str| {
+            !rest.is_empty() && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+        };
+        let lead =
+            |rest: &str, banned: &[char]| rest.chars().next().is_some_and(|c| !banned.contains(&c));
+        if text.is_empty() || text.len() > Self::MAX_LEN {
+            return Err(refused());
+        }
+        let allowed = if text.starts_with('/') {
+            !text.chars().any(char::is_control)
+        } else if let Some(rest) = text
+            .strip_prefix("https://")
+            .or_else(|| text.strip_prefix("ssh://"))
+        {
+            plain(rest) && lead(rest, &['-', '/'])
+        } else if let Some((user, rest)) = text.split_once('@')
+            && let Some((host, path)) = rest.split_once(':')
+        {
+            let name = |part: &str, extra: &[char]| {
+                part.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
+                    && part.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || c == '.' || c == '-' || extra.contains(&c)
+                    })
+            };
+            name(user, &['_']) && name(host, &[]) && plain(path) && lead(path, &['-', ':'])
+        } else {
+            false
+        };
+        if allowed {
+            Ok(Self(text.to_string()))
+        } else {
+            Err(refused())
+        }
+    }
+
+    /// The source as git is given it.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Run git and return its trimmed stdout, or the failure as an error.
 pub(crate) fn git(arguments: &[&str]) -> Result<String, WorkspaceError> {
-    let output = Command::new("git")
+    let output = controller_git()
         .args(arguments)
-        .stdin(Stdio::null())
         .output()
         .map_err(|error| unavailable(format!("run git: {error}")))?;
     if !output.status.success() {
@@ -209,10 +292,10 @@ pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf
         }
         return Ok(scratch);
     };
-    // A source is handed to git; one that looks like an option is not.
-    if source.starts_with('-') {
-        return Err(unavailable(format!("source {source} starts with '-'")));
-    }
+    // A source is handed to git only once it is one ([`MissionSource`]):
+    // a source stored before the check is refused here, not run.
+    let source = MissionSource::parse(source).map_err(unavailable)?;
+    let source = source.as_str();
     let mirror = directory.join(mirror_name(source));
     if !mirror.exists() {
         git(&[
@@ -248,6 +331,10 @@ pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf
 /// from the last copy, and the reason is logged.
 pub(crate) fn refresh(mirror: &Path, source: &str) {
     let path = mirror.to_string_lossy();
+    if let Err(error) = MissionSource::parse(source) {
+        eprintln!("sources: not refreshing {path}: {error}");
+        return;
+    }
     if let Err(error) = git(&[
         "--git-dir",
         &path,
@@ -443,9 +530,8 @@ pub(crate) fn fetch_pushed_into(
     agent: &str,
     tracking: &str,
 ) -> Result<Option<String>, WorkspaceError> {
-    if source.starts_with('-') {
-        return Err(unavailable(format!("source {source} starts with '-'")));
-    }
+    let source = MissionSource::parse(source).map_err(unavailable)?;
+    let source = source.as_str();
     let remote = pushed_ref(agent);
     let path = mirror.to_string_lossy().to_string();
     let listed = git(&[
@@ -610,7 +696,8 @@ impl Drop for MissionWorkspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        Adopted, adopt_for_branch, adopt_pushed, ensure_mirror, git, mirror_name, shares_branches,
+        Adopted, MissionSource, adopt_for_branch, adopt_pushed, ensure_mirror, git, mirror_name,
+        shares_branches,
     };
     use crate::push::{Pushed, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
@@ -888,16 +975,12 @@ mod tests {
         );
     }
 
-    /// Audit H5: a source is handed to the controller's git with no scheme
-    /// allowlist of Spawn's own. Here git 2.56's default (`ext` never)
-    /// refuses the transport, but the refusal is git's, so on a git or a
-    /// host config that allows `ext` the command runs as the owner. Spawn
-    /// should refuse a transport command itself, before git sees it.
+    /// Audit H5: a source that names a transport command is refused by
+    /// Spawn itself, before git sees it, not by whatever the installed git
+    /// defaults to.
     #[test]
-    #[ignore = "audit H5 repro"]
-    fn a_source_that_names_a_transport_command_is_refused_by_spawn_repro() {
-        let base =
-            std::env::temp_dir().join(format!("spawn-h5-repro-{}", std::process::id()));
+    fn a_source_that_names_a_transport_command_is_refused_by_spawn() {
+        let base = std::env::temp_dir().join(format!("spawn-h5-repro-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("base");
         let marker = base.join("ran");
@@ -912,6 +995,108 @@ mod tests {
             !text.contains("git clone:"),
             "only git's own default stood between the source and a command: {text}"
         );
+    }
+
+    #[test]
+    fn a_source_is_an_absolute_path_or_an_https_or_ssh_url() {
+        for good in [
+            "/srv/widget.git",
+            "/home/me/my repo",
+            "https://github.com/acme/widget.git",
+            "ssh://git@github.com/acme/widget.git",
+            "git@github.com:acme/widget.git",
+            "deploy_bot@git.example.org:team/x.git",
+        ] {
+            assert_eq!(
+                MissionSource::parse(good).map(|source| source.as_str().to_string()),
+                Ok(good.to_string()),
+                "{good}"
+            );
+        }
+        for bad in [
+            "",
+            "ext::sh -c touch% /tmp/x",
+            "fd::3",
+            "file:///srv/widget.git",
+            "http://github.com/acme/widget.git",
+            "git://github.com/acme/widget.git",
+            "widget",
+            "../widget",
+            "-uhelp",
+            "--upload-pack=touch /tmp/x",
+            "https://-oProxyCommand=x/repo",
+            "https:///etc/passwd",
+            "https://host/a b",
+            "https://host/a\nb",
+            "ssh://host/\u{0}",
+            "-u@host:path",
+            "git@-host:path",
+            "git@host:-path",
+            "git@host::path",
+            "ext@host:path with space",
+            "/srv/a\u{7}b",
+        ] {
+            assert!(MissionSource::parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(MissionSource::parse(&format!("/{}", "a".repeat(5000))).is_err());
+    }
+
+    /// The controller's git runs only file, https and ssh, even on a host
+    /// whose git configuration allows `ext::`: GIT_ALLOW_PROTOCOL wins.
+    #[test]
+    fn the_controllers_git_runs_no_transport_command_whatever_the_host_allows() {
+        let base = std::env::temp_dir().join(format!("spawn-git-protocols-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("base");
+        let marker = base.join("ran");
+        let allowing = |mut command: std::process::Command| {
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "protocol.ext.allow")
+                .env("GIT_CONFIG_VALUE_0", "always")
+                .args([
+                    "ls-remote",
+                    &format!("ext::sh -c touch% {}", marker.display()),
+                ])
+                .output()
+                .expect("git runs")
+        };
+        let mut plain = std::process::Command::new("git");
+        plain.stdin(std::process::Stdio::null());
+        let _ = allowing(plain);
+        assert!(marker.exists(), "the host's configuration would run it");
+        std::fs::remove_file(&marker).expect("reset");
+        let refused = allowing(super::controller_git());
+        assert!(!refused.status.success());
+        assert!(
+            !marker.exists(),
+            "the controller's git ran a transport command"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every git the controller runs is built by `controller_git`: no other
+    /// module of the CLI starts git itself (tests aside).
+    #[test]
+    fn every_controller_git_is_built_in_one_place() {
+        for (name, text) in [
+            ("push.rs", include_str!("push.rs")),
+            ("integrate.rs", include_str!("integrate.rs")),
+            ("missions.rs", include_str!("missions.rs")),
+            ("config.rs", include_str!("config.rs")),
+            ("deliver.rs", include_str!("deliver.rs")),
+            ("supervise.rs", include_str!("supervise.rs")),
+            ("runtime.rs", include_str!("runtime.rs")),
+        ] {
+            let code = text.split("#[cfg(test)]").next().unwrap_or(text);
+            assert!(
+                !code.contains("Command::new(\"git\")"),
+                "{name} starts git without controller_git"
+            );
+        }
+        let own = include_str!("sources.rs");
+        let code = own.split("#[cfg(test)]").next().unwrap_or(own);
+        assert_eq!(code.matches("Command::new(\"git\")").count(), 1);
     }
 
     #[test]
