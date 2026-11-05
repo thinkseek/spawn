@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use spawn_core::id::{SessionId, TerminalName, WorkspaceId};
+use spawn_core::id::{SessionId, WorkspaceId};
 use spawn_core::observe::ObservationContext;
 use spawn_core::port::TerminalHost;
 use spawn_postgres::PostgresStore;
@@ -29,7 +29,6 @@ impl HostContext {
 impl ObservationContext for HostContext {
     fn screen_tail(&self, session: &SessionId) -> Option<String> {
         let (terminal, workspace) = self.store.latest_terminal(session).ok()??;
-        let terminal = TerminalName::new(terminal).ok()?;
         let workspace = WorkspaceId::new(workspace).ok()?;
         let text = self
             .terminals

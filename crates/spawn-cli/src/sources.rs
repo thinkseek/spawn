@@ -17,7 +17,10 @@
 //! the background ([`crate::push`]), to the source's `spawn/<agent>`. A host
 //! that starts an agent whose branch it lacks takes that branch from the
 //! source when it is there (resume on another host), and fast-forwards a
-//! local branch another host moved on since.
+//! local branch another host moved on since. While the source cannot be
+//! asked, such a start fails (the failure escalates, and a later start
+//! tries again): it never makes a fresh branch from `main` beside the
+//! pushed one ([`adopt_for_branch`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -354,6 +357,64 @@ pub(crate) fn adopt_pushed(
     Ok(Adopted::Diverged { local, pushed })
 }
 
+/// What an agent's start takes from the source before its branch is made
+/// here: the branch another host pushed (`Some`, the mirror's branch now
+/// created at it), or nothing (`None`: the mirror's own branch stands, or
+/// the source has none and a new branch is made from `main`).
+///
+/// Absent is not unknown. When the source could not be asked (unreachable,
+/// unreadable, a local source directory gone) and the mirror has no branch
+/// of the agent, the answer is an error: the start fails, and a later one
+/// tries again. A fresh branch from `main` would leave the pushed one
+/// behind as a second, divergent history. With a local branch, this host
+/// keeps working on it.
+pub(crate) fn adopt_for_branch(
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+    local: bool,
+    push_sources: &[String],
+) -> Result<Option<Fork>, WorkspaceError> {
+    let could_not_ask = |why: String| {
+        unavailable(format!(
+            "could not ask {source} for {}: {why}; {agent}'s branch is not made from main \
+             while the source may hold it, start again once it answers",
+            pushed_ref(agent)
+        ))
+    };
+    if !shares_branches(source, push_sources) {
+        // A local source shares branches whenever it is a directory: one
+        // that is not (any more) cannot say whether it holds the branch.
+        let looks_local = !source.contains("://") && Path::new(source).is_absolute();
+        if looks_local && !local {
+            return Err(could_not_ask("not a directory".to_string()));
+        }
+        return Ok(None);
+    }
+    match adopt_pushed(mirror, source, agent) {
+        Ok(Adopted::Created(commit)) => Ok(Some(Fork {
+            from: format!("spawn/{agent}"),
+            commit: commit_id(commit)?,
+        })),
+        Ok(Adopted::Diverged { local, pushed }) => {
+            eprintln!(
+                "sources: {agent} is at {local} here but at {pushed} on {source}: \
+                 two writers; this host keeps its own"
+            );
+            Ok(None)
+        }
+        Ok(Adopted::Absent | Adopted::Advanced(_) | Adopted::Kept) => Ok(None),
+        Err(error) if local => {
+            eprintln!(
+                "sources: could not read {} from {source}: {error}",
+                pushed_ref(agent)
+            );
+            Ok(None)
+        }
+        Err(error) => Err(could_not_ask(error.to_string())),
+    }
+}
+
 /// The source's `spawn/<agent>`, fetched into the mirror under
 /// `refs/remotes/source/`, or `None` when the source has none.
 fn fetch_pushed(
@@ -417,6 +478,59 @@ fn commit_id(commit: String) -> Result<CommitId, WorkspaceError> {
     CommitId::new(commit).map_err(|error| unavailable(error.to_string()))
 }
 
+/// [`WorkspaceStore::ensure_branch`] of an agent whose mission has a
+/// source: `store` works in `mirror`, the mirror of `source`. Every way a
+/// branch is made here goes through [`adopt_for_branch`] first, and a fork
+/// `from` an agent the mirror lacks reads that agent's pushed head: a source
+/// that cannot be asked fails the start, it never makes the agent's branch,
+/// or the fork, from `main`. `push` is called when the branch is made here
+/// or already was (not when it was taken from the source).
+fn ensure_mirrored_branch(
+    store: &GitWorkspace,
+    mirror: &Path,
+    source: &str,
+    branch: &BranchName,
+    from: Option<&str>,
+    push_sources: &[String],
+    push: impl FnOnce(),
+) -> Result<Branch, WorkspaceError> {
+    let agent = branch.as_str();
+    let local = has_branch(mirror, agent);
+    // Another host may have run this agent: its branch is on the source.
+    if let Some(fork) = adopt_for_branch(mirror, source, agent, local, push_sources)? {
+        return Ok(Branch::Created(fork));
+    }
+    // A fork from an agent this mirror has no branch of: its head as the
+    // source holds it.
+    let mut resolved = from.map(str::to_string);
+    if let Some(from) = from
+        && shares_branches(source, push_sources)
+        && !local
+        && AgentId::new(from).is_ok()
+        && !has_branch(mirror, from)
+    {
+        // Could not ask is not "has none": the start fails for now, not
+        // refused as a fork from an agent without a branch.
+        if let Some(commit) = fetch_pushed(mirror, source, from).map_err(|error| {
+            unavailable(format!(
+                "could not read {} from {source}: {error}",
+                pushed_ref(from)
+            ))
+        })? {
+            resolved = Some(commit);
+        }
+    }
+    let made = match store.ensure_branch(branch, resolved.as_deref())? {
+        Branch::Created(fork) => Branch::Created(Fork {
+            from: from.map_or(fork.from, str::to_string),
+            commit: fork.commit,
+        }),
+        Branch::Existing => Branch::Existing,
+    };
+    push();
+    Ok(made)
+}
+
 impl WorkspaceStore for MissionWorkspaces {
     fn project(&self) -> &'static str {
         "missions"
@@ -431,64 +545,21 @@ impl WorkspaceStore for MissionWorkspaces {
         let Some((repo, source)) = routed.mirror.clone() else {
             return routed.store.ensure_branch(branch, from);
         };
-        let agent = branch.as_str();
-        let local = has_branch(&repo, agent);
-        if !local {
+        if !has_branch(&repo, branch.as_str()) {
             self.refresh_main(&repo, &source, true);
         }
-        let shared = shares_branches(&source, &self.push_sources);
-        // Another host may have run this agent: its branch is on the source.
-        let adopted = if shared {
-            adopt_pushed(&repo, &source, agent)
-        } else {
-            Ok(Adopted::Absent)
-        };
-        match adopted {
-            Ok(Adopted::Created(commit)) => {
-                return Ok(Branch::Created(Fork {
-                    from: format!("spawn/{agent}"),
-                    commit: commit_id(commit)?,
-                }));
-            }
-            Ok(Adopted::Diverged { local, pushed }) => eprintln!(
-                "sources: {agent} is at {local} here but at {pushed} on {source}: \
-                 two writers; this host keeps its own"
-            ),
-            Ok(_) => {}
-            Err(error) => eprintln!(
-                "sources: could not read {} from {source}: {error}",
-                pushed_ref(agent)
-            ),
-        }
-        // A fork from an agent this mirror has no branch of: its head as the
-        // source holds it.
-        let mut resolved = from.map(str::to_string);
-        if let Some(from) = from
-            && shared
-            && !local
-            && AgentId::new(from).is_ok()
-            && !has_branch(&repo, from)
-        {
-            match fetch_pushed(&repo, &source, from) {
-                Ok(Some(commit)) => resolved = Some(commit),
-                Ok(None) => {}
-                Err(error) => eprintln!(
-                    "sources: could not read {} from {source}: {error}",
-                    pushed_ref(from)
-                ),
-            }
-        }
-        let made = match routed.store.ensure_branch(branch, resolved.as_deref())? {
-            Branch::Created(fork) => Branch::Created(Fork {
-                from: from.map_or(fork.from, str::to_string),
-                commit: fork.commit,
-            }),
-            Branch::Existing => Branch::Existing,
-        };
         // A new branch shares its fork point; an existing one is pushed
         // again in case its last push was lost with a process.
-        self.mark(&repo, &source, agent);
-        Ok(made)
+        let push = || self.mark(&repo, &source, branch.as_str());
+        ensure_mirrored_branch(
+            &routed.store,
+            &repo,
+            &source,
+            branch,
+            from,
+            &self.push_sources,
+            push,
+        )
     }
 
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError> {
@@ -530,7 +601,9 @@ impl Drop for MissionWorkspaces {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adopted, adopt_pushed, ensure_mirror, git, mirror_name, shares_branches};
+    use super::{
+        Adopted, adopt_for_branch, adopt_pushed, ensure_mirror, git, mirror_name, shares_branches,
+    };
     use crate::push::{Pushed, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
     use spawn_core::port::{Commit, WorkspaceStore};
@@ -627,6 +700,167 @@ mod tests {
             push_branch(&mirror_a, &gone, "agent_x"),
             Pushed::Failed(_)
         ));
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_asked_never_gets_a_branch_made_from_main() {
+        let base = std::env::temp_dir().join(format!("spawn-sources-ask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            &seed_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let source_dir = base.join("source.git");
+        let source = source_dir.to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let root = base.join("host");
+        let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
+
+        // Readable and without the branch: absent, a branch from main may
+        // be made.
+        assert_eq!(
+            adopt_for_branch(&mirror, &source, "agent_x", false, &[]).expect("asked"),
+            None
+        );
+
+        // Unreadable: an error, and no branch appears in the mirror.
+        let mode = |bits: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source_dir, std::fs::Permissions::from_mode(bits))
+                .expect("chmod the source");
+        };
+        mode(0o000);
+        let unreadable = std::fs::read_dir(&source_dir).is_err();
+        let asked = adopt_for_branch(&mirror, &source, "agent_x", false, &[]);
+        mode(0o755);
+        if unreadable {
+            assert!(asked.is_err(), "{asked:?}");
+        }
+        assert!(!super::has_branch(&mirror, "agent_x"));
+
+        // Gone: a local source that is no directory cannot be asked either.
+        std::fs::rename(&source_dir, base.join("moved.git")).expect("move the source away");
+        let asked = adopt_for_branch(&mirror, &source, "agent_x", false, &[]);
+        assert!(
+            asked
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("not made from main")),
+            "{asked:?}"
+        );
+        // A branch this host has keeps working without the source.
+        assert_eq!(
+            adopt_for_branch(&mirror, &source, "agent_x", true, &[]).expect("local"),
+            None
+        );
+        // A listed remote that cannot be reached is the same error.
+        let remote = "file:///nonexistent/spawn-source.git".to_string();
+        assert!(
+            adopt_for_branch(
+                &mirror,
+                &remote,
+                "agent_x",
+                false,
+                std::slice::from_ref(&remote)
+            )
+            .is_err()
+        );
+        assert!(!super::has_branch(&mirror, "agent_x"));
+    }
+
+    /// The whole start of a mirrored agent ([`super::ensure_mirrored_branch`],
+    /// what `MissionWorkspaces::ensure_branch` runs once the agent is routed):
+    /// while the source is gone neither the agent's branch nor a fork of
+    /// another agent is made from main; once it answers, both start from
+    /// what the source holds.
+    #[test]
+    fn a_start_while_the_source_is_gone_makes_no_branch_from_main() {
+        use super::ensure_mirrored_branch;
+        use spawn_core::port::Branch;
+        use std::cell::Cell;
+
+        let base = std::env::temp_dir().join(format!("spawn-sources-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            &seed_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let source_dir = base.join("source.git");
+        let source = source_dir.to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let mirror_a = ensure_mirror(&base.join("a"), Some(&source)).expect("mirror a");
+        let host_a = GitWorkspace::new(&mirror_a, base.join("a"));
+        let pushed = checkpoint(&host_a, "agent_x", "one.txt");
+        assert_eq!(push_branch(&mirror_a, &source, "agent_x"), Pushed::Done);
+
+        let root_b = base.join("b");
+        let mirror_b = ensure_mirror(&root_b, Some(&source)).expect("mirror b");
+        let host_b = GitWorkspace::new(&mirror_b, &root_b);
+        let (agent_x, agent_y) = (
+            BranchName::new("agent_x").expect("valid"),
+            BranchName::new("agent_y").expect("valid"),
+        );
+        let push_calls = Cell::new(0);
+        let start = |branch: &BranchName, from: Option<&str>| {
+            ensure_mirrored_branch(&host_b, &mirror_b, &source, branch, from, &[], || {
+                push_calls.set(push_calls.get() + 1);
+            })
+        };
+
+        let moved = base.join("moved.git");
+        std::fs::rename(&source_dir, &moved).expect("the source goes");
+        assert!(start(&agent_x, None).is_err(), "the agent's own branch");
+        assert!(start(&agent_y, Some("agent_x")).is_err(), "a fork");
+        assert!(!super::has_branch(&mirror_b, "agent_x"));
+        assert!(!super::has_branch(&mirror_b, "agent_y"));
+        assert_eq!(push_calls.get(), 0);
+
+        // Back: the fork starts at the head the source holds, not main.
+        std::fs::rename(&moved, &source_dir).expect("the source is back");
+        let Branch::Created(fork) = start(&agent_y, Some("agent_x")).expect("fork") else {
+            panic!("a new branch");
+        };
+        assert_eq!(
+            (fork.from.as_str(), fork.commit.as_str()),
+            ("agent_x", pushed.as_str())
+        );
+        let Branch::Created(resumed) = start(&agent_x, None).expect("resume") else {
+            panic!("taken from the source");
+        };
+        assert_eq!(resumed.commit.as_str(), pushed);
+        assert_eq!(push_calls.get(), 1, "only the branch made here is pushed");
+
+        // A branch this host has keeps working while the source is gone.
+        std::fs::rename(&source_dir, &moved).expect("the source goes again");
+        assert_eq!(start(&agent_x, None).expect("existing"), Branch::Existing);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

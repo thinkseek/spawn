@@ -8,10 +8,11 @@ pub mod chunks;
 pub mod gc;
 pub mod git;
 pub mod tmux;
+pub mod tree_path;
 
 pub use chunks::LocalChunkStore;
 pub use git::{
     DEFAULT_CHUNK_DIRECTORY, GitWorkspace, LARGE_FILE_BYTES, container_name, docker_prefix,
-    has_conflict_block,
+    has_conflict_block, has_conflict_block_sized,
 };
 pub use tmux::{PrefixBuilder, TmuxHost};

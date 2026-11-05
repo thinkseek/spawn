@@ -1,10 +1,9 @@
-//! The judge contract: what a judge is shown, what it answers, and the
-//! deterministic stand-in used when no model is configured.
+//! The judge contract: what a judge is shown and what it answers.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::event::{EndCause, Engine, SessionSeq};
+use crate::event::{EndCause, SessionSeq};
 use crate::observation::{Ambiguity, Confidence, SemanticState};
 use crate::screen::ScreenState;
 
@@ -18,9 +17,8 @@ pub enum JudgeError {
 
 /// Facts one judgement uses. The shape is the judge's input contract.
 ///
-/// It is stored as the evidence of every model judgement and read back for
-/// replay, so every field defaults: a row written before a field existed
-/// still replays.
+/// It is stored as the evidence of every model judgement, and every field
+/// defaults, so a row written before a field existed still reads.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JudgeInput {
@@ -28,8 +26,8 @@ pub struct JudgeInput {
     pub agent_id: String,
     /// Judged session.
     pub session_id: String,
-    /// Engine of the latest execution.
-    pub engine: Option<Engine>,
+    /// Engine of the latest execution, as its record names it.
+    pub engine: Option<String>,
     /// Whether an execution is running.
     pub execution_active: bool,
     /// The end under way whose final checkpoint keeps failing
@@ -59,6 +57,11 @@ pub struct JudgeInput {
     pub ambiguity: Option<Ambiguity>,
     /// Milliseconds since the session's latest fact.
     pub quiet_ms: Option<u64>,
+    /// Milliseconds since the engine last moved: its latest transcript fact
+    /// (a tool, a message, a turn), or the execution's start. Screen
+    /// readings and commands are not progress: a spinner redrawn over a
+    /// hung tool keeps refreshing the screen, never this.
+    pub progress_ms: Option<u64>,
     /// The agent's task, as it was typed into the agent.
     pub task: Option<String>,
     /// Tail of the agent's terminal, as a person would see it.
@@ -115,44 +118,4 @@ pub trait StateJudge: Send + Sync {
 
     /// Classify one snapshot.
     fn judge(&self, input: &JudgeInput) -> Result<Judgement, JudgeError>;
-}
-
-/// Deterministic stand-in for the model judge.
-///
-/// It answers ambiguous cases when no Jev endpoint is configured, and keeps
-/// the Observer testable without a model. It is not the rules tier: see
-/// [`rules`](super::rules).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HeuristicJudge;
-
-impl StateJudge for HeuristicJudge {
-    fn name(&self) -> &'static str {
-        "heuristic"
-    }
-
-    fn judge(&self, input: &JudgeInput) -> Result<Judgement, JudgeError> {
-        let confidence = |value: f64| Confidence::new(value).unwrap_or(Confidence::ZERO);
-        if input.permission_pending || input.screen == Some(ScreenState::Permission) {
-            return Ok(Judgement::of(SemanticState::Blocked, confidence(0.9)));
-        }
-        if input.execution_active {
-            let state = if input.open_tools > 0 || input.screen == Some(ScreenState::Busy) {
-                SemanticState::Working
-            } else if input.turn == Some(TurnFact::Stopped)
-                || input.screen == Some(ScreenState::Ready)
-            {
-                SemanticState::Waiting
-            } else {
-                SemanticState::Working
-            };
-            return Ok(Judgement::of(state, confidence(0.8)));
-        }
-        match input.last_end {
-            Some(EndCause::Exited | EndCause::Stopped) => {
-                Ok(Judgement::of(SemanticState::Completed, confidence(0.6)))
-            }
-            Some(EndCause::Lost) => Ok(Judgement::of(SemanticState::Unknown, confidence(0.3))),
-            None => Ok(Judgement::of(SemanticState::Waiting, confidence(0.5))),
-        }
-    }
 }

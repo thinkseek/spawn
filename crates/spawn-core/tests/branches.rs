@@ -8,7 +8,7 @@ use std::sync::Arc;
 use spawn_core::bridge::{Bridge, BridgeConfig, TickReport, claude_session_id};
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{
-    CheckpointReason, EndCause, Engine, EventKind, Fork, GlobalPosition, NewEvent,
+    CheckpointReason, ENGINE, EndCause, EventKind, Fork, GlobalPosition, NewEvent,
 };
 use spawn_core::id::{
     AgentId, BranchName, CommandId, CommitId, ExecutionId, IdempotencyKey, Principal, SessionId,
@@ -62,7 +62,7 @@ fn start(store: &MemoryStore, from: Option<&str>) {
         store,
         "key_start",
         CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "work".to_string(),
             parent_session_id: None,
             from: from.map(str::to_string),
@@ -249,6 +249,84 @@ fn the_base_is_merged_right_after_a_turns_checkpoint() {
     // Recorded once: the next ticks have nothing to commit or merge.
     quiet(&bridge.tick().expect("idle"));
     assert_eq!(calls_after_start(&store).len(), 3);
+}
+
+#[test]
+fn a_merge_or_checkpoint_whose_record_failed_is_recorded_at_the_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+
+    // The branch took main, and the log refused the record.
+    let merged = CommitId::new("e".repeat(40)).expect("valid commit");
+    store.set_base_merge(BaseMerge::Merged {
+        commit: merged.clone(),
+        files: vec!["README.md".to_string()],
+    });
+    transcript(&store, &[turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn end"));
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    assert!(checkpoints(&store).is_empty());
+    // The next tick records it, though the branch already holds the merge.
+    quiet(&bridge.tick().expect("the log is back"));
+    assert_eq!(
+        checkpoints(&store),
+        [(CheckpointReason::BaseMerged, merged.as_str().to_string())]
+    );
+
+    // A checkpoint's record is kept the same way.
+    store.set_base_merge(BaseMerge::Current);
+    let workspace = spawn_core::id::WorkspaceId::new("1:/workspaces/1").expect("valid");
+    transcript(&store, &tool_call("toolu_1"));
+    quiet(&bridge.tick().expect("read the tool call"));
+    store.mark_dirty(&workspace);
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    quiet(&bridge.tick().expect("the log is back"));
+    let recorded = checkpoints(&store);
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(recorded[1].0, CheckpointReason::ToolCompleted);
+    quiet(&bridge.tick().expect("idle"));
+    assert_eq!(checkpoints(&store).len(), 2, "recorded once");
+}
+
+#[test]
+fn a_conflict_whose_record_failed_is_recorded_at_the_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Conflicted {
+        files: vec!["README.md".to_string()],
+        marked: true,
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    let conflicts = |store: &MemoryStore| {
+        events(store)
+            .into_iter()
+            .filter(|event| matches!(event.kind, EventKind::MergeConflicted { .. }))
+            .count()
+    };
+    assert_eq!(conflicts(&store), 0);
+    // Nothing of the failed tick was kept: the next one merges, reports and
+    // records again.
+    let report = bridge.tick().expect("the log is back");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("README.md")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(conflicts(&store), 1);
+    bridge.tick().expect("idle");
+    assert_eq!(conflicts(&store), 1, "recorded once");
 }
 
 #[test]
@@ -861,4 +939,105 @@ fn a_discard_unmounts_a_stalled_end() {
         })
         .collect();
     assert_eq!(finished.last(), Some(&true), "the discard succeeded");
+}
+
+/// Append lines to the transcript of the session's first native session as
+/// the engine of the `mount`-th workspace writes it: a resumed session keeps
+/// writing the file the earlier execution wrote.
+fn transcript_in(store: &MemoryStore, mount: u64, lines: &[String]) {
+    let path = spawn_core::bridge::transcript_path(
+        &BridgeConfig::new("tester").claude_projects,
+        &spawn_core::id::WorkspaceId::new(format!("{mount}:/workspaces/{mount}"))
+            .expect("valid workspace"),
+        &claude_session_id(&ExecutionId::for_command(CommandId(1))),
+    );
+    store.append_file(&path, &(lines.join("\n") + "\n"));
+}
+
+/// The session ran one turn on the first execution (merged after it), was
+/// stopped, and resumed with a prompt: the second execution's turn is open.
+fn resumed(clock: &Arc<ManualClock>) -> (Arc<MemoryStore>, Bridge) {
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    for command in 1..=4 {
+        let execution = ExecutionId::for_command(CommandId(command));
+        store.set_pane(&TerminalName::for_execution(&execution), READY);
+    }
+    let mut bridge = bridge(&store).with_clock(clock.clone());
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn"));
+    quiet(&bridge.tick().expect("checkpoint and merge"));
+    assert_eq!(merges(&store), 1);
+    submit(&store, "key_stop", CommandAction::Stop);
+    quiet(&bridge.tick().expect("stop"));
+    submit(
+        &store,
+        "key_resume",
+        CommandAction::Resume {
+            prompt: Some("go on".to_string()),
+            model: None,
+        },
+    );
+    quiet(&bridge.tick().expect("resume and type the prompt"));
+    (store, bridge)
+}
+
+#[test]
+fn a_late_turn_end_of_an_earlier_execution_neither_closes_the_turn_nor_merges() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let (store, mut bridge) = resumed(&clock);
+    // The resumed execution starts a tool, which still runs.
+    transcript_in(&store, 2, &tool_call("toolu_9")[..1]);
+    quiet(&bridge.tick().expect("read the tool start"));
+
+    // A turn end of the first execution reaches the log only now.
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new("agent_one").expect("valid agent"),
+            session_id: SessionId::new("session_one").expect("valid session"),
+            execution_id: Some(ExecutionId::for_command(CommandId(1))),
+            source: spawn_core::event::Source::Claude,
+            source_event_id: Some("t-late".to_string()),
+            kind: EventKind::TurnStopped {
+                input_tokens: None,
+                output_tokens: None,
+            },
+        })
+        .expect("append succeeds");
+    let commits_before = commits(&store);
+    for _ in 0..3 {
+        clock.advance(std::time::Duration::from_mins(1));
+        quiet(&bridge.tick().expect("the tool runs"));
+    }
+    assert_eq!(merges(&store), 1, "no merge while the tool runs");
+    assert_eq!(
+        commits(&store),
+        commits_before,
+        "the earlier execution's turn end asks no checkpoint of this one"
+    );
+
+    // The turn is still open: only its own end closes it, then the merge.
+    transcript_in(&store, 2, &[tool_call("toolu_9")[1].clone(), turn_end("9")]);
+    quiet(&bridge.tick().expect("read the turn end"));
+    quiet(&bridge.tick().expect("checkpoint and merge"));
+    assert_eq!(merges(&store), 2);
+}
+
+#[test]
+fn the_earlier_executions_lines_read_again_on_resume_leave_the_turn_open() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let (store, mut bridge) = resumed(&clock);
+    // The resumed engine has not written yet; its file holds the first
+    // execution's turn, already recorded under that execution.
+    transcript_in(&store, 2, &[prompt("1"), turn_end("1")]);
+    for _ in 0..3 {
+        clock.advance(std::time::Duration::from_mins(1));
+        quiet(&bridge.tick().expect("the typed prompt runs"));
+    }
+    assert_eq!(merges(&store), 1, "no merge while the typed prompt runs");
+    transcript_in(&store, 2, &[prompt("2"), turn_end("2")]);
+    quiet(&bridge.tick().expect("read the turn"));
+    quiet(&bridge.tick().expect("checkpoint and merge"));
+    assert_eq!(merges(&store), 2);
 }

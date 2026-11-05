@@ -1,12 +1,11 @@
-//! `submit` and `dispatch`: writing commands to the queue.
+//! `submit`: writing a command to the queue.
 
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::port::CommandQueue;
 
 use crate::Flags;
-use crate::config::{env_value, open_store, spawn_program, supervised, workspace_root};
-use crate::dispatch;
+use crate::config::{env_value, open_store};
 
 /// `spawn submit`: write one command to the queue.
 pub(crate) fn submit(flags: &Flags) -> Result<i32, String> {
@@ -37,45 +36,5 @@ pub(crate) fn submit(flags: &Flags) -> Result<i32, String> {
     }
     .map_err(|error| error.to_string())?;
     println!("command={}", id.0);
-    Ok(0)
-}
-
-/// `spawn dispatch [--dry-run] [--root <dir>]`: one dispatcher step;
-/// `--dry-run` prints the plan and submits nothing; `--root` (default
-/// `SPAWN_WORKSPACE_ROOT`) is the workspace root, as for `spawn loop`.
-pub(crate) fn dispatch_once(rest: &[String]) -> Result<i32, String> {
-    let dry = rest.iter().any(|word| word == "--dry-run");
-    let valued: Vec<String> = rest
-        .iter()
-        .filter(|word| *word != "--dry-run")
-        .cloned()
-        .collect();
-    let flags =
-        Flags::parse(&valued).map_err(|error| format!("{error}\n{}", crate::DISPATCH_USAGE))?;
-    let root = workspace_root(&flags).map(std::path::PathBuf::from);
-    let store = open_store()?;
-    let supervised = supervised();
-    let spawn = spawn_program();
-    if dry {
-        let plan = dispatch::plan(&store, supervised, &spawn)?;
-        for order in &plan.orders {
-            println!(
-                "order {} -> {}: {}",
-                order.key,
-                order.session_id,
-                serde_json::to_string(&order.action).unwrap_or_default()
-            );
-        }
-        for item in &plan.pending {
-            println!("pending {} {:?}: {}", item.session_id, item.why, item.line);
-        }
-        if plan.orders.is_empty() && plan.pending.is_empty() {
-            println!("dispatch: nothing to do");
-        }
-        return Ok(0);
-    }
-    for line in dispatch::step(&store, supervised, &spawn, root.as_deref())? {
-        println!("{line}");
-    }
     Ok(0)
 }

@@ -8,10 +8,10 @@
 
 | 能力 | 实现方 | Spawn 做的事 |
 | --- | --- | --- |
-| 计算 | Claude Code、Codex CLI | 启动进程、投递提示、读取 transcript、屏幕与退出文件 |
+| 计算 | Claude Code | 启动进程、投递提示、读取 transcript、屏幕与退出文件 |
 | 工作区 | git | 裸仓库加每分支一份工作树，`git archive` 导出、`commit-tree` 收口 |
 | 事件存储 | PostgreSQL 16 | 建表、写入函数、视图、命令队列 |
-| 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时用内置启发式判定） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
+| 语义状态 | 规则，加判定模型 `/v1/systemone`（未配置时只用规则） | 规则先判；规则定不了的情形发一次 HTTP 请求；写一条 observation |
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
 | 终端 | tmux | 建会话、输入文本、抓取屏尾 |
 
@@ -65,7 +65,7 @@ spawn_submit(principal, key, agent, session, action)
 
 两条链路互不依赖：数据链路是引擎到事件到 SQL，状态链路是事件到判定再回到事件。
 
-worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。Codex 的 `exec --json` 输出由 `spawn run` 复制到 `.spawn/codex-<execution>.jsonl`，Bridge 同样按行读取。
+worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。
 
 ## 4. 终端接入：尾行解析
 
@@ -121,7 +121,7 @@ spawn init-db
 spawn submit --agent agent_001 --session session_001 --key k1 \
   --action '{"type":"start","engine":"claude","prompt":"整理最近三个提交"}'
 spawn tick
-spawn status
+spawn fleet
 ```
 
 | 子命令 | 作用 |
@@ -129,15 +129,12 @@ spawn status
 | `init-db` | 安装或刷新 schema，可重复执行 |
 | `submit` | 写一条命令，幂等键重复则返回原命令 |
 | `tick` | 跑一轮 Bridge 与 Observer |
-| `status` | 扫描全部事件，打印每会话最新一条 observation |
-| `hook` | 读取并丢弃标准输入。Spawn 不配置 hook；它只为设置里写了它的引擎存在 |
 | `run` | 在终端内启动引擎，退出时把退出码写入 `SPAWN_EXIT_FILE`（Bridge 读到后写 `execution.ended{Exited}`），转发退出码；不连数据库 |
 | `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
 | `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
 | `serve` | 常驻：只读看板与 HTTP 查询 |
-| `dispatch` | 跑一轮派发：把消息、任务、新闻送给对应会话 |
 | `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
-| `judge` / `fleet` / `tail` / `corpus` | 判定、舰队概览、事件尾随、导出判定语料 |
+| `fleet` / `tail` | 舰队概览（每个会话及其判定）、单个会话的判定与事件尾随 |
 | `version` | 打印 `spawn <版本>` |
 
 | 环境变量 | 默认值 | 说明 |
@@ -146,8 +143,8 @@ spawn status
 | `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
-| `SPAWN_CODEX_PROGRAM` | `codex` | Codex 可执行文件 |
-| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录（Bridge 所见路径） |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects`；设置 `SPAWN_EXEC_IMAGE` 时为 `$SPAWN_EXEC_HOME/.claude/projects` | Claude 写 transcript 的目录（引擎所见路径；容器模式下 Bridge 在容器内读取） |
+| `SPAWN_EXEC_HOME` | `/root` | 容器内引擎的 home（`docker exec` 不带宿主机的 `HOME`、`CLAUDE_CONFIG_DIR`） |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件 |
 | `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket |
 | `SPAWN_EXEC_IMAGE` | 未设 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |

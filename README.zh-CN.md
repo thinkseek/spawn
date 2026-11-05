@@ -2,11 +2,11 @@
 
 [English](./README.md) · 简体中文
 
-Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
+Spawn 在隔离的工作区中运行 Claude Code agent，并把它们的全部行为记录到一个 PostgreSQL 事件日志。
 
 - 调用方向 PostgreSQL 中的队列提交命令（start、input、resume、stop）。
 - `spawn tick` 领取命令，创建一个 git 分支，导出工作树，在 tmux 会话中启动引擎。
-- Claude Code 的 transcript、Codex JSON 输出、终端屏幕与引擎退出状态转为日志中的类型化事件。引擎所在终端不持有数据库登录。
+- Claude Code 的 transcript、终端屏幕与引擎退出状态转为日志中的类型化事件。引擎所在终端不持有数据库登录。
 - Observer 判定每个会话的状态（可输入、运行中、阻塞、失败），并把结论作为事件写回。
 
 日志是唯一的状态。每次 `spawn tick` 是新进程，从日志重建视图，进程崩溃不丢状态。
@@ -18,9 +18,9 @@ Spawn 在隔离的工作区中运行 Claude Code 与 Codex CLI agent，并把它
 | Rust | 1.95 及以上 | 编译 |
 | PostgreSQL | 16 及以上 | 事件日志、命令队列、视图 |
 | tmux | 3.x | 终端 |
-| git | 2.30 及以上 | 分支与工作区 |
+| git | 2.40 及以上（`git --attr-source`，启动时检查） | 分支与工作区 |
 | docker | 可选 | 设置 `SPAWN_EXEC_IMAGE` 时在容器内运行引擎 |
-| Claude Code 和/或 Codex CLI | 当前版本 | 引擎 |
+| Claude Code | 当前版本 | 引擎 |
 
 ## 安装
 
@@ -52,10 +52,11 @@ spawn submit --agent agent_demo --session session_demo --key demo-1 --action '{"
 spawn tick --repo /data/spawn/repo.git --root /data/spawn/ws
 ```
 
-打印每个会话的最新判定：
+打印每个会话及其最新判定，以及单个会话的事件：
 
 ```bash
-spawn status
+spawn fleet
+spawn tail --session session_demo
 ```
 
 生产部署跑常驻进程：`spawn loop`（Bridge、Observer、派发、存活规则，默认 500 ms 一轮）、`spawn integrate`（门禁与落地）、`spawn serve`（只读看板），对应 `deploy/systemd/` 下的 user unit。`spawn tick` 只跑一轮，用于调试和测试。
@@ -67,8 +68,12 @@ spawn status
 | `init-db` | 安装或更新 SQL schema，可重复执行 |
 | `submit` | 向队列写一条命令。参数：`--agent`、`--session`、`--key`、`--action`、`--principal`（默认 `spawn`） |
 | `tick` | 领取并执行排队命令，推进活跃执行，记录判定。参数：`--repo`、`--root`、`--judge-url` |
-| `status` | 打印每个会话的最新判定 |
-| `hook` | 读取并忽略标准输入。Spawn 不配置 hook；它只为设置里写了它的引擎存在 |
+| `loop` | 常驻运行舰队：Bridge、Observer、派发，以及（`SPAWN_SUPERVISOR=1` 时）supervisor 的存活规则 |
+| `fleet` | 以 JSON 打印当前登录可读的每个会话及其判定 |
+| `tail --session <id>` | 以 JSON 打印单个会话的最新判定、近期事件、判定与命令 |
+| `integrate [--once] [--root <dir>]` | 唯一的落地路径：用 `scripts/rsi/gate.sh` 判定就绪的工作，以 compare-and-swap 推送落到来源，按停机规则暂停任务，并给目标任务（RSI）分配下一条 backlog |
+| `serve` | 以 `spawn_reader` 提供只读看板与 API；默认绑定 `127.0.0.1:8787`，其他地址需要 `SPAWN_SERVE_TOKEN` |
+| `mission`、`task`、`resident` | 任务层：添加、配置、关闭、恢复任务；分派、验收、退回子任务；提议、批准、退役常驻 worker。每条命令输出 JSON |
 | `run` | 在终端内运行引擎，把退出状态写入文件供 Bridge 读取。由 Spawn 配置，无需手动调用 |
 | `version` | 打印 `spawn <版本>` |
 
@@ -76,9 +81,9 @@ spawn status
 
 | `type` | 字段 |
 | --- | --- |
-| `start` | `engine`（`claude` 或 `codex`）、`prompt`（Codex 必须非空）、可选 `parent_session_id`、可选 `from`（同一任务源的另一个 agent，即其分支头，或完整 commit id：新分支从这里开始而不是 `main`） |
-| `input` | `text`；仅 Claude |
-| `resume` | 可选 `prompt`；Codex 必填 |
+| `start` | `prompt`、可选 `engine`（`claude`，唯一的引擎）、可选 `parent_session_id`、可选 `from`（同一任务源的另一个 agent，即其分支头，或完整 commit id：新分支从这里开始而不是 `main`） |
+| `input` | `text` |
+| `resume` | 可选 `prompt` |
 | `stop` | 无 |
 
 ## 配置
@@ -94,10 +99,10 @@ spawn status
 | `SPAWN_EXEC_IMAGE` | 未设置 | 设置后每个分支一个容器，引擎与 tmux 在里面运行 |
 | `SPAWN_DOCKER_PROGRAM` | `docker` | docker 路径 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
-| `SPAWN_CODEX_PROGRAM` | `codex` | Codex CLI 路径 |
-| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录（Bridge 所见路径） |
+| `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects`；设置 `SPAWN_EXEC_IMAGE` 时为 `$SPAWN_EXEC_HOME/.claude/projects` | Claude Code 写 transcript 的目录（引擎所见路径；容器模式下 Bridge 在容器内读取） |
+| `SPAWN_EXEC_HOME` | `/root` | 容器内引擎的 home（`docker exec` 不带宿主机的 `HOME`、`CLAUDE_CONFIG_DIR`） |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
-| `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时用本地启发式判定 |
+| `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时只用规则判定，规则定不了的情形要求关注 |
 
 ## 开发
 

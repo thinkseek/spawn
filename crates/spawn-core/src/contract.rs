@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::command::{Claimed, CommandAction, Outcome, Submission};
-use crate::event::{Appended, Engine, EventKind, GlobalPosition, NewEvent, SessionSeq, Source};
+use crate::event::{Appended, ENGINE, EventKind, GlobalPosition, NewEvent, SessionSeq, Source};
 use crate::id::{
     AgentId, BranchName, IdempotencyKey, Principal, SessionId, TerminalName, WorkspaceId,
 };
@@ -99,7 +99,7 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
         session_id: session(tag, 1),
         idempotency_key: IdempotencyKey::new(format!("key_{tag}_1")).expect("valid key"),
         action: CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "first task".to_string(),
             parent_session_id: None,
             from: None,

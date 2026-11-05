@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type { OverviewSession, RsiSummary } from "../api";
 import type { View } from "../App";
 import { relativeTime } from "../format";
+import { rsiPhase, sessionTaskLabel } from "../missions";
 import { phaseStyle } from "./rsi/Phase";
 import { StateDot, stateLabel } from "./StateDot";
 import { cx } from "./ui";
@@ -48,12 +49,7 @@ export function Sidebar({
   onShowRsi,
   onSelect,
 }: SidebarProps) {
-  // The RSI line: halted first, then the task in flight, else idle.
-  const phase = rsi
-    ? rsi.halted
-      ? "halted"
-      : (rsi.open_task?.state ?? "idle")
-    : null;
+  const phase = rsiPhase(rsi);
   return (
     <aside className="hidden w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar md:flex">
       <div className="flex h-12 shrink-0 items-center px-4">
@@ -115,7 +111,12 @@ export function Sidebar({
           <ul className="space-y-px">
             {sessions.map((session) => {
               const selected = session.session_id === selectedId;
-              const confidence = session.observation?.confidence;
+              // A worker whose task waits for the gate (or lands) idles at
+              // its prompt, but the task is not done: say where it is.
+              const taskLabel = sessionTaskLabel(session.session_id, rsi);
+              const confidence = taskLabel
+                ? null
+                : session.observation?.confidence;
               return (
                 <li key={session.session_id}>
                   <button
@@ -140,7 +141,7 @@ export function Sidebar({
                       </span>
                     </span>
                     <span className="mt-0.5 flex items-center gap-1.5 pl-3.5 text-micro text-muted-foreground">
-                      <span>{stateLabel(session.state)}</span>
+                      <span>{taskLabel ?? stateLabel(session.state)}</span>
                       {confidence != null && confidence > 0 && (
                         <span className="tnum text-faint-foreground">
                           · {Math.round(confidence * 100)}%

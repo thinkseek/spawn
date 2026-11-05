@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 use spawn_core::bridge::{Bridge, BridgeConfig, ModelRelay, TickReport, claude_settings};
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::{Engine, EventKind, GlobalPosition, ModelProfile, NewEvent};
+use spawn_core::event::{ENGINE, EventKind, GlobalPosition, ModelProfile, NewEvent};
 use spawn_core::id::TerminalName;
 use spawn_core::id::{AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId};
 use spawn_core::memory::MemoryStore;
@@ -90,7 +90,7 @@ fn profiles_round_trip_and_the_default_is_left_out_of_records() {
     assert_eq!(ModelProfile::parse("default"), Some(ModelProfile::Default));
     assert_eq!(ModelProfile::parse("opus"), None);
     let start = |model| CommandAction::Start {
-        engine: Engine::Claude,
+        engine: ENGINE.to_string(),
         prompt: "p".to_string(),
         parent_session_id: None,
         from: None,
@@ -161,7 +161,7 @@ impl Fleet {
 
     fn start(&mut self, model: Option<ModelProfile>) -> TickReport {
         self.send(CommandAction::Start {
-            engine: Engine::Claude,
+            engine: ENGINE.to_string(),
             prompt: "write the docs".to_string(),
             parent_session_id: None,
             from: None,
