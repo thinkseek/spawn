@@ -526,8 +526,10 @@ expect "two METRIC lines on stdout: no metric" "$(judge "$twice" "$scenarios/008
 expect "two METRIC lines are reported" "$(cat "$work/gate.out")" 'two or more METRIC lines'
 
 # 7. The candidate may not run fewer tests than the base, as cargo counts
-# them: a tiny crate on a base of its own (the only cases that run cargo,
-# offline, no dependencies). Its base runs 3: a, b and extra (c is ignored).
+# them, nor stop running one of the base's by name, nor add or edit a test
+# into an empty body: a tiny crate on a base of its own (the only cases that
+# run cargo, offline, no dependencies). Its base runs 4: tests::a, tests::b,
+# extra and the doctest of `one` (tests::c is ignored).
 branch base-rust
 printf '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n' >"$seed/Cargo.toml"
 mkdir -p "$seed/src" "$seed/tests"
@@ -535,6 +537,10 @@ cat >"$seed/src/lib.rs" <<'EOF'
 //! A crate with tests.
 
 /// One.
+///
+/// ```
+/// assert_eq!(t::one(), 1);
+/// ```
 pub fn one() -> u32 {
     1
 }
@@ -547,14 +553,14 @@ mod tests {
     }
 
     #[test]
-    fn b() {}
+    fn b() { assert_eq!(super::one() + 1, 2); }
 
     #[test]
     #[ignore]
-    fn c() {}
+    fn c() { assert_eq!(super::one(), 1); }
 }
 EOF
-printf '#[test]\nfn extra() {}\n' >"$seed/tests/extra.rs"
+printf '#[test]\nfn extra() {\n    assert_eq!(t::one(), 1);\n}\n' >"$seed/tests/extra.rs"
 (cd "$seed" && CARGO_NET_OFFLINE=true cargo generate-lockfile -q)
 rust_base=$(commit base-rust)
 rust_branch() {
@@ -567,36 +573,76 @@ judge_rust() {
     judge "$1"
     base=$saved_base
 }
+# drop_b: tests::b leaves src/lib.rs.
+drop_b() { sed -i '/#\[test\]$/{N;/fn b() {/d}' "$seed/src/lib.rs"; }
 rust_branch rust-same
 same=$(commit rust-same)
 expect "the same tests land" "$(judge_rust "$same")" 'exit=0 {"verdict":"accepted"}'
-expect "the counts are reported" "$(cat "$work/gate.out")" 'tests cargo runs: 3 on the base, 3 on the candidate'
+expect "the counts are reported" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+rust_branch rust-doc-shifted
+sed -i '1a //!\n//! More about the crate.' "$seed/src/lib.rs"
+shifted=$(commit rust-doc-shifted)
+expect "a doctest whose line moved keeps its name" "$(judge_rust "$shifted")" 'exit=0 {"verdict":"accepted"}'
 rust_branch rust-comment
-sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
+drop_b
 printf '\n// #[test]\n// fn b() {}\n/// A string, not a test.\npub const B: &str = "#[test] fn b() {}";\n' \
     >>"$seed/src/lib.rs"
 comment=$(commit rust-comment)
 expect "a test replaced by a comment and a string is refused" "$(judge_rust "$comment")" \
-    'runs fewer tests (3 -> 2)'
+    'runs fewer tests (4 -> 3)'
 rust_branch rust-orphan
-sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
-printf '#[test]\nfn b() {}\n' >"$seed/src/orphan.rs"
+drop_b
+printf '#[test]\nfn b() {\n    assert_eq!(1 + 1, 2);\n}\n' >"$seed/src/orphan.rs"
 orphan=$(commit rust-orphan)
 expect "a test moved to a file no mod includes is refused" "$(judge_rust "$orphan")" \
-    'runs fewer tests (3 -> 2)'
+    'runs fewer tests (4 -> 3)'
 rust_branch rust-ignored
-sed -i 's/^    fn b() {}$/    #[ignore]\n    fn b() {}/' "$seed/src/lib.rs"
+sed -i 's/^    fn b() {/    #[ignore]\n&/' "$seed/src/lib.rs"
 ignored=$(commit rust-ignored)
-expect "an ignored test is refused" "$(judge_rust "$ignored")" 'runs fewer tests (3 -> 2)'
+expect "an ignored test is refused" "$(judge_rust "$ignored")" 'runs fewer tests (4 -> 3)'
 rust_branch rust-cfg
 sed -i 's/^#\[cfg(test)\]$/#[cfg(any())]/' "$seed/src/lib.rs"
 uncompiled=$(commit rust-cfg)
-expect "a test module compiled out is refused" "$(judge_rust "$uncompiled")" 'runs fewer tests (3 -> 1)'
+expect "a test module compiled out is refused" "$(judge_rust "$uncompiled")" 'runs fewer tests (4 -> 2)'
+rust_branch rust-renamed
+sed -i 's/^    fn b() {/    fn b_renamed() {/' "$seed/src/lib.rs"
+renamed=$(commit rust-renamed)
+expect "a renamed test is refused though the count holds" "$(judge_rust "$renamed")" \
+    'drops or renames base tests (1: tests::b)'
+expect "the count did hold" "$(cat "$work/gate.out")" 'tests cargo runs: 4 on the base, 4 on the candidate'
+rust_branch rust-moved-path
+drop_b
+printf '#[test]\nfn b() {\n    assert_eq!(t::one() + 1, 2);\n}\n' >>"$seed/tests/extra.rs"
+moved_path=$(commit rust-moved-path)
+expect "a test moved to another module path is a rename" "$(judge_rust "$moved_path")" \
+    'drops or renames base tests (1: tests::b)'
 rust_branch rust-moved
-sed -i '/#\[test\]$/{N;/fn b() {}/d}' "$seed/src/lib.rs"
-printf '#[test]\nfn b() {}\n' >>"$seed/tests/extra.rs"
+drop_b
+printf 'mod tests {\n    #[test]\n    fn b() {\n        assert_eq!(t::one() + 1, 2);\n    }\n}\n' \
+    >>"$seed/tests/extra.rs"
 moved=$(commit rust-moved)
-expect "a moved test is not a drop" "$(judge_rust "$moved")" 'exit=0 {"verdict":"accepted"}'
+expect "a test moved to another file under its module path lands" "$(judge_rust "$moved")" \
+    'exit=0 {"verdict":"accepted"}'
+rust_branch rust-emptied
+sed -i 's/^    fn b() { .*/    fn b() {}/' "$seed/src/lib.rs"
+emptied=$(commit rust-emptied)
+expect "a test whose body is emptied is refused" "$(judge_rust "$emptied")" \
+    'adds or edits a test with an empty body (src/lib.rs:19 b)'
+rust_branch rust-emptied-comment
+sed -i 's|^    fn b() { .*|    fn b() {\n        // kept for later\n        ;\n    }|' "$seed/src/lib.rs"
+emptied_comment=$(commit rust-emptied-comment)
+expect "a body of a comment and a semicolon is empty" "$(judge_rust "$emptied_comment")" \
+    'adds or edits a test with an empty body (src/lib.rs:19 b)'
+rust_branch rust-new-empty
+printf '\n#[tokio::test(flavor = "current_thread")]\nasync fn d() {}\n' >>"$seed/tests/extra.rs"
+new_empty=$(commit rust-new-empty)
+expect "a new test with an empty body is refused" "$(judge_rust "$new_empty")" \
+    'adds or edits a test with an empty body (tests/extra.rs:6 d)'
+# The limit, stated: a body that asserts nothing real is not empty text.
+rust_branch rust-assert-true
+sed -i 's/^    fn b() { .*/    fn b() { assert!(true); }/' "$seed/src/lib.rs"
+assert_true=$(commit rust-assert-true)
+expect "the limit: assert!(true) is not caught" "$(judge_rust "$assert_true")" 'exit=0 {"verdict":"accepted"}'
 rust_branch rust-broken
 printf '#[test]\nfn broken() { let x: u32 = "no"; }\n' >>"$seed/tests/extra.rs"
 broken=$(commit rust-broken)
