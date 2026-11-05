@@ -107,8 +107,10 @@ impl TranscriptArchive for LocalTranscriptArchive {
         std::fs::create_dir_all(&directory)
             .map_err(|error| failed("create", &directory, &error))?;
         let created = !path.exists();
+        // Only a copy's first append creates it: a refused one leaves no
+        // empty copy behind.
         let mut file = OpenOptions::new()
-            .create(true)
+            .create(at == 0)
             .append(true)
             .open(&path)
             .map_err(|error| failed("open", &path, &error))?;

@@ -437,6 +437,10 @@ pub fn transcript_archive(tag: &str, archive: &dyn crate::port::TranscriptArchiv
         archive.append(&agent, native, 2, 0, b"x").is_err(),
         "no copy past the next"
     );
+    assert!(
+        archive.append(&agent, native, 1, 3, b"x").is_err(),
+        "a new copy starts at 0"
+    );
     archive
         .append(&agent, native, 1, 0, b"whole\n")
         .expect("the next copy");
