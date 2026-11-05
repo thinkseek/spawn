@@ -32,7 +32,6 @@ from (
                            where s.session_id = k.session_id and s.live)))
 ) t";
 
-<<<<<<< 67c5b1bba25ebe9d3af830a13ccfd01c7a9b5fb0
 /// Residents (not retired) whose latest delivered task is cancelled: the
 /// dispatcher stops such a worker, sets the task's work aside and tells it
 /// (docs/fleet-architecture.md, "When a task closes"). The latest delivery
@@ -110,7 +109,7 @@ from (
        order by e.session_seq desc limit 1) last on true
    where first.id is not null
 ) t";
-=======
+
 /// What the dispatcher measures stalls from (`dispatch/stall.rs`,
 /// docs/fleet-architecture.md §3), all from the log and on the database's
 /// clock: `now_ms` is `spawn_now_ms()`, and every `age_ms` is it minus the
@@ -227,7 +226,6 @@ select jsonb_build_object(
        order by e.session_seq desc limit 1) h on true
    where m.halted is not null), '[]'::jsonb)
 )";
->>>>>>> 6a5853b0d48600ddb720e011e9e75cf21b2a4d04
 
 /// What the supervisor should hear about, beyond worker states: open
 /// missions, reports it reviews (not those of a mission its gate alone
@@ -772,16 +770,15 @@ impl PostgresStore {
         self.query_json(DELIVERY_TASKS, &[])
     }
 
-<<<<<<< 67c5b1bba25ebe9d3af830a13ccfd01c7a9b5fb0
     /// Residents whose latest delivered task is cancelled, with the
     /// checkpoint it started from ([`CANCELLED_DELIVERIES`]).
     pub fn cancelled_deliveries(&self) -> Result<Value, StoreError> {
         self.query_json(CANCELLED_DELIVERIES, &[])
-=======
+    }
+
     /// What the dispatcher measures stalls from ([`STALL_FACTS`]).
     pub fn stall_facts(&self) -> Result<Value, StoreError> {
         self.query_json(STALL_FACTS, &[])
->>>>>>> 6a5853b0d48600ddb720e011e9e75cf21b2a4d04
     }
 
     /// Missions, reports, approvals and human messages for the digest.
