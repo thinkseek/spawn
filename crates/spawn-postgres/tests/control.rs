@@ -1101,8 +1101,9 @@ fn host_disk_records_are_owner_only_facts_the_fold_ignores() {
     assert_eq!(tables(&mut client), before);
     assert_eq!(control_types(&mut client), ["host.disk"; 3]);
 
+    let supervisor = common::login(&schema, "spawn_supervisor");
     client
-        .batch_execute("set session authorization spawn_supervisor")
+        .batch_execute(&format!("set session authorization {supervisor}"))
         .expect("become the supervisor");
     assert!(
         client
