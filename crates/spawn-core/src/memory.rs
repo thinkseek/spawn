@@ -590,6 +590,35 @@ impl WorkspaceStore for MemoryStore {
         Ok(merge)
     }
 
+    fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
+        let mut state = self.lock();
+        state.workspace_calls.push(format!("merge_main {branch}"));
+        if !state.heads.contains_key(branch) {
+            return Err(WorkspaceError::Refused {
+                code: "NoSuchBranch".to_string(),
+                message: branch.to_string(),
+            });
+        }
+        match state.base_merge.clone() {
+            BaseMerge::Current => Ok(BaseMerge::Current),
+            BaseMerge::Merged { commit, files } => {
+                // A merge the branch already holds is current.
+                let history = state.history.entry(branch.clone()).or_default();
+                if !history.insert(commit.clone()) {
+                    return Ok(BaseMerge::Current);
+                }
+                state.known.insert(commit.clone());
+                state.heads.insert(branch.clone(), commit.clone());
+                Ok(BaseMerge::Merged { commit, files })
+            }
+            // A conflict leaves the branch as it is.
+            BaseMerge::Conflicted { files, .. } => Ok(BaseMerge::Conflicted {
+                files,
+                marked: false,
+            }),
+        }
+    }
+
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         Ok(self.lock().heads.get(branch).cloned())
     }

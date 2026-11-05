@@ -109,8 +109,8 @@ pub enum CheckpointReason {
     TurnStopped,
     /// The execution ended.
     ExecutionEnded,
-    /// The source's `main` moved and was merged into the idle branch after a
-    /// turn ended (docs/storage.md, "Main into branches automatically").
+    /// `main` was merged into the agent's branch: when an execution starts or
+    /// resumes, and only cleanly (older records: into an idle workspace).
     BaseMerged,
 }
 
@@ -185,8 +185,10 @@ pub enum EventKind {
     /// A prompt reached the engine.
     #[serde(rename = "message.received")]
     MessageReceived,
-    /// The Bridge typed a prompt that opens with the merge notice
-    /// ([`crate::ingest::MERGE_NOTICE_OPENING`]): what merges of main changed
+    /// Read only, in records written before main stopped being merged into
+    /// running workspaces: nothing writes it, and folds ignore it. The
+    /// Bridge typed a prompt that opened with a merge notice: what merges of
+    /// main changed
     /// in the agent's workspace, up to and including the event at `through`.
     /// The notice stays due until that prompt reaches the engine.
     #[serde(rename = "notice.typed")]
@@ -194,9 +196,9 @@ pub enum EventKind {
         /// The last merge event the typed notice told of.
         through: GlobalPosition,
     },
-    /// A prompt that opens with the merge notice reached the engine: the
-    /// notice the Bridge typed last is delivered. Read from the engine's
-    /// transcript, never inferred from any prompt.
+    /// Read only, like [`EventKind::NoticeTyped`]: nothing writes it, and
+    /// folds ignore it. A prompt that opened with the merge notice reached
+    /// the engine: the notice the Bridge typed last was delivered.
     #[serde(rename = "notice.received")]
     NoticeReceived,
     /// The engine asked for attention, for example a permission prompt.
@@ -300,18 +302,19 @@ pub enum EventKind {
         reason: CheckpointReason,
         /// Commit reference.
         artifact: ArtifactRef,
-        /// For a merge of main (`base_merged`): the files it changed in the
-        /// workspace, under the agent.
+        /// For a merge of main (`base_merged`): the files it changed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
     },
-    /// Merging the source's `main` into an idle workspace conflicted.
+    /// Merging the source's `main` into an agent's branch at a start or
+    /// resume conflicted: the branch stayed as it was.
     #[serde(rename = "merge.conflicted")]
     MergeConflicted {
         /// Conflicting paths.
         files: Vec<String>,
-        /// The workspace now holds the merge, with conflict markers in
-        /// `files`; false: a conflict markers cannot show, nothing changed.
+        /// Always false now. True only in records written while main was
+        /// merged into running workspaces: that workspace held the merge with
+        /// conflict markers in `files`.
         marked: bool,
     },
     /// The SQL gateway accepted a command.

@@ -153,7 +153,7 @@ impl Rig {
         self.store
             .workspace_calls()
             .iter()
-            .filter(|call| *call == "merge_base")
+            .filter(|call| call.starts_with("merge"))
             .count()
     }
 }
@@ -390,13 +390,11 @@ fn m8_utc_ms_overflows_on_an_out_of_range_year() {
     }
 }
 
-/// M4: after a Bridge restart between typing a prompt and the engine's
-/// transcript recording it, the turn the Bridge opened in memory is gone,
-/// the screen folds to the ready frame recorded before typing and the
-/// merge timer starts over: main is merged into a workspace whose turn runs.
+/// M4: main is never merged into a running execution, not after a Bridge
+/// restart between typing a prompt and the engine's transcript recording it
+/// either (main reaches a branch only when an execution starts or resumes).
 #[test]
-#[ignore = "audit M4 repro"]
-fn m4_main_merges_under_a_turn_typed_before_a_restart_repro() {
+fn m4_main_merges_under_a_turn_typed_before_a_restart() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
@@ -420,12 +418,10 @@ fn m4_main_merges_under_a_turn_typed_before_a_restart_repro() {
     assert_eq!(rig.merges(), merged, "no merge while the typed turn runs");
 }
 
-/// M4, without a restart: a turn someone else typed into the pane. The
-/// first busy frame is not confirmed and the transcript has no line yet;
-/// the last confirmed frame (ready) lets the idle merge through.
+/// M4, without a restart: a turn someone else typed into the pane, whose
+/// first busy frame is not confirmed yet. No idle merge exists to slip in.
 #[test]
-#[ignore = "audit M4 repro"]
-fn m4_main_merges_on_the_first_busy_frame_of_a_turn_repro() {
+fn m4_main_merges_on_the_first_busy_frame_of_a_turn() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.start("");
@@ -442,11 +438,10 @@ fn m4_main_merges_on_the_first_busy_frame_of_a_turn_repro() {
     assert_eq!(rig.merges(), merged, "the frame just read is busy");
 }
 
-/// L1: the once-per-conflict suppression lives in memory; after a restart
-/// the same conflict is recorded (and so told to the agent) again.
+/// L1: a conflict is recorded once: at the start, keyed by the branch head
+/// and its files; a restart records nothing again.
 #[test]
-#[ignore = "audit L1 repro"]
-fn l1_the_same_conflict_is_recorded_again_after_a_restart_repro() {
+fn l1_the_same_conflict_is_recorded_again_after_a_restart() {
     let rig = Rig::new();
     let mut bridge = rig.bridge();
     rig.store.set_base_merge(BaseMerge::Conflicted {
