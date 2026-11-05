@@ -830,20 +830,105 @@ expect "the base cache is unchanged" \
 [ ! -e "$cache/planted" ] || { echo "FAIL the sandbox planted a base cache entry"; exit 1; }
 echo "ok   nothing planted in the base cache"
 
-# A helper the scenarios source from the controller is in the key: the
-# controller is two levels above the scenarios directory.
+# 9b. The base cache's key is everything that decides a base result, and
+# nothing else. The scenarios run from a controller checkout (two levels
+# above them) whose helper 011.sh sources; a controller file no scenario
+# names is not in the key.
 controller=$work/controller
 mkdir -p "$controller/rsi" "$controller/scripts/blackbox"
 cp -r "$objectives" "$controller/rsi/scenarios"
 printf '# helper\n' >"$controller/scripts/blackbox/lib.sh"
-judge "$good" "" "$controller/rsi/scenarios" >/dev/null
-expect "with the controller's helpers, a second run is cached" \
-    "$(judge "$good" "" "$controller/rsi/scenarios")" 'exit=0 {"verdict":"accepted"}'
-expect "from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+printf '# the runner of other suites\n' >"$controller/scripts/blackbox/runner.sh"
+printf '. "$(dirname "$0")/../../scripts/blackbox/lib.sh"\n' >>"$controller/rsi/scenarios/011.sh"
+keyed=$controller/rsi/scenarios
+# from_cache: the base results the last run took from the cache.
+from_cache() { sed -n 's/^| base results from the cache: \(.*\); run on the base:.*/\1/p' "$work/gate.out"; }
+judge "$good" "" "$keyed" >/dev/null
+expect "a first run on a base runs both objectives there" "$(cat "$work/gate.out")" \
+    '| base results from the cache: none; run on the base: 007.sh 011.sh'
+expect "a cache hit: the same key again" "$(judge "$good" "" "$keyed")" 'exit=0 {"verdict":"accepted"}'
+expect "both results from the cache" "$(from_cache)" '007.sh 011.sh'
+expect "each named so in the log" "$(cat "$work/gate.out")" '| == base: 007.sh: unsolved (cached)'
+refuse "and nothing built on the base" "$(cat "$work/gate.out")" '== base: build'
+expect "the log names the toolchain" "$(cat "$work/gate.out")" '| base cache: toolchain rustc '
+
+printf '# changed\n' >>"$controller/scripts/blackbox/runner.sh"
+judge "$good" "" "$keyed" >/dev/null
+expect "a controller file no scenario names changes no key" "$(from_cache)" '007.sh 011.sh'
+
 printf '# changed\n' >>"$controller/scripts/blackbox/lib.sh"
-expect "a changed helper is judged again" "$(judge "$good" "" "$controller/rsi/scenarios")" \
+judge "$good" "" "$keyed" >/dev/null
+expect "a miss: a helper the scenario sources changed" "$(cat "$work/gate.out")" \
+    'from the cache: 007.sh; run on the base: 011.sh'
+
+printf '# changed\n' >>"$keyed/007.sh"
+judge "$good" "" "$keyed" >/dev/null
+expect "a miss: the scenario's blob changed" "$(cat "$work/gate.out")" \
+    'from the cache: 011.sh; run on the base: 007.sh'
+
+printf '# changed\n' >>"$keyed/build"
+judge "$good" "" "$keyed" >/dev/null
+expect "a miss: the build hook changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+
+git -C "$seed" checkout -q -B other-base "$base"
+printf 'unrelated\n' >"$seed/unrelated"
+other_base=$(commit other-base)
+saved_base=$base
+base=$other_base
+judge "$good" "" "$keyed" >/dev/null
+base=$saved_base
+expect "a miss: another base commit" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+
+gate_copy=$work/gate-copy/scripts
+mkdir -p "$gate_copy/rsi"
+cp "$(dirname "$gate")"/../*.sh "$gate_copy/"
+cp "$gate" "$gate_copy/rsi/gate.sh"
+printf '# changed\n' >>"$gate_copy/rsi/gate.sh"
+saved_gate=$gate
+gate=$gate_copy/rsi/gate.sh
+judge "$good" "" "$keyed" >/dev/null
+gate=$saved_gate
+expect "a miss: gate.sh's blob changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+
+# Another toolchain: a rustc that says another version, first on PATH.
+mkdir -p "$work/other-rust"
+printf '#!/bin/sh\necho "rustc 0.0.1-other (test)"\necho "release: 0.0.1-other"\n' >"$work/other-rust/rustc"
+chmod +x "$work/other-rust/rustc"
+expect "a miss: another toolchain" "$(PATH="$work/other-rust:$PATH" judge "$good" "" "$keyed")" \
     'exit=0 {"verdict":"accepted"}'
-refuse "not from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+expect "run on the base" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+expect "and the log names it" "$(cat "$work/gate.out")" 'toolchain rustc 0.0.1-other'
+judge "$good" "" "$keyed" >/dev/null
+expect "the toolchain back: cached again" "$(from_cache)" '007.sh 011.sh'
+
+# A corrupt entry is a miss: whatever an entry holds but "solved" or
+# "unsolved", an entry that cannot be read, or one that is a directory, is
+# judged again, and rewritten.
+for entry in "$cache"/*; do printf 'solved, trust me\n' >"$entry"; done
+expect "corrupt entries: the verdict is the base's own" "$(judge "$good" "" "$keyed")" \
+    'exit=0 {"verdict":"accepted"}'
+expect "each judged again" "$(cat "$work/gate.out")" '| == base: 007.sh: its cache entry cannot be read; judged again'
+expect "on the base" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+judge "$good" "" "$keyed" >/dev/null
+expect "and rewritten" "$(from_cache)" '007.sh 011.sh'
+for entry in "$cache"/*; do chmod 000 "$entry"; done
+judge "$good" "" "$keyed" >/dev/null
+expect "unreadable entries are misses" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+for entry in "$cache"/*; do
+    chmod 600 "$entry" 2>/dev/null || true
+    rm -rf "$entry"
+    mkdir "$entry"
+done
+judge "$good" "" "$keyed" >/dev/null
+expect "an entry that is a directory is a miss" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+judge "$good" "" "$keyed" >/dev/null
+expect "and is replaced" "$(from_cache)" '007.sh 011.sh'
+chmod -R u+rwx "$cache"
 
 # A base cache the sandbox would show again (under a directory it binds) is
 # refused before anything runs.
