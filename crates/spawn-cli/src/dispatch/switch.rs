@@ -168,7 +168,6 @@ mod tests {
     use serde_json::json;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
-    use spawn_core::mission::TaskState;
     use spawn_core::observation::{Ambiguity, Confidence, Observation, SemanticState};
 
     /// A cheap task for the resident `core`.
