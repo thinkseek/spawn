@@ -381,10 +381,12 @@ pub fn read_claude_screen(pane: &str) -> ScreenReading {
         // A finished turn that left background shells running: the line
         // that says so is the evidence, so the log records that the engine
         // still works ([`shows_background_shells`]).
-        Some("") => match finished_line(&tail, index).filter(|line| shows_background_shells(line)) {
-            Some(line) => ScreenReading::new(ScreenState::Ready, line),
-            None => ScreenReading::new(ScreenState::Ready, prompt),
-        },
+        Some("") => {
+            match finished_line(&tail, index).filter(|line| shows_background_shells(line)) {
+                Some(line) => ScreenReading::new(ScreenState::Ready, line),
+                None => ScreenReading::new(ScreenState::Ready, prompt),
+            }
+        }
         Some(_) => ScreenReading::new(ScreenState::Drafted, prompt),
         None => ScreenReading::unknown(),
     }
@@ -473,7 +475,8 @@ mod background_shell_tests {
             "✻ Sautéed for 6s · done 11:27 PM · 5 shells still running",
             "✻ Baked for 2m 3s · done 9:01 AM · 1 shell still running",
         ] {
-            let reading = read_claude_screen(&format!("claude: started them\n{line}\n❯ \n{STATUS}"));
+            let reading =
+                read_claude_screen(&format!("claude: started them\n{line}\n❯ \n{STATUS}"));
             assert_eq!(reading.state, ScreenState::Ready);
             assert_eq!(reading.evidence, line);
             assert!(shows_background_shells(&reading.evidence));

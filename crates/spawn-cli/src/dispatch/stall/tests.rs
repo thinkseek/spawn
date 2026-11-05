@@ -132,8 +132,15 @@ fn an_assigned_task_its_sessions_turn_is_at_delivery_from_its_assignment() {
     let item = only(&items(&facts, &tasks, &found, &bounds())).clone();
     assert_eq!(item.why, Why::Stalled);
     assert_eq!(item.tag(), format!("{SESSION} stall-7-delivery-120"));
-    assert!(item.line.starts_with("task #7 (mission #1) has not moved from step delivery for 10m00s"));
-    assert!(item.line.contains("task.assigned (record 120, 10m00s ago)"), "{}", item.line);
+    assert!(
+        item.line
+            .starts_with("task #7 (mission #1) has not moved from step delivery for 10m00s")
+    );
+    assert!(
+        item.line.contains("task.assigned (record 120, 10m00s ago)"),
+        "{}",
+        item.line
+    );
 }
 
 #[test]
@@ -158,14 +165,21 @@ fn a_delivered_task_is_at_activity_from_the_later_of_its_delivery_and_the_latest
     let item = only(&items(&facts, &tasks, &found, &bounds())).clone();
     assert_eq!(item.id, "stall-7-activity-20");
     assert!(item.line.contains("for 15m00s"), "{}", item.line);
-    assert!(item.line.contains("tool.completed (seq 20"), "{}", item.line);
+    assert!(
+        item.line.contains("tool.completed (seq 20"),
+        "{}",
+        item.line
+    );
     // No fact after the delivery record: measured from the record.
     let found = stalls(json!({
         "tasks": [open(7, "delivered", (140, "task.delivered", 900_000))],
         "sessions": [{"session_id": SESSION, "seq": 20, "event_name": "message.received",
                       "at_ms": NOW - 901_000}],
     }));
-    assert_eq!(only(&items(&facts, &tasks, &found, &bounds())).id, "stall-7-activity-140");
+    assert_eq!(
+        only(&items(&facts, &tasks, &found, &bounds())).id,
+        "stall-7-activity-140"
+    );
 }
 
 #[test]
@@ -177,7 +191,10 @@ fn a_worker_idle_at_its_prompt_with_no_report_is_at_activity_too() {
         "sessions": [{"session_id": SESSION, "seq": 20, "event_name": "turn.stopped",
                       "at_ms": NOW - 900_000, "screen": "❯"}],
     }));
-    assert_eq!(only(&items(&facts, &tasks, &found, &bounds())).id, "stall-7-activity-20");
+    assert_eq!(
+        only(&items(&facts, &tasks, &found, &bounds())).id,
+        "stall-7-activity-20"
+    );
 }
 
 /// Task 33: a resident ran clippy, the tests and the e2e in background
@@ -203,11 +220,22 @@ fn a_report_under_review_is_at_judgement_from_its_report() {
     let found = stalls(json!({"tasks": [open(7, "reported", (150, "task.reported", 1_800_000))]}));
     let item = only(&items(&facts, &tasks, &found, &bounds())).clone();
     assert_eq!(item.id, "stall-7-judgement-150");
-    assert!(item.line.contains("the report item is not sent yet"), "{}", item.line);
+    assert!(
+        item.line.contains("the report item is not sent yet"),
+        "{}",
+        item.line
+    );
     // Told: the item says so.
-    let told = [worker(SemanticState::Waiting, true), supervisor(&[format!("{SESSION} report-7-0")])];
+    let told = [
+        worker(SemanticState::Waiting, true),
+        supervisor(&[format!("{SESSION} report-7-0")]),
+    ];
     let item = only(&items(&told, &tasks, &found, &bounds())).clone();
-    assert!(item.line.contains("the report item was sent"), "{}", item.line);
+    assert!(
+        item.line.contains("the report item was sent"),
+        "{}",
+        item.line
+    );
 }
 
 /// A gated task the integrator judges next waits from the later of its
@@ -230,7 +258,10 @@ fn only_the_task_the_gate_judges_next_is_at_judgement_and_a_stale_verdict_moves_
                       "at_ms": NOW - 3_700_000}],
     }));
     let item = only(&items(&facts, &tasks, &found, &bounds())).clone();
-    assert_eq!(item.id, "stall-8-judgement-180", "measured from the mission's verdict");
+    assert_eq!(
+        item.id, "stall-8-judgement-180",
+        "measured from the mission's verdict"
+    );
     assert!(item.line.contains("the push lags"), "{}", item.line);
     assert!(item.line.contains("accepted on task #5"), "{}", item.line);
     // Under the gate's bound since that verdict: nothing.
@@ -247,16 +278,26 @@ fn a_landing_task_is_at_landing_and_a_closed_ephemeral_worker_still_running_at_s
     let facts = [worker(SemanticState::Waiting, true)];
     let tasks = work(&[]);
     let found = stalls(json!({"tasks": [open(7, "landing", (190, "task.gated", 600_000))]}));
-    assert_eq!(only(&items(&facts, &tasks, &found, &bounds())).id, "stall-7-landing-190");
+    assert_eq!(
+        only(&items(&facts, &tasks, &found, &bounds())).id,
+        "stall-7-landing-190"
+    );
 
     let mut closed = open(7, "cancelled", (200, "task.cancelled", 300_000));
     closed["kind"] = json!("ephemeral");
     let found = stalls(json!({"tasks": [closed.clone()]}));
     let mut running = worker(SemanticState::Working, false);
-    running.dispatched.push(failed(41, "retire-task-7", 200_000, "kill-session refused"));
+    running
+        .dispatched
+        .push(failed(41, "retire-task-7", 200_000, "kill-session refused"));
     let item = only(&items(&[running.clone()], &tasks, &found, &bounds())).clone();
     assert_eq!(item.id, "stall-7-stop-200");
-    assert!(item.line.contains("`retire-task-7` failed (kill-session refused)"), "{}", item.line);
+    assert!(
+        item.line
+            .contains("`retire-task-7` failed (kill-session refused)"),
+        "{}",
+        item.line
+    );
     // Its worker gone: nothing to stop.
     running.live = false;
     assert!(items(&[running], &tasks, &found, &bounds()).is_empty());
@@ -267,14 +308,20 @@ fn a_landing_task_is_at_landing_and_a_closed_ephemeral_worker_still_running_at_s
 #[test]
 fn a_halted_mission_is_escalated_once_per_halt_record() {
     let halted = |record: i64| {
-        stalls(json!({"halted": [{"mission_id": 3, "reason": "3 gate rejections in a row",
+        stalls(
+            json!({"halted": [{"mission_id": 3, "reason": "3 gate rejections in a row",
                                    "record": {"id": record, "type": "mission.halted",
                                               "at_ms": NOW - 1_000},
-                                   "tasks": [11, 12]}]}))
+                                   "tasks": [11, 12]}]}),
+        )
     };
     let item = only(&items(&[], &work(&[]), &halted(500), &bounds())).clone();
     assert_eq!(item.tag(), "missions stall-mission-3-halted-500");
-    assert!(item.line.contains("3 gate rejections in a row"), "{}", item.line);
+    assert!(
+        item.line.contains("3 gate rejections in a row"),
+        "{}",
+        item.line
+    );
     assert!(item.line.contains("#11, #12"), "{}", item.line);
     // Told once, it is not pending again; a new halt is.
     let host = items(&[], &work(&[]), &halted(500), &bounds());
@@ -313,7 +360,10 @@ fn a_task_queued_behind_another_of_its_session_is_not_escalated() {
                   open(9, "assigned", (120, "task.assigned", 9_000_000))],
     }));
     let facts = [worker(SemanticState::Waiting, true)];
-    assert_eq!(only(&items(&facts, &tasks, &found, &bounds())).id, "stall-8-delivery-110");
+    assert_eq!(
+        only(&items(&facts, &tasks, &found, &bounds())).id,
+        "stall-8-delivery-110"
+    );
 }
 
 // --- the bound's edges -------------------------------------------------------
@@ -322,13 +372,14 @@ fn a_task_queued_behind_another_of_its_session_is_not_escalated() {
 fn a_step_is_escalated_at_its_bound_and_not_a_second_before() {
     let facts = [worker(SemanticState::Waiting, true)];
     let tasks = work(&[row(7, "assigned", SESSION)]);
-    let at = |ago_ms: i64| stalls(json!({"tasks": [open(7, "assigned", (120, "task.assigned", ago_ms))]}));
+    let at = |ago_ms: i64| {
+        stalls(json!({"tasks": [open(7, "assigned", (120, "task.assigned", ago_ms))]}))
+    };
     assert!(items(&facts, &tasks, &at(599_000), &bounds()).is_empty());
     assert_eq!(items(&facts, &tasks, &at(600_000), &bounds()).len(), 1);
     // The bounds come from the environment, whole seconds.
-    let (short, warnings) = Bounds::read(|name| {
-        (name == "SPAWN_STALL_DELIVERY_SECS").then(|| "90".to_string())
-    });
+    let (short, warnings) =
+        Bounds::read(|name| (name == "SPAWN_STALL_DELIVERY_SECS").then(|| "90".to_string()));
     assert!(warnings.is_empty());
     assert!(items(&facts, &tasks, &at(89_000), &short).is_empty());
     assert_eq!(items(&facts, &tasks, &at(90_000), &short).len(), 1);
@@ -337,19 +388,26 @@ fn a_step_is_escalated_at_its_bound_and_not_a_second_before() {
 #[test]
 fn a_bound_that_is_not_a_whole_number_of_seconds_warns_and_keeps_its_default() {
     for bad in ["-5", "1.5", "soon"] {
-        let (read, warnings) = Bounds::read(|name| {
-            (name == "SPAWN_STALL_ACTIVITY_SECS").then(|| bad.to_string())
-        });
+        let (read, warnings) =
+            Bounds::read(|name| (name == "SPAWN_STALL_ACTIVITY_SECS").then(|| bad.to_string()));
         assert_eq!(read, Bounds::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("SPAWN_STALL_ACTIVITY_SECS"));
     }
     let defaults = Bounds::default();
     assert_eq!(
-        [defaults.delivery, defaults.activity, defaults.review, defaults.gate],
+        [
+            defaults.delivery,
+            defaults.activity,
+            defaults.review,
+            defaults.gate
+        ],
         [600_000, 900_000, 1_800_000, 3_600_000]
     );
-    assert_eq!([defaults.landing, defaults.stop, defaults.halted], [600_000, 300_000, 0]);
+    assert_eq!(
+        [defaults.landing, defaults.stop, defaults.halted],
+        [600_000, 300_000, 0]
+    );
 }
 
 // --- what moves a tag --------------------------------------------------------
@@ -378,15 +436,30 @@ fn a_failed_retry_does_not_change_the_delivery_tag() {
     let tasks = work(&[row(7, "assigned", SESSION)]);
     let found = stalls(json!({"tasks": [open(7, "assigned", (120, "task.assigned", 700_000))]}));
     let mut facts = worker(SemanticState::Waiting, true);
-    facts.dispatched.push(failed(30, "deliver-7-0", 690_000, "terminal gone: no pane"));
-    let before = only(&items(&[facts.clone()], &tasks, &found, &bounds())).clone();
     facts
         .dispatched
-        .push(failed(31, "deliver-7-0-retry-1", 600_000, "terminal gone: no pane"));
+        .push(failed(30, "deliver-7-0", 690_000, "terminal gone: no pane"));
+    let before = only(&items(&[facts.clone()], &tasks, &found, &bounds())).clone();
+    facts.dispatched.push(failed(
+        31,
+        "deliver-7-0-retry-1",
+        60_000,
+        "terminal gone: no pane",
+    ));
     let after = only(&items(&[facts], &tasks, &found, &bounds())).clone();
     assert_eq!(before.tag(), after.tag());
-    assert!(after.line.contains("`deliver-7-0-retry-1` failed (the same error)"), "{}", after.line);
-    assert!(after.line.contains("retry `deliver-7-0-retry-2` due in"), "{}", after.line);
+    assert!(
+        after
+            .line
+            .contains("`deliver-7-0-retry-1` failed (the same error)"),
+        "{}",
+        after.line
+    );
+    assert!(
+        after.line.contains("retry `deliver-7-0-retry-2` due in"),
+        "{}",
+        after.line
+    );
 }
 
 /// Retries spent: `DeliveryFailed` was the stall's escalation. A delivery
@@ -397,7 +470,9 @@ fn a_delivery_given_up_gets_no_stall_item() {
     let found = stalls(json!({"tasks": [open(7, "assigned", (120, "task.assigned", 2_000_000))]}));
     let mut facts = worker(SemanticState::Waiting, true);
     let error = "terminal gone: no pane";
-    facts.dispatched.push(failed(30, "deliver-7-0", 1_900_000, error));
+    facts
+        .dispatched
+        .push(failed(30, "deliver-7-0", 1_900_000, error));
     for retry in 1..=crate::deliver::DELIVERY_RETRIES {
         facts.dispatched.push(failed(
             30 + i64::try_from(retry).expect("small"),
@@ -418,7 +493,9 @@ fn a_delivery_given_up_gets_no_stall_item() {
     assert_eq!(whys, [Why::DeliveryFailed], "{:?}", plan.pending);
     // One that may have typed: not retried, and its stall is escalated.
     let mut unsure = worker(SemanticState::Waiting, true);
-    unsure.dispatched.push(failed(30, "deliver-7-0", 1_900_000, REFUSED));
+    unsure
+        .dispatched
+        .push(failed(30, "deliver-7-0", 1_900_000, REFUSED));
     let item = only(&items(&[unsure], &tasks, &found, &bounds())).clone();
     assert!(item.line.contains("not tried again"), "{}", item.line);
 }
@@ -433,13 +510,16 @@ fn the_line_names_the_task_the_step_the_failed_attempts_and_the_judgement() {
     let tasks = work(&[row(7, "assigned", SESSION)]);
     let found = stalls(json!({"tasks": [open(7, "assigned", (120, "task.assigned", 95_000))]}));
     let mut facts = worker(SemanticState::Waiting, true);
-    facts.dispatched.push(failed(30, "deliver-7-0", 94_000, "terminal gone: no pane"));
-    facts.dispatched.push(failed(31, "deliver-7-0-retry-1", 30_000, BUSY));
+    facts
+        .dispatched
+        .push(failed(30, "deliver-7-0", 94_000, "terminal gone: no pane"));
+    facts
+        .dispatched
+        .push(failed(31, "deliver-7-0-retry-1", 30_000, BUSY));
     // Its latest judgement is older than the facts its own refusals wrote.
     facts.evidence_seq = Some(24);
-    let (short, _) = Bounds::read(|name| {
-        (name == "SPAWN_STALL_DELIVERY_SECS").then(|| "90".to_string())
-    });
+    let (short, _) =
+        Bounds::read(|name| (name == "SPAWN_STALL_DELIVERY_SECS").then(|| "90".to_string()));
     let item = only(&items(&[facts], &tasks, &found, &short)).clone();
     for word in [
         "task #7",
@@ -465,12 +545,17 @@ fn the_activity_line_names_the_latest_fact_and_the_judgement_state() {
         "sessions": [{"session_id": SESSION, "seq": 20, "event_name": "message.received",
                       "at_ms": NOW - 41_000, "screen": "you: BB:SILENT quiet"}],
     }));
-    let (short, _) = Bounds::read(|name| {
-        (name == "SPAWN_STALL_ACTIVITY_SECS").then(|| "30".to_string())
-    });
+    let (short, _) =
+        Bounds::read(|name| (name == "SPAWN_STALL_ACTIVITY_SECS").then(|| "30".to_string()));
     let item = only(&items(&facts, &tasks, &found, &short)).clone();
     assert_eq!(item.id, "stall-7-activity-140");
-    for word in ["task #7", "step activity", "message.received", "WORKING", "covers the latest fact"] {
+    for word in [
+        "task #7",
+        "step activity",
+        "message.received",
+        "WORKING",
+        "covers the latest fact",
+    ] {
         assert!(item.line.contains(word), "{word}: {}", item.line);
     }
 }
@@ -494,7 +579,10 @@ fn a_stall_reaches_the_supervisor_once_under_its_heading() {
         panic!("a digest is typed input");
     };
     assert_eq!(tags, &[format!("{SESSION} stall-7-delivery-120")]);
-    assert!(text.contains(&format!("- {SESSION} — stalled: task #7")), "{text}");
+    assert!(
+        text.contains(&format!("- {SESSION} — stalled: task #7")),
+        "{text}"
+    );
     let rows = [resident, supervisor(tags)];
     let host = items(&rows, &tasks, &found, &bounds());
     let plan = decide_with(&rows, &tasks, &host, true, NOW, "spawn");

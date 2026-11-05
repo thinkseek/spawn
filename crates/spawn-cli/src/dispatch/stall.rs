@@ -100,7 +100,9 @@ impl Bounds {
                     *fallback
                 }),
             };
-            *value = i64::try_from(secs).unwrap_or(i64::MAX / 1000).saturating_mul(1000);
+            *value = i64::try_from(secs)
+                .unwrap_or(i64::MAX / 1000)
+                .saturating_mul(1000);
         }
         let [delivery, activity, review, gate, landing, stop, halted] = values;
         (
@@ -349,7 +351,10 @@ fn tried_on_worker(facts: Option<&Facts>, told: &BTreeSet<String>, task: &OpenTa
     for (id, what) in [
         (format!("idle-{episode}"), "the idle item"),
         (format!("done-{episode}"), "the finished item"),
-        (format!("report-{}-{}", task.id, task.revisions), "the report item"),
+        (
+            format!("report-{}-{}", task.id, task.revisions),
+            "the report item",
+        ),
     ] {
         if told.contains(&format!("{} {id}", task.session_id)) {
             tried.push(format!("{what} was sent"));
@@ -434,9 +439,8 @@ fn measure(
                 // At its prompt with background shells running: active.
                 return None;
             }
-            let fact = latest.and_then(|latest| {
-                Some((latest.seq?, latest.event_name.clone()?, latest.at_ms?))
-            });
+            let fact = latest
+                .and_then(|latest| Some((latest.seq?, latest.event_name.clone()?, latest.at_ms?)));
             let fact_line = fact.as_ref().map_or_else(
                 || "the session has no fact".to_string(),
                 |(seq, name, at)| {
@@ -465,9 +469,10 @@ fn measure(
             })
         }
         TaskState::Reported if !(task.gated && task.accept == "gate") => {
-            let told = context
-                .told
-                .contains(&format!("{} report-{}-{}", task.session_id, task.id, task.revisions));
+            let told = context.told.contains(&format!(
+                "{} report-{}-{}",
+                task.session_id, task.id, task.revisions
+            ));
             Some(since_record(
                 Step::Judgement,
                 bounds.review,
@@ -476,11 +481,7 @@ fn measure(
                      report item {}",
                     task.revisions,
                     named(record, now),
-                    if told {
-                        "was sent"
-                    } else {
-                        "is not sent yet"
-                    }
+                    if told { "was sent" } else { "is not sent yet" }
                 ),
             ))
         }
