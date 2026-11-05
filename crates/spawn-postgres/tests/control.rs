@@ -614,6 +614,251 @@ fn accepted_work_of_a_done_mission_still_lands_and_a_dropped_one_lets_it_go() {
 }
 
 #[test]
+fn a_halted_mission_keeps_its_baseline_when_the_owner_moves_its_source() {
+    let (store, schema) = store("control_moved_halted");
+    let source = "/tmp/moved.git";
+    let mission = || {
+        let mission = store
+            .mission_add("On the source", &json!([source]), "human")
+            .expect("add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+            .expect("configure");
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "rejected",
+                                       "base": "b0", "note": "no"}),
+            )
+            .expect("a first verdict sets the baseline");
+        mission
+    };
+    let (running, halted) = (mission(), mission());
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": halted, "reason": "stop"}))
+        .expect("halt");
+    assert_eq!(store.source_moved(source, "b0", "d1").expect("moved"), 1);
+    let mut client = admin(&schema);
+    let baselines = |client: &mut Client| -> Vec<String> {
+        client
+            .query(
+                "select baseline from mission_missions where id = any($1) order by id",
+                &[&vec![running, halted]],
+            )
+            .expect("baselines")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    assert_eq!(baselines(&mut client), ["d1", "b0"], "the halted one stays");
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live);
+
+    // A record from before the record named its missions folds as it did.
+    client
+        .batch_execute(&format!(
+            "select spawn_control_record(jsonb_build_object(
+                 'type', 'source.moved', 'source', '{source}', 'from', 'b0', 'to', 'e1'))"
+        ))
+        .expect("an earlier record");
+    assert_eq!(baselines(&mut client), ["d1", "e1"]);
+}
+
+#[test]
+fn a_dropped_mission_lands_nothing_even_with_a_push_in_flight() {
+    let (store, schema) = store("control_dropped_landing");
+    // A gated mission whose task the gate passed: landing.
+    let landing_task = || {
+        let mission = store
+            .mission_add("Land", &json!(["/tmp/source.git"]), "human")
+            .expect("add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "review", None, None)
+            .expect("configure");
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "").expect("accept");
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                       "base": "b1", "candidate": "c1", "scenarios": 1}),
+            )
+            .expect("gate");
+        (mission, task)
+    };
+    let mut client = admin(&schema);
+    let state = |client: &mut Client, task: i64| -> String {
+        client
+            .query_one("select state from mission_tasks where id = $1", &[&task])
+            .expect("task")
+            .get(0)
+    };
+
+    // Dropping the mission cancels its landing.
+    let (mission, task) = landing_task();
+    assert_eq!(state(&mut client, task), "landing");
+    store
+        .mission_close(mission, "dropped", "gone")
+        .expect("drop");
+    assert_eq!(state(&mut client, task), "cancelled");
+    assert!(store.landing_hold(task).expect("hold").is_none());
+    assert!(
+        store
+            .integrator_record(
+                &json!({"type": "task.landed", "id": task, "from": "b1", "to": "c1"})
+            )
+            .is_err(),
+        "a cancelled landing records no landing"
+    );
+
+    // While the integrator holds a landing for its push, a drop waits.
+    let (mission, task) = landing_task();
+    let hold = store.landing_hold(task).expect("hold").expect("landing");
+    client
+        .batch_execute("set lock_timeout = '300ms'")
+        .expect("bound the wait");
+    let error = client
+        .execute(
+            "select spawn_mission_close($1, 'dropped', 'gone')",
+            &[&mission],
+        )
+        .expect_err("the drop waits for the push");
+    assert_eq!(
+        error.code(),
+        Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+    );
+    // The push landed; its record goes in before the hold is let go.
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": task, "from": "b1", "to": "c1"}))
+        .expect("landed");
+    drop(hold);
+    client
+        .execute(
+            "select spawn_mission_close($1, 'dropped', 'gone')",
+            &[&mission],
+        )
+        .expect("the drop goes through after the push");
+    assert_eq!(
+        state(&mut client, task),
+        "landed",
+        "landed work stays landed"
+    );
+
+    // A landing a fold from before left under a dropped mission is
+    // recorded cancelled instead of landed.
+    let (mission, task) = landing_task();
+    store
+        .mission_close(mission, "dropped", "gone")
+        .expect("drop");
+    client
+        .execute(
+            "update mission_tasks set state = 'landing' where id = $1",
+            &[&task],
+        )
+        .expect("the earlier fold's table");
+    assert!(store.landing_hold(task).expect("hold").is_none());
+    assert_eq!(state(&mut client, task), "cancelled");
+    assert_eq!(
+        control_types(&mut client).last().map(String::as_str),
+        Some("task.cancelled")
+    );
+}
+
+#[test]
+fn a_done_missions_landing_that_stays_stale_is_aborted_after_three_tries() {
+    let (store, schema) = store("control_done_stale");
+    let landing_task = |text: &str| {
+        let mission = store
+            .mission_add(text, &json!(["/tmp/source.git"]), "human")
+            .expect("add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "review", None, None)
+            .expect("configure");
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "").expect("accept");
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                       "base": "b1", "candidate": "c1", "scenarios": 1}),
+            )
+            .expect("gate");
+        (mission, task)
+    };
+    let mut client = admin(&schema);
+    let state = |client: &mut Client, task: i64| -> String {
+        client
+            .query_one("select state from mission_tasks where id = $1", &[&task])
+            .expect("task")
+            .get(0)
+    };
+    let gate_stale = |task: i64| {
+        store
+            .integrator_record(&json!({"type": "task.gated", "id": task, "verdict": "stale"}))
+            .expect("stale")
+    };
+
+    // An open mission's stale landings go back to be judged, every time:
+    // its worker may still push.
+    let (_open, open_task) = landing_task("Open");
+    for _ in 0..4 {
+        gate_stale(open_task);
+        assert_eq!(state(&mut client, open_task), "accepted");
+    }
+
+    // A done mission's: twice, then the third aborts it, and the integrator
+    // has nothing left to judge.
+    let (done, done_task) = landing_task("Done");
+    gate_stale(done_task);
+    store.mission_close(done, "done", "shipped").expect("close");
+    for _ in 0..2 {
+        gate_stale(done_task);
+        assert_eq!(
+            state(&mut client, done_task),
+            "accepted",
+            "stale before the bound"
+        );
+    }
+    gate_stale(done_task);
+    assert_eq!(state(&mut client, done_task), "cancelled");
+    assert_eq!(
+        control_types(&mut client).last().map(String::as_str),
+        Some("task.aborted")
+    );
+    let note: String = client
+        .query_one(
+            "select review_note from mission_tasks where id = $1",
+            &[&done_task],
+        )
+        .expect("task")
+        .get(0);
+    assert_eq!(
+        note,
+        format!("the landing went stale 3 times after mission {done} was done")
+    );
+    let gated: Vec<i64> = store
+        .gated_missions()
+        .expect("gated")
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|row| row["id"].as_i64())
+        .collect();
+    assert!(!gated.contains(&done), "{gated:?}");
+}
+
+#[test]
 fn one_integrator_holds_the_lock() {
     let (first, schema) = store("control_integrator_lock");
     let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
@@ -774,8 +1019,9 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["missions"][0]["tasks"][0]["stages"], expected);
     for login in ["spawn_supervisor", "spawn_reader"] {
+        let role = common::login(&schema, login);
         client
-            .batch_execute(&format!("set session authorization {login}"))
+            .batch_execute(&format!("set session authorization {role}"))
             .expect("become the login");
         let stages: serde_json::Value = client
             .query_one("select spawn_task_stages($1)", &[&task])
@@ -794,4 +1040,69 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
             .batch_execute("reset session authorization")
             .expect("back to the owner");
     }
+}
+
+#[test]
+fn host_disk_records_are_owner_only_facts_the_fold_ignores() {
+    let (store, schema) = store("control_host_disk");
+    let mut client = admin(&schema);
+    let record = |path: &str, state: &str, free: u64| {
+        json!({"type": "host.disk", "label": "workspace", "path": path,
+               "state": state, "free_bytes": free, "warn_bytes": 20, "floor_bytes": 2})
+    };
+    assert_eq!(store.host_disk().expect("none yet"), json!([]));
+    store
+        .host_record(&record("/ws", "low", 10))
+        .expect("record low");
+    store
+        .host_record(&record("/tmp", "low", 5))
+        .expect("another path");
+    let recovered = store
+        .host_record(&record("/ws", "recovered", 30))
+        .expect("record recovered");
+    let latest = store.host_disk().expect("latest per path");
+    let summary: Vec<(String, String, u64)> = latest
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|record| {
+            (
+                record["path"].as_str().unwrap_or_default().to_string(),
+                record["state"].as_str().unwrap_or_default().to_string(),
+                record["free_bytes"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("/tmp".to_string(), "low".to_string(), 5),
+            ("/ws".to_string(), "recovered".to_string(), 30)
+        ]
+    );
+    assert_eq!(latest[1]["event_id"], json!(recovered));
+    assert!(latest[1]["at_ms"].as_i64().is_some());
+
+    for bad in [
+        json!({"type": "task.landed", "id": 1}),
+        record("/ws", "full", 1),
+        json!({"type": "host.disk", "path": "/ws", "state": "low"}),
+    ] {
+        assert!(store.host_record(&bad).is_err(), "refused: {bad}");
+    }
+    // The fold has nothing to do with them, and refolding replays them.
+    let before = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), before);
+    assert_eq!(control_types(&mut client), ["host.disk"; 3]);
+
+    client
+        .batch_execute("set session authorization spawn_supervisor")
+        .expect("become the supervisor");
+    assert!(
+        client
+            .query_one("select spawn_host_record($1)", &[&record("/ws", "low", 1)])
+            .is_err(),
+        "the supervisor records no host facts"
+    );
 }

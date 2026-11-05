@@ -1,0 +1,12 @@
+[Unit]
+Description=Spawn: daily routine cleanup (scripts/maintenance.sh)
+
+[Timer]
+# Local time, after the 03:30 backup window; a run missed while the host
+# was off happens at the next boot.
+OnCalendar=*-*-* 05:15:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

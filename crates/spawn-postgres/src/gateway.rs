@@ -55,12 +55,10 @@ pub(crate) const TAIL: &str = "select jsonb_build_object(
                                         order by t.command_id desc limit 20) c), '[]'::jsonb)
                  ) as tail";
 
-/// Submit as the database login. No RETURNING: that needs SELECT on the
-/// view, which a restricted login does not hold.
+/// Submit as the database login, through `spawn_gateway_submit`, which
+/// returns the command made: no login may select from `agent_commands`.
 /// `$1` agent, `$2` session, `$3` idempotency key, `$4` action.
-pub(crate) const SUBMIT: &str =
-    "insert into agent_commands (agent_id, session_id, idempotency_key, action)
-                 values ($1, $2, $3, $4) returning id";
+pub(crate) const SUBMIT: &str = "select spawn_gateway_submit($1, $2, $3, $4)";
 
 impl PostgresStore {
     /// The fleet as one JSON array, read through the grant-filtered

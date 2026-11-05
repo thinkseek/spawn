@@ -50,11 +50,15 @@ case "$base_url" in
 esac
 
 # Reads go through the supervisor's login: the fleet readers are filtered by
-# grants, and the owner holds none. Its password is derived from the owner's
-# as spawn-postgres does it (role_password): SHA-256 of
-# "spawn-login-v1\0<owner password>\0<role>", in hex. The owner password is
-# the URL's percent-decoded (`p%40ss` is `p@ss`), as spawn-postgres reads it
-# (scripts/pg-url.sh).
+# grants, and the owner holds none. The login is this database's
+# (spawn_login_role), with a salt in its role comment; its password is
+# derived from the owner's as spawn-postgres does it (role_password):
+# PBKDF2-HMAC-SHA256 of the owner password with the salt
+# "spawn-login-v2\0<salt>\0<role>", 600000 rounds, in hex. Set after init-db
+# below, which makes the login. The owner password is the URL's,
+# percent-decoded (`p%40ss` is `p@ss`) by the parser every script shares
+# (scripts/pg-url.sh), and reaches python through its environment, not its
+# argv.
 # shellcheck source=scripts/pg-url.sh
 . "$root/scripts/pg-url.sh"
 if ! pg_url_parse "$base_url"; then
@@ -62,8 +66,21 @@ if ! pg_url_parse "$base_url"; then
   exit 1
 fi
 owner_password=$pg_url_password
-sup_password=$(printf 'spawn-login-v1\0%s\0spawn_supervisor' "$owner_password" | sha256sum | cut -d' ' -f1)
-sup_url=$(printf '%s' "$url" | sed -E "s#://[^@]*@#://spawn_supervisor:$sup_password@#")
+supervisor_url() {
+  local login role salt password
+  login=$(psql -X -q -At "$url" -c "select r.rolname || ' ' || substring(
+            shobj_description(r.oid, 'pg_authid') from '^spawn login salt ([0-9a-f]{64})$')
+            from pg_roles r where r.rolname = spawn_login_role('spawn_supervisor')")
+  role=${login% *}
+  salt=${login#* }
+  password=$(SPAWN_E2E_OWNER_PASSWORD=$owner_password python3 -I -c '
+import hashlib, os, sys
+salt, role = sys.argv[1:]
+owner = os.environ["SPAWN_E2E_OWNER_PASSWORD"]
+salt = b"spawn-login-v2\0" + salt.encode() + b"\0" + role.encode()
+print(hashlib.pbkdf2_hmac("sha256", owner.encode(), salt, 600000).hex())' "$salt" "$role")
+  printf '%s' "$url" | sed -E "s#://[^@]*@#://$role:$password@#"
+}
 
 cleanup() {
   [ -n "$loop_pid" ] && kill "$loop_pid" 2>/dev/null || true
@@ -265,6 +282,7 @@ export SPAWN_SUPERVISOR=1 SPAWN_MISSION_FILE=$work/mission.md
 : >"$work/mission.md"
 
 "$bin" init-db >/dev/null
+sup_url=$(supervisor_url)
 start_jev
 export SPAWN_JUDGE_URL=http://127.0.0.1:$port
 

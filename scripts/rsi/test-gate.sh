@@ -14,6 +14,9 @@ fi
 
 gate=$(cd "$(dirname "$0")" && pwd)/gate.sh
 work=$(mktemp -d)
+# The cases do not depend on this host's free disk; one case below raises
+# the gate's floor to test the refusal.
+export SPAWN_GATE_MIN_FREE_GB=0
 # A file in the host's /tmp, which the sandbox must not show.
 marker=$(mktemp /tmp/test-gate-marker.XXXXXX)
 # Background helpers (listeners, fake servers) are killed on exit.
@@ -160,6 +163,20 @@ expect "a ref is resolved to its commit" \
 expect "a candidate that names no commit is no verdict" \
     "exit=$(sh "$gate" "$repo" "$base" no-such-ref "$scenarios" >/dev/null 2>&1 || echo $?)" 'exit=3'
 expect "no task scenario: regression only" "$(judge "$good")" 'exit=0 {"verdict":"accepted"}'
+
+# No room in TMPDIR: an abort (exit 3, no verdict) before any scratch is made.
+roomless=$work/roomless-tmp
+mkdir "$roomless"
+expect "a TMPDIR without room aborts the gate" \
+    "$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000; judge "$good")" 'exit=3 '
+refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'verdict'
+expect "and says why" "$(cat "$work/gate.out")" 'under SPAWN_GATE_MIN_FREE_GB=1000000000: not starting'
+refuse "and leaves no scratch" "$(ls -A "$roomless")" 'spawn-gate'
+expect "a floor that is not whole GiB aborts too" \
+    "$(export SPAWN_GATE_MIN_FREE_GB=lots; judge "$good")" 'exit=3 '
+expect "the gate's scratch is named for cleanup" \
+    "$(export TMPDIR="$roomless"; . "$(dirname "$gate")/../disk.sh"; basename "$(gate_scratch)")" 'spawn-gate.'
+rm -rf "$roomless"
 
 expect "a task scenario already green on the base" "$(judge "$good" "$scenarios/check-built.sh")" 'already passes'
 

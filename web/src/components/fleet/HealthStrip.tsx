@@ -1,7 +1,7 @@
 import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 
-import type { FleetHealth, LadderStep } from "../../fleet";
+import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
 import { FLEET_STATES, stateLabelUpper } from "../../fleet";
 import { formatDuration } from "../../format";
 import { cx } from "../ui";
@@ -91,6 +91,35 @@ function Stat({
   );
 }
 
+function formatGib(bytes: number | null): string {
+  return bytes == null ? "—" : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+
+function DiskLine({ disk }: { disk: DiskPlace[] }) {
+  if (disk.length === 0) return null;
+  return (
+    <div className="mt-1.5 flex flex-wrap gap-x-2.5 gap-y-1 text-caption">
+      {disk.map((place) => (
+        <Stat
+          key={`${place.label}:${place.path}`}
+          label={`free · ${place.label}`}
+          value={formatGib(place.free_bytes)}
+          tone={
+            place.free_bytes == null
+              ? "text-faint-foreground"
+              : place.free_bytes < place.floor_bytes
+                ? "text-destructive"
+                : place.free_bytes < place.warn_bytes
+                  ? "text-warning"
+                  : undefined
+          }
+          title={`${place.path}: a warning under ${formatGib(place.warn_bytes)}, no new executions under ${formatGib(place.floor_bytes)}`}
+        />
+      ))}
+    </div>
+  );
+}
+
 function formatRate(value: number | null): string {
   if (value == null) return "—";
   if (value === 0) return "0";
@@ -173,6 +202,7 @@ export function HealthStrip({ health }: { health: FleetHealth }) {
             <span className="text-faint-foreground">no agents yet</span>
           )}
         </div>
+        <DiskLine disk={health.disk} />
       </Cell>
 
       <Cell label="Judgements · last hour" className="col-span-2 md:col-span-1">

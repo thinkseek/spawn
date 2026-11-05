@@ -8,7 +8,7 @@ use crate::config::{
     env_value, loop_interval, open_store, spawn_program, supervised, workspace_root,
 };
 use crate::runtime::runtime;
-use crate::{dispatch, supervise};
+use crate::{disk, dispatch, supervise};
 
 /// Most intervals a failing loop waits before its next pass.
 const MAX_BACKOFF_INTERVALS: u32 = 30;
@@ -40,7 +40,8 @@ pub(crate) fn tick(flags: &Flags) -> Result<i32, String> {
 /// restarts it with fresh connections (the store does not reconnect).
 const MAX_FAILURES: u32 = 10;
 
-/// Run the Bridge, the Observer, the dispatcher and the liveness rule.
+/// Run the Bridge, the Observer, the disk watch, the dispatcher and the
+/// liveness rule.
 ///
 /// The loop holds its connections and one in-memory cursor, so its cost does
 /// not grow with the event log. A failed pass is logged and retried with a
@@ -55,6 +56,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let spawn = spawn_program();
     let mut store: Option<PostgresStore> = None;
     let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
+    let mut disk = disk::Monitor::new(workspace_root.as_deref());
     let mut failures: u32 = 0;
     loop {
         let mut failed = false;
@@ -82,13 +84,25 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
                 Ok(more) => lines.extend(more),
                 Err(error) => fail(what, &error),
             };
+            // The disk watch never fails a pass: a fleet must not stop
+            // because it cannot record a warning.
+            step(
+                "disk",
+                Ok(disk
+                    .check(open)
+                    .unwrap_or_else(|error| vec![format!("disk: {error}")])),
+            );
             if dispatching {
                 step(
                     "dispatch",
-                    dispatch::step(open, supervised, &spawn, workspace_root.as_deref()),
+                    dispatch::step(open, supervised, &spawn, workspace_root.as_deref(), &disk),
                 );
             }
-            step("residents", supervise::keep_residents(open));
+            // Under the disk floor no resident is revived (a new execution);
+            // the supervisor still is, to act on the warning.
+            if !disk.below_floor() {
+                step("residents", supervise::keep_residents(open));
+            }
             if supervised {
                 step(
                     "supervise",
