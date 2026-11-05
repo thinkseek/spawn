@@ -72,17 +72,29 @@
 //! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
-//!    and never two for one objective. Filling happens on every pass that
-//!    gets this far, before the judging of step 4. A halted mission gets no
-//!    new task.
+//!    and never two for one objective. Filling happens on every pass, for
+//!    every mission that is not halted, whatever its gate or any other
+//!    mission's gate is doing. A halted mission gets no new task.
+//!
+//! **Every mission gets its step in every pass.** A pass visits every
+//! mission: halts, budgets, landings and assignments never wait for another
+//! mission. Only a landing ends anything early: it moves its source's main
+//! and the baselines of the missions on it, so the rest of that source
+//! waits for the next pass, which reads everything again; other sources go
+//! on. The ready tasks the pass found are given gates after every mission
+//! had its step ([`Integrator::start_ready`]): the one that has waited
+//! longest first, from when it was reported or from when its mission's
+//! previous judging ended, whichever is later. The mission id decides
+//! nothing, so two missions that are always ready take turns.
 //!
 //! **Gates run per mission, on threads.** A judging (step 4, from the
 //! fetch of the pushed branch to the landing) runs on a thread of its own:
 //! - a mission has at most one judging in flight, its lowest ready task:
 //!   its tasks stay serial, each landing on the main the next is judged
-//!   against. While it runs, the pass skips the mission altogether (halts,
-//!   budgets, landings, assignments), and every other mission on its source
-//!   too: they share the mirror and the main it judges against;
+//!   against. While it runs, the pass leaves the mirror of that source
+//!   alone (no landing, fetch or judging for the mission or any other on
+//!   its source: they share the mirror and the main it judges against);
+//!   halts, budgets and assignments go on;
 //! - at most `--gates N` (`SPAWN_INTEGRATE_GATES`) judgings run at once
 //!   across missions, and N is [`DEFAULT_GATES`], one: the gates share one
 //!   test database server whose gate login is a superuser, so a second
