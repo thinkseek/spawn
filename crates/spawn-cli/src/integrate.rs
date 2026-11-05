@@ -236,7 +236,8 @@ pub(crate) fn freshness(
                 ))
             } else {
                 Freshness::Stale(format!(
-                    "the pushed branch ({pushed}) does not contain the latest checkpoint                      ({checkpoint})"
+                    "the pushed branch ({pushed}) does not contain the latest checkpoint \
+                     ({checkpoint})"
                 ))
             }
         }
@@ -1055,7 +1056,8 @@ mod tests {
         );
         let diverged = freshness(Some("c2"), Some("d2"), history);
         assert!(
-            matches!(&diverged, Freshness::Stale(reason) if reason.contains("does not contain")),
+            matches!(&diverged, Freshness::Stale(reason)
+                if reason == "the pushed branch (d2) does not contain the latest checkpoint (c2)"),
             "{diverged:?}"
         );
         let unknown = freshness(Some("elsewhere"), Some("c3"), history);

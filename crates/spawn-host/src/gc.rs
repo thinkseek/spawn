@@ -13,19 +13,28 @@
 //! Everything is decided before anything is deleted, and a read error
 //! deletes nothing: a repository that cannot be read, or a manifest a
 //! reachable commit names that is missing or does not verify, stops the
-//! collection with an error that names it.
+//! collection with an error that names it. One exception: a manifest that
+//! is missing (not corrupt) and that only refs outside `refs/heads/` name
+//! (a fetched `refs/spawn-integrate/*`, a mirror's `refs/remotes/*`) is
+//! another host's, whose chunk store is not this one; it is skipped and
+//! reported ([`Collected::skipped`]), or no collection would ever run on a
+//! host that shares branches.
+//!
+//! Each removal reads the object's age again under the store's exclusive
+//! lock ([`ChunkStore::remove_if_older`]), which a `put` or `touch` holds
+//! shared, so an object refreshed after the listing stays.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use spawn_core::port::ChunkStore;
+use spawn_core::port::{ChunkError, ChunkStore};
 
 use crate::chunks::{Manifest, trailer_of};
 
 /// What one collection did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Collected {
     /// Objects still in the store.
     pub kept: usize,
@@ -33,6 +42,18 @@ pub struct Collected {
     pub removed: usize,
     /// Bytes the removed objects took.
     pub freed: u64,
+    /// Manifests missing here that only refs outside `refs/heads/` name:
+    /// another host's, skipped.
+    pub skipped: Vec<String>,
+}
+
+/// The live set of a collection ([`live_objects`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Live {
+    /// Every manifest a reachable commit names and every chunk it lists.
+    pub objects: HashSet<String>,
+    /// Manifests missing here that only refs outside `refs/heads/` name.
+    pub skipped: Vec<String>,
 }
 
 /// The repositories whose commits keep objects alive: `default` and every
@@ -63,9 +84,45 @@ pub fn repositories(default: &Path, root: &Path) -> Result<Vec<PathBuf>, String>
     Ok(repositories)
 }
 
+/// Whether `repo` has at least one ref. A collection over a default
+/// repository without any (a wrong `--repo`) would find nothing live, so
+/// the command refuses it.
+pub fn has_refs(repo: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(repo)
+        .args(["for-each-ref", "--count=1", "--format=%(refname)"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            format!(
+                "cannot read repository {}: run git: {error}",
+                repo.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot read repository {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.trim_ascii().is_empty())
+}
+
 /// The manifests named by the `Spawn-Large` trailers of every commit
 /// reachable from any ref of `repo`.
 pub fn manifests_named(repo: &Path) -> Result<BTreeSet<String>, String> {
+    trailers(repo, "--all")
+}
+
+/// The manifests named by commits reachable from `refs/heads/*` of `repo`.
+fn manifests_on_branches(repo: &Path) -> Result<BTreeSet<String>, String> {
+    trailers(repo, "--branches")
+}
+
+/// The `Spawn-Large` trailers of the commits `git log <revisions>` walks.
+fn trailers(repo: &Path, revisions: &str) -> Result<BTreeSet<String>, String> {
     let unreadable = |why: &str| format!("cannot read repository {}: {why}", repo.display());
     if !repo.is_dir() {
         return Err(unreadable("not a directory"));
@@ -76,7 +133,7 @@ pub fn manifests_named(repo: &Path) -> Result<BTreeSet<String>, String> {
     let output = Command::new("git")
         .arg("--git-dir")
         .arg(repo)
-        .args(["log", "--all", "-z", "--format=%B"])
+        .args(["log", revisions, "-z", "--format=%B"])
         .stdin(Stdio::null())
         .output()
         .map_err(|error| unreadable(&format!("run git: {error}")))?;
@@ -90,24 +147,37 @@ pub fn manifests_named(repo: &Path) -> Result<BTreeSet<String>, String> {
 }
 
 /// Every object a reachable commit of `repos` can still restore: the
-/// manifests and the chunks they list. A manifest that is missing, cannot be
-/// read, does not verify or does not parse is an error naming it.
-pub fn live_objects(store: &dyn ChunkStore, repos: &[PathBuf]) -> Result<HashSet<String>, String> {
+/// manifests and the chunks they list. A manifest that cannot be read, does
+/// not verify or does not parse is an error naming it, and so is a missing
+/// one a branch (`refs/heads/*`) reaches; a missing one only other refs
+/// reach is skipped ([`Live::skipped`]).
+pub fn live_objects(store: &dyn ChunkStore, repos: &[PathBuf]) -> Result<Live, String> {
     let mut manifests = BTreeSet::new();
+    let mut on_branches = BTreeSet::new();
     for repo in repos {
         manifests.extend(manifests_named(repo)?);
+        on_branches.extend(manifests_on_branches(repo)?);
     }
-    let mut live = HashSet::new();
+    let mut live = Live::default();
     for name in manifests {
-        let bytes = store
-            .get(&name)
-            .map_err(|error| format!("manifest {name} named by a reachable commit: {error}"))?;
+        let bytes = match store.get(&name) {
+            Ok(bytes) => bytes,
+            Err(ChunkError::Missing(_)) if !on_branches.contains(&name) => {
+                live.skipped.push(name);
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "manifest {name} named by a reachable commit: {error}"
+                ));
+            }
+        };
         let manifest = Manifest::from_bytes(&bytes)
             .map_err(|error| format!("manifest {name} named by a reachable commit: {error}"))?;
         for file in manifest.files {
-            live.extend(file.chunks);
+            live.objects.extend(file.chunks);
         }
-        live.insert(name);
+        live.objects.insert(name);
     }
     Ok(live)
 }
@@ -126,10 +196,13 @@ pub fn collect(
         .map_err(|error| format!("cannot list the chunk store: {error}"))?;
     let doomed: Vec<&str> = objects
         .iter()
-        .filter(|object| !live.contains(&object.name) && object.age > grace)
+        .filter(|object| !live.objects.contains(&object.name) && object.age > grace)
         .map(|object| object.name.as_str())
         .collect();
-    let mut collected = Collected::default();
+    let mut collected = Collected {
+        skipped: live.skipped,
+        ..Collected::default()
+    };
     for name in doomed {
         // The age is read again by the store just before the removal.
         if let Some(bytes) = store
@@ -238,7 +311,9 @@ mod tests {
         let other = commit(&repo, None, Some(&dropped));
         git(&repo, &["update-ref", "refs/spawn-integrate/agent", &other]);
 
-        let live = live_objects(&store, std::slice::from_ref(&repo)).expect("live set");
+        let live = live_objects(&store, std::slice::from_ref(&repo))
+            .expect("live set")
+            .objects;
         for name in [&old, &new, &dropped]
             .into_iter()
             .chain(&old_chunks)
@@ -250,7 +325,9 @@ mod tests {
 
         // Dropped: its objects are no longer live, and go once old.
         git(&repo, &["update-ref", "-d", "refs/spawn-integrate/agent"]);
-        let live = live_objects(&store, std::slice::from_ref(&repo)).expect("live set");
+        let live = live_objects(&store, std::slice::from_ref(&repo))
+            .expect("live set")
+            .objects;
         assert!(!live.contains(&dropped) && !live.contains(&dropped_chunks[0]));
         for object in store.list().expect("list") {
             age(&store, &object.name, 2 * HOUR);
@@ -354,6 +431,72 @@ mod tests {
 
         let error = collect(&store, &[directory.join("absent.git")], HOUR).expect_err("no repo");
         assert!(error.contains("absent.git"), "{error}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn another_hosts_manifest_that_only_fetched_refs_name_is_skipped_not_fatal() {
+        let directory = scratch("other-host");
+        let repo = bare(&directory);
+        let store = LocalChunkStore::new(directory.join("store"));
+        let garbage = store.put(b"unreferenced").expect("put");
+        age(&store, &garbage, 2 * HOUR);
+        let (here, here_chunks) = manifest(&store, &[b"this host's chunk"]);
+        let head = commit(&repo, None, Some(&here));
+        git(&repo, &["update-ref", "refs/heads/agent", &head]);
+        // Another host's checkpoint, fetched for landing and mirrored: its
+        // manifest lives in that host's store.
+        let elsewhere = hash_of(b"a manifest in another host's store");
+        let fetched = commit(&repo, Some(&head), Some(&elsewhere));
+        git(
+            &repo,
+            &["update-ref", "refs/spawn-integrate/agent", &fetched],
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/source/spawn/agent", &fetched],
+        );
+
+        let collected = collect(&store, std::slice::from_ref(&repo), HOUR).expect("collect");
+        assert_eq!(collected.skipped, vec![elsewhere.clone()]);
+        assert_eq!(collected.removed, 1, "the unreferenced object went");
+        assert!(!store.contains(&garbage).expect("contains"));
+        assert!(store.contains(&here).expect("contains"));
+        assert!(store.contains(&here_chunks[0]).expect("contains"));
+
+        // A branch of this host naming it: this host must have it.
+        git(&repo, &["update-ref", "refs/heads/adopted", &fetched]);
+        let error = collect(&store, std::slice::from_ref(&repo), HOUR).expect_err("missing");
+        assert!(error.contains(&elsewhere), "{error}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A writer that refreshes an object after the collection read its age
+    /// (it holds the store's lock shared, as a `put` or `touch` does) keeps
+    /// the object: the removal waits for it and reads the age again.
+    #[test]
+    fn an_object_refreshed_while_its_removal_waits_stays() {
+        let directory = scratch("race");
+        let store = LocalChunkStore::new(directory.join("store"));
+        let name = store.put(b"reused by a checkpoint in flight").expect("put");
+        age(&store, &name, 2 * HOUR);
+        let writer = std::fs::File::open(store.directory()).expect("the store's directory");
+        writer.lock_shared().expect("hold it as a writer");
+        let remover = {
+            let store = store.clone();
+            let name = name.clone();
+            std::thread::spawn(move || store.remove_if_older(&name, HOUR).expect("remove"))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        // The writer's refresh, between the collection's listing and the
+        // removal's unlink.
+        std::fs::File::open(store.directory().join(&name[..2]).join(&name))
+            .expect("still there while the writer holds the lock")
+            .set_modified(SystemTime::now())
+            .expect("refresh");
+        writer.unlock().expect("release");
+        assert_eq!(remover.join().expect("the removal"), None, "young again");
+        assert!(store.contains(&name).expect("contains"));
         let _ = std::fs::remove_dir_all(&directory);
     }
 

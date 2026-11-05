@@ -5,13 +5,15 @@ Engines reach their models through this relay (`ANTHROPIC_BASE_URL` in the
 inline `--settings` the Bridge passes). Every request under `/v1/` is routed
 by the `model` of its JSON body:
 
-- `deepseek-*` goes to DeepSeek's Anthropic-compatible endpoint. The client's
-  `Authorization` and `x-api-key` headers are dropped and replaced by
-  `x-api-key: $DEEPSEEK_API_KEY`.
+- `deepseek-*` goes to DeepSeek's Anthropic-compatible endpoint with only
+  the headers in `DEEPSEEK_HEADERS` from the client (no auth, cookie or
+  gateway header) plus `x-api-key: $DEEPSEEK_API_KEY`.
 - Everything else goes unchanged to the upstream gateway, with the client's
   own auth headers. The relay never holds the gateway's token.
 
-Responses, server-sent events included, are passed on as they arrive.
+Responses, server-sent events included, are passed on as they arrive. A
+redirect is passed back to the client, never followed: following it would
+send the request's credentials to whatever host it names.
 
 The DeepSeek key stays in this process. It never enters Spawn's environment,
 the engine's environment, the event log, or an agent's terminal.
@@ -27,6 +29,9 @@ Environment:
                           "8791") means host 127.0.0.1
   MODEL_RELAY_MAX_BODY    request cap in bytes, default 32 MiB (the
                           Messages API's own limit)
+  MODEL_RELAY_CLIENT_TIMEOUT  seconds a client socket may stall (a request
+                          that stops arriving, a stream it stops reading),
+                          default 60
   http_proxy, https_proxy honored for both upstreams; no_proxy too
 """
 
@@ -56,12 +61,27 @@ HOP = {
     # fills; the hop to the client is loopback, so plain is free.
     "accept-encoding",
 }
-# Credentials the client sent for the gateway; DeepSeek gets its own.
-CLIENT_AUTH = {"authorization", "x-api-key"}
+# The only client headers DeepSeek gets: the Messages API's own. Anything
+# else (the gateway's auth, cookies, a gateway's custom header) stays here;
+# DeepSeek gets its own key.
+DEEPSEEK_HEADERS = {"content-type", "accept", "anthropic-version", "anthropic-beta", "user-agent"}
 # A model's first token can take minutes behind a long prompt, and a stream
 # may pause as long between events.
 TIMEOUT = 600
 CHUNK = 64 * 1024
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Hands a 3xx back as an HTTPError instead of following it."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def opener():
+    """An opener with the environment's proxies (read now, as urlopen
+    would) that never follows a redirect."""
+    return urllib.request.build_opener(NoRedirect)
 
 
 def settings_upstream():
@@ -87,6 +107,7 @@ def config(environ):
         "host": host or "127.0.0.1",
         "port": int(port),
         "max_body": int(environ.get("MODEL_RELAY_MAX_BODY", str(32 * 1024 * 1024))),
+        "client_timeout": float(environ.get("MODEL_RELAY_CLIENT_TIMEOUT", "60")),
     }
 
 
@@ -111,6 +132,10 @@ def handler(settings):
 
     class Relay(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # The client socket's timeout: a client that stalls (a body that
+        # never arrives, an idle keep-alive, a stream left unread) frees its
+        # thread instead of holding it forever.
+        timeout = settings["client_timeout"]
 
         def _reply(self, status, body, close=False):
             self.send_response(status)
@@ -162,7 +187,7 @@ def handler(settings):
                 headers = {
                     name: value
                     for name, value in headers.items()
-                    if name.lower() not in CLIENT_AUTH
+                    if name.lower() in DEEPSEEK_HEADERS
                 }
                 headers["x-api-key"] = settings["key"]
             else:
@@ -177,7 +202,7 @@ def handler(settings):
             status = 502
             try:
                 try:
-                    response = urllib.request.urlopen(request, timeout=TIMEOUT)
+                    response = opener().open(request, timeout=TIMEOUT)
                 except urllib.error.HTTPError as error:
                     response = error
                 status = response.status if hasattr(response, "status") else response.code

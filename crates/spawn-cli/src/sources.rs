@@ -65,6 +65,10 @@ struct Routed {
     mirror: Option<(PathBuf, String)>,
 }
 
+/// How a start that failed because the source did not answer ends its
+/// error: the dispatcher retries such a start ([`crate::deliver`]).
+pub(crate) const SOURCE_UNANSWERED: &str = "start again once it answers";
+
 fn unavailable(text: String) -> WorkspaceError {
     WorkspaceError::Unavailable(text)
 }
@@ -378,7 +382,7 @@ pub(crate) fn adopt_for_branch(
     let could_not_ask = |why: String| {
         unavailable(format!(
             "could not ask {source} for {}: {why}; {agent}'s branch is not made from main \
-             while the source may hold it, start again once it answers",
+             while the source may hold it, {SOURCE_UNANSWERED}",
             pushed_ref(agent)
         ))
     };
@@ -589,6 +593,10 @@ impl WorkspaceStore for MissionWorkspaces {
             self.mark(repo, source, workspace.sandbox());
         }
         Ok(merged)
+    }
+
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        self.route(branch.as_str())?.store.branch_head(branch)
     }
 }
 

@@ -156,6 +156,28 @@ files, a chunk fetch.
   symlink at a large file's path or at one of its parent directories makes
   the merge a conflict markers cannot show (`marked: false`, the large
   files' paths), and nothing moves.
+- **A merge that loses the branch race**: when another writer moved the
+  branch between the merge's directory update and its compare-and-swap,
+  the directory follows the head that won: its text by the same two-tree
+  update (merge tree to the winner's tree), and its large files to the
+  winner's manifest (each file the two manifests differ in is written from
+  the chunk store, or removed, with its stat-cache entry), so the next
+  checkpoint neither commits the lost merge as edits nor drops the other
+  writer's large files. When either is refused (a file the two sides differ
+  in changed in the workspace meanwhile, a large one included, or the
+  winner's tree has no room for its large files) the workspace is marked
+  **stale** (`<root>/.stale/<agent>`). It keeps its work: each checkpoint of
+  a stale workspace commits its tree (large files and all) to
+  `refs/spawn-stale/<agent>` (first parent the branch head, second the
+  snapshot before it), never to the branch, and answers `WorkspaceStale`;
+  merges of `main` are refused. A mount or an unmount commits that snapshot
+  before it replaces or removes the directory, and fails, changing nothing,
+  when it cannot. The Bridge ends an execution whose workspace answers
+  `WorkspaceStale` (its state is kept, so the unmount loses nothing) instead
+  of retrying; the next start mounts the branch head afresh. What the
+  snapshot holds is not merged back: a person or the supervisor takes what
+  they need from `refs/spawn-stale/<agent>` (it is never pushed or landed;
+  chunk collection keeps what it names, like every ref).
 - **Ending an execution**: final checkpoint, terminal killed, workspace
   unmounted, then `execution.ended`. The workspace holds the only copy of
   what the execution did not commit, so it is unmounted only after the final
@@ -253,13 +275,26 @@ files, a chunk fetch.
     only branch heads (an older commit of a branch still restores its
     files). Each `Spawn-Large` trailer names a manifest; the manifest and
     every chunk it lists are live.
+  - *Another host's manifests*: a manifest missing from this store that
+    only refs outside `refs/heads/` name (`refs/spawn-integrate/*`,
+    `refs/remotes/*`: another host's pushed checkpoints) lives in that
+    host's store; it is skipped with a warning naming it, so collection
+    still runs on a host that shares branches. One a local branch reaches
+    must be here, and stops the collection.
   - *Grace*: an object (a file named by 64 hex digits under
     `<store>/<2 hex>/`) goes only when it is not live and older than the
-    grace period (default 60 minutes), its time read again just before it
-    is removed. Chunks are written before the commit that names them, and a
-    `put` or a stat-cache reuse makes an object young again, so a checkpoint
-    in flight keeps what it reuses as long as it commits within the grace
-    period.
+    grace period (default 60 minutes, at least 10: a shorter one is
+    refused), its time read again just before it is removed. Chunks are
+    written before the commit that names them, and a `put` or a stat-cache
+    reuse makes an object young again, so a checkpoint in flight keeps what
+    it reuses as long as it commits within the grace period. The age check
+    and the unlink happen under the store's lock (a `flock` on the store
+    directory) held exclusively, which every `put` and `touch` holds shared: a refresh
+    between the listing and the removal keeps the object, and a writer that
+    waited finds it gone and writes it again.
+  - *An empty default repository is refused*: with `--repo` (or
+    `SPAWN_GIT_REPO`) naming a repository without any ref, nothing would be
+    live, so nothing is deleted and the exit is non-zero.
   - *Read errors delete nothing*: everything is decided before anything is
     deleted. A repository that cannot be read (named by its path), or a
     manifest a reachable commit names that is missing, unreadable or does

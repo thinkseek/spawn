@@ -173,6 +173,20 @@ fn a_branch_forks_from_another_agent_or_from_a_commit() {
 }
 
 #[test]
+fn a_branch_head_is_its_last_commit_and_a_missing_branch_has_none() {
+    let fixture = Fixture::new("head", &[("README.md", "base\n")]);
+    let missing = BranchName::new("agent_none").expect("valid branch");
+    assert_eq!(fixture.store.branch_head(&missing).expect("ask"), None);
+    let (branch, workspace, _) = fixture.mount("agent_a");
+    let commit = fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    let head = fixture.store.branch_head(&branch).expect("ask");
+    assert_eq!(
+        head.as_ref().map(spawn_core::id::CommitId::as_str),
+        Some(commit.as_str())
+    );
+}
+
+#[test]
 fn a_branch_that_contains_main_is_current() {
     let fixture = Fixture::new("current", &[("README.md", "base\n")]);
     let (_, workspace, _) = fixture.mount("agent_a");

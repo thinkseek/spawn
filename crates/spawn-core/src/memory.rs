@@ -75,8 +75,13 @@ struct State {
     workspace_calls: Vec<String>,
     /// Commits fail while set.
     commit_fails: bool,
+    /// Commits and merges answer `WorkspaceStale` while set.
+    stale: bool,
     /// The next append of an `artifact.committed` event fails.
     branch_record_fails: bool,
+    /// Sessions whose `artifact.committed` and `merge.conflicted` appends
+    /// all fail, as a record the log can never take would.
+    branch_records_refused: HashSet<SessionId>,
     terminals: HashSet<TerminalName>,
     /// Every terminal start, in order.
     launches: Vec<Launch>,
@@ -186,10 +191,28 @@ impl MemoryStore {
         self.lock().commit_fails = fail;
     }
 
+    /// Make every commit and merge answer `WorkspaceStale` (`true`), as a
+    /// store does that kept the workspace's state off its branch, or work
+    /// again. Test helper.
+    pub fn make_stale(&self, stale: bool) {
+        self.lock().stale = stale;
+    }
+
     /// Make the next append of an `artifact.committed` or `merge.conflicted`
     /// event fail, as a log that is down would. Test helper.
     pub fn fail_next_branch_record(&self) {
         self.lock().branch_record_fails = true;
+    }
+
+    /// Make every append of an `artifact.committed` or `merge.conflicted`
+    /// event of `session` fail (`true`) or work again. Test helper.
+    pub fn refuse_branch_records_of(&self, session: &SessionId, refuse: bool) {
+        let mut state = self.lock();
+        if refuse {
+            state.branch_records_refused.insert(session.clone());
+        } else {
+            state.branch_records_refused.remove(session);
+        }
     }
 
     /// Mark a workspace as holding uncommitted changes. Test helper.
@@ -211,6 +234,11 @@ impl EventLog for MemoryStore {
         if state.branch_record_fails && branch_record {
             state.branch_record_fails = false;
             return Err(StoreError::Backend("the log is down".to_string()));
+        }
+        if branch_record && state.branch_records_refused.contains(&event.session_id) {
+            return Err(StoreError::Backend(
+                "the log refuses this record".to_string(),
+            ));
         }
         let (record, inserted) = state.insert(event, now);
         Ok(Appended { record, inserted })
@@ -439,6 +467,9 @@ impl WorkspaceStore for MemoryStore {
         if state.commit_fails {
             return Err(WorkspaceError::Unavailable("commit fails".to_string()));
         }
+        if state.stale {
+            return Err(stale_refusal());
+        }
         let Some(mount) = state.mounts.get_mut(workspace) else {
             return Err(WorkspaceError::Refused {
                 code: "NoSuchWorkspace".to_string(),
@@ -473,6 +504,9 @@ impl WorkspaceStore for MemoryStore {
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let mut state = self.lock();
         state.workspace_calls.push("merge_base".to_string());
+        if state.stale {
+            return Err(stale_refusal());
+        }
         let Some(branch) = state
             .mounts
             .get(workspace)
@@ -495,6 +529,10 @@ impl WorkspaceStore for MemoryStore {
             state.heads.insert(branch, commit.clone());
         }
         Ok(merge)
+    }
+
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        Ok(self.lock().heads.get(branch).cloned())
     }
 }
 
@@ -604,6 +642,14 @@ impl TerminalHost for MemoryStore {
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
         Ok(())
+    }
+}
+
+/// What a stale workspace answers ([`crate::port::WORKSPACE_STALE`]).
+fn stale_refusal() -> WorkspaceError {
+    WorkspaceError::Refused {
+        code: crate::port::WORKSPACE_STALE.to_string(),
+        message: "kept off the branch".to_string(),
     }
 }
 

@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -30,10 +31,13 @@ use serde_json::{Value, json};
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    BaseMerge, Branch, ChunkStore, Commit, ForkFrom, WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, ChunkStore, Commit, ForkFrom, WORKSPACE_STALE, WorkspaceError,
+    WorkspaceStore,
 };
 
-use crate::chunks::{LargeFile, LocalChunkStore, Manifest, materialize, mode_of, store_file};
+use crate::chunks::{
+    LargeFile, LocalChunkStore, Manifest, materialize, mode_of, remove_large, store_file,
+};
 use crate::tree_path::{TreePath, nul_fields};
 
 /// Distinguishes the staged mounts of one process ([`GitWorkspace::staging_path`]).
@@ -110,6 +114,42 @@ fn shown_arguments<S: AsRef<OsStr>>(arguments: &[S]) -> String {
         .map(|argument| argument.as_ref().to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Bytes of pathspecs one `git ls-tree` call carries on its command line:
+/// far under Linux's 2 MiB for arguments and environment together, and
+/// over any single path, so every batch holds at least one.
+const PATHSPEC_BATCH_BYTES: usize = 128 << 10;
+
+/// `specs` in order, cut into runs of at most [`PATHSPEC_BATCH_BYTES`]
+/// (a longer spec gets a run of its own).
+fn pathspec_batches(specs: Vec<OsString>) -> Vec<Vec<OsString>> {
+    let mut batches: Vec<Vec<OsString>> = Vec::new();
+    let mut bytes = 0;
+    for spec in specs {
+        let length = spec.len() + 1;
+        match batches.last_mut() {
+            Some(batch) if bytes + length <= PATHSPEC_BATCH_BYTES => {
+                bytes += length;
+                batch.push(spec);
+            }
+            _ => {
+                bytes = length;
+                batches.push(vec![spec]);
+            }
+        }
+    }
+    batches
+}
+
+/// `specs` NUL-terminated, for `--pathspec-from-file=- --pathspec-file-nul`.
+fn nul_terminated(specs: &[OsString]) -> Vec<u8> {
+    let mut input = Vec::new();
+    for spec in specs {
+        input.extend_from_slice(spec.as_bytes());
+        input.push(0);
+    }
+    input
 }
 
 /// The paths of a NUL-separated listing of paths.
@@ -328,6 +368,38 @@ impl GitWorkspace {
         report_listing(output, &shown_arguments(arguments))
     }
 
+    /// [`Self::listing_in`] for a command that reads its pathspecs from
+    /// standard input (`--pathspec-from-file=- --pathspec-file-nul`): any
+    /// number of paths, none of them on the command line.
+    fn listing_in_with_pathspecs<S: AsRef<OsStr>>(
+        &self,
+        directory: &Path,
+        index: &Path,
+        arguments: &[S],
+        specs: &[OsString],
+    ) -> Result<Vec<u8>, WorkspaceError> {
+        let word = shown_arguments(arguments);
+        let mut child = self
+            .command_in(directory, index)
+            .args(arguments)
+            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
+        let stdin = child.stdin.take();
+        let input = nul_terminated(specs);
+        // Written beside the read: a long answer must not block the input.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                use std::io::Write;
+                stdin.map(|mut stdin| stdin.write_all(&input))
+            });
+            report_listing(child.wait_with_output(), &word)
+        })
+    }
+
     fn has_base(&self) -> bool {
         self.git_output(&[
             "rev-parse",
@@ -469,13 +541,7 @@ impl GitWorkspace {
         let mut large = self.large_files(directory, index)?;
         let blobs = self.blobs_in(kept_in, &large)?;
         large.retain(|(path, _)| !blobs.contains(path));
-        let mut add: Vec<OsString> = ["add", "-A", "--", "."].map(OsString::from).into();
-        add.extend(
-            large
-                .iter()
-                .map(|(path, _)| path.pathspec("exclude,literal")),
-        );
-        self.output_in(directory, index, &add)?;
+        self.stage_all_but(directory, index, &large)?;
         self.unstage(directory, index, &large)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the limit between the size check and `add`
@@ -495,6 +561,25 @@ impl GitWorkspace {
         Ok((tree, large))
     }
 
+    /// `git add -A` of the work tree in `directory` except `large`, which is
+    /// never hashed. The paths go to git on standard input, so any number
+    /// of large files fits.
+    fn stage_all_but(
+        &self,
+        directory: &Path,
+        index: &Path,
+        large: &[(TreePath, u64)],
+    ) -> Result<(), WorkspaceError> {
+        let mut add = vec![OsString::from(".")];
+        add.extend(
+            large
+                .iter()
+                .map(|(path, _)| path.pathspec("exclude,literal")),
+        );
+        self.listing_in_with_pathspecs(directory, index, &["add", "-A"], &add)
+            .map(|_| ())
+    }
+
     /// Take build output and `paths` out of the index. Paths go to git as
     /// literals: a file named `*` or `:/` must not match others.
     fn unstage(
@@ -503,13 +588,15 @@ impl GitWorkspace {
         index: &Path,
         paths: &[(TreePath, u64)],
     ) -> Result<(), WorkspaceError> {
-        let mut remove: Vec<OsString> = ["rm", "-r", "--cached", "--ignore-unmatch", "--"]
-            .into_iter()
-            .chain(BUILD_OUTPUT)
-            .map(OsString::from)
-            .collect();
+        let mut remove: Vec<OsString> = BUILD_OUTPUT.into_iter().map(OsString::from).collect();
         remove.extend(paths.iter().map(|(path, _)| path.pathspec("literal")));
-        self.output_in(directory, index, &remove).map(|_| ())
+        self.listing_in_with_pathspecs(
+            directory,
+            index,
+            &["rm", "-r", "--cached", "--ignore-unmatch", "--quiet"],
+            &remove,
+        )
+        .map(|_| ())
     }
 
     /// Which of `paths` are a blob in at least one of `commits`.
@@ -522,20 +609,29 @@ impl GitWorkspace {
         if paths.is_empty() {
             return Ok(found);
         }
+        let asked: HashSet<&TreePath> = paths.iter().map(|(path, _)| path).collect();
+        let batches = pathspec_batches(
+            paths
+                .iter()
+                .map(|(path, _)| path.pathspec("literal"))
+                .collect(),
+        );
         for commit in commits {
-            let mut arguments: Vec<OsString> =
-                ["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"]
-                    .map(OsString::from)
-                    .into();
-            arguments.extend(paths.iter().map(|(path, _)| path.pathspec("literal")));
-            let listed = self.git_listing(&arguments)?;
-            for entry in nul_fields(&listed) {
-                // `<mode> blob <id>\t<path>`
-                if let Some((meta, path)) = tree_entry(entry)
-                    && meta.split_whitespace().nth(1) == Some("blob")
-                    && paths.iter().any(|(large, _)| *large == path)
-                {
-                    found.insert(path);
+            for batch in &batches {
+                let mut arguments: Vec<OsString> =
+                    ["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"]
+                        .map(OsString::from)
+                        .into();
+                arguments.extend(batch.iter().cloned());
+                let listed = self.git_listing(&arguments)?;
+                for entry in nul_fields(&listed) {
+                    // `<mode> blob <id>\t<path>`
+                    if let Some((meta, path)) = tree_entry(entry)
+                        && meta.split_whitespace().nth(1) == Some("blob")
+                        && asked.contains(&path)
+                    {
+                        found.insert(path);
+                    }
                 }
             }
         }
@@ -810,21 +906,22 @@ impl GitWorkspace {
         if asked.is_empty() {
             return Ok(Vec::new());
         }
-        let mut arguments: Vec<OsString> = ["ls-tree", "-t", "-z", "--full-tree", tree, "--"]
-            .map(OsString::from)
-            .into();
-        arguments.extend(asked.iter().map(|path| path.pathspec("literal")));
-        let listed = self.git_listing(&arguments)?;
         // The type of each entry asked for; a directory's other children
         // the listing shows on the way are not asked for.
-        let kinds: BTreeMap<TreePath, String> = nul_fields(&listed)
-            .filter_map(|entry| {
+        let mut kinds: BTreeMap<TreePath, String> = BTreeMap::new();
+        for batch in pathspec_batches(asked.iter().map(|path| path.pathspec("literal")).collect()) {
+            let mut arguments: Vec<OsString> = ["ls-tree", "-t", "-z", "--full-tree", tree, "--"]
+                .map(OsString::from)
+                .into();
+            arguments.extend(batch);
+            let listed = self.git_listing(&arguments)?;
+            kinds.extend(nul_fields(&listed).filter_map(|entry| {
                 // `<mode> <type> <id>\t<path>`
                 let (meta, path) = tree_entry(entry)?;
                 let kind = meta.split_whitespace().nth(1)?.to_string();
                 asked.contains(&path).then_some((path, kind))
-            })
-            .collect();
+            }));
+        }
         Ok(manifest
             .files
             .iter()
@@ -1101,9 +1198,15 @@ impl WorkspaceStore for GitWorkspace {
         .map_err(|_| WorkspaceError::Unavailable(format!("branch {branch} has no commit")))?;
         let (staged, known) = self.stage_mount(branch.as_str())?;
 
+        let directory = self.root.join(branch.as_str());
+        // A stale directory holds work its branch does not: kept before it
+        // is replaced, or the mount fails and the directory stays.
+        if let Err(error) = self.keep_stale_directory(branch.as_str(), &directory) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error);
+        }
         // A pending merge stays only when the branch carries its markers.
         self.settle_pending(branch.as_str());
-        let directory = self.root.join(branch.as_str());
         if let Err(error) = self.replace_workspace(branch.as_str(), &staged, &directory) {
             let _ = std::fs::remove_dir_all(&staged);
             return Err(error);
@@ -1137,7 +1240,10 @@ impl WorkspaceStore for GitWorkspace {
         lock.lock().map_err(|error| {
             WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
         })?;
-        self.refuse_stale(&branch)?;
+        if self.is_stale(&branch) {
+            let kept = self.keep_stale(&branch, &directory)?;
+            return Err(stale_refusal(&branch, Some(&kept)));
+        }
         let reference = format!("refs/heads/{branch}");
         let parent = self.git_output(&["rev-parse", &reference])?;
         let tree = self.tree_of(&directory, &index, &self.source_commits(&branch, &parent));
@@ -1176,6 +1282,8 @@ impl WorkspaceStore for GitWorkspace {
 
     fn unmount(&self, workspace: &WorkspaceId) -> Result<(), WorkspaceError> {
         let directory = self.checked_path(workspace)?;
+        // Not even a discard removes a stale directory before it is kept.
+        self.keep_stale_directory(workspace.sandbox(), &directory)?;
         // A pending merge stays only when the branch carries its markers.
         self.settle_pending(workspace.sandbox());
         if let Some(container) = self.container.as_ref() {
@@ -1202,6 +1310,20 @@ impl WorkspaceStore for GitWorkspace {
 
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         self.merge_main(workspace)
+    }
+
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        let head = self.git_output(&[
+            "for-each-ref",
+            "--format=%(objectname)",
+            &format!("refs/heads/{branch}"),
+        ])?;
+        if head.is_empty() {
+            return Ok(None);
+        }
+        CommitId::new(head)
+            .map(Some)
+            .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
     }
 }
 
@@ -1373,7 +1495,7 @@ impl GitWorkspace {
             &message,
         ])?;
         if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
-            return Err(self.follow_moved_branch(&branch, &directory, &merged, &error));
+            return Err(self.follow_moved_branch(&branch, &directory, &head, &merged, &error));
         }
         Ok(BaseMerge::Merged {
             commit: CommitId::new(commit)
@@ -1383,17 +1505,21 @@ impl GitWorkspace {
     }
 
     /// After a merge wrote tree `merged` into `directory` and its
-    /// compare-and-swap lost (another writer moved the branch), bring the
-    /// directory to the branch's head as it is now, the same two-tree way:
-    /// otherwise the next checkpoint would commit the merge over the other
-    /// writer's commit as plain edits. When that is refused (the directory
-    /// changed meanwhile in a file the two trees differ in), the directory
-    /// is marked stale: checkpoints are refused until it is mounted again.
+    /// compare-and-swap lost (another writer moved the branch from `head`),
+    /// bring the directory to the branch's head as it is now: its text the
+    /// same two-tree way, and its large files to the manifest the head names
+    /// ([`Self::follow_large`]). Otherwise the next checkpoint would commit
+    /// the merge over the other writer's commit as plain edits, and the
+    /// directory's large files over the other writer's. When either is
+    /// refused (the directory changed meanwhile in a file the two sides
+    /// differ in), the directory is marked stale: its checkpoints go to
+    /// `refs/spawn-stale/<branch>`, not the branch ([`Self::keep_stale`]).
     /// The answer is the error the merge returns.
     fn follow_moved_branch(
         &self,
         branch: &str,
         directory: &Path,
+        head: &str,
         merged: &str,
         lost: &WorkspaceError,
     ) -> WorkspaceError {
@@ -1402,6 +1528,7 @@ impl GitWorkspace {
             .and_then(|now| {
                 let tree = self.git_output(&["rev-parse", &format!("{now}^{{tree}}")])?;
                 self.update_directory(branch, directory, merged, &tree)?;
+                self.follow_large(branch, directory, head, &now)?;
                 Ok(now)
             });
         match followed {
@@ -1413,13 +1540,130 @@ impl GitWorkspace {
                 let marked = self.mark_stale(branch);
                 WorkspaceError::Unavailable(format!(
                     "{lost} (branch moved under the merge, and the workspace cannot follow \
-                     its head: {error}; checkpoints are refused until it is mounted again{})",
+                     its head: {error}; its checkpoints go to {} until it is mounted \
+                     again{})",
+                    stale_ref(branch),
                     marked
                         .err()
                         .map_or(String::new(), |error| format!(", {error}"))
                 ))
             }
         }
+    }
+
+    /// The large files of the manifest `commit` names, by path.
+    fn large_of(&self, commit: &str) -> Result<BTreeMap<TreePath, LargeFile>, WorkspaceError> {
+        let Some(name) = self.manifest_of(commit)? else {
+            return Ok(BTreeMap::new());
+        };
+        Ok(self
+            .manifest(&name)?
+            .files
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect())
+    }
+
+    /// Move the large files of `directory` from the manifest of `from` to
+    /// the manifest of `to`: each file the two differ in is written from
+    /// the chunk store, or removed when `to` has none, and its stat-cache
+    /// entry with it. Refused, changing nothing, when such a file in the
+    /// directory is not `from`'s (the agent changed or made it since), or
+    /// when `to`'s tree has no room for its large files.
+    fn follow_large(
+        &self,
+        branch: &str,
+        directory: &Path,
+        from: &str,
+        to: &str,
+    ) -> Result<(), WorkspaceError> {
+        let before = self.large_of(from)?;
+        let after = self.large_of(to)?;
+        let differ = |path: &TreePath| {
+            let (left, right) = (before.get(path), after.get(path));
+            left.map(|file| (file.mode, &file.chunks))
+                != right.map(|file| (file.mode, &file.chunks))
+        };
+        let changed: Vec<TreePath> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| differ(path))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let refused = |message: String| WorkspaceError::Refused {
+            code: "WorkspaceDiffers".to_string(),
+            message,
+        };
+        let manifest = Manifest {
+            files: after.values().cloned().collect(),
+        };
+        let clashes = self.large_clashes(&manifest, &format!("{to}^{{tree}}"))?;
+        if !clashes.is_empty() {
+            return Err(refused(format!(
+                "large files {} clash with the tree of {to}",
+                shown_paths(&clashes).join(", ")
+            )));
+        }
+        // Every file first: nothing is written unless all are as `from` left them.
+        for path in &changed {
+            let full = directory.join(path.as_path());
+            let present = match std::fs::symlink_metadata(&full) {
+                Ok(metadata) if metadata.is_file() => Some(
+                    crate::chunks::chunk_names_of(&full)
+                        .map_err(chunk_failure)?
+                        .0,
+                ),
+                Ok(_) => {
+                    return Err(refused(format!(
+                        "large file {path}: something other than a file is in the workspace"
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(WorkspaceError::Unavailable(format!(
+                        "stat {}: {error}",
+                        full.display()
+                    )));
+                }
+            };
+            if present.as_ref() != before.get(path).map(|file| &file.chunks) {
+                return Err(refused(format!(
+                    "large file {path} changed in the workspace since its last checkpoint"
+                )));
+            }
+        }
+        let mut known = self.read_cache(branch);
+        for path in &changed {
+            known.remove(path);
+            match after.get(path) {
+                Some(file) => {
+                    materialize(self.chunks.as_ref(), directory, file).map_err(|error| {
+                        WorkspaceError::Unavailable(format!("large file {path}: {error}"))
+                    })?;
+                    let cached_at_ns = now_ns();
+                    if let Some(stat) = stat_of(&directory.join(path.as_path())) {
+                        known.insert(
+                            path.clone(),
+                            Known {
+                                stat,
+                                cached_at_ns,
+                                chunks: file.chunks.clone(),
+                            },
+                        );
+                    }
+                }
+                None => remove_large(directory, path).map_err(|error| {
+                    WorkspaceError::Unavailable(format!("large file {path}: {error}"))
+                })?,
+            }
+        }
+        self.write_cache(branch, &known);
+        Ok(())
     }
 
     /// Where a branch's workspace is marked stale ([`Self::follow_moved_branch`]).
@@ -1443,18 +1687,72 @@ impl GitWorkspace {
         let _ = std::fs::remove_file(self.stale_path(branch));
     }
 
-    /// Refuse to commit or merge a workspace marked stale.
+    fn is_stale(&self, branch: &str) -> bool {
+        self.stale_path(branch).exists()
+    }
+
+    /// Refuse to merge into a workspace marked stale.
     fn refuse_stale(&self, branch: &str) -> Result<(), WorkspaceError> {
-        if !self.stale_path(branch).exists() {
+        if !self.is_stale(branch) {
             return Ok(());
         }
-        Err(WorkspaceError::Refused {
-            code: "WorkspaceStale".to_string(),
-            message: format!(
-                "the workspace of {branch} holds a merge of main its branch never took (another \
-                 writer moved the branch) and changes of its own; mount it again"
+        Err(stale_refusal(branch, None))
+    }
+
+    /// Keep the state of a stale workspace off its branch: commit the
+    /// directory's tree (large files and all, like a checkpoint) to
+    /// [`stale_ref`], with the branch head as first parent and the snapshot
+    /// before it, if any, as the second. The branch is never moved. Returns
+    /// the snapshot's commit; one equal to the last snapshot is not written
+    /// again. The caller holds the branch's lock.
+    fn keep_stale(&self, branch: &str, directory: &Path) -> Result<String, WorkspaceError> {
+        let index = self.root.join(".index").join(format!("{branch}.stale"));
+        if let Some(parent) = index.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+            })?;
+        }
+        let head = self.commit_id_of(&format!("refs/heads/{branch}"))?;
+        let reference = stale_ref(branch);
+        let previous = self.commit_id_of(&reference).ok();
+        let tree = self.tree_of(directory, &index, &self.source_commits(branch, &head));
+        if tree.is_err() {
+            let _ = std::fs::remove_file(&index);
+        }
+        let (tree, large) = tree?;
+        let manifest = self.store_large(branch, directory, &large)?;
+        if let Some(previous) = &previous
+            && self.git_output(&["rev-parse", &format!("{previous}^{{tree}}")])? == tree
+            && self.manifest_of(previous)? == manifest
+        {
+            return Ok(previous.clone());
+        }
+        let message = crate::chunks::with_trailer(
+            &format!(
+                "spawn: stale workspace of {branch}, kept off the branch (another writer moved \
+                 the branch under a merge and the workspace could not follow)"
             ),
-        })
+            manifest.as_deref(),
+        );
+        let mut arguments = vec!["commit-tree", tree.as_str(), "-p", head.as_str()];
+        if let Some(previous) = previous.as_deref().filter(|previous| *previous != head) {
+            arguments.extend(["-p", previous]);
+        }
+        arguments.extend(["-m", message.as_str()]);
+        let commit = self.git_output(&arguments)?;
+        let old = previous.unwrap_or_default();
+        self.git_output(&["update-ref", &reference, &commit, &old])?;
+        Ok(commit)
+    }
+
+    /// When `branch` is marked stale and its directory exists, keep the
+    /// directory's state ([`Self::keep_stale`]) under the branch's lock.
+    fn keep_stale_directory(&self, branch: &str, directory: &Path) -> Result<(), WorkspaceError> {
+        if !self.is_stale(branch) || std::fs::symlink_metadata(directory).is_err() {
+            return Ok(());
+        }
+        let _lock = self.lock_branch(branch)?;
+        self.keep_stale(branch, directory).map(|_| ())
     }
 
     /// Move the files of `directory` from tree `from` to tree `to`, or
@@ -1745,6 +2043,32 @@ impl GitWorkspace {
 
 /// `<meta>\t<path>`, an entry of a `-z` tree listing: the meta fields
 /// (ASCII) and the path as bytes.
+/// Where the state of a stale workspace of `branch` is kept
+/// ([`GitWorkspace::keep_stale`]): a ref chunk collection walks like any
+/// other, never pushed and never landed.
+pub fn stale_ref(branch: &str) -> String {
+    format!("refs/spawn-stale/{branch}")
+}
+
+/// The refusal of a stale workspace's checkpoint or merge, naming the
+/// snapshot that keeps its state when there is one.
+fn stale_refusal(branch: &str, kept: Option<&str>) -> WorkspaceError {
+    let kept = kept.map_or_else(String::new, |commit| {
+        format!(
+            " Its state is kept as {commit} on {}, not on the branch.",
+            stale_ref(branch)
+        )
+    });
+    WorkspaceError::Refused {
+        code: WORKSPACE_STALE.to_string(),
+        message: format!(
+            "the workspace of {branch} could not follow its branch (another writer moved it \
+             under a merge of main).{kept} End the execution; the next mount starts from the \
+             branch head."
+        ),
+    }
+}
+
 fn tree_entry(entry: &[u8]) -> Option<(&str, TreePath)> {
     let tab = entry.iter().position(|byte| *byte == b'\t')?;
     let meta = std::str::from_utf8(&entry[..tab]).ok()?;
@@ -1876,6 +2200,103 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Far more large paths than one command line holds (Linux: 2 MiB of
+    /// arguments) still go through every git call that names them: the
+    /// checkpoint's `add`, `rm --cached`, the blob lookup and the clash check.
+    #[test]
+    fn many_large_paths_never_overflow_a_command_line() {
+        use super::{LargeFile, Manifest, TreePath};
+        let base =
+            std::env::temp_dir().join(format!("spawn-git-many-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        std::fs::create_dir_all(checkout.join("big")).expect("create the repository");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        let long = "x".repeat(200);
+        let names: Vec<String> = (0..20_000).map(|n| format!("big/{long}-{n}")).collect();
+        // Two of them are blobs on main, and one more file is not asked for.
+        for name in &names[..2] {
+            std::fs::write(checkout.join(name), "held\n").expect("write");
+        }
+        std::fs::write(checkout.join("other.txt"), "other\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let paths: Vec<(TreePath, u64)> = names
+            .iter()
+            .map(|name| (TreePath::from(name.as_str()), 1))
+            .collect();
+        let bytes: usize = names.iter().map(|name| name.len() + 12).sum();
+        assert!(bytes > 2 << 20, "the paths alone exceed ARG_MAX: {bytes}");
+
+        let held = store
+            .blobs_in(&["main".to_string()], &paths)
+            .expect("blob lookup");
+        let mut held: Vec<String> = held.iter().map(ToString::to_string).collect();
+        held.sort();
+        let mut expected = names[..2].to_vec();
+        expected.sort();
+        assert_eq!(held, expected);
+
+        let manifest = Manifest {
+            files: names
+                .iter()
+                .map(|name| LargeFile {
+                    path: TreePath::from(name.as_str()),
+                    mode: 0o100_644,
+                    size: 1,
+                    chunks: Vec::new(),
+                })
+                .collect(),
+        };
+        let tree = git(&checkout, &["rev-parse", "main^{tree}"]);
+        let mut clashes: Vec<String> = store
+            .large_clashes(&manifest, &tree)
+            .expect("clash check")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        clashes.sort();
+        assert_eq!(clashes, expected, "a blob where a large file goes clashes");
+
+        let staged = |index: &Path| {
+            let listed = Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .arg("ls-files")
+                .env("GIT_INDEX_FILE", index)
+                .output()
+                .expect("ls-files");
+            String::from_utf8_lossy(&listed.stdout).to_string()
+        };
+        std::fs::write(checkout.join("added.txt"), "added\n").expect("write");
+        let index = base.join("index");
+        store
+            .stage_all_but(&checkout, &index, &paths)
+            .expect("add with every large path excluded");
+        assert_eq!(
+            staged(&index),
+            "added.txt\nother.txt\n",
+            "no large path is staged"
+        );
+        // An index that holds two of them loses both.
+        let full = base.join("full-index");
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["add", "-A"])
+            .env("GIT_INDEX_FILE", &full)
+            .status()
+            .expect("add");
+        assert!(added.success());
+        assert_eq!(staged(&full).lines().count(), 4);
+        store
+            .unstage(&checkout, &full, &paths)
+            .expect("rm --cached of every large path");
+        assert_eq!(staged(&full), "added.txt\nother.txt\n");
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 
     /// A repository with `main` checked out, an agent branch with one
@@ -2034,13 +2455,213 @@ mod tests {
         assert!(refused(store.commit(&workspace, "over").map(|_| ())));
         assert!(refused(store.merge_base(&workspace).map(|_| ())));
         assert_eq!(git(&checkout, &["rev-parse", "refs/heads/agent_a"]), other);
+        let show = |path: &str| {
+            git(
+                &checkout,
+                &["show", &format!("refs/spawn-stale/agent_a:{path}")],
+            )
+        };
+        assert_eq!(
+            show("new.txt"),
+            "edited",
+            "the checkpoint was kept off the branch"
+        );
 
+        // Work after the last checkpoint: a mount keeps it before it
+        // replaces the directory.
+        std::fs::write(directory.join("work.txt"), "later\n").expect("write");
         let branch = BranchName::new("agent_a").expect("valid branch");
         let workspace = store.mount(&branch).expect("mount again");
+        assert_eq!(show("work.txt"), "later");
+        assert_eq!(
+            git(
+                &checkout,
+                &["rev-list", "--count", "refs/spawn-stale/agent_a"]
+            ),
+            git(&checkout, &["rev-list", "--count", "refs/heads/agent_a"])
+                .parse::<u32>()
+                .map(|count| (count + 2).to_string())
+                .expect("a count"),
+            "two snapshots, chained on the head"
+        );
         assert_eq!(
             store.commit(&workspace, "fresh").expect("commit"),
             Commit::Unchanged
         );
+    }
+
+    /// A stale workspace whose state cannot be kept (the snapshot's commit
+    /// fails) is neither replaced by a mount nor removed by an unmount.
+    #[test]
+    fn a_stale_workspace_that_cannot_be_kept_is_not_wiped() {
+        let (_checkout, store, workspace, base) = due_merge("stale-unkept");
+        let directory = PathBuf::from(workspace.path());
+        store.mark_stale("agent_a").expect("mark");
+        std::fs::write(directory.join("work.txt"), "unkept\n").expect("write");
+        let script = base.join("failing-git");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in\n  *\"stale workspace\"*) exit 1 ;;\nesac\nexec git \"$@\"\n",
+        )
+        .expect("write the failing git");
+        assert!(
+            Command::new("chmod")
+                .arg("+x")
+                .arg(&script)
+                .status()
+                .expect("chmod")
+                .success()
+        );
+        let failing = GitWorkspace {
+            git: script.to_string_lossy().to_string(),
+            ..store.clone()
+        };
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        assert!(failing.mount(&branch).is_err(), "the mount fails");
+        assert!(failing.unmount(&workspace).is_err(), "the unmount fails");
+        assert_eq!(
+            std::fs::read_to_string(directory.join("work.txt")).expect("still there"),
+            "unkept\n"
+        );
+        store.unmount(&workspace).expect("kept, then removed");
+        assert!(!directory.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A commit on `agent_a` made by a second workspace (its own root, the
+    /// same repository and chunk store), in which `write` changed the files;
+    /// the branch is put back where it was, so the commit can win a race
+    /// later ([`racing_git`]).
+    fn second_writers_commit(
+        store: &GitWorkspace,
+        checkout: &Path,
+        base: &Path,
+        write: impl FnOnce(&Path),
+    ) -> String {
+        let before = git(checkout, &["rev-parse", "refs/heads/agent_a"]);
+        let second = GitWorkspace {
+            root: base.join("second"),
+            ..store.clone()
+        };
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let workspace = second.mount(&branch).expect("mount a second time");
+        write(Path::new(workspace.path()));
+        let Commit::Created(commit) = second.commit(&workspace, "second").expect("commit") else {
+            panic!("the second writer changed something");
+        };
+        git(
+            checkout,
+            &["update-ref", "refs/heads/agent_a", &before, commit.as_str()],
+        );
+        commit.as_str().to_string()
+    }
+
+    /// The large files the manifest of `commit` lists.
+    fn large_paths(store: &GitWorkspace, commit: &str) -> Vec<String> {
+        store
+            .manifest_of(commit)
+            .expect("read the commit")
+            .map(|name| {
+                store
+                    .manifest(&name)
+                    .expect("the manifest")
+                    .files
+                    .iter()
+                    .map(|file| file.path.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_lost_race_takes_the_winning_heads_large_files_into_the_workspace() {
+        let (checkout, store, workspace, base) = due_merge("race-large");
+        let directory = PathBuf::from(workspace.path());
+        let other = second_writers_commit(&store, &checkout, &base, |directory| {
+            std::fs::write(directory.join("big.bin"), large_noise(7)).expect("write");
+        });
+        assert_eq!(large_paths(&store, &other), ["big.bin"]);
+        let racing = GitWorkspace {
+            git: racing_git(&base, &checkout, &other, ":"),
+            ..store.clone()
+        };
+        let lost = racing.merge_base(&workspace);
+        assert!(
+            matches!(&lost, Err(WorkspaceError::Unavailable(text)) if text.contains("follows its head")),
+            "{lost:?}"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("big.bin")).expect("the other writer's large file"),
+            large_noise(7)
+        );
+        // The next checkpoint keeps it on the branch: nothing changed.
+        assert_eq!(
+            store.commit(&workspace, "after").expect("commit"),
+            Commit::Unchanged
+        );
+        std::fs::write(directory.join("work.txt"), "more\n").expect("write");
+        let Commit::Created(next) = store.commit(&workspace, "more").expect("commit") else {
+            panic!("work.txt changed");
+        };
+        assert_eq!(large_paths(&store, next.as_str()), ["big.bin"]);
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let workspace = store.mount(&branch).expect("mount again");
+        assert_eq!(
+            std::fs::read(Path::new(workspace.path()).join("big.bin")).expect("remounted"),
+            large_noise(7)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_lost_race_over_a_large_file_the_agent_changed_keeps_its_work_off_the_branch() {
+        let (checkout, store, workspace, base) = due_merge("race-large-stale");
+        let directory = PathBuf::from(workspace.path());
+        std::fs::write(directory.join("model.bin"), large_noise(1)).expect("write");
+        assert!(matches!(
+            store.commit(&workspace, "model").expect("commit"),
+            Commit::Created(_)
+        ));
+        let other = second_writers_commit(&store, &checkout, &base, |directory| {
+            std::fs::write(directory.join("model.bin"), large_noise(2)).expect("write");
+        });
+        // The agent's own change, not checkpointed yet.
+        std::fs::write(directory.join("model.bin"), large_noise(3)).expect("write");
+        let racing = GitWorkspace {
+            git: racing_git(&base, &checkout, &other, ":"),
+            ..store.clone()
+        };
+        let lost = racing.merge_base(&workspace);
+        assert!(
+            matches!(&lost, Err(WorkspaceError::Unavailable(text)) if text.contains("cannot follow")),
+            "{lost:?}"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("model.bin")).expect("the agent's"),
+            large_noise(3),
+            "nothing of the agent's was overwritten"
+        );
+        let refused = store.commit(&workspace, "over");
+        assert!(
+            matches!(&refused, Err(WorkspaceError::Refused { code, message }) if code == "WorkspaceStale" && message.contains("refs/spawn-stale/agent_a")),
+            "{refused:?}"
+        );
+        assert_eq!(git(&checkout, &["rev-parse", "refs/heads/agent_a"]), other);
+        let kept = git(&checkout, &["rev-parse", "refs/spawn-stale/agent_a"]);
+        let name = store.manifest_of(&kept).expect("read").expect("a manifest");
+        let chunks = &store.manifest(&name).expect("manifest").files[0].chunks;
+        let (expected, _) =
+            crate::chunks::chunk_names_of(&directory.join("model.bin")).expect("hash");
+        assert_eq!(
+            chunks, &expected,
+            "the snapshot holds the agent's model.bin"
+        );
+        assert_eq!(
+            git(&checkout, &["rev-parse", &format!("{kept}^1")]),
+            other,
+            "on top of the head that won"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Deterministic incompressible bytes (xorshift), just over the large
