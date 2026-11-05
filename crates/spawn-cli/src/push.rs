@@ -12,7 +12,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -45,11 +44,15 @@ pub(crate) fn pushed_ref(branch: &str) -> String {
 /// Push one branch's head from a mirror to its source, without force.
 pub(crate) fn push_branch(mirror: &Path, source: &str, branch: &str) -> Pushed {
     let refspec = format!("refs/heads/{branch}:{}", pushed_ref(branch));
-    let output = Command::new("git")
+    // Not a source git may be given: no push can ever succeed, so it is not
+    // retried.
+    if let Err(error) = crate::sources::MissionSource::parse(source) {
+        return Pushed::Rejected(error);
+    }
+    let output = crate::sources::controller_git()
         .arg("--git-dir")
         .arg(mirror)
         .args(["push", "--porcelain", "--", source, &refspec])
-        .stdin(Stdio::null())
         .output();
     let output = match output {
         Ok(output) => output,

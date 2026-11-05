@@ -256,7 +256,8 @@ fn git(arguments: &[&str]) -> Result<String, String> {
 
 /// The source's default branch and its commit, as `git ls-remote` sees it.
 fn source_head(source: &str) -> Result<(String, String), String> {
-    let listing = git(&["ls-remote", "--symref", "--", source, "HEAD"])?;
+    let source = sources::MissionSource::parse(source)?;
+    let listing = git(&["ls-remote", "--symref", "--", source.as_str(), "HEAD"])?;
     let mut branch = "refs/heads/main".to_string();
     let mut commit = String::new();
     for line in listing.lines() {
@@ -269,7 +270,7 @@ fn source_head(source: &str) -> Result<(String, String), String> {
         }
     }
     if commit.is_empty() {
-        return Err(format!("{source} has no HEAD"));
+        return Err(format!("{} has no HEAD", source.as_str()));
     }
     Ok((branch, commit))
 }
@@ -724,14 +725,13 @@ const LANDING_IDENTITY: (&str, &str) = ("spawn-integrate", "integrate@localhost"
 /// which git takes over any configuration.
 fn commit_landing(mirror_path: &str, arguments: &[&str]) -> Result<String, String> {
     let (name, email) = LANDING_IDENTITY;
-    let output = std::process::Command::new("git")
+    let output = sources::controller_git()
         .args(["--git-dir", mirror_path, "commit-tree", "--no-gpg-sign"])
         .args(arguments)
         .env("GIT_AUTHOR_NAME", name)
         .env("GIT_AUTHOR_EMAIL", email)
         .env("GIT_COMMITTER_NAME", name)
         .env("GIT_COMMITTER_EMAIL", email)
-        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("run git: {error}"))?;
     if !output.status.success() {

@@ -1360,11 +1360,28 @@ begin
     end loop;
 end $$;
 
+-- Whether `p_source` is a mission source Spawn hands to git: an absolute
+-- path, an https:// or ssh:// URL, or ssh's `user@host:path`. Nothing that
+-- names another transport (`ext::`, `fd::`, `file://`), nothing relative,
+-- nothing that begins like an option, no whitespace or control character in
+-- a URL. The controller's git also allows only file, https and ssh
+-- (GIT_ALLOW_PROTOCOL), so a source stored before this check still reaches
+-- no other transport. Mirrors `MissionSource::parse` in spawn-cli.
+create or replace function spawn_source_allowed(p_source text)
+returns boolean language sql immutable as $$
+    select p_source is not null
+       and length(p_source) <= 4096
+       and (p_source ~ '^/[^[:cntrl:]]*$'
+            or p_source ~ '^(https|ssh)://[^-/[:space:][:cntrl:]][^[:space:][:cntrl:]]*$'
+            or p_source ~ '^[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:[^-:[:space:][:cntrl:]][^[:space:][:cntrl:]]*$')
+$$;
+
 create or replace function spawn_mission_add(p_text text, p_sources jsonb, p_origin text)
 returns bigint language plpgsql security definer as $$
 declare
     v_caller text := spawn_mission_caller();
     v_id bigint;
+    v_source jsonb;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -1374,6 +1391,24 @@ begin
     if coalesce(trim(p_text), '') = '' then
         raise exception 'a mission needs text';
     end if;
+    if jsonb_typeof(coalesce(p_sources, '[]'::jsonb)) <> 'array' then
+        raise exception 'a mission''s sources are a list' using errcode = '22023';
+    end if;
+    -- Every source is one git runs as the owner: a checked shape, and from
+    -- the supervisor only one a human already gave a mission. The supervisor
+    -- reads text other agents write; it never introduces a repository.
+    for v_source in select value from jsonb_array_elements(coalesce(p_sources, '[]'::jsonb)) loop
+        if jsonb_typeof(v_source) <> 'string' or not spawn_source_allowed(v_source #>> '{}') then
+            raise exception 'a source is an absolute path or an https:// or ssh:// URL, not %',
+                v_source using errcode = '22023';
+        end if;
+        if v_caller = 'spawn_supervisor' and not exists (
+            select 1 from mission_missions
+             where origin <> 'spawn_supervisor' and sources @> jsonb_build_array(v_source)) then
+            raise exception 'the supervisor names only a source a human gave a mission, not %',
+                v_source using errcode = '42501';
+        end if;
+    end loop;
     v_id := nextval(pg_get_serial_sequence('mission_missions', 'id'));
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.added', 'id', v_id, 'text', p_text,

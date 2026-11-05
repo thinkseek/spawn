@@ -288,10 +288,15 @@ tables, folded from the control stream (§10.1): a mission has its text,
 origin, sources, state and landing settings; a task has its mission, brief,
 kind, assignee, model profile, state and report.
 
-**Mission sources.** A mission names its source: any git repository (a path
-or a URL), mirrored into `$SPAWN_WORKSPACE_ROOT/.sources/`, or none (an empty
-scratch repository). Each worker's workspace is a branch of that mirror.
-`SPAWN_GIT_REPO` is the repository of agents no mission owns.
+**Mission sources.** A mission names its source: a git repository, as an
+absolute path, an `https://` or `ssh://` URL, or ssh's `user@host:path`,
+mirrored into `$SPAWN_WORKSPACE_ROOT/.sources/`, or none (an empty scratch
+repository). Each worker's workspace is a branch of that mirror.
+`SPAWN_GIT_REPO` is the repository of agents no mission owns. A source is
+git run as the owner, so `spawn_mission_add` refuses any other shape (an
+`ext::` command, a relative path, an option), the supervisor may name only a
+source a human already gave a mission, and every git the controller runs
+allows only file, https and ssh (`GIT_ALLOW_PROTOCOL`).
 
 **Limits.** None fixed. The supervisor decides fleet size; humans stop what
 overreaches, and the UI shows the live workers.
