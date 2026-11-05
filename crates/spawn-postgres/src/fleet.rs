@@ -139,8 +139,11 @@ select jsonb_build_object(
 /// supervisor, with the latest judgement, the episode (latest command from
 /// someone other than the dispatcher, or a task it delivered), whether a command is in flight, the
 /// model profile of its latest execution, and what the dispatcher already
-/// sent there in the last day.
-pub(crate) const DISPATCH_FACTS: &str = r"
+/// sent there in the last day; `resumed_young` counts the executions its
+/// resumes started that died young (`died_young!`) since the session's last
+/// execution that did not.
+pub(crate) const DISPATCH_FACTS: &str = concat!(
+    r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
 from (
   select
@@ -175,7 +178,19 @@ from (
     (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'
-      order by c.id desc limit 1) as last_delivery
+      order by c.id desc limit 1) as last_delivery,
+    (select count(*) from agent_executions x
+       join spawn_commands c on c.id = x.command_id
+      where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.idempotency_key like 'dispatch-resume-%' and c.succeeded
+        and x.started_at_ms > (select coalesce(max(h.started_at_ms), 0)
+                                 from agent_executions h
+                                where h.session_id = s.session_id and not ",
+    died_young!("h"),
+    r")
+        and ",
+    died_young!("x"),
+    r") as resumed_young
   from agent_status s
   join spawn_session_state p using (session_id)
   left join lateral (select c.id, c.action from spawn_commands c
@@ -184,7 +199,8 @@ from (
      order by c.id desc limit 1) ep on true
   where s.agent_id like 'agent\_worker\_%' or s.agent_id like 'agent\_resident\_%'
      or s.session_id = 'session_supervisor'
-) w";
+) w"
+);
 
 /// One session's judgements, newest first, with the evidence each saw.
 /// `$1` session, `$2` limit.

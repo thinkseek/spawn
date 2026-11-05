@@ -1574,14 +1574,13 @@ fn migrations_racing_on_one_server_all_succeed() {
     }
 }
 
-/// M15: a revival whose engine dies right after it launched counts as no
-/// failure: the resume command succeeded, and only failed commands since
-/// the last execution started are counted. The backoff and the handoff
-/// after three failed resumes never engage.
+/// M15: a revival whose engine dies right after it launched counts as a
+/// failure though its command succeeded, so the backoff and the handoff
+/// after three failed resumes engage; a revival that stayed up past the
+/// grace minute starts the count over.
 #[test]
-#[ignore = "audit M15 repro"]
-fn m15_a_revival_that_dies_at_once_counts_as_a_failure_repro() {
-    let (store, _schema) = store("revival_storm");
+fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
+    let (store, schema) = store("revival_storm");
     let reviver = "spawn-supervise";
     let run = |number: u64, command: CommandId| {
         let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
@@ -1652,9 +1651,120 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure_repro() {
         run(attempt, command);
     }
     let facts = store.liveness_facts(&session(), reviver).expect("facts");
-    assert!(
-        facts.failures >= 3,
+    assert_eq!(
+        facts.failures, 3,
         "three revivals died at once; counted {}",
         facts.failures
+    );
+    assert!(facts.last_failure_ms.is_some(), "the backoff has a start");
+    // A fourth revival whose engine ran two minutes before it was lost.
+    let command = revive("revive-5");
+    run(5, command);
+    admin(&schema)
+        .execute(
+            "update spawn_events set recorded_at_ms = recorded_at_ms - 120000
+              where execution_id is distinct from 'exec_5' or event_name <> 'execution.ended'",
+            &[],
+        )
+        .expect("age all but the last end");
+    let facts = store.liveness_facts(&session(), reviver).expect("facts");
+    assert_eq!(
+        facts.failures, 0,
+        "an engine that stayed up resets the count"
+    );
+}
+
+/// The dispatcher's facts count a resume whose engine was lost again within
+/// the grace minute (`resumed_young`), until an execution stays up.
+#[test]
+fn dispatch_facts_count_resumes_lost_again_at_once() {
+    let (store, schema) = store("facts_resumed_young");
+    let worker = AgentId::new("agent_worker_a").expect("valid agent");
+    let session = SessionId::new("session_worker_a").expect("valid session");
+    let run = |number: u64, command: CommandId| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        for (key, kind) in [
+            (
+                "started",
+                EventKind::ExecutionStarted {
+                    engine: ENGINE.to_string(),
+                    workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                    command_id: command,
+                    fork: None,
+                    model: ModelProfile::Default,
+                    transcript_from: None,
+                },
+            ),
+            (
+                "ended",
+                EventKind::ExecutionEnded {
+                    cause: EndCause::Lost,
+                    exit_code: None,
+                },
+            ),
+        ] {
+            store
+                .append(NewEvent {
+                    agent_id: worker.clone(),
+                    session_id: session.clone(),
+                    ..lifecycle(
+                        &execution,
+                        Source::Bridge,
+                        &format!("exec_{number}:{key}"),
+                        kind,
+                    )
+                })
+                .expect("append");
+        }
+    };
+    let send = |principal: &str, key: &str| {
+        let command = store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &Submission {
+                    agent_id: worker.clone(),
+                    action: CommandAction::Resume {
+                        prompt: None,
+                        model: None,
+                    },
+                    ..start(session.clone(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the command");
+        store
+            .finish(&claimed, &Outcome::Succeeded)
+            .expect("the engine launched");
+        command
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    run(1, send("human", "first"));
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(0),
+        "no resume yet"
+    );
+    run(2, send("spawn-dispatch", "dispatch-resume-exec_1"));
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(1),
+        "the resumed engine was lost at once"
+    );
+    // A later execution that ran two minutes before it was lost.
+    run(3, send("human", "again"));
+    admin(&schema)
+        .execute(
+            "update spawn_events set recorded_at_ms = recorded_at_ms - 120000
+              where execution_id is distinct from 'exec_3' or event_name <> 'execution.ended'",
+            &[],
+        )
+        .expect("age all but the last end");
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(0),
+        "an engine that stayed up starts the count over"
     );
 }

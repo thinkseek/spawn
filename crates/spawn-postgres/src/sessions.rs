@@ -50,7 +50,13 @@ pub(crate) const TIMELINE: &str =
 
 /// Everything the supervisor's liveness rule decides from.
 /// `$1` session, `$2` principal of the reviver.
-pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
+///
+/// `failures` counts, since the latest execution that did not die young
+/// (`died_young!`), the reviver's failed commands and the executions its
+/// succeeded commands started that died young: a revival is judged by
+/// whether its engine stayed up, not by whether it launched.
+pub(crate) const LIVENESS_FACTS: &str = concat!(
+    "with last_exec as (
                     select e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause
                       from agent_executions e
                      where e.session_id = $1
@@ -59,6 +65,20 @@ pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
                     select c.action ->> 'type' as kind
                       from spawn_commands c where c.session_id = $1
                      order by c.id desc limit 1
+                 ), healthy as (
+                    select coalesce(max(x.started_at_ms), 0) as since
+                      from agent_executions x
+                     where x.session_id = $1 and not ",
+    died_young!("x"),
+    "
+                 ), died as (
+                    select x.ended_at_ms
+                      from agent_executions x
+                      join spawn_commands c on c.id = x.command_id
+                     where x.session_id = $1 and c.principal = $2 and c.succeeded
+                       and x.started_at_ms > (select since from healthy) and ",
+    died_young!("x"),
+    "
                  )
                  select
                     exists (select 1 from spawn_commands c
@@ -72,11 +92,14 @@ pub(crate) const LIVENESS_FACTS: &str = "with last_exec as (
                                and e.event_name = 'session.native_started') as native_bound,
                     (select count(*) from spawn_commands c
                       where c.session_id = $1 and c.principal = $2 and c.succeeded = false
-                        and c.created_at_ms > coalesce((select started_at_ms from last_exec), 0)
-                    ) as failures,
-                    (select max(c.finished_at_ms) from spawn_commands c
-                      where c.session_id = $1 and c.principal = $2 and c.succeeded = false
-                    ) as last_failure_ms";
+                        and c.created_at_ms > (select since from healthy)
+                    ) + (select count(*) from died) as failures,
+                    greatest(
+                      (select max(c.finished_at_ms) from spawn_commands c
+                        where c.session_id = $1 and c.principal = $2 and c.succeeded = false),
+                      (select max(ended_at_ms) from died)
+                    ) as last_failure_ms"
+);
 
 /// Commands one principal submitted, newest first, as one JSON array.
 /// `$1` principal, `$2` limit.

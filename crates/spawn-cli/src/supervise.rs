@@ -390,6 +390,29 @@ mod tests {
         );
     }
 
+    /// Revivals whose engines died at once count as failures
+    /// (`LIVENESS_FACTS`), though each resume command succeeded: they back
+    /// off, longer each time, and the third hands off to a new session.
+    #[test]
+    fn revivals_that_die_at_once_back_off_then_hand_off() {
+        let died = |failures: u32| LivenessFacts {
+            failures,
+            last_failure_ms: Some(100_000),
+            cause: Some("lost".to_string()),
+            last_kind: Some("resume".to_string()),
+            ..facts()
+        };
+        assert_eq!(decide(&died(1), 100_000 + 19_000), Revive::Nothing);
+        assert_eq!(decide(&died(1), 100_000 + 20_000), Revive::Resume);
+        assert_eq!(decide(&died(2), 100_000 + 20_000), Revive::Nothing);
+        assert_eq!(decide(&died(2), 100_000 + 40_000), Revive::Resume);
+        assert_eq!(decide(&died(3), 100_000 + 79_000), Revive::Nothing);
+        assert_eq!(
+            decide(&died(3), 100_000 + 80_000),
+            Revive::Start { handoff: true }
+        );
+    }
+
     #[test]
     fn nothing_to_resume_means_a_handoff() {
         let unbound = LivenessFacts {

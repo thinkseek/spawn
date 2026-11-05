@@ -185,7 +185,8 @@ it, on the same ladder.
   with confidence ≥ 0.7, `needs_human` ≤ 0.2 and `stuck` < 0.5, once per
   episode (the latest non-dispatcher command) and three per agent-hour; a
   worker idle at its prompt and not nudged, a nudge that did not help, a
-  failed resume, attention, and a finished execution nobody stopped all
+  failed resume (or one whose engine was lost again within a minute),
+  attention, and a finished execution nobody stopped all
   escalate. Escalations coalesce into one digest typed into the supervisor
   while it is idle. The dispatcher keeps no state: idempotency keys mark its
   nudges and resumes, and a `[spawn:esc <session> <id>]` marker per item in
@@ -215,7 +216,7 @@ the system. Its continuity is a design requirement, not a best effort:
 | Threat | What keeps the session |
 | --- | --- |
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
-| The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff |
+| The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff; a revival whose engine is lost or exits non-zero within a minute counts as a failed one, and only an execution that stayed up starts the count over |
 | The machine reboots | tmux is gone, so the execution is `Lost`; the same rule resumes it from the native transcript |
 | A transcript Claude Code deleted (or a container took with it) | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
 | The native session cannot be resumed (transcript lost with no copy, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |

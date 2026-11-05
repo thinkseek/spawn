@@ -806,6 +806,7 @@ mod tests {
             dispatched: Vec::new(),
             last_delivery: None,
             model: ModelProfile::Default,
+            resumed_young: 0,
         }
     }
 
