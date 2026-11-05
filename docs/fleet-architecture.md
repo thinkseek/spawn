@@ -561,10 +561,18 @@ the tree's own:
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
-- objective results on the base are cached outside the sandbox, keyed by
-  the base commit and the scenario, build hook, controller helpers and gate
-  hashes; candidate code cannot see or write the cache, but any process of
-  the same uid outside the sandbox can (the same-uid limit).
+- objective results on the base (solved, or unsolved after two runs that
+  agree) are cached outside the sandbox, keyed by everything that decides
+  them: the base commit, the blobs of the scenario and of the gate, the
+  toolchain the base builds with (`rustc -vV`, `cargo -V`, `node
+  --version` in the base tree), the scenarios directory's build hook and
+  helpers, and the files the scenario names (`scripts/...` of the
+  controller, transitively). A controller file no scenario names (the
+  black-box runner) changes no key. Only the gate writes an entry, after a
+  completed base run; an entry it cannot read is a miss; candidate runs are
+  never cached; the log lists which base results came from the cache.
+  Candidate code cannot see or write the cache, but any process of the
+  same uid outside the sandbox can (the same-uid limit).
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
@@ -598,7 +606,9 @@ the tree's own:
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
   another mission's task in `landing` waits for it (the push may have moved
-  `main` before its `task.landed`). For each task that is ready, it:
+  `main` before its `task.landed`). For a mission's lowest ready task (one
+  per mission at a time, and a few missions at once: §10.4, "One gate per
+  mission"), on a thread of its own, it:
   1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into
      its mirror's `refs/spawn-integrate/<agent>` (it never commits a
      workspace and never moves `refs/heads/<agent>`). A push that lags the
@@ -681,8 +691,8 @@ the tree's own:
     dispatcher once its task lands or is cancelled (`retire-task-<id>`). Its
     report reaches the supervisor's digest like any report. With N = 1 this
     is one task at a time on the resident, as before.
-  - Landing stays one at a time: one candidate judged per pass, the lowest
-    ready task first, main moved by compare-and-swap. A task whose base is
+  - Landing stays one at a time per mission: one candidate judged at a
+    time, the lowest ready task first, main moved by compare-and-swap. A task whose base is
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
   - Budgets apply per task, from its delivery; the halt rules stay per
@@ -702,5 +712,15 @@ the tree's own:
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
   `/api/rsi/task/<id>` answers one task; `/api/rsi/pane` shows the
   resident's terminal.
-- **One gate at a time.** Integrator passes hold an advisory lock, so two
-  gates never run at once.
+- **One gate per mission, a few at once.** A judging (fetch, gate,
+  landing) runs on a thread of its own, so a mission's 20-minute gate does
+  not hold another's. A mission has at most one in flight, and so does a
+  source (missions on one source share its mirror and its main); while it
+  runs, the integrator's passes skip that mission and its source. At most
+  `--gates N` (`SPAWN_INTEGRATE_GATES`, default 2, at most 8) run at once
+  across missions, since gates share the CPU and the test database. Each
+  judging records its own verdict and landing, which the next pass reads;
+  finished judgings are reaped before a pass reads the missions. A restart
+  mid-gate kills the gates with the process (no record), and the next
+  integrator judges those tasks again. One integrator per database: its
+  advisory lock belongs to the connection, kept while any gate runs.
