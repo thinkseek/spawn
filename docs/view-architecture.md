@@ -80,7 +80,7 @@
 
 ## 6. 权限
 
-采用多租户方案：原始表、投影表与全部 `agent_*` 视图都收回 public，只留 `agent_commands` 的 insert（和 `id` 列的 select，供 `returning id` 用）。其他角色走函数：`spawn_read_state()`、`spawn_read_status()`、`spawn_read_tasks()`、`spawn_read_freshness()` 跨会话；`spawn_read_timeline(session_id)`、`spawn_read_judgements(session_id)` 取会话参数。其余视图没有读函数。`spawn_reader`（`spawn serve` 的登录）例外：它能 select 全部表和视图，什么都不能写。函数是 `security definer`，固定 `search_path`，按 `spawn_grants` 过滤 `session_user`，`'*'` 表示全部 agent。
+采用多租户方案：原始表、投影表与全部 `agent_*` 视图都收回 public，只留 `agent_commands` 的 insert（不给 select，连 `id` 列也不给：否则能列出所有命令 id；提交方经 `spawn_gateway_submit` 拿回自己那条命令的 id）。其他角色走函数：`spawn_read_state()`、`spawn_read_status()`、`spawn_read_tasks()`、`spawn_read_freshness()` 跨会话；`spawn_read_timeline(session_id)`、`spawn_read_judgements(session_id)` 取会话参数。其余视图没有读函数。`spawn_reader`（`spawn serve` 的登录）例外：它能 select 全部表和视图，什么都不能写。函数是 `security definer`，固定 `search_path`，按 `spawn_grants` 过滤 `session_user`，`'*'` 表示全部 agent。
 
 `spawn` CLI 以 owner 连接，直读视图。迁移对视图执行 revoke；直查视图的非 owner 客户端收到 `42501`，应改走函数。
 
