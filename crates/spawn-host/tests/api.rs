@@ -489,6 +489,44 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     );
 }
 
+/// A prompt longer than tmux's message size (16 KiB; an objective's brief
+/// can be) is staged and pasted whole: `set-buffer <text>` refused it as
+/// "command too long", and the dispatcher retried that refusal forever.
+#[test]
+fn tmux_stages_a_text_longer_than_its_message_size() {
+    let _exclusive = exclusive();
+    let tmux = isolated_tmux("long");
+    let host = TmuxHost::local(&tmux.program);
+    let name = terminal("long");
+    start_session(&host, &launch(&name)).expect("start succeeds");
+
+    // Short lines: the test's /bin/cat reads a terminal in canonical mode,
+    // which caps one line at 4 KiB; the engine reads raw, as one paste.
+    let text = format!(
+        "{}LONG-TEXT-END",
+        format!("{}\n", "x".repeat(99)).repeat(410)
+    );
+    host.stage_text(&name, &workspace(), &text)
+        .expect("a 40 KiB text stages");
+    host.submit_staged(&name, &workspace())
+        .expect("the staged text is pasted");
+    // The pane echoes 40 KiB: wait for its end to show, at most 10 s.
+    let mut pane = String::new();
+    for _ in 0..100 {
+        pane = host
+            .capture_tail(&name, &workspace(), 20)
+            .expect("capture succeeds");
+        if pane.contains("LONG-TEXT-END") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(pane.contains("LONG-TEXT-END"), "pane tail: {pane}");
+
+    host.terminate(&name, &workspace())
+        .expect("terminate succeeds");
+}
+
 /// Audit G: a launch's environment (a database login among it) never goes
 /// on tmux's command line, which every local user reads in /proc. The pane
 /// still gets every value exactly, and the file that carried them is gone.

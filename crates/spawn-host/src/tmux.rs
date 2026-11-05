@@ -199,8 +199,6 @@ fn write_environment(
     terminal: &TerminalName,
     environment: &[(String, String)],
 ) -> Result<std::path::PathBuf, TerminalError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let mut text = String::new();
     for (key, value) in environment {
         let name_ok = key
@@ -218,6 +216,22 @@ fn write_environment(
         text.push_str(&spawn_core::shell::shell_quote(value));
         text.push('\n');
     }
+    write_private(terminal, "launch", "env", "the environment", &text)
+}
+
+/// `text` in a new file only this uid reads (mode 600, created exclusively)
+/// in `XDG_RUNTIME_DIR` (else the temporary directory): what must reach tmux
+/// but never a command line, which every local user reads in /proc and tmux
+/// caps in size. The caller removes it.
+fn write_private(
+    terminal: &TerminalName,
+    kind: &str,
+    extension: &str,
+    what: &str,
+    text: &str,
+) -> Result<std::path::PathBuf, TerminalError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let directory = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_dir())
@@ -226,13 +240,12 @@ fn write_environment(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let path = directory.join(format!(
-        "spawn-launch-{}-{}-{nanos}.env",
+        "spawn-{kind}-{}-{}-{nanos}.{extension}",
         terminal.as_str(),
         std::process::id()
     ));
-    let failed = |error: std::io::Error| {
-        TerminalError(format!("write the environment of {terminal}: {error}"))
-    };
+    let failed =
+        |error: std::io::Error| TerminalError(format!("write {what} of {terminal}: {error}"));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -315,18 +328,23 @@ impl TerminalHost for TmuxHost {
         _workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError> {
-        // A named buffer, which no key reaches until it is pasted.
-        let set = vec![
-            "set-buffer".to_string(),
+        // A named buffer, which no key reaches until it is pasted. Loaded
+        // from a private file, not given on the command line: tmux refuses
+        // a command over its message size (16 KiB), and a long prompt (an
+        // objective's brief) is longer.
+        let path = write_private(terminal, "stage", "txt", "the text to stage", text)?;
+        let load = vec![
+            "load-buffer".to_string(),
             "-b".to_string(),
             Self::buffer(terminal),
-            "--".to_string(),
-            text.to_string(),
+            path.to_string_lossy().into_owned(),
         ];
-        let run = self.run(&set)?;
+        let run = self.run(&load);
+        let _ = std::fs::remove_file(&path);
+        let run = run?;
         if run.code != Some(0) {
             return Err(TerminalError(format!(
-                "set-buffer failed: {}",
+                "load-buffer failed: {}",
                 run.stderr.trim()
             )));
         }
