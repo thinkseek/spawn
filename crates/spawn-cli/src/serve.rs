@@ -1318,6 +1318,53 @@ mod tests {
             .expect("status line")
     }
 
+    /// Audit M2: `serve` answers one request at a time on one thread with
+    /// no write timeout. A client that asks for a large file and never reads
+    /// it blocks `respond`, and every other client waits behind it. This
+    /// runs `serve`'s own loop (`for request in incoming_requests() {
+    /// handle(..) }`) over the real handler.
+    #[test]
+    #[ignore = "audit M2 repro"]
+    fn a_client_that_stops_reading_does_not_stall_the_others_repro() {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+        let web = std::env::temp_dir().join(format!("spawn-m2-repro-{}", std::process::id()));
+        std::fs::create_dir_all(&web).expect("web");
+        std::fs::write(web.join("big.bin"), vec![0u8; 64 << 20]).expect("big file");
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let hosts = server_hosts("127.0.0.1:0", port);
+        let served = web.clone();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let _ = handle(request, &served, None, Some(port), &hosts);
+            }
+        });
+        // The stalled client: asks, never reads.
+        let mut stalled = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(stalled, "GET /big.bin HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").expect("send");
+        std::thread::sleep(Duration::from_millis(500));
+        // Another client: a request answered without the store (400).
+        let mut other = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        other
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        write!(
+            other,
+            "GET /api/session/not%20a%20session HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut answer = [0u8; 12];
+        let read = other.read(&mut answer);
+        let _ = std::fs::remove_dir_all(&web);
+        drop(stalled);
+        assert!(
+            matches!(read, Ok(n) if n > 0),
+            "a second client got no answer in 3 s while the first did not read: {read:?}"
+        );
+    }
+
     #[test]
     fn a_rebound_or_cross_origin_api_read_is_refused_before_it_reaches_the_store() {
         // A malformed session id answers 400 without a store: the request
