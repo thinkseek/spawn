@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use super::SCREEN_STALE;
 use super::judge::{JudgeInput, TurnFact};
-use crate::event::{EndCause, Engine, EventKind, EventRecord, SessionSeq};
+use crate::event::{EndCause, EventKind, EventRecord, SessionSeq, Source};
 use crate::id::{AgentId, ExecutionId, SessionId};
 use crate::screen::ScreenState;
 use crate::time::Timestamp;
@@ -12,7 +12,7 @@ use crate::time::Timestamp;
 /// Facts the Observer keeps for one session.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Snapshot {
-    engine: Option<Engine>,
+    engine: Option<String>,
     /// The newest execution started.
     execution: Option<ExecutionId>,
     pub(super) execution_active: bool,
@@ -30,13 +30,26 @@ pub(super) struct Snapshot {
     exit_code: Option<i32>,
     pub(super) evidence_seq: SessionSeq,
     last_fact_at: Option<Timestamp>,
+    /// When the engine last moved: its latest transcript fact, or the
+    /// execution's start. Screen readings and commands do not move it.
+    progress_at: Option<Timestamp>,
 }
 
 impl Snapshot {
-    /// Apply one event.
-    pub(super) fn apply(&mut self, record: &EventRecord) {
+    /// When the facts were last added to, and the engine last moved.
+    fn note_times(&mut self, record: &EventRecord) {
         self.evidence_seq = record.session_seq;
         self.last_fact_at = Some(record.recorded_at);
+        if record.event.source == Source::Claude
+            || matches!(record.event.kind, EventKind::ExecutionStarted { .. })
+        {
+            self.progress_at = Some(record.recorded_at);
+        }
+    }
+
+    /// Apply one event.
+    pub(super) fn apply(&mut self, record: &EventRecord) {
+        self.note_times(record);
         // A hook event is newer than any screen reading and means the engine
         // moved on, so an older screen state or permission prompt is stale.
         if matches!(
@@ -53,7 +66,7 @@ impl Snapshot {
         }
         match &record.event.kind {
             EventKind::ExecutionStarted { engine, .. } => {
-                self.engine = Some(*engine);
+                self.engine = Some(engine.clone());
                 self.execution.clone_from(&record.event.execution_id);
                 self.execution_active = true;
                 self.stalled_end = None;
@@ -91,7 +104,7 @@ impl Snapshot {
                 self.permission_pending = false;
             }
             EventKind::NativeSessionStarted { engine, .. } => {
-                self.engine = Some(*engine);
+                self.engine = Some(engine.clone());
             }
             EventKind::ToolStarted {
                 tool_name,
@@ -161,10 +174,11 @@ impl Snapshot {
             Some(ScreenState::Busy) if stale => None,
             other => other,
         };
+        let since = |at: Timestamp| u64::try_from(now.since(at).as_millis()).unwrap_or(u64::MAX);
         JudgeInput {
             agent_id: agent_id.to_string(),
             session_id: session_id.to_string(),
-            engine: self.engine,
+            engine: self.engine.clone(),
             execution_active: self.execution_active,
             stalled_end: self.stalled_end,
             last_end: self.last_end,
@@ -177,9 +191,8 @@ impl Snapshot {
             last_error: self.last_error.clone(),
             evidence_seq: self.evidence_seq,
             ambiguity: None,
-            quiet_ms: self
-                .last_fact_at
-                .map(|at| u64::try_from(now.since(at).as_millis()).unwrap_or(u64::MAX)),
+            quiet_ms: self.last_fact_at.map(since),
+            progress_ms: self.progress_at.map(since),
             task: None,
             screen_tail: None,
             perpetual: false,

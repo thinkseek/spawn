@@ -17,7 +17,7 @@
 //! the same revival twice.
 
 use spawn_core::command::{CommandAction, Submission};
-use spawn_core::event::Engine;
+use spawn_core::event::ENGINE;
 use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::mission::TaskState;
 use spawn_core::port::CommandQueue;
@@ -153,14 +153,6 @@ ephemeral workers should not exist.
     )
 }
 
-/// The charter as this build writes it, for re-briefing a running supervisor.
-pub(crate) fn current_charter() -> String {
-    charter(
-        &spawn_program(),
-        &env_or("SPAWN_MISSION_FILE", "mission.md"),
-    )
-}
-
 /// Summary of the log for a new native session.
 fn handoff(store: &PostgresStore) -> String {
     let fleet = store.fleet_json().map_or_else(
@@ -214,7 +206,7 @@ fn revive(
         ),
         Revive::Start { handoff } => (
             CommandAction::Start {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 prompt: start(handoff),
                 parent_session_id: None,
                 from: None,

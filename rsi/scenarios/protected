@@ -1,7 +1,14 @@
-# Paths a candidate may not change (scripts/rsi/gate.sh). They judge it:
-# the backlog and scenarios, the gate, and the black-box tests the checks
-# run from the controller's checkout.
+# Paths a candidate may not change (scripts/rsi/gate.sh). Everything here
+# runs as the owner outside the gate's sandbox, or judges the candidate:
+# the backlog and scenarios, the gate and every helper it or its checks
+# source from the controller's checkout (scripts/), the deploy and backup
+# scripts, the relays and the systemd units (deploy/, scripts/*.py), and the
+# UI build's configuration, which deploy.sh executes (web/ config files).
 rsi/
-scripts/rsi/
-scripts/blackbox/
-scripts/e2e.sh
+scripts/
+deploy/
+web/vite.config.ts
+web/package.json
+web/pnpm-lock.yaml
+web/pnpm-workspace.yaml
+web/tsconfig.json

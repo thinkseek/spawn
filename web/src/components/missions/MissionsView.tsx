@@ -19,14 +19,16 @@ import type {
   MissionTask,
   Missions,
   Resident,
-  TaskStage,
   TaskState,
 } from "../../missions";
 import {
   approveCommand,
+  endedWell,
   fetchMissions,
   pipelineOf,
+  shownStages,
   slowStages,
+  stageStep,
 } from "../../missions";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
@@ -659,36 +661,6 @@ function Pipeline({
   );
 }
 
-/** How a record shows as a step: what it moved the task to. */
-interface StageStep {
-  label: string;
-  /** `back`: sent back for another round; `closed`: the task ended there. */
-  tone: "forward" | "back" | "closed";
-}
-
-function stageStep(stage: TaskStage): StageStep {
-  switch (stage.stage) {
-    case "reviewed":
-      return stage.verdict === "accepted"
-        ? { label: "accepted", tone: "forward" }
-        : { label: "sent back", tone: "back" };
-    case "gated":
-      if (stage.verdict === "accepted") return { label: "landing", tone: "forward" };
-      return {
-        label: `gate ${stage.verdict ?? "verdict"}`,
-        tone:
-          stage.verdict === "rejected" || stage.verdict === "conflict"
-            ? "back"
-            : "forward",
-      };
-    case "aborted":
-    case "cancelled":
-      return { label: stage.stage, tone: "closed" };
-    default:
-      return { label: stage.stage, tone: "forward" };
-  }
-}
-
 /** The steps of the task's path it has still to walk. */
 function remainingSteps(
   state: TaskState,
@@ -712,27 +684,27 @@ function StageSteps({
   steps: ReadonlyArray<TaskState>;
 }) {
   const ahead = remainingSteps(task.state, steps);
-  const last = task.stages[task.stages.length - 1];
+  const stages = shownStages(task);
+  const last = stages[stages.length - 1];
   const waiting =
     ahead.length > 0 && last.at_ms !== null
       ? Math.max(0, Date.now() - last.at_ms)
       : null;
   const slow = slowStages([
-    ...task.stages,
+    ...stages,
     ...(waiting !== null
       ? [{ stage: "waiting", verdict: null, at_ms: null, took_ms: waiting }]
       : []),
   ]);
-  const settled =
-    task.state === "landed" || task.state === "accepted" || task.state === "cancelled";
+  const settled = endedWell(task.state);
   return (
     <ol
       aria-label={`Task stages, state ${task.raw_state ?? "unknown"}`}
       className="flex flex-wrap items-start gap-x-1 gap-y-2"
     >
-      {task.stages.map((stage, index) => {
+      {stages.map((stage, index) => {
         const step = stageStep(stage);
-        const current = index === task.stages.length - 1;
+        const current = index === stages.length - 1;
         return (
           <StepItem
             key={`${index}-${stage.stage}`}

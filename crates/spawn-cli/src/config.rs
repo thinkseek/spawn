@@ -70,6 +70,53 @@ fn resolve_workspace_root(flag: Option<String>, environment: Option<String>) -> 
     flag.or(environment)
 }
 
+/// The oldest git Spawn runs on. Merges of main into a branch, the Bridge's
+/// and the integrator's, take main's merge rules from its `.gitattributes`
+/// with the global option `git --attr-source=<main>` (a bare repository
+/// reads no in-tree attributes otherwise), which Git 2.40 introduced.
+pub(crate) const MIN_GIT: (u32, u32) = (2, 40);
+
+/// Major and minor version of `git --version`'s answer (`git version
+/// 2.56.0`, `git version 2.39.5 (Apple Git-154)`, `git version
+/// 2.45.1.windows.1`).
+fn git_version(answer: &str) -> Option<(u32, u32)> {
+    let version = answer.trim().strip_prefix("git version ")?;
+    let mut parts = version.split(['.', ' ']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// `Ok` when `answer` (what `git --version` printed) names [`MIN_GIT`] or
+/// newer; otherwise why not, in words that say what to install.
+fn check_git_version(answer: &str) -> Result<(), String> {
+    let (major, minor) = MIN_GIT;
+    match git_version(answer) {
+        Some(found) if found >= MIN_GIT => Ok(()),
+        Some((found_major, found_minor)) => Err(format!(
+            "git {found_major}.{found_minor} is too old: Spawn needs git {major}.{minor} or later \
+             (merges take main's .gitattributes through `git --attr-source`, added in \
+             {major}.{minor})"
+        )),
+        None => Err(format!(
+            "cannot read the git version from {:?}; Spawn needs git {major}.{minor} or later",
+            answer.trim()
+        )),
+    }
+}
+
+/// Check once, at start, that the `git` on `PATH` is [`MIN_GIT`] or newer,
+/// so an old git fails with a clear error instead of an unknown option in
+/// the middle of a merge.
+pub(crate) fn require_git() -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("run git --version: {error}"))?;
+    check_git_version(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Pause between loop passes: `SPAWN_LOOP_INTERVAL_MS`, 500 by default.
 /// Each pass reads every live engine's transcript and screen, so a short
 /// pause is how quickly the fleet notices anything; the cost is a few reads.
@@ -129,6 +176,37 @@ mod tests {
             Some("/env")
         );
         assert_eq!(resolve_workspace_root(None, None), None);
+    }
+
+    #[test]
+    fn git_versions_read_from_every_known_shape() {
+        assert_eq!(git_version("git version 2.56.0\n"), Some((2, 56)));
+        assert_eq!(
+            git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39))
+        );
+        assert_eq!(git_version("git version 2.45.1.windows.1"), Some((2, 45)));
+        assert_eq!(git_version("git version 3.0"), Some((3, 0)));
+        assert_eq!(git_version("hub version 2.14.2"), None);
+        assert_eq!(git_version(""), None);
+    }
+
+    #[test]
+    fn git_older_than_the_attr_source_option_is_refused_clearly() {
+        assert!(check_git_version("git version 2.40.0").is_ok());
+        assert!(check_git_version("git version 2.56.0").is_ok());
+        assert!(check_git_version("git version 3.1.0").is_ok());
+        let old = check_git_version("git version 2.39.5").expect_err("too old");
+        assert!(old.contains("git 2.39 is too old"), "{old}");
+        assert!(old.contains("2.40 or later"), "{old}");
+        assert!(old.contains("--attr-source"), "{old}");
+        assert!(check_git_version("git version 2.30.2").is_err());
+        assert!(check_git_version("not git").is_err());
+    }
+
+    #[test]
+    fn the_git_on_this_host_is_new_enough() {
+        require_git().expect("the build host runs a current git");
     }
 
     #[test]

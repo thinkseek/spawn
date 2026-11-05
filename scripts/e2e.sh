@@ -12,8 +12,7 @@
 #   5. with Jev down, a stalled worker is escalated on rules alone, not nudged;
 #   6. killing the supervisor's engine, then its tmux server, then the loop,
 #      each ends with session_supervisor live again, resumed natively;
-#   7. the corpus exports and replay reports a tier per episode;
-#   8. missions: a human mission reaches the supervisor; a resident is
+#   7. missions: a human mission reaches the supervisor; a resident is
 #      proposed by the supervisor and runs only after a human approves it;
 #      its tasks are delivered one at a time, reported, sent back once and
 #      accepted; an ephemeral worker reports and is stopped once accepted; a
@@ -371,7 +370,7 @@ tail_of session_worker_d | jq -e '[.commands[]? | select(.principal == "spawn-di
 pass "with Jev down the stalled worker was escalated, not nudged"
 start_jev
 
-# --- 8. missions, residents, tasks, reports --------------------------------
+# --- 7. missions, residents, tasks, reports --------------------------------
 sup() { SPAWN_DATABASE_URL=$sup_url "$bin" "$@"; }
 board() { sup mission list; }
 task_state() { board | jq -r --argjson id "$1" '.missions[].tasks[] | select(.id == $id) | .state'; }
@@ -590,13 +589,5 @@ sleep 5
 live session_supervisor || fail "the supervisor died with the loop"
 [ "$(execution_of session_supervisor)" = "$before" ] || fail "the loop restart replaced the supervisor's execution"
 pass "loop killed -> the same supervisor execution kept running"
-
-# --- 7. experience --------------------------------------------------------
-"$bin" corpus export >"$work/corpus.jsonl"
-records=$(wc -l <"$work/corpus.jsonl")
-[ "$records" -gt 0 ] || fail "the corpus is empty"
-"$bin" judge --replay "$work/corpus.jsonl" >"$work/replay.json"
-jq -e '.total > 0 and (.by_tier | length) > 0' "$work/replay.json" >/dev/null || fail "replay has no tiers"
-pass "corpus exported ($records records); replay: $(jq -c '{coverage, by_tier}' "$work/replay.json")"
 
 echo "e2e: PASS"

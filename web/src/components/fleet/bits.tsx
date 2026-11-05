@@ -1,4 +1,4 @@
-import { Cpu, ListChecks, Sparkles } from "lucide-react";
+import { ListChecks, Sparkles } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { FleetState, Role } from "../../fleet";
@@ -27,13 +27,6 @@ export function JudgeBadge({
       icon: <ListChecks size={11} />,
       label: "Rules",
       title: "Settled by the deterministic rules",
-    },
-    heuristic: {
-      className:
-        "border border-dashed border-border-strong text-faint-foreground ring-0",
-      icon: <Cpu size={11} />,
-      label: "Heuristic",
-      title: "Judged by the built-in heuristic (no model judge configured)",
     },
     other: {
       className: "bg-transparent text-faint-foreground ring-surface-border",

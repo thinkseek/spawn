@@ -124,61 +124,110 @@ impl PostgresStore {
     /// Install or refresh the schema, and set the logins' passwords.
     /// Idempotent: every process of one install derives the same ones.
     pub fn migrate(&self) -> Result<(), StoreError> {
+        // Roles and grants are cluster-wide, so migrations of two databases
+        // (or schemas) on one server race on them ("tuple concurrently
+        // updated"). Every statement of the schema is idempotent, so the
+        // whole migration is simply run again, a bounded number of times.
+        let mut attempt: u32 = 0;
+        loop {
+            match self.migrate_once() {
+                Err(error) if attempt < MIGRATE_ATTEMPTS && concurrent_catalog_update(&error) => {
+                    attempt += 1;
+                    std::thread::sleep(retry_pause(attempt));
+                }
+                result => return result.map_err(|error| backend(&error)),
+            }
+        }
+    }
+
+    /// One migration, in one transaction: the schema takes the append lock
+    /// first, so the migrations of one database (which share its logins)
+    /// set the logins one at a time. Dropped on failure, it rolls back.
+    fn migrate_once(&self) -> Result<(), postgres::Error> {
         let mut client = self.lock();
-        // One transaction: the schema takes the append lock first, so the
-        // migrations of one database (which share its logins) set the
-        // logins one at a time; two at once would collide in the catalog.
-        let mut transaction = client.transaction().map_err(|error| backend(&error))?;
-        transaction
-            .batch_execute(SCHEMA)
-            .map_err(|error| backend(&error))?;
+        let mut transaction = client.transaction()?;
+        transaction.batch_execute(SCHEMA)?;
         // No owner password (peer or trust login, PGPASSWORD): a password
         // derived from "" would be a constant anyone can compute, and a
         // password an earlier migration set (or a fixed one from an older
         // install) would outlive the owner's choice to have none. Such a
         // migration turns the logins off (spawn_logins_off warns).
         if self.password.is_empty() {
-            transaction
-                .batch_execute("select spawn_logins_off()")
-                .map_err(|error| backend(&error))?;
+            transaction.batch_execute("select spawn_logins_off()")?;
         } else {
             for base in LOGINS {
-                let (role, salt) = login(&mut transaction, base)?;
+                // The schema above made the login and its salt, in this
+                // transaction: it is there.
+                let Some((role, salt)) = login_row(&mut transaction, base)? else {
+                    continue;
+                };
                 // Hex only, and the role [a-z0-9_]: nothing needs quoting.
                 let password = role_password(&self.password, &salt, &role);
-                transaction
-                    .batch_execute(&format!(
-                        "alter role \"{role}\" with login password '{password}'"
-                    ))
-                    .map_err(|error| backend(&error))?;
+                transaction.batch_execute(&format!(
+                    "alter role \"{role}\" with login password '{password}'"
+                ))?;
             }
         }
-        transaction.commit().map_err(|error| backend(&error))
+        transaction.commit()
     }
 }
 
 /// One restricted login of the database `client` is in: its role name
-/// (`spawn_login_role`) and the salt in its comment. The schema must be on
-/// the connection's search path.
-fn login(
+/// (`spawn_login_role`) and the salt in its comment, or `None` before the
+/// schema made it. The schema must be on the connection's search path.
+fn login_row(
     client: &mut impl postgres::GenericClient,
     base: &str,
-) -> Result<(String, String), StoreError> {
-    let row = client
-        .query_opt(
-            "select r.rolname::text,
-                    substring(shobj_description(r.oid, 'pg_authid')
-                              from '^spawn login salt ([0-9a-f]{64})$')
-               from pg_roles r where r.rolname = spawn_login_role($1)",
-            &[&base],
-        )
-        .map_err(|error| backend(&error))?;
-    match row.map(|row| (row.get::<_, String>(0), row.get::<_, Option<String>>(1))) {
-        Some((role, Some(salt))) => Ok((role, salt)),
-        _ => Err(StoreError::Backend(format!(
-            "{base}: this database has no such login yet; run spawn init-db"
-        ))),
-    }
+) -> Result<Option<(String, String)>, postgres::Error> {
+    let row = client.query_opt(
+        "select r.rolname::text,
+                substring(shobj_description(r.oid, 'pg_authid')
+                          from '^spawn login salt ([0-9a-f]{64})$')
+           from pg_roles r where r.rolname = spawn_login_role($1)",
+        &[&base],
+    )?;
+    Ok(row.and_then(|row| {
+        let salt: Option<String> = row.get(1);
+        salt.map(|salt| (row.get(0), salt))
+    }))
+}
+
+fn no_login(base: &str) -> StoreError {
+    StoreError::Backend(format!(
+        "{base}: this database has no such login yet; run spawn init-db"
+    ))
+}
+
+/// How often a migration that lost a race on the cluster's catalogs is run
+/// again.
+const MIGRATE_ATTEMPTS: u32 = 12;
+
+/// Whether `error` is another session changing the same cluster-wide catalog
+/// row at the same moment: a lost race, not a broken migration.
+fn concurrent_catalog_update(error: &postgres::Error) -> bool {
+    use postgres::error::SqlState;
+    let Some(database) = error.as_db_error() else {
+        return false;
+    };
+    let code = database.code();
+    *code == SqlState::T_R_SERIALIZATION_FAILURE
+        || *code == SqlState::T_R_DEADLOCK_DETECTED
+        || (*code == SqlState::INTERNAL_ERROR
+            && database.message().contains("tuple concurrently"))
+        // Two `create role` / `create type` at once: the loser hits the
+        // catalog's unique index.
+        || (*code == SqlState::UNIQUE_VIOLATION
+            && database.constraint().is_some_and(|name| name.starts_with("pg_")))
+}
+
+/// A pause that grows with the attempt and differs between processes, so
+/// racing migrations fall out of step: 20 ms * attempt, plus up to 50 ms.
+fn retry_pause(attempt: u32) -> std::time::Duration {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos() ^ std::process::id())
+        % 50;
+    std::time::Duration::from_millis(u64::from(20 * attempt + jitter))
 }
 
 /// The password part of a `scheme://user:password@host/...` URL, decoded
@@ -296,7 +345,9 @@ pub fn role_url(owner: &str, role: &str) -> Result<String, String> {
     let mut client = config
         .connect(NoTls)
         .map_err(|error| format!("{role}: {}", backend(&error)))?;
-    let (name, salt) = login(&mut client, role).map_err(|error| error.to_string())?;
+    let (name, salt) = login_row(&mut client, role)
+        .map_err(|error| format!("{role}: {}", backend(&error)))?
+        .ok_or_else(|| no_login(role).to_string())?;
     Ok(login_url(
         scheme,
         rest,
