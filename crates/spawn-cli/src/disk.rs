@@ -202,7 +202,7 @@ pub(crate) fn escalations(records: &[Value], now_ms: i64) -> Vec<Escalation> {
             let line = match record["state"].as_str()? {
                 "low" => format!(
                     "{label} {path} has {free} free, under {} (`SPAWN_DISK_WARN_GB`). Under {} \
-no new executions start; free space (`spawn chunks gc`, old workspaces) or tell the owner.",
+no new executions start; free space (old workspaces, build output) or tell the owner.",
                     gib(record["warn_bytes"].as_u64().unwrap_or_default()),
                     gib(record["floor_bytes"].as_u64().unwrap_or_default()),
                 ),

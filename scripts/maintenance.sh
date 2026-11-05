@@ -3,16 +3,13 @@
 # spawn-maintenance.timer (deploy/systemd). Nothing Spawn did not create is
 # touched:
 #
-#   1. chunks   `spawn chunks gc --grace <SPAWN_MAINTENANCE_CHUNK_GRACE_MIN>`
-#               (default 120 minutes): chunk-store objects no reachable
-#               commit names (docs/storage.md, "Collection").
-#   2. scratch  the gate's scratch directories, `$TMPDIR/spawn-gate.XXXXXX`
+#   1. scratch  the gate's scratch directories, `$TMPDIR/spawn-gate.XXXXXX`
 #               (scripts/disk.sh names them), owned by this user and not
 #               modified for SPAWN_MAINTENANCE_SCRATCH_AGE_MIN (default 1440,
 #               a day). The gate removes its own scratch on exit and the
 #               integrator kills it after 45 minutes, so one that old was
 #               left by a gate killed before its trap ran.
-#   3. dumps    deploy.sh's pre-deploy dumps in SPAWN_BACKUP_DIR (default
+#   2. dumps    deploy.sh's pre-deploy dumps in SPAWN_BACKUP_DIR (default
 #               ~/.local/share/spawn-rsi/backups), named exactly
 #               `spawn-YYYYMMDD-HHMMSS.dump`: the newest
 #               SPAWN_MAINTENANCE_KEEP_DUMPS (default 5) stay. pg-backup.sh's
@@ -21,9 +18,7 @@
 #
 # Every step runs even when an earlier one failed; the exit status is 1
 # when any did. SPAWN_MAINTENANCE_DRY_RUN=1 prints what would go and
-# deletes nothing. The chunk collection needs SPAWN_WORKSPACE_ROOT and
-# SPAWN_GIT_REPO (spawn.env) and the `spawn` of SPAWN_PROGRAM (else `spawn`
-# on PATH); SPAWN_MAINTENANCE_CHUNKS=0 skips it.
+# deletes nothing.
 #
 # usage: scripts/maintenance.sh
 set -u
@@ -54,19 +49,7 @@ whole() { # <name> <value>: the value, when it is a whole number
     esac
 }
 
-# 1. chunks
-if [ "${SPAWN_MAINTENANCE_CHUNKS:-1}" = 0 ]; then
-    say "chunks: skipped (SPAWN_MAINTENANCE_CHUNKS=0)"
-elif [ "$dry" = 1 ]; then
-    say "chunks: dry run, not collected"
-else
-    grace=${SPAWN_MAINTENANCE_CHUNK_GRACE_MIN:-120}
-    if whole SPAWN_MAINTENANCE_CHUNK_GRACE_MIN "$grace"; then
-        "${SPAWN_PROGRAM:-spawn}" chunks gc --grace "$grace" || fail "chunks gc failed; nothing it could not read was deleted"
-    fi
-fi
-
-# 2. the gate's scratch
+# 1. the gate's scratch
 tmp=${TMPDIR:-/tmp}
 age=${SPAWN_MAINTENANCE_SCRATCH_AGE_MIN:-1440}
 if whole SPAWN_MAINTENANCE_SCRATCH_AGE_MIN "$age"; then
@@ -89,7 +72,7 @@ if whole SPAWN_MAINTENANCE_SCRATCH_AGE_MIN "$age"; then
     say "scratch: removed $removed gate scratch director$([ "$removed" = 1 ] && echo y || echo ies) from $tmp$note"
 fi
 
-# 3. deploy.sh's dumps
+# 2. deploy.sh's dumps
 backups=${SPAWN_BACKUP_DIR:-$HOME/.local/share/spawn-rsi/backups}
 keep=${SPAWN_MAINTENANCE_KEEP_DUMPS:-5}
 if whole SPAWN_MAINTENANCE_KEEP_DUMPS "$keep" && [ -d "$backups" ]; then

@@ -668,7 +668,7 @@ fn landing_candidate(
             "--format=%B",
             branch,
         ])?;
-        if spawn_host::chunks::trailer_of(&message).is_none() {
+        if !spawn_host::names_files_outside_git(&message) {
             return Ok(Some(branch.to_string()));
         }
         let tree = git(&[
@@ -959,15 +959,42 @@ mod tests {
             let workspace = store.mount(&branch).expect("mount");
             let directory = std::path::Path::new(workspace.path());
             std::fs::write(directory.join(format!("{agent}.txt")), "work\n").expect("write");
-            if !main_moves {
-                // A large file: the head carries the trailer, so the landing
-                // is a commit of its own.
-                std::fs::write(directory.join("weights.bin"), vec![1_u8; 9 << 20]).expect("large");
-            }
             assert!(matches!(
                 store.commit(&workspace, "work").expect("commit"),
                 Commit::Created(_)
             ));
+            if !main_moves {
+                // A head an earlier version wrote, naming large files kept
+                // outside git: the landing is a commit of its own, without
+                // the trailer.
+                let head = rev(&format!("refs/heads/{agent}"));
+                let message = format!("work\n\nSpawn-Large: {}", "a".repeat(64));
+                let named = git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit-tree",
+                    &format!("{head}^{{tree}}"),
+                    "-p",
+                    &head,
+                    "-m",
+                    &message,
+                ])
+                .expect("a head with the trailer");
+                let reference = format!("refs/heads/{agent}");
+                git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "update-ref",
+                    &reference,
+                    &named,
+                    &head,
+                ])
+                .expect("move the branch");
+            }
             assert_eq!(push_branch(&mirror, &source, agent), Pushed::Done);
             if main_moves {
                 // Main moved since the worker started.

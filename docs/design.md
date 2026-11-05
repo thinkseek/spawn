@@ -101,7 +101,6 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进空闲工作区的分支：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
-| `ChunkStore` | `put`、`get`、`contains` | 按内容寻址的大文件对象存储：对象以其字节的哈希命名，写一次、不改，读时校验；`put` 遇到已有对象先校验，损坏的原子替换（修复，不是修改）（见 [storage.md](./storage.md)） |
 | `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`capture_tail`、`read_from`、`write_new`、`terminate` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 | `TranscriptArchive` | `copies`、`read`、`append(copy, at, bytes)` | 原生会话记录的存档（见 [storage.md](./storage.md#the-transcript-archive)）：每个 agent 的每个原生会话有编号的副本，副本只增长，`at` 不等于副本当前长度的追加被拒，已存的字节从不改写；本地实现在 `<root>/.transcripts` |
 
@@ -280,10 +279,10 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 方法 | 命令 |
 | --- | --- |
 | `ensure_branch` | 无 `refs/heads/main` 时用 `mktree` + `commit-tree` 建根提交；分支已存在返回 `Existing`；否则把 `from`（`refs/heads/<agent>` 或完整 commit id，`rev-parse --verify <x>^{commit}`）或 `main` 解析成 commit，`update-ref refs/heads/<b> <commit> ""`（只建不改） |
-| `mount` | `git archive refs/heads/<b> \| tar -x -C <dir>` |
-| `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A` → `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref` |
+| `mount` | 分支头的提交说明带 `Spawn-Large` trailer（旧版本把大文件放在块存储里，本版本没有块存储）时拒绝（`FilesOutsideGit`）；否则 `git archive refs/heads/<b> \| tar -x -C <dir>`，先解到 `<root>/.mount/` 再改名换上 |
+| `commit` | `GIT_INDEX_FILE=<root>/.index/<b> git add -A`（超过 `SPAWN_MAX_FILE_MB` 的文件排除在外、不哈希，`main` 里已有的 blob 除外）→ `write-tree`；树与父树相同则 `Unchanged`，否则 `commit-tree` + `update-ref`。被排除的文件记在 `<root>/.oversized/<b>`，`take_notices` 每个只交出一次，Bridge 记进日志并放在下一个 prompt 前 |
 | `unmount` | 删工作树目录 |
-| `merge_base` | `main` 是分支头的祖先则 `Current`；否则 `git --attr-source=<main> merge-tree --write-tree --name-only -z <main> <head>`（合并规则取自 `main` 的 `.gitattributes`，只有 gate 能动它；裸仓库不加 `--attr-source` 不读树内属性）。退出码 1 为 `Conflicted`：消息种类（`-z` 输出里的稳定字符串）只有 `CONFLICT (contents)` 时，按下述同一安全流程把带冲突标记的合并树写进目录，分支不动，`main` 作为待定的第二父提交原子地写进 `<root>/.merge/<b>`（`main` 与冲突路径，NUL 分隔）；有别的冲突种类（modify/delete、改名、二进制）时什么都不改。待定合并存在时不合并更晚的 `main`：标记未解决返回 `Conflicted{marked: true}`，已解决返回 `Current`。`merge_base` 全程持有与 `commit` 相同的 `<index>.spawn-lock`；`mount`、`unmount` 都删掉待定文件（待定合并只属于写入它的那个目录）。`commit` 在待定合并列出的冲突文件里都没有完整的标记块（行首 `<<<<<<< `，其后一行恰为 `=======`，再其后行首 `>>>>>>> `；单独的 `=======` 不算）时以 `-p <head> -p <待定 main>` 提交（树未变也提交）并删掉待定文件，否则照常单父提交；干净时先动目录：临时索引 `read-tree <head 树>`、`update-index -q --refresh`、`read-tree -m -u <head 树> <合并树>`（目录里要改的文件与分支不符、或未跟踪文件挡路时拒绝，返回错误、什么都不改），再 `commit-tree -p <head> -p <main>`（保留 head 的 `Spawn-Large` trailer）和带旧值的 `update-ref`。顺序不能反：先动 ref 会让下一次 checkpoint 把旧文件提交回去，抹掉 `main` 的改动 |
+| `merge_base` | `main` 是分支头的祖先则 `Current`；否则 `git --attr-source=<main> merge-tree --write-tree --name-only -z <main> <head>`（合并规则取自 `main` 的 `.gitattributes`，只有 gate 能动它；裸仓库不加 `--attr-source` 不读树内属性）。退出码 1 为 `Conflicted`：消息种类（`-z` 输出里的稳定字符串）只有 `CONFLICT (contents)` 时，按下述同一安全流程把带冲突标记的合并树写进目录，分支不动，`main` 作为待定的第二父提交原子地写进 `<root>/.merge/<b>`（`main` 与冲突路径，NUL 分隔）；有别的冲突种类（modify/delete、改名、二进制）时什么都不改。待定合并存在时不合并更晚的 `main`：标记未解决返回 `Conflicted{marked: true}`，已解决返回 `Current`。`merge_base` 全程持有与 `commit` 相同的 `<index>.spawn-lock`；`mount`、`unmount` 都删掉待定文件（待定合并只属于写入它的那个目录）。`commit` 在待定合并列出的冲突文件里都没有完整的标记块（行首 `<<<<<<< `，其后一行恰为 `=======`，再其后行首 `>>>>>>> `；单独的 `=======` 不算）时以 `-p <head> -p <待定 main>` 提交（树未变也提交）并删掉待定文件，否则照常单父提交；干净时先动目录：临时索引 `read-tree <head 树>`、`update-index -q --refresh`、`read-tree -m -u <head 树> <合并树>`（目录里要改的文件与分支不符、或未跟踪文件挡路时拒绝，返回错误、什么都不改），再 `commit-tree -p <head> -p <main>` 和带旧值的 `update-ref`。顺序不能反：先动 ref 会让下一次 checkpoint 把旧文件提交回去，抹掉 `main` 的改动 |
 
 积分器（integrator）在评判前拒绝带待定合并（`<root>/.merge/<agent>`）或改动文件里有完整标记块（`GitWorkspace::conflict_markers`）的分支：记 `conflict`，附「先解决冲突标记」的说明。
 
@@ -340,6 +339,6 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 | 订阅 | 读取 `spawn_events` 增量；`LISTEN/NOTIFY` 未接入 | 接入 `LISTEN/NOTIFY` |
 | 写入串行 | `spawn_append` 用一把全局 advisory lock | 按会话分锁 |
 | 判定入参 | `JudgeInput` 的 serde 输出与真实服务入参是否语义等价未验证 | 用真实服务做契约测试 |
-| 大文件 | 超过 8 MiB 的文件存在主机本地的块存储里，换一台主机就挂载失败 | 块存储放到 R2（见 [storage.md](./storage.md)） |
+| 大文件 | 超过 `SPAWN_MAX_FILE_MB`（默认 100）的文件不进 checkpoint，卸载即丢 | 需要时再加外部存储（见 [storage.md](./storage.md)） |
 | tmux 输入 | `submit_text` 逐行发送，空串不发送任何内容 | `paste-buffer` |
 | mount 泄漏 | mount 与 `execution.started` 之间崩溃会遗留一个 mount | 启动时清扫未记录的 mount |

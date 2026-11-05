@@ -56,7 +56,7 @@ No layer calls another layer's process directly; they meet in the log.
 
 | Layer | Parts |
 | --- | --- |
-| 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, the chunk store, transcripts and exit files |
+| 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, transcripts and exit files |
 | 2 Event log | `spawn_events` (with the control stream), `spawn_commands`, grants, projections, views |
 | 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |

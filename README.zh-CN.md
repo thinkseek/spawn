@@ -97,6 +97,7 @@ spawn tail --session session_demo
 | `SPAWN_TMUX_SOCKET` | 默认 socket | tmux `-L` socket 名 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude Code 路径 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude Code 写 transcript 的目录 |
+| `SPAWN_MAX_FILE_MB` | `100` | checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次 |
 | `SPAWN_PROGRAM` | 当前二进制 | 终端内使用的 `spawn` 路径 |
 | `SPAWN_JUDGE_URL` | 未设置 | Jev 判定服务；未设置时只用规则判定，规则定不了的情形要求关注 |
 

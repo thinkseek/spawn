@@ -144,6 +144,7 @@ spawn fleet
 | `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录 |
+| `SPAWN_MAX_FILE_MB` | `100` | checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次 |
 | `SPAWN_TMUX_PROGRAM` | `tmux` | tmux 可执行文件 |
 | `SPAWN_TMUX_SOCKET` | 无 | 私有 tmux socket |
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
