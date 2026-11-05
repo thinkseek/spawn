@@ -6,8 +6,10 @@
 //!    the facts still allow, so a model cannot contradict a fact.
 //!
 //! The Observer never acts. It appends an `observation.recorded` event when
-//! the judgement changes, with who decided, why the rules could not, and the
-//! evidence the model saw. A judge failure keeps the rules' guess, marks it
+//! the judgement changes, and once a session's facts settle ([`SETTLE`]) when
+//! its latest observation is older than its latest fact, so the latest
+//! judgement covers the latest fact. Each says who decided, why the rules
+//! could not, and the evidence the model saw. A judge failure keeps the rules' guess, marks it
 //! `JudgeUnavailable` and asks for attention; it never reports "dead". With
 //! no judge configured an ambiguous case goes the same way, its judge named
 //! [`NO_JUDGE`].
@@ -37,6 +39,12 @@ pub const QUIET_AFTER: Duration = Duration::from_mins(2);
 /// A live session is classified again this often when no fact arrives, so a
 /// silent hang is noticed.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// A session with no new fact for this long has settled: if its latest
+/// observation is older than its latest fact, the verdict on its facts is
+/// written again, changed or not, so the latest judgement covers them. A
+/// burst of facts thus gets one such observation, not one per fact.
+pub const SETTLE: Duration = Duration::from_secs(2);
 
 /// A tool open this long with no progress of the engine (no transcript
 /// fact; a busy screen read again is none) is ambiguous: it may hang.
