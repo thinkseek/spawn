@@ -41,8 +41,25 @@ for name in spawn-auto-20261101-000000.dump spawn-auto-20261102-000000.dump \
 done
 mkdir "$backups/spawn-20261101-000000.dump"          # a directory, not a dump
 
+# The gate's base cache: entries used lately stay, one untouched for 20
+# days goes, and so does an unfinished write that old; a file not named
+# like an entry, and a directory named like one, stay.
+cache=$work/cache/spawn/gate-base
+mkdir -p "$cache"
+hex=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+stale() { touch -h -d '20 days ago' "$@"; }
+echo solved >"$cache/a$(printf '%s' "$hex" | cut -c2-)"   # used lately
+echo unsolved >"$cache/b$(printf '%s' "$hex" | cut -c2-)" # untouched for 20 days
+stale "$cache/b$(printf '%s' "$hex" | cut -c2-)"
+echo solved >"$cache/c$(printf '%s' "$hex" | cut -c2-).4242"
+stale "$cache/c$(printf '%s' "$hex" | cut -c2-).4242"
+echo owner >"$cache/notes"
+stale "$cache/notes"
+mkdir "$cache/d$(printf '%s' "$hex" | cut -c2-)"
+stale "$cache/d$(printf '%s' "$hex" | cut -c2-)"
+
 run() {
-    env TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" "$@" \
+    env TMPDIR="$tmp" SPAWN_BACKUP_DIR="$backups" XDG_CACHE_HOME="$work/cache" "$@" \
         sh "$maintenance" >"$work/out" 2>&1
 }
 listing() { (cd "$1" && ls -A | LC_ALL=C sort | tr '\n' ' '); }
@@ -60,10 +77,12 @@ expect() {
 
 before_tmp=$(listing "$tmp")
 before_backups=$(listing "$backups")
+before_cache=$(listing "$cache")
 run SPAWN_MAINTENANCE_DRY_RUN=1
 expect "a dry run deletes nothing in TMPDIR" "$(listing "$tmp")" "$before_tmp"
 expect "nor in the backups" "$(listing "$backups")" "$before_backups"
-expect "it says what would go" "$(grep -c 'would remove' "$work/out")" "3"
+expect "nor in the base cache" "$(listing "$cache")" "$before_cache"
+expect "it says what would go" "$(grep -c 'would remove' "$work/out")" "5"
 
 status=0
 run || status=$?
@@ -73,6 +92,10 @@ expect "only the old gate scratch directory goes" "$(listing "$tmp")" \
 expect "a symlink's target is untouched" "$(listing "$elsewhere")" "keep "
 expect "the newest five deploy dumps stay, and every other file" "$(listing "$backups")" \
     "missions-20261104T1126.sql pg-backup.state spawn-20261101-000000.dump spawn-20261101-010101.dump.gpg spawn-20261103-010101.dump spawn-20261104-010101.dump spawn-20261104T1401 spawn-20261105-010101.dump spawn-20261106-010101.dump spawn-20261107-010101.dump spawn-auto-20261101-000000.dump spawn-auto-20261102-000000.dump spawn-full-20261104T1216.dump "
+
+expect "base cache entries no gate used for 14 days go, and nothing else" "$(listing "$cache")" \
+    "a$(printf '%s' "$hex" | cut -c2-) d$(printf '%s' "$hex" | cut -c2-) notes "
+expect "a recently used entry is intact" "$(cat "$cache/a$(printf '%s' "$hex" | cut -c2-)")" "solved"
 
 after_backups=$(listing "$backups")
 run || status=$?
