@@ -717,6 +717,92 @@ fn a_dropped_mission_lands_nothing_even_with_a_push_in_flight() {
 }
 
 #[test]
+fn a_done_missions_landing_that_stays_stale_is_aborted_after_three_tries() {
+    let (store, schema) = store("control_done_stale");
+    let landing_task = |text: &str| {
+        let mission = store
+            .mission_add(text, &json!(["/tmp/source.git"]), "human")
+            .expect("add");
+        store
+            .mission_configure(mission, Some("/scenarios"), "review", None, None)
+            .expect("configure");
+        let task = store
+            .task_assign(mission, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "").expect("accept");
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "verdict": "accepted",
+                                       "base": "b1", "candidate": "c1", "scenarios": 1}),
+            )
+            .expect("gate");
+        (mission, task)
+    };
+    let mut client = admin(&schema);
+    let state = |client: &mut Client, task: i64| -> String {
+        client
+            .query_one("select state from mission_tasks where id = $1", &[&task])
+            .expect("task")
+            .get(0)
+    };
+    let stale = |task: i64| {
+        store
+            .integrator_record(&json!({"type": "task.gated", "id": task, "verdict": "stale"}))
+            .expect("stale")
+    };
+
+    // An open mission's stale landings go back to be judged, every time:
+    // its worker may still push.
+    let (_open, open_task) = landing_task("Open");
+    for _ in 0..4 {
+        stale(open_task);
+        assert_eq!(state(&mut client, open_task), "accepted");
+    }
+
+    // A done mission's: twice, then the third aborts it, and the integrator
+    // has nothing left to judge.
+    let (done, done_task) = landing_task("Done");
+    stale(done_task);
+    store.mission_close(done, "done", "shipped").expect("close");
+    for _ in 0..2 {
+        stale(done_task);
+        assert_eq!(
+            state(&mut client, done_task),
+            "accepted",
+            "stale before the bound"
+        );
+    }
+    stale(done_task);
+    assert_eq!(state(&mut client, done_task), "cancelled");
+    assert_eq!(
+        control_types(&mut client).last().map(String::as_str),
+        Some("task.aborted")
+    );
+    let note: String = client
+        .query_one(
+            "select review_note from mission_tasks where id = $1",
+            &[&done_task],
+        )
+        .expect("task")
+        .get(0);
+    assert_eq!(
+        note,
+        format!("the landing went stale 3 times after mission {done} was done")
+    );
+    let gated: Vec<i64> = store
+        .gated_missions()
+        .expect("gated")
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|row| row["id"].as_i64())
+        .collect();
+    assert!(!gated.contains(&done), "{gated:?}");
+}
+
+#[test]
 fn one_integrator_holds_the_lock() {
     let (first, schema) = store("control_integrator_lock");
     let second = PostgresStore::connect_in_schema(&url(), &schema).expect("second connection");
