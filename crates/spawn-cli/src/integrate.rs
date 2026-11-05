@@ -4043,8 +4043,12 @@ mod database_tests {
         ])
         .expect("push the agent's branch");
 
+        // Judgings run on threads: settle each pass's before the next, as
+        // `--once` does.
         integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
         integrator.pass_on(&db.store).expect("a second pass");
+        integrator.settle();
         let runs = std::fs::read_to_string(base.join("runs")).expect("the gate ran");
         assert_eq!(
             runs.lines().count(),
