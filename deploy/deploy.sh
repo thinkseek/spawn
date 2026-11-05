@@ -125,12 +125,13 @@ complete_pending() {
 # a pending deploy is completed and the services restart.
 export_dir=${TMPDIR:-/tmp}/spawn-deploy-export-$(id -u)
 stopped=0
+completing_at_start=0
 on_exit() {
   local status=$?
   rm -rf "$export_dir"
   if [ "$status" -ne 0 ] && [ "$stopped" = 1 ]; then
     printf "deploy: failed (exit %s); restarting the services\n" "$status" >&2
-    (complete_pending) || printf "deploy: the pending deploy is not complete: %s\n" "$pending" >&2
+    [ "$completing_at_start" = 1 ] || (complete_pending) || printf "deploy: the pending deploy is not complete: %s\n" "$pending" >&2
     restart || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
   fi
 }
@@ -138,11 +139,11 @@ trap on_exit EXIT
 
 if [ -f "$pending" ]; then
   say "a deploy is pending ($(cat "$pending")); completing it"
-  stopped=1
+  stopped=1 completing_at_start=1
   systemctl --user stop spawn-integrate
   complete_pending
   systemctl --user start spawn-integrate
-  stopped=0
+  stopped=0 completing_at_start=0
 fi
 
 [ -z "$(git status --porcelain --untracked-files=no)" ] || die "the tree has uncommitted changes"

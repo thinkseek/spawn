@@ -99,7 +99,11 @@ echo stray >"$checkout/web/public/stray.txt"
 git init -q --bare "$missions"
 git -C "$checkout" push -q "$missions" "$base:refs/heads/main"
 verdict=$scratch/verdict.json
-jq -n --arg c "$head" --arg b "$base" '{verdict: "accepted", candidate: $c, base: $b}' >"$verdict"
+# verdict_over <main>: the gate's verdict for HEAD over that main.
+verdict_over() {
+  jq -n --arg c "$head" --arg b "$1" '{verdict: "accepted", candidate: $c, base: $b}' >"$verdict"
+}
+verdict_over "$base"
 
 main() { git --git-dir="$missions" rev-parse main; }
 # deploy [ENV=VALUE...]: run deploy.sh in the checkout; output in $out, status in $status.
@@ -139,8 +143,8 @@ deploy DEPLOY_TEST_AFTER_PUSH=kill
 check "it died (status $status)" [ "$status" -eq 137 ]
 check "main moved to HEAD" [ "$(main)" = "$head" ]
 check "deploy.pending holds the move" [ "$(cat "$live/deploy.pending" 2>/dev/null)" = "$base $head" ]
-check "the integrator was stopped and nothing restarted" \
-  bash -c 'grep -qx -- "--user stop spawn-integrate" "$1" && ! grep -q restart "$1"' _ "$SYSTEMCTL_LOG"
+check "the integrator was stopped and the services not restarted" \
+  bash -c 'grep -qx -- "--user stop spawn-integrate" "$1" && ! grep -q "restart spawn-loop" "$1"' _ "$SYSTEMCTL_LOG"
 check "the real binary is installed" "$live/bin/spawn" version
 check "the untracked .cargo/config.toml did not reach the binary" \
   bash -c '! readelf -n "$1" | grep -qi "$2"' _ "$live/bin/spawn" "$build_id"
@@ -148,6 +152,8 @@ check "the untracked web/public/stray.txt did not reach the UI" [ ! -e "$live/we
 check "the UI is installed" [ -f "$live/web/index.html" ]
 
 echo "== the next deploy completes it"
+# Main is HEAD now: the operator runs the gate again, over it.
+verdict_over "$head"
 : >"$SYSTEMCTL_LOG"
 deploy
 check "succeeded (status $status)" [ "$status" -eq 0 ]
@@ -160,6 +166,7 @@ check "the export is removed" bash -c '! compgen -G "$1/spawn-deploy-export-*" >
 
 echo "== a deploy failing after its push completes it on exit"
 git --git-dir="$missions" update-ref refs/heads/main "$base"
+verdict_over "$base"
 : >"$SYSTEMCTL_LOG"
 deploy DEPLOY_TEST_AFTER_PUSH=fail
 check "failed (status $status)" [ "$status" -ne 0 ]
@@ -175,7 +182,7 @@ printf '%s %s\n' "$base" "$other" >"$live/deploy.pending"
 : >"$SYSTEMCTL_LOG"
 deploy
 check "refused (status $status)" [ "$status" -ne 0 ]
-check "says main is elsewhere" grep -q "is pending, but the missions main is $head" "$out"
+check "says main is elsewhere, once" [ "$(grep -c "is pending, but the missions main is $head" "$out")" -eq 1 ]
 check "deploy.pending stays" [ "$(cat "$live/deploy.pending")" = "$base $other" ]
 check "the integrator is not left stopped" grep -qx -- "--user restart spawn-loop spawn-integrate spawn-serve" "$SYSTEMCTL_LOG"
 
