@@ -1293,14 +1293,19 @@ impl GitWorkspace {
         if head_tree == start_tree {
             return Ok(SetAside::Unchanged);
         }
-        let changed =
-            self.git_listing(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &start_tree])?;
+        let changed = self.git_listing(&[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            &head_tree,
+            &start_tree,
+        ])?;
         let files = shown_paths(&listed_paths(&changed));
         if mounted {
             self.update_directory(branch, &directory, &head_tree, &start_tree)?;
         }
-        let commit =
-            self.git_output(&["commit-tree", &start_tree, "-p", &head, "-m", message])?;
+        let commit = self.git_output(&["commit-tree", &start_tree, "-p", &head, "-m", message])?;
         if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
             if mounted {
                 return Err(self.follow_moved_branch(branch, &directory, &start_tree, &error));
@@ -2554,7 +2559,10 @@ mod tests {
         let directory = PathBuf::from(workspace.path());
         std::fs::write(directory.join("late.txt"), "late\n").expect("write");
         let repo = base.join("repo");
-        let foreign = git(&repo, &["commit-tree", "-m", "foreign", &format!("{start}^{{tree}}")]);
+        let foreign = git(
+            &repo,
+            &["commit-tree", "-m", "foreign", &format!("{start}^{{tree}}")],
+        );
         assert!(matches!(
             store.set_aside(&branch, Some(&foreign), "no"),
             Err(WorkspaceError::Refused { .. })
@@ -2565,9 +2573,19 @@ mod tests {
         else {
             panic!("the work differs from the start");
         };
-        assert_ne!(kept.as_str(), work, "the unsaved state got a commit of its own");
-        assert_eq!(git(&repo, &["rev-parse", &format!("{}^", kept.as_str())]), work);
-        assert_eq!(git(&repo, &["show", &format!("{}:late.txt", kept.as_str())]), "late");
+        assert_ne!(
+            kept.as_str(),
+            work,
+            "the unsaved state got a commit of its own"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("{}^", kept.as_str())]),
+            work
+        );
+        assert_eq!(
+            git(&repo, &["show", &format!("{}:late.txt", kept.as_str())]),
+            "late"
+        );
         assert!(!directory.join("late.txt").exists());
 
         // Not mounted: the branch moves, no directory is made.

@@ -51,9 +51,9 @@ pub(crate) fn note(task: i64, done: &Done) -> String {
              commit {commit} on top of it returned your workspace to the checkpoint task #{task} \
              started from. None of it is in your workspace now; do not redo it."
         ),
-        Done::Nothing => format!(
-            "Task #{task} changed nothing in your workspace, so nothing was set aside."
-        ),
+        Done::Nothing => {
+            format!("Task #{task} changed nothing in your workspace, so nothing was set aside.")
+        }
         Done::NoBranch => String::new(),
     }
 }
@@ -110,7 +110,14 @@ pub(crate) fn set_aside(
             files,
         } => {
             // Recorded before the push: the published head has its record.
-            record(store, workspaces.project(), cancelled, &branch, &commit, files)?;
+            record(
+                store,
+                workspaces.project(),
+                cancelled,
+                &branch,
+                &commit,
+                files,
+            )?;
             Done::SetAside {
                 commit: commit.as_str().to_string(),
                 kept: kept.as_str().to_string(),
@@ -134,8 +141,7 @@ fn record(
     store
         .append(NewEvent {
             agent_id: AgentId::new(cancelled.agent_id.as_str()).map_err(|e| e.to_string())?,
-            session_id: SessionId::new(cancelled.session_id.as_str())
-                .map_err(|e| e.to_string())?,
+            session_id: SessionId::new(cancelled.session_id.as_str()).map_err(|e| e.to_string())?,
             execution_id: None,
             source: Source::Bridge,
             source_event_id: Some(format!("set-aside:{}", cancelled.id)),
