@@ -462,7 +462,9 @@ fn set_aside_before(
     order: &mut Order,
 ) -> Result<Option<String>, String> {
     let Some(cancelled) = work.cancelled.iter().find(|cancelled| cancelled.id == task) else {
-        return Err(format!("task #{task}'s cancel notice: the task is not a cancelled delivery"));
+        return Err(format!(
+            "task #{task}'s cancel notice: the task is not a cancelled delivery"
+        ));
     };
     let Some(root) = root else {
         return Ok(None);
@@ -478,9 +480,7 @@ fn set_aside_before(
         text.push_str(&note);
     }
     Ok(match done {
-        crate::set_aside::Done::SetAside { commit, kept }
-            if cancelled.set_aside.is_none() =>
-        {
+        crate::set_aside::Done::SetAside { commit, kept } if cancelled.set_aside.is_none() => {
             Some(format!(
                 "deliver: task #{task} cancelled: its work set aside in {kept}, the branch at {commit}"
             ))

@@ -188,5 +188,8 @@ fn only_the_latest_delivery_of_a_resident_still_serving_is_found() {
     assert_eq!(found[0]["id"], second);
 
     store.resident_retire("core").expect("retire");
-    assert!(rows(&store).is_empty(), "a retired resident is only stopped");
+    assert!(
+        rows(&store).is_empty(),
+        "a retired resident is only stopped"
+    );
 }

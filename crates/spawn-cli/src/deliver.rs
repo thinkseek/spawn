@@ -2045,9 +2045,15 @@ mod tests {
         else {
             panic!("a resume that carries the notice: {:?}", plan[0].action);
         };
-        assert!(text.contains("Task #7 of mission #1 was cancelled"), "{text}");
+        assert!(
+            text.contains("Task #7 of mission #1 was cancelled"),
+            "{text}"
+        );
         assert!(text.contains("do not write a report"), "{text}");
-        assert!(!text.contains("brief 7"), "the notice does not repeat the brief");
+        assert!(
+            !text.contains("brief 7"),
+            "the notice does not repeat the brief"
+        );
 
         // The notice is under way, then failed: the waiting task still waits.
         let mut sending = stopped();
@@ -2070,7 +2076,10 @@ mod tests {
         assert!(super::orders(&after_cancel(false), &[failed.clone()], 1_001).is_empty());
         let retry = super::orders(&after_cancel(false), &[failed], 1_000 + 60_000);
         assert_eq!(retry.len(), 1);
-        assert_eq!(retry[0].key, "cancel-notice-7-1", "a retry under a key of its own");
+        assert_eq!(
+            retry[0].key, "cancel-notice-7-1",
+            "a retry under a key of its own"
+        );
 
         // Told: the waiting task goes to the idle worker.
         let plan = orders(&after_cancel(true), &[worker(true, true)]);
@@ -2087,7 +2096,9 @@ mod tests {
         stopping.open_command = true;
         assert!(orders(&after_cancel(false), &[stopping]).is_empty());
         let mut pursued = working();
-        pursued.stops.push(failed_switch("cancel-stop-7-exec_3", 1_000));
+        pursued
+            .stops
+            .push(failed_switch("cancel-stop-7-exec_3", 1_000));
         assert!(orders(&after_cancel(false), &[pursued]).is_empty());
         let told = Work {
             cancelled: vec![cancelled(true)],
@@ -2132,7 +2143,10 @@ mod tests {
         let plan = orders(&retired, &[working()]);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].action, CommandAction::Stop);
-        assert!(orders(&retired, &[stopped()]).is_empty(), "not resumed to be told");
+        assert!(
+            orders(&retired, &[stopped()]).is_empty(),
+            "not resumed to be told"
+        );
     }
 
     /// An abort over budget says so in the notice.
@@ -2142,6 +2156,9 @@ mod tests {
         aborted.closed_by = Some("task.aborted".to_string());
         aborted.reason = Some("over budget: 5 hours".to_string());
         let text = super::cancel_notice(&aborted);
-        assert!(text.contains("cancelled by the integrator (over budget: 5 hours)"), "{text}");
+        assert!(
+            text.contains("cancelled by the integrator (over budget: 5 hours)"),
+            "{text}"
+        );
     }
 }
