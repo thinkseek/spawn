@@ -53,8 +53,16 @@ esac
 # Reads go through the supervisor's login: the fleet readers are filtered by
 # grants, and the owner holds none. Its password is derived from the owner's
 # as spawn-postgres does it (role_password): SHA-256 of
-# "spawn-login-v1\0<owner password>\0<role>", in hex.
-owner_password=$(printf '%s' "$url" | sed -E 's#^[a-z]+://[^:@]*:([^@]*)@.*#\1#')
+# "spawn-login-v1\0<owner password>\0<role>", in hex. The owner password is
+# the URL's percent-decoded (`p%40ss` is `p@ss`), as spawn-postgres reads it
+# (scripts/pg-url.sh).
+# shellcheck source=scripts/pg-url.sh
+. "$root/scripts/pg-url.sh"
+if ! pg_url_parse "$base_url"; then
+  echo "e2e: SPAWN_DATABASE_URL is not a single-host postgres:// URL" >&2
+  exit 1
+fi
+owner_password=$pg_url_password
 sup_password=$(printf 'spawn-login-v1\0%s\0spawn_supervisor' "$owner_password" | sha256sum | cut -d' ' -f1)
 sup_url=$(printf '%s' "$url" | sed -E "s#://[^@]*@#://spawn_supervisor:$sup_password@#")
 

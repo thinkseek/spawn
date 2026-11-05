@@ -1,7 +1,8 @@
 # Paths a candidate may not change (scripts/rsi/gate.sh). They judge it:
-# the backlog and scenarios, the gate, and the black-box tests the checks
-# run from the controller's checkout.
+# the backlog and scenarios, the gate, the black-box tests the checks run
+# from the controller's checkout, and the URL parser they share.
 rsi/
 scripts/rsi/
 scripts/blackbox/
 scripts/e2e.sh
+scripts/pg-url.sh

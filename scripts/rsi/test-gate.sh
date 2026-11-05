@@ -612,6 +612,44 @@ expect "an unsolved result needs two runs that agree" \
 expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
 unset SPAWN_TEST_DATABASE_URL
 
+# 10. The URL parser the gate and the checks share (scripts/pg-url.sh):
+# `parsed <url>` prints what psql gets, `user|password|host|port|db|options`.
+# shellcheck source=scripts/pg-url.sh
+. "$(dirname "$gate")/../pg-url.sh"
+parsed() {
+    if pg_url_parse "$1"; then
+        printf '%s|%s|%s|%s|%s|%s' "$pg_url_user" "$pg_url_password" "$pg_url_host" "$pg_url_port" \
+            "$pg_url_database" "$pg_url_options"
+    else
+        printf 'not a URL'
+    fi
+}
+expect "a socket URL, the password percent-decoded" "$(parsed 'postgres://u:p%40ss@%2Ftmp%2Fs/db')" \
+    'u|p@ss|/tmp/s|5432|db|'
+expect "a socket URL with a port" "$(parsed 'postgres://u:p%40ss@%2Ftmp%2Fs:5433/db')" 'u|p@ss|/tmp/s|5433|db|'
+expect "localhost, the other parameters kept" \
+    "$(parsed 'postgresql://u:pw@localhost:5434/spawn_test?sslmode=disable&application_name=t')" \
+    'u|pw|localhost|5434|spawn_test|sslmode=disable&application_name=t'
+expect "an IPv6 literal with a port" "$(parsed 'postgres://u:pw@[::1]:5435/x')" 'u|pw|::1|5435|x|'
+expect "an IPv6 literal without one" "$(parsed 'postgres://u:pw@[::1]/x')" 'u|pw|::1|5432|x|'
+expect "host and port as parameters" "$(parsed 'postgres://u:pw@/x?host=%2Frun%2Fpg&port=5436')" \
+    'u|pw|/run/pg|5436|x|'
+expect "a host parameter not encoded" "$(parsed 'postgres://u:pw@/x?host=/run/pg')" 'u|pw|/run/pg|5432|x|'
+expect "no password" "$(parsed 'postgres://u@db.example:6543/x')" 'u||db.example|6543|x|'
+expect "an encoded colon and percent" "$(parsed 'postgres://u:a%3Ab%25c@h/x')" 'u|a:b%c|h|5432|x|'
+expect "a raw @ in the password: the host is after the last" "$(parsed 'postgres://u:p@ss@h/x')" 'u|p@ss|h|5432|x|'
+expect "a list of hosts is refused" "$(parsed 'postgres://u@a,b/x')" 'not a URL'
+expect "another scheme is refused" "$(parsed 'mysql://u@h/x')" 'not a URL'
+expect "the server URL puts host and port in the authority" \
+    "$(pg_url_server 'postgres://u:p%40ss@/x?host=/run/pg&port=5436')" 'postgres://u:p%40ss@%2Frun%2Fpg:5436'
+expect "the server URL of an IPv6 host keeps the brackets" \
+    "$(pg_url_server 'postgres://u:pw@[::1]:5435/x')" 'postgres://u:pw@[::1]:5435'
+expect "psql gets the decoded password" \
+    "$(pg_url_export 'postgres://u:p%40ss@%2Ftmp%2Fs/db' && printf '%s %s %s %s' "$PGUSER" "$PGPASSWORD" "$PGHOST" "$PGPORT")" \
+    'u p@ss /tmp/s 5432'
+refuse "no password, no PGPASSWORD" \
+    "$(PGPASSWORD=stale; export PGPASSWORD; pg_url_export 'postgres://u@h/x'; printf '%s' "${PGPASSWORD-unset}")" 'stale'
+
 # 6. A reason with a quote stays valid JSON.
 quoted_scenarios=$work/quoted
 cp -r "$scenarios" "$quoted_scenarios"
