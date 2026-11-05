@@ -257,7 +257,27 @@ pub struct StoredObject {
 /// Objects are collected (`spawn chunks gc`) when no reachable commit names
 /// them and they are older than a grace period, so every use restarts an
 /// object's age: chunks are written before the commit that names them.
+///
+/// A commit that writes objects holds [`ChunkStore::writing`] from its first
+/// object until its ref names them, and a collection holds
+/// [`ChunkStore::collecting`] from before it reads the refs until its last
+/// removal: a collection never sees the objects of a commit in flight
+/// without its ref, however long the commit takes.
 pub trait ChunkStore: Send + Sync + std::fmt::Debug {
+    /// Hold off collections until the guard is dropped: taken by a writer
+    /// before its first object and kept until a ref names them. Writers
+    /// share it. A store no collection runs against holds nothing.
+    fn writing(&self) -> Result<ChunkGuard, ChunkError> {
+        Ok(Box::new(()))
+    }
+
+    /// Wait for every writer holding [`ChunkStore::writing`], then hold off
+    /// new ones until the guard is dropped; [`ChunkStore::remove_if_older`]
+    /// runs meanwhile.
+    fn collecting(&self) -> Result<ChunkGuard, ChunkError> {
+        Ok(Box::new(()))
+    }
+
     /// Store `bytes` unless a sound object of the same content exists; its
     /// name. A corrupt object of that content is replaced; a sound one is
     /// made young again.
@@ -281,6 +301,10 @@ pub trait ChunkStore: Send + Sync + std::fmt::Debug {
     /// it was kept (made young meanwhile, or already gone).
     fn remove_if_older(&self, name: &str, older_than: Duration) -> Result<Option<u64>, ChunkError>;
 }
+
+/// Held by [`ChunkStore::writing`] or [`ChunkStore::collecting`] until it is
+/// dropped.
+pub type ChunkGuard = Box<dyn std::any::Any + Send>;
 
 /// Terminal failure.
 #[derive(Debug, Error)]
