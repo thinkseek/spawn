@@ -10,7 +10,7 @@ The units this host runs, with `%h` for the home directory.
 | `spawn-jev-relay` | `scripts/jev-relay.py` on 127.0.0.1:8790, holding the API key | never |
 | `spawn-model-relay` | `scripts/model-relay.py` on 127.0.0.1:8791: the engines' model calls, `deepseek-*` to DeepSeek with `DEEPSEEK_API_KEY` (from `~/.hermes/.env`, held only here), everything else to the gateway of `~/.claude/settings.json` with the engine's own auth ([fleet-architecture.md §3.3](../../docs/fleet-architecture.md#33-engine-models)) | never |
 | `spawn-backup` (`.timer`) | `pg-backup.sh`: daily encrypted `pg_dump` to R2 (bucket-locked, R2 expires it); install and keys in [deploy/backup](../backup/README.md) | oneshot, daily at 03:30 + random delay |
-| `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the checkout: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` older than a day), deploy.sh's dumps in the backups directory beyond the newest 5; nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, daily at 05:15 + random delay |
+| `spawn-maintenance` (`.timer`) | `scripts/maintenance.sh` from the checkout: the gate's leftover scratch (`$TMPDIR/spawn-gate.XXXXXX` older than 3 h), deploy.sh's dumps in the backups directory beyond the newest 5; nothing Spawn did not create ([docs/storage.md](../../docs/storage.md#disk-room)) | oneshot, hourly (scratch older than 3 h) |
 
 `spawn-loop` uses `KillMode=process` so a restart keeps the agents' tmux
 server alive. That only works because `ExecStart` is `spawn loop` itself: with

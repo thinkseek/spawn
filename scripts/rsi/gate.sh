@@ -160,6 +160,12 @@ section() {
     echo "| == $1"
 }
 trap 'stage_close aborted; rm -rf "$work"' EXIT
+# A signal ends the gate through its EXIT trap, so the work directory goes
+# too, whatever the shell (bash runs EXIT on a fatal signal, dash does not).
+# SIGKILL leaves the directory: spawn-maintenance.timer removes it.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # Sandboxed git reads this, never the owner's ~/.gitconfig.
 cat >"$work/gitconfig" <<'EOF'
 [user]
@@ -386,6 +392,11 @@ if [ -n "${SPAWN_TEST_DATABASE_URL-}" ]; then
     sandbox_db_url="$pg_url_scheme://${pg_url_userinfo:+$pg_url_userinfo@}$(pg_url_encode_host \
         "$(dirname "$db_socket")"):$pg_url_port/$(pg_url_encode_component "$pg_url_database")"
     [ -z "$pg_url_options" ] || sandbox_db_url="$sandbox_db_url?$pg_url_options"
+    # The URL holds the test database's password: bwrap reads it from a file
+    # only this uid can read (--args), never from its command line, which
+    # every local user sees in ps.
+    (umask 077 && printf '%s\0' --setenv SPAWN_TEST_DATABASE_URL "$sandbox_db_url" \
+        >"$work/sandbox-db-args")
 fi
 
 # The forwarder of a TCP test database: a Unix socket in $work/test-db that
@@ -572,7 +583,7 @@ sandbox() {
         eval "value=\${$name-}"
         [ -n "$value" ] && set -- "$@" --setenv "$name" "$value"
     done
-    [ -n "$sandbox_db_url" ] && set -- "$@" --setenv SPAWN_TEST_DATABASE_URL "$sandbox_db_url"
+    [ -n "$sandbox_db_url" ] && set -- "$@" --args 9
     set -- "$@" --chdir "$tree" --
     # The command was given first: move it after the options.
     while [ "$count" -gt 0 ]; do
@@ -580,7 +591,11 @@ sandbox() {
         shift
         count=$((count - 1))
     done
-    "$@" </dev/null
+    if [ -n "$sandbox_db_url" ]; then
+        "$@" </dev/null 9<"$work/sandbox-db-args"
+    else
+        "$@" </dev/null
+    fi
 }
 
 extract() {
