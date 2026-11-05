@@ -14,6 +14,8 @@
 #   rename detection, no quoting); a path with a newline is refused, and so
 #   is every candidate when the list is missing (an empty list protects
 #   nothing on purpose).
+# - It may not change anything under a `node_modules/` or `target/`
+#   directory.
 # - It may not add build-time code: a changed `build.rs` or `.cargo/`, a
 #   `build =` key in any Cargo.toml of the tree (cargo would run the file it
 #   names as a build script).
@@ -662,6 +664,18 @@ buildtime=$(printf '%s\n' "$changed" | grep -E '(^|/)build\.rs$|(^|/)\.cargo/' |
 if [ -n "$buildtime" ]; then
     echo "| candidate adds build-time code: $(echo "$buildtime" | tr '\n' ' ')"
     verdict rejected "candidate adds build-time code (build.rs or .cargo/)"
+    exit 0
+fi
+
+# Nothing under a node_modules/ or target/ directory: both are gitignored,
+# and git overwrites an ignored file with a committed one when it checks out
+# or merges, so a committed web/node_modules/.bin/tsc or target/ file would
+# replace the owner's build tools (deploy.sh runs them, and the sandbox
+# binds the controller's web/node_modules).
+planted=$(printf '%s\n' "$changed" | grep -E '(^|/)(node_modules|target)/' || true)
+if [ -n "$planted" ]; then
+    echo "| candidate commits build output or installed packages: $(echo "$planted" | head -n 5 | tr '\n' ' ')"
+    verdict rejected "candidate changes a path under node_modules/ or target/"
     exit 0
 fi
 
