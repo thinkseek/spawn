@@ -1398,6 +1398,37 @@ begin
     return spawn_control_record(p_record);
 end $$;
 
+-- A task's records in the control stream, found without reading the rest.
+create index if not exists spawn_events_control_record
+    on spawn_events ((kind -> 'detail' -> 'record' ->> 'id'), session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded';
+
+-- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
+-- `stage` is the record type without `task.`; `verdict` is a gate's verdict
+-- or a review's (`accepted`, `rejected`); `took_ms` is the time since the
+-- task's previous record (none on the first). Runs as the owner, so the
+-- supervisor's login, which may not read `spawn_events`, reads it too.
+create or replace function spawn_task_stages(p_task bigint)
+returns jsonb language sql stable security definer as $$
+    select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+               'stage', substr(s.type, 6), 'verdict', s.verdict, 'at_ms', s.at_ms,
+               'took_ms', s.at_ms - s.previous_ms)) order by s.seq), '[]'::jsonb)
+      from (select e.session_seq as seq, r.record ->> 'type' as type,
+                   case r.record ->> 'type'
+                     when 'task.gated' then r.record ->> 'verdict'
+                     when 'task.reviewed' then
+                       case when (r.record ->> 'accepted')::boolean then 'accepted'
+                            else 'rejected' end
+                   end as verdict,
+                   e.recorded_at_ms as at_ms,
+                   lag(e.recorded_at_ms) over (order by e.session_seq) as previous_ms
+              from spawn_events e
+             cross join lateral (select e.kind -> 'detail' -> 'record' as record) r
+             where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+               and (e.kind -> 'detail' -> 'record' ->> 'id') = p_task::text
+               and r.record ->> 'type' like 'task.%') s
+$$;
+
 -- A database from before the control stream has rows and no records. Each
 -- row becomes one `legacy.imported` record, once.
 do $$
@@ -1450,7 +1481,7 @@ begin
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)',
-        'spawn_objective_assign(bigint, integer, text, text)'] loop
+        'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -1459,7 +1490,7 @@ begin
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text)',
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
-        'spawn_resident_retire(text)'] loop
+        'spawn_resident_retire(text)', 'spawn_task_stages(bigint)'] loop
         execute format('grant execute on function %s to spawn_supervisor', v_function);
     end loop;
 end
@@ -1484,6 +1515,8 @@ begin
     execute format('grant select on all tables in schema %I to spawn_reader', current_schema());
 end
 $$;
+-- The board it serves carries every task's stages.
+grant execute on function spawn_task_stages(bigint) to spawn_reader;
 
 -- `spawn_append` is now SECURITY DEFINER, so it must not resolve names
 -- through the caller's `search_path`.
