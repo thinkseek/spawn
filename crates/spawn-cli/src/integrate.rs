@@ -788,7 +788,9 @@ fn landing_candidate(
 /// exist.
 fn merged_tree(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Option<String>, String> {
     match code {
-        Some(0) => Ok(Some(stdout.lines().next().unwrap_or_default().trim().to_string())),
+        Some(0) => Ok(Some(
+            stdout.lines().next().unwrap_or_default().trim().to_string(),
+        )),
         Some(1) => Ok(None),
         failure => {
             let how = failure.map_or_else(
@@ -1014,8 +1016,7 @@ fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree,
-        over_budget,
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, over_budget,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
