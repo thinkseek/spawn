@@ -480,10 +480,7 @@ mod tests {
         let store = LocalChunkStore::new(directory.join("store"));
         let name = store.put(b"reused by a checkpoint in flight").expect("put");
         age(&store, &name, 2 * HOUR);
-        let writer = std::fs::File::options()
-            .write(true)
-            .open(store.directory().join(".lock"))
-            .expect("the store's lock file");
+        let writer = std::fs::File::open(store.directory()).expect("the store's directory");
         writer.lock_shared().expect("hold it as a writer");
         let remover = {
             let store = store.clone();

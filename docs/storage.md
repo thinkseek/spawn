@@ -288,8 +288,8 @@ files, a chunk fetch.
     written before the commit that names them, and a `put` or a stat-cache
     reuse makes an object young again, so a checkpoint in flight keeps what
     it reuses as long as it commits within the grace period. The age check
-    and the unlink happen under the store's lock (`<store>/.lock`) held
-    exclusively, which every `put` and `touch` holds shared: a refresh
+    and the unlink happen under the store's lock (a `flock` on the store
+    directory) held exclusively, which every `put` and `touch` holds shared: a refresh
     between the listing and the removal keeps the object, and a writer that
     waited finds it gone and writes it again.
   - *An empty default repository is refused*: with `--repo` (or

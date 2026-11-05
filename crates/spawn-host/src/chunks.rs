@@ -173,28 +173,24 @@ impl LocalChunkStore {
         self.directory.join(&name[..2]).join(name)
     }
 
-    /// Hold the store's lock file, `<store>/.lock` (made when missing),
-    /// until the returned file is dropped: shared by a `put` or a `touch`
-    /// (they make objects young), exclusive by a removal. So a removal's
-    /// last age check and its unlink see no refresh in between: an object
-    /// a writer refreshed after a collection listed it stays.
+    /// Hold the store's lock (a `flock` on the store directory itself,
+    /// made when missing) until the returned handle is dropped: shared by a
+    /// `put` or a `touch` (they make objects young), exclusive by a removal.
+    /// So a removal's last age check and its unlink see no refresh in
+    /// between: an object a writer refreshed after a collection listed it
+    /// stays.
     fn hold(&self, exclusive: bool) -> Result<File, ChunkError> {
         std::fs::create_dir_all(&self.directory)
             .map_err(|error| unavailable("create", &self.directory, &error))?;
-        let path = self.directory.join(".lock");
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|error| unavailable("open", &path, &error))?;
+        let directory = File::open(&self.directory)
+            .map_err(|error| unavailable("open", &self.directory, &error))?;
         let locked = if exclusive {
-            file.lock()
+            directory.lock()
         } else {
-            file.lock_shared()
+            directory.lock_shared()
         };
-        locked.map_err(|error| unavailable("lock", &path, &error))?;
-        Ok(file)
+        locked.map_err(|error| unavailable("lock", &self.directory, &error))?;
+        Ok(directory)
     }
 }
 
