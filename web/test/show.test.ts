@@ -14,6 +14,7 @@ import {
   eventsPerMinute,
   gatePassRate,
   landedToday,
+  landings,
   prune,
   replayTime,
   runningCount,
@@ -177,6 +178,16 @@ test("landed today counts landings since local midnight", () => {
     control({ type: "task.landed" }, now + 1),
   ];
   assert.equal(landedToday(events, now), 2);
+});
+
+test("landings are known by task, up to now", () => {
+  const events = [
+    control({ type: "task.landed", id: 3 }, 100),
+    control({ type: "task.landed", id: 4 }, 200),
+    control({ type: "task.gated", id: 5, verdict: "accepted" }, 150),
+  ];
+  assert.deepEqual([...landings(events, 150)], [[3, 100]]);
+  assert.deepEqual([...landings(events, 300)], [[3, 100], [4, 200]]);
 });
 
 test("the gate pass rate counts only verdicts that judge the work", () => {

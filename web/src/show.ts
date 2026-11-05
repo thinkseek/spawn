@@ -347,6 +347,18 @@ export function gatePassRate(events: readonly LogEvent[], nowMs: number): number
   return judged === 0 ? null : accepted / judged;
 }
 
+/** When each task last landed, up to `nowMs`, by task id. */
+export function landings(events: readonly LogEvent[], nowMs: number): Map<number, number> {
+  const landed = new Map<number, number>();
+  for (const event of events) {
+    if (event.recorded_at_ms > nowMs) continue;
+    const record = controlRecord(event);
+    if (record?.type !== "task.landed" || typeof record.id !== "number") continue;
+    landed.set(record.id, Math.max(landed.get(record.id) ?? 0, event.recorded_at_ms));
+  }
+  return landed;
+}
+
 // --- Time -------------------------------------------------------------------
 
 export type Mode = "live" | "replay";
