@@ -1298,6 +1298,25 @@ fn dispatch_facts_name_the_latest_delivery_however_old() {
     let latest = submit("spawn-dispatch", "deliver-7-1");
     submit("spawn-dispatch", "dispatch-nudge-session_worker_a-1");
     submit("human", "deliver-9-0");
+    // A failed command carries its error (what a retried start looks at).
+    let claimed = store
+        .claim("w1", Duration::from_mins(1))
+        .expect("claim succeeds")
+        .expect("a command waits");
+    store
+        .finish(
+            &claimed,
+            &Outcome::Failed("the source did not answer".to_string()),
+        )
+        .expect("finish succeeds");
+    let failed = row()["dispatched"]
+        .as_array()
+        .expect("dispatched")
+        .iter()
+        .find(|sent| sent["succeeded"] == serde_json::json!(false))
+        .cloned()
+        .expect("the failed command is among the dispatched");
+    assert_eq!(failed["error"].as_str(), Some("the source did not answer"));
     // Two days ago: out of the window `dispatched` keeps.
     admin(&schema)
         .execute(
