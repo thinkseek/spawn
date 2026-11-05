@@ -1,6 +1,6 @@
 //! The restricted logins: one set per database, passwords derived slowly
-//! from the owner's with a per-login salt, and the cluster-wide logins of
-//! earlier installs cut off.
+//! from the owner's with a per-login salt, off without an owner password,
+//! and the cluster-wide logins of earlier installs cut off.
 //!
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`). Cases that
 //! change a database's logins make a database of their own, so the shared
@@ -140,6 +140,97 @@ fn each_database_has_its_own_logins_and_another_install_sets_none_of_ours() {
             Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE)
         );
     }
+}
+
+#[test]
+fn a_migration_without_the_owner_password_turns_the_logins_off() {
+    let database = Database::new("roles_off", None);
+    PostgresStore::connect(&database.url())
+        .expect("connect")
+        .migrate()
+        .expect("migrate with the owner's password");
+    let supervisor = role_url(&database.url(), "spawn_supervisor").expect("the login's URL");
+    assert!(can_log_in(&supervisor));
+    let login = format!("spawn_supervisor_{}", database.name);
+    // As an earlier install left it: a fixed password anyone can guess.
+    admin("public")
+        .batch_execute(&format!("alter role {login} login password '{login}'"))
+        .expect("an earlier install's password");
+    let fixed = database_url(&login, &login, &database.name);
+    assert!(can_log_in(&fixed));
+
+    // The owner without a password in the URL (it travels as a parameter,
+    // as PGPASSWORD or a peer login would leave it out of the URL).
+    let Parts {
+        scheme,
+        user,
+        password,
+        host,
+    } = parts();
+    let encoded = password
+        .replace('&', "%26")
+        .replace('=', "%3D")
+        .replace('+', "%2B");
+    let passwordless = format!(
+        "{scheme}://{user}@{host}/{}?password={encoded}",
+        database.name
+    );
+    PostgresStore::connect(&passwordless)
+        .expect("the owner connects")
+        .migrate()
+        .expect("migrate without the owner's password");
+    assert!(!can_log_in(&fixed), "the earlier password is gone");
+    assert!(!can_log_in(&supervisor), "the derived one too");
+    let rows = admin("public")
+        .query(
+            "select rolname::text, rolcanlogin, rolpassword is null from pg_authid
+              where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1)
+              order by 1",
+            &[&database.name],
+        )
+        .expect("the logins");
+    let logins: Vec<(String, bool, bool)> = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(
+        logins,
+        [
+            (format!("spawn_reader_{}", database.name), false, true),
+            (format!("spawn_supervisor_{}", database.name), false, true),
+        ]
+    );
+
+    // It says so.
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&warnings);
+    let mut config: postgres::Config = passwordless.parse().expect("parses");
+    config.notice_callback(move |notice| {
+        if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
+            sink.lock()
+                .expect("warnings")
+                .push(notice.message().to_string());
+        }
+    });
+    config
+        .connect(NoTls)
+        .expect("connect")
+        .batch_execute("select spawn_logins_off()")
+        .expect("turn them off again");
+    let warnings = warnings.lock().expect("warnings").clone();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("no owner password") && warnings[0].contains(&login),
+        "{warnings:?}"
+    );
+
+    // A migration with the password turns them on again.
+    PostgresStore::connect(&database.url())
+        .expect("connect")
+        .migrate()
+        .expect("migrate with the owner's password");
+    assert!(can_log_in(&supervisor));
+    assert!(!can_log_in(&fixed));
 }
 
 #[test]

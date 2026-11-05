@@ -947,6 +947,24 @@ begin
 end
 $$;
 
+-- A migration without the owner's password turns this database's logins
+-- off (PostgresStore::migrate): their passwords derive from the owner's, so
+-- none can be set, and one an earlier migration set must not outlive it.
+create or replace function spawn_logins_off() returns void
+language plpgsql as $$
+declare
+    v_role text;
+begin
+    foreach v_role in array array[spawn_login_role('spawn_supervisor'),
+                                  spawn_login_role('spawn_reader')] loop
+        execute format('alter role %I with nologin password null', v_role);
+    end loop;
+    raise warning 'the database URL has no owner password: logins % and % are off (no login, '
+                  'no password) until a migration with the owner''s password',
+                  spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader');
+end $$;
+revoke execute on function spawn_logins_off() from public;
+
 -- The supervisor's terminal connects with its login. It reads the fleet
 -- and submits commands through the `agent_commands` gateway, which records
 -- `spawn_supervisor` as the principal and allows only the agents its grants

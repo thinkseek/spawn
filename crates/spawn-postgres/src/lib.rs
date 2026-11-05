@@ -133,9 +133,15 @@ impl PostgresStore {
             .batch_execute(SCHEMA)
             .map_err(|error| backend(&error))?;
         // No owner password (peer or trust login, PGPASSWORD): a password
-        // derived from "" would be a constant anyone can compute. Such a
-        // migration leaves the logins as they are.
-        if !self.password.is_empty() {
+        // derived from "" would be a constant anyone can compute, and a
+        // password an earlier migration set (or a fixed one from an older
+        // install) would outlive the owner's choice to have none. Such a
+        // migration turns the logins off (spawn_logins_off warns).
+        if self.password.is_empty() {
+            transaction
+                .batch_execute("select spawn_logins_off()")
+                .map_err(|error| backend(&error))?;
+        } else {
             for base in LOGINS {
                 let (role, salt) = login(&mut transaction, base)?;
                 // Hex only, and the role [a-z0-9_]: nothing needs quoting.
