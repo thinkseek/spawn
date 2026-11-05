@@ -220,6 +220,44 @@ fn a_clean_merge_moves_the_directory_then_the_branch_and_leaves_build_output() {
     );
 }
 
+#[test]
+fn a_repeated_merge_of_the_same_main_never_moves_the_branch_back() {
+    let fixture = Fixture::new("repeat", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "one\n")]);
+    fixture.land(&[("new.txt", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Merged { .. }
+    ));
+    let after = fixture.work(&workspace, &[("work.txt", "two\n")]);
+    // Main has not moved: the branch contains it, whatever came after.
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("again"),
+        BaseMerge::Current
+    );
+    assert_eq!(fixture.head("agent_a"), after);
+    assert_eq!(read(&directory, "work.txt"), "two\n");
+
+    // The same holds after a merge that a resolved checkpoint recorded.
+    let fixture = Fixture::new("repeat-resolved", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("README.md", "mine\n")]);
+    fixture.land(&[("README.md", "theirs\n")]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    fixture.work(&workspace, &[("README.md", "both\n")]);
+    let after = fixture.work(&workspace, &[("README.md", "both, then more\n")]);
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("again"),
+        BaseMerge::Current
+    );
+    assert_eq!(fixture.head("agent_a"), after);
+    assert_eq!(read(&directory, "README.md"), "both, then more\n");
+}
+
 /// Where the store keeps a branch's pending merge.
 fn pending(directory: &Path, branch: &str) -> PathBuf {
     directory
