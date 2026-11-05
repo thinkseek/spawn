@@ -162,6 +162,14 @@ pub(crate) struct Task {
     /// task has moved on to another.
     #[serde(default)]
     pub(crate) revisions: i32,
+    /// Its brief (`mission_tasks.brief`): an objective task's first line is
+    /// `Objective <id>: <title>`.
+    #[serde(default)]
+    pub(crate) brief: String,
+    /// The report the gate's verdict is for (`mission_tasks.report`), as the
+    /// record holds it: the landing's message summarises it.
+    #[serde(default)]
+    pub(crate) report: Option<String>,
 }
 
 impl Mission {
@@ -681,7 +689,8 @@ impl Integrator {
         if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
             return gated("conflict", json!({ "note": note }));
         }
-        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, task.id)? else {
+        let message = landing_message(task, &branch);
+        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
             // The worker cannot merge main itself: merge it into the
             // workspace now, while the worker waits for this verdict, so
             // the note names what it has to resolve.
@@ -755,16 +764,23 @@ impl Integrator {
     }
 }
 
-/// The commit that would land `branch` (the agent's pushed head, in the
-/// mirror) on `main`, or `None` when the two conflict. Only objects are
-/// written, never a ref: the agent's `refs/heads/<agent>` stays the Bridge's,
-/// and `spawn/<agent>` catches up with a landing through the Bridge's next
-/// merge of main, which its pusher pushes like any checkpoint.
+/// The commit that lands `branch` (the agent's pushed head, in the mirror)
+/// on `main`, with `message` ([`landing_message`]), or `None` when the two
+/// conflict. Always one new merge commit: first parent `main` (the base the
+/// gate judges against), second parent `branch`, so main's first-parent line
+/// is one commit per landing and every checkpoint stays reachable through
+/// the second parents. Its tree is the branch's when main is in it, and the
+/// merge of both by main's merge rules otherwise. Never the branch head
+/// itself, so a head that names a large-file manifest lands without it.
+/// Only objects are written, never a ref: the agent's `refs/heads/<agent>`
+/// stays the Bridge's, and `spawn/<agent>` catches up with a landing through
+/// the Bridge's next merge of main, which its pusher pushes like any
+/// checkpoint.
 fn landing_candidate(
     mirror_path: &str,
     main: &str,
     branch: &str,
-    task: i64,
+    message: &str,
 ) -> Result<Option<String>, String> {
     let main_is_in = git(&[
         "--git-dir",
@@ -775,69 +791,142 @@ fn landing_candidate(
         branch,
     ])
     .is_ok();
-    if main_is_in {
-        // Large files are workspace state, never source: a branch head
-        // that names a large-file manifest lands as a commit of the same
-        // tree without it, so nothing forked from main inherits them.
-        let message = git(&[
-            "--git-dir",
-            mirror_path,
-            "show",
-            "-s",
-            "--format=%B",
-            branch,
-        ])?;
-        if !spawn_host::names_files_outside_git(&message) {
-            return Ok(Some(branch.to_string()));
-        }
-        let tree = git(&[
+    let tree = if main_is_in {
+        git(&[
             "--git-dir",
             mirror_path,
             "rev-parse",
             &format!("{branch}^{{tree}}"),
-        ])?;
-        return commit_landing(
-            mirror_path,
-            &[&tree, "-p", branch, "-m", &format!("Land task {task}")],
-        )
-        .map(Some);
-    }
-    // Main moved since the worker started: land the merge of both, by
-    // main's merge rules (a bare repository reads no in-tree
-    // .gitattributes otherwise), as main is merged into agents' branches.
-    let output = sources::controller_git()
-        .args([
-            "--git-dir",
-            mirror_path,
-            &format!("--attr-source={main}"),
-            "merge-tree",
-            "--write-tree",
-            main,
-            branch,
-        ])
-        .output()
-        .map_err(|error| format!("run git merge-tree: {error}"))?;
-    let Some(tree) = merged_tree(
-        output.status.code(),
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    )?
-    else {
-        return Ok(None);
+        ])?
+    } else {
+        // Main moved since the worker started: land the merge of both, by
+        // main's merge rules (a bare repository reads no in-tree
+        // .gitattributes otherwise), as main is merged into agents' branches.
+        let output = sources::controller_git()
+            .args([
+                "--git-dir",
+                mirror_path,
+                &format!("--attr-source={main}"),
+                "merge-tree",
+                "--write-tree",
+                main,
+                branch,
+            ])
+            .output()
+            .map_err(|error| format!("run git merge-tree: {error}"))?;
+        let Some(tree) = merged_tree(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )?
+        else {
+            return Ok(None);
+        };
+        tree
     };
     commit_landing(
         mirror_path,
-        &[
-            &tree,
-            "-p",
-            main,
-            "-p",
-            branch,
-            "-m",
-            &format!("Land task {task} (merged with main)"),
-        ],
+        &[&tree, "-p", main, "-p", branch, "-m", message],
     )
     .map(Some)
+}
+
+/// Characters of a report's summary a landing's message holds at most.
+const SUMMARY_CHARS: usize = 3000;
+
+/// Characters of a brief's first line a landing's first line holds at most.
+const TITLE_CHARS: usize = 100;
+
+/// The message of `task`'s landing of `head`: what landed, from the record
+/// alone (never a workspace). The first line holds the objective's title
+/// (the brief's first line, `Objective <id>: <title>`) and names the
+/// objective and the task, or, for a task without an objective, the brief's
+/// first non-empty line and the task. After a blank line, the report's
+/// `## What changed` section (the whole report when it has none), bounded,
+/// with every line that could read as a `Spawn-` trailer indented. Last, the
+/// integrator's own trailers.
+pub(crate) fn landing_message(task: &Task, head: &str) -> String {
+    let first = task
+        .brief
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut subject = match task.objective {
+        Some(objective) => {
+            let title = first
+                .strip_prefix(&format!("Objective {objective}:"))
+                .map_or(first, str::trim);
+            let title = cut(title, TITLE_CHARS);
+            if title.is_empty() {
+                format!("Land objective {objective}, task {}", task.id)
+            } else {
+                format!("{title} (objective {objective}, task {})", task.id)
+            }
+        }
+        None if first.is_empty() => format!("Land task {}", task.id),
+        None => format!("{} (task {})", cut(first, TITLE_CHARS), task.id),
+    };
+    if subject.to_ascii_lowercase().starts_with("spawn checkpoint") {
+        subject = format!("Land {subject}");
+    }
+    let mut message = subject;
+    message.push_str("\n\n");
+    let summary = report_summary(task.report.as_deref().unwrap_or_default());
+    if summary.is_empty() {
+        message.push_str("The task's report is empty.");
+    } else {
+        for line in summary.lines() {
+            if line.trim_start().to_ascii_lowercase().starts_with("spawn-") {
+                message.push_str("    ");
+            }
+            message.push_str(line);
+            message.push('\n');
+        }
+    }
+    let message = message.trim_end().to_string();
+    let mut trailers = format!("Spawn-Task: {}\n", task.id);
+    if let Some(objective) = task.objective {
+        trailers.push_str(&format!("Spawn-Objective: {objective}\n"));
+    }
+    trailers.push_str(&format!("Spawn-Head: {head}\n"));
+    format!("{message}\n\n{trailers}")
+}
+
+/// What a landing's message quotes of `report`: its `## What changed`
+/// section, or the whole report when it has none (or an empty one),
+/// trimmed and cut to [`SUMMARY_CHARS`].
+fn report_summary(report: &str) -> String {
+    let heading = |line: &str| {
+        let level = line.bytes().take_while(|&byte| byte == b'#').count();
+        (1..=2)
+            .contains(&level)
+            .then(|| line[level..].trim().trim_end_matches(':').trim())
+    };
+    let mut lines = report.lines();
+    let mut section = None;
+    if lines.any(|line| heading(line).is_some_and(|text| text.eq_ignore_ascii_case("what changed")))
+    {
+        let body: Vec<&str> = lines.take_while(|line| heading(line).is_none()).collect();
+        let body = body.join("\n");
+        if !body.trim().is_empty() {
+            section = Some(body);
+        }
+    }
+    let text = section.as_deref().unwrap_or(report).trim();
+    let summary = cut(text, SUMMARY_CHARS);
+    if summary.len() < text.len() {
+        format!("{summary}\n[the report continues]")
+    } else {
+        summary.to_string()
+    }
+}
+
+/// `text` cut to at most `limit` characters, on a character boundary.
+fn cut(text: &str, limit: usize) -> &str {
+    text.char_indices()
+        .nth(limit)
+        .map_or(text, |(at, _)| text[..at].trim_end())
 }
 
 /// What `git merge-tree --write-tree` said, from its exit code (`None`: no
