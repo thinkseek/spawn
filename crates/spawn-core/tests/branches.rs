@@ -266,7 +266,7 @@ fn a_merge_or_checkpoint_whose_record_failed_is_recorded_at_the_next_tick() {
     });
     transcript(&store, &[turn_end("1")]);
     quiet(&bridge.tick().expect("read the turn end"));
-    store.fail_next_commit_record();
+    store.fail_next_branch_record();
     assert!(bridge.tick().is_err(), "the log is down");
     assert!(checkpoints(&store).is_empty());
     // The next tick records it, though the branch already holds the merge.
@@ -282,7 +282,7 @@ fn a_merge_or_checkpoint_whose_record_failed_is_recorded_at_the_next_tick() {
     transcript(&store, &tool_call("toolu_1"));
     quiet(&bridge.tick().expect("read the tool call"));
     store.mark_dirty(&workspace);
-    store.fail_next_commit_record();
+    store.fail_next_branch_record();
     assert!(bridge.tick().is_err(), "the log is down");
     quiet(&bridge.tick().expect("the log is back"));
     let recorded = checkpoints(&store);
@@ -290,6 +290,43 @@ fn a_merge_or_checkpoint_whose_record_failed_is_recorded_at_the_next_tick() {
     assert_eq!(recorded[1].0, CheckpointReason::ToolCompleted);
     quiet(&bridge.tick().expect("idle"));
     assert_eq!(checkpoints(&store).len(), 2, "recorded once");
+}
+
+#[test]
+fn a_conflict_whose_record_failed_is_recorded_at_the_next_tick() {
+    let store = store();
+    let mut bridge = bridge(&store);
+    start(&store, None);
+    bridge.tick().expect("start");
+    store.set_base_merge(BaseMerge::Conflicted {
+        files: vec!["README.md".to_string()],
+        marked: true,
+    });
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    bridge.tick().expect("read the turn");
+    store.fail_next_branch_record();
+    assert!(bridge.tick().is_err(), "the log is down");
+    let conflicts = |store: &MemoryStore| {
+        events(store)
+            .into_iter()
+            .filter(|event| matches!(event.kind, EventKind::MergeConflicted { .. }))
+            .count()
+    };
+    assert_eq!(conflicts(&store), 0);
+    // Nothing of the failed tick was kept: the next one merges, reports and
+    // records again.
+    let report = bridge.tick().expect("the log is back");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("README.md")),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(conflicts(&store), 1);
+    bridge.tick().expect("idle");
+    assert_eq!(conflicts(&store), 1, "recorded once");
 }
 
 #[test]

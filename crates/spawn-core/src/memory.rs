@@ -76,7 +76,7 @@ struct State {
     /// Commits fail while set.
     commit_fails: bool,
     /// The next append of an `artifact.committed` event fails.
-    commit_record_fails: bool,
+    branch_record_fails: bool,
     terminals: HashSet<TerminalName>,
     /// Every terminal start, in order.
     launches: Vec<Launch>,
@@ -186,10 +186,10 @@ impl MemoryStore {
         self.lock().commit_fails = fail;
     }
 
-    /// Make the next append of an `artifact.committed` event fail, as a log
-    /// that is down would. Test helper.
-    pub fn fail_next_commit_record(&self) {
-        self.lock().commit_record_fails = true;
+    /// Make the next append of an `artifact.committed` or `merge.conflicted`
+    /// event fail, as a log that is down would. Test helper.
+    pub fn fail_next_branch_record(&self) {
+        self.lock().branch_record_fails = true;
     }
 
     /// Mark a workspace as holding uncommitted changes. Test helper.
@@ -204,8 +204,12 @@ impl EventLog for MemoryStore {
     fn append(&self, event: NewEvent) -> Result<Appended, StoreError> {
         let now = self.clock.now();
         let mut state = self.lock();
-        if state.commit_record_fails && matches!(event.kind, EventKind::ArtifactCommitted { .. }) {
-            state.commit_record_fails = false;
+        let branch_record = matches!(
+            event.kind,
+            EventKind::ArtifactCommitted { .. } | EventKind::MergeConflicted { .. }
+        );
+        if state.branch_record_fails && branch_record {
+            state.branch_record_fails = false;
             return Err(StoreError::Backend("the log is down".to_string()));
         }
         let (record, inserted) = state.insert(event, now);
