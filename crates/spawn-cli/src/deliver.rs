@@ -31,7 +31,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use spawn_core::command::CommandAction;
-use spawn_core::event::{Engine, ModelProfile};
+use spawn_core::event::{ENGINE, ModelProfile};
 use spawn_core::mission::TaskState;
 use spawn_postgres::PostgresStore;
 
@@ -303,7 +303,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
         _ => Some(task.order(
             key,
             CommandAction::Start {
-                engine: Engine::Claude,
+                engine: ENGINE.to_string(),
                 prompt: task_prompt(task),
                 parent_session_id: None,
                 from: None,

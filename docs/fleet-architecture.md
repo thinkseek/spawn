@@ -46,8 +46,8 @@ Three ideas carry the design:
  │               (queue), grants, views; the control stream (§10.1)      │
  ├──────────────────────────────────────────────────────────────────────┤
  │ 1 Runtime     Bridge: start / input / resume / stop                   │
- │               engines (Claude Code, Codex) in tmux + git workspaces   │
- │               transcripts, JSON lines, screen, exit files → events    │
+ │               Claude Code engines in tmux + git workspaces            │
+ │               transcripts, screen, exit files → events                │
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,7 +58,7 @@ No layer calls another layer's process directly; they meet in the log.
 | --- | --- |
 | 1 Runtime | Bridge, tmux, git workspaces and mission mirrors, the chunk store, transcripts and exit files |
 | 2 Event log | `spawn_events` (with the control stream), `spawn_commands`, grants, projections, views |
-| 3 Observation | Observer: rules first, then the model judge on ambiguity (Jev, or the local heuristic judge when no Jev URL is set) |
+| 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
 | 5 Interface | `spawn serve` (read-only API and web UI), the `spawn` CLI |
 
@@ -91,10 +91,12 @@ facts. It answers in one request:
 - `needs_human` (yes/no): probability that a human must answer or decide;
 - `stuck` (yes/no): probability that the agent loops or makes no progress.
 
-Without a Jev URL (`SPAWN_JUDGE_URL` or `--judge-url`), the heuristic judge
-(`HeuristicJudge`, `judge: "heuristic"`) answers the ambiguous cases with
-fixed rules over the same input. It keeps the system running without a model
-and is what the tests use.
+Without a Jev URL (`SPAWN_JUDGE_URL` or `--judge-url`), the Observer judges
+by the rules alone. A case they cannot settle goes the way of a judge that is
+down (below): the rules' guess with its ambiguity, `reason =
+JudgeUnavailable`, `judge: "none"`, and attention, so the dispatcher
+escalates it rather than nudging. Observations in the log that name
+`judge: "heuristic"`, a judge since removed, read and show like any other.
 
 Every observation records who decided and why:
 
@@ -347,19 +349,12 @@ probes a relay, and a cheap start fails.
 
 ## 4. Experience
 
-Nothing is stored outside the log. `spawn corpus export` derives episodes
-from it and writes them as JSONL: an episode is one model judgement with its
-evidence and an outcome label. The outcome is measured from the evidence the
-judgement covered (not from when it was written) and labelled `continued`
-(the agent made a tool call before anyone acted), `needed_decision` (a human
-or the supervisor typed next), `needed_input`, `nudged`, `stopped`, `ended`,
-`restarted` (an outage; says nothing about the judged state) or `open`.
-
-`spawn judge --replay <corpus>` runs the current rules over a corpus and
-reports which tier would decide each episode, the coverage, and the rules'
-agreement with the model and with the outcomes. That is the measure of
-moving decisions down the ladder: episodes move from Jev to the rules
-without losing agreement.
+Nothing is stored outside the log. Every model judgement is an
+`observation.recorded` event with the evidence the model saw, its answer and
+the rules' guess (§2); what happened next (the agent's next tool call, the
+next command and who sent it, the end of the execution) follows it in the
+same log. Nothing exports these episodes or replays them through the rules
+(§9).
 
 The ladder metrics in the UI (decisions per tier, escalations, human
 decisions per agent-hour over the last 24 h) are computed from the log by
@@ -399,7 +394,7 @@ Known edges, each with its rule:
 - The event log is the only state; every process is restartable.
 - `EventKind` stays closed; observation fields are additive.
 - Facts > rules > Jev; observation never acts; Jev alone triggers only reversible, bounded actions.
-- Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the runner's copy of Codex output, the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing; it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. The restricted logins' passwords are derived from the owner's (SHA-256 over the owner's password and the role name, `spawn_postgres::role_url`) and set by every migration, so nothing stores them and only a holder of the owner's credentials can form them. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration leaves the logins as they are (created `nologin`; enabled only by a migration that has the owner's password), never with a password derived from the empty string.
+- Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing; it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. The restricted logins' passwords are derived from the owner's (SHA-256 over the owner's password and the role name, `spawn_postgres::role_url`) and set by every migration, so nothing stores them and only a holder of the owner's credentials can form them. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration leaves the logins as they are (created `nologin`; enabled only by a migration that has the owner's password), never with a password derived from the empty string.
 - No model key in Spawn: the DeepSeek key stays in the model relay's process, the gateway token in Claude Code's own settings (§3.3).
 - Every landing goes through the black-box gate, a host-side commit, a compare-and-swap move of the baseline, and the halt rules (§10).
 
@@ -409,9 +404,6 @@ Known edges, each with its rule:
  worker acts ──► observe (rules → Jev) ──► dispatch (rules → Jev nudge → supervisor → human)
       ▲                                              │
       └──────────── command ◄────────────────────────┘
-                                                     │ every decision + its outcome
-                                                     ▼
-                    corpus export ──► replay: which tier decides each episode
 ```
 
 The supervisor is kept alive by the liveness rule (resume, then handoff),
@@ -421,8 +413,7 @@ Jev on ambiguity, with the full payload. The dispatcher's policy decides
 fixed cases by rules, allows one guarded Jev-gated nudge (`continue`), and
 escalates everything else to the supervisor, which may escalate to a human.
 A human acts from the attention queue with `spawn submit --principal human`.
-Every decision is exported with its outcome, and replay measures how many
-the rules could decide.
+Every decision is in the log with its evidence and what followed it.
 
 ### 7.1 The end-to-end check
 
@@ -454,7 +445,6 @@ asserts:
 9. Killing the supervisor's engine, then its tmux server, ends with the same
    `session_supervisor` resumed natively; killing the loop leaves the same
    supervisor execution running.
-10. The corpus exports, and replay reports a tier per episode.
 
 ## 8. Known limit: one uid
 
@@ -474,19 +464,18 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 
 ## 9. Not built
 
-- **Experience views in SQL** (`decisions`, `outcomes`, `interventions`).
-  Outcomes are derived per export by `spawn corpus export`.
+- **Experience views in SQL** (`decisions`, `outcomes`, `interventions`)
+  and outcome labels: the log holds what followed each judgement, but
+  nothing derives, exports or replays the episodes.
 - **RSI objectives over the corpus**, judged by black-box replay through the
   candidate's `spawn` binary on a corpus snapshot the candidate cannot edit:
   rules coverage (share of episodes decided by rules up, agreement with the
   labelled outcome kept), Jev filtering (escalations to the supervisor down,
   outcome accuracy kept), playbook reach (interventions in the corpus the
   playbook would have resolved, up), and human interventions per agent-hour
-  on live runs. A `spawn dispatch --replay` for the playbook does not exist.
+  on live runs. Nothing replays the playbook over recorded episodes.
 - **A write endpoint in the UI** (an input box to the supervisor). Humans
   act with `spawn submit --principal human`.
-- **Codex workers for mission tasks.** Delivery starts every worker with
-  Claude Code; Codex runs only through `spawn submit`.
 - **More dispatcher rules:** stopping a COMPLETED one-shot task and
   retrying after a transient API error (both escalate), and the actions
   `restart` and `reassign`.

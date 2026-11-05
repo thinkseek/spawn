@@ -11,7 +11,9 @@
 //! chunks in the chunk store, the checkpoint commit names their manifest in a
 //! `Spawn-Large: <hash>` trailer, and a mount materializes them again from
 //! the branch head (docs/storage.md). The branch head alone is the
-//! whole workspace.
+//! whole workspace. The one exception: a large file git already holds as a
+//! blob in the branch head or in `main` (it came from the source) stays a
+//! blob, so a checkpoint never drops it from the tree.
 //!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
 //! part before the colon, and the container of an execution is named from it,
@@ -74,8 +76,10 @@ pub fn docker_prefix(docker: &str, branch: &str) -> Vec<String> {
     ]
 }
 
-/// Trimmed stdout of a git command, or the failure as an error.
-fn report(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
+/// Stdout of a git command exactly as written, or the failure as an error.
+/// A `-z` listing is read this way: a path may begin or end with
+/// whitespace, which trimming would cut off the first or the last path.
+fn report_listing(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
     let output =
         output.map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
     if !output.status.success() {
@@ -84,7 +88,18 @@ fn report(output: std::io::Result<Output>, word: &str) -> Result<String, Workspa
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Trimmed stdout of a git command that prints one value (a commit, a
+/// tree), or the failure as an error. Never for a listing of paths.
+fn report(output: std::io::Result<Output>, word: &str) -> Result<String, WorkspaceError> {
+    report_listing(output, word).map(|stdout| stdout.trim().to_string())
+}
+
+/// The fields of a NUL-separated (`-z`) listing, the empty end dropped.
+fn nul_fields(listing: &str) -> impl Iterator<Item = &str> {
+    listing.split('\0').filter(|field| !field.is_empty())
 }
 
 /// First field of a pending merge's file.
@@ -222,7 +237,24 @@ impl GitWorkspace {
         report(output, &arguments.join(" "))
     }
 
+    /// Stdout of a `-z` listing of paths, untrimmed ([`report_listing`]).
+    fn git_listing(&self, arguments: &[&str]) -> Result<String, WorkspaceError> {
+        let output = self.command().args(arguments).stdin(Stdio::null()).output();
+        report_listing(output, &arguments.join(" "))
+    }
+
     fn output_in(
+        &self,
+        directory: &Path,
+        index: &Path,
+        arguments: &[&str],
+    ) -> Result<String, WorkspaceError> {
+        self.listing_in(directory, index, arguments)
+            .map(|stdout| stdout.trim().to_string())
+    }
+
+    /// Stdout of a `-z` listing of paths in a work tree, untrimmed.
+    fn listing_in(
         &self,
         directory: &Path,
         index: &Path,
@@ -233,7 +265,7 @@ impl GitWorkspace {
             .args(arguments)
             .stdin(Stdio::null())
             .output();
-        report(output, &arguments.join(" "))
+        report_listing(output, &arguments.join(" "))
     }
 
     fn has_base(&self) -> bool {
@@ -362,12 +394,21 @@ impl GitWorkspace {
     /// Build output and files over [`LARGE_FILE_BYTES`] leave the index after
     /// `add -A`, so a `.gitignore` inside the tree cannot re-include them; a
     /// large file is excluded before it is hashed.
+    ///
+    /// A large file that git already holds as a blob in one of `kept_in`
+    /// (the branch head, `main`, a pending merge's `main`) stays a blob: it
+    /// came from the source (main may get one from outside Spawn), and
+    /// leaving it out of the tree would delete it from the branch, and from
+    /// `main` when the branch lands.
     fn tree_of(
         &self,
         directory: &Path,
         index: &Path,
+        kept_in: &[String],
     ) -> Result<(String, Vec<(String, u64)>), WorkspaceError> {
         let mut large = self.large_files(directory, index)?;
+        let blobs = self.blobs_in(kept_in, &large)?;
+        large.retain(|(path, _)| !blobs.contains(path));
         let mut add = vec!["add", "-A", "--", "."];
         let excluded: Vec<String> = large
             .iter()
@@ -380,7 +421,9 @@ impl GitWorkspace {
         // A file that grew past the limit between the size check and `add`
         // was hashed anyway; keep it off the branch all the same, and in the
         // chunk store with the other large files.
-        let grown = self.large_blobs(&tree)?;
+        let mut grown = self.large_blobs(&tree)?;
+        let blobs = self.blobs_in(kept_in, &grown)?;
+        grown.retain(|(path, _)| !blobs.contains(path));
         if grown.is_empty() {
             return Ok((tree, large));
         }
@@ -410,11 +453,57 @@ impl GitWorkspace {
         self.output_in(directory, index, &remove).map(|_| ())
     }
 
+    /// Which of `paths` are a blob in at least one of `commits`.
+    fn blobs_in(
+        &self,
+        commits: &[String],
+        paths: &[(String, u64)],
+    ) -> Result<std::collections::HashSet<String>, WorkspaceError> {
+        let mut found = std::collections::HashSet::new();
+        if paths.is_empty() {
+            return Ok(found);
+        }
+        let literal: Vec<String> = paths
+            .iter()
+            .map(|(path, _)| format!(":(literal){path}"))
+            .collect();
+        for commit in commits {
+            let mut arguments = vec!["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"];
+            arguments.extend(literal.iter().map(String::as_str));
+            let listed = self.git_listing(&arguments)?;
+            for entry in nul_fields(&listed) {
+                // `<mode> blob <id>\t<path>`
+                if let Some((meta, path)) = entry.split_once('\t')
+                    && meta.split_whitespace().nth(1) == Some("blob")
+                    && paths.iter().any(|(large, _)| large == path)
+                {
+                    found.insert(path.to_string());
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The commits whose blobs a checkpoint of `branch` over `parent` keeps
+    /// as blobs ([`Self::tree_of`]): the head, `main`, and the `main` of a
+    /// pending merge.
+    fn source_commits(&self, branch: &str, parent: &str) -> Vec<String> {
+        let mut commits = vec![parent.to_string()];
+        if let Ok(main) = self.commit_id_of(&format!("refs/heads/{BASE}")) {
+            commits.push(main);
+        }
+        if let Some(pending) = self.pending_merge(branch) {
+            commits.push(pending.main);
+        }
+        commits.sort();
+        commits.dedup();
+        commits
+    }
+
     /// Blobs of `tree` larger than [`LARGE_FILE_BYTES`], with their sizes.
     fn large_blobs(&self, tree: &str) -> Result<Vec<(String, u64)>, WorkspaceError> {
-        let listed = self.git_output(&["ls-tree", "-r", "-l", "-z", tree])?;
-        Ok(listed
-            .split('\0')
+        let listed = self.git_listing(&["ls-tree", "-r", "-l", "-z", tree])?;
+        Ok(nul_fields(&listed)
             .filter_map(|entry| {
                 // `<mode> blob <id> <size>\t<path>`
                 let (meta, path) = entry.split_once('\t')?;
@@ -433,7 +522,7 @@ impl GitWorkspace {
         directory: &Path,
         index: &Path,
     ) -> Result<Vec<(String, u64)>, WorkspaceError> {
-        let listed = self.output_in(
+        let listed = self.listing_in(
             directory,
             index,
             &[
@@ -444,9 +533,7 @@ impl GitWorkspace {
                 "--exclude-standard",
             ],
         )?;
-        let mut large: Vec<(String, u64)> = listed
-            .split('\0')
-            .filter(|path| !path.is_empty())
+        let mut large: Vec<(String, u64)> = nul_fields(&listed)
             .filter_map(|path| {
                 let size = std::fs::symlink_metadata(directory.join(path))
                     .ok()
@@ -853,6 +940,8 @@ impl WorkspaceStore for GitWorkspace {
             )));
         }
         self.materialize_large(branch.as_str(), &directory)?;
+        // A fresh export is the branch head: nothing stale is left.
+        self.clear_stale(branch.as_str());
 
         self.start_container(branch.as_str(), &directory)?;
 
@@ -878,15 +967,16 @@ impl WorkspaceStore for GitWorkspace {
         lock.lock().map_err(|error| {
             WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
         })?;
-        let tree = self.tree_of(&directory, &index);
+        self.refuse_stale(&branch)?;
+        let reference = format!("refs/heads/{branch}");
+        let parent = self.git_output(&["rev-parse", &reference])?;
+        let tree = self.tree_of(&directory, &index, &self.source_commits(&branch, &parent));
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, large) = tree?;
         let manifest = self.store_large(&branch, &directory, &large)?;
 
-        let reference = format!("refs/heads/{branch}");
-        let parent = self.git_output(&["rev-parse", &reference])?;
         let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
         // A merge of main whose conflicts are now resolved: main is the
         // second parent, even when the tree did not change.
@@ -925,8 +1015,14 @@ impl WorkspaceStore for GitWorkspace {
                 .output();
         }
         match std::fs::remove_dir_all(&directory) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                self.clear_stale(workspace.sandbox());
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.clear_stale(workspace.sandbox());
+                Ok(())
+            }
             Err(error) => Err(WorkspaceError::Unavailable(format!(
                 "remove {}: {error}",
                 directory.display()
@@ -997,7 +1093,9 @@ impl GitWorkspace {
     /// two-tree `read-tree -m -u` against a temporary index that refuses when
     /// a file the merge changes differs from the branch; only then does the
     /// branch move, by compare-and-swap. The other order would let the next
-    /// checkpoint commit the old files over the merge and revert `main`.
+    /// checkpoint commit the old files over the merge and revert `main`. A
+    /// compare-and-swap that loses to another writer takes the directory to
+    /// the branch's new head ([`Self::follow_moved_branch`]).
     ///
     /// A content conflict is written into the directory the same safe way,
     /// conflict markers and all, and `main` waits under `.merge/<branch>` as
@@ -1011,6 +1109,7 @@ impl GitWorkspace {
         // The integrator commits this workspace too: no checkpoint reads the
         // directory halfway through a merge.
         let _lock = self.lock_branch(&branch)?;
+        self.refuse_stale(&branch)?;
         if let Some(Pending { files, .. }) = self.pending_merge(&branch) {
             if unresolved(&directory, &files) {
                 return Ok(BaseMerge::Conflicted {
@@ -1085,12 +1184,8 @@ impl GitWorkspace {
         }
         self.update_directory(&branch, &directory, &head_tree, &merged)?;
         let changed =
-            self.git_output(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
-        let files = changed
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(str::to_string)
-            .collect();
+            self.git_listing(&["diff-tree", "-r", "--name-only", "-z", &head_tree, &merged])?;
+        let files = nul_fields(&changed).map(str::to_string).collect();
         let message = crate::chunks::with_trailer(
             &format!("spawn: merge main {main} into {branch}"),
             manifest.as_deref(),
@@ -1105,14 +1200,88 @@ impl GitWorkspace {
             "-m",
             &message,
         ])?;
-        self.git_output(&["update-ref", &reference, &commit, &head])
-            .map_err(|error| {
-                WorkspaceError::Unavailable(format!("{error} (branch moved under the merge)"))
-            })?;
+        if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
+            return Err(self.follow_moved_branch(&branch, &directory, &merged, &error));
+        }
         Ok(BaseMerge::Merged {
             commit: CommitId::new(commit)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
             files,
+        })
+    }
+
+    /// After a merge wrote tree `merged` into `directory` and its
+    /// compare-and-swap lost (another writer moved the branch), bring the
+    /// directory to the branch's head as it is now, the same two-tree way:
+    /// otherwise the next checkpoint would commit the merge over the other
+    /// writer's commit as plain edits. When that is refused (the directory
+    /// changed meanwhile in a file the two trees differ in), the directory
+    /// is marked stale: checkpoints are refused until it is mounted again.
+    /// The answer is the error the merge returns.
+    fn follow_moved_branch(
+        &self,
+        branch: &str,
+        directory: &Path,
+        merged: &str,
+        lost: &WorkspaceError,
+    ) -> WorkspaceError {
+        let followed = self
+            .commit_id_of(&format!("refs/heads/{branch}"))
+            .and_then(|now| {
+                let tree = self.git_output(&["rev-parse", &format!("{now}^{{tree}}")])?;
+                self.update_directory(branch, directory, merged, &tree)?;
+                Ok(now)
+            });
+        match followed {
+            Ok(now) => WorkspaceError::Unavailable(format!(
+                "{lost} (branch moved under the merge; the workspace follows its head {now} \
+                 again)"
+            )),
+            Err(error) => {
+                let marked = self.mark_stale(branch);
+                WorkspaceError::Unavailable(format!(
+                    "{lost} (branch moved under the merge, and the workspace cannot follow \
+                     its head: {error}; checkpoints are refused until it is mounted again{})",
+                    marked
+                        .err()
+                        .map_or(String::new(), |error| format!(", {error}"))
+                ))
+            }
+        }
+    }
+
+    /// Where a branch's workspace is marked stale ([`Self::follow_moved_branch`]).
+    fn stale_path(&self, branch: &str) -> PathBuf {
+        self.root.join(".stale").join(branch)
+    }
+
+    fn mark_stale(&self, branch: &str) -> Result<(), WorkspaceError> {
+        let path = self.stale_path(branch);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                WorkspaceError::Unavailable(format!("create {}: {error}", parent.display()))
+            })?;
+        }
+        std::fs::write(&path, b"").map_err(|error| {
+            WorkspaceError::Unavailable(format!("write {}: {error}", path.display()))
+        })
+    }
+
+    fn clear_stale(&self, branch: &str) {
+        let _ = std::fs::remove_file(self.stale_path(branch));
+    }
+
+    /// Refuse to commit or merge a workspace marked stale.
+    fn refuse_stale(&self, branch: &str) -> Result<(), WorkspaceError> {
+        if !self.stale_path(branch).exists() {
+            return Ok(());
+        }
+        Err(WorkspaceError::Refused {
+            code: "WorkspaceStale".to_string(),
+            message: format!(
+                "the workspace of {branch} holds a merge of main its branch never took (another \
+                 writer moved the branch) and changes of its own; mount it again"
+            ),
         })
     }
 
@@ -1288,7 +1457,7 @@ impl GitWorkspace {
         base: &str,
         commit: &str,
     ) -> Result<Vec<String>, WorkspaceError> {
-        let changed = self.git_output(&[
+        let changed = self.git_listing(&[
             "diff-tree",
             "-r",
             "--name-only",
@@ -1298,7 +1467,7 @@ impl GitWorkspace {
             commit,
         ])?;
         let mut marked = Vec::new();
-        for path in changed.split('\0').filter(|path| !path.is_empty()) {
+        for path in nul_fields(&changed) {
             let output = self
                 .command()
                 .args(["cat-file", "blob", &format!("{commit}:{path}")])
@@ -1364,4 +1533,201 @@ pub fn has_conflict_block(bytes: &[u8]) -> bool {
         };
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use spawn_core::id::{BranchName, WorkspaceId};
+    use spawn_core::port::{BaseMerge, Commit, WorkspaceError, WorkspaceStore};
+
+    use super::GitWorkspace;
+
+    fn git(directory: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args([
+                "-c",
+                "user.name=spawn-test",
+                "-c",
+                "user.email=spawn@localhost",
+            ])
+            .args(arguments)
+            .output()
+            .expect("git is installed");
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A repository with `main` checked out, an agent branch with one
+    /// checkpoint mounted, and `main` moved on by a new file: a clean merge
+    /// is due. Returns the checkout, the store, the workspace and the base
+    /// directory.
+    fn due_merge(tag: &str) -> (PathBuf, GitWorkspace, WorkspaceId, PathBuf) {
+        let base = std::env::temp_dir().join(format!("spawn-git-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        std::fs::create_dir_all(&checkout).expect("create the repository");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        store.ensure_branch(&branch, None).expect("branch");
+        let workspace = store.mount(&branch).expect("mount");
+        std::fs::write(Path::new(workspace.path()).join("work.txt"), "mine\n").expect("write");
+        assert!(matches!(
+            store.commit(&workspace, "work").expect("commit"),
+            Commit::Created(_)
+        ));
+        std::fs::write(checkout.join("new.txt"), "theirs\n").expect("write on main");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "landed"]);
+        (checkout, store, workspace, base)
+    }
+
+    /// Another writer's commit on `agent_a`: its head plus `other.txt`.
+    fn other_writers_commit(checkout: &Path) -> String {
+        let index = checkout.join(".git").join("other-writer-index");
+        let with_index = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(checkout)
+                .args(arguments)
+                .env("GIT_INDEX_FILE", &index)
+                .output()
+                .expect("git is installed");
+            assert!(output.status.success(), "git {arguments:?}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        with_index(&["read-tree", "refs/heads/agent_a"]);
+        std::fs::write(checkout.join("other.txt"), "the other writer\n").expect("write");
+        let blob = git(checkout, &["hash-object", "-w", "other.txt"]);
+        std::fs::remove_file(checkout.join("other.txt")).expect("remove");
+        with_index(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},other.txt"),
+        ]);
+        let tree = with_index(&["write-tree"]);
+        git(
+            checkout,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                "refs/heads/agent_a",
+                "-m",
+                "the other writer",
+            ],
+        )
+    }
+
+    /// A git that, just before the merge commit is written (after the
+    /// directory took the merge, before the compare-and-swap), moves
+    /// `agent_a` to `other` and runs `meanwhile`.
+    fn racing_git(base: &Path, checkout: &Path, other: &str, meanwhile: &str) -> String {
+        let script = base.join("racing-git");
+        let git_dir = checkout.join(".git");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"spawn: merge main\"*)\n    git --git-dir='{}' \
+                 update-ref refs/heads/agent_a {other}\n    {meanwhile}\n    ;;\nesac\nexec git \
+                 \"$@\"\n",
+                git_dir.display()
+            ),
+        )
+        .expect("write the racing git");
+        let status = Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status()
+            .expect("chmod");
+        assert!(status.success());
+        script.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn a_merge_that_loses_the_branch_race_leaves_the_workspace_at_the_branch_head() {
+        let (checkout, store, workspace, base) = due_merge("race");
+        let directory = PathBuf::from(workspace.path());
+        let other = other_writers_commit(&checkout);
+        let racing = GitWorkspace {
+            git: racing_git(&base, &checkout, &other, ":"),
+            ..store.clone()
+        };
+        let lost = racing.merge_base(&workspace);
+        assert!(
+            matches!(&lost, Err(WorkspaceError::Unavailable(text)) if text.contains("follows its head")),
+            "{lost:?}"
+        );
+        assert_eq!(git(&checkout, &["rev-parse", "refs/heads/agent_a"]), other);
+        // The directory is the other writer's head, not the lost merge.
+        assert!(!directory.join("new.txt").exists(), "the merge went back");
+        assert_eq!(
+            std::fs::read_to_string(directory.join("other.txt")).expect("theirs"),
+            "the other writer\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("work.txt")).expect("mine"),
+            "mine\n"
+        );
+        // So the next checkpoint has nothing to commit over it, and the
+        // next merge merges into the head that won.
+        assert_eq!(
+            store.commit(&workspace, "after").expect("commit"),
+            Commit::Unchanged
+        );
+        let BaseMerge::Merged { commit, .. } = store.merge_base(&workspace).expect("merge") else {
+            panic!("main is still due");
+        };
+        let parents = git(
+            &checkout,
+            &["rev-list", "--parents", "-n1", commit.as_str()],
+        );
+        assert!(parents.contains(&other), "{parents}");
+        assert!(directory.join("new.txt").exists());
+    }
+
+    #[test]
+    fn a_lost_race_that_cannot_be_undone_refuses_checkpoints_until_a_mount() {
+        let (checkout, store, workspace, base) = due_merge("race-stale");
+        let directory = PathBuf::from(workspace.path());
+        let other = other_writers_commit(&checkout);
+        // A change the merge did not make, in a file the merge wrote.
+        let meanwhile = format!(
+            "printf 'edited\\n' > '{}'",
+            directory.join("new.txt").display()
+        );
+        let racing = GitWorkspace {
+            git: racing_git(&base, &checkout, &other, &meanwhile),
+            ..store.clone()
+        };
+        let lost = racing.merge_base(&workspace);
+        assert!(
+            matches!(&lost, Err(WorkspaceError::Unavailable(text)) if text.contains("cannot follow")),
+            "{lost:?}"
+        );
+        let refused = |result: Result<_, WorkspaceError>| matches!(result, Err(WorkspaceError::Refused { code, .. }) if code == "WorkspaceStale");
+        assert!(refused(store.commit(&workspace, "over").map(|_| ())));
+        assert!(refused(store.merge_base(&workspace).map(|_| ())));
+        assert_eq!(git(&checkout, &["rev-parse", "refs/heads/agent_a"]), other);
+
+        let branch = BranchName::new("agent_a").expect("valid branch");
+        let workspace = store.mount(&branch).expect("mount again");
+        assert_eq!(
+            store.commit(&workspace, "fresh").expect("commit"),
+            Commit::Unchanged
+        );
+    }
 }

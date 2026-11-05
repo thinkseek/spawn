@@ -666,6 +666,13 @@ if [ -f "$work/candidate/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
         verdict rejected "candidate adds build-time code (a build script target)"
         exit 0
     fi
+    # A proc-macro crate of the workspace runs at compile time too, and the
+    # deploy compiles outside any sandbox.
+    if grep -q '"proc-macro"' "$work/metadata.json"; then
+        echo "| a workspace member of the candidate is a proc-macro crate"
+        verdict rejected "candidate adds build-time code (a proc-macro crate)"
+        exit 0
+    fi
 fi
 
 # The candidate's own lints judge it (check-clippy): it may not relax them

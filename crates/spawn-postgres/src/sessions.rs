@@ -4,7 +4,7 @@
 //! ponytail: methods on the store, no port; promote to a trait when a second
 //! reader (for example an HTTP read service) appears.
 
-use spawn_core::event::{GlobalPosition, SessionSeq, Source};
+use spawn_core::event::{GlobalPosition, SessionSeq};
 use spawn_core::id::{AgentId, CommandId, ExecutionId, SessionId};
 use spawn_core::observation::Observation;
 use spawn_core::port::StoreError;
@@ -14,7 +14,7 @@ use postgres::Row;
 
 use crate::PostgresStore;
 use crate::row::{
-    agent_id, bigint, corrupt, execution_id, global_position, session_id, session_seq, source,
+    agent_id, bigint, corrupt, execution_id, global_position, session_id, session_seq,
 };
 
 /// Columns of `agent_state` that make one `SessionState`.
@@ -147,8 +147,9 @@ pub struct TimelineEntry {
     pub event_id: GlobalPosition,
     /// Execution the event belongs to.
     pub execution_id: Option<ExecutionId>,
-    /// Writer of the event.
-    pub source: Source,
+    /// Writer of the event, as stored: a source this build no longer knows
+    /// still shows.
+    pub source: String,
     /// Dotted event name.
     pub event_name: String,
     /// Event payload without the name.
@@ -272,7 +273,7 @@ impl PostgresStore {
                 session_seq: session_seq(row, "session_seq"),
                 event_id: global_position(row, "id"),
                 execution_id: execution_id(row)?,
-                source: source(row)?,
+                source: row.get("source"),
                 event_name: row
                     .get::<_, Option<String>>("event_name")
                     .unwrap_or_default(),
