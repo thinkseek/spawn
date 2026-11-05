@@ -23,8 +23,9 @@ const USAGE: &str = "usage:
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
                     [--model default|cheap]   (cheap: every model on DeepSeek)
-  spawn task accept --id N
-  spawn task reject --id N --note <what to fix>
+  spawn task accept --id N [--revision R]
+  spawn task reject --id N [--revision R] --note <what to fix>
+      (R: the report's revision as read; refused once the task has moved on)
   spawn task cancel --id N
   spawn task stages --id N   (each stage with its verdict, time, and how long since the one before)
   spawn resident propose --name <name> --charter <text>
@@ -50,6 +51,18 @@ fn text(flags: &Flags, name: &str) -> Result<String, String> {
     flags
         .get(name)
         .ok_or_else(|| format!("--{name} is required\n{USAGE}"))
+}
+
+/// The `--revision` of the report a review judged, if named: without it,
+/// the report as it is now.
+fn revision(flags: &Flags) -> Result<Option<i32>, String> {
+    flags
+        .get("revision")
+        .map(|text| {
+            text.parse()
+                .map_err(|_| format!("--revision must be a number, not {text}"))
+        })
+        .transpose()
 }
 
 /// The `--model` profile a task runs on, `default` when unset.
@@ -161,6 +174,20 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
                 None => json!([]),
             };
             let settings = Settings::from(&flags)?;
+            // spawn_mission_configure refuses it too, but only once the
+            // mission exists.
+            if settings.gate.is_some()
+                && sources
+                    .get(0)
+                    .and_then(Value::as_str)
+                    .is_some_and(|source| !source.starts_with('/'))
+            {
+                return Err(
+                    "a gate lands only on a source that is a directory on this host; agents' \
+                     branches never reach a remote one"
+                        .to_string(),
+                );
+            }
             let id = store
                 .mission_add(&text(&flags, "text")?, &sources, "human")
                 .map_err(err)?;
@@ -250,13 +277,15 @@ pub(crate) fn task(rest: &[String]) -> Result<i32, String> {
         }
         "accept" => {
             let task = id(&flags, "id")?;
-            store.task_review(task, true, "").map_err(err)?;
+            store
+                .task_review(task, true, "", revision(&flags)?)
+                .map_err(err)?;
             print(&json!({ "task": task, "accepted": true }));
         }
         "reject" => {
             let task = id(&flags, "id")?;
             store
-                .task_review(task, false, &text(&flags, "note")?)
+                .task_review(task, false, &text(&flags, "note")?, revision(&flags)?)
                 .map_err(err)?;
             print(&json!({ "task": task, "sent_back": true }));
         }

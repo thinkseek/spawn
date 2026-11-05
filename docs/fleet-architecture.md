@@ -234,7 +234,7 @@ the system. Its continuity is a design requirement, not a best effort:
 | `spawn loop` restarts or is replaced | The engine runs in tmux outside the loop's lifetime (`KillMode=process`); the next loop recovers the execution from the log and keeps observing it |
 | The engine process exits or crashes | A **liveness rule** (control layer, facts only, no model): no live execution means `resume` with the recorded native session id, with backoff; a revival whose engine is lost or exits non-zero within a minute counts as a failed one, and only an execution that stayed up starts the count over |
 | The machine reboots | tmux is gone, so the execution is `Lost`; the same rule resumes it from the native transcript |
-| A transcript Claude Code deleted (or a container took with it) | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
+| A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
 | The native session cannot be resumed (transcript lost with no copy, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
 | The supervisor hangs or loops | Its own observations (rules, then Jev) flag `stuck`; that goes to a human, never to an automatic stop |
@@ -259,7 +259,7 @@ input of a mission.
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
 | Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
-| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, 8 when the source did not answer, then escalated; a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, then escalated; a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
 **Two kinds of worker.**
@@ -574,14 +574,31 @@ the tree's own:
   scenarios directory in the controller's checkout), how tasks are accepted,
   and an optional budget:
   - `review`: the supervisor accepts, then the gate runs;
-  - `gate`: the gate alone decides;
+  - `gate`: the gate alone decides. The supervisor is not told of its
+    reports (`mission_news`) and `spawn_task_review` refuses them: a review
+    could send back the revision the gate is judging;
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
     aborted (`task.aborted`) and its worker stopped (the Stop is submitted
     before the record, so a failed record is retried with it; a Stop that
     fails is pursued and escalated by the dispatcher); an abort counts
     toward the abort halt, not as a rejection.
-- **The integrator:** `spawn integrate` (unit `spawn-integrate`). For each
-  task that is ready, it:
+
+  A gate needs a source that is a directory on the integrator's host:
+  agents' branches reach no other (storage.md, "Landing"), so a gate on a
+  URL is refused, and a mission configured with one before that is halted
+  by the integrator with the reason.
+- **Verdicts name what they judged.** A task's report has a revision (its
+  `revisions`, one more each time it is sent back). `task.reviewed` and
+  `task.gated` name the revision they judged (`spawn task accept|reject
+  --revision R`, which the supervisor's digest gives; without it, a human's
+  review takes the report as it is now). The checked functions refuse a
+  verdict on a revision the task has left, and the fold applies none: a
+  45-minute gate run on revision 0 never lands, or sends back, revision 1.
+- **The integrator:** `spawn integrate` (unit `spawn-integrate`). A mission
+  whose source it cannot fetch this pass is skipped: the mirror's last copy
+  of `main` is no reading of the source's. A mission whose source has
+  another mission's task in `landing` waits for it (the push may have moved
+  `main` before its `task.landed`). For each task that is ready, it:
   1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into
      its mirror's `refs/spawn-integrate/<agent>` (it never commits a
      workspace and never moves `refs/heads/<agent>`). A push that lags the
@@ -598,8 +615,10 @@ the tree's own:
   4. records `task.gated` (verdict, log, metric) before git moves;
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
-     verdict is `stale` and the task is judged again;
-  6. records `task.landed`.
+     verdict is `stale` and the task is judged again, unless the candidate
+     is already in `main`'s history (an earlier push of this landing whose
+     record was lost), which is a landing;
+  6. records `task.landed` (`from`, `to`).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
 - **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
@@ -624,8 +643,10 @@ the tree's own:
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
 - **A shared source has one baseline.** A landing moves the baseline of
-  every mission on that source, so RSI and fleet work on the same repository
-  don't halt each other. A deploy that moves `main` forward records
+  every mission on that source whose baseline was its `from` and that is not
+  halted (the record names them), so RSI and fleet work on the same
+  repository don't halt each other, and a move of `main` that no landing
+  explains still halts the missions that saw `main` before it. A deploy that moves `main` forward records
   `source.moved` (`spawn mission moved`, run by `deploy/deploy.sh`), and the
   missions on that source take the new `main` as their baseline instead of
   halting.

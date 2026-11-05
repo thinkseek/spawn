@@ -583,6 +583,7 @@ dependencies = [
 name = "spawn-cli"
 version = "0.1.0"
 dependencies = [
+ "postgres",
  "serde",
  "serde_json",
  "spawn-core",

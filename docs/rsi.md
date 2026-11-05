@@ -21,8 +21,8 @@ backlog、场景和门禁都从控制器的 checkout 按绝对路径读取，age
 
 1. 目标任务没有未完成的 task 时，积分器给常驻 worker 派下一个未完成的目标（`task.assigned`，带目标编号与场景路径）。一次性目标落地一次即完成；循环目标直到最近一次落地的指标达到 `target` 才完成。
 2. dispatcher 投递 brief：目标的 prompt、工作规则（只在工作区里工作，不跑 git、不提交，不改受保护路径），以及最近几次尝试的门禁裁决。
-3. worker 结束时写 `.spawn/report.md`。验收方式为 `gate`，报告直接进门禁，不经 supervisor。
-4. 积分器提交工作区，构建候选（`main` 动过就与它合并），跑门禁；先记 `task.gated`，再 CAS 推送，最后记 `task.landed`。
+3. worker 结束时写 `.spawn/report.md`。验收方式为 `gate`，报告直接进门禁，不经 supervisor：supervisor 不会收到这类报告，`spawn task accept|reject` 也拒绝它们。
+4. 积分器取 worker 推送的分支，构建候选（`main` 动过就与它合并），跑门禁；先记 `task.gated`（写明它评判的报告版本 `revision`，任务已换了版本就被拒），再 CAS 推送，最后记 `task.landed`。
 5. 被拒：任务回到 `revise`，门禁输出（最多 4000 字符）作为说明。
 6. 超预算（分钟数或工具调用数）：记 `task.aborted`，停掉 worker，计一次中止。
 
@@ -86,7 +86,7 @@ output=$("$SPAWN_BIN" version) || exit 1
 
 基础设施失败与候选失败分开计数，否则一个死掉的代理会把好补丁判成被拒；但连续 3 次中止也停机，否则候选制造基础设施失败就能绕过停止条件。
 
-裁决先写进日志，再移动 `main`，再记落地；中途崩溃时下一轮补完落地，不重跑门禁。推送时 `main` 已经动过，裁决记为 `stale`，任务重新判定。
+裁决先写进日志，再移动 `main`，再记落地；中途崩溃时下一轮补完落地，不重跑门禁。推送时 `main` 已经动过，裁决记为 `stale`，任务重新判定；但候选已在 `main` 的历史里（上一次推送成功而落地未记），就记为落地。同一个源上有别的任务处于 `landing` 时，其他任务等它落定，不据此时的 `main` 停机。拉取源失败时本轮跳过该任务，不拿镜像里旧的 `main` 当源的 `main`。
 
 ## 6. 复合
 

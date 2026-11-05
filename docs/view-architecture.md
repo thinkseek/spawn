@@ -49,7 +49,7 @@
 | `agent_status` | `session_id` | — | 投影表的判定与位置，加最近一次执行；`live` 表示该执行尚未被 Bridge 结束 |
 | `agent_timeline` | `event_id` | `session_seq`、`id` | 行内 `recorded_at_ms` |
 | `agent_judgements` | `event_id` | `session_seq` | 行内 `recorded_at_ms` |
-| `agent_executions` | `execution_id` | `started_at_ms desc` | `ended_at_ms` 为空表示 Bridge 尚未结束该执行；`exit_reported` 表示引擎已退出、待下次 tick 清理 |
+| `agent_executions` | `execution_id` | `started_at_ms desc` | `ended_at_ms` 为空表示 Bridge 尚未结束该执行；`exit_reported` 只对旧执行可能为真：旧 runner 以事件报告引擎退出；现在 runner 写 `SPAWN_EXIT_FILE`，无人再写该事件 |
 | `agent_artifacts` | `session_id` 加 `commit_id` | `session_seq` | 行内时间戳 |
 | `agent_open_tools` | `session_id` 加 `tool_use_id` | `session_seq` | started 减 completed、failed，且所属执行未结束 |
 | `agent_tasks` | `command_id` | `created_at_ms desc` | `finished_at_ms`；`prompt` 取 action 的 `prompt` 或 `text` |
@@ -75,7 +75,7 @@
 | `agent_state` | 带 `event_id`，与 `based_on_seq` 并列 | 同一 session 的 `event_id` 等于其 observation 事件 id |
 | `agent_open_tools` | `tool.started` 按 `(session_id, tool_use_id)` 左连 `tool.completed`、`tool.failed`，取未闭合，排除执行已有 Bridge 结束事件的行 | 两个 started 一个 completed，结果恰一行；执行结束后结果为空 |
 | `agent_freshness` | 每 `session_id` 取 `max(session_seq)`、`max(id)`、`max(recorded_at_ms)`、事件数 | 空会话不出现 |
-| `agent_executions` | 结束行只取 `source = 'bridge'` 的 `execution.ended`；`exit_reported` 表示存在其他来源的结束事件 | 已报告退出、Bridge 未结束时 `ended_at_ms` 为空且 `exit_reported` 为真 |
+| `agent_executions` | 结束行只取 `source = 'bridge'` 的 `execution.ended`；`exit_reported` 表示存在其他来源的结束事件（只在旧日志里有） | 旧日志里已报告退出、Bridge 未结束时 `ended_at_ms` 为空且 `exit_reported` 为真 |
 | `agent_timeline` / `agent_judgements` | 时间线排除 `source = 'observer'`，判定走 `agent_judgements` | 时间线不含 observation，判定视图只含 observation |
 
 ## 6. 权限
