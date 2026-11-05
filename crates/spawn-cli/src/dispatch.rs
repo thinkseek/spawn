@@ -429,7 +429,12 @@ pub(crate) fn step(
     }
     let now = now_ms();
     let mut host = disk.escalations(now);
-    host.extend(stall::items(&rows, &work, &load_stalls(store)?, bounds));
+    // A stall read that failed costs this pass its stall items, never its
+    // deliveries: the next pass measures the same stalls again.
+    match load_stalls(store) {
+        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
+        Err(error) => lines.push(format!("dispatch: stalls: {error}")),
+    }
     let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
