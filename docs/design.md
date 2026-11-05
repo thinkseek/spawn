@@ -331,6 +331,8 @@ git：一个裸仓库持有全部基线 commit，每个分支一份工作树。�
 
 缺少 `SPAWN_TEST_DATABASE_URL` 时 PG 测试显式 panic，不静默跳过。
 
+门禁在 base 上的 objective 结果（solved，或两次一致的 unsolved）缓存在沙箱看不到的 `~/.cache/spawn/gate-base`，键恰好是这些：base commit；场景文件的 blob；`gate.sh` 与它引入的 `pg-url.sh` 的 blob；场景目录里除场景（`*.sh`）、`protected`、`retired-tests` 以外的文件（构建钩子、`bind` 列表的文本、场景旁的帮助脚本）；`bind` 列表里每个目录的指纹（有 `.modules.yaml` 或 `.pnpm/lock.yaml` 时取它们的 blob，否则取目录下全部条目的路径、类型、大小、修改时间与链接目标，不跟随符号链接）；场景代码行（不含注释）点名的文件及它们再点名的文件（控制器的 `scripts/...`、同目录的 `<name>.sh`；经变量或 `cd` 间接进入 `scripts/` 时取整个 `scripts/`）；沙箱里在 base 树内问到的 `rustc -vV`、`cargo -V`、`node --version`、`psql -V`、`git --version`、`tmux -V`、`python3 -V`、`jq --version` 与测试服务器的 `server_version_num`。不在键里的：有安装记录的目录里未经安装的单个文件改动；候选代码留在共享测试服务器上的状态（角色、库、设置）——每个门禁一个一次性测试服务器是 GitHub issue #6，在那之前集成器一次只跑一个门禁。只有门禁在一次完整的 base 运行后写条目；读不出的条目算未命中；候选的运行从不缓存；命中会 touch 条目，`spawn-maintenance` 删除 14 天没用过的条目。
+
 ## 13. 已知限制
 
 | 项 | 限制 | 改法 |
