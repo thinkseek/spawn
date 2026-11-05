@@ -142,9 +142,14 @@ fn each_database_has_its_own_logins_and_another_install_sets_none_of_ours() {
     }
 }
 
+/// The owner's password is the one the driver connects with, however the
+/// URL spells it: as a `password=` parameter it derives the same logins as
+/// in the user info, and the migration replaces a fixed password an earlier
+/// install left. (A migration with no owner password at all turns the
+/// logins off: `lib.rs`, `a_migration_without_the_owner_password_turns_the_logins_off`.)
 #[test]
-fn a_migration_without_the_owner_password_turns_the_logins_off() {
-    let database = Database::new("roles_off", None);
+fn an_owner_password_given_as_a_parameter_is_the_same_password() {
+    let database = Database::new("roles_param", None);
     PostgresStore::connect(&database.url())
         .expect("connect")
         .migrate()
@@ -159,8 +164,6 @@ fn a_migration_without_the_owner_password_turns_the_logins_off() {
     let fixed = database_url(&login, &login, &database.name);
     assert!(can_log_in(&fixed));
 
-    // The owner without a password in the URL (it travels as a parameter,
-    // as PGPASSWORD or a peer login would leave it out of the URL).
     let Parts {
         scheme,
         user,
@@ -171,66 +174,24 @@ fn a_migration_without_the_owner_password_turns_the_logins_off() {
         .replace('&', "%26")
         .replace('=', "%3D")
         .replace('+', "%2B");
-    let passwordless = format!(
+    let as_parameter = format!(
         "{scheme}://{user}@{host}/{}?password={encoded}",
         database.name
     );
-    PostgresStore::connect(&passwordless)
+    PostgresStore::connect(&as_parameter)
         .expect("the owner connects")
         .migrate()
-        .expect("migrate without the owner's password");
+        .expect("migrate");
     assert!(!can_log_in(&fixed), "the earlier password is gone");
-    assert!(!can_log_in(&supervisor), "the derived one too");
-    let rows = admin("public")
-        .query(
-            "select rolname::text, rolcanlogin, rolpassword is null from pg_authid
-              where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1)
-              order by 1",
-            &[&database.name],
-        )
-        .expect("the logins");
-    let logins: Vec<(String, bool, bool)> = rows
-        .iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
-        .collect();
-    assert_eq!(
-        logins,
-        [
-            (format!("spawn_reader_{}", database.name), false, true),
-            (format!("spawn_supervisor_{}", database.name), false, true),
-        ]
-    );
-
-    // It says so.
-    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&warnings);
-    let mut config: postgres::Config = passwordless.parse().expect("parses");
-    config.notice_callback(move |notice| {
-        if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
-            sink.lock()
-                .expect("warnings")
-                .push(notice.message().to_string());
-        }
-    });
-    config
-        .connect(NoTls)
-        .expect("connect")
-        .batch_execute("select spawn_logins_off()")
-        .expect("turn them off again");
-    let warnings = warnings.lock().expect("warnings").clone();
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
-        warnings[0].contains("no owner password") && warnings[0].contains(&login),
-        "{warnings:?}"
+        can_log_in(&supervisor),
+        "the same derived password as before"
     );
-
-    // A migration with the password turns them on again.
-    PostgresStore::connect(&database.url())
-        .expect("connect")
-        .migrate()
-        .expect("migrate with the owner's password");
-    assert!(can_log_in(&supervisor));
-    assert!(!can_log_in(&fixed));
+    assert_eq!(
+        role_url(&as_parameter, "spawn_supervisor").expect("the login's URL"),
+        supervisor,
+        "one login URL, whichever way the owner's password is given"
+    );
 }
 
 #[test]
@@ -402,7 +363,11 @@ fn a_login_password_never_appears_in_statement_text() {
     let mut watcher = admin("public");
     let prefix = format!("alter role \"{login}\" with login password '");
     let mut seen: Option<String> = None;
-    for _ in 0..200 {
+    // Other tests' migrations hold the server-wide migration lock first, so
+    // the wait is long; it ends early once the statement shows or the
+    // migration finished without blocking.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(3);
+    while std::time::Instant::now() < deadline && !migration.is_finished() {
         seen = watcher
             .query(
                 "select query from pg_stat_activity where starts_with(query, $1)",
