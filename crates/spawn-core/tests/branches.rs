@@ -399,6 +399,7 @@ fn no_merge_while_a_turn_runs() {
         "key_input",
         CommandAction::Input {
             text: "more".to_string(),
+            tags: Vec::new(),
         },
     );
     bridge.tick().expect("type, then checkpoint the turn");
@@ -496,6 +497,7 @@ fn an_idle_execution_is_offered_main_every_thirty_seconds_and_never_in_a_turn() 
         "key_input",
         CommandAction::Input {
             text: "more".to_string(),
+            tags: Vec::new(),
         },
     );
     bridge.tick().expect("type");
@@ -537,6 +539,7 @@ fn input(store: &MemoryStore, key: &str, text: &str) {
         key,
         CommandAction::Input {
             text: text.to_string(),
+            tags: Vec::new(),
         },
     );
 }

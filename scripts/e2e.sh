@@ -325,7 +325,8 @@ pass "rule decided WORKING while the tool ran"
 unset E2E_TOOL_SECONDS
 completed_by_jev() { observation session_worker_a | jq -e '.state == "COMPLETED" and .judge == "jev"'; }
 wait_for 60 "Jev to judge worker a COMPLETED" completed_by_jev
-digest_has() { pane session_supervisor | grep -q "\[spawn:esc $1 "; }
+# A digest item reads `- <session> — <what>: …`.
+digest_has() { pane session_supervisor | grep -qF -- "- $1 — "; }
 wait_for 60 "a digest about worker a in the supervisor's pane" digest_has session_worker_a
 pass "Jev decided the idle prompt; the supervisor got the digest"
 
@@ -545,7 +546,7 @@ pass "an objective becomes a resident's task, the gate alone lands it, and a sol
 
 "$bin" submit --principal human --agent agent_resident_core --session session_resident_core \
   --key "human-$(date +%s%N)" --action '{"type":"input","text":"hello from a human"}' >/dev/null
-human_noted() { pane session_supervisor | grep -q '\[spawn:esc session_resident_core human-'; }
+human_noted() { pane session_supervisor | grep -qF -- '- session_resident_core — human message: '; }
 wait_for 60 "the human message in the supervisor's digest" human_noted
 pass "a human message to a worker reached the supervisor"
 

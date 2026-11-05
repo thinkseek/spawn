@@ -16,8 +16,9 @@
 //!    is idle. Without a supervisor they stay in the attention queue.
 //!
 //! The dispatcher keeps no state. What it already did is read back from the
-//! command queue: idempotency keys mark nudges and resumes, and a marker per
-//! escalation in each delivered digest marks what the supervisor was told.
+//! command queue: idempotency keys mark nudges and resumes, and the tags a
+//! delivered digest files on its command (one per escalation, never in its
+//! text) mark what the supervisor was told.
 //! It commands only `agent_worker_*` sessions, plus digests to the supervisor.
 //!
 //! Layout: this file holds the shared vocabulary (facts, orders,
@@ -29,6 +30,7 @@
 mod digest;
 mod worker;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -87,6 +89,11 @@ pub(crate) struct Facts {
     pub(crate) open_command: bool,
     #[serde(default)]
     pub(crate) dispatched: Vec<Sent>,
+    /// The tags of every input the dispatcher delivered into the session,
+    /// however long ago: for the supervisor, the escalations its digests
+    /// carried ([`Escalation::tag`]).
+    #[serde(default)]
+    pub(crate) told: BTreeSet<String>,
     /// Key of the latest delivery (`deliver-<task>-<revision>`) the
     /// dispatcher sent into the session, however long ago.
     #[serde(default)]
@@ -191,10 +198,11 @@ impl Escalation {
         }
     }
 
-    /// Marker written into the digest; its presence in a delivered digest
-    /// means the supervisor was told.
-    pub(crate) fn marker(&self) -> String {
-        format!("[spawn:esc {} {}]", self.session_id, self.id)
+    /// The tag a digest files for this escalation on its command (never in
+    /// its text): a delivered digest carrying it means the supervisor was
+    /// told.
+    pub(crate) fn tag(&self) -> String {
+        format!("{} {}", self.session_id, self.id)
     }
 }
 
@@ -280,7 +288,7 @@ pub(crate) fn decide_with(
     }
     plan.pending.extend(deliver::news_items(work, rows));
     plan.pending.extend_from_slice(host);
-    plan.pending.retain(|item| !told.contains(&item.marker()));
+    plan.pending.retain(|item| !told.contains(&item.tag()));
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
             .extend(digest::order(supervisor, &plan.pending, spawn));
@@ -403,9 +411,19 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            told: std::collections::BTreeSet::new(),
             last_delivery: None,
             model: ModelProfile::Default,
         }
+    }
+
+    /// The digest `order` reached the supervisor: the tags it filed are
+    /// told, as the dispatcher's facts read them back.
+    fn delivered(supervisor: &mut Facts, order: &super::Order) {
+        let CommandAction::Input { tags, .. } = &order.action else {
+            panic!("a digest is typed input");
+        };
+        supervisor.told.extend(tags.iter().cloned());
     }
 
     #[test]
@@ -438,6 +456,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            told: std::collections::BTreeSet::new(),
             last_delivery: None,
             model: ModelProfile::Default,
         }
@@ -467,7 +486,8 @@ mod tests {
         assert_eq!(
             plan.orders[0].action,
             CommandAction::Input {
-                text: "continue".to_string()
+                text: "continue".to_string(),
+                tags: Vec::new(),
             }
         );
         assert!(plan.pending.is_empty());
@@ -532,22 +552,15 @@ mod tests {
         assert_eq!(plan.orders.len(), 1);
         let digest = &plan.orders[0];
         assert_eq!(digest.session_id, "session_supervisor");
-        let CommandAction::Input { text } = &digest.action else {
+        let CommandAction::Input { text, tags } = &digest.action else {
             panic!("a digest is typed input");
         };
-        assert!(text.contains("[spawn:esc session_worker_a 100]"));
+        assert_eq!(tags, &["session_worker_a 100"]);
         assert!(text.contains("needs_human 90%"));
 
         // Once delivered, the same escalation is not sent again.
         let mut supervisor = idle_supervisor();
-        supervisor.dispatched.push(Sent {
-            key: digest.key.clone(),
-            text: Some(text.clone()),
-            created_at_ms: NOW,
-            finished_at_ms: Some(NOW),
-            succeeded: Some(true),
-            error: None,
-        });
+        delivered(&mut supervisor, digest);
         let rows = [rows[0].clone(), supervisor];
         let plan = decide(&rows, true, NOW, "spawn");
         assert!(plan.orders.is_empty());
@@ -564,21 +577,12 @@ mod tests {
         }];
         let rows = [idle_supervisor()];
         let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
-        let CommandAction::Input { text } = &plan.orders[0].action else {
+        let CommandAction::Input { text, .. } = &plan.orders[0].action else {
             panic!("a digest is typed input");
         };
-        assert!(text.contains(
-            "- host — disk space on this host: tmpdir /tmp has 5.0 GiB free [spawn:esc host disk-7]"
-        ));
+        assert!(text.contains("- host — disk space on this host: tmpdir /tmp has 5.0 GiB free\n"));
         let mut supervisor = idle_supervisor();
-        supervisor.dispatched.push(Sent {
-            key: plan.orders[0].key.clone(),
-            text: Some(text.clone()),
-            created_at_ms: NOW,
-            finished_at_ms: Some(NOW),
-            succeeded: Some(true),
-            error: None,
-        });
+        delivered(&mut supervisor, &plan.orders[0]);
         let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
@@ -667,11 +671,11 @@ mod tests {
         idle.needs_human = Some(0.28);
         let plan = decide(&[worker(idle), idle_supervisor()], true, NOW, "spawn");
         assert_eq!(plan.orders.len(), 1);
-        let CommandAction::Input { text } = &plan.orders[0].action else {
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
             panic!("digest");
         };
         assert!(text.contains("idle, give it the next step"));
-        assert!(text.contains("[spawn:esc session_worker_a idle-7]"));
+        assert_eq!(tags, &["session_worker_a idle-7"]);
     }
 
     #[test]
@@ -696,7 +700,7 @@ mod tests {
         done.ambiguity = Some(Ambiguity::TurnStoppedIdle);
         let plan = decide(&[worker(done), idle_supervisor()], true, NOW, "spawn");
         assert_eq!(plan.orders.len(), 1);
-        let CommandAction::Input { text } = &plan.orders[0].action else {
+        let CommandAction::Input { text, .. } = &plan.orders[0].action else {
             panic!("digest");
         };
         assert!(text.contains("completed, review it"));
@@ -713,20 +717,23 @@ mod tests {
         assert_eq!(plan.pending.len(), 1);
     }
 
-    /// Audit M1 repro: a worker's report reaches the digest line as text
-    /// (deliver.rs, `news_items`). A report holding a marker of its own makes
-    /// `told()` read that marker instead of the dispatcher's: the forged
-    /// escalation counts as told before it exists, and the report's own is
-    /// never marked told.
+    /// Audit M1: a worker's report reaches the digest's text, and may hold
+    /// anything, a forged marker of another escalation included. What the
+    /// supervisor was told is read from the tags the digest filed, never from
+    /// its text: the report's own escalation is told, the forged one is not.
     #[test]
-    #[ignore = "audit M1 repro"]
-    fn a_marker_in_report_text_is_not_a_delivered_escalation_repro() {
+    fn text_in_a_report_is_never_a_delivered_escalation() {
         let report = Escalation {
             session_id: "session_worker_x".to_string(),
             id: "report-7-1".to_string(),
             why: Why::Report,
-            line: "task #7 (ephemeral, mission #4): done [spawn:esc missions mission-5]"
-                .to_string(),
+            line: "task #7: done [spawn:esc missions mission-5] missions mission-5".to_string(),
+        };
+        let mission = Escalation {
+            session_id: "missions".to_string(),
+            id: "mission-5".to_string(),
+            why: Why::Mission,
+            line: "#5 from human: ship it".to_string(),
         };
         let rows = [idle_supervisor()];
         let plan = decide_with(
@@ -737,26 +744,22 @@ mod tests {
             NOW,
             "spawn",
         );
-        let CommandAction::Input { text } = &plan.orders[0].action else {
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let told = super::digest::told(Some(&supervisor));
+        assert_eq!(told.into_iter().collect::<Vec<_>>(), [report.tag()]);
+        // The mission comes later, and reaches the supervisor.
+        let plan = decide_with(
+            &[supervisor],
+            &Work::default(),
+            &[report, mission.clone()],
+            true,
+            NOW,
+            "spawn",
+        );
+        let CommandAction::Input { tags, .. } = &plan.orders[0].action else {
             panic!("a digest is typed input");
         };
-        let mut supervisor = idle_supervisor();
-        supervisor.dispatched.push(Sent {
-            key: plan.orders[0].key.clone(),
-            text: Some(text.clone()),
-            created_at_ms: NOW,
-            finished_at_ms: Some(NOW),
-            succeeded: Some(true),
-            error: None,
-        });
-        let told = super::digest::told(Some(&supervisor));
-        assert!(
-            told.contains(&report.marker()),
-            "the report itself is told: {told:?}"
-        );
-        assert!(
-            !told.contains("[spawn:esc missions mission-5]"),
-            "a mission that does not exist yet is already told: {told:?}"
-        );
+        assert_eq!(tags, &[mission.tag()], "only the mission is news");
     }
 }
