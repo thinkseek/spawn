@@ -75,8 +75,9 @@ struct State {
     workspace_calls: Vec<String>,
     /// Commits fail while set.
     commit_fails: bool,
-    /// How many of the next `submit_text` calls fail, after their text may
-    /// have reached the engine.
+    /// How many of the next `submit_staged` calls fail (the keys broke
+    /// midway), after their text may have reached the engine; the staged
+    /// text stays for a retry.
     submit_failures: u32,
     /// Commits and merges answer `WorkspaceStale` while set.
     stale: bool,
@@ -89,6 +90,8 @@ struct State {
     /// Every terminal start, in order.
     launches: Vec<Launch>,
     panes: HashMap<TerminalName, String>,
+    /// Text staged for a terminal's next submit.
+    staged: HashMap<TerminalName, String>,
     files: HashMap<String, Vec<u8>>,
     /// Engines that exit at the next liveness check: the file is written
     /// and the terminal closes then, between the Bridge's two reads.
@@ -660,11 +663,23 @@ impl TerminalHost for MemoryStore {
         Ok(())
     }
 
-    fn submit_text(
+    fn stage_text(
         &self,
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
         text: &str,
+    ) -> Result<(), TerminalError> {
+        // Like a tmux buffer: held by the server, whatever the pane.
+        self.lock()
+            .staged
+            .insert(terminal.clone(), text.to_string());
+        Ok(())
+    }
+
+    fn submit_staged(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
     ) -> Result<(), TerminalError> {
         let mut state = self.lock();
         if !state.terminals.contains(terminal) {
@@ -674,8 +689,11 @@ impl TerminalHost for MemoryStore {
             state.submit_failures -= 1;
             return Err(TerminalError("send-keys broke midway".to_string()));
         }
+        let Some(text) = state.staged.remove(terminal) else {
+            return Err(TerminalError(format!("nothing staged for {terminal}")));
+        };
         let pane = state.panes.entry(terminal.clone()).or_default();
-        pane.push_str(text);
+        pane.push_str(&text);
         pane.push('\n');
         Ok(())
     }
