@@ -172,6 +172,30 @@ impl LocalChunkStore {
     fn path_of(&self, name: &str) -> PathBuf {
         self.directory.join(&name[..2]).join(name)
     }
+
+    /// Hold the store's lock file, `<store>/.lock` (made when missing),
+    /// until the returned file is dropped: shared by a `put` or a `touch`
+    /// (they make objects young), exclusive by a removal. So a removal's
+    /// last age check and its unlink see no refresh in between: an object
+    /// a writer refreshed after a collection listed it stays.
+    fn hold(&self, exclusive: bool) -> Result<File, ChunkError> {
+        std::fs::create_dir_all(&self.directory)
+            .map_err(|error| unavailable("create", &self.directory, &error))?;
+        let path = self.directory.join(".lock");
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|error| unavailable("open", &path, &error))?;
+        let locked = if exclusive {
+            file.lock()
+        } else {
+            file.lock_shared()
+        };
+        locked.map_err(|error| unavailable("lock", &path, &error))?;
+        Ok(file)
+    }
 }
 
 fn unavailable(what: &str, path: &Path, error: &std::io::Error) -> ChunkError {
@@ -243,6 +267,7 @@ impl ChunkStore for LocalChunkStore {
     /// every manifest that names it. File and directories are fsynced.
     fn put(&self, bytes: &[u8]) -> Result<String, ChunkError> {
         let name = hash_of(bytes);
+        let _held = self.hold(false)?;
         let path = self.path_of(&name);
         let exists = std::fs::symlink_metadata(&path).is_ok();
         if exists && self.sound(&name, &path) {
@@ -343,6 +368,7 @@ impl ChunkStore for LocalChunkStore {
             return Ok(false);
         }
         let path = self.path_of(name);
+        let _held = self.hold(false)?;
         match refresh(&path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -404,8 +430,12 @@ impl ChunkStore for LocalChunkStore {
             return Ok(None);
         }
         let path = self.path_of(name);
-        // The time is read again here, just before the removal: a put since
-        // the listing made the object young, and it stays.
+        // The time is read again here, just before the removal and under the
+        // exclusive lock: a put or touch since the listing made the object
+        // young, and it stays; one that waits for the lock finds it gone and
+        // writes it again (a touch answers false, and its caller chunks the
+        // file again).
+        let _held = self.hold(true)?;
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => return Ok(None),
