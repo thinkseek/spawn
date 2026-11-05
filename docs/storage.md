@@ -40,7 +40,16 @@ head alone is the whole workspace, so everything below is a git operation.
   tree against the kept index (a stat cache: only changed files are hashed).
   Cost is proportional to what changed.
 - **Branch**: `refs/heads/<agent>`, moved by compare-and-swap on the old
-  commit.
+  commit. A checkpoint or merge removes git's own `<index>.lock` under the
+  branch's lock before it runs git on the index: one that is there was
+  left by a git that died mid-command, and would fail every later
+  checkpoint and merge of the branch.
+- **Files the agent wrote** are opened by the controller one way only
+  (`spawn_host::agent_files`): parents walked through held descriptors
+  without following a symlink, the file `O_NOFOLLOW | O_NONBLOCK`, its stat
+  from the descriptor, anything but a regular file refused, reads bounded.
+  The pending-merge marker check and the task report and delivery marks
+  (`.spawn/report.md`, `.spawn/deliveries/`) read and write that way.
 - **Fork from any commit**: a new branch at an existing commit. No data is
   copied; sub-agents fork recursively.
   `start {from}` names another agent of the same mission source (its branch
@@ -207,6 +216,9 @@ head alone is the whole workspace, so everything below is a git operation.
   unmounted. A file over the cap that `main` (or a pending merge's `main`)
   holds as a blob came from the source and stays a blob: leaving it out
   would delete it from `main` when the branch lands.
+- **Special files.** A FIFO, a socket or a device in the workspace is left
+  out of every checkpoint too, without a notice (`git add` refuses one at a
+  tracked path, which would fail every checkpoint while it is there).
 - **The agent is told once.** The checkpoint records the files it left out
   in `<root>/.oversized/<agent>` (NUL-separated: told or not, size, path);
   `WorkspaceStore::take_notices` hands out each one not yet told and marks
