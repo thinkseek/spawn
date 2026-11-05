@@ -669,6 +669,33 @@ fn the_rsi_page_reads_it(store: &PostgresStore, mission: i64, task: i64) {
     assert_eq!(gates[task.to_string()]["verdict"], "rejected");
 }
 
+/// Move a task's control records, oldest first, to `base` plus `seconds`.
+fn set_record_times(client: &mut Client, task: i64, base: i64, seconds: &[i64]) {
+    let seqs: Vec<i64> = client
+        .query(
+            "select session_seq from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'id' = $1
+                and kind -> 'detail' -> 'record' ->> 'type' like 'task.%'
+              order by session_seq",
+            &[&task.to_string()],
+        )
+        .expect("the task's records")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(seqs.len(), seconds.len());
+    for (seq, after) in seqs.iter().zip(seconds) {
+        client
+            .execute(
+                "update spawn_events set recorded_at_ms = $1
+                  where session_id = 'session_control' and session_seq = $2",
+                &[&(base + after * 1000), seq],
+            )
+            .expect("set the record's time");
+    }
+}
+
 #[test]
 fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     let (store, schema) = store("control_stages");
@@ -712,32 +739,14 @@ fn a_tasks_stages_are_its_records_in_order_with_the_time_each_took() {
     store.task_cancel(other).expect("cancel the other");
 
     // The task's records at known times, in seconds after the assignment.
-    let seconds = [0, 3385, 3881, 3900, 3960, 4560, 4570, 4748, 4748];
     let base: i64 = 1_800_000_000_000;
     let mut client = admin(&schema);
-    let seqs: Vec<i64> = client
-        .query(
-            "select session_seq from spawn_events
-              where session_id = 'session_control'
-                and kind -> 'detail' -> 'record' ->> 'id' = $1
-                and kind -> 'detail' -> 'record' ->> 'type' like 'task.%'
-              order by session_seq",
-            &[&task.to_string()],
-        )
-        .expect("the task's records")
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(seqs.len(), seconds.len());
-    for (seq, after) in seqs.iter().zip(seconds) {
-        client
-            .execute(
-                "update spawn_events set recorded_at_ms = $1
-                  where session_id = 'session_control' and session_seq = $2",
-                &[&(base + after * 1000), seq],
-            )
-            .expect("set the record's time");
-    }
+    set_record_times(
+        &mut client,
+        task,
+        base,
+        &[0, 3385, 3881, 3900, 3960, 4560, 4570, 4748, 4748],
+    );
 
     let expected = json!([
         {"stage": "assigned", "at_ms": base},
