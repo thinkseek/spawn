@@ -150,7 +150,7 @@ pub(crate) const MAX_GATES: usize = 8;
 pub(crate) fn gate_slots(
     flag: Option<String>,
     env: Option<String>,
-    per_gate: Option<String>,
+    per_gate: Option<&str>,
 ) -> Result<usize, String> {
     let Some((name, text)) = flag
         .map(|text| ("--gates", text))
@@ -161,7 +161,7 @@ pub(crate) fn gate_slots(
     match text.trim().parse::<usize>() {
         Ok(1) => Ok(1),
         Ok(slots) if (2..=MAX_GATES).contains(&slots) => {
-            if per_gate.as_deref().map(str::trim) == Some("1") {
+            if per_gate.map(str::trim) == Some("1") {
                 Ok(slots)
             } else {
                 Err(format!(
@@ -449,7 +449,7 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     let gates = gate_slots(
         flags.get("gates"),
         crate::config::env_value("SPAWN_INTEGRATE_GATES"),
-        crate::config::env_value(PER_GATE_SERVER),
+        crate::config::env_value(PER_GATE_SERVER).as_deref(),
     )
     .map_err(|error| format!("{error}\n{USAGE}"))?;
     let integrator = Integrator::new(root, gate, gate_env, gates);
@@ -1404,7 +1404,7 @@ mod tests {
     #[test]
     fn the_gate_cap_is_one_and_more_needs_a_server_per_gate() {
         use super::{DEFAULT_GATES, MAX_GATES, gate_slots};
-        let per_gate = || Some("1".to_string());
+        let per_gate = || Some("1");
         assert_eq!(gate_slots(None, None, None), Ok(1));
         assert_eq!(DEFAULT_GATES, 1);
         assert_eq!(gate_slots(Some("1".into()), None, None), Ok(1));
@@ -1416,14 +1416,7 @@ mod tests {
                     .is_err_and(|error| error.contains("SPAWN_TEST_DATABASE_PER_GATE=1")),
                 "{flag:?} {env:?}: {refused:?}"
             );
-            assert!(
-                gate_slots(
-                    flag.map(Into::into),
-                    env.map(Into::into),
-                    Some("yes".into())
-                )
-                .is_err()
-            );
+            assert!(gate_slots(flag.map(Into::into), env.map(Into::into), Some("yes")).is_err());
         }
         assert_eq!(gate_slots(None, Some("3".into()), per_gate()), Ok(3));
         assert_eq!(
