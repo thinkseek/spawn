@@ -131,6 +131,12 @@ pub enum CheckpointReason {
     /// starts or resumes, or into its mounted workspace between turns (a
     /// `conflict` verdict, a task's delivery).
     BaseMerged,
+    /// The work of a cancelled task was set aside: a commit on top of the
+    /// branch whose tree is the checkpoint the task started from, written by
+    /// the dispatcher while nothing of the agent ran
+    /// ([`crate::port::WorkspaceStore::set_aside`]). The work stays in its
+    /// parent.
+    SetAside,
 }
 
 /// How an execution ended.
