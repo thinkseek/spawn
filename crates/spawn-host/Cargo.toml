@@ -1,6 +1,6 @@
 [package]
 name = "spawn-host"
-description = "tmux and LayerFS CLI adapters for Spawn."
+description = "Host adapters for Spawn: tmux terminals, git workspaces, the local chunk store and the transcript archive."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
