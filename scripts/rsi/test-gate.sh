@@ -956,7 +956,8 @@ for planted_path in web/node_modules/.bin/tsc target/debug/spawn crates/lib/targ
     expect "a committed $planted_path is refused" "$(judge "$planted")" 'node_modules/ or target/'
 done
 
-# 13. Under web/ only web/src/ and web/index.html may change: a new
+# 13. The controller's list protects web/ but web/src/ and web/index.html
+# (an exception line, `!<prefix>`): a new
 # vite.config.js (loaded before vite.config.ts) or postcss.config.js would
 # run as the owner at deploy.
 for web_path in web/vite.config.js web/postcss.config.js web/.postcssrc.json; do
@@ -965,7 +966,7 @@ for web_path in web/vite.config.js web/postcss.config.js web/.postcssrc.json; do
     mkdir -p "$seed/web"
     printf 'export default {}\n' >"$seed/$web_path"
     web_config=$(commit "web-${web_path#web/}")
-    expect "a new $web_path is refused" "$(judge "$web_config")" 'outside web/src/ and web/index.html'
+    expect "a new $web_path is refused" "$(judge "$web_config" "$listed/007.sh" "$listed")" 'candidate touches protected paths'
 done
 branch web-src
 printf 'two\n' >"$seed/value"
@@ -973,7 +974,7 @@ mkdir -p "$seed/web/src"
 printf 'export const x = 1;\n' >"$seed/web/src/app.ts"
 printf '<!doctype html>\n' >"$seed/web/index.html"
 web_src=$(commit web-src)
-expect "web/src/ and web/index.html may change" "$(judge "$web_src")" 'exit=0 {"verdict":"accepted"}'
+expect "web/src/ and web/index.html may change" "$(judge "$web_src" "$listed/007.sh" "$listed")" 'exit=0 {"verdict":"accepted"}'
 
 # 14. A proc-macro crate outside the workspace (a path dependency the
 # workspace does not include) runs at compile time too: refused when new or
