@@ -37,6 +37,7 @@ struct Rig {
     failing_appends: Mutex<Vec<Rule>>,
     failing_finishes: Mutex<usize>,
     typed: Mutex<Vec<String>>,
+    staged: Mutex<Option<String>>,
     outcomes: Mutex<Vec<(CommandId, Outcome)>>,
 }
 
@@ -53,6 +54,7 @@ impl Rig {
             failing_appends: Mutex::default(),
             failing_finishes: Mutex::default(),
             typed: Mutex::default(),
+            staged: Mutex::default(),
             outcomes: Mutex::default(),
         })
     }
@@ -264,14 +266,25 @@ impl TerminalHost for Rig {
         self.store.start(launch)
     }
 
-    fn submit_text(
+    fn stage_text(
         &self,
         terminal: &TerminalName,
         workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError> {
-        self.typed.lock().expect("typed").push(text.to_string());
-        self.store.submit_text(terminal, workspace, text)
+        *self.staged.lock().expect("staged") = Some(text.to_string());
+        self.store.stage_text(terminal, workspace, text)
+    }
+
+    fn submit_staged(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        if let Some(text) = self.staged.lock().expect("staged").take() {
+            self.typed.lock().expect("typed").push(text);
+        }
+        self.store.submit_staged(terminal, workspace)
     }
 
     fn send_keys(
