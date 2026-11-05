@@ -1273,6 +1273,10 @@ begin
         -- Its queued tasks are dropped.
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at
          where agent_id = 'agent_resident_' || (p_record ->> 'name') and state in ('assigned', 'revise');
+    when 'host.disk' then
+        -- A fact about this host's free disk (spawn loop, crate disk.rs):
+        -- read from the log, folded into no table.
+        null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
         case p_record ->> 'table'
@@ -1758,6 +1762,33 @@ create index if not exists spawn_events_control_record
     on spawn_events ((kind -> 'detail' -> 'record' ->> 'id'), session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded';
 
+-- The loop's disk records (`host.disk`, owner only): free space on a path
+-- the fleet writes to fell under the warning threshold (`low`) or came back
+-- (`recovered`). One record per crossing; the loop reads the latest per path
+-- back from the log after a restart.
+create or replace function spawn_host_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record host facts', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' is distinct from 'host.disk' then
+        raise exception 'not a host record: %', p_record ->> 'type';
+    end if;
+    if p_record ->> 'state' not in ('low', 'recovered') or p_record ->> 'path' is null
+       or jsonb_typeof(p_record -> 'free_bytes') is distinct from 'number' then
+        raise exception 'a host.disk record has a path, free_bytes and state low or recovered: %', p_record;
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The `host.disk` records, found without reading the rest of the stream.
+create index if not exists spawn_events_host_disk
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
+
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
 -- `stage` is the record type without `task.`; `verdict` is a gate's verdict
 -- or a review's (`accepted`, `rejected`); `took_ms` is the time since the
@@ -1835,7 +1866,7 @@ begin
         'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
-        'spawn_source_moved(text, text, text)',
+        'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());

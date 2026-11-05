@@ -500,15 +500,16 @@ controller. Missions, tasks, residents and landings are events in
   `mission.halted`, `mission.resumed`, `source.moved`, `task.assigned`,
   `task.delivered`, `task.reported`, `task.reviewed`, `task.cancelled`,
   `task.gated`, `task.landed`, `task.aborted`, `resident.proposed`,
-  `resident.approved`, `resident.retired`, `legacy.imported`.
+  `resident.approved`, `resident.retired`, `legacy.imported`, `host.disk`.
   `legacy.imported` carries one row of the mission tables as it stood
   before the control stream existed: a database with mission rows and no
   records imports them once, on migration.
 - **Who writes it:** only the checked mission functions, through
   `spawn_control_record`. The integrator's records (`task.gated`,
-  `task.landed`, `task.aborted`, `mission.halted`) and `source.moved` need
-  the owner's login. The restricted logins write no events at all:
-  `spawn_append` refuses them.
+  `task.landed`, `task.aborted`, `mission.halted`), `source.moved` and the
+  loop's `host.disk` (through `spawn_host_record`; folded into no table,
+  [storage.md](storage.md#disk-room)) need the owner's login. The
+  restricted logins write no events at all: `spawn_append` refuses them.
 - **The tables are a projection.** `spawn_control_apply(record)` is the only
   writer of `mission_*`, and it runs in the same transaction as the append.
   `spawn_control_refold()` rebuilds the tables from the log, and a test
