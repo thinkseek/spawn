@@ -2056,6 +2056,13 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
+-- The control records that name one task or mission (`record ->> 'id'`),
+-- newest last: a task's stages and the dispatcher's stall facts
+-- (`STALL_FACTS`) find them without reading the rest of the stream.
+create index if not exists spawn_events_control_record
+    on spawn_events (((kind -> 'detail' -> 'record' ->> 'id')), session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded';
+
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
 -- `stage` is the record type without `task.`; `verdict` is a gate's verdict
 -- or a review's (`accepted`, `rejected`); `took_ms` is the time since the
