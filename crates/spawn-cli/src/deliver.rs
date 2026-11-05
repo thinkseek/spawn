@@ -917,6 +917,8 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            turn_ended: idle,
+            checkpoint: None,
         }
     }
 
