@@ -190,17 +190,13 @@ section() {
     stage_open gate "$1"
     echo "| == $1"
 }
-<<<<<<< c6453bc8cf38a32f1691a9404d2ff6d8fcfbac65
-trap 'stage_close aborted; rm -rf "$work"' EXIT
+trap 'stage_close aborted; gate_times; rm -rf "$work"' EXIT
 # A signal ends the gate through its EXIT trap, so the work directory goes
 # too, whatever the shell (bash runs EXIT on a fatal signal, dash does not).
 # SIGKILL leaves the directory: spawn-maintenance.timer removes it.
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-=======
-trap 'stage_close aborted; gate_times; rm -rf "$work"' EXIT
->>>>>>> 594fb7ba3ae41807b95f827fb5a4a5e261d93344
 # Sandboxed git reads this, never the owner's ~/.gitconfig.
 cat >"$work/gitconfig" <<'EOF'
 [user]
