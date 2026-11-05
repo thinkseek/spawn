@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 postgres.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 
 [dev-dependencies]
 spawn-core = { workspace = true, features = ["testing"] }

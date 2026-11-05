@@ -81,7 +81,7 @@ assert_eq "$(scalar "select session_seq from spawn_events where source_event_id 
 
 # --- --principal is recorded, and keys are scoped per principal -----------
 # The same key under another principal is a different command.
-capture "$SPAWN_BIN" submit --principal alice --agent agent_001 \
+capture "$SPAWN_BIN" submit --principal alice --agent agent_002 \
     --session session_002 --key key-1 --action '{"type":"stop"}'
 assert_eq "$status" 0 "principal submit exit"
 third=$(out | sed -n 's/^command=//p')
@@ -99,7 +99,7 @@ assert_eq "$(scalar "select source_event_id from spawn_events where source_event
     "cmd_${third}:accepted" "principal event source key"
 
 # Repeating it under the same principal returns that same id.
-capture "$SPAWN_BIN" submit --principal alice --agent agent_001 \
+capture "$SPAWN_BIN" submit --principal alice --agent agent_002 \
     --session session_002 --key key-1 --action '{"type":"stop"}'
 assert_eq "$status" 0 "principal repeat exit"
 assert_eq "$(out)" "command=$third" "principal repeat returns the same id"
