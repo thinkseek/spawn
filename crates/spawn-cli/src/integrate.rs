@@ -1898,11 +1898,17 @@ mod tests {
         assert_eq!(first["min_gb"], 10);
         assert_eq!(first["escalate"], false, "the first of a run");
         waiting.gate_room_since_ms = Some(0);
-        let at = |minutes: i64| no_room(&waiting, 1, 10, "/t", "", minutes * MINUTE)["escalate"].clone();
-        assert_eq!(at(120), false, "two hours exactly is not more than two");
-        assert_eq!(at(121), true);
+        let at = |mission: &Mission, minutes: i64| {
+            no_room(mission, 1, 10, "/t", "", minutes * MINUTE)["escalate"].clone()
+        };
+        assert_eq!(
+            at(&waiting, 120),
+            false,
+            "two hours exactly is not more than two"
+        );
+        assert_eq!(at(&waiting, 121), true);
         waiting.gate_room_escalated = true;
-        assert_eq!(at(500), false, "told once per run");
+        assert_eq!(at(&waiting, 500), false, "told once per run");
         // And it never counts toward the halt the mission already nears.
         assert_eq!(halt_reason(&waiting, 0), None);
     }
@@ -2362,10 +2368,17 @@ mod database_tests {
         assert_eq!(after.gate_room_waits, 5);
         assert!(after.gate_room_escalated);
         assert!(after.gate_room_since_ms.is_some() && after.gate_room_last_ms.is_some());
-        assert_eq!(after.tasks[0].state, spawn_core::mission::TaskState::Reported);
+        assert_eq!(
+            after.tasks[0].state,
+            spawn_core::mission::TaskState::Reported
+        );
         assert!(after.halted.is_none());
         let escalations = db.store.gate_room_escalations(0).expect("escalations");
-        assert_eq!(escalations.as_array().map(Vec::len), Some(1), "{escalations}");
+        assert_eq!(
+            escalations.as_array().map(Vec::len),
+            Some(1),
+            "{escalations}"
+        );
         assert_eq!(escalations[0]["mission"], mission);
         assert_eq!(escalations[0]["free_kb"], 1024);
 
@@ -2426,9 +2439,16 @@ mod database_tests {
         integrator.pass_on(&db.store).expect("a pass");
         integrator.pass_on(&db.store).expect("a second pass");
         let runs = std::fs::read_to_string(base.join("runs")).expect("the gate ran");
-        assert_eq!(runs.lines().count(), 1, "the second pass waits out the backoff");
+        assert_eq!(
+            runs.lines().count(),
+            1,
+            "the second pass waits out the backoff"
+        );
         let after = gated(&db, mission);
-        assert_eq!(after.tasks[0].state, spawn_core::mission::TaskState::Reported);
+        assert_eq!(
+            after.tasks[0].state,
+            spawn_core::mission::TaskState::Reported
+        );
         assert_eq!((after.gate_aborts, after.gate_rejections), (0, 0));
         assert_eq!(after.gate_room_waits, 1);
         let record: Value = db
