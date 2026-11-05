@@ -1,92 +1,36 @@
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, GanttChart, List } from "lucide-react";
 import { Fragment, useLayoutEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 
 import type { TimelineEvent } from "../api";
-import { clockTime, formatDuration } from "../format";
+import { eventTone, fullText, pairs } from "../eventFormat";
+import { clockTime } from "../format";
+import { TraceView } from "./trace/TraceView";
 import { EmptyState, cx } from "./ui";
 
-const BOTTOM_SLACK_PX = 56;
+type Mode = "trace" | "list";
+const MODE_KEY = "spawn.timeline.mode";
 
-const COLUMNS =
-  "md:grid-cols-[3rem_4.5rem_4.5rem_minmax(9rem,13rem)_minmax(0,1fr)]";
-
-/** Marker color by event family; neutral unless the event means something. */
-function eventTone(name: string): string {
-  if (/fail|error|lost|crash/i.test(name)) return "bg-destructive";
-  if (name === "artifact.committed") return "bg-success";
-  if (name.startsWith("execution.") || name.startsWith("session.")) {
-    return "bg-info";
-  }
-  if (name.startsWith("notification.") || name.startsWith("screen.")) {
-    return "bg-warning";
-  }
-  return "bg-faint-foreground/60";
-}
-
-function short(value: unknown): string {
-  if (typeof value === "string") {
-    if (/^[0-9a-f]{40}$/.test(value)) return value.slice(0, 7);
-    // Opaque ids (toolu_01Ab…) only need their tail to be told apart.
-    const id = /^([a-z]+_)([A-Za-z0-9]{16,})$/.exec(value);
-    if (id) return `${id[1]}…${id[2].slice(-6)}`;
-    return value;
-  }
-  if (value === null || value === undefined) return "null";
-  if (typeof value === "object") {
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  }
-  return String(value);
-}
-
-/** Flatten one level of nesting into key/value pairs. */
-function pairs(detail: unknown): Array<[string, string]> {
-  if (detail === null || typeof detail !== "object" || Array.isArray(detail)) {
-    return detail == null ? [] : [["", short(detail)]];
-  }
-  const out: Array<[string, string]> = [];
-  for (const [key, value] of Object.entries(detail as Record<string, unknown>)) {
-    if (value === null) continue;
-    if (key.endsWith("_ms") && typeof value === "number") {
-      out.push([key.replace(/_ms$/, ""), formatDuration(value)]);
-    } else if (value && typeof value === "object" && !Array.isArray(value)) {
-      for (const [inner, innerValue] of Object.entries(
-        value as Record<string, unknown>,
-      )) {
-        out.push([`${key}.${inner}`, short(innerValue)]);
-      }
-    } else {
-      out.push([key, short(value)]);
-    }
-  }
-  return out;
-}
-
-function fullText(detail: unknown): string {
+function savedMode(): Mode {
   try {
-    return typeof detail === "string"
-      ? detail
-      : JSON.stringify(detail, null, 2);
+    return window.localStorage.getItem(MODE_KEY) === "list" ? "list" : "trace";
   } catch {
-    return String(detail);
+    return "trace";
   }
 }
 
+/** A session's events as a trace (spans on a time axis) or as the plain
+ * list, for searching and copying. The choice is remembered. */
 export function Timeline({ events }: { events: TimelineEvent[] }) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const stickToBottom = useRef(true);
-  const [following, setFollowing] = useState(true);
-  const lastEventId = events.at(-1)?.event_id ?? null;
-
-  useLayoutEffect(() => {
-    const element = scrollRef.current;
-    if (element && stickToBottom.current) {
-      element.scrollTop = element.scrollHeight;
+  const [mode, setMode] = useState<Mode>(savedMode);
+  const choose = (next: Mode) => {
+    setMode(next);
+    try {
+      window.localStorage.setItem(MODE_KEY, next);
+    } catch {
+      // Private mode: the choice lasts for this page only.
     }
-  }, [lastEventId, events.length]);
+  };
 
   if (events.length === 0) {
     return (
@@ -99,8 +43,68 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
     );
   }
 
+  const toggle = <ModeToggle mode={mode} onChange={choose} />;
+  return mode === "trace" ? (
+    <TraceView events={events} header={toggle} />
+  ) : (
+    <EventList events={events} header={toggle} />
+  );
+}
+
+function ModeToggle({ mode, onChange }: { mode: Mode; onChange: (mode: Mode) => void }) {
+  const options: Array<{ id: Mode; label: string; icon: ReactNode }> = [
+    { id: "trace", label: "Trace", icon: <GanttChart size={13} /> },
+    { id: "list", label: "List", icon: <List size={13} /> },
+  ];
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Timeline view"
+      className="inline-flex shrink-0 items-center rounded-md bg-muted p-0.5"
+    >
+      {options.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          role="radio"
+          aria-checked={mode === option.id}
+          onClick={() => onChange(option.id)}
+          className={cx(
+            "inline-flex h-6 items-center gap-1.5 rounded-[5px] px-2 text-caption font-medium transition-colors",
+            mode === option.id
+              ? "bg-surface-selected text-foreground shadow-[var(--surface-shadow)]"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {option.icon}
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const BOTTOM_SLACK_PX = 56;
+
+const COLUMNS =
+  "md:grid-cols-[3rem_4.5rem_4.5rem_minmax(9rem,13rem)_minmax(0,1fr)]";
+
+function EventList({ events, header }: { events: TimelineEvent[]; header: ReactNode }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+  const [following, setFollowing] = useState(true);
+  const lastEventId = events.at(-1)?.event_id ?? null;
+
+  useLayoutEffect(() => {
+    const element = scrollRef.current;
+    if (element && stickToBottom.current) {
+      element.scrollTop = element.scrollHeight;
+    }
+  }, [lastEventId, events.length]);
+
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
+      <div className="flex h-11 shrink-0 items-center px-4 sm:px-5">{header}</div>
       <div
         ref={scrollRef}
         onScroll={() => {
