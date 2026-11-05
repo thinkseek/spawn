@@ -345,10 +345,10 @@ start_worker session_worker_b "E2E:STALL do half"
 nudges() {
   tail_of session_worker_b | jq -r '[.commands[]? | select(.principal == "spawn-dispatch")] | length'
 }
-nudged_once() { [ "$(nudges)" -eq 1 ]; }
+nudged_once() { [ "$(nudges)" -eq 1 ] 2>/dev/null; }
 # At least one: a second nudge between two polls is checked below, as such,
 # not as a timeout.
-nudged() { [ "$(nudges)" -ge 1 ]; }
+nudged() { [ "$(nudges)" -ge 1 ] 2>/dev/null; }
 wait_for 60 "a nudge into worker b" nudged
 finished_after_nudge() { pane session_worker_b | grep -q 'finished after continue'; }
 wait_for 30 "worker b to finish after the nudge" finished_after_nudge
