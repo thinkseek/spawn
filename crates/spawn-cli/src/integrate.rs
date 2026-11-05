@@ -1390,7 +1390,7 @@ mod tests {
             main
         );
         assert!(root.join("agent_clean").join("added.txt").exists());
-        let note = delivery_note(&merge).expect("the brief says so");
+        let note = delivery_note(&merge, &[]).expect("the brief says so");
         assert!(
             note.contains("added.txt") && note.contains("without a conflict"),
             "{note}"
@@ -1400,7 +1400,27 @@ mod tests {
             Merge::Current,
             "a branch that contains main is left alone"
         );
-        assert_eq!(delivery_note(&Merge::Current), None);
+        // The merge is read back from the branch: a record whose append
+        // failed is written at the next merge (causality audit #8).
+        assert_eq!(
+            crate::main_merge::head_merge(&mirror, "agent_clean"),
+            Some(merge.clone())
+        );
+        assert_eq!(
+            crate::main_merge::head_merge(&mirror, "agent_marked"),
+            None,
+            "a checkpoint is no merge"
+        );
+        assert_eq!(delivery_note(&Merge::Current, &[]), None);
+        // The first delivery was refused before typing (a pane not ready);
+        // its retry finds main already in, and still tells what the
+        // recorded merge changed (causality audit #7).
+        let note = delivery_note(&Merge::Current, &["added.txt".to_string()])
+            .expect("the retry's brief says so");
+        assert!(
+            note.contains("added.txt") && note.contains("without a conflict"),
+            "{note}"
+        );
 
         let merge = into_workspace(&store, &mirror, &root, "agent_marked");
         assert_eq!(
@@ -1410,7 +1430,7 @@ mod tests {
             }
         );
         assert!(store.has_pending_merge("agent_marked"));
-        let note = delivery_note(&merge).expect("the brief says so");
+        let note = delivery_note(&merge, &[]).expect("the brief says so");
         assert!(
             note.contains("README.md") && note.contains("conflict markers"),
             "{note}"

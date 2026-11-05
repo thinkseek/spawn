@@ -168,17 +168,63 @@ pub(crate) fn merge_main(
         Arc::clone(store),
         factory,
     );
-    let merge = into_workspace(&workspaces, &mirror, root, agent);
     let project = workspaces.project().to_string();
-    // Dropping the store pushes the merge commit it marked.
-    drop(workspaces);
+    // A merge whose record failed (here, or the Bridge's at a start) is
+    // recorded from the branch now; one already recorded is a no-op.
+    if let Some(earlier) = head_merge(&mirror, agent)
+        && let Err(error) = record(store, &project, agent, session, "-", &earlier)
+    {
+        eprintln!("merge main into {agent}: record the earlier merge: {error}");
+    }
+    let merge = into_workspace(&workspaces, &mirror, root, agent);
     let head = GitWorkspace::new(&mirror, root)
         .commit_id_of(&format!("refs/heads/{agent}"))
         .unwrap_or_else(|_| "-".to_string());
+    // Recorded before the push: the published head has its record.
     if let Err(error) = record(store, &project, agent, session, &head, &merge) {
-        eprintln!("merge main into {agent}: record: {error}");
+        eprintln!("merge main into {agent}: record (retried at its next merge): {error}");
     }
+    // Dropping the store pushes the merge commit it marked.
+    drop(workspaces);
     merge
+}
+
+/// The head of `agent`'s branch in `mirror` as a clean merge of main, when it
+/// is one (two parents, made by [`WorkspaceStore::merge_base`] or the
+/// Bridge's start merge: "spawn: merge main …"): the commit and the files it
+/// changed against the branch's own parent.
+pub(crate) fn head_merge(mirror: &Path, agent: &str) -> Option<Merge> {
+    let path = mirror.to_string_lossy();
+    let shown = sources::git(&[
+        "--git-dir",
+        &path,
+        "log",
+        "-1",
+        "--format=%H%n%P%n%s",
+        &format!("refs/heads/{agent}"),
+        "--",
+    ])
+    .ok()?;
+    let mut lines = shown.lines();
+    let (commit, parents, subject) = (lines.next()?, lines.next()?, lines.next()?);
+    let parents: Vec<&str> = parents.split_whitespace().collect();
+    if parents.len() != 2 || !subject.starts_with("spawn: merge main ") {
+        return None;
+    }
+    let files = sources::git(&[
+        "--git-dir",
+        &path,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        parents[0],
+        commit,
+    ])
+    .ok()?;
+    Some(Merge::Merged {
+        commit: commit.to_string(),
+        files: files.lines().map(str::to_string).collect(),
+    })
 }
 
 /// The event that records `merge` in the agent's session, if it changed or
@@ -310,14 +356,25 @@ pub(crate) fn conflict_note(main: &str, merge: &Merge) -> String {
 }
 
 /// What a task's brief says about `merge`, done right before the task was
-/// typed in; nothing when main was already in.
-pub(crate) fn delivery_note(merge: &Merge) -> Option<String> {
+/// typed in, and about the clean merges recorded since the worker was last
+/// typed a delivery (`untold`: the files they changed,
+/// [`PostgresStore::untold_merges`]). A delivery refused before typing
+/// (a pane not ready) is retried, and the retry's merge finds main already
+/// in: what the first one merged is told from its record. Nothing when no
+/// merge is untold.
+pub(crate) fn delivery_note(merge: &Merge, untold: &[String]) -> Option<String> {
     let opening = "Before this task, the source's main was merged into your workspace";
-    match merge {
-        Merge::Merged { files, .. } => Some(format!(
+    let clean = |files: &[String]| {
+        let mut files: Vec<String> = untold.iter().chain(files).cloned().collect();
+        files.sort();
+        files.dedup();
+        format!(
             "{opening}, without a conflict; it changed {}. Re-read those files before editing.",
-            shown(files)
-        )),
+            shown(&files)
+        )
+    };
+    match merge {
+        Merge::Merged { files, .. } => Some(clean(files)),
         Merge::Marked { files } => Some(format!(
             "{opening}, and these files carry conflict markers: {}. {RESOLVE_MARKERS} Resolve \
              them first.",
@@ -327,7 +384,9 @@ pub(crate) fn delivery_note(merge: &Merge) -> Option<String> {
             "{opening}, but it conflicts with your branch. {} Do that first.",
             unmarked_instructions(files, copied)
         )),
-        Merge::Current | Merge::NotMounted | Merge::Failed(_) => None,
+        Merge::Current | Merge::NotMounted | Merge::Failed(_) => {
+            (!untold.is_empty()).then(|| clean(&[]))
+        }
     }
 }
 

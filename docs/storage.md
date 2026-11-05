@@ -101,10 +101,17 @@ head alone is the whole workspace, so everything below is a git operation.
     its note names the files that now carry markers;
   - the dispatcher's delivery of a task typed into a live worker, so the
     task starts from main and its text says what the merge did. (A start or
-    resume mounts later; the Bridge's clean merge above covers it.)
+    resume mounts later; the Bridge's clean merge above covers it.) The
+    text names the files of every `base_merged` record since the last
+    delivery the worker was typed, not only this attempt's merge: a
+    delivery refused before typing (a pane not ready) is retried, and the
+    retry's merge finds main already in.
 
   A clean merge is a merge commit recorded as `artifact.committed`
-  (`base_merged`, its files) and pushed. A content conflict writes the merge
+  (`base_merged`, its files) and then pushed. A record whose append failed
+  is written at the agent's next merge, read back from the branch head (a
+  two-parent "spawn: merge main" commit; the record's key makes a repeat a
+  no-op). A content conflict writes the merge
   with conflict markers into the directory and leaves `main` pending under
   `<root>/.merge/<agent>`: the checkpoint after the last marker is gone
   takes `main` as its second parent (a checkpoint with markers still in is a
