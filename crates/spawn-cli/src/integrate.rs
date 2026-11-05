@@ -263,6 +263,10 @@ pub(crate) struct Task {
     /// record holds it: the landing's message summarises it.
     #[serde(default)]
     pub(crate) report: Option<String>,
+    /// When it last changed state (reported, accepted, or a verdict that
+    /// left it ready): how long it has waited for a gate.
+    #[serde(default)]
+    pub(crate) updated_at_ms: i64,
 }
 
 impl Mission {
@@ -515,6 +519,9 @@ struct Integrator {
     /// Tasks already said to wait for a gate: said again only once they
     /// have had one.
     waiting: RefCell<std::collections::HashSet<i64>>,
+    /// When each mission's last judging ended (this process's reading):
+    /// its next task waits for a gate from then.
+    last_judged: RefCell<std::collections::HashMap<i64, i64>>,
 }
 
 /// What a judging needs, owned, so it runs on a thread of its own.
@@ -524,6 +531,17 @@ struct Judge {
     gate: PathBuf,
     /// The gate's whole environment ([`gate::gate_env`]).
     gate_env: Vec<(String, String)>,
+}
+
+/// A task a mission may judge now, waiting for a gate.
+struct Ready {
+    mission: i64,
+    source: String,
+    mirror: PathBuf,
+    main: String,
+    scenarios: PathBuf,
+    count: u32,
+    task: Task,
 }
 
 /// One judging in flight.
@@ -546,6 +564,7 @@ impl Integrator {
             running: RefCell::new(Vec::new()),
             held: RefCell::new(None),
             waiting: RefCell::new(std::collections::HashSet::new()),
+            last_judged: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -624,132 +643,199 @@ impl Integrator {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
+        // Every mission gets its step in every pass: halts, budgets,
+        // landings and objective assignments never wait for another
+        // mission's gate. A landing moves its source's main and the
+        // baselines of the missions on it, so the rest of that source waits
+        // for the next pass, which reads everything again; other sources go
+        // on.
+        let mut moved = std::collections::HashSet::new();
+        let mut ready = Vec::new();
         for mission in &missions {
-            match self.mission(store, &missions, mission) {
-                // Whatever one mission did may move another's view (a shared
-                // source's main): the next pass reads everything again.
-                Ok(true) => return Ok(()),
+            let source = mission.source.clone();
+            if source.as_ref().is_some_and(|source| moved.contains(source)) {
+                continue;
+            }
+            match self.mission(store, &missions, mission, &mut ready) {
+                Ok(true) => {
+                    if let Some(source) = source {
+                        moved.insert(source);
+                    }
+                }
                 Ok(false) => {}
                 Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
             }
         }
+        ready.retain(|candidate: &Ready| !moved.contains(&candidate.source));
+        self.start_ready(store, ready);
         Ok(())
     }
 
-    /// One mission's step. True when it recorded anything. `missions` is
-    /// every mission of the pass, for the landings on a shared source.
+    /// One mission's step. True when it landed a task (its source's main
+    /// moved). A ready task it may judge goes to `ready`; the gates are
+    /// given out after every mission had its step ([`Self::start_ready`]).
+    /// `missions` is every mission of the pass, for the landings on a
+    /// shared source.
     fn mission(
         &self,
         store: &Arc<PostgresStore>,
         missions: &[Mission],
         mission: &Mission,
+        ready: &mut Vec<Ready>,
     ) -> Result<bool, String> {
-        if mission.halted.is_some() || self.busy(mission) {
+        if mission.halted.is_some() {
             return Ok(false);
         }
         let scenarios = pinned(Path::new(&mission.gate));
         let count = gate::count_scenarios(&scenarios)?;
         if let Some(reason) = halt_reason(mission, count) {
-            return halt(store, mission, &reason).map(|()| true);
+            return halt(store, mission, &reason).map(|()| false);
         }
-        if Self::enforce_budget(store, mission)? {
-            return Ok(true);
-        }
+        Self::enforce_budget(store, mission)?;
         let Some(source) = mission.source.as_deref() else {
             return Ok(false);
         };
         if let Some(reason) = unlandable(source) {
-            return halt(store, mission, &reason).map(|()| true);
+            return halt(store, mission, &reason).map(|()| false);
         }
-        let mirror = sources::ensure_mirror(&self.judge.root, Some(source))
-            .map_err(|error| error.to_string())?;
-        if let Some(task) = mission.landing() {
-            return land(store, &mirror, source, task).map(|()| true);
-        }
-        // Another mission's landing on this source may have moved main
-        // without its record yet (a crash between the push and
-        // `task.landed`): main says nothing about this mission until that
-        // landing is resolved, by its own mission's next step.
-        if let Some((other, task)) = landing_elsewhere(missions, mission) {
-            println!(
-                "integrate: mission {}: waits for task {task} of mission {other} to land on                  its source",
-                mission.id
-            );
-            return Ok(false);
-        }
-        // A fetch that failed leaves the mirror's last copy of main, which
-        // is no reading of the source's main: no halt, no verdict by it.
-        sources::refresh(&mirror, source)?;
-        let main = git(&[
-            "--git-dir",
-            &mirror.to_string_lossy(),
-            "rev-parse",
-            "refs/heads/main",
-        ])?;
-        if let Some(baseline) = &mission.baseline
-            && *baseline != main
-        {
-            return halt(
-                store,
-                mission,
-                &format!("the source's main is {main}, but the last landing left {baseline}"),
-            )
-            .map(|()| true);
-        }
-        // An objective mission's free slots get their objectives; a closed
-        // mission gets none. An assignment that fails does not keep a ready
-        // task from its judging.
-        let assigned = if mission.state == "done" {
-            false
-        } else {
-            match objectives::assign_next(store, mission) {
-                Ok(assigned) => !assigned.is_empty(),
-                Err(error) if mission.ready().is_none() => return Err(error),
-                Err(error) => {
-                    eprintln!("integrate: mission {}: {error}", mission.id);
-                    false
+        // The mirror and main, when this mission may judge now: not while a
+        // gate of its own, or of another mission on its source, runs (they
+        // share the mirror and the main it judges against).
+        let mut judgeable = None;
+        if !self.busy(mission) {
+            let mirror = sources::ensure_mirror(&self.judge.root, Some(source))
+                .map_err(|error| error.to_string())?;
+            if let Some(task) = mission.landing() {
+                return land(store, &mirror, source, task).map(|()| true);
+            }
+            // Another mission's landing on this source may have moved main
+            // without its record yet (a crash between the push and
+            // `task.landed`): main says nothing about this mission until
+            // that landing is resolved, by its own mission's next step.
+            if let Some((other, task)) = landing_elsewhere(missions, mission) {
+                println!(
+                    "integrate: mission {}: waits for task {task} of mission {other} to land on \
+                     its source",
+                    mission.id
+                );
+            } else {
+                // A fetch that failed leaves the mirror's last copy of main,
+                // which is no reading of the source's main: no halt, no
+                // verdict by it.
+                match sources::refresh(&mirror, source).and_then(|()| {
+                    git(&[
+                        "--git-dir",
+                        &mirror.to_string_lossy(),
+                        "rev-parse",
+                        "refs/heads/main",
+                    ])
+                }) {
+                    Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
+                    Ok(main) => {
+                        if let Some(baseline) = &mission.baseline
+                            && *baseline != main
+                        {
+                            return halt(
+                                store,
+                                mission,
+                                &format!(
+                                    "the source's main is {main}, but the last landing left \
+                                     {baseline}"
+                                ),
+                            )
+                            .map(|()| false);
+                        }
+                        judgeable = Some((mirror, main));
+                    }
                 }
             }
-        };
-        let Some(task) = mission.ready() else {
-            return Ok(assigned);
-        };
-        let running = self.running.borrow().len();
-        if running >= self.gates {
-            if self.waiting.borrow_mut().insert(task.id) {
-                println!(
-                    "integrate: mission {}: task {} waits for a gate ({running} of {} running)",
-                    mission.id, task.id, self.gates
-                );
-            }
-            return Ok(assigned);
         }
-        self.waiting.borrow_mut().remove(&task.id);
-        self.start_judging(
-            store, mirror, source, main, scenarios, count, mission.id, task, running,
-        )?;
-        Ok(assigned)
+        // An objective mission's free slots get their objectives, whatever
+        // its gate is doing; a closed mission gets none.
+        if mission.state != "done"
+            && let Err(error) = objectives::assign_next(store, mission)
+        {
+            eprintln!("integrate: mission {}: {error}", mission.id);
+        }
+        if let (Some((mirror, main)), Some(task)) = (judgeable, mission.ready()) {
+            ready.push(Ready {
+                mission: mission.id,
+                source: source.to_string(),
+                mirror,
+                main,
+                scenarios,
+                count,
+                task: task.clone(),
+            });
+        }
+        Ok(false)
     }
 
-    /// Judge `task` on a thread of its own, under the gate cap.
-    #[allow(clippy::too_many_arguments)]
+    /// Give the free gates to the ready tasks that have waited longest:
+    /// since they were reported (`updated_at_ms`, which every verdict also
+    /// moves), or since their mission's last judging ended, whichever is
+    /// later (a task cannot have a gate while its mission's previous one
+    /// runs). Two missions that are always ready thus take turns, and the
+    /// mission id decides nothing. At most one judging per mission and per
+    /// source.
+    fn start_ready(&self, store: &Arc<PostgresStore>, mut ready: Vec<Ready>) {
+        let since = |candidate: &Ready| {
+            let ended = self
+                .last_judged
+                .borrow()
+                .get(&candidate.mission)
+                .copied()
+                .unwrap_or(0);
+            candidate.task.updated_at_ms.max(ended)
+        };
+        ready.sort_by_key(|candidate| (since(candidate), candidate.task.id));
+        for candidate in ready {
+            let taken = self.running.borrow().iter().any(|gate| {
+                gate.mission == candidate.mission || gate.source == candidate.source
+            });
+            if taken {
+                continue;
+            }
+            let running = self.running.borrow().len();
+            if running >= self.gates {
+                if self.waiting.borrow_mut().insert(candidate.task.id) {
+                    println!(
+                        "integrate: mission {}: task {} waits for a gate ({running} of {} \
+                         running)",
+                        candidate.mission, candidate.task.id, self.gates
+                    );
+                }
+                continue;
+            }
+            self.waiting.borrow_mut().remove(&candidate.task.id);
+            let mission = candidate.mission;
+            if let Err(error) = self.start_judging(store, candidate, running) {
+                eprintln!("integrate: mission {mission}: {error}");
+            }
+        }
+    }
+
+    /// Judge a ready task on a thread of its own.
     fn start_judging(
         &self,
         store: &Arc<PostgresStore>,
-        mirror: PathBuf,
-        source: &str,
-        main: String,
-        scenarios: PathBuf,
-        count: u32,
-        mission_id: i64,
-        task: &Task,
+        candidate: Ready,
         running: usize,
     ) -> Result<(), String> {
+        let Ready {
+            mission: mission_id,
+            source,
+            mirror,
+            main,
+            scenarios,
+            count,
+            task,
+        } = candidate;
         let judge = self.judge.clone();
         let task_id = task.id;
-        let (store, task, source_owned) = (Arc::clone(store), task.clone(), source.to_string());
+        let (store, source_owned) = (Arc::clone(store), source.clone());
         let handle = std::thread::Builder::new()
-            .name(format!("gate-{}", task.id))
+            .name(format!("gate-{task_id}"))
             .spawn(move || {
                 judged_or_aborted(&store, &task, &main, mission_id, || {
                     judge.judge(
@@ -765,15 +851,13 @@ impl Integrator {
             })
             .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
         println!(
-            "integrate: mission {}: judging task {} ({} of {} gates)",
-            mission_id,
-            task_id,
+            "integrate: mission {mission_id}: judging task {task_id} ({} of {} gates)",
             running + 1,
             self.gates
         );
         self.running.borrow_mut().push(Running {
             mission: mission_id,
-            source: source.to_string(),
+            source,
             task: task_id,
             handle,
         });
