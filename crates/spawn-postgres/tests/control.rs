@@ -1944,6 +1944,7 @@ fn a_review_lands_only_on_the_revision_it_read() {
         ],
         "every review names its revision (the human's, the current one)"
     );
+}
 
 /// How many `task.cancelled` records the control stream holds for `task`.
 fn cancelled_records(client: &mut Client, task: i64) -> i64 {
