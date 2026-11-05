@@ -123,10 +123,16 @@ files, a chunk fetch.
   `merge.conflicted {files, marked}`. The agent hears of the conflict at
   landing and with its next prompt, and finds the markers in its files.
   Checkpoints keep single parents while any conflicted file the merge listed
-  still holds a whole marker block (a line starting `<<<<<<< `, later one
-  that is exactly `=======`, later one starting `>>>>>>> `; a lone `=======`
-  heading underline is not one); the first one without commits with parents
-  (head, pending `main`) and clears it, after which the branch lands clean.
+  still holds a whole marker block (a line of `n` `<` alone or before a
+  label, later one that is exactly `n` `=`, later one of `n` `>`, one `n`
+  per block: 7 or more, as git writes them by default, longer under
+  `conflict-marker-size` or for a conflict nested in a diff3 merge base, and
+  shorter only where main's `.gitattributes` sets `conflict-marker-size`
+  lower for the path; a lone `=======` heading underline is not one). Paths
+  are kept as git's bytes throughout, so a file name that is not UTF-8 or
+  holds a newline is checked under its own name. The first checkpoint
+  without a block commits with parents (head, pending `main`) and clears
+  it, after which the branch lands clean.
   The integrator does not judge a branch with a pending merge, or with marker
   blocks in the files it changes against `main`: it is gated `conflict` with
   a note to resolve the markers first. Mount and unmount keep a pending
@@ -209,14 +215,23 @@ files, a chunk fetch.
   that object young again (its modification time is set to now). Objects
   are removed only by a collection (below).
 - **Manifest.** The large-file manifest is a chunk-store object, and the
-  checkpoint commit names it in a `Spawn-Large` trailer. Only large files
-  whose size, mtime or mode changed are chunked again (a stat cache in
-  `<root>/.large/<branch>`). A checkpoint that takes chunk names from that
+  checkpoint commit names it in a `Spawn-Large` trailer. A path that is not
+  UTF-8 is written as `path_hex`, so any name round-trips. Only large files
+  whose size, mtime, ctime, inode or mode changed are chunked again (a stat
+  cache in `<root>/.large/<branch>`); an entry whose file changed within
+  3 s of its stat ("racily clean", as git says) is hashed again before its
+  chunks are trusted, so a same-size rewrite in the same timestamp tick, or
+  one whose mtime was put back, is never committed with the old chunks. A
+  checkpoint that takes chunk names from that
   cache touches each one (makes it young again) and chunks the file again
   when the store no longer holds one, so it never names a collected chunk.
 - **Mount.** Mount materializes the large files again, each atomically, and
   fails rather than write bytes that do not verify, or write outside the
-  workspace. A manifest whose large file the head's tree has no room for (a
+  workspace. The whole new tree, large files included, is built in
+  `<root>/.mount/` first; only when every chunk was fetched and verified is
+  the workspace renamed aside and the new tree renamed into its place, so
+  a mount that fails leaves the workspace, uncommitted files and all, as it
+  was. A manifest whose large file the head's tree has no room for (a
   tracked entry at its path, a file or a symlink at a parent directory)
   fails the mount. Parent directories are walked one component at a time,
   each opened with `O_NOFOLLOW` through the open descriptor of the one above
