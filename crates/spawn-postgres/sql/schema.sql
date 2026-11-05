@@ -2063,6 +2063,15 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
+-- The `no_room` gate records that escalate, found without reading the rest
+-- of the stream (the dispatcher reads them on every step).
+create index if not exists spawn_events_gate_room
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+      and kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
+      and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
+
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
 -- `stage` is the record type without `task.`; `verdict` is a gate's verdict
 -- or a review's (`accepted`, `rejected`); `took_ms` is the time since the

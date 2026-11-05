@@ -140,7 +140,8 @@ pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
-         m.gate_rejections, m.gate_aborts, m.objectives, m.sources ->> 0 as source,
+         m.gate_rejections, m.gate_aborts, m.gate_room_since_ms, m.gate_room_last_ms,
+         m.gate_room_waits, m.gate_room_escalated, m.objectives, m.sources ->> 0 as source,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -159,6 +160,22 @@ from (
    where m.gate is not null
      and (m.state in ('open', 'active') or t.tasks is not null)
 ) x";
+
+/// The `no_room` gate records that carry `escalate` (the mission's gate
+/// went without room past the integrator's limit), recorded at or after
+/// `$1` (ms), oldest first, each with its `event_id`, `at_ms` and `mission`.
+pub(crate) const GATE_ROOM_ESCALATIONS: &str = r"
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms,
+                                                  'mission', k.mission_id)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join mission_tasks k on k.id = (r ->> 'id')::bigint
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
+   and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
+   and e.recorded_at_ms >= $1";
 
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
@@ -437,6 +454,12 @@ impl PostgresStore {
     /// ones, and closed ones while the closure rule lets their work go on.
     pub fn gated_missions(&self) -> Result<Value, StoreError> {
         self.query_json(GATED, &[])
+    }
+
+    /// The `no_room` gate records that escalate, recorded since `since_ms`
+    /// ([`GATE_ROOM_ESCALATIONS`]).
+    pub fn gate_room_escalations(&self, since_ms: i64) -> Result<Value, StoreError> {
+        self.query_json(GATE_ROOM_ESCALATIONS, &[&since_ms])
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.
