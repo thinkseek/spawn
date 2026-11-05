@@ -122,8 +122,12 @@ pub struct BridgeConfig {
     pub max_commands_per_tick: usize,
     /// Attempts to find a ready input box before typing.
     pub ready_attempts: usize,
-    /// Delay between ready attempts.
+    /// Delay between ready attempts, and between input attempts.
     pub ready_interval: Duration,
+    /// Attempts of an input whose terminal call failed (a capture, or the
+    /// staging of its text) while the terminal is still there. A pane that
+    /// reads as not ready is refused at once ([`PANE_NOT_READY`]).
+    pub input_attempts: usize,
     /// Where Claude Code writes session transcripts (its `projects`
     /// directory), as the terminal host sees it.
     pub claude_projects: String,
@@ -147,6 +151,7 @@ impl BridgeConfig {
             max_commands_per_tick: 16,
             ready_attempts: 40,
             ready_interval: Duration::from_millis(250),
+            input_attempts: 4,
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
             model_relay: None,
@@ -927,14 +932,39 @@ impl Bridge {
             }
             return Ok(());
         };
+        let mut read = 0_usize;
         for line in bytes[..end].split(|byte| *byte == b'\n') {
+            let start = read;
+            read += line.len() + 1;
             let line = String::from_utf8_lossy(line);
+            let events = claude_line(&line);
+            // A turn's checkpoint is part of the turn's end: the workspace
+            // is committed (and its `artifact.committed` recorded) before
+            // the `turn.stopped` or `turn.failed` that ends it, so whoever
+            // reads the turn's end from the log also finds the checkpoint
+            // of what it wrote. A commit that fails holds the line back: it
+            // is read (and committed) again next tick.
+            let ends_turn = events
+                .iter()
+                .any(|event| event.kind.checkpoint_reason() == Some(CheckpointReason::TurnStopped));
+            if ends_turn
+                && !self.checkpoint(
+                    agent_id,
+                    session,
+                    active,
+                    CheckpointReason::TurnStopped,
+                    report,
+                )?
+            {
+                active.follow.offset += u64::try_from(start).unwrap_or(u64::MAX);
+                return Ok(());
+            }
             if active.follow.version.is_none()
                 && let Some(version) = claude_version(&line)
             {
                 self.record_version(agent_id, session, native, active, &path, version)?;
             }
-            for event in claude_line(&line) {
+            for event in events {
                 self.log.append(NewEvent {
                     agent_id: agent_id.clone(),
                     session_id: session.clone(),
@@ -1627,17 +1657,19 @@ impl Bridge {
         )
     }
 
-    /// Text into the engine's input box, at most once: the intent is
-    /// recorded before the keys go and the completion after, so a retried
-    /// command or a restarted Bridge can tell whether it was typed. What the
-    /// workspace store has to tell and no prompt carried yet goes before
-    /// it, and is marked told in the store once the typing is recorded.
+    /// Text into the engine's input box, at most once: the text is staged
+    /// first (no key goes), the intent recorded before the keys go and the
+    /// completion after, so a retried command or a restarted Bridge can tell
+    /// whether it was typed. A staging refused is [`Untyped::Refused`] with
+    /// nothing recorded: nothing was typed, and that is what the log says.
+    /// What the workspace store has to tell and no prompt carried yet goes
+    /// before it, and is marked told in the store once the typing is recorded.
     fn type_once(
         &self,
         claimed: &Claimed,
         active: &Active,
         text: &str,
-    ) -> Result<Result<(), TerminalError>, StoreError> {
+    ) -> Result<Result<(), Untyped>, StoreError> {
         // What the workspace store has to tell the agent goes first. It is
         // the store's record, not this process's memory, so a restart
         // between the checkpoint and this prompt loses none of it.
@@ -1647,6 +1679,12 @@ impl Bridge {
         } else {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
+        if let Err(error) = self
+            .terminals
+            .stage_text(&active.terminal(), &active.workspace, &text)
+        {
+            return Ok(Err(Untyped::Refused(error)));
+        }
         self.step(
             claimed,
             Some(&active.execution_id),
@@ -1655,7 +1693,7 @@ impl Bridge {
         )?;
         let typed = self
             .terminals
-            .submit_text(&active.terminal(), &active.workspace, &text);
+            .submit_staged(&active.terminal(), &active.workspace);
         if typed.is_ok() {
             self.step(
                 claimed,
@@ -1667,7 +1705,18 @@ impl Bridge {
                 self.workspaces.notices_told(&active.workspace, &notices);
             }
         }
-        Ok(typed)
+        Ok(typed.map_err(Untyped::Unknown))
+    }
+
+    /// Whether `has-session` says the terminal is gone. A host call that
+    /// failed on a terminal that is still there, or that cannot be told
+    /// (the check failed too), is a transient failure, not a lost terminal.
+    fn terminal_gone(&self, active: &Active) -> bool {
+        matches!(
+            self.terminals
+                .is_alive(&active.terminal(), &active.workspace),
+            Ok(false)
+        )
     }
 
     /// The engine of a recorded execution started in its terminal, then its
@@ -2127,20 +2176,32 @@ impl Bridge {
         let mut prompt_seen = false;
         // A dialog frame is answered only when the next read shows it again.
         let mut dialog: Option<String> = None;
+        // The last terminal call that failed on a terminal still there.
+        let mut transient: Option<String> = None;
         // The trust dialog comes before the engine starts up, so answering it
-        // restarts the budget instead of spending it.
+        // restarts the budget instead of spending it. A failed capture, or a
+        // staging refused before any key went, spends one attempt: only a
+        // terminal that is gone ends the wait early.
         let mut attempt = 0;
         while attempt < self.config.ready_attempts {
             if attempt > 0 {
                 sleep(self.config.ready_interval);
             }
             attempt += 1;
-            let Ok(pane) =
-                self.terminals
+            let pane =
+                match self
+                    .terminals
                     .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
-            else {
-                return Ok(Outcome::Failed("terminal disappeared".to_string()));
-            };
+                {
+                    Ok(pane) => pane,
+                    Err(error) => {
+                        if self.terminal_gone(active) {
+                            return Ok(Outcome::Failed(format!("terminal disappeared: {error}")));
+                        }
+                        transient = Some(format!("capture: {error}"));
+                        continue;
+                    }
+                };
             let reading = read_claude_screen(&pane);
             prompt_seen |= reading.state != ScreenState::Unknown;
             // The Bridge exported this directory itself, so it trusts it.
@@ -2177,13 +2238,21 @@ impl Bridge {
                     evidence: reading.evidence,
                 },
             )?;
-            return match self.type_once(claimed, active, prompt)? {
-                Ok(()) => Ok(Outcome::Succeeded),
-                Err(error) => Ok(Outcome::Failed(format!("submit prompt: {error}"))),
-            };
+            match self.type_once(claimed, active, prompt)? {
+                Ok(()) => return Ok(Outcome::Succeeded),
+                Err(Untyped::Refused(error)) => {
+                    transient = Some(format!("submit prompt refused before typing: {error}"));
+                }
+                Err(Untyped::Unknown(error)) => {
+                    return Ok(Outcome::Failed(format!(
+                        "submit prompt: {error}; the prompt {MAY_HAVE_TYPED}"
+                    )));
+                }
+            }
         }
+        let why = transient.map_or_else(String::new, |why| format!("; last failure {why}"));
         Ok(Outcome::Failed(format!(
-            "pane never became ready, last state {last:?}"
+            "pane never became ready, last state {last:?}{why}"
         )))
     }
 
@@ -2202,33 +2271,71 @@ impl Bridge {
                 return Ok(Outcome::Failed(format!("the text {MAY_HAVE_TYPED}")));
             }
         }
-        let Ok(pane) =
-            self.terminals
-                .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
-        else {
-            return Ok(Outcome::Failed("terminal disappeared".to_string()));
-        };
-        let reading = read_claude_screen(&pane);
-        self.append(
-            &claimed.agent_id,
-            &claimed.session_id,
-            Some(&active.execution_id),
-            Source::Bridge,
-            None,
-            EventKind::ScreenObserved {
-                state: reading.state,
-                evidence: reading.evidence,
-            },
-        )?;
-        if !reading.state.accepts_input() {
-            return Ok(Outcome::Failed(format!(
-                "pane state {:?} {PANE_NOT_READY}",
-                reading.state
-            )));
-        }
-        match self.type_once(claimed, &active, text)? {
-            Ok(()) => Ok(Outcome::Succeeded),
-            Err(error) => Ok(Outcome::Failed(format!("submit text: {error}"))),
+        // A failed capture or a staging refused, on a terminal still there,
+        // spends one attempt; out of attempts, the input is refused as not
+        // ready, which typed nothing. Only a terminal that is gone fails it.
+        let mut attempt = 0;
+        loop {
+            if attempt > 0 {
+                sleep(self.config.ready_interval);
+            }
+            attempt += 1;
+            let last = attempt >= self.config.input_attempts;
+            let pane =
+                match self
+                    .terminals
+                    .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
+                {
+                    Ok(pane) => pane,
+                    Err(error) => {
+                        if self.terminal_gone(&active) {
+                            return Ok(Outcome::Failed(format!("terminal disappeared: {error}")));
+                        }
+                        if last {
+                            return Ok(Outcome::Failed(format!(
+                                "pane unread ({error}): taken as one that {PANE_NOT_READY}"
+                            )));
+                        }
+                        continue;
+                    }
+                };
+            let reading = read_claude_screen(&pane);
+            self.append(
+                &claimed.agent_id,
+                &claimed.session_id,
+                Some(&active.execution_id),
+                Source::Bridge,
+                None,
+                EventKind::ScreenObserved {
+                    state: reading.state,
+                    evidence: reading.evidence,
+                },
+            )?;
+            if !reading.state.accepts_input() {
+                return Ok(Outcome::Failed(format!(
+                    "pane state {:?} {PANE_NOT_READY}",
+                    reading.state
+                )));
+            }
+            match self.type_once(claimed, &active, text)? {
+                Ok(()) => return Ok(Outcome::Succeeded),
+                Err(Untyped::Refused(error)) => {
+                    if self.terminal_gone(&active) {
+                        return Ok(Outcome::Failed(format!("terminal disappeared: {error}")));
+                    }
+                    if last {
+                        return Ok(Outcome::Failed(format!(
+                            "submit text refused before typing ({error}): taken as a pane that \
+                             {PANE_NOT_READY}"
+                        )));
+                    }
+                }
+                Err(Untyped::Unknown(error)) => {
+                    return Ok(Outcome::Failed(format!(
+                        "submit text: {error}; the text {MAY_HAVE_TYPED}"
+                    )));
+                }
+            }
         }
     }
 
@@ -2322,11 +2429,22 @@ impl Bridge {
 }
 
 /// How an input fails when the pane does not show a prompt that takes
-/// text (`pane state <state> does not accept input`): refused before
-/// anything was typed, so nothing reached the engine. The pane may be a
+/// text (`pane state <state> does not accept input`), or when the terminal,
+/// still there, kept failing the capture or the staging of the text:
+/// refused before anything was typed, so nothing reached the engine. The pane may be a
 /// moment from ready: a turn's end reaches the transcript before the screen
 /// settles at the prompt.
 pub const PANE_NOT_READY: &str = "does not accept input";
+
+/// Why text sent into a terminal did not arrive.
+enum Untyped {
+    /// Refused before any key went (the text could not be staged): nothing
+    /// reached the engine and nothing says it might have.
+    Refused(TerminalError),
+    /// Failed once the keys began to go (`command.typing` is recorded):
+    /// some or all of it may have arrived.
+    Unknown(TerminalError),
+}
 
 /// How a command that may or may not have typed its text fails (the log
 /// shows typing began and nothing shows it arrived): it is not typed again,

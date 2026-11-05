@@ -317,13 +317,36 @@ pub trait TerminalHost: Send + Sync {
     // Every call after `start` names the workspace again, so a host that
     // runs inside the workspace needs no memory between processes.
 
-    /// Type `text` literally, then press Enter.
-    fn submit_text(
+    /// Hold `text` for the terminal's next [`Self::submit_staged`]. Nothing
+    /// reaches the pane: a failure here typed nothing, so the caller may try
+    /// again. Staging again replaces what was held.
+    fn stage_text(
         &self,
         terminal: &TerminalName,
         workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError>;
+
+    /// Type what [`Self::stage_text`] held, literally, then press Enter. A
+    /// failure here may have typed some or all of it.
+    fn submit_staged(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError>;
+
+    /// Type `text` literally, then press Enter: [`Self::stage_text`], then
+    /// [`Self::submit_staged`]. A caller that records what it typed calls
+    /// the two itself, so a failure before any key went is known as one.
+    fn submit_text(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+        text: &str,
+    ) -> Result<(), TerminalError> {
+        self.stage_text(terminal, workspace, text)?;
+        self.submit_staged(terminal, workspace)
+    }
 
     /// Press keys one at a time, without a paste. `keys` uses tmux key
     /// names (`y`, `Enter`). For dialogs that ignore pasted text.

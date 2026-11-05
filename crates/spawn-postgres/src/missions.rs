@@ -333,6 +333,15 @@ pub(crate) const LATEST_CHECKPOINT: &str = "select kind -> 'detail' -> 'artifact
                   where agent_id = $1 and event_name = 'artifact.committed'
                   order by id desc limit 1";
 
+/// The `commit` of a task's latest `task.reported` control record. `$1`
+/// the task id, as text (the record's `id`).
+pub(crate) const REPORTED_COMMIT: &str = "select kind -> 'detail' -> 'record' ->> 'commit'
+                   from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.reported'
+                    and kind -> 'detail' -> 'record' ->> 'id' = $1
+                  order by id desc limit 1";
+
 // Residents and workspaces.
 
 /// Approved residents that have run before, as (agent, session, charter).
@@ -682,10 +691,35 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// Store a delivered task's report.
+    /// Store a delivered task's report, naming no checkpoint.
     pub fn task_reported(&self, task: i64, report: &str) -> Result<bool, StoreError> {
         let row = self.query_one("select spawn_task_reported($1, $2)", &[&task, &report])?;
         Ok(row.get(0))
+    }
+
+    /// Store a delivered task's report with `commit`, the agent's checkpoint
+    /// the report's turn ended with (`None`: the agent has none). The
+    /// integrator judges the report against it.
+    pub fn task_reported_with(
+        &self,
+        task: i64,
+        report: &str,
+        commit: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let row = self.query_one(
+            "select spawn_task_reported($1, $2, $3)",
+            &[&task, &report, &commit],
+        )?;
+        Ok(row.get(0))
+    }
+
+    /// The checkpoint the task's latest report names (`commit` of its latest
+    /// `task.reported`): `None` for a report that names none (one recorded
+    /// before reports named their checkpoint), or no report.
+    pub fn reported_commit(&self, task: i64) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .query_opt(REPORTED_COMMIT, &[&task.to_string()])?
+            .and_then(|row| row.get::<_, Option<String>>(0)))
     }
 }
 

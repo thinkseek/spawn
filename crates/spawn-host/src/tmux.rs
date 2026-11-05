@@ -96,6 +96,11 @@ impl TmuxHost {
     fn pane(terminal: &TerminalName) -> String {
         format!("={}:", terminal.as_str())
     }
+
+    /// The paste buffer that holds a terminal's staged text.
+    fn buffer(terminal: &TerminalName) -> String {
+        format!("spawn-{}", terminal.as_str())
+    }
 }
 
 /// How long a `capture-pane` may take.
@@ -304,20 +309,17 @@ impl TerminalHost for TmuxHost {
         )))
     }
 
-    fn submit_text(
+    fn stage_text(
         &self,
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
         text: &str,
     ) -> Result<(), TerminalError> {
-        let target = Self::pane(terminal);
-        // One bracketed paste, then one Enter. Typing a line and pressing
-        // Enter per line would submit a multi-paragraph prompt in pieces.
-        let buffer = format!("spawn-{}", terminal.as_str());
+        // A named buffer, which no key reaches until it is pasted.
         let set = vec![
             "set-buffer".to_string(),
             "-b".to_string(),
-            buffer.clone(),
+            Self::buffer(terminal),
             "--".to_string(),
             text.to_string(),
         ];
@@ -328,12 +330,23 @@ impl TerminalHost for TmuxHost {
                 run.stderr.trim()
             )));
         }
+        Ok(())
+    }
+
+    fn submit_staged(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<(), TerminalError> {
+        let target = Self::pane(terminal);
+        // One bracketed paste, then one Enter. Typing a line and pressing
+        // Enter per line would submit a multi-paragraph prompt in pieces.
         let paste = vec![
             "paste-buffer".to_string(),
             "-p".to_string(),
             "-d".to_string(),
             "-b".to_string(),
-            buffer,
+            Self::buffer(terminal),
             "-t".to_string(),
             target.clone(),
         ];

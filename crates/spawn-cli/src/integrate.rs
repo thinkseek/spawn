@@ -39,7 +39,18 @@
 //!    the task goes back to `reported` (`accepted` under review), no
 //!    rejection is counted, nothing reaches the worker, and a later pass
 //!    judges again. An agent with neither a checkpoint nor a pushed branch
-//!    has no branch to land;
+//!    has no branch to land.
+//!
+//!    **A report is judged against the checkpoint of the turn that produced
+//!    it.** The dispatcher collects a report only after the turn that wrote
+//!    it ended in the log, and the Bridge records a turn's checkpoint before
+//!    its end; the `task.reported` record names that checkpoint in `commit`.
+//!    The pushed head must also be that commit or a descendant of it
+//!    ([`report_freshness`]); otherwise the verdict is `stale`, as above. A
+//!    report that names a commit is never judged for lack of a checkpoint
+//!    (the branch pushed when the workspace was mounted is only the task's
+//!    base). A report with a null commit (a record from before reports named
+//!    one) is judged by the rule above alone;
 //! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
@@ -264,6 +275,46 @@ pub(crate) fn freshness(
     }
 }
 
+/// The stale rule for a reported task: the pushed head must be the
+/// report's commit (`reported`, the agent's checkpoint the report's turn
+/// ended with) or a descendant of it, and pass [`freshness`] against the
+/// agent's latest checkpoint as well. A report that names a commit is never
+/// judged for lack of a checkpoint: with no pushed branch, or one that lacks
+/// the commit, it is stale. A report that names none (a record from before
+/// reports named their checkpoint) is judged by [`freshness`] alone.
+pub(crate) fn report_freshness(
+    reported: Option<&str>,
+    checkpoint: Option<&str>,
+    pushed: Option<&str>,
+    contains: impl Fn(&str, &str) -> bool,
+) -> Freshness {
+    if let Some(reported) = reported {
+        match pushed {
+            None => {
+                return Freshness::Stale(format!(
+                    "the source has no spawn/<agent> yet, and the report's checkpoint is \
+                     {reported}"
+                ));
+            }
+            Some(pushed) if pushed != reported && !contains(reported, pushed) => {
+                return Freshness::Stale(if contains(pushed, reported) {
+                    format!(
+                        "the pushed branch ({pushed}) is behind the report's checkpoint \
+                         ({reported})"
+                    )
+                } else {
+                    format!(
+                        "the pushed branch ({pushed}) does not contain the report's checkpoint \
+                         ({reported})"
+                    )
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    freshness(checkpoint, pushed, contains)
+}
+
 /// The mirror's own copy of an agent's pushed branch: never
 /// `refs/heads/<agent>`, which on the Bridge's host is the Bridge's.
 fn integrator_ref(agent: &str) -> String {
@@ -393,7 +444,7 @@ impl Integrator {
         if mission.halted.is_some() {
             return Ok(false);
         }
-        let scenarios = PathBuf::from(&mission.gate);
+        let scenarios = pinned(Path::new(&mission.gate));
         let count = gate::count_scenarios(&scenarios)?;
         if let Some(reason) = halt_reason(mission, count) {
             return halt(store, mission, &reason).map(|()| true);
@@ -495,16 +546,21 @@ impl Integrator {
     }
 
     /// The agent's pushed branch, fetched into the mirror, checked against
-    /// its latest checkpoint. A lagging push is fetched again for up to
-    /// [`PUSH_WAIT`] before it counts as stale.
+    /// the checkpoint the task's report names and the agent's latest
+    /// checkpoint ([`report_freshness`]). A lagging push is fetched again for
+    /// up to [`PUSH_WAIT`] before it counts as stale.
     fn pushed_candidate(
         store: &PostgresStore,
         mirror: &Path,
         source: &str,
-        agent: &str,
+        task: &Task,
     ) -> Result<Freshness, String> {
+        let agent = task.agent_id.as_str();
         let checkpoint = store
             .latest_checkpoint(agent)
+            .map_err(|error| error.to_string())?;
+        let reported = store
+            .reported_commit(task.id)
             .map_err(|error| error.to_string())?;
         let mirror_path = mirror.to_string_lossy().to_string();
         let contains = |ancestor: &str, commit: &str| {
@@ -522,7 +578,12 @@ impl Integrator {
         loop {
             let pushed = sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
                 .map_err(|error| error.to_string())?;
-            let verdict = freshness(checkpoint.as_deref(), pushed.as_deref(), contains);
+            let verdict = report_freshness(
+                reported.as_deref(),
+                checkpoint.as_deref(),
+                pushed.as_deref(),
+                contains,
+            );
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
                 return Ok(verdict);
             }
@@ -544,7 +605,7 @@ impl Integrator {
         count: u32,
         task: &Task,
     ) -> Result<bool, String> {
-        let branch = match Self::pushed_candidate(store, mirror, source, &task.agent_id)? {
+        let branch = match Self::pushed_candidate(store, mirror, source, task)? {
             Freshness::Fresh(branch) => Some(branch),
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
@@ -652,7 +713,7 @@ impl Integrator {
             return rejected("the patch is larger than 1 MiB", "");
         }
 
-        let scenario = task.scenario.as_deref().map(PathBuf::from);
+        let scenario = task_scenario(scenarios, task.scenario.as_deref());
         // The test server must not be the owner's, by identity, asked now:
         // a socket mount or a DNS name can change between gate runs.
         let owner = std::env::var("SPAWN_DATABASE_URL").ok();
@@ -664,7 +725,7 @@ impl Integrator {
             eprintln!("integrate: {warning}");
         }
         match gate::judge(
-            &self.gate,
+            &pinned(&self.gate),
             mirror,
             main,
             &candidate,
@@ -1013,10 +1074,31 @@ fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
         .map_err(|e| error(&e))
 }
 
+/// A path through the controller's symlink (`controllers/<name>` in the
+/// live directory, switched by deploy/controller.sh), resolved once for a
+/// step: what counts the scenarios, the gate and its scenarios are then one
+/// deployed commit's, even if a switch happens while the gate runs (the
+/// previous controller stays until nothing uses it). A path that does not
+/// resolve stays as named; the step that reads it reports it.
+fn pinned(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The scenario that judges an objective task: its file (`<objective>.sh`,
+/// named when the task was assigned) in the mission's scenarios directory as
+/// it is now. Not the recorded path: a mission moved to another directory (the
+/// owner's checkout to the deployed controller) must not keep judging its
+/// tasks in flight with a scenario from the old one, which nothing deploys.
+fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
+    let name = Path::new(recorded?).file_name()?;
+    Some(scenarios.join(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, over_budget,
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree,
+        over_budget, pinned, report_freshness, task_scenario,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
@@ -1045,6 +1127,42 @@ mod tests {
         assert!(merged_tree(Some(139), "", "Segmentation fault").is_err());
         assert!(merged_tree(Some(128), "", "fatal: bad object").is_err());
         assert!(merged_tree(Some(2), "", "").is_err());
+    }
+
+    #[test]
+    fn a_task_scenario_is_read_from_the_mission_s_scenarios_as_they_are_now() {
+        let now = std::path::Path::new("/live/controllers/spawn-abc/rsi/scenarios");
+        assert_eq!(
+            task_scenario(now, Some("/home/owner/projects/Spawn/rsi/scenarios/007.sh")),
+            Some(now.join("007.sh"))
+        );
+        assert_eq!(task_scenario(now, None), None);
+        assert_eq!(task_scenario(now, Some("/")), None);
+    }
+
+    #[test]
+    fn pinned_resolves_the_controller_symlink_once() {
+        let base = std::env::temp_dir().join(format!("spawn-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("spawn-one/rsi/scenarios")).expect("one");
+        std::fs::create_dir_all(base.join("spawn-two/rsi/scenarios")).expect("two");
+        std::os::unix::fs::symlink("spawn-one", base.join("spawn")).expect("link");
+        let through = base.join("spawn/rsi/scenarios");
+        let held = pinned(&through);
+        assert!(
+            held.ends_with("spawn-one/rsi/scenarios"),
+            "{}",
+            held.display()
+        );
+        // The switch: what was pinned stays the first controller's.
+        std::fs::remove_file(base.join("spawn")).expect("unlink");
+        std::os::unix::fs::symlink("spawn-two", base.join("spawn")).expect("relink");
+        assert!(held.ends_with("spawn-one/rsi/scenarios"));
+        assert!(pinned(&through).ends_with("spawn-two/rsi/scenarios"));
+        // A path that does not resolve stays as named.
+        let missing = base.join("missing/scenarios");
+        assert_eq!(pinned(&missing), missing);
+        std::fs::remove_dir_all(&base).expect("clean");
     }
 
     /// Commit everything in the checkout `directory`.
@@ -1677,6 +1795,53 @@ mod tests {
         assert!(
             matches!(&absent, Freshness::Stale(reason) if reason.contains("no spawn/<agent>")),
             "{absent:?}"
+        );
+    }
+
+    #[test]
+    fn a_report_is_judged_against_its_own_checkpoint() {
+        assert_eq!(
+            report_freshness(Some("c2"), Some("c2"), Some("c2"), history),
+            Freshness::Fresh("c2".to_string()),
+            "equal"
+        );
+        assert_eq!(
+            report_freshness(Some("c2"), Some("c2"), Some("c3"), history),
+            Freshness::Fresh("c3".to_string()),
+            "descendant"
+        );
+        let behind = report_freshness(Some("c2"), None, Some("c1"), history);
+        assert!(
+            matches!(&behind, Freshness::Stale(reason)
+                if reason.contains("behind the report's checkpoint")),
+            "the base pushed at the mount, with no checkpoint recorded: {behind:?}"
+        );
+        let diverged = report_freshness(Some("c2"), Some("c2"), Some("d2"), history);
+        assert!(
+            matches!(&diverged, Freshness::Stale(reason)
+                if reason.contains("does not contain the report's checkpoint")),
+            "{diverged:?}"
+        );
+        let absent = report_freshness(Some("c2"), None, None, history);
+        assert!(
+            matches!(&absent, Freshness::Stale(reason) if reason.contains("no spawn/<agent>")),
+            "no pushed branch: {absent:?}"
+        );
+        // Past the report's checkpoint but behind a later one: the latest
+        // checkpoint still rules.
+        let lagging = report_freshness(Some("c1"), Some("c3"), Some("c2"), history);
+        assert!(
+            matches!(&lagging, Freshness::Stale(reason) if reason.contains("behind")),
+            "{lagging:?}"
+        );
+        // A report that names no commit is judged as before.
+        assert_eq!(
+            report_freshness(None, None, Some("c1"), history),
+            Freshness::Fresh("c1".to_string())
+        );
+        assert_eq!(
+            report_freshness(None, None, None, history),
+            Freshness::Nothing
         );
     }
 

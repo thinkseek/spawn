@@ -3,6 +3,13 @@
 #
 #   deploy/deploy.sh <verdict-file>   # build, install, move missions main, restart
 #
+# The live system runs only what a deploy installed: the binary and UI in
+# $live, and the controller ($live/controllers/spawn, deploy/controller.sh),
+# the deployed commit's tree, from which the integrator runs the gate, its
+# scenarios and the objective backlog, and the maintenance timer its script.
+# Nothing live reads the owner's checkout: an owner edit (to gate.sh, a
+# scenario, an objective in rsi/backlog) is live only after its deploy.
+#
 # <verdict-file> is what the gate wrote for this exact HEAD, judged against the
 # missions repo's current main. Make it from the checkout being deployed:
 #
@@ -34,7 +41,10 @@
 #      password reaches pg_dump through PGPASSWORD, never argv);
 #   5. HEAD is exported (`git archive`, so nothing untracked or ignored in
 #      the checkout is built) to $TMPDIR/spawn-deploy-export-<uid>, with the
-#      checkout's web/node_modules linked in; a release build without the
+#      checkout's web/node_modules linked in; the controller for HEAD is
+#      built beside the current one ($live/controllers/spawn-<head>, its
+#      web/node_modules a reflink copy of the checkout's, which must be
+#      installed from HEAD's lockfile); a release build without the
 #      compiler cache into the persistent SPAWN_DEPLOY_TARGET (default
 #      ~/.cache/spawn/deploy-target) and the UI build (only
 #      web/vite.config.ts, named with --config; postcss configured inline)
@@ -48,7 +58,10 @@
 #      verdict's base), the staged binary migrates the schema, and only then
 #      binary and UI are installed: the replaced copies become spawn.prev and
 #      web.prev, unless the live copy already is this build (a deploy run
-#      again keeps its rollback copies). Then $live/deploy.pending is written
+#      again keeps its rollback copies), and the controller switches to
+#      HEAD's (one atomic rename; the one it replaces stays as
+#      controllers/spawn.prev, older ones are removed unless a process
+#      still uses them). Then $live/deploy.pending is written
 #      ("<main it replaces> <head>"), main moves forward (never forced),
 #      every gated mission whose baseline was the old main takes the new one
 #      (so the deploy is not mistaken for a push outside the gate), and
@@ -215,6 +228,10 @@ node_modules=$(readlink -f "$repo/web/node_modules") ||
   die "no web/node_modules in $repo: install the UI's dependencies"
 [ -d "$node_modules" ] || die "no web/node_modules in $repo: install the UI's dependencies"
 ln -s "$node_modules" "$export_dir/web/node_modules"
+# The controller for HEAD (deploy/controller.sh): built now, beside the
+# current one, and made current with the install below. It refuses a
+# node_modules installed from another lockfile than HEAD's.
+bash "$repo/deploy/controller.sh" build spawn "$(git rev-parse --absolute-git-dir)" "$head" "$node_modules" >/dev/null
 sandbox_rw "$export_dir" "$target"
 sandbox_ro "$node_modules"
 sandbox_env CARGO_TARGET_DIR "$target"
@@ -242,6 +259,10 @@ systemctl --user stop spawn-integrate
   die "the missions main moved during the deploy: run the gate on the new main and deploy again"
 "$live/bin/spawn.staged" init-db >/dev/null
 install_build
+# What the integrator (restarted below) and the maintenance timer read: the
+# gate, the scenarios, the backlog. Switched with the integrator stopped, so
+# no gate of this host runs across it.
+bash "$repo/deploy/controller.sh" switch spawn "$head"
 if [ "$old" != "$head" ]; then
   # Written before the push, removed once the missions took the new main:
   # a deploy that dies in between is completed by on_exit or the next deploy.
