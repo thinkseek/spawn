@@ -107,6 +107,21 @@ pub enum Commit {
     Unchanged,
 }
 
+/// Result of [`WorkspaceStore::set_aside`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetAside {
+    /// The branch already holds the start's tree: nothing to set aside.
+    Unchanged,
+    /// `commit`, whose first parent is `kept`, has the start's tree; `kept`
+    /// holds the work set aside; `files` are the paths the two trees differ
+    /// in.
+    Created {
+        commit: CommitId,
+        kept: CommitId,
+        files: Vec<String>,
+    },
+}
+
 /// Result of [`WorkspaceStore::ensure_branch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Branch {
@@ -226,6 +241,26 @@ pub trait WorkspaceStore: Send + Sync {
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let _ = workspace;
         Ok(BaseMerge::Current)
+    }
+
+    /// Set aside the work on `branch` since the commit `start` (a checkpoint
+    /// of the branch, so its ancestor; `None`: where the branch forked from
+    /// `main`), for a task that was cancelled. Called by the dispatcher
+    /// while nothing of the agent writes the branch (its execution has
+    /// ended), under the branch's lock. Nothing is rewound: a mounted
+    /// workspace whose state no checkpoint took is committed first, then a
+    /// new commit with `start`'s tree goes on top of the branch head (by
+    /// compare-and-swap) and the workspace follows it. The work stays in the
+    /// branch's history ([`SetAside::Created`]'s `kept`). A store without
+    /// branches has nothing to set aside.
+    fn set_aside(
+        &self,
+        branch: &BranchName,
+        start: Option<&str>,
+        message: &str,
+    ) -> Result<SetAside, WorkspaceError> {
+        let _ = (branch, start, message);
+        Ok(SetAside::Unchanged)
     }
 
     /// What the store must tell the agent of the workspace and has not

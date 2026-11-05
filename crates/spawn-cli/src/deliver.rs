@@ -19,16 +19,50 @@
 //! - a report (`.spawn/report.md`) is collected once its worker is idle, if
 //!   it was written after the delivery's mark in the workspace (one clock,
 //!   the filesystem's, sets both times), and moved aside so the next task
-//!   starts clean;
+//!   starts clean. **A report is judged against the checkpoint of the turn
+//!   that produced it.** The Bridge commits a turn's workspace and records
+//!   its `artifact.committed` before the turn's end (`turn.stopped`,
+//!   `turn.failed`), so a report is collected only once the worker's latest
+//!   turn event in the log is a turn's end, not a newer `message.received`,
+//!   and never on a ready screen alone ([`Facts::report_due`]). The
+//!   `task.reported` record names in `commit` the agent's latest checkpoint
+//!   read with that turn's end (null only when the agent has none); a turn
+//!   that changed nothing leaves the branch head, the earlier checkpoint, as
+//!   its own. An idle judgement with no model answer need not be newer than
+//!   the turn's end: such a judgement is written again only when its verdict
+//!   changes (a model's answer is written for every new situation, and a
+//!   stale one waits for the next);
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
-//!   next task waits) until the work lands or the gate sends it back.
+//!   next task waits) until the work lands or the gate sends it back;
+//! - a resident whose latest delivered task is cancelled, whatever cancelled
+//!   it (`spawn task cancel`, the supervisor, the integrator's abort over
+//!   budget, the closure rule), is stopped at once if it runs, idle or in
+//!   the middle of a turn: a Stop takes a final checkpoint, and nothing of
+//!   the task's turn is left to finish. Once it no longer runs, the task's
+//!   work is set aside ([`crate::set_aside`]: a commit on top of its branch
+//!   whose tree is the checkpoint the task started from; the work stays in
+//!   the branch's history) and the worker is resumed with a notice that
+//!   names the task, says it is cancelled and where its work is. Its next
+//!   task waits until that notice reached it ([`Work::blocked`]). A task
+//!   never delivered, or not the latest delivery, changes nothing for its
+//!   worker; an ephemeral worker is only stopped, and a retired resident is
+//!   stopped and not told. A cancelled task's report is never collected: only
+//!   delivered tasks are, and only a report written after their own mark.
 //!
 //! Missions, reports, approvals, human commands to workers (with their
 //! outcome) and failed deliveries become digest items for the supervisor ([`news_items`]). Like
 //! the dispatcher, delivery keeps no state: idempotency keys and the task
 //! rows say what was already done.
+//!
+//! A waiting task that does not move is not left to wait silently: the
+//! task whose turn it is ([`next_up`]) is at its `delivery` step from the
+//! record that put it there, and the dispatcher's stall layer
+//! (`dispatch::stall`) escalates it once its bound
+//! (`SPAWN_STALL_DELIVERY_SECS`) has passed, naming every attempt and its
+//! outcome and the retry still due or held ([`delivery_status`]). One whose
+//! retries are spent was escalated as delivery failed, and gets no stall.
 //!
 //! [`orders`] is pure; [`collect_reports`] is the one step with side effects
 //! (the report file and the task row).
@@ -41,6 +75,7 @@ use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
 use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, ModelProfile};
 use spawn_core::mission::TaskState;
+use spawn_core::observation::Ambiguity;
 use spawn_host::tree_path::TreePath;
 use spawn_postgres::PostgresStore;
 
@@ -156,6 +191,78 @@ impl TaskRow {
     }
 }
 
+/// A resident whose latest delivered task is cancelled, from
+/// `cancelled_deliveries`: it is stopped, its work set aside, and it is told.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Cancelled {
+    /// The cancelled task.
+    pub(crate) id: i64,
+    pub(crate) mission_id: i64,
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    /// The checkpoint the task started from; `None`: the branch's fork from
+    /// `main`.
+    #[serde(default)]
+    pub(crate) start: Option<String>,
+    /// The set-aside already recorded for the task.
+    #[serde(default)]
+    pub(crate) set_aside: Option<String>,
+    /// The notice reached the worker.
+    #[serde(default)]
+    pub(crate) told: bool,
+    /// The task's last control record (`task.cancelled`, `task.aborted`).
+    #[serde(default)]
+    pub(crate) closed_by: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+}
+
+impl Cancelled {
+    /// Key prefix of the notice's attempts: `cancel-notice-<task>-<n>`.
+    fn notice_prefix(&self) -> String {
+        format!("cancel-notice-{}-", self.id)
+    }
+
+    fn command(&self, key: String, action: CommandAction) -> Order {
+        Order {
+            agent_id: self.agent_id.clone(),
+            session_id: self.session_id.clone(),
+            key,
+            action,
+            task: None,
+        }
+    }
+}
+
+/// The task a cancel notice's key (`cancel-notice-<task>-<n>`) is about.
+pub(crate) fn notice_task(key: &str) -> Option<i64> {
+    key.strip_prefix("cancel-notice-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// What a resident is told when its latest task was cancelled: the task,
+/// that it is cancelled, and what to do now. Where its work went is added
+/// when the work is set aside ([`crate::set_aside::note`]).
+pub(crate) fn cancel_notice(cancelled: &Cancelled) -> String {
+    let by = match (cancelled.closed_by.as_deref(), cancelled.reason.as_deref()) {
+        (Some("task.aborted"), Some(reason)) => {
+            format!(" by the integrator ({})", one_line(reason, 300))
+        }
+        (Some("task.aborted"), None) => " by the integrator".to_string(),
+        _ => String::new(),
+    };
+    format!(
+        "[Task #{id} was cancelled — this is not a new task]\nTask #{id} of mission #{mission} \
+was cancelled{by}. Stop working on it: do not continue it and do not write a report for it; \
+nothing written for it is collected. Wait for your next task.",
+        id = cancelled.id,
+        mission = cancelled.mission_id,
+    )
+}
+
 /// An open mission, for the supervisor's inbox.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct MissionNote {
@@ -235,6 +342,8 @@ pub(crate) struct Work {
     pub(crate) news: News,
     /// Retired residents, as (agent, session).
     pub(crate) retired: Vec<(String, String)>,
+    /// Residents whose latest delivered task is cancelled.
+    pub(crate) cancelled: Vec<Cancelled>,
 }
 
 impl Work {
@@ -247,6 +356,8 @@ impl Work {
             news: serde_json::from_value(store.mission_news().map_err(error)?)
                 .map_err(|error| format!("mission news: {error}"))?,
             retired: store.retired_residents().map_err(error)?,
+            cancelled: serde_json::from_value(store.cancelled_deliveries().map_err(error)?)
+                .map_err(|error| format!("cancelled deliveries: {error}"))?,
         })
     }
 
@@ -273,6 +384,14 @@ impl Work {
                 .iter()
                 .filter(|task| task.state == TaskState::Accepted && task.gated)
                 .map(|task| task.session_id.as_str()),
+        );
+        // A resident not yet told that its latest task was cancelled gets
+        // nothing else first.
+        blocked.extend(
+            self.cancelled
+                .iter()
+                .filter(|cancelled| !cancelled.told)
+                .map(|cancelled| cancelled.session_id.as_str()),
         );
         blocked
     }
@@ -429,8 +548,9 @@ enum Attempts {
     /// goes at `due_ms`.
     Retry { number: usize, due_ms: i64 },
     /// The latest attempt failed and is not tried again: why, for the
-    /// supervisor.
-    Failed(&'static str),
+    /// supervisor, and whether its retries are spent (`false`: it may have
+    /// typed the task, so it is not tried again).
+    Failed { why: &'static str, spent: bool },
 }
 
 /// Where `task`'s current delivery into `facts`' session stands. A failure
@@ -462,10 +582,11 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
         Some(false) => {
             let error = last.error.as_deref().unwrap_or_default();
             if error.contains(MAY_HAVE_TYPED) {
-                return Attempts::Failed(
-                    "may or may not have reached its worker; ask the worker before assigning it \
-                     again",
-                );
+                return Attempts::Failed {
+                    why: "may or may not have reached its worker; ask the worker before assigning \
+                          it again",
+                    spent: false,
+                };
             }
             let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
             if not_ready(last) && refusals <= NOT_READY_FREE {
@@ -475,13 +596,138 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
                 };
             }
             if failures > DELIVERY_RETRIES {
-                return Attempts::Failed("never reached its worker; cancel it and assign it again");
+                return Attempts::Failed {
+                    why: "never reached its worker; cancel it and assign it again",
+                    spent: true,
+                };
             }
             Attempts::Retry {
                 number: sent.len(),
                 due_ms: finished.saturating_add(retry_wait_ms(failures)),
             }
         }
+    }
+}
+
+/// Why a delivery due now is not sent, if it is held: what [`delivery`]
+/// waits for on the worker. `settled`: as there.
+fn held(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<String> {
+    let facts = found?;
+    if facts.open_command {
+        return Some("a command is in flight in its session".to_string());
+    }
+    if facts.stopping() {
+        return Some("its worker's stop is under way".to_string());
+    }
+    if !facts.live {
+        // Started or resumed with the task: nothing to wait for.
+        return None;
+    }
+    let ready = if task.is_revision() {
+        facts.turn_stopped_idle()
+    } else {
+        facts.idle_at_prompt() || (settled && facts.turn_stopped_idle())
+    };
+    if ready {
+        return None;
+    }
+    Some(
+        match (facts.current_observation(), facts.observation.as_ref()) {
+            (None, Some(latest)) => format!(
+                "its worker has no judgement covering its latest fact (the latest, {}, is older)",
+                latest.state.key()
+            ),
+            (None, None) => "its worker has no judgement yet".to_string(),
+            (Some(current), _) if current.ambiguity != Some(Ambiguity::TurnStoppedIdle) => format!(
+                "its worker is not idle at its prompt (judged {})",
+                current.state.key()
+            ),
+            (Some(current), _) => format!(
+                "its worker stopped at its prompt judged {} and the task it last got is still open",
+                current.state.key()
+            ),
+        },
+    )
+}
+
+/// What delivery did and does about one waiting task, for its stall
+/// ([`crate::dispatch`]'s `stall`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeliveryStatus {
+    /// Its retries are spent: [`Why::DeliveryFailed`] was its escalation.
+    pub(crate) given_up: bool,
+    /// Every attempt with its key and outcome (a failed one with its
+    /// error), then what comes next: a retry due, or due and held and why,
+    /// or none.
+    pub(crate) line: String,
+}
+
+/// Where `task`'s delivery stands, at `now_ms` (the database's clock).
+pub(crate) fn delivery_status(
+    work: &Work,
+    task: &TaskRow,
+    found: Option<&Facts>,
+    now_ms: i64,
+) -> DeliveryStatus {
+    let sent = found
+        .map(|facts| delivery_attempts(task, facts))
+        .unwrap_or_default();
+    let mut parts = Vec::new();
+    let mut last_error: Option<&str> = None;
+    for attempt in &sent {
+        parts.push(match attempt.succeeded {
+            None => format!("`{}` in flight", attempt.key),
+            Some(true) => format!("`{}` succeeded", attempt.key),
+            Some(false) => {
+                let error = attempt.error.as_deref().unwrap_or("no error recorded");
+                let said = if last_error == Some(error) {
+                    "the same error".to_string()
+                } else {
+                    one_line(error, 200)
+                };
+                last_error = Some(error);
+                format!("`{}` failed ({said})", attempt.key)
+            }
+        });
+    }
+    let tried = if parts.is_empty() {
+        "nothing sent yet".to_string()
+    } else {
+        format!("attempts: {}", parts.join("; "))
+    };
+    let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
+    let mut given_up = false;
+    let next = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
+        Attempts::None => held(task, found, settled).map_or_else(
+            || "its first attempt goes on the next pass".to_string(),
+            |why| format!("its first attempt is held: {why}"),
+        ),
+        Attempts::Open => "an attempt is in flight".to_string(),
+        Attempts::Delivered(_) => {
+            "the last attempt succeeded; the task is marked delivered on the next pass".to_string()
+        }
+        Attempts::Retry { number, due_ms } => {
+            let key = format!("{}-retry-{number}", task.delivery_key());
+            if now_ms < due_ms {
+                format!(
+                    "retry `{key}` due in {}s",
+                    (due_ms - now_ms).saturating_add(999) / 1000
+                )
+            } else {
+                held(task, found, settled).map_or_else(
+                    || format!("retry `{key}` due now"),
+                    |why| format!("retry `{key}` due and held: {why}"),
+                )
+            }
+        }
+        Attempts::Failed { why, spent } => {
+            given_up = spent;
+            format!("not tried again: it {why} (escalated as delivery failed)")
+        }
+    };
+    DeliveryStatus {
+        given_up,
+        line: format!("{tried}; {next}"),
     }
 }
 
@@ -511,6 +757,21 @@ pub(crate) fn delivered(work: &Work, rows: &[Facts]) -> Vec<(i64, i64)> {
         .collect()
 }
 
+/// The waiting tasks (assigned, or sent back) that are their session's
+/// turn ([`Turns`]: a revision first, then the oldest new task) with no
+/// open task of the session holding it ([`Work::blocked`]): the ones
+/// delivery tries now. Every other waiting task is queued behind one.
+pub(crate) fn next_up(work: &Work) -> BTreeSet<i64> {
+    let blocked = work.blocked();
+    let mut turns = Turns::new(work);
+    work.tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
+        .filter(|task| turns.take(task) && !blocked.contains(task.session_id.as_str()))
+        .map(|task| task.id)
+        .collect()
+}
+
 /// Delivery orders for the current facts: a task's delivery, or its retry
 /// once due ([`attempts`]).
 pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
@@ -518,16 +779,14 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
         .iter()
         .map(|facts| (facts.session_id.as_str(), facts))
         .collect();
-    let blocked = work.blocked();
-    let mut turns = Turns::new(work);
+    let next = next_up(work);
     let mut orders = Vec::new();
     for task in &work.tasks {
         let session = task.session_id.as_str();
         let found = facts.get(session).copied();
         match task.state {
             TaskState::Assigned | TaskState::Revise => {
-                let turn = turns.take(task);
-                if !turn || blocked.contains(session) {
+                if !next.contains(&task.id) {
                     continue;
                 }
                 let key = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
@@ -538,7 +797,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                     Attempts::Retry { .. }
                     | Attempts::Open
                     | Attempts::Delivered(_)
-                    | Attempts::Failed(_) => continue,
+                    | Attempts::Failed { .. } => continue,
                 };
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
                 orders.extend(delivery(task, found, settled, key));
@@ -560,6 +819,11 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
             | TaskState::Landed => {}
         }
     }
+    for cancelled in work.cancelled.iter().filter(|cancelled| !cancelled.told) {
+        if let Some(facts) = facts.get(cancelled.session_id.as_str()) {
+            orders.extend(cancel_order(cancelled, facts, now_ms));
+        }
+    }
     for (agent, session) in &work.retired {
         if let Some(facts) = facts.get(session.as_str())
             && facts.live_and_free()
@@ -578,6 +842,50 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
         }
     }
     orders
+}
+
+/// The next step for a resident not yet told that its latest task was
+/// cancelled: a live one is stopped (once per execution; a stop that fails is
+/// pursued by [`crate::dispatch`]), one that no longer runs is resumed with
+/// the notice, whose work is set aside first ([`crate::dispatch::step`]). A
+/// notice that failed goes again under a key of its own, after a wait that
+/// doubles ([`retry_wait_ms`]).
+fn cancel_order(cancelled: &Cancelled, facts: &Facts, now_ms: i64) -> Option<Order> {
+    if facts.open_command || facts.stopping() {
+        return None;
+    }
+    let prefix = cancelled.notice_prefix();
+    let attempts: Vec<&crate::dispatch::Sent> = facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key.starts_with(&prefix))
+        .collect();
+    let due = match attempts.last() {
+        None => true,
+        // Under way, or told (the log says so by the next pass): a worker
+        // its notice resumed is not stopped again.
+        Some(last) if last.succeeded != Some(false) => return None,
+        Some(last) => {
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            now_ms >= finished.saturating_add(retry_wait_ms(attempts.len()))
+        }
+    };
+    if facts.live {
+        let execution = facts.execution_id.as_deref().unwrap_or("none");
+        let key = format!("cancel-stop-{}-{execution}", cancelled.id);
+        return Some(cancelled.command(key, CommandAction::Stop));
+    }
+    if !due {
+        return None;
+    }
+    facts.execution_id.as_ref()?;
+    Some(cancelled.command(
+        format!("{prefix}{}", attempts.len()),
+        CommandAction::Resume {
+            prompt: Some(cancel_notice(cancelled)),
+            model: None,
+        },
+    ))
 }
 
 /// How every task asks to be reported on.
@@ -725,7 +1033,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         });
     }
     for (task, attempts) in waiting_attempts(work, rows) {
-        if let Attempts::Failed(why) = attempts {
+        if let Attempts::Failed { why, .. } = attempts {
             items.push(Escalation {
                 session_id: task.session_id.clone(),
                 id: task.delivery_key(),
@@ -812,6 +1120,15 @@ fn new_report(workspace: &Path, key: &str) -> Option<String> {
 /// idle prompt, judged waiting, completed or blocked alike: the report
 /// contract asks for one when the task is done or the worker cannot go on.
 /// Returns log lines. The file is moved to `.spawn/reports/task-<id>.md`.
+/// The facts of `task`'s worker when a report of it may be collected now
+/// ([`Facts::report_due`]): the turn that wrote it has ended in the log,
+/// after its checkpoint, which the report then names.
+fn report_due<'a>(task: &TaskRow, rows: &'a [Facts]) -> Option<&'a Facts> {
+    rows.iter()
+        .find(|facts| facts.session_id == task.session_id)
+        .filter(|facts| facts.report_due())
+}
+
 pub(crate) fn collect_reports(
     store: &PostgresStore,
     work: &Work,
@@ -824,13 +1141,9 @@ pub(crate) fn collect_reports(
         .iter()
         .filter(|task| task.state == TaskState::Delivered)
     {
-        let idle = rows
-            .iter()
-            .find(|facts| facts.session_id == task.session_id)
-            .is_some_and(Facts::turn_stopped_idle);
-        if !idle {
+        let Some(facts) = report_due(task, rows) else {
             continue;
-        }
+        };
         let workspace = root.join(&task.agent_id);
         let key = task.delivery_key();
         let Some(report) = new_report(&workspace, &key) else {
@@ -839,7 +1152,7 @@ pub(crate) fn collect_reports(
         if report.trim().is_empty() {
             continue;
         }
-        match store.task_reported(task.id, report.trim()) {
+        match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref()) {
             Ok(true) => {
                 put_aside(&workspace, task.id);
                 let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
@@ -855,8 +1168,9 @@ pub(crate) fn collect_reports(
 #[cfg(test)]
 mod tests {
     use super::{
-        DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery,
-        new_report, news_items, put_aside, report_contract, task_prompt,
+        Cancelled, DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark,
+        mark_delivery, new_report, news_items, notice_task, put_aside, report_contract, report_due,
+        task_prompt,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -917,6 +1231,8 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            turn_ended: idle,
+            checkpoint: None,
         }
     }
 
@@ -944,6 +1260,84 @@ mod tests {
             tasks,
             ..Work::default()
         }
+    }
+
+    /// A worker at a ready screen, judged idle on it (`TurnStoppedIdle`),
+    /// whose turn's end the transcript has not given yet: the log's latest
+    /// turn event is the prompt (`message.received`).
+    fn ready_screen_before_the_turn_end() -> Facts {
+        let mut facts = worker(true, true);
+        facts.turn_ended = false;
+        facts.checkpoint = Some("c0".to_string());
+        facts
+    }
+
+    #[test]
+    fn no_report_is_collected_on_a_ready_screen_before_the_turns_end() {
+        let task = task(7, TaskState::Delivered, "ephemeral");
+        let facts = ready_screen_before_the_turn_end();
+        assert!(facts.turn_stopped_idle(), "the screen alone says idle");
+        assert!(
+            report_due(&task, std::slice::from_ref(&facts)).is_none(),
+            "the turn that wrote the report has not ended in the log: its checkpoint may not exist"
+        );
+    }
+
+    #[test]
+    fn a_report_is_collected_after_the_turns_end_with_its_checkpoint() {
+        let task = task(7, TaskState::Delivered, "ephemeral");
+        let mut facts = ready_screen_before_the_turn_end();
+        // The Bridge recorded the turn's checkpoint, then its end: both are
+        // newer than the idle judgement, which the Observer (no model judge,
+        // the same verdict) does not write again.
+        facts.turn_ended = true;
+        facts.checkpoint = Some("c1".to_string());
+        facts.evidence_seq = Some(8);
+        assert!(
+            facts.current_observation().is_none(),
+            "the judgement is older"
+        );
+        let rows = [facts];
+        let due = report_due(&task, &rows).expect("the turn ended: the report is collected");
+        assert_eq!(
+            due.checkpoint.as_deref(),
+            Some("c1"),
+            "the report names the checkpoint of its turn"
+        );
+
+        let mut busy = rows[0].clone();
+        busy.observation = Some(Observation::basic(
+            SemanticState::Working,
+            None,
+            SessionSeq(9),
+            Confidence::new(0.9).expect("valid"),
+            "rules",
+        ));
+        assert!(
+            report_due(&task, &[busy]).is_none(),
+            "a verdict that changed since holds it back"
+        );
+        let mut answered = rows[0].clone();
+        if let Some(observation) = answered.observation.as_mut() {
+            observation.fingerprint = Some("asked".to_string());
+        }
+        assert!(
+            report_due(&task, &[answered]).is_none(),
+            "a model's answer is written for every new situation: a stale one waits for the next"
+        );
+        let mut open = rows[0].clone();
+        open.open_command = true;
+        assert!(report_due(&task, &[open]).is_none(), "a command in flight");
+        let mut gone = rows[0].clone();
+        gone.live = false;
+        assert!(report_due(&task, &[gone]).is_none(), "not live");
+        let mut none = rows[0].clone();
+        none.checkpoint = None;
+        assert_eq!(
+            report_due(&task, std::slice::from_ref(&none)).map(|facts| facts.checkpoint.clone()),
+            Some(None),
+            "an agent with no checkpoint at all reports a null commit"
+        );
     }
 
     #[test]
@@ -1825,5 +2219,192 @@ mod tests {
         one.resident = None;
         one.charter = None;
         assert!(task_prompt(&one).contains("started for one task"));
+    }
+
+    /// Resident `core`'s latest delivered task, 7, is cancelled.
+    fn cancelled(told: bool) -> Cancelled {
+        Cancelled {
+            id: 7,
+            mission_id: 1,
+            agent_id: "agent_resident_core".to_string(),
+            session_id: "session_resident_core".to_string(),
+            start: Some("abc123".to_string()),
+            set_aside: None,
+            told,
+            closed_by: Some("task.cancelled".to_string()),
+            reason: None,
+        }
+    }
+
+    /// Task 7 cancelled while delivered, task 8 waiting for the same worker.
+    fn after_cancel(told: bool) -> Work {
+        Work {
+            tasks: vec![task(8, TaskState::Assigned, "resident")],
+            cancelled: vec![cancelled(told)],
+            ..Work::default()
+        }
+    }
+
+    /// The worker in the middle of a turn.
+    fn working() -> Facts {
+        let mut facts = worker(true, false);
+        facts.last_delivery = Some("deliver-7-0".to_string());
+        facts
+    }
+
+    /// The worker after its execution ended.
+    fn stopped() -> Facts {
+        let mut facts = worker(false, false);
+        facts.last_delivery = Some("deliver-7-0".to_string());
+        facts
+    }
+
+    /// Objective 012: a resident in the middle of a turn whose latest task
+    /// was cancelled is stopped at once (the Stop takes its final
+    /// checkpoint), once per execution; its waiting task gets nothing. An
+    /// idle one is stopped the same way: no turn is interrupted, and its
+    /// notice comes with the resume.
+    #[test]
+    fn a_resident_working_on_a_cancelled_task_is_stopped_and_its_next_task_waits() {
+        for facts in [working(), worker(true, true)] {
+            let plan = orders(&after_cancel(false), &[facts]);
+            assert_eq!(plan.len(), 1, "{plan:?}");
+            assert_eq!(plan[0].key, "cancel-stop-7-exec_3");
+            assert_eq!(plan[0].action, CommandAction::Stop);
+            assert_eq!(plan[0].task, None, "the stop carries no task");
+        }
+    }
+
+    /// Once it has stopped, the resident is resumed with the notice, which
+    /// names the task and says it is cancelled; the waiting task is held
+    /// until the notice succeeded, then typed in as usual.
+    #[test]
+    fn a_stopped_resident_is_told_before_its_waiting_task_which_waits_for_the_notice() {
+        let plan = orders(&after_cancel(false), &[stopped()]);
+        assert_eq!(plan.len(), 1, "only the notice: {plan:?}");
+        assert_eq!(plan[0].key, "cancel-notice-7-0");
+        assert_eq!(notice_task(&plan[0].key), Some(7));
+        let CommandAction::Resume {
+            prompt: Some(text),
+            model: None,
+        } = &plan[0].action
+        else {
+            panic!("a resume that carries the notice: {:?}", plan[0].action);
+        };
+        assert!(
+            text.contains("Task #7 of mission #1 was cancelled"),
+            "{text}"
+        );
+        assert!(text.contains("do not write a report"), "{text}");
+        assert!(
+            !text.contains("brief 7"),
+            "the notice does not repeat the brief"
+        );
+
+        // The notice is under way, then failed: the waiting task still waits.
+        let mut sending = stopped();
+        sending.open_command = true;
+        assert!(orders(&after_cancel(false), &[sending]).is_empty());
+        let mut resumed = worker(true, true);
+        resumed.dispatched.push(Sent {
+            succeeded: None,
+            finished_at_ms: None,
+            ..sent(30, "cancel-notice-7-0", 1_000, None)
+        });
+        assert!(
+            orders(&after_cancel(false), &[resumed]).is_empty(),
+            "a live worker whose notice is open is neither stopped nor given the task"
+        );
+        let mut failed = stopped();
+        failed
+            .dispatched
+            .push(sent(30, "cancel-notice-7-0", 1_000, Some("pane not ready")));
+        assert!(super::orders(&after_cancel(false), &[failed.clone()], 1_001).is_empty());
+        let retry = super::orders(&after_cancel(false), &[failed], 1_000 + 60_000);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(
+            retry[0].key, "cancel-notice-7-1",
+            "a retry under a key of its own"
+        );
+
+        // Told: the waiting task goes to the idle worker.
+        let plan = orders(&after_cancel(true), &[worker(true, true)]);
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        assert_eq!(plan[0].task, Some(8));
+        assert!(matches!(plan[0].action, CommandAction::Input { .. }));
+    }
+
+    /// Every pass after the first sends nothing new: a stop submitted (in
+    /// flight, or being pursued), a notice in flight, a worker told.
+    #[test]
+    fn a_second_pass_after_a_cancel_sends_nothing_new() {
+        let mut stopping = working();
+        stopping.open_command = true;
+        assert!(orders(&after_cancel(false), &[stopping]).is_empty());
+        let mut pursued = working();
+        pursued
+            .stops
+            .push(failed_switch("cancel-stop-7-exec_3", 1_000));
+        assert!(orders(&after_cancel(false), &[pursued]).is_empty());
+        let told = Work {
+            cancelled: vec![cancelled(true)],
+            ..Work::default()
+        };
+        for facts in [working(), stopped(), worker(true, true)] {
+            assert!(orders(&told, &[facts]).is_empty(), "told: nothing more");
+        }
+    }
+
+    /// A cancelled task that is not the worker's latest delivery (a later
+    /// task was delivered since) is not among the cancelled deliveries: its
+    /// worker is left alone. An ephemeral worker is only stopped, and a
+    /// retired resident is stopped, never told.
+    #[test]
+    fn only_a_residents_latest_cancelled_delivery_is_told_and_others_are_only_stopped() {
+        let mut later = worker(true, false);
+        later.last_delivery = Some("deliver-9-0".to_string());
+        let not_latest = Work {
+            tasks: vec![
+                task(7, TaskState::Cancelled, "resident"),
+                task(9, TaskState::Delivered, "resident"),
+            ],
+            ..Work::default()
+        };
+        assert!(orders(&not_latest, &[later]).is_empty());
+
+        let ephemeral = work(vec![task(4, TaskState::Cancelled, "ephemeral")]);
+        let plan = orders(&ephemeral, &[working()]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].key, "retire-task-4");
+        assert_eq!(plan[0].action, CommandAction::Stop);
+        assert!(orders(&ephemeral, &[stopped()]).is_empty(), "not told");
+
+        let retired = Work {
+            retired: vec![(
+                "agent_resident_core".to_string(),
+                "session_resident_core".to_string(),
+            )],
+            ..Work::default()
+        };
+        let plan = orders(&retired, &[working()]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].action, CommandAction::Stop);
+        assert!(
+            orders(&retired, &[stopped()]).is_empty(),
+            "not resumed to be told"
+        );
+    }
+
+    /// An abort over budget says so in the notice.
+    #[test]
+    fn the_notice_of_an_abort_says_who_cancelled_and_why() {
+        let mut aborted = cancelled(false);
+        aborted.closed_by = Some("task.aborted".to_string());
+        aborted.reason = Some("over budget: 5 hours".to_string());
+        let text = super::cancel_notice(&aborted);
+        assert!(
+            text.contains("cancelled by the integrator (over budget: 5 hours)"),
+            "{text}"
+        );
     }
 }

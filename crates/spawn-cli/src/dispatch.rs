@@ -15,9 +15,20 @@
 //!    gets reviewed).
 //!
 //! A Stop that failed, whoever sent it, is sent again and then escalated
-//! ([`stops`]): until then the worker gets no task, no nudge. Escalations
-//!    are coalesced into one digest typed into the supervisor's pane while it
-//!    is idle. Without a supervisor they stay in the attention queue.
+//! ([`stops`]): until then the worker gets no task, no nudge.
+//!
+//! No task waits silently ([`stall`]): every open task is at one step
+//! (`delivery`, `activity`, `judgement`, `landing`, `stop`, or its mission
+//! `halted`), measured from the record that started it on the database's
+//! clock, and a step that has not moved within its bound
+//! (`SPAWN_STALL_*_SECS`) is escalated once per stall, tagged
+//! `<session> stall-<task>-<step>-<n>` with `n` naming that record. That
+//! layer acts on nothing; the recoveries Spawn has run on their own
+//! schedules, and the item says what was tried and what is still due.
+//!
+//! Escalations are coalesced into one digest typed into the supervisor's
+//! pane while it is idle. Without a supervisor they stay in the attention
+//! queue.
 //!
 //! The dispatcher keeps no state. What it already did is read back from the
 //! command queue: idempotency keys and their commands' outcomes mark
@@ -33,8 +44,11 @@
 //! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
 
 mod digest;
+mod stall;
 mod stops;
 mod worker;
+
+pub(crate) use stall::Bounds;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -111,6 +125,16 @@ pub(crate) struct Facts {
     /// ([`crate::main_merge`]); a judgement older than one still holds.
     #[serde(default)]
     pub(crate) evidence_seq: Option<u64>,
+    /// The live execution's latest turn event in the log is a turn's end
+    /// (`turn.stopped` or `turn.failed`), not a newer `message.received`.
+    /// The Bridge records a turn's checkpoint before its end.
+    #[serde(default)]
+    pub(crate) turn_ended: bool,
+    /// The commit of the agent's latest `artifact.committed`, read with the
+    /// rest of these facts: once `turn_ended`, the checkpoint of the turn
+    /// that ended (or a later one).
+    #[serde(default)]
+    pub(crate) checkpoint: Option<String>,
     #[serde(default)]
     pub(crate) episode: Option<i64>,
     #[serde(default)]
@@ -187,6 +211,36 @@ impl Facts {
             })
     }
 
+    /// Whether a report written in the worker's workspace may be collected
+    /// now: the turn that wrote it has ended in the log (the transcript's
+    /// end of the turn, not only a ready screen), and so its checkpoint has
+    /// been taken ([`Self::checkpoint`]); the worker is live with no command
+    /// open; and its latest judgement is [`Ambiguity::TurnStoppedIdle`].
+    ///
+    /// A judgement the Observer writes again only when its verdict changes
+    /// (one with no model answer: no model judge, or the judge unavailable)
+    /// need not be current: a turn's end read after the screen showed the
+    /// prompt leaves the idle judgement older than the latest fact, and
+    /// nobody judges again. The log's own end of the turn is newer evidence
+    /// than the judgement, and is what the collection rests on; a turn that
+    /// started since (`message.received`) or a verdict that changed holds it
+    /// back. A model's answer (it carries a fingerprint) is written for every
+    /// new situation, so a stale one waits for the model's judgement of the
+    /// turn, as before.
+    pub(crate) fn report_due(&self) -> bool {
+        let idle =
+            |observation: &Observation| observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
+        self.live_and_free()
+            && self.turn_ended
+            && match self.current_observation() {
+                Some(current) => idle(current),
+                None => self
+                    .observation
+                    .as_ref()
+                    .is_some_and(|latest| latest.fingerprint.is_none() && idle(latest)),
+            }
+    }
+
     pub(crate) fn idle_at_prompt(&self) -> bool {
         self.live_and_free()
             && self.current_observation().is_some_and(|observation| {
@@ -230,6 +284,8 @@ pub(crate) enum Why {
     /// A mission's gate has had no room in TMPDIR for hours
     /// ([`crate::disk::gate_room_escalations`]).
     GateRoom,
+    /// An open task's step has not moved within its bound ([`stall`]).
+    Stalled,
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -368,6 +424,13 @@ fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     Ok((rows, Work::load(store)?))
 }
 
+/// What stalls are measured from, read after the facts and rows: a record
+/// newer than them only makes a step look younger.
+fn load_stalls(store: &PostgresStore) -> Result<stall::Stalls, String> {
+    serde_json::from_value(store.stall_facts().map_err(|error| error.to_string())?)
+        .map_err(|error| format!("stall facts: {error}"))
+}
+
 fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
@@ -388,7 +451,8 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
 }
 
 /// Run one dispatcher step against the store: collect reports from idle
-/// workers under `root`, then submit the plan, without its new executions
+/// workers under `root`, then submit the plan, with the stalls past their
+/// `bounds` among its escalations ([`stall`]), without its new executions
 /// while the disk is under its floor ([`crate::disk`]). Returns log lines.
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
@@ -396,6 +460,7 @@ pub(crate) fn step(
     spawn: &str,
     root: Option<&Path>,
     disk: &crate::disk::Monitor,
+    bounds: &Bounds,
 ) -> Result<Vec<String>, String> {
     let (mut rows, mut work) = load(store)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
@@ -414,6 +479,12 @@ pub(crate) fn step(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
+    // A stall read that failed costs this pass its stall items, never its
+    // deliveries: the next pass measures the same stalls again.
+    match load_stalls(store) {
+        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
+        Err(error) => lines.push(format!("dispatch: stalls: {error}")),
+    }
     let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
@@ -433,6 +504,18 @@ pub(crate) fn step(
     }
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for mut order in plan.orders {
+        // A cancelled task's work is set aside before its resident is told
+        // ([`crate::set_aside`]); a set-aside that fails holds the notice,
+        // and so the resident's next task, until a later pass.
+        if let Some(task) = deliver::notice_task(&order.key) {
+            match set_aside_before(store, root, &work, task, &mut order) {
+                Ok(line) => lines.extend(line),
+                Err(error) => {
+                    lines.push(format!("deliver: {error}"));
+                    continue;
+                }
+            }
+        }
         // A task typed into a live worker starts from the source's main:
         // merged into its idle workspace first, and the brief says what the
         // merge did ([`crate::main_merge`]).
@@ -451,6 +534,45 @@ pub(crate) fn step(
         lines.push(line);
     }
     Ok(lines)
+}
+
+/// Set aside the work of the cancelled task `task` before `order`, its
+/// notice, is sent, and add to the notice where the work went. Without a
+/// workspace root there is no branch here to set aside: the notice goes as
+/// it is. Returns a log line when the set-aside did something.
+fn set_aside_before(
+    store: &std::sync::Arc<PostgresStore>,
+    root: Option<&Path>,
+    work: &Work,
+    task: i64,
+    order: &mut Order,
+) -> Result<Option<String>, String> {
+    let Some(cancelled) = work.cancelled.iter().find(|cancelled| cancelled.id == task) else {
+        return Err(format!(
+            "task #{task}'s cancel notice: the task is not a cancelled delivery"
+        ));
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let done = crate::set_aside::set_aside(store, root, cancelled)?;
+    let note = crate::set_aside::note(task, &done);
+    if let CommandAction::Resume {
+        prompt: Some(text), ..
+    } = &mut order.action
+        && !note.is_empty()
+    {
+        text.push_str("\n\n");
+        text.push_str(&note);
+    }
+    Ok(match done {
+        crate::set_aside::Done::SetAside { commit, kept } if cancelled.set_aside.is_none() => {
+            Some(format!(
+                "deliver: task #{task} cancelled: its work set aside in {kept}, the branch at {commit}"
+            ))
+        }
+        _ => None,
+    })
 }
 
 /// Merge main into the workspace of the live worker `order` types a task
@@ -528,6 +650,8 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            turn_ended: true,
+            checkpoint: None,
         }
     }
 
@@ -628,6 +752,8 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            turn_ended: true,
+            checkpoint: None,
         }
     }
 
