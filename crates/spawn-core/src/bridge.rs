@@ -21,7 +21,7 @@ use crate::event::{
     ModelProfile, NewEvent, Source,
 };
 use crate::id::{AgentId, BranchName, ExecutionId, SessionId, TerminalName, WorkspaceId};
-use crate::ingest::{MERGE_NOTICE_OPENING, claude_line};
+use crate::ingest::{MERGE_NOTICE_OPENING, claude_line, claude_version};
 use crate::port::{
     BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
     TerminalHost, WorkspaceError, WorkspaceStore,
@@ -225,6 +225,9 @@ struct Follow {
     /// When the end's final checkpoint was last tried, by the Bridge's
     /// clock: a stalled end retries every [`END_RETRY_MS`].
     end_tried_at: Option<i64>,
+    /// The engine's version was read from this execution's transcript and
+    /// recorded.
+    version_read: bool,
 }
 
 /// What the Bridge knows about one session.
@@ -821,9 +824,15 @@ impl Bridge {
         };
         for line in bytes[..end].split(|byte| *byte == b'\n') {
             let line = String::from_utf8_lossy(line);
+            let since = active.started_ms - CLOCK_SLACK_MS;
+            if !active.follow.version_read
+                && let Some(version) = claude_version(&line, since)
+            {
+                self.record_version(agent_id, session, native, active, &path, version)?;
+            }
             // A minute of slack for a log clock ahead of this host's: lines
             // already recorded are dropped by their keys anyway.
-            for event in claude_line(&line, active.started_ms - CLOCK_SLACK_MS) {
+            for event in claude_line(&line, since) {
                 let opens = opens_turn(&event.kind);
                 let checkpoint = event.kind.checkpoint_reason().is_some();
                 let stored = self.log.append(NewEvent {
@@ -849,6 +858,33 @@ impl Bridge {
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
         Ok(())
+    }
+
+    /// The engine's version, read from the execution's transcript: the
+    /// native session is recorded again with it, once per execution.
+    fn record_version(
+        &self,
+        agent_id: &AgentId,
+        session: &SessionId,
+        native: &str,
+        active: &mut Active,
+        path: &str,
+        version: String,
+    ) -> Result<(), StoreError> {
+        active.follow.version_read = true;
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Claude,
+            Some(format!("{}:engine_version", active.execution_id)),
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: native.to_string(),
+                transcript_path: Some(path.to_string()),
+                engine_version: Some(version),
+            },
+        )
     }
 
     /// Read the pane and record its state when it changes, or again after
@@ -1437,6 +1473,7 @@ impl Bridge {
                     &active.workspace,
                     &id,
                 )),
+                engine_version: None,
             },
         )?;
         self.catch_up()?;

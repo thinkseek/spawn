@@ -132,6 +132,33 @@ fn events_round_trip_through_json() {
         TerminalName::for_execution(&ExecutionId::new("exec_1").expect("valid")).as_str(),
         "spawn-exec_1"
     );
+    // `engine_version` is optional: a record from before it reads, and an
+    // unset one is left out.
+    let native = serde_json::json!({
+        "name": "session.native_started",
+        "detail": {"engine": ENGINE, "native_session_id": "n1", "transcript_path": null},
+    });
+    let read: EventKind = serde_json::from_value(native.clone()).expect("an old record reads");
+    assert!(matches!(
+        &read,
+        EventKind::NativeSessionStarted {
+            engine_version: None,
+            ..
+        }
+    ));
+    assert_eq!(serde_json::to_value(&read).expect("serialize"), native);
+    let versioned = EventKind::NativeSessionStarted {
+        engine: ENGINE.to_string(),
+        native_session_id: "n1".to_string(),
+        transcript_path: None,
+        engine_version: Some("2.1.318".to_string()),
+    };
+    let written = serde_json::to_value(&versioned).expect("serialize");
+    assert_eq!(written["detail"]["engine_version"], "2.1.318");
+    assert_eq!(
+        serde_json::from_value::<EventKind>(written).expect("reads back"),
+        versioned
+    );
     let start = |engine: &str| {
         serde_json::from_value::<CommandAction>(
             serde_json::json!({"type": "start", "engine": engine, "prompt": "x"}),
@@ -623,6 +650,51 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
 }
 
 #[test]
+fn the_engine_version_is_read_from_the_transcript_once_per_execution() {
+    let store = store();
+    let execution = ExecutionId::for_command(CommandId(1));
+    store.set_pane(&TerminalName::for_execution(&execution), READY);
+    submit_start(&store, "list the files");
+    tick_fresh(&store);
+    let path = events(&store)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::NativeSessionStarted {
+                transcript_path, ..
+            } => transcript_path,
+            _ => None,
+        })
+        .expect("the start records the transcript");
+    let at = r#""timestamp":"2099-01-01T00:00:00.000Z""#;
+    store.append_file(
+        &path,
+        &format!(
+            "{{\"type\":\"user\",\"uuid\":\"u1\",{at},\"version\":\"2.1.318\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"system\",\"subtype\":\"turn_duration\",\"uuid\":\"s1\",{at},\"version\":\"2.1.318\"}}\n"
+        ),
+    );
+    tick_fresh(&store);
+    // A restarted Bridge reads the file again; the key keeps one record.
+    tick_fresh(&store);
+    let versions: Vec<(Source, Option<String>)> = events(&store)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            EventKind::NativeSessionStarted { engine_version, .. } => {
+                Some((event.source, engine_version))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        versions,
+        vec![
+            (Source::Bridge, None),
+            (Source::Claude, Some("2.1.318".to_string()))
+        ]
+    );
+}
+
+#[test]
 fn an_engine_that_exits_between_the_two_reads_is_exited_not_lost() {
     let store = store();
     let mut bridge = Bridge::new(
@@ -792,6 +864,7 @@ fn bridge_resumes_the_stored_native_session() {
                 engine: ENGINE.to_string(),
                 native_session_id: "native-7".to_string(),
                 transcript_path: None,
+                engine_version: None,
             },
         })
         .expect("append succeeds");
