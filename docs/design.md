@@ -38,6 +38,8 @@ spawn-core
 | `Principal`、`IdempotencyKey`、`BranchName`、`CommitId` | 无 | 外部原文包装 |
 | `WorkspaceId` | 无 | 必须形如 `<sandbox>:/<path>` |
 
+Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Session 只属于一个 Agent。`session_id` 只作为日志的列保留（日志不可改，各组件照旧传它），不是独立的实体。PostgreSQL 用 `spawn_agent_sessions(agent_id 主键, session_id 唯一)` 记下每个 Agent 首次写入的 Session，`spawn_append_trusted`（所有追加与提交都经过它）拒绝任何其他配对（`42501`）；靠的是两个唯一键，所以两个并发的首次写入不会都成功。迁移从已有日志回填，违反规则的配对以 warning 报出，保留各自的首个配对，日志不动。
+
 校验规则：
 
 | 规则 | 实现 |
@@ -234,6 +236,7 @@ Observer 每次 tick：
 | `spawn_events` | `id`、`agent_id`、`session_id`、`execution_id`、`source`、`source_event_id`、`kind`、`session_seq`、`recorded_at_ms`、生成列 `event_name` |
 | `spawn_commands` | `principal`、`idempotency_key`、`state`、`lease_until_ms`、`lease_attempt` |
 | `spawn_grants` | 授权 principal |
+| `spawn_agent_sessions` | `agent_id` 主键、`session_id` 唯一：Agent 与 Session 一一对应（§2） |
 
 函数：
 

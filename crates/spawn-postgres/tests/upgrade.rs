@@ -7,26 +7,8 @@
 use postgres::Client;
 
 mod common;
-use common::{admin, store, url};
+use common::{admin, first_shapes, migrate_warnings, store, url};
 use spawn_postgres::PostgresStore;
-
-const FIRST_SHAPES: &str = include_str!("first-shapes.sql");
-
-/// A schema holding the first shape of every table, and an owner
-/// connection in it.
-fn first_shapes(case: &str) -> (String, Client) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.subsec_nanos());
-    let schema = format!("spawn_test_{}_{nanos:x}_{case}", std::process::id());
-    let mut client = Client::connect(&url(), postgres::NoTls).expect("admin connection");
-    client
-        .batch_execute(&format!(
-            "create schema {schema}; set search_path to {schema}; {FIRST_SHAPES}"
-        ))
-        .expect("the first shapes");
-    (schema, client)
-}
 
 /// Every column of the schema's tables, with what decides how a row reads:
 /// position, type, nullability, default.
@@ -132,29 +114,6 @@ fn the_first_shape_of_every_table_migrates_to_the_current_columns() {
     let before = columns(&mut client, &schema);
     upgraded.migrate().expect("migrate again");
     assert_eq!(columns(&mut client, &schema), before);
-}
-
-/// Run the schema over `schema` as the owner and return its warnings.
-fn migrate_warnings(schema: &str) -> Vec<String> {
-    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = std::sync::Arc::clone(&warnings);
-    let mut config: postgres::Config = url().parse().expect("the test URL parses");
-    config.notice_callback(move |notice| {
-        if notice.parsed_severity() == Some(postgres::error::Severity::Warning) {
-            sink.lock()
-                .expect("warnings")
-                .push(notice.message().to_string());
-        }
-    });
-    let mut client = config.connect(postgres::NoTls).expect("owner connection");
-    client
-        .batch_execute(&format!(
-            "set search_path to {schema}; {}",
-            include_str!("../sql/schema.sql")
-        ))
-        .expect("migrate");
-    drop(client);
-    std::mem::take(&mut *warnings.lock().expect("warnings"))
 }
 
 fn exists(client: &mut Client, table: &str) -> bool {

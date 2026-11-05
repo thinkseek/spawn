@@ -122,6 +122,52 @@ from (select e.session_id, max(e.session_seq) as last_seq
 left join spawn_session_state p on p.session_id = f.session_id
 where p.last_session_seq is distinct from f.last_seq;
 
+-- One session per agent, one agent per session: an agent and its session
+-- are one entity, and `session_id` stays only as the log's column. The pair
+-- is the one an append recorded first; `spawn_append_trusted` refuses every
+-- other pairing. Keys, not only the append lock, hold it: two first writes
+-- racing cannot both commit.
+create table if not exists spawn_agent_sessions (
+    agent_id   text primary key,
+    session_id text not null unique
+);
+
+-- A log from before the table: its pairs, in the order they first appear.
+-- A pairing that breaks the rule is reported, and the first pair of each
+-- agent and session stands; the log is never changed.
+do $$
+declare
+    v_pair record;
+    v_broken text := '';
+    v_count integer := 0;
+begin
+    if exists (select 1 from spawn_agent_sessions) or not exists (select 1 from spawn_events) then
+        return;
+    end if;
+    for v_pair in
+        select e.agent_id, e.session_id from spawn_events e
+         group by e.agent_id, e.session_id
+         order by min(e.id)
+    loop
+        insert into spawn_agent_sessions (agent_id, session_id)
+        values (v_pair.agent_id, v_pair.session_id)
+        on conflict do nothing;
+        if not exists (select 1 from spawn_agent_sessions s
+                        where s.agent_id = v_pair.agent_id and s.session_id = v_pair.session_id) then
+            v_count := v_count + 1;
+            if v_count <= 20 then
+                v_broken := v_broken || format(' (%s, %s)', v_pair.agent_id, v_pair.session_id);
+            end if;
+        end if;
+    end loop;
+    if v_count > 0 then
+        raise warning 'the log pairs % agents and sessions against one session per agent:%; '
+                      'their first pairs stand and new writes of these pairs are refused',
+                      v_count, v_broken;
+    end if;
+end
+$$;
+
 -- The writer. Only the owner reaches it: directly, or through SECURITY
 -- DEFINER paths such as the `agent_commands` gateway, which must record
 -- `command.accepted` with source `gateway` even when a restricted login
@@ -143,6 +189,7 @@ declare
     v_seq bigint;
     v_id  bigint;
     v_at  bigint;
+    v_owned text;
     -- Only the Observer's judgement is the projected state.
     v_obs constant boolean := p_kind ->> 'name' = 'observation.recorded' and p_source = 'observer';
 begin
@@ -162,6 +209,23 @@ begin
               and e.source_event_id = p_source_key
             limit 1;
         return;
+    end if;
+
+    -- The agent's session is the one recorded for it first.
+    if not exists (select 1 from spawn_agent_sessions s
+                    where s.agent_id = p_agent and s.session_id = p_session) then
+        insert into spawn_agent_sessions (agent_id, session_id) values (p_agent, p_session)
+            on conflict do nothing;
+        select s.session_id into v_owned from spawn_agent_sessions s where s.agent_id = p_agent;
+        if v_owned is distinct from p_session then
+            raise exception 'agent % has session %, not %', p_agent, v_owned, p_session
+                using errcode = '42501';
+        end if;
+        select s.agent_id into v_owned from spawn_agent_sessions s where s.session_id = p_session;
+        if v_owned is distinct from p_agent then
+            raise exception 'session % belongs to agent %, not %', p_session, v_owned, p_agent
+                using errcode = '42501';
+        end if;
     end if;
 
     select coalesce(max(e.session_seq), 0) + 1 into v_seq
@@ -405,12 +469,16 @@ begin
     end if;
     -- A session belongs to the agent that first used it: a grant for one
     -- agent must not reach another agent's session (the Bridge acts on the
-    -- session, not the agent).
-    if exists (select 1 from spawn_session_state p
-                where p.session_id = new.session_id and p.agent_id <> new.agent_id)
-       or exists (select 1 from spawn_commands c
-                   where c.session_id = new.session_id and c.agent_id <> new.agent_id) then
+    -- session, not the agent). This early answer names the pair; the append
+    -- in `spawn_submit` is what holds it when two first submissions race.
+    if exists (select 1 from spawn_agent_sessions s
+                where s.session_id = new.session_id and s.agent_id <> new.agent_id) then
         raise exception 'session % belongs to another agent than %', new.session_id, new.agent_id
+            using errcode = '42501';
+    end if;
+    if exists (select 1 from spawn_agent_sessions s
+                where s.agent_id = new.agent_id and s.session_id <> new.session_id) then
+        raise exception 'agent % has another session than %', new.agent_id, new.session_id
             using errcode = '42501';
     end if;
 
@@ -651,7 +719,8 @@ left join lateral (
 -- go through the grant-filtered `spawn_read_*` functions below; the gateway
 -- trigger runs as the owner and checks `session_user` against `spawn_grants`.
 -- The revoke on the views also removes the public select of older schemas.
-revoke all on spawn_events, spawn_commands, spawn_grants, spawn_session_state from public;
+revoke all on spawn_events, spawn_commands, spawn_grants, spawn_session_state, spawn_agent_sessions
+    from public;
 revoke select on agent_state, agent_status, agent_timeline, agent_judgements, agent_tasks,
     agent_task_events, agent_executions, agent_artifacts, agent_relations,
     agent_lineage, agent_open_tools, agent_freshness

@@ -24,9 +24,11 @@ fn session(tag: &str, number: u32) -> SessionId {
     SessionId::new(format!("session_{tag}{number}")).expect("tag forms a valid session id")
 }
 
+/// An event of session `number`, by that session's agent: an agent has one
+/// session (the PostgreSQL log refuses any other pairing).
 fn message(tag: &str, number: u32) -> NewEvent {
     NewEvent {
-        agent_id: agent(tag),
+        agent_id: agent(&format!("{tag}{number}")),
         session_id: session(tag, number),
         execution_id: None,
         source: Source::Claude,
