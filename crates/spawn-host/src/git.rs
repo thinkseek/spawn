@@ -607,8 +607,12 @@ impl GitWorkspace {
             return Ok(found);
         }
         let asked: HashSet<&TreePath> = paths.iter().map(|(path, _)| path).collect();
-        let batches =
-            pathspec_batches(paths.iter().map(|(path, _)| path.pathspec("literal")).collect());
+        let batches = pathspec_batches(
+            paths
+                .iter()
+                .map(|(path, _)| path.pathspec("literal"))
+                .collect(),
+        );
         for commit in commits {
             for batch in &batches {
                 let mut arguments: Vec<OsString> =
@@ -1997,7 +2001,9 @@ mod tests {
         let bytes: usize = names.iter().map(|name| name.len() + 12).sum();
         assert!(bytes > 2 << 20, "the paths alone exceed ARG_MAX: {bytes}");
 
-        let held = store.blobs_in(&["main".to_string()], &paths).expect("blob lookup");
+        let held = store
+            .blobs_in(&["main".to_string()], &paths)
+            .expect("blob lookup");
         let mut held: Vec<String> = held.iter().map(ToString::to_string).collect();
         held.sort();
         let mut expected = names[..2].to_vec();
@@ -2040,7 +2046,11 @@ mod tests {
         store
             .stage_all_but(&checkout, &index, &paths)
             .expect("add with every large path excluded");
-        assert_eq!(staged(&index), "added.txt\nother.txt\n", "no large path is staged");
+        assert_eq!(
+            staged(&index),
+            "added.txt\nother.txt\n",
+            "no large path is staged"
+        );
         // An index that holds two of them loses both.
         let full = base.join("full-index");
         let added = Command::new("git")
