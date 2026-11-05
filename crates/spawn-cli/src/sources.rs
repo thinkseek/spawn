@@ -590,6 +590,10 @@ impl WorkspaceStore for MissionWorkspaces {
         }
         Ok(merged)
     }
+
+    fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
+        self.route(branch.as_str())?.store.branch_head(branch)
+    }
 }
 
 impl Drop for MissionWorkspaces {
