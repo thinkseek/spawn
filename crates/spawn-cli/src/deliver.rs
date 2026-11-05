@@ -316,7 +316,13 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<Orde
                 let key = format!("switch-model-{}-{}", task.id, task.revisions);
                 return Some(task.command(key, CommandAction::Stop));
             }
-            Some(task.delivery(key, CommandAction::Input { text: typed(task) }))
+            Some(task.delivery(
+                key,
+                CommandAction::Input {
+                    text: typed(task),
+                    tags: Vec::new(),
+                },
+            ))
         }
         // Ran before: resume, so a resident keeps its context.
         Some(facts) if facts.execution_id.is_some() => Some(task.delivery(
@@ -572,8 +578,10 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             session_id: report.session_id.clone(),
             id: format!("report-{}-{}", report.id, report.revisions),
             why: Why::Report,
+            // The report is the worker's text, not the dispatcher's: framed
+            // as a quote, so an instruction in it reads as the worker's.
             line: format!(
-                "task #{} ({}, mission #{}): {}",
+                "task #{} ({}, mission #{}); the worker's report, quoted: «{}»",
                 report.id,
                 report.kind,
                 report.mission_id,
@@ -804,6 +812,7 @@ mod tests {
             episode_action: Some("start".to_string()),
             open_command: false,
             dispatched: Vec::new(),
+            told: std::collections::BTreeSet::new(),
             last_delivery: None,
             model: ModelProfile::Default,
         }
@@ -1059,7 +1068,7 @@ mod tests {
         revise.revisions = 1;
         let plan = orders(&work(vec![revise]), &[worker(true, true)]);
         assert_eq!(plan[0].key, "deliver-4-1");
-        let CommandAction::Input { text } = &plan[0].action else {
+        let CommandAction::Input { text, .. } = &plan[0].action else {
             panic!("typed");
         };
         assert!(text.contains("tests fail"));
@@ -1130,8 +1139,8 @@ mod tests {
             vec![Why::Mission, Why::Report, Why::Approved, Why::Human]
         );
         assert_eq!(
-            items[1].marker(),
-            "[spawn:esc session_worker_x_7 report-7-1]",
+            items[1].tag(),
+            "session_worker_x_7 report-7-1",
             "a report after a revision is news again"
         );
         assert!(items[1].line.contains("## Outcome done"));
@@ -1226,10 +1235,7 @@ mod tests {
         let items = news_items(&tasks, &[facts]);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
-        assert_eq!(
-            items[0].marker(),
-            "[spawn:esc session_resident_core deliver-4-0]"
-        );
+        assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
     }
 
     /// A root with one worker's workspace in it, its report written, and
