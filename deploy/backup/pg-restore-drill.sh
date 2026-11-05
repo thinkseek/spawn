@@ -11,8 +11,9 @@
 # 2. GET it, decrypt with backup.key, check the SHA-256 recorded at upload
 # 3. start a container from the live server's image: --network none (no port,
 #    nothing outside can connect, so its local trust login is safe), data on
-#    tmpfs, label spawn.restore-drill; removed on exit, and leftovers of
-#    earlier drills are removed at start
+#    tmpfs, label spawn.restore-drill=<this run's id>; this run removes its
+#    own container on exit and no other drill's running one (see "Other
+#    drills" below)
 # 4. pg_restore with the container's own pg_restore into a new database
 # 5. row counts of the core tables there and on live (read-only
 #    transactions), side by side
@@ -30,6 +31,15 @@
 # server's pg_postmaster_start_time before the identity check and checks it
 # is unchanged after the restore and after the counts: every statement went
 # to the one server it checked.
+#
+# Other drills. Two drills may run at once (a timer and a human): each
+# removes only its own container, by name, on exit. At start, a container
+# another drill left is removed only when it is not running and is older
+# than SPAWN_DRILL_LEFTOVER_AGE seconds (default a day): a running one may
+# be a concurrent drill, and is left alone. A drill killed before its exit
+# trap (SIGKILL) leaves its container running; that container's life is
+# bounded instead: postgres runs under `timeout SPAWN_DRILL_LIFETIME`
+# (default 6 hours) and --rm removes the container when it stops.
 set -euo pipefail
 umask 077
 PROG=pg-restore-drill
@@ -38,6 +48,10 @@ PROG=pg-restore-drill
 TABLES=(spawn_events spawn_commands mission_missions mission_tasks)
 LABEL=spawn.restore-drill
 TMPFS_SIZE=${SPAWN_DRILL_TMPFS_SIZE:-4g}
+LEFTOVER_AGE=${SPAWN_DRILL_LEFTOVER_AGE:-86400}
+LIFETIME=${SPAWN_DRILL_LIFETIME:-21600}
+[[ $LEFTOVER_AGE =~ ^[0-9]+$ ]] || die "SPAWN_DRILL_LEFTOVER_AGE must be whole seconds"
+[[ $LIFETIME =~ ^[1-9][0-9]*$ ]] || die "SPAWN_DRILL_LIFETIME must be whole seconds"
 
 local_dump=
 case "${1-}" in
@@ -69,12 +83,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-old=$(docker ps -aq --filter "label=$LABEL")
-if [ -n "$old" ]; then
-  # shellcheck disable=SC2086
-  docker rm -f $old >/dev/null || die "cannot remove leftover drill containers"
-  log "removed $(wc -w <<<"$old") leftover drill container(s)"
-fi
+# Containers other drills left (see "Other drills" above): a stopped one past
+# LEFTOVER_AGE is removed (`docker rm` without -f: one that started meanwhile
+# stays); a running one is left alone.
+now=$(date -u +%s)
+while read -r id state created; do
+  [ -n "$id" ] || continue
+  age=$((now - $(date -u -d "$created" +%s)))
+  case $state in
+    running | restarting | paused)
+      log "drill container ${id:0:12} is $state (another drill, or one killed $((age / 60))m ago): left alone"
+      ;;
+    *)
+      if [ "$age" -ge "$LEFTOVER_AGE" ]; then
+        docker rm "$id" >/dev/null 2>&1 && log "removed a stopped leftover drill container (${id:0:12})" \
+          || warn "could not remove the leftover drill container ${id:0:12}"
+      fi
+      ;;
+  esac
+done < <(docker ps -aq --filter "label=$LABEL" | xargs -r docker inspect -f '{{.Id}} {{.State.Status}} {{.Created}}')
 
 if [ -n "$local_dump" ]; then
   # 1-2. a local dump: nothing to fetch, decrypt or compare with an upload
@@ -112,10 +139,14 @@ fi
 
 # 3. the throwaway server
 image=$(pg_image)
-ctr="spawn-restore-drill-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-docker run -d --rm --name "$ctr" --label "$LABEL=1" --network none \
+run_id=$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+# The name is set before the run: should `docker run` fail half-way, the
+# exit trap still removes this run's container and no other.
+ctr="spawn-restore-drill-$run_id"
+docker run -d --rm --name "$ctr" --label "$LABEL=$run_id" --network none \
   --tmpfs "/var/lib/postgresql/data:rw,size=$TMPFS_SIZE" \
-  -e POSTGRES_HOST_AUTH_METHOD=trust "$image" >/dev/null \
+  -e POSTGRES_HOST_AUTH_METHOD=trust "$image" \
+  timeout "$LIFETIME" docker-entrypoint.sh postgres >/dev/null \
   || die "cannot start a $image container"
 # The real server, not the entrypoint's temporary one (see the header): its
 # log shows initdb's server stopped and the real one ready, and TCP on the
