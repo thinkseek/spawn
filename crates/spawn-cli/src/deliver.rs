@@ -36,6 +36,7 @@ use spawn_core::bridge::MAY_HAVE_TYPED;
 use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, ModelProfile};
 use spawn_core::mission::TaskState;
+use spawn_host::tree_path::TreePath;
 use spawn_postgres::PostgresStore;
 
 use crate::dispatch::{Escalation, Facts, Order, Why};
@@ -659,22 +660,20 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
 
 /// Move a collected report to `.spawn/reports/task-<id>.md` under the
 /// workspace, or delete it if it cannot be moved, so the next task starts
-/// clean.
-fn put_aside(path: &Path, workspace: &Path, task: i64) {
-    let kept = workspace.join(KEPT_REPORTS).join(format!("task-{task}.md"));
-    let moved = kept
-        .parent()
-        .map(std::fs::create_dir_all)
-        .and_then(Result::ok)
-        .and_then(|()| std::fs::rename(path, &kept).ok());
-    if moved.is_none() {
-        let _ = std::fs::remove_file(path);
+/// clean. Both inside the workspace only, never through a symlink
+/// ([`spawn_host::agent_files`]).
+fn put_aside(workspace: &Path, task: i64) {
+    use spawn_host::agent_files::{remove, rename_within};
+    let report = TreePath::from(REPORT);
+    let kept = TreePath::from(format!("{KEPT_REPORTS}/task-{task}.md").as_str());
+    if rename_within(workspace, &report, &kept).is_err() {
+        let _ = remove(workspace, &report);
     }
 }
 
-/// The mark of the delivery `key` in `workspace`.
-fn delivery_mark(workspace: &Path, key: &str) -> std::path::PathBuf {
-    workspace.join(DELIVERY_MARKS).join(key)
+/// The mark of the delivery `key`, relative to the workspace.
+fn delivery_mark(key: &str) -> TreePath {
+    TreePath::from(format!("{DELIVERY_MARKS}/{key}").as_str())
 }
 
 /// Mark in the worker's workspace under `root` that `order`, which carries
@@ -692,35 +691,42 @@ pub(crate) fn mark_delivery(root: &Path, order: &Order) -> Result<(), String> {
     if order.task.is_none() || !workspace.is_dir() {
         return Ok(());
     }
+    // Made inside the workspace only: no directory or mark is followed
+    // through a symlink the agent put there. One already there stays.
     let key = order.key.split("-retry-").next().unwrap_or(&order.key);
-    let mark = delivery_mark(&workspace, key);
-    let created = mark
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&mark)
-        });
-    match created {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(format!("mark {}: {error}", mark.display())),
-    }
+    let mark = delivery_mark(key);
+    spawn_host::agent_files::create_new(&workspace, &mark)
+        .map(|_| ())
+        .map_err(|error| format!("mark {}: {error}", workspace.join(mark.as_path()).display()))
 }
 
-/// Whether the report at `report` was written for the delivery whose mark
-/// is `mark`: at or after the mark, by the same filesystem clock. Without a
-/// mark the workspace was mounted after the delivery was sent (a start or
-/// resume mounts a fresh one), so everything in it is newer. A report that
-/// cannot be read is never new.
-fn report_is_new(report: &Path, mark: &Path) -> bool {
-    let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified());
-    let Ok(written) = modified(report) else {
-        return false;
+/// The most of a report [`new_report`] reads.
+const REPORT_LIMIT: u64 = 1 << 20;
+
+/// The report in `workspace` written for the delivery `key`, if there is
+/// one: written at or after the delivery's mark, by the same filesystem
+/// clock. Without a mark the workspace was mounted after the delivery was
+/// sent (a start or resume mounts a fresh one), so everything in it is
+/// newer. The agent writes both files, so each is opened the safe way
+/// ([`spawn_host::agent_files`]): a symlink is not followed, a FIFO is not
+/// waited on, the times are the opened files' own, and at most
+/// [`REPORT_LIMIT`] bytes are read. A report that cannot be read that way
+/// is never new.
+fn new_report(workspace: &Path, key: &str) -> Option<String> {
+    use spawn_host::agent_files::{open_regular, read_regular};
+    let (bytes, metadata, _) = read_regular(workspace, &TreePath::from(REPORT), REPORT_LIMIT)
+        .ok()
+        .flatten()?;
+    let written = metadata.modified().ok()?;
+    let sent = match open_regular(workspace, &delivery_mark(key)) {
+        Ok(None) => None,
+        Ok(Some(mark)) => Some(mark.metadata.modified().ok()?),
+        Err(_) => return None,
     };
-    modified(mark).map_or(true, |sent| written >= sent)
+    if sent.is_some_and(|sent| written < sent) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Collect the reports of delivered tasks whose worker's turn stopped at an
@@ -747,12 +753,8 @@ pub(crate) fn collect_reports(
             continue;
         }
         let workspace = root.join(&task.agent_id);
-        let path = workspace.join(REPORT);
-        let mark = delivery_mark(&workspace, &task.delivery_key());
-        if !report_is_new(&path, &mark) {
-            continue;
-        }
-        let Ok(report) = std::fs::read_to_string(&path) else {
+        let key = task.delivery_key();
+        let Some(report) = new_report(&workspace, &key) else {
             continue;
         };
         if report.trim().is_empty() {
@@ -760,8 +762,8 @@ pub(crate) fn collect_reports(
         }
         match store.task_reported(task.id, report.trim()) {
             Ok(true) => {
-                put_aside(&path, &workspace, task.id);
-                let _ = std::fs::remove_file(&mark);
+                put_aside(&workspace, task.id);
+                let _ = spawn_host::agent_files::remove(&workspace, &delivery_mark(&key));
                 lines.push(format!("deliver: task #{} reported", task.id));
             }
             Ok(false) => {}
@@ -775,7 +777,7 @@ pub(crate) fn collect_reports(
 mod tests {
     use super::{
         DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark, mark_delivery,
-        news_items, report_contract, report_is_new, task_prompt,
+        new_report, news_items, put_aside, report_contract, task_prompt,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -1277,14 +1279,14 @@ mod tests {
     #[test]
     fn a_retry_keeps_the_deliverys_mark() {
         let (root, workspace, order) = marked_workspace("retry");
-        let mark = delivery_mark(&workspace, &order.key);
+        let mark = workspace.join(delivery_mark(&order.key).as_path());
         let first = std::fs::metadata(&mark).and_then(|meta| meta.modified());
         let retry = Order {
             key: format!("{}-retry-1", order.key),
             ..order
         };
         mark_delivery(&root, &retry).expect("mark");
-        assert!(!delivery_mark(&workspace, &retry.key).exists());
+        assert!(!workspace.join(delivery_mark(&retry.key).as_path()).exists());
         assert_eq!(
             std::fs::metadata(&mark)
                 .and_then(|meta| meta.modified())
@@ -1325,14 +1327,22 @@ mod tests {
     fn a_report_older_than_its_delivery_is_not_collected() {
         let (root, workspace, _) = marked_workspace("older");
         let report = workspace.join(REPORT);
-        let mark = delivery_mark(&workspace, "deliver-4-0");
+        let mark = workspace.join(delivery_mark("deliver-4-0").as_path());
         let sent = std::time::SystemTime::now();
         set_modified(&mark, sent);
         set_modified(&report, sent - std::time::Duration::from_secs(10));
-        assert!(!report_is_new(&report, &mark), "left over from before");
+        assert_eq!(
+            new_report(&workspace, "deliver-4-0"),
+            None,
+            "left over from before"
+        );
         set_modified(&report, sent + std::time::Duration::from_secs(10));
-        assert!(report_is_new(&report, &mark));
-        assert!(!report_is_new(&workspace.join("missing.md"), &mark));
+        assert_eq!(
+            new_report(&workspace, "deliver-4-0").as_deref(),
+            Some("## Outcome\ndone")
+        );
+        std::fs::remove_file(&report).expect("remove the report");
+        assert_eq!(new_report(&workspace, "deliver-4-0"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1340,21 +1350,22 @@ mod tests {
     fn a_report_is_judged_by_its_filesystems_clock_never_the_databases() {
         let (root, workspace, order) = marked_workspace("skewed");
         let report = workspace.join(REPORT);
-        let mark = delivery_mark(&workspace, &order.key);
+        let mark = workspace.join(delivery_mark(&order.key).as_path());
+        let is_new = || new_report(&workspace, &order.key).is_some();
         // The host's clock is a day behind the database's (or ahead: the
         // database is never asked): the mark and the report share it.
         let host = std::time::SystemTime::now() - std::time::Duration::from_hours(24);
         set_modified(&mark, host);
         set_modified(&report, host + std::time::Duration::from_secs(5));
-        assert!(report_is_new(&report, &mark));
+        assert!(is_new());
         // A delivery planned again keeps its first mark.
         mark_delivery(&root, &order).expect("marked again");
         let kept = std::fs::metadata(&mark).and_then(|meta| meta.modified());
         assert_eq!(kept.ok(), Some(host));
-        assert!(report_is_new(&report, &mark));
+        assert!(is_new());
         // No mark: the workspace was mounted after the delivery.
         std::fs::remove_file(&mark).expect("remove the mark");
-        assert!(report_is_new(&report, &mark));
+        assert!(is_new());
         // A worker with no workspace yet gets none, and no error.
         let unmounted = Order {
             agent_id: "agent_worker_new".to_string(),
@@ -1362,6 +1373,57 @@ mod tests {
         };
         mark_delivery(&root, &unmounted).expect("nothing to mark");
         assert!(!root.join("agent_worker_new").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The agent writes the report and the marks: a report that is a
+    /// symlink (to an owner's file) or a FIFO with no writer, and a mark
+    /// whose directory is a symlink, are refused without reading through
+    /// them or waiting; the report is put aside inside the workspace only.
+    #[test]
+    fn a_report_or_mark_the_agent_planted_is_refused_without_following_or_waiting() {
+        let (root, workspace, order) = marked_workspace("planted");
+        let report = workspace.join(REPORT);
+        let secret = root.join("owner-secret.txt");
+        std::fs::write(&secret, "owner only\n").expect("secret");
+        std::fs::remove_file(&report).expect("remove the report");
+        std::os::unix::fs::symlink(&secret, &report).expect("symlink");
+        assert_eq!(new_report(&workspace, &order.key), None, "not followed");
+
+        std::fs::remove_file(&report).expect("remove the symlink");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&report)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        let started = std::time::Instant::now();
+        assert_eq!(
+            new_report(&workspace, &order.key),
+            None,
+            "a FIFO is no report"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the read waited on the FIFO"
+        );
+        std::fs::remove_file(&report).expect("remove the FIFO");
+
+        // Marks whose directory is a symlink to a directory outside.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let marks = workspace.join(".spawn/deliveries");
+        std::fs::remove_dir_all(&marks).expect("remove the marks");
+        std::os::unix::fs::symlink(&outside, &marks).expect("symlink");
+        assert!(mark_delivery(&root, &order).is_err(), "refused");
+        assert_eq!(std::fs::read_dir(&outside).expect("outside").count(), 0);
+
+        // A report put aside where `.spawn/reports` is a symlink outside:
+        // removed, never moved through it.
+        std::fs::write(&report, "## Outcome\ndone").expect("report");
+        std::os::unix::fs::symlink(&outside, workspace.join(".spawn/reports")).expect("symlink");
+        put_aside(&workspace, 4);
+        assert!(!report.exists(), "the report is gone from its place");
+        assert_eq!(std::fs::read_dir(&outside).expect("outside").count(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -860,3 +860,146 @@ fn a_forged_turn_end_mid_turn_does_not_merge_main() {
     bridge.tick().expect("checkpoint");
     assert_eq!(merges(&store), before, "no merge under a running turn");
 }
+
+/// A workspace store with one notice for the agent after its first
+/// checkpoint, as the git store has when a checkpoint left out a file over
+/// the size cap.
+struct Telling {
+    inner: Arc<MemoryStore>,
+    notice: std::sync::Mutex<Option<String>>,
+}
+
+impl WorkspaceStore for Telling {
+    fn project(&self) -> &str {
+        self.inner.project()
+    }
+    fn ensure_branch(
+        &self,
+        branch: &BranchName,
+        from: Option<&str>,
+    ) -> Result<spawn_core::port::Branch, spawn_core::port::WorkspaceError> {
+        self.inner.ensure_branch(branch, from)
+    }
+    fn mount(
+        &self,
+        branch: &BranchName,
+    ) -> Result<spawn_core::id::WorkspaceId, spawn_core::port::WorkspaceError> {
+        self.inner.mount(branch)
+    }
+    fn commit(
+        &self,
+        workspace: &spawn_core::id::WorkspaceId,
+        message: &str,
+    ) -> Result<spawn_core::port::Commit, spawn_core::port::WorkspaceError> {
+        self.inner.commit(workspace, message)
+    }
+    fn unmount(
+        &self,
+        workspace: &spawn_core::id::WorkspaceId,
+    ) -> Result<(), spawn_core::port::WorkspaceError> {
+        self.inner.unmount(workspace)
+    }
+    fn merge_base(
+        &self,
+        workspace: &spawn_core::id::WorkspaceId,
+    ) -> Result<BaseMerge, spawn_core::port::WorkspaceError> {
+        self.inner.merge_base(workspace)
+    }
+    fn take_notices(&self, _workspace: &spawn_core::id::WorkspaceId) -> Vec<String> {
+        self.notice
+            .lock()
+            .expect("the notice")
+            .take()
+            .into_iter()
+            .collect()
+    }
+}
+
+fn pane(store: &MemoryStore, command: u64) -> String {
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(command)));
+    store
+        .capture_tail(
+            &terminal,
+            &spawn_core::id::WorkspaceId::new("1:/w").expect("valid"),
+            200,
+        )
+        .expect("a pane")
+}
+
+fn reset_pane(store: &MemoryStore, command: u64) {
+    let terminal = TerminalName::for_execution(&ExecutionId::for_command(CommandId(command)));
+    store.set_pane(&terminal, READY);
+}
+
+/// What was typed into the first execution since its pane last read ready.
+fn typed_last(store: &MemoryStore) -> String {
+    let pane = pane(store, 1);
+    pane.rsplit("tok/s").next().unwrap_or_default().to_string()
+}
+
+fn input(store: &MemoryStore, key: &str, text: &str) {
+    submit(
+        store,
+        key,
+        CommandAction::Input {
+            text: text.to_string(),
+            tags: Vec::new(),
+        },
+    );
+}
+
+const LEFT_OUT: &str = "model.bin (200 MiB) is over the 100 MiB cap for one file in a checkpoint";
+
+/// What the store has to tell the agent is a tick warning when the
+/// checkpoint hands it over, and goes before the next prompt the Bridge
+/// types, once.
+#[test]
+fn a_notice_of_the_workspace_store_is_logged_and_told_with_the_next_prompt_once() {
+    let store = store();
+    let telling = Arc::new(Telling {
+        inner: store.clone(),
+        notice: std::sync::Mutex::new(Some(LEFT_OUT.to_string())),
+    });
+    let mut bridge = Bridge::new(
+        store.clone(),
+        store.clone(),
+        telling,
+        store.clone(),
+        BridgeConfig::new("tester"),
+    )
+    .with_transcript_archive(store.clone());
+    start(&store, None);
+    bridge.tick().expect("start");
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    let mut warnings = Vec::new();
+    for _ in 0..2 {
+        warnings.extend(bridge.tick().expect("checkpoint").warnings);
+    }
+    assert!(
+        warnings.iter().any(|warning| warning.contains(LEFT_OUT)),
+        "{warnings:?}"
+    );
+    assert!(
+        !pane(&store, 1).contains(LEFT_OUT),
+        "never typed unprompted"
+    );
+
+    reset_pane(&store, 1);
+    input(&store, "key_input_1", "next");
+    bridge.tick().expect("type");
+    let typed = typed_last(&store);
+    let told = typed.find(LEFT_OUT).expect("the notice was typed");
+    assert!(typed[told..].contains("\n\nnext"), "{typed}");
+
+    transcript(&store, &[prompt("2"), turn_end("2")]);
+    bridge.tick().expect("read the turn");
+    bridge.tick().expect("checkpoint");
+    reset_pane(&store, 1);
+    input(&store, "key_input_2", "again");
+    bridge.tick().expect("type");
+    let typed = typed_last(&store);
+    assert!(
+        typed.contains("again") && !typed.contains(LEFT_OUT),
+        "{typed}"
+    );
+}

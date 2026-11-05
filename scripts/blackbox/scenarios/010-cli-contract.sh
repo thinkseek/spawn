@@ -13,7 +13,7 @@ assert_eq "$status" 0 "second init-db exit"
 capture "$SPAWN_BIN"
 assert_eq "$status" 1 "no subcommand exit"
 assert_contains "$(err)" \
-    "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|chunks|serve|fleet|tail|run|version>" \
+    "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|serve|fleet|tail|run|version>" \
     "the usage names every command"
 
 capture "$SPAWN_BIN" nonsense

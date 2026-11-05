@@ -205,10 +205,8 @@ pub enum EventKind {
     MessageReceived,
     /// Read only, in records written before main stopped being merged into
     /// running workspaces: nothing writes it, and folds ignore it. The
-    /// Bridge typed a prompt that opened with a merge notice: what merges of
-    /// main changed
-    /// in the agent's workspace, up to and including the event at `through`.
-    /// The notice stays due until that prompt reaches the engine.
+    /// Bridge typed a prompt that opened with a merge notice, telling of
+    /// the merges up to and including the event at `through`.
     #[serde(rename = "notice.typed")]
     NoticeTyped {
         /// The last merge event the typed notice told of.

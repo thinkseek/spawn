@@ -134,8 +134,7 @@ Tools (run them with Bash; they go through your restricted login):
 - `{spawn} submit --agent <agent> --session <session> --key <unique> --action '{{\"type\":\"stop\"}}'` \
 — stop a worker if you must (input to workers goes through tasks). An agent whose `fleet` \
 attention says `end_stalled` has ended but its final checkpoint keeps failing: its workspace \
-stays mounted and holds work that is on no branch. Fix the cause if you can (a full disk, the \
-chunk store); `{{\"type\":\"discard\"}}` unmounts it and loses that work, so send it only \
+stays mounted and holds work that is on no branch. Fix the cause if you can (a full disk); `{{\"type\":\"discard\"}}` unmounts it and loses that work, so send it only \
 when the work may go.
 
 Boundaries:

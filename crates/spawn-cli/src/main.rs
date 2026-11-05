@@ -9,7 +9,6 @@
 //!   the supervisor's liveness rule.
 //! - `mission`, `task`, `resident` manage the mission layer.
 //! - `integrate` lands gated missions' work and assigns objectives (RSI).
-//! - `chunks gc` removes chunk-store objects no reachable commit names.
 //! - `serve` serves the read-only dashboard and API.
 //! - `fleet` prints every session with its judgement; `tail` one session's
 //!   judgement, events, judgements and commands.
@@ -43,9 +42,9 @@ mod supervise;
 // Re-exported at the crate root, where the command modules import them.
 pub(crate) use config::{Flags, env_or, env_value, open_store};
 
-use commands::{chunks, engine, inspect, loops, queue};
+use commands::{engine, inspect, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|chunks|serve|fleet|tail|run|version>";
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|serve|fleet|tail|run|version>";
 
 fn main() {
     let code = match dispatch() {
@@ -75,7 +74,6 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "loop" => loops::resident_loop(&Flags::parse(&rest)?),
         "serve" => serve::serve(&Flags::parse(&rest)?),
         "integrate" => integrate::integrate(&rest),
-        "chunks" => chunks::command(&rest),
         "mission" => missions::mission(&rest),
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),
