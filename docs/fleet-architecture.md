@@ -188,8 +188,9 @@ it, on the same ladder.
   failed resume, attention, and a finished execution nobody stopped all
   escalate. Escalations coalesce into one digest typed into the supervisor
   while it is idle. The dispatcher keeps no state: idempotency keys mark its
-  nudges and resumes, and a `[spawn:esc <session> <id>]` marker per item in
-  each delivered digest marks what the supervisor was told.
+  nudges and resumes, and the tags a delivered digest files on its command
+  (`<session> <id>` per item, never in the text, which quotes workers'
+  reports) mark what the supervisor was told.
 - **Supervisor**: one perpetual Claude Code session (`agent_supervisor`).
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet

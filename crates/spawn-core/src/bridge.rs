@@ -1431,7 +1431,7 @@ impl Bridge {
                 },
                 report,
             ),
-            CommandAction::Input { text } => self.input(claimed, &text),
+            CommandAction::Input { text, .. } => self.input(claimed, &text),
             CommandAction::Stop => self.stop(claimed, false, report),
             CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt, model } => {
