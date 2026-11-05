@@ -164,16 +164,26 @@ expect "a candidate that names no commit is no verdict" \
     "exit=$(sh "$gate" "$repo" "$base" no-such-ref "$scenarios" >/dev/null 2>&1 || echo $?)" 'exit=3'
 expect "no task scenario: regression only" "$(judge "$good")" 'exit=0 {"verdict":"accepted"}'
 
-# No room in TMPDIR: an abort (exit 3, no verdict) before any scratch is made.
+# No room in TMPDIR: exit 5 and a no-room fact in the verdict file (no
+# verdict), before any scratch is made. The integrator records it as
+# `no_room`, which does not count toward a halt.
 roomless=$work/roomless-tmp
 mkdir "$roomless"
-expect "a TMPDIR without room aborts the gate" \
-    "$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000; judge "$good")" 'exit=3 '
-refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'verdict'
+expect "a TMPDIR without room stops the gate with its own status" \
+    "$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000; judge "$good")" \
+    'exit=5 {"no_room":true,"free_kb":'
+expect "the reason names the floor and TMPDIR" "$(cat "$integrator/verdict")" \
+    "\"min_gb\":1000000000,\"tmpdir\":\"$roomless\"}"
+expect "and the free space, in KiB" \
+    "$(sed -E 's/.*"free_kb":([0-9]+),.*/free=\1/' "$integrator/verdict")" "free=$(df -Pk "$roomless" | awk 'NR == 2 { print $4 }' | cut -c1-3)"
+refuse "with no verdict" "$(cat "$integrator/verdict")" '"verdict"'
 expect "and says why" "$(cat "$work/gate.out")" 'under SPAWN_GATE_MIN_FREE_GB=1000000000: not starting'
 refuse "and leaves no scratch" "$(ls -A "$roomless")" 'spawn-gate'
-expect "a floor that is not whole GiB aborts too" \
+expect "a floor that is not whole GiB is an abort (exit 3), not short room" \
     "$(export SPAWN_GATE_MIN_FREE_GB=lots; judge "$good")" 'exit=3 '
+refuse "and writes no no-room fact" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'no_room'
+expect "a TMPDIR whose free space cannot be read is an abort too" \
+    "$(export TMPDIR="$work/no-such-tmp" SPAWN_GATE_MIN_FREE_GB=1; judge "$good")" 'exit=3 '
 expect "the gate's scratch is named for cleanup" \
     "$(export TMPDIR="$roomless"; . "$(dirname "$gate")/../disk.sh"; basename "$(gate_scratch)")" 'spawn-gate.'
 rm -rf "$roomless"
