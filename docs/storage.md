@@ -1,12 +1,10 @@
 # Storage: one place, by kind of object
 
 The goal: everything Spawn knows lives in one store that any machine with the
-right credentials can reach, and work in it branches and merges the way
-LayerFS models it (a branch per agent, a checkpoint per tool call, fork from
-any commit, merge back automatically), but durably. LayerFS itself is not the
-store: its Store "runs in its Disposable profile only, with no crash or
-power-loss durability" (its README), it is one SQLite file, and its rejected
-branches cannot be deleted.
+right credentials can reach, and work in it branches and merges (a branch per
+agent, a checkpoint per tool call, fork from any commit, merge back
+automatically), durably: a crash or a power loss loses no committed state,
+and a rejected branch can be deleted.
 
 Git is not the store either. It versions text; it stores every version of a
 file whole. Measured on this host (git 2.56, btrfs):
