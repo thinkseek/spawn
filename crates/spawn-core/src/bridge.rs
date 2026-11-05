@@ -380,9 +380,10 @@ pub struct Bridge {
     /// took whose append failed: appended again first at the next tick
     /// ([`Bridge::record_commit`]).
     unrecorded_commits: std::sync::Mutex<HashMap<SessionId, Vec<NewEvent>>>,
-    /// Per session, what the workspace store had to tell the agent
-    /// ([`WorkspaceStore::take_notices`]) and no prompt carried yet.
-    untold: std::sync::Mutex<HashMap<SessionId, Vec<String>>>,
+    /// Per session, the store's notices this Bridge already logged as a
+    /// warning. Only the log: whether the agent was told is the store's
+    /// record ([`WorkspaceStore::notices_told`]).
+    warned: std::sync::Mutex<HashMap<SessionId, HashSet<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
 }
@@ -406,7 +407,7 @@ impl Bridge {
             sessions: HashMap::new(),
             clock: Arc::new(SystemClock),
             unrecorded_commits: std::sync::Mutex::default(),
-            untold: std::sync::Mutex::default(),
+            warned: std::sync::Mutex::default(),
             transcripts: None,
         }
     }
@@ -1254,14 +1255,17 @@ impl Bridge {
                 return Ok(false);
             }
         }
-        // Logged, and carried by the next prompt the Bridge types.
-        let notices = self.workspaces.take_notices(&active.workspace);
-        if !notices.is_empty() {
-            for notice in &notices {
-                report.warnings.push(format!("{session}: {notice}"));
-            }
-            if let Ok(mut untold) = self.untold.lock() {
-                untold.entry(session.clone()).or_default().extend(notices);
+        // Logged once, and carried by the next prompt the Bridge types.
+        let notices = self.workspaces.notices(&active.workspace);
+        if !notices.is_empty()
+            && let Ok(mut warned) = self.warned.lock()
+        {
+            let seen = warned.entry(session.clone()).or_default();
+            for notice in notices {
+                if !seen.contains(&notice) {
+                    report.warnings.push(format!("{session}: {notice}"));
+                    seen.insert(notice);
+                }
             }
         }
         Ok(true)
@@ -1621,21 +1625,23 @@ impl Bridge {
     /// Text into the engine's input box, at most once: the intent is
     /// recorded before the keys go and the completion after, so a retried
     /// command or a restarted Bridge can tell whether it was typed. What the
-    /// workspace store told and no prompt carried yet goes before it.
+    /// workspace store has to tell and no prompt carried yet goes before
+    /// it, and is marked told in the store once the typing is recorded.
     fn type_once(
         &self,
         claimed: &Claimed,
         active: &Active,
         text: &str,
     ) -> Result<Result<(), TerminalError>, StoreError> {
-        // What the workspace store had to tell the agent goes first, and is
-        // told once: it clears when the typing is recorded.
-        let untold = self.untold.lock().ok().and_then(|untold| {
-            untold
-                .get(&claimed.session_id)
-                .map(|notices| notices.join("\n\n"))
-        });
-        let text = untold.map_or_else(|| text.to_string(), |told| format!("{told}\n\n{text}"));
+        // What the workspace store has to tell the agent goes first. It is
+        // the store's record, not this process's memory, so a restart
+        // between the checkpoint and this prompt loses none of it.
+        let notices = self.workspaces.notices(&active.workspace);
+        let text = if notices.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}\n\n{text}", notices.join("\n\n"))
+        };
         self.step(
             claimed,
             Some(&active.execution_id),
@@ -1652,8 +1658,8 @@ impl Bridge {
                 CommandStep::Typed,
                 None,
             )?;
-            if let Ok(mut untold) = self.untold.lock() {
-                untold.remove(&claimed.session_id);
+            if !notices.is_empty() {
+                self.workspaces.notices_told(&active.workspace, &notices);
             }
         }
         Ok(typed)
