@@ -1016,8 +1016,8 @@ fn tool_completed(store: &MemoryStore, id: &str) {
         store,
         Source::Claude,
         EventKind::ToolCompleted {
-            tool_name: "Bash".to_string(),
             tool_use_id: id.to_string(),
+            duration_ms: None,
         },
     );
 }
