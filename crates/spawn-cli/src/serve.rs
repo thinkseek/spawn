@@ -8,11 +8,14 @@
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
 //! it refuses to start without `SPAWN_SERVE_TOKEN`. With a token set, every
 //! API request must carry it (`Authorization: Bearer <token>` or
-//! `?token=<token>`), except from loopback when `SPAWN_SERVE_LOCAL_OPEN=1`.
+//! `?token=<token>`), except, with `SPAWN_SERVE_LOCAL_OPEN=1`, from a loopback
+//! client that runs as the owner's uid (Linux: the uid of its socket in
+//! `/proc/net/tcp{,6}`; without `/proc`, no client is exempt).
 //! The built UI's static files are served without it:
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -67,8 +70,9 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         server.server_addr(),
         web.display()
     );
+    let port = server.server_addr().to_ip().map(|address| address.port());
     for request in server.incoming_requests() {
-        if let Err(error) = handle(request, &web, token.as_deref()) {
+        if let Err(error) = handle(request, &web, token.as_deref(), port) {
             eprintln!("serve: {error}");
         }
     }
@@ -87,14 +91,124 @@ fn access_token(address: &str, token: Option<String>) -> Result<Option<String>, 
     Ok(token)
 }
 
-/// Whether every address `address` resolves to is a loopback one. An
-/// address that does not resolve counts as public.
-/// Whether loopback clients may read without the token
+/// Whether the owner's own loopback clients may read without the token
 /// (`SPAWN_SERVE_LOCAL_OPEN=1`).
 fn local_open() -> bool {
     std::env::var("SPAWN_SERVE_LOCAL_OPEN").is_ok_and(|value| value == "1")
 }
 
+/// `address` with an IPv4-mapped IPv6 address written as the IPv4 one, so
+/// a dual-stack listener's peer compares with the kernel's IPv4 tables.
+fn plain(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(address, |v4| {
+            SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+        }),
+        SocketAddr::V4(_) => address,
+    }
+}
+
+/// One TCP socket of `/proc/net/tcp` or `/proc/net/tcp6`: its local and
+/// remote address and the uid that owns it.
+#[derive(Debug, PartialEq, Eq)]
+struct ProcSocket {
+    local: SocketAddr,
+    remote: SocketAddr,
+    uid: u32,
+}
+
+/// An address as `/proc/net/tcp{,6}` writes it: the address in hex, each
+/// 32-bit word in the host's byte order, a colon, the port in hex.
+fn proc_address(text: &str) -> Option<SocketAddr> {
+    let (address, port) = text.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |hex: &str| u32::from_str_radix(hex, 16).ok().map(u32::to_ne_bytes);
+    let ip = match address.len() {
+        8 => std::net::IpAddr::from(word(address)?),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (index, chunk) in bytes.chunks_mut(4).enumerate() {
+                chunk.copy_from_slice(&word(address.get(index * 8..index * 8 + 8)?)?);
+            }
+            std::net::IpAddr::from(bytes)
+        }
+        _ => return None,
+    };
+    Some(plain(SocketAddr::new(ip, port)))
+}
+
+/// The sockets of one `/proc/net/tcp{,6}` table: past the header line,
+/// fields `sl local_address rem_address st tx:rx tr:when retrnsmt uid ...`.
+/// A line that does not parse is skipped.
+fn proc_sockets(table: &str) -> Vec<ProcSocket> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            Some(ProcSocket {
+                local: proc_address(fields.get(1)?)?,
+                remote: proc_address(fields.get(2)?)?,
+                uid: fields.get(7)?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// The uid that owns the client end of a connection from `peer` to this
+/// server's `port`: the socket whose local address is `peer` and whose
+/// remote port is `port`, in the kernel's `tables`.
+fn peer_uid(peer: SocketAddr, port: u16, tables: &[String]) -> Option<u32> {
+    let peer = plain(peer);
+    tables
+        .iter()
+        .flat_map(|table| proc_sockets(table))
+        .find(|socket| socket.local == peer && socket.remote.port() == port)
+        .map(|socket| socket.uid)
+}
+
+/// The uid this server runs as: the owner of `/proc/self`. Without `/proc`,
+/// none.
+fn owner_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|meta| meta.uid())
+}
+
+/// Whether a request from `peer` reads without the token: only with
+/// `SPAWN_SERVE_LOCAL_OPEN=1` (`enabled`), from loopback, and from a socket
+/// the owner's uid holds. Another user on this machine reaches loopback too;
+/// a peer whose uid is unknown (no `/proc`, no matching socket) is not
+/// exempt.
+fn local_exemption(
+    enabled: bool,
+    peer: Option<SocketAddr>,
+    peer_uid: Option<u32>,
+    owner: Option<u32>,
+) -> bool {
+    enabled
+        && peer.is_some_and(|peer| plain(peer).ip().is_loopback())
+        && owner.is_some()
+        && peer_uid == owner
+}
+
+/// [`local_exemption`] for a request from `peer` to this server's `port`,
+/// with the uids read from `/proc`.
+fn owners_own_request(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
+    if !local_open() {
+        return false;
+    }
+    let tables: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect();
+    let uid = peer
+        .zip(port)
+        .and_then(|(peer, port)| peer_uid(peer, port, &tables));
+    local_exemption(true, peer, uid, owner_uid())
+}
+
+/// Whether every address `address` resolves to is a loopback one. An
+/// address that does not resolve counts as public.
 fn is_loopback(address: &str) -> bool {
     let Ok(resolved) = std::net::ToSocketAddrs::to_socket_addrs(address) else {
         return false;
@@ -141,19 +255,22 @@ fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
     spawn_postgres::PostgresStore::connect(&url).map_err(|error| error.to_string())
 }
 
-fn handle(request: Request, web: &Path, token: Option<&str>) -> Result<(), String> {
+fn handle(
+    request: Request,
+    web: &Path,
+    token: Option<&str>,
+    port: Option<u16>,
+) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((path, query)) => (path, query),
         None => (url.as_str(), ""),
     };
-    // With SPAWN_SERVE_LOCAL_OPEN=1 a browser on this machine needs no
-    // token: anything that reaches loopback here runs as the owner's uid and
-    // can read the token file anyway. Off by default.
-    let local = local_open()
-        && request
-            .remote_addr()
-            .is_some_and(|address| address.ip().is_loopback());
+    // With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
+    // needs no token: a client running as the owner's uid can read the
+    // token file anyway. Another user's loopback client still needs it.
+    // Off by default.
+    let local = owners_own_request(request.remote_addr().copied(), port);
     if let Some(token) = token
         && path.starts_with("/api/")
         && !local
@@ -759,9 +876,138 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        access_token, is_loopback, objective_json, rsi_summary, same_secret, with_last_gates,
+        ProcSocket, access_token, is_loopback, local_exemption, objective_json, owner_uid,
+        peer_uid, proc_sockets, rsi_summary, same_secret, with_last_gates,
     };
     use crate::objectives::Task;
+    use std::net::SocketAddr;
+
+    fn address(text: &str) -> SocketAddr {
+        text.parse().expect("a socket address")
+    }
+
+    /// `/proc/net/tcp` on a little-endian host: a listener on
+    /// 127.0.0.1:8787, another user's client (uid 1001) at port 54321 and
+    /// the server's end of that connection (uid 1000), and the owner's own
+    /// client at port 54322.
+    const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1313053 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:D431 0100007F:2253 01 00000000:00000000 00:00000000 00000000  1001        0 1313100 1 0000000000000000 20 4 30 10 -1
+   2: 0100007F:2253 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 1313101 1 0000000000000000 20 4 30 10 -1
+   3: 0100007F:D432 0100007F:2253 01 00000000:00000000 00:00000000 00000000  1000        0 1313102 1 0000000000000000 20 4 30 10 -1
+   4: garbage
+";
+
+    /// `/proc/net/tcp6`: a client at [::1]:54323 of uid 1001 and one at
+    /// [::ffff:127.0.0.1]:54324 of uid 1000, both to port 8787.
+    const TCP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000001000000:D433 00000000000000000000000001000000:2253 01 00000000:00000000 00:00000000 00000000  1001        0 77 1 0000000000000000 20 4 30 10 -1
+   1: 0000000000000000FFFF00000100007F:D434 0000000000000000FFFF00000100007F:2253 01 00000000:00000000 00:00000000 00000000  1000        0 78 1 0000000000000000 20 4 30 10 -1
+";
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn proc_net_tcp_rows_parse_into_addresses_and_uids() {
+        let sockets = proc_sockets(TCP);
+        assert_eq!(
+            sockets.len(),
+            4,
+            "the header and a garbage line are skipped"
+        );
+        assert_eq!(
+            sockets[1],
+            ProcSocket {
+                local: address("127.0.0.1:54321"),
+                remote: address("127.0.0.1:8787"),
+                uid: 1001,
+            }
+        );
+        let six = proc_sockets(TCP6);
+        assert_eq!(six[0].local, address("[::1]:54323"));
+        // An IPv4-mapped address reads as the IPv4 one.
+        assert_eq!(six[1].local, address("127.0.0.1:54324"));
+        assert_eq!(six[1].uid, 1000);
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn a_peers_uid_is_the_uid_of_its_own_end_of_the_connection() {
+        let tables = [TCP.to_string(), TCP6.to_string()];
+        assert_eq!(
+            peer_uid(address("127.0.0.1:54321"), 8787, &tables),
+            Some(1001)
+        );
+        assert_eq!(
+            peer_uid(address("127.0.0.1:54322"), 8787, &tables),
+            Some(1000)
+        );
+        assert_eq!(peer_uid(address("[::1]:54323"), 8787, &tables), Some(1001));
+        assert_eq!(
+            peer_uid(address("[::ffff:127.0.0.1]:54324"), 8787, &tables),
+            Some(1000),
+            "a dual-stack listener's IPv4 peer"
+        );
+        assert_eq!(
+            peer_uid(address("127.0.0.1:54321"), 9999, &tables),
+            None,
+            "a connection to another port"
+        );
+        assert_eq!(peer_uid(address("127.0.0.1:1"), 8787, &tables), None);
+        assert_eq!(
+            peer_uid(address("127.0.0.1:54322"), 8787, &[]),
+            None,
+            "no /proc"
+        );
+    }
+
+    #[test]
+    fn only_the_owners_loopback_client_reads_without_the_token() {
+        let loopback = Some(address("127.0.0.1:54322"));
+        assert!(local_exemption(true, loopback, Some(1000), Some(1000)));
+        assert!(
+            !local_exemption(true, loopback, Some(1001), Some(1000)),
+            "another user on this machine"
+        );
+        assert!(
+            !local_exemption(true, loopback, None, Some(1000)),
+            "uid unknown"
+        );
+        assert!(
+            !local_exemption(true, loopback, None, None),
+            "no /proc at all"
+        );
+        assert!(
+            !local_exemption(false, loopback, Some(1000), Some(1000)),
+            "off"
+        );
+        assert!(
+            !local_exemption(
+                true,
+                Some(address("192.168.1.10:5000")),
+                Some(1000),
+                Some(1000)
+            ),
+            "not loopback"
+        );
+        assert!(!local_exemption(true, None, Some(1000), Some(1000)));
+    }
+
+    #[test]
+    fn this_processs_own_connection_is_found_as_the_owners() {
+        let Some(owner) = owner_uid() else {
+            return; // No /proc: nothing is exempt, and nothing to find.
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let port = listener.local_addr().expect("bound").port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (_server_end, peer) = listener.accept().expect("accept");
+        assert_eq!(peer, client.local_addr().expect("client address"));
+        let tables: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect();
+        assert_eq!(peer_uid(peer, port, &tables), Some(owner));
+    }
 
     fn objective(id: u32, recurring: bool) -> Task {
         Task {
