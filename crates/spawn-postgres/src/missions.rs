@@ -209,8 +209,11 @@ select (select jsonb_build_object(
                 and r ->> 'id' = k.id::text), '[]'::jsonb))
           from mission_tasks k where k.id = $1)";
 
-/// The integrator's advisory lock: one integrator per database.
-pub(crate) const INTEGRATOR_LOCK_KEY: i64 = 1_399_957_336;
+/// The integrator's advisory lock: one integrator per store (database and
+/// schema). The two-key form pairs this class with the schema's name, so
+/// stores in other schemas of the same database (tests, the e2e) never
+/// contend for it.
+pub(crate) const INTEGRATOR_LOCK_KEY: i32 = 1_399_957_336;
 
 /// Tool calls a session started after a moment. `$1` session, `$2` ms.
 pub(crate) const TOOL_CALLS_SINCE: &str = "select count(*) from spawn_events
@@ -332,7 +335,7 @@ impl PostgresStore {
     pub fn integrator_try_lock(&self) -> Result<bool, StoreError> {
         Ok(self
             .query_one(
-                "select pg_try_advisory_lock($1) as held",
+                "select pg_try_advisory_lock($1, hashtext(current_schema())) as held",
                 &[&INTEGRATOR_LOCK_KEY],
             )?
             .get("held"))
