@@ -164,7 +164,9 @@ head alone is the whole workspace, so everything below is a git operation.
   nothing reaches the worker, and a later pass judges again once the pusher
   has caught up. An agent with neither a checkpoint nor a pushed branch is
   rejected ("the worker has no branch to land"). So only a source that is a
-  directory on this host has its agents' work landed. The
+  directory on this host has its agents' work landed: a gate on any other
+  source is refused when it is configured, and a mission gated on one
+  before that is halted by the integrator. The
   rest is unchanged: a branch behind a moved `main` lands as the merge by
   `main`'s merge rules; one that conflicts with it is gated `conflict` after
   `main` is merged into its workspace (above); marker blocks in the files
@@ -312,7 +314,7 @@ holds the agents' history; none of them is pruned automatically.
 | What an engine did | read by the Bridge from transcript and pane into the log | Yes: in the log |
 | Full transcript text | `~/.claude/projects/...` on the compute host, copied to `<root>/.transcripts/<agent>/` at turn ends and execution ends | From the archive, on the same host (restored before a resume when missing); **no** on another host |
 | Code: mission sources | bare repos (`missions/*.git`) or remote URLs | Remote URLs: yes |
-| Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed to the source as `spawn/<agent>` | Yes for missions with a source; no for scratch missions and the default repository |
+| Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed as `spawn/<agent>` to a source that is a directory on this host (a remote source receives none) | Yes for missions with a directory source; no for remote sources, scratch missions and the default repository |
 | Work a task lands | the source's `spawn/<agent>`, fetched by the integrator into its mirror's `refs/spawn-integrate/<agent>`; judged only when it contains the agent's latest checkpoint (its `artifact.committed` in the event log) | Yes: the source holds it; nothing on the host that ran the agent is needed |
 | Large files in workspaces | git blobs on the agent's branch, up to `SPAWN_MAX_FILE_MB`; larger ones only in the workspace | Up to the cap, as code; **no** over it |
 | Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host (versioning them with the source is not built) |

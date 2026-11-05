@@ -6,8 +6,11 @@
 //!
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row, the
-//!    scenario count below its floor, or the source's main not where the
-//!    last landing left it;
+//!    scenario count below its floor, a remote source (agents' branches
+//!    never reach it), or the source's main not where the last landing left
+//!    it. That last one is read only from a fetch that succeeded this pass,
+//!    and only while no other mission's landing on the source is unresolved
+//!    (its push may have moved main before its record);
 //! 2. a delivered task over its mission's budget is aborted and its worker
 //!    stopped;
 //! 3. a task whose gate passed is landed (again, after a crash);
@@ -20,7 +23,9 @@
 //!    so it works the same on a host that never ran the agent, and a file
 //!    written after the last checkpoint never lands. The candidate is
 //!    merged with the source's main when main moved, and judged by
-//!    `scripts/rsi/gate.sh` with the mission's scenarios. A pass records
+//!    `scripts/rsi/gate.sh` with the mission's scenarios. Every verdict
+//!    names the revision of the report it judged (the task's `revisions`),
+//!    and the store refuses it once the task has moved on. A pass records
 //!    the verdict before git moves, then moves the source's main with a
 //!    compare-and-swap push and records the landing. A rejection sends the
 //!    task back to its worker with the gate's output as the note;
@@ -133,6 +138,11 @@ pub(crate) struct Task {
     pub(crate) scenario: Option<String>,
     #[serde(default)]
     pub(crate) delivered_at_ms: Option<i64>,
+    /// The revision of its report (`mission_tasks.revisions`): every
+    /// verdict names the one it judged, and the store refuses it once the
+    /// task has moved on to another.
+    #[serde(default)]
+    pub(crate) revisions: i32,
 }
 
 impl Mission {
@@ -344,11 +354,16 @@ impl Integrator {
         {
             return Ok(());
         }
+        self.pass_on(&store)
+    }
+
+    /// One pass over every gated mission, holding the integrator's lock.
+    fn pass_on(&self, store: &Arc<PostgresStore>) -> Result<(), String> {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
         for mission in &missions {
-            match self.mission(&store, mission) {
+            match self.mission(store, &missions, mission) {
                 // Whatever one mission did may move another's view (a shared
                 // source's main): the next pass reads everything again.
                 Ok(true) => return Ok(()),
@@ -359,8 +374,14 @@ impl Integrator {
         Ok(())
     }
 
-    /// One mission's step. True when it recorded anything.
-    fn mission(&self, store: &Arc<PostgresStore>, mission: &Mission) -> Result<bool, String> {
+    /// One mission's step. True when it recorded anything. `missions` is
+    /// every mission of the pass, for the landings on a shared source.
+    fn mission(
+        &self,
+        store: &Arc<PostgresStore>,
+        missions: &[Mission],
+        mission: &Mission,
+    ) -> Result<bool, String> {
         if mission.halted.is_some() {
             return Ok(false);
         }
@@ -375,12 +396,28 @@ impl Integrator {
         let Some(source) = mission.source.as_deref() else {
             return Ok(false);
         };
+        if let Some(reason) = unlandable(source) {
+            return halt(store, mission, &reason).map(|()| true);
+        }
         let mirror =
             sources::ensure_mirror(&self.root, Some(source)).map_err(|error| error.to_string())?;
         if let Some(task) = mission.landing() {
             return land(store, &mirror, source, task).map(|()| true);
         }
-        sources::refresh(&mirror, source);
+        // Another mission's landing on this source may have moved main
+        // without its record yet (a crash between the push and
+        // `task.landed`): main says nothing about this mission until that
+        // landing is resolved, by its own mission's next step.
+        if let Some((other, task)) = landing_elsewhere(missions, mission) {
+            println!(
+                "integrate: mission {}: waits for task {task} of mission {other} to land on                  its source",
+                mission.id
+            );
+            return Ok(false);
+        }
+        // A fetch that failed leaves the mirror's last copy of main, which
+        // is no reading of the source's main: no halt, no verdict by it.
+        sources::refresh(&mirror, source)?;
         let main = git(&[
             "--git-dir",
             &mirror.to_string_lossy(),
@@ -490,16 +527,10 @@ impl Integrator {
             Freshness::Nothing => None,
             Freshness::Stale(reason) => {
                 // Not a verdict on the work: the pusher has not caught up.
-                if !sources::receives_branches(source) {
-                    eprintln!(
-                        "integrate: {source} receives no agents' branches (only a directory \
-                         on this host does), so its work never lands"
-                    );
-                }
                 record(
                     store,
                     &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
-                            "reason": reason}),
+                            "revision": task.revisions, "reason": reason}),
                 )?;
                 println!("integrate: task {} stale: {reason}", task.id);
                 return Ok(false);
@@ -536,7 +567,8 @@ impl Integrator {
         let repo = GitWorkspace::new(mirror, &self.root);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
             let mut record_value = json!({"type": "task.gated", "id": task.id, "verdict": verdict,
-                                          "base": main, "scenarios": count});
+                                          "revision": task.revisions, "base": main,
+                                          "scenarios": count});
             if let (Some(target), Some(extra)) = (record_value.as_object_mut(), extra.as_object()) {
                 target.extend(extra.clone());
             }
@@ -779,12 +811,16 @@ fn aborted(failure: &GateFailure) -> Value {
 
 /// Move the source's default branch from the task's base to its candidate,
 /// only if it is still at the base, and record the landing. A branch that
-/// moved meanwhile sends the task back to be judged again.
+/// moved meanwhile sends the task back to be judged again, unless the
+/// candidate is already in its history: a push of an earlier pass that was
+/// never recorded (the integrator stopped in between), with main moved on
+/// top of it since. That landing happened, and is recorded so.
 fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Result<(), String> {
     let (Some(base), Some(candidate)) = (task.base.as_deref(), task.candidate.as_deref()) else {
         return record(
             store,
-            &json!({"type": "task.gated", "id": task.id, "verdict": "stale"}),
+            &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                    "revision": task.revisions}),
         );
     };
     // Held until the landing is recorded: dropping the mission waits for it.
@@ -813,28 +849,74 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
     // A push that failed may still have happened (a crash, a lost reply).
     let (_, now) = source_head(source)?;
     if pushed.is_err() && now != candidate {
+        // Main moved on: past this candidate (it landed before), or past
+        // its base without it. The fetch brings `now` into the mirror; one
+        // that fails decides nothing this pass.
+        sources::refresh(mirror, source)?;
+        let under_main = git(&[
+            "--git-dir",
+            &mirror_path,
+            "merge-base",
+            "--is-ancestor",
+            candidate,
+            &now,
+        ])
+        .is_ok();
+        if !under_main {
+            println!(
+                "integrate: task {}: {branch} moved to {now}; judging again",
+                task.id
+            );
+            return record(
+                store,
+                &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
+                        "revision": task.revisions}),
+            );
+        }
         println!(
-            "integrate: task {}: {branch} moved to {now}; judging again",
+            "integrate: task {}: {candidate} is already under {branch} ({now})",
             task.id
         );
-        return record(
-            store,
-            &json!({"type": "task.gated", "id": task.id, "verdict": "stale"}),
-        );
+    } else {
+        let _ = git(&[
+            "--git-dir",
+            &mirror_path,
+            "update-ref",
+            "refs/heads/main",
+            candidate,
+        ]);
     }
-    let _ = git(&[
-        "--git-dir",
-        &mirror_path,
-        "update-ref",
-        "refs/heads/main",
-        candidate,
-    ]);
     record(
         store,
         &json!({"type": "task.landed", "id": task.id, "from": base, "to": candidate}),
     )?;
     println!("integrate: task {} landed {candidate} on {source}", task.id);
     Ok(())
+}
+
+/// Why a mission on `source` can never land, if it cannot: agents' branches
+/// reach only a directory on this host (the pusher's one destination since
+/// the cross-host cut), so a gate on a URL would wait for a push nobody
+/// makes, `stale` on every pass. `spawn_mission_configure` refuses such a
+/// gate; one configured before that is halted, so a human sees it. A local
+/// path that is missing now is not this: its fetch fails, and the pass
+/// skips the mission.
+fn unlandable(source: &str) -> Option<String> {
+    (!source.starts_with('/')).then(|| {
+        format!(
+            "its source {source} is remote: agents' branches reach only a directory on this \
+             host, so its work never lands"
+        )
+    })
+}
+
+/// Another mission's task landing on `mission`'s source, if one is:
+/// `(mission, task)`. Its push may have moved main before its record.
+fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Option<(i64, i64)> {
+    missions
+        .iter()
+        .filter(|other| other.id != mission.id && other.source == mission.source)
+        .find_map(|other| other.landing().map(|task| (other.id, task.id)))
 }
 
 fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
@@ -875,7 +957,7 @@ mod tests {
     use serde_json::json;
 
     /// Commit everything in the checkout `directory`.
-    fn commit_in(directory: &str, message: &str) {
+    pub(super) fn commit_in(directory: &str, message: &str) {
         let git = crate::sources::git;
         git(&["-C", directory, "add", "-A"]).expect("add");
         git(&[
@@ -1006,7 +1088,7 @@ mod tests {
                 std::fs::write(clone.join("other.txt"), "theirs\n").expect("write");
                 commit_in(&clone_path, "elsewhere");
                 git(&["-C", &clone_path, "push", "-q", "origin", "main"]).expect("push main");
-                crate::sources::refresh(&mirror, &source);
+                crate::sources::refresh(&mirror, &source).expect("refresh");
             }
 
             let agent_head = rev(&format!("refs/heads/{agent}"));
@@ -1083,7 +1165,7 @@ mod tests {
         change(&clone);
         commit_in(&clone_path, "main moves");
         git(&["-C", &clone_path, "push", "-q", "origin", "main"]).expect("push main");
-        crate::sources::refresh(mirror, source);
+        crate::sources::refresh(mirror, source).expect("refresh");
         git(&[
             "--git-dir",
             &mirror.to_string_lossy(),
@@ -1682,6 +1764,354 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The integrator's passes against the test database
+/// (`SPAWN_TEST_DATABASE_URL`; like the spawn-postgres tests, they do not
+/// skip), each in a schema of its own, dropped afterwards, with real git
+/// sources and a stub gate.
+#[cfg(test)]
+mod database_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use serde_json::{Value, json};
+    use spawn_postgres::PostgresStore;
+
+    use super::Integrator;
+    use crate::sources::git;
+
+    struct Db {
+        store: Arc<PostgresStore>,
+        url: String,
+        schema: String,
+    }
+
+    impl Db {
+        fn new(case: &str) -> Self {
+            let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+                "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+            );
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let schema = format!("spawn_test_{}_{nanos:x}_{case}", std::process::id());
+            let store = PostgresStore::connect_in_schema(&url, &schema).expect("connect");
+            Self {
+                store: Arc::new(store),
+                url,
+                schema,
+            }
+        }
+
+        /// An owner connection in the schema.
+        fn admin(&self) -> postgres::Client {
+            let mut client =
+                postgres::Client::connect(&self.url, postgres::NoTls).expect("admin connection");
+            client
+                .batch_execute(&format!("set search_path to {}", self.schema))
+                .expect("schema");
+            client
+        }
+
+        /// A mission its gate alone accepts, on `source`.
+        fn gated_mission(&self, source: &str, scenarios: &Path) -> i64 {
+            let mission = self
+                .store
+                .mission_add("gated", &json!([source]), "human")
+                .expect("add");
+            self.store
+                .mission_configure(
+                    mission,
+                    Some(&scenarios.to_string_lossy()),
+                    "gate",
+                    None,
+                    None,
+                )
+                .expect("configure");
+            mission
+        }
+
+        /// A task of `mission` for `worker`, delivered and reported.
+        fn reported_task(&self, mission: i64, worker: &str) -> i64 {
+            let task = self
+                .store
+                .task_assign(mission, "ephemeral", worker, "brief", "default")
+                .expect("assign");
+            self.store.task_delivered(task, 1).expect("delivered");
+            assert!(self.store.task_reported(task, "done").expect("reported"));
+            task
+        }
+
+        fn record(&self, record: &Value) {
+            self.store.integrator_record(record).expect("record");
+        }
+
+        fn mission(&self, id: i64) -> Value {
+            let board = self.store.mission_board(50).expect("board");
+            board["missions"]
+                .as_array()
+                .expect("missions")
+                .iter()
+                .find(|mission| mission["id"] == id)
+                .cloned()
+                .expect("the mission")
+        }
+    }
+
+    impl Drop for Db {
+        fn drop(&mut self) {
+            if let Ok(mut client) = postgres::Client::connect(&self.url, postgres::NoTls) {
+                let _ =
+                    client.batch_execute(&format!("drop schema if exists {} cascade", self.schema));
+            }
+        }
+    }
+
+    /// A bare source with one commit on main, under a fresh directory, and
+    /// an integrator whose workspace root is beside it: `(base, source,
+    /// scenarios, integrator)`.
+    fn world(tag: &str, gate: &str) -> (PathBuf, String, PathBuf, Integrator) {
+        let base = std::env::temp_dir().join(format!("spawn-db-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        super::tests::commit_in(&seed_path, "base");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let scenarios = base.join("scenarios");
+        std::fs::create_dir_all(&scenarios).expect("scenarios");
+        let gate_path = base.join("gate.sh");
+        std::fs::write(&gate_path, gate).expect("gate");
+        let integrator = Integrator {
+            root: base.join("host"),
+            gate: gate_path,
+            gate_env: Vec::new(),
+        };
+        (base, source, scenarios, integrator)
+    }
+
+    /// Main moves on the source by one commit, pushed from a clone; the
+    /// integrator's mirror does not follow. Main's new commit.
+    fn main_moves(base: &Path, source: &str, file: &str) -> String {
+        let clone = base.join(format!("clone-{file}"));
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", source, &clone_path]).expect("clone");
+        std::fs::write(clone.join(file), "moved\n").expect("write");
+        super::tests::commit_in(&clone_path, "main moves");
+        git(&["-C", &clone_path, "push", "-q", "origin", "main"]).expect("push main");
+        git(&["--git-dir", source, "rev-parse", "refs/heads/main"]).expect("main")
+    }
+
+    fn source_main(source: &str) -> String {
+        git(&["--git-dir", source, "rev-parse", "refs/heads/main"]).expect("main")
+    }
+
+    /// Audit #17: a landing's push moved main, and the integrator stopped
+    /// before it recorded `task.landed`. A lower-id mission on the same
+    /// source runs first in the next pass: it must not read the moved main
+    /// as an unexplained move (a halt) while the landing is unresolved. The
+    /// landing then resolves (main holds its candidate), and its record
+    /// moves the waiting mission's baseline with it.
+    #[test]
+    fn an_unrecorded_landing_holds_the_other_missions_on_its_source() {
+        let (base, source, scenarios, integrator) = world("unrecorded-landing", "exit 1\n");
+        let db = Db::new("unrecorded_landing");
+        let b0 = source_main(&source);
+        let waiting = db.gated_mission(&source, &scenarios);
+        let landing = db.gated_mission(&source, &scenarios);
+        let waiting_task = db.reported_task(waiting, "w");
+        let landing_task = db.reported_task(landing, "l");
+        db.record(
+            &json!({"type": "task.gated", "id": waiting_task, "revision": 0,
+                          "verdict": "aborted", "base": b0, "reason": "a gate that died"}),
+        );
+        let c1 = main_moves(&base, &source, "landed.txt");
+        db.record(
+            &json!({"type": "task.gated", "id": landing_task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": c1}),
+        );
+        // The mirror exists, as it did when the push went out.
+        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        let waited = db.mission(waiting);
+        assert!(
+            waited["halted"].is_null(),
+            "the waiting mission halted: {}",
+            waited["halted"]
+        );
+        let landed = db.mission(landing);
+        assert_eq!(landed["tasks"][0]["state"], "landed");
+        assert_eq!(landed["baseline"], c1.as_str());
+        assert_eq!(
+            db.mission(waiting)["baseline"],
+            c1.as_str(),
+            "the landing names the mission that waited at its from"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Audit #17, the other half: main moved past the landing's candidate
+    /// (another landing went on top of it before the record), so the
+    /// compare-and-swap push fails and main is not the candidate. The
+    /// candidate is in main's history: it landed, and is recorded so,
+    /// instead of judging landed work again.
+    #[test]
+    fn a_landing_already_under_main_is_recorded_landed() {
+        let (base, source, scenarios, integrator) = world("landing-under-main", "exit 1\n");
+        let db = Db::new("landing_under_main");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        let c1 = main_moves(&base, &source, "landed.txt");
+        let c2 = main_moves(&base, &source, "on-top.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": c1}));
+        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        let after = db.mission(mission);
+        assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
+        assert_eq!(after["baseline"], c1.as_str());
+        assert_eq!(source_main(&source), c2, "main is left where it is");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Audit #13: the owner moved main F -> T and recorded it (the baseline
+    /// is T), but the integrator's fetch fails, so its mirror still says F.
+    /// That is no reading of the source's main: the mission is skipped this
+    /// pass, not halted.
+    #[test]
+    fn a_failed_fetch_halts_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, source, scenarios, integrator) = world("failed-fetch", "exit 1\n");
+        let db = Db::new("failed_fetch");
+        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror at F");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let t = main_moves(&base, &source, "deploy.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "aborted", "base": t, "reason": "a gate that died"}));
+        let permissions = |mode| {
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode))
+                .expect("permissions");
+        };
+        permissions(0o000);
+        let pass = integrator.pass_on(&db.store);
+        permissions(0o755);
+        pass.expect("a pass");
+        let after = db.mission(mission);
+        assert!(after["halted"].is_null(), "halted: {}", after["halted"]);
+        assert_eq!(after["baseline"], t.as_str());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Audit #14: only a directory on this host receives agents' branches.
+    /// A gated mission on a remote source (configured before the gate was
+    /// refused on one) would be gated `stale` on every pass, forever: it is
+    /// halted with the reason instead.
+    #[test]
+    fn a_gated_mission_on_a_remote_source_is_halted() {
+        let db = Db::new("remote_source");
+        let source = "https://example.invalid/widget.git";
+        let mission = db
+            .store
+            .mission_add("remote", &json!([source]), "human")
+            .expect("add");
+        db.admin()
+            .execute(
+                "select spawn_control_record($1)",
+                &[&json!({"type": "mission.configured", "id": mission,
+                          "gate": "/controller/rsi/scenarios", "accept": "gate"})],
+            )
+            .expect("a gate configured before the check");
+        db.reported_task(mission, "w");
+        let base = std::env::temp_dir().join(format!("spawn-db-remote-{}", std::process::id()));
+        let integrator = Integrator {
+            root: base.join("host"),
+            gate: base.join("gate.sh"),
+            gate_env: Vec::new(),
+        };
+        integrator.pass_on(&db.store).expect("a pass");
+        let halted = db.mission(mission)["halted"].clone();
+        assert!(
+            halted
+                .as_str()
+                .is_some_and(|reason| reason.contains("never lands")),
+            "halted: {halted}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Audit #10: the integrator's verdict names the revision it judged. A
+    /// task sent back once by the gate is reported again (revision 1); the
+    /// stub gate accepts, and the verdict for revision 1 lands it.
+    #[test]
+    fn a_verdict_names_the_revision_it_judged_and_lands() {
+        let gate = "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo '{\"verdict\":\"accepted\"}'\n";
+        let (base, source, scenarios, integrator) = world("verdict-revision", gate);
+        let db = Db::new("verdict_revision");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent_id = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "rejected", "base": b0, "note": "again"}));
+        db.store.task_delivered(task, 2).expect("delivered again");
+        assert!(
+            db.store
+                .task_reported(task, "again")
+                .expect("reported again")
+        );
+        // The agent's work, pushed as spawn/<agent> (no checkpoint recorded,
+        // so the push is what lands).
+        let clone = base.join("agent");
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &clone_path]).expect("clone");
+        std::fs::write(clone.join("work.txt"), "work\n").expect("write");
+        super::tests::commit_in(&clone_path, "work");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/spawn/{agent_id}"),
+        ])
+        .expect("push the agent's branch");
+        let work = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        let after = db.mission(mission);
+        assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
+        assert_eq!(source_main(&source), work);
+        let revisions: Vec<Option<String>> = db
+            .admin()
+            .query(
+                "select kind -> 'detail' -> 'record' ->> 'revision' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                  order by session_seq",
+                &[],
+            )
+            .expect("verdicts")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            revisions,
+            vec![Some("0".to_string()), Some("1".to_string())]
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

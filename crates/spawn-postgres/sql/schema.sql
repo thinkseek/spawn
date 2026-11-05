@@ -1259,9 +1259,17 @@ begin
          where id = v_id;
     when 'task.gated' then
         v_verdict := p_record ->> 'verdict';
+        -- A verdict names the revision of the report it judged; one on
+        -- another revision (or a task gone) moves nothing. A record from
+        -- before it named none applies as it did.
         select k.mission_id, m.accept into v_mission, v_accept
           from mission_tasks k join mission_missions m on m.id = k.mission_id
-         where k.id = v_id;
+         where k.id = v_id
+           and (p_record ->> 'revision' is null
+                or k.revisions = (p_record ->> 'revision')::integer);
+        if v_mission is null then
+            return;
+        end if;
         update mission_tasks
            set state = case v_verdict
                          when 'accepted' then 'landing'
@@ -1292,12 +1300,18 @@ begin
     when 'task.landed' then
         update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
         -- Every mission on the same source sees the same main: the landing
-        -- moves the baseline of each one that has one.
+        -- moves its own mission's baseline, and those of the other missions
+        -- it names (spawn_integrator_record: the ones whose baseline was its
+        -- `from`, not halted). A record from before it named them moved
+        -- every mission on the source that had a baseline.
         update mission_missions m set baseline = p_record ->> 'to', updated_at_ms = p_at
           from mission_missions own join mission_tasks k on k.mission_id = own.id
          where k.id = v_id
            and (m.id = own.id
-                or (m.baseline is not null and m.sources ->> 0 = own.sources ->> 0));
+                or (p_record -> 'missions' is null
+                    and m.baseline is not null and m.sources ->> 0 = own.sources ->> 0)
+                or m.id in (select x::bigint
+                              from jsonb_array_elements_text(p_record -> 'missions') x));
     when 'task.aborted' then
         -- Over budget: the work is dropped, and it counts toward the abort halt.
         update mission_tasks set state = 'cancelled', review_note = p_record ->> 'reason',
@@ -1311,12 +1325,16 @@ begin
          where id = v_id;
     when 'task.reviewed' then
         v_accepted := (p_record ->> 'accepted')::boolean;
+        -- A review names the revision of the report it judged; one on another
+        -- revision moves nothing (a record from before it named none applies).
         update mission_tasks
            set state = case when v_accepted then 'accepted' else 'revise' end,
                review_note = case when v_accepted then review_note else p_record ->> 'note' end,
                revisions = revisions + case when v_accepted then 0 else 1 end,
                updated_at_ms = p_at
-         where id = v_id;
+         where id = v_id
+           and (p_record ->> 'revision' is null
+                or revisions = (p_record ->> 'revision')::integer);
     when 'task.cancelled' then
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
     when 'resident.proposed' then
@@ -1576,9 +1594,20 @@ begin
     return true;
 end $$;
 
--- Review a report: accept, or send it back with a note.
-create or replace function spawn_task_review(p_task bigint, p_accept boolean, p_note text)
+-- Review a report: accept, or send it back with a note. `p_revision` names
+-- the revision of the report the reviewer read (`revisions` in the news and
+-- the board); a review of another revision is refused, so a decision on an
+-- old report never lands on a newer one. Without it, the report as it is
+-- now (a human at the command line); the record names that revision either
+-- way. A mission whose gate alone accepts takes no review: its gate is
+-- judging the report, and a review would send back the revision it judges.
+-- The first version named no revision.
+drop function if exists spawn_task_review(bigint, boolean, text);
+create or replace function spawn_task_review(p_task bigint, p_accept boolean, p_note text,
+                                             p_revision integer default null)
 returns void language plpgsql security definer as $$
+declare
+    v_revision integer;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -1588,8 +1617,18 @@ begin
     if not p_accept and coalesce(trim(p_note), '') = '' then
         raise exception 'sending a task back needs a note';
     end if;
-    if not exists (select 1 from mission_tasks where id = p_task and state = 'reported') then
+    select revisions into v_revision from mission_tasks where id = p_task and state = 'reported';
+    if v_revision is null then
         raise exception 'task % has no report to review', p_task;
+    end if;
+    if p_revision is not null and p_revision <> v_revision then
+        raise exception 'task % is at revision %, not %: read its report again', p_task,
+                        v_revision, p_revision;
+    end if;
+    if exists (select 1 from mission_tasks k join mission_missions m on m.id = k.mission_id
+                where k.id = p_task and m.gate is not null and m.accept = 'gate') then
+        raise exception 'task % belongs to a mission its gate alone accepts: it is not reviewed',
+                        p_task;
     end if;
     -- A closed mission, or a retired resident, takes no new work: the
     -- report is accepted (when its mission still lands work) or cancelled.
@@ -1598,7 +1637,8 @@ begin
                         p_task, case when p_accept then 'be accepted' else 'be sent back' end;
     end if;
     perform spawn_control_record(jsonb_build_object(
-        'type', 'task.reviewed', 'id', p_task, 'accepted', p_accept, 'note', p_note));
+        'type', 'task.reviewed', 'id', p_task, 'accepted', p_accept, 'note', p_note,
+        'revision', v_revision));
 end $$;
 
 create or replace function spawn_task_cancel(p_task bigint)
@@ -1696,6 +1736,16 @@ begin
     end if;
     if p_objectives is not null and p_gate is null then
         raise exception 'objectives need a gate to land on';
+    end if;
+    -- Agents' branches reach only a directory on this host (the pusher's
+    -- one producer since the cross-host cut): a gate on a URL would wait
+    -- for a push nobody makes. A source the integrator cannot find is
+    -- halted by it.
+    if p_gate is not null and exists (
+        select 1 from mission_missions
+         where id = p_mission and sources ->> 0 is not null and left(sources ->> 0, 1) <> '/') then
+        raise exception 'mission % has a remote source: a gate lands only on a directory on this host',
+                        p_mission;
     end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.configured', 'id', p_mission, 'gate', p_gate,
@@ -1806,6 +1856,29 @@ begin
                               when 'task.aborted' then array['delivered']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
+    end if;
+    -- A verdict names the revision of the report it judged (the task's
+    -- `revisions` when the gate began). The gate runs for minutes: one on a
+    -- revision the task has left would land, or send back, work it never
+    -- judged.
+    if p_record ->> 'type' = 'task.gated' and not exists (
+        select 1 from mission_tasks
+         where id = (p_record ->> 'id')::bigint
+           and revisions::text = p_record ->> 'revision') then
+        raise exception 'task % is not at the revision the verdict judged (%)',
+                        p_record ->> 'id', coalesce(p_record ->> 'revision', 'none named');
+    end if;
+    -- A landing moves the baseline of the other missions on its source
+    -- whose baseline was its `from` (they saw the same main), never a halted
+    -- one's: the record names them, as `source.moved` does.
+    if p_record ->> 'type' = 'task.landed' then
+        p_record := p_record || jsonb_build_object('missions', (
+            select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
+              from mission_missions m
+              join mission_missions own on m.sources ->> 0 = own.sources ->> 0 and m.id <> own.id
+              join mission_tasks k on k.mission_id = own.id
+             where k.id = (p_record ->> 'id')::bigint
+               and m.baseline = p_record ->> 'from' and m.halted is null));
     end if;
     -- A done mission's work still lands, but nothing new comes for it: a
     -- landing that keeps going stale (its worker never pushes again, main
@@ -2018,7 +2091,7 @@ begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text, text)',
-        'spawn_task_review(bigint, boolean, text)',
+        'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
@@ -2034,7 +2107,7 @@ begin
     foreach v_function in array array[
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text, text)',
-        'spawn_task_review(bigint, boolean, text)',
+        'spawn_task_review(bigint, boolean, text, integer)',
         'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_task_stages(bigint)'] loop
         execute format('grant execute on function %s to %I', v_function,

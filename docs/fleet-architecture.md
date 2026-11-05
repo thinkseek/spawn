@@ -557,12 +557,29 @@ the tree's own:
   scenarios directory in the controller's checkout), how tasks are accepted,
   and an optional budget:
   - `review`: the supervisor accepts, then the gate runs;
-  - `gate`: the gate alone decides;
+  - `gate`: the gate alone decides. The supervisor is not told of its
+    reports (`mission_news`) and `spawn_task_review` refuses them: a review
+    could send back the revision the gate is judging;
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
     aborted (`task.aborted`) and its worker stopped; an abort counts toward
     the abort halt, not as a rejection.
-- **The integrator:** `spawn integrate` (unit `spawn-integrate`). For each
-  task that is ready, it:
+
+  A gate needs a source that is a directory on the integrator's host:
+  agents' branches reach no other (storage.md, "Landing"), so a gate on a
+  URL is refused, and a mission configured with one before that is halted
+  by the integrator with the reason.
+- **Verdicts name what they judged.** A task's report has a revision (its
+  `revisions`, one more each time it is sent back). `task.reviewed` and
+  `task.gated` name the revision they judged (`spawn task accept|reject
+  --revision R`, which the supervisor's digest gives; without it, a human's
+  review takes the report as it is now). The checked functions refuse a
+  verdict on a revision the task has left, and the fold applies none: a
+  45-minute gate run on revision 0 never lands, or sends back, revision 1.
+- **The integrator:** `spawn integrate` (unit `spawn-integrate`). A mission
+  whose source it cannot fetch this pass is skipped: the mirror's last copy
+  of `main` is no reading of the source's. A mission whose source has
+  another mission's task in `landing` waits for it (the push may have moved
+  `main` before its `task.landed`). For each task that is ready, it:
   1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into
      its mirror's `refs/spawn-integrate/<agent>` (it never commits a
      workspace and never moves `refs/heads/<agent>`). A push that lags the
@@ -579,8 +596,10 @@ the tree's own:
   4. records `task.gated` (verdict, log, metric) before git moves;
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
-     verdict is `stale` and the task is judged again;
-  6. records `task.landed`.
+     verdict is `stale` and the task is judged again, unless the candidate
+     is already in `main`'s history (an earlier push of this landing whose
+     record was lost), which is a landing;
+  6. records `task.landed` (`from`, `to`).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
 - **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
@@ -605,8 +624,10 @@ the tree's own:
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
 - **A shared source has one baseline.** A landing moves the baseline of
-  every mission on that source, so RSI and fleet work on the same repository
-  don't halt each other. A deploy that moves `main` forward records
+  every mission on that source whose baseline was its `from` and that is not
+  halted (the record names them), so RSI and fleet work on the same
+  repository don't halt each other, and a move of `main` that no landing
+  explains still halts the missions that saw `main` before it. A deploy that moves `main` forward records
   `source.moved` (`spawn mission moved`, run by `deploy/deploy.sh`), and the
   missions on that source take the new `main` as their baseline instead of
   halting.

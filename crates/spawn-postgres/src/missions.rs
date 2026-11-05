@@ -29,7 +29,10 @@ from (
 ) t";
 
 /// What the supervisor should hear about, beyond worker states: open
-/// missions, reports, residents approved, and human messages to workers.
+/// missions, reports it reviews (not those of a mission its gate alone
+/// accepts: the gate judges them, and `spawn_task_review` refuses them),
+/// residents approved, and human messages to workers. A report carries its
+/// `revisions`, which the review names.
 pub(crate) const MISSION_NEWS: &str = r"
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
@@ -39,7 +42,9 @@ select jsonb_build_object(
                  'id', k.id, 'mission_id', k.mission_id, 'kind', k.kind,
                  'session_id', k.session_id, 'revisions', k.revisions,
                  'report', left(k.report, 600)) order by k.id)
-               from mission_tasks k where k.state = 'reported'), '[]'::jsonb),
+               from mission_tasks k join mission_missions m on m.id = k.mission_id
+              where k.state = 'reported'
+                and not (m.gate is not null and m.accept = 'gate')), '[]'::jsonb),
   'approved', coalesce((select jsonb_agg(jsonb_build_object('name', r.name) order by r.name)
                from mission_residents r
               where r.state = 'approved'
@@ -122,7 +127,7 @@ from (
                'id', k.id, 'agent_id', k.agent_id,
                'session_id', k.session_id, 'state', k.state, 'base', k.base,
                'candidate', k.candidate, 'scenario', k.scenario,
-               'delivered_at_ms', k.delivered_at_ms)
+               'delivered_at_ms', k.delivered_at_ms, 'revisions', k.revisions)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -430,11 +435,18 @@ impl PostgresStore {
         Ok(row.get(0))
     }
 
-    /// Accept a report, or send the task back with a note.
-    pub fn task_review(&self, task: i64, accept: bool, note: &str) -> Result<(), StoreError> {
+    /// Accept a report, or send the task back with a note. `revision` names
+    /// the revision of the report the reviewer read; `None`, the current one.
+    pub fn task_review(
+        &self,
+        task: i64,
+        accept: bool,
+        note: &str,
+        revision: Option<i32>,
+    ) -> Result<(), StoreError> {
         self.execute(
-            "select spawn_task_review($1, $2, $3)",
-            &[&task, &accept, &note],
+            "select spawn_task_review($1, $2, $3, $4)",
+            &[&task, &accept, &note, &revision],
         )?;
         Ok(())
     }
