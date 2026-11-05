@@ -40,7 +40,7 @@ pub(crate) const RECOVERY_MARGIN: u64 = GIB;
 /// The window in which a record reaches the supervisor's digest: the same
 /// day the dispatcher reads delivered digests back over, so a record told
 /// once is not told again.
-const DIGEST_WINDOW_MS: i64 = 86_400_000;
+pub(crate) const DIGEST_WINDOW_MS: i64 = 86_400_000;
 
 /// The thresholds, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +214,41 @@ no new executions start; free space (old workspaces, build output) or tell the o
                 id: format!("disk-{id}"),
                 why: Why::Disk,
                 line,
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `records`, the integrator's `no_room` gate records
+/// that carry `escalate` (`PostgresStore::gate_room_escalations`): a
+/// mission's gate has had no room in TMPDIR for more than two hours. One
+/// item per record of the last day; the integrator writes one per run of
+/// them, so the supervisor is told once.
+pub(crate) fn gate_room_escalations(records: &[Value], now_ms: i64) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter(|record| {
+            record["at_ms"]
+                .as_i64()
+                .is_some_and(|at| now_ms - at < DIGEST_WINDOW_MS)
+        })
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let free = gib(record["free_kb"].as_u64()?.saturating_mul(1024));
+            let tmpdir = record["tmpdir"].as_str()?;
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "a mission".to_string(), |id| format!("mission {id}"));
+            Some(Escalation {
+                session_id: "host".to_string(),
+                id: format!("gate-room-{id}"),
+                why: Why::GateRoom,
+                line: format!(
+                    "the gate of {mission} has had no room to judge for over two hours: {free} \
+free in TMPDIR {tmpdir}, under SPAWN_GATE_MIN_FREE_GB={}. Its work waits (no halt counts); free \
+space there (old gate scratch, build output) or tell the owner.",
+                    record["min_gb"].as_u64().unwrap_or_default()
+                ),
             })
         })
         .collect()
