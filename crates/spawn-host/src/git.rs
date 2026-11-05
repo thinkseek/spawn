@@ -11,7 +11,9 @@
 //! chunks in the chunk store, the checkpoint commit names their manifest in a
 //! `Spawn-Large: <hash>` trailer, and a mount materializes them again from
 //! the branch head (docs/storage.md). The branch head alone is the
-//! whole workspace.
+//! whole workspace. The one exception: a large file git already holds as a
+//! blob in the branch head or in `main` (it came from the source) stays a
+//! blob, so a checkpoint never drops it from the tree.
 //!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
 //! part before the colon, and the container of an execution is named from it,
@@ -392,12 +394,21 @@ impl GitWorkspace {
     /// Build output and files over [`LARGE_FILE_BYTES`] leave the index after
     /// `add -A`, so a `.gitignore` inside the tree cannot re-include them; a
     /// large file is excluded before it is hashed.
+    ///
+    /// A large file that git already holds as a blob in one of `kept_in`
+    /// (the branch head, `main`, a pending merge's `main`) stays a blob: it
+    /// came from the source (main may get one from outside Spawn), and
+    /// leaving it out of the tree would delete it from the branch, and from
+    /// `main` when the branch lands.
     fn tree_of(
         &self,
         directory: &Path,
         index: &Path,
+        kept_in: &[String],
     ) -> Result<(String, Vec<(String, u64)>), WorkspaceError> {
         let mut large = self.large_files(directory, index)?;
+        let blobs = self.blobs_in(kept_in, &large)?;
+        large.retain(|(path, _)| !blobs.contains(path));
         let mut add = vec!["add", "-A", "--", "."];
         let excluded: Vec<String> = large
             .iter()
@@ -410,7 +421,9 @@ impl GitWorkspace {
         // A file that grew past the limit between the size check and `add`
         // was hashed anyway; keep it off the branch all the same, and in the
         // chunk store with the other large files.
-        let grown = self.large_blobs(&tree)?;
+        let mut grown = self.large_blobs(&tree)?;
+        let blobs = self.blobs_in(kept_in, &grown)?;
+        grown.retain(|(path, _)| !blobs.contains(path));
         if grown.is_empty() {
             return Ok((tree, large));
         }
@@ -438,6 +451,53 @@ impl GitWorkspace {
         remove.extend(BUILD_OUTPUT);
         remove.extend(literal.iter().map(String::as_str));
         self.output_in(directory, index, &remove).map(|_| ())
+    }
+
+    /// Which of `paths` are a blob in at least one of `commits`.
+    fn blobs_in(
+        &self,
+        commits: &[String],
+        paths: &[(String, u64)],
+    ) -> Result<std::collections::HashSet<String>, WorkspaceError> {
+        let mut found = std::collections::HashSet::new();
+        if paths.is_empty() {
+            return Ok(found);
+        }
+        let literal: Vec<String> = paths
+            .iter()
+            .map(|(path, _)| format!(":(literal){path}"))
+            .collect();
+        for commit in commits {
+            let mut arguments = vec!["ls-tree", "-r", "-z", "--full-tree", commit.as_str(), "--"];
+            arguments.extend(literal.iter().map(String::as_str));
+            let listed = self.git_listing(&arguments)?;
+            for entry in nul_fields(&listed) {
+                // `<mode> blob <id>\t<path>`
+                if let Some((meta, path)) = entry.split_once('\t')
+                    && meta.split_whitespace().nth(1) == Some("blob")
+                    && paths.iter().any(|(large, _)| large == path)
+                {
+                    found.insert(path.to_string());
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The commits whose blobs a checkpoint of `branch` over `parent` keeps
+    /// as blobs ([`Self::tree_of`]): the head, `main`, and the `main` of a
+    /// pending merge.
+    fn source_commits(&self, branch: &str, parent: &str) -> Vec<String> {
+        let mut commits = vec![parent.to_string()];
+        if let Ok(main) = self.commit_id_of(&format!("refs/heads/{BASE}")) {
+            commits.push(main);
+        }
+        if let Some(pending) = self.pending_merge(branch) {
+            commits.push(pending.main);
+        }
+        commits.sort();
+        commits.dedup();
+        commits
     }
 
     /// Blobs of `tree` larger than [`LARGE_FILE_BYTES`], with their sizes.
@@ -908,15 +968,15 @@ impl WorkspaceStore for GitWorkspace {
             WorkspaceError::Unavailable(format!("lock {}: {error}", lock_path.display()))
         })?;
         self.refuse_stale(&branch)?;
-        let tree = self.tree_of(&directory, &index);
+        let reference = format!("refs/heads/{branch}");
+        let parent = self.git_output(&["rev-parse", &reference])?;
+        let tree = self.tree_of(&directory, &index, &self.source_commits(&branch, &parent));
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
         let (tree, large) = tree?;
         let manifest = self.store_large(&branch, &directory, &large)?;
 
-        let reference = format!("refs/heads/{branch}");
-        let parent = self.git_output(&["rev-parse", &reference])?;
         let parent_tree = self.git_output(&["rev-parse", &format!("{parent}^{{tree}}")])?;
         // A merge of main whose conflicts are now resolved: main is the
         // second parent, even when the tree did not change.
