@@ -69,7 +69,7 @@
 #       bb029_<run>-gate-<task id>-<n>.scope inside the slice, with
 #       memory.high 30 MiB, memory.max 32 MiB and memory.swap.max 8 MiB, and
 #       on its first run allocates past that envelope (hog's tool).
-#   (6) that gate, killed by its memory limit, is a host fault: within 20 s
+#   (6) that gate, killed by its memory limit, is a host fault: within 30 s
 #       a `task.gated` with verdict `host_fault`, evidence `memory_limit`
 #       naming its scope, memory_max 33554432 and oom_kills > 0, backoff_ms
 #       3000 and due_ms its time + 3000; gate_aborts and gate_rejections
@@ -843,10 +843,39 @@ if [ -n "$(engine_line late)" ]; then
     fi
 fi
 
-# --- (5) a gate in its own scope ---------------------------------------------------
+# --- (5) a gate in its own scope, killed by its envelope ------------------------------
+
+# The first task.gated record (not `stale`) of task $1 after event $2:
+# `<event id>|<at ms>|<record>`.
+gated_after() {
+    sql "select e.id || '|' || e.recorded_at_ms || '|' || (e.kind -> 'detail' -> 'record')::text
+           from spawn_events e
+          where e.session_id = 'session_control'
+            and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+            and e.kind -> 'detail' -> 'record' ->> 'id' = '$1'
+            and coalesce(e.kind -> 'detail' -> 'record' ->> 'verdict', '') <> 'stale'
+            and e.id > $2
+          order by e.id limit 1"
+}
+mission_col() { q "select coalesce($1::text, '') from mission_missions where id = $mission"; }
+# gate_scope_n <cgroup>: the n of $stem-gate-$task-<n>.scope directly in the
+# slice, or nothing.
+gate_scope_n() {
+    case "$1" in
+    "$manager_cg/$slice/$stem-gate-$task-"*.scope)
+        n=${1#*"$stem-gate-$task-"}
+        n=${n%%.scope*}
+        case "$n" in '' | *[!0-9]*) ;; *) echo "$n" ;; esac
+        ;;
+    esac
+}
 
 within 60 '[ "$(q "select state from mission_tasks where id = $task")" = reported ]' ||
     harness "calm's task #$task was not reported within 60 s (state $(q "select state from mission_tasks where id = $task"))"
+before_gate=$(q "select coalesce(max(id), 0) from spawn_events")
+aborts_before=$(mission_col gate_aborts)
+rejections_before=$(mission_col gate_rejections)
+revisions_before=$(q "select revisions from mission_tasks where id = $task")
 deadline=$(($(now) + 90))
 while [ ! -s "$WORK/gate.log" ]; do
     [ "$(now)" -lt "$deadline" ] ||
@@ -855,23 +884,81 @@ while [ ! -s "$WORK/gate.log" ]; do
     sleep 0.5
 done
 judged=$(head -n 1 "$WORK/gate.log")
-echo "029: task #$task's gate ran in $(field "$judged" 2), memory.max $(field "$judged" 3), memory.swap.max $(field "$judged" 4)"
-case "$(field "$judged" 2)" in
-"$manager_cg/$slice/$stem-gate-$task-"*.scope)
-    n=${judged#*"$stem-gate-$task-"}
-    n=${n%%.scope*}
-    case "$n" in '' | *[!0-9]*) measured_fail "(5) task #$task's gate scope $(field "$judged" 2) is not $stem-gate-$task-<n>.scope" ;; esac
-    ;;
-*)
+scope1=$(basename "$(field "$judged" 2)")
+n1=$(gate_scope_n "$(field "$judged" 2)")
+echo "029: task #$task's gate (run 1) ran in $(field "$judged" 2), memory.high $(field "$judged" 5), memory.max $(field "$judged" 3), memory.swap.max $(field "$judged" 4)"
+[ -n "$n1" ] ||
     measured_fail "(5) task #$task's gate runs in $(field "$judged" 2), not in its own scope $stem-gate-$task-<n>.scope inside $slice"
-    ;;
+[ "$(field "$judged" 5)" = "$GATE_HIGH" ] && [ "$(field "$judged" 3)" = "$GATE_MAX" ] && [ "$(field "$judged" 4)" = "$GATE_SWAP" ] ||
+    measured_fail "(5) task #$task's gate runs with memory.high $(field "$judged" 5), memory.max $(field "$judged" 3) and memory.swap.max $(field "$judged" 4), not $GATE_HIGH, $GATE_MAX and $GATE_SWAP (SPAWN_GATE_MEMORY_HIGH=30M, _MAX=32M, _SWAP_MAX=8M)"
+
+# --- (6) a gate its envelope killed is a host fault, judged again ---------------------
+
+# Passes every half second until the judging is recorded (the gate's tool
+# needs a few seconds to reach its MemoryMax through its MemoryHigh).
+gated=""
+deadline=$(($(now) + 30))
+while :; do
+    gated=$(gated_after "$task" "$before_gate")
+    [ -n "$gated" ] && break
+    [ "$(now)" -lt "$deadline" ] || break
+    sleep 0.5
+    integrate_once
+done
+[ -n "$gated" ] ||
+    fail "(6) task #$task's first gate run recorded no verdict within 30 s (its tool: $(cut -d'|' -f3- "$WORK/gate-alloc.log" | tr '\n' ' '); integrate: $(tail -n 3 "$WORK/integrate.log" | tr '\n' ' '))"
+g1_id=$(printf '%s' "$gated" | cut -d'|' -f1)
+g1_at=$(printf '%s' "$gated" | cut -d'|' -f2)
+g1=$(printf '%s' "$gated" | cut -d'|' -f3-)
+g1_verdict=$(printf '%s' "$g1" | jq -r '.verdict // empty')
+echo "029: run 1's tool: $(cut -d'|' -f3- "$WORK/gate-alloc.log" | tr '\n' ' '); gated '$g1_verdict' ($(printf '%s' "$g1" | jq -r '.reason // empty' | head -c 200)); gate_aborts $aborts_before -> $(mission_col gate_aborts)"
+if [ "$g1_verdict" != host_fault ]; then
+    measured_fail "(6) task #$task's gate, killed by its memory limit, was gated '$g1_verdict' ($(printf '%s' "$g1" | jq -r '.reason // empty' | head -c 200)), not 'host_fault'; gate_aborts $aborts_before -> $(mission_col gate_aborts): a gate its envelope kills is the host's fault, never an abort"
+else
+    [ "$(printf '%s' "$g1" | jq -r '.evidence // empty')" = memory_limit ] &&
+        [ "$(printf '%s' "$g1" | jq -r '.scope // empty')" = "$scope1" ] &&
+        [ "$(printf '%s' "$g1" | jq -r '.memory_max // empty')" = "$GATE_MAX" ] &&
+        [ "$(printf '%s' "$g1" | jq -r '(.oom_kills // 0) > 0')" = true ] ||
+        measured_fail "(6) the host fault does not name evidence memory_limit, the gate's scope $scope1, memory_max $GATE_MAX and oom_kills > 0: $(printf '%s' "$g1" | jq -c '{evidence, scope, memory_high, memory_max, oom_kills, memory_peak}')"
+    [ "$(printf '%s' "$g1" | jq -r '.backoff_ms // empty')" = $((BACKOFF_SECS * 1000)) ] &&
+        [ "$(printf '%s' "$g1" | jq -r '.due_ms // empty')" = $((g1_at + BACKOFF_SECS * 1000)) ] ||
+        measured_fail "(6) the host fault's backoff_ms [$(printf '%s' "$g1" | jq -r '.backoff_ms // empty')] and due_ms [$(printf '%s' "$g1" | jq -r '.due_ms // empty')] are not $((BACKOFF_SECS * 1000)) and its time + $((BACKOFF_SECS * 1000)) ($((g1_at + BACKOFF_SECS * 1000)))"
+fi
+[ "$(mission_col gate_aborts)" = "$aborts_before" ] && [ "$(mission_col gate_rejections)" = "$rejections_before" ] ||
+    measured_fail "(6) gate_aborts $aborts_before -> $(mission_col gate_aborts), gate_rejections $rejections_before -> $(mission_col gate_rejections) after a gate its envelope killed: it must count toward no halt"
+[ "$(q "select state from mission_tasks where id = $task")" = reported ] &&
+    [ "$(q "select revisions from mission_tasks where id = $task")" = "$revisions_before" ] ||
+    measured_fail "(6) task #$task is $(q "select state || ', revisions ' || revisions from mission_tasks where id = $task") after its gate was killed by its memory limit; wanted reported, revisions $revisions_before"
+[ -z "$(mission_col halted)" ] ||
+    measured_fail "(6) the mission halted after a gate its envelope killed: [$(mission_col halted)]"
+due=$(printf '%s' "$g1" | jq -r '.due_ms // empty')
+deadline=$(($(now) + 60))
+while [ "$(wc -l <"$WORK/gate.log" | tr -d ' ')" -lt 2 ]; do
+    [ "$(now)" -lt "$deadline" ] ||
+        harness "task #$task's gate did not run again within 60 s of its first judging (state $(q "select state from mission_tasks where id = $task"))"
+    integrate_once
+    sleep 0.5
+done
+judged2=$(sed -n 2p "$WORK/gate.log")
+ran2=$(field "$judged2" 1)
+n2=$(gate_scope_n "$(field "$judged2" 2)")
+echo "029: task #$task's gate ran again $((ran2 - g1_at)) ms after its first judging was recorded, in $(field "$judged2" 2)"
+case "$due" in
+'' | *[!0-9]*) measured_fail "(6) task #$task's gate ran again $((ran2 - g1_at)) ms after its first judging, with no due time to wait for" ;;
+*) [ "$ran2" -ge "$due" ] || measured_fail "(6) task #$task's gate ran again at $ran2 ms, before its host fault's due time $due ms" ;;
 esac
-[ "$(field "$judged" 3)" = "$GATE_MAX" ] && [ "$(field "$judged" 4)" = 0 ] ||
-    measured_fail "(5) task #$task's gate runs with memory.max $(field "$judged" 3) and memory.swap.max $(field "$judged" 4), not $GATE_MAX (SPAWN_GATE_MEMORY_MAX=32M) and 0"
+if [ -n "$n1" ]; then
+    [ -n "$n2" ] && [ "$n2" -gt "$n1" ] ||
+        measured_fail "(6) task #$task's second gate runs in $(field "$judged2" 2), not in a scope $stem-gate-$task-<n>.scope of a larger n than the first ($n1)"
+fi
+gated2=""
+within 30 'gated2=$(gated_after "$task" "$g1_id") && [ -n "$gated2" ]' || true
+[ "$(printf '%s' "$gated2" | cut -d'|' -f3- | jq -r '.verdict // empty' 2>/dev/null)" = accepted ] ||
+    measured_fail "(6) task #$task's second gate run was gated [$(printf '%s' "$gated2" | cut -d'|' -f3- | jq -r '.verdict // empty' 2>/dev/null)], not accepted"
 
 if [ -n "$failed_any" ]; then
     asserted=1
     exit 1
 fi
-echo "029: every execution and the gate ran in their own scopes in $slice; the memory-limit kill ended hog's execution only, was recorded and resumed with its work; late waited for room and started once it fit"
+echo "029: every execution and the gate ran in their own scopes in $slice; the memory-limit kill ended hog's execution only, was recorded and resumed with its work; late waited for room and started once it fit; the gate its envelope killed was a host fault, judged again after its backoff"
 exit 0
