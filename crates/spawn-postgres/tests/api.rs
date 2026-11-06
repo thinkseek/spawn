@@ -424,6 +424,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
     let ended = |cause| EventKind::ExecutionEnded {
         cause,
         exit_code: Some(0),
+        evidence: None,
     };
     let row = |label: &str| {
         let row = admin(&schema)
@@ -548,6 +549,7 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
+                evidence: None,
             },
         ))
         .expect("the end of a lost execution");
@@ -596,6 +598,7 @@ fn open_tools_are_started_minus_finished_in_live_executions() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Exited,
                 exit_code: Some(0),
+                evidence: None,
             },
         ))
         .expect("append succeeds");
@@ -1692,6 +1695,7 @@ impl Worker<'_> {
             EventKind::ExecutionEnded {
                 cause: EndCause::Stopped,
                 exit_code: None,
+                evidence: None,
             },
         );
     }
@@ -2135,6 +2139,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                     EventKind::ExecutionEnded {
                         cause: EndCause::Stopped,
                         exit_code: None,
+                        evidence: None,
                     },
                 )
             })
@@ -2319,6 +2324,7 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    evidence: None,
                 },
             ))
             .expect("ended");
@@ -2412,6 +2418,7 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    evidence: None,
                 },
             ),
         ] {
