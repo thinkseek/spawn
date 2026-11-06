@@ -4125,6 +4125,68 @@ mod host_fault_tests {
         );
     }
 
+    /// `cargo test` as Rust 1.95 prints it (thread ids, an `Error:` test),
+    /// through check-tests.sh in both of its forms: the FAILED lines name all
+    /// three; the excerpt, cut by grep, shows the two panics only.
+    #[test]
+    fn real_cargo_output_reads_in_both_forms() {
+        let owners = [
+            "FAILED tests::asserted: src/lib.rs:6:21: assertion `left == right` failed: the \
+             landing moved main",
+            "FAILED tests::returns: Error: \"db error: FATAL: the database system is in recovery \
+             mode\"",
+            "FAILED tests::refused: src/lib.rs:4:98: connect to the test database: \"error \
+             connecting to server: Connection refused (os error 111)\"",
+        ];
+        let excerpt = [
+            "tests::asserted --- FAILED",
+            "tests::returns --- FAILED",
+            "tests::refused --- FAILED",
+            "",
+            "failures:",
+            "",
+            "---- tests::asserted stdout ----",
+            "",
+            "thread 'tests::asserted' (2819485) panicked at src/lib.rs:6:21:",
+            "assertion `left == right` failed: the landing moved main",
+            "  left: 1",
+            " right: 2",
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "",
+            "--",
+            "thread 'tests::refused' (2819487) panicked at src/lib.rs:4:98:",
+            "connect to the test database: \"error connecting to server: Connection refused (os \
+             error 111)\"",
+            "",
+            "",
+            "failures:",
+            "    tests::asserted",
+            "--",
+            "test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.00s",
+            "",
+            "error: test failed, to rerun pass `--lib`",
+        ];
+        let both: Vec<&str> = owners.iter().chain(excerpt.iter()).copied().collect();
+        let failures = host::check_tests_failures(&gate_output(&both));
+        assert_eq!(
+            tests_of(&failures),
+            ["tests::asserted", "tests::returns", "tests::refused"]
+        );
+        let classes: Vec<Class> = failures
+            .iter()
+            .map(|failure| host::classify(&failure.message))
+            .collect();
+        assert_eq!(classes, [Class::Work, Class::Connection, Class::Connection]);
+        let failures = host::check_tests_failures(&gate_output(&excerpt));
+        assert_eq!(tests_of(&failures), ["tests::asserted", "tests::refused"]);
+        assert_eq!(
+            failures[0].message,
+            "assertion `left == right` failed: the landing moved main\n  left: 1\n right: 2"
+        );
+        assert_eq!(host::classify(&failures[1].message), Class::Connection);
+    }
+
     /// A test that returned an error prints `Error: ...` under its stdout
     /// header: a failure of that test, with that line as its message.
     #[test]
