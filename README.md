@@ -125,6 +125,7 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | Wait after the first host fault in a row before the task is judged again; doubled per host fault in a row, at most an hour |
 | `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | Address `spawn serve` binds (`--address` overrides it) |
 | `SPAWN_SERVE_TOKEN` | unset | Token every `spawn serve` API request must carry; required off loopback |
+| `SPAWN_SERVE_OPEN_NETWORKS` | unset | Comma-separated CIDRs (e.g. `192.168.31.0/24`) whose clients read without the token when they name the server by its address in that network (`http://192.168.31.112:8787/`); a name in `Host` (DNS rebinding) or a foreign `Origin` still needs it; `/0` is refused |
 
 ## Development
 
