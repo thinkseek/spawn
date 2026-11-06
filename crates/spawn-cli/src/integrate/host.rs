@@ -158,16 +158,16 @@ fn failed_line(line: &str) -> Option<Failure> {
 }
 
 /// The test of a `thread '<test>' panicked at <location>:` line.
-fn panicked(text: &str) -> Option<&str> {
-    let rest = text.strip_prefix("thread '")?;
-    let (test, _) = rest.split_once("' panicked at")?;
-    Some(test)
+fn panicked(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("thread '")?;
+    let (name, _) = rest.split_once("' panicked at")?;
+    Some(name)
 }
 
 /// The test of a `---- <test> stdout ----` line.
-fn stdout_header(text: &str) -> Option<&str> {
-    let test = text.strip_prefix("---- ")?.strip_suffix(" stdout ----")?;
-    (!test.is_empty()).then_some(test)
+fn stdout_header(line: &str) -> Option<&str> {
+    let name = line.strip_prefix("---- ")?.strip_suffix(" stdout ----")?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Whether a line ends a panic's message: a `note:`, `---- `, `test
