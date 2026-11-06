@@ -2718,4 +2718,297 @@ mod tests {
             "{text}"
         );
     }
+
+    // --- spent deliveries: re-issued, escalated, tried after a deploy -------
+
+    /// The host's refusal of task 66 on 2026-11-06, as the Bridge reports a
+    /// staging refused before typing to the dispatcher.
+    const REFUSED: &str = "pane state Ready does not accept input: submit text refused before \
+                           typing (set-buffer failed: command too long)";
+
+    /// The waits a loop with `SPAWN_DELIVERY_RETRY_SECS=2` and
+    /// `SPAWN_REISSUE_AFTER_SECS=10` reads.
+    fn short_waits() -> super::Waits {
+        super::Waits {
+            retry_ms: 2_000,
+            reissue_after_ms: 10_000,
+        }
+    }
+
+    /// `facts` with the delivery `key` of a task refused before typing at
+    /// every attempt until spent: the ten free refusals, then four counted,
+    /// the last one finished at `last`.
+    fn spent_facts(key: &str, last: i64) -> Facts {
+        let mut facts = worker(true, true);
+        let total = super::NOT_READY_FREE + DELIVERY_RETRIES + 1;
+        for n in 0..total {
+            let attempt = if n == 0 {
+                key.to_string()
+            } else {
+                format!("{key}-retry-{n}")
+            };
+            let at = last - i64::try_from(total - 1 - n).expect("small") * 1_000;
+            let id = 100 + i64::try_from(n).expect("small");
+            facts.dispatched.push(sent(id, &attempt, at, Some(REFUSED)));
+        }
+        facts
+    }
+
+    fn with(tasks: Vec<TaskRow>, moved: Option<super::Moved>) -> Work {
+        Work {
+            tasks,
+            moved,
+            waits: short_waits(),
+            ..Work::default()
+        }
+    }
+
+    #[test]
+    fn the_waits_are_read_from_the_environment_with_their_defaults() {
+        let (waits, warnings) = super::Waits::read(|_| None);
+        assert_eq!(waits, super::Waits::default());
+        assert_eq!(waits.retry_ms, 60_000);
+        assert_eq!(waits.reissue_after_ms, 300_000);
+        assert!(warnings.is_empty());
+        let (waits, warnings) = super::Waits::read(|name| match name {
+            "SPAWN_DELIVERY_RETRY_SECS" => Some("2".to_string()),
+            "SPAWN_REISSUE_AFTER_SECS" => Some(" 10 ".to_string()),
+            _ => None,
+        });
+        assert_eq!(waits, short_waits());
+        assert!(warnings.is_empty());
+        let (waits, warnings) = super::Waits::read(|name| {
+            (name == "SPAWN_REISSUE_AFTER_SECS").then(|| "soon".to_string())
+        });
+        assert_eq!(waits.reissue_after_ms, 300_000, "the default holds");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("SPAWN_REISSUE_AFTER_SECS"), "{warnings:?}");
+    }
+
+    /// The first counted retry waits `SPAWN_DELIVERY_RETRY_SECS`, doubling.
+    #[test]
+    fn a_counted_retry_waits_the_set_retry_wait_doubling() {
+        let tasks = with(vec![task(4, TaskState::Assigned, "resident")], None);
+        let mut facts = worker(true, true);
+        facts
+            .dispatched
+            .push(sent(10, "deliver-4-0", 1_000, Some("terminal disappeared")));
+        assert!(super::orders(&tasks, &[facts.clone()], 2_999).is_empty());
+        assert_eq!(
+            super::orders(&tasks, &[facts.clone()], 3_000)[0].key,
+            "deliver-4-0-retry-1"
+        );
+        facts.dispatched.push(sent(
+            11,
+            "deliver-4-0-retry-1",
+            5_000,
+            Some("terminal disappeared"),
+        ));
+        assert!(super::orders(&tasks, &[facts.clone()], 8_999).is_empty());
+        assert_eq!(
+            super::orders(&tasks, &[facts], 9_000)[0].key,
+            "deliver-4-0-retry-2"
+        );
+    }
+
+    /// Task 66: a first delivery refused before typing at every attempt is
+    /// not escalated; once `SPAWN_REISSUE_AFTER_SECS` have passed since its
+    /// last attempt, not before, it is re-issued with every attempt.
+    #[test]
+    fn a_spent_first_delivery_is_not_escalated_and_is_reissued_after_the_wait() {
+        let tasks = with(vec![task(66, TaskState::Assigned, "resident")], None);
+        let facts = spent_facts("deliver-66-0", 50_000);
+        let rows = [facts];
+        assert!(news_items(&tasks, &rows).is_empty(), "not for a person");
+        assert!(super::orders(&tasks, &rows, 59_999).is_empty(), "no retry");
+        assert!(super::reissues(&tasks, &rows, 50_000 + 9_999).is_empty());
+        let due = super::reissues(&tasks, &rows, 50_000 + 10_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].task, 66);
+        let keys: Vec<&str> = due[0]
+            .attempts
+            .iter()
+            .map(|attempt| attempt.key.as_str())
+            .collect();
+        assert_eq!(keys.len(), 14, "every attempt: {keys:?}");
+        assert_eq!(keys[0], "deliver-66-0");
+        assert_eq!(keys[13], "deliver-66-0-retry-13");
+        assert_eq!(due[0].attempts[0].command, Some(100));
+        assert_eq!(due[0].attempts[13].error.as_deref(), Some(REFUSED));
+        assert!(
+            super::orders(&tasks, &rows, 50_000 + 10_000).is_empty(),
+            "the re-issue, not a delivery"
+        );
+        // The stall layer hears it is given up: no stall either.
+        let status = super::delivery_status(&tasks, &tasks.tasks[0], rows.first(), 55_000);
+        assert!(status.given_up);
+        assert!(status.line.contains("re-issued"), "{}", status.line);
+        assert!(status.line.contains("in 5s"), "{}", status.line);
+        // Through the whole pass, with an idle supervisor.
+        let plan = pass(&tasks, &rows[0], 50_000 + 10_000);
+        assert_eq!(plan.reissues, due);
+        assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+    }
+
+    /// One whose attempt may have typed the task is escalated and never
+    /// re-issued: the worker may have it.
+    #[test]
+    fn a_delivery_that_may_have_typed_is_escalated_and_not_reissued() {
+        let tasks = with(vec![task(4, TaskState::Assigned, "resident")], None);
+        let mut facts = spent_facts("deliver-4-0", 50_000);
+        // An earlier attempt may have typed it, the later ones refused.
+        facts.dispatched[3].error = Some(format!(
+            "submit text: tmux died; the text {}",
+            spawn_core::bridge::MAY_HAVE_TYPED
+        ));
+        let rows = [facts];
+        assert!(super::reissues(&tasks, &rows, i64::MAX / 2).is_empty());
+        assert!(super::orders(&tasks, &rows, i64::MAX / 2).is_empty());
+        let items = news_items(&tasks, &rows);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::DeliveryFailed);
+        assert!(items[0].line.contains("may or may not"), "{}", items[0].line);
+        let status = super::delivery_status(&tasks, &tasks.tasks[0], rows.first(), 60_000);
+        assert!(!status.given_up, "its stall is escalated");
+    }
+
+    /// A re-issue whose delivery is spent too is escalated, naming the task
+    /// and the task it re-issued with the attempts of both, and never
+    /// re-issued again.
+    #[test]
+    fn a_spent_reissue_is_escalated_naming_both_tasks_and_not_reissued() {
+        let before: Vec<super::Attempt> = (0..14)
+            .map(|n| super::Attempt {
+                command: Some(n),
+                key: if n == 0 {
+                    "deliver-3-0".to_string()
+                } else {
+                    format!("deliver-3-0-retry-{n}")
+                },
+                error: Some(REFUSED.to_string()),
+            })
+            .collect();
+        let reissue = TaskRow {
+            reissue_of: Some(3),
+            reissued_attempts: Some(before),
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        let tasks = with(vec![reissue], None);
+        let rows = [spent_facts("deliver-4-0", 50_000)];
+        assert!(super::reissues(&tasks, &rows, i64::MAX / 2).is_empty());
+        assert!(super::orders(&tasks, &rows, i64::MAX / 2).is_empty());
+        let items = news_items(&tasks, &rows);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::DeliveryFailed);
+        assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
+        let line = &items[0].line;
+        assert!(line.starts_with("task #4 (a re-issue of task #3) never reached its worker"));
+        assert!(line.contains("`deliver-4-0` to `deliver-4-0-retry-13` (14 attempts)"), "{line}");
+        assert!(line.contains("`deliver-3-0` to `deliver-3-0-retry-13` (14 attempts)"), "{line}");
+        assert!(line.contains("command too long"), "{line}");
+        assert!(!line.contains('\n'));
+        let status = super::delivery_status(&tasks, &tasks.tasks[0], rows.first(), 60_000);
+        assert!(status.given_up, "escalated as delivery failed: no stall");
+    }
+
+    /// After a `source.moved` record every spent delivery gets one attempt,
+    /// at once, keyed by the record's event id; none again for the same
+    /// record, none for a record from before it was spent. A success
+    /// delivers the task (its re-issue is then not made); a failure leaves
+    /// it as it was, until the next record.
+    #[test]
+    fn after_a_deploy_a_spent_delivery_is_tried_once_more_under_its_moved_key() {
+        let reissue = TaskRow {
+            reissue_of: Some(3),
+            ..task(4, TaskState::Assigned, "resident")
+        };
+        let facts = spent_facts("deliver-4-0", 50_000);
+        let moved = |id, at_ms| Some(super::Moved { id, at_ms });
+        // A deploy before the delivery was spent gives it nothing.
+        let early = with(vec![reissue.clone()], moved(70, 40_000));
+        assert!(super::orders(&early, &[facts.clone()], 60_000).is_empty());
+        // One after it: one attempt at once, delivering the task.
+        let tasks = with(vec![reissue.clone()], moved(90, 60_000));
+        let tried = super::orders(&tasks, &[facts.clone()], 60_001);
+        assert_eq!(tried.len(), 1, "{tried:?}");
+        assert_eq!(tried[0].key, "deliver-4-0-moved-90");
+        assert_eq!(tried[0].task, Some(4));
+        assert!(matches!(tried[0].action, CommandAction::Input { .. }));
+
+        // In flight: nothing more, and no re-issue for a first delivery.
+        let mut flying = facts.clone();
+        flying.dispatched.push(Sent {
+            succeeded: None,
+            finished_at_ms: None,
+            ..sent(200, "deliver-4-0-moved-90", 60_002, None)
+        });
+        assert!(super::orders(&tasks, &[flying.clone()], 90_000).is_empty());
+        let first = with(vec![task(4, TaskState::Assigned, "resident")], moved(90, 60_000));
+        assert!(super::reissues(&first, &[flying], i64::MAX / 2).is_empty());
+
+        // Succeeded: the task is delivered by it; a pending re-issue is not made.
+        let mut through = facts.clone();
+        through
+            .dispatched
+            .push(sent(200, "deliver-4-0-moved-90", 62_000, None));
+        assert_eq!(delivered(&first, &[through.clone()]), vec![(4, 200)]);
+        assert!(super::reissues(&first, &[through], i64::MAX / 2).is_empty());
+
+        // Failed: as it was. No attempt again for this record, no new
+        // escalation; the re-issue of a first delivery still comes.
+        let mut refused = facts.clone();
+        refused
+            .dispatched
+            .push(sent(200, "deliver-4-0-moved-90", 62_000, Some(REFUSED)));
+        assert!(super::orders(&tasks, &[refused.clone()], i64::MAX / 2).is_empty());
+        let items = news_items(&tasks, &[refused.clone()]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tag(), "session_resident_core deliver-4-0", "the same item");
+        assert!(news_items(&first, &[refused.clone()]).is_empty());
+        assert_eq!(super::reissues(&first, &[refused.clone()], 72_000).len(), 1);
+        // The next deploy: one attempt more.
+        let next = with(vec![reissue], moved(95, 63_000));
+        assert_eq!(
+            super::orders(&next, &[refused], 63_001)[0].key,
+            "deliver-4-0-moved-95"
+        );
+
+        // A spent revision's delivery gets its attempt too; one that may have
+        // typed does not.
+        let revision = with(
+            vec![TaskRow {
+                revisions: 1,
+                ..task(5, TaskState::Revise, "resident")
+            }],
+            moved(90, 60_000),
+        );
+        assert_eq!(
+            super::orders(&revision, &[spent_facts("deliver-5-1", 50_000)], 60_001)[0].key,
+            "deliver-5-1-moved-90"
+        );
+        let mut unsure = spent_facts("deliver-4-0", 50_000);
+        unsure.dispatched[13].error = Some(spawn_core::bridge::MAY_HAVE_TYPED.to_string());
+        assert!(super::orders(&tasks, &[unsure], 60_001).is_empty());
+    }
+
+    /// A deploy recorded while a first delivery waits for its re-issue: the
+    /// re-issue, once due, goes first, and no extra attempt beside it.
+    #[test]
+    fn a_due_reissue_takes_the_place_of_the_deploys_attempt() {
+        let tasks = with(
+            vec![task(4, TaskState::Assigned, "resident")],
+            Some(super::Moved {
+                id: 90,
+                at_ms: 55_000,
+            }),
+        );
+        let rows = [spent_facts("deliver-4-0", 50_000)];
+        assert_eq!(
+            super::orders(&tasks, &rows, 55_001)[0].key,
+            "deliver-4-0-moved-90",
+            "before the re-issue is due"
+        );
+        assert!(super::orders(&tasks, &rows, 60_000).is_empty());
+        assert_eq!(super::reissues(&tasks, &rows, 60_000).len(), 1);
+    }
 }
