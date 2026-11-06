@@ -380,8 +380,6 @@ check() {
         '($got | length) == 1 and $got[0] == $want' >/dev/null 2>&1 ||
         fail "$4: $2 is ${got#[}, expected $3"
 }
-# A field that is null must be there and null, not absent.
-has_null_field() { :; }
 card=$WORK/card.json
 check "$card" '.min_n' 3 "(1) the minimum n"
 check "$card" '.since_ms' "$(scalar "select (extract(epoch from timestamptz '2026-10-02 00:00:00+00') * 1000)::bigint")" "(1) the window's start"
@@ -599,6 +597,9 @@ check "$card" '[.scopes[] | select(.scope == "fleet") | .days[].day]' '["2026-10
     "(2) the fleet's days"
 while read -r scope dimension field want; do
     [ -n "$scope" ] || continue
+    # The field is there (a null is written, not left out), then its value.
+    check "$card" "$(path_of "$scope" "$dimension") | has(\"$field\")" true \
+        "(2) $scope $dimension has a field $field"
     check "$card" "$(path_of "$scope" "$dimension") | .$field" "$want" "(2) $scope $dimension $field"
 done <"$WORK/expected"
 
