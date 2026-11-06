@@ -191,9 +191,28 @@ const ROOM_BACKOFF_MAX: Duration = Duration::from_mins(40);
 /// told, once per run.
 const ROOM_ESCALATE_AFTER: Duration = Duration::from_hours(2);
 
-/// Wall clock of one gate run: two builds, clippy, the tests, the e2e and
-/// the black-box scenarios fit well inside it.
-const GATE_WALL_CLOCK: Duration = Duration::from_mins(45);
+/// Wall clock of one gate run: `SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by
+/// default. The gate grows with every objective whose scenario it runs (an
+/// unsolved one runs twice on the base), so the bound is a setting: on
+/// 2026-11-06 a fixed 45 minutes aborted a healthy gate still in its
+/// regression phase, and three such aborts halt a mission. Keep it below the
+/// scratch age at which spawn-maintenance removes a gate's leftovers
+/// (SPAWN_MAINTENANCE_SCRATCH_AGE_MIN, 180 in
+/// deploy/systemd/spawn-maintenance.service), or a live gate's scratch could go.
+fn gate_wall_clock() -> Duration {
+    wall_clock_minutes(crate::config::env_value("SPAWN_GATE_WALL_CLOCK_MINUTES").as_deref())
+}
+
+/// [`gate_wall_clock`] from the setting's text: a whole number of minutes
+/// from 1 up; anything else is the default.
+fn wall_clock_minutes(text: Option<&str>) -> Duration {
+    const DEFAULT_MINUTES: u64 = 120;
+    let minutes = text
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|minutes| *minutes > 0)
+        .unwrap_or(DEFAULT_MINUTES);
+    Duration::from_mins(minutes)
+}
 
 /// Guard against runaway candidates.
 const MAX_PATCH_BYTES: usize = 1 << 20;
@@ -1225,7 +1244,7 @@ impl Judge {
                 scenarios,
                 scenario.as_deref(),
                 &gate_env,
-                GATE_WALL_CLOCK,
+                gate_wall_clock(),
             )
         };
         match run_gate(main, &candidate) {
@@ -2036,6 +2055,7 @@ mod tests {
     use super::{
         Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, no_room,
         over_budget, pinned, report_freshness, room_backoff, room_wait, task_scenario,
+        wall_clock_minutes,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
@@ -3239,6 +3259,18 @@ mod tests {
         assert_eq!(at(&waiting, 500), false, "told once per run");
         // And it never counts toward the halt the mission already nears.
         assert_eq!(halt_reason(&waiting, 0), None);
+    }
+
+    #[test]
+    fn the_gate_wall_clock_is_a_setting_with_a_default() {
+        let minutes = |text: Option<&str>| wall_clock_minutes(text).as_secs() / 60;
+        assert_eq!(minutes(None), 120);
+        assert_eq!(minutes(Some("90")), 90);
+        assert_eq!(minutes(Some(" 240 ")), 240);
+        // Nothing that is not a whole number of minutes from 1 up is taken.
+        for bad in ["", "0", "-5", "1.5", "two hours"] {
+            assert_eq!(minutes(Some(bad)), 120, "{bad:?}");
+        }
     }
 
     #[test]
