@@ -77,10 +77,20 @@ head alone is the whole workspace, so everything below is a git operation.
   from a background pusher off the Bridge's loop: at most one push per
   branch every 5 s, carrying the head as it is then, failures retried with
   backoff, and what still waits pushed when the store drops (a one-shot
-  `spawn tick`, or `spawn loop` ending on SIGTERM after its pass). The
-  queue is in memory, so a new Bridge queues again the branch of every
-  agent with an open task: a push lost with a killed process is made after
-  the restart (a branch the source already has is a no-op push). Only a source that is a directory on this host receives
+  `spawn tick`, or `spawn loop` ending on SIGTERM after its pass). A process
+  has one pusher per source, for its whole life, and every store it builds
+  pushes through it: the Bridge's, and the one-shot stores the dispatcher
+  and the integrator build for a merge of main or a set-aside. So a source
+  has one queue and one pusher thread per process, however many merges it
+  sees. What a one-shot store changed is pushed at once, on the caller's
+  thread, never beside a push of the same branch; a push that fails there
+  stays queued and the pusher's thread retries it. The queue is in memory,
+  so a new Bridge queues again the branch of every agent with an open task,
+  and the integrator, when the pushed branch lacks the agent's latest
+  recorded checkpoint and this host's branch head is that checkpoint,
+  pushes it again before it judges the task `stale`: a push lost with a
+  killed process is made after the restart (a branch the source already
+  has is a no-op push). Only a source that is a directory on this host receives
   branches: a remote may be public, and every agent commit would leave the
   host.
 - **Main at a start or resume**: the Bridge merges main into an agent's
@@ -106,7 +116,18 @@ head alone is the whole workspace, so everything below is a git operation.
   into the agent's mounted workspace (`merge_base`, routed and refreshed by
   `MissionWorkspaces`, holding the branch's lock so no checkpoint reads the
   directory halfway) at two moments when the agent is idle between turns
-  (spawn-cli's `main_merge`):
+  (spawn-cli's `main_merge`). Both moments are chosen on facts read
+  earlier, so the store asks again, under the branch's lock, after the
+  fetch of main and right before it writes anything (`merge_base_when`), on
+  the dispatcher's facts read then: no command in flight in the session, no
+  stop under way, and a live worker stopped at its prompt, judged on its
+  latest fact (the rule a revision is typed in by). The Bridge types into
+  an engine under the same lock (`WorkspaceStore::hold`), so a turn typed in
+  meanwhile is seen. A worker that is not idle keeps its workspace as it is
+  and the merge waits: the integrator's `conflict` note says main is merged
+  when the revision is typed in (the dispatcher's merge below), and a
+  delivery whose merge finds the worker busy is not sent that pass and is
+  tried again on the next:
   - the integrator's `conflict` verdict, before the verdict is recorded, so
     its note names the files that now carry markers;
   - the dispatcher's delivery of a task typed into a live worker, so the
@@ -118,7 +139,8 @@ head alone is the whole workspace, so everything below is a git operation.
     retry's merge finds main already in.
 
   A clean merge is a merge commit recorded as `artifact.committed`
-  (`base_merged`, its files) and then pushed. A record whose append failed
+  (`base_merged`, its files) and then pushed at once (a push that fails
+  stays queued and is retried, above). A record whose append failed
   is written at the agent's next merge, read back from the branch head (a
   two-parent "spawn: merge main" commit; the record's key makes a repeat a
   no-op). A content conflict writes the merge
@@ -133,7 +155,11 @@ head alone is the whole workspace, so everything below is a git operation.
   each such file under `.spawn/main/` in the workspace, and the note or the
   task text tells the worker, who cannot run git, to make each file exactly
   `main`'s version (or delete it where `main` has none); recorded as
-  `merge.conflicted {files, marked: false}`. An agent with no workspace on
+  `merge.conflicted {files, marked: false}`. `.spawn/` is never committed and
+  a mount exports the workspace afresh, so the store records the copies
+  (`main`'s commit and the files) under `<root>/.main-copies/<agent>`, and
+  every mount (a resume after an engine was lost, a host restart) puts them
+  back until the branch contains that `main`. An agent with no workspace on
   the integrator's host gets no merge, and its note says so.
 - **Work set aside**: a resident keeps its branch from task to task, so the
   work of a task cancelled while it was delivered (by `spawn task cancel`,
@@ -232,7 +258,13 @@ head alone is the whole workspace, so everything below is a git operation.
   `main` is merged into its workspace (above); one whose merge is clean as
   text but fails the gate, while the head alone passes it against its
   merge-base with `main`, is gated `incompatible` and sent back the same
-  way, not counted as a rejection (fleet-architecture.md §10.3); marker blocks in the files
+  way, not counted as a rejection (fleet-architecture.md §10.3); one whose
+  check-tests.sh failures are all the host's (connection errors to the test
+  database, or database errors while the test database's log,
+  `SPAWN_TEST_DATABASE_LOG`, shows a crash during the gate) is gated
+  `host_fault`: no verdict on the work, never counted, the task left where it
+  was and judged again after a backoff from the record's `due_ms`, two in a
+  row escalated to the supervisor (fleet-architecture.md §10.3); marker blocks in the files
   the branch changes are gated `conflict`, a pending merge of `main` (it lives with the workspace
   directory, on the Bridge's host) blocks judging when that directory is on
   the integrator's host, and its markers, once checkpointed and pushed, are

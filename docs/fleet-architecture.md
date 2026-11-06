@@ -285,7 +285,12 @@ it, on the same ladder.
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
   state as JSON), `spawn tail <session>` (screen and recent events) and
   `spawn submit`. The dispatcher wakes it by typing a digest into its pane
-  while it is idle; digests coalesce while it works. Its memory is its native
+  while it is idle; digests coalesce while it works. Idle is its turn stopped
+  at its prompt, whatever Jev judged: a turn that ended on a question for the
+  human is judged BLOCKED, and digests still reach it. A digest has one line per
+  session and reason: repeated items of one kind about one worker (a human's
+  notes that could not be delivered, retried) are counted on one line, the
+  latest quoted, so they cannot fill the digest. Its memory is its native
   session (restored by resume) plus the log.
 - **Human**: the attention queue in the UI lists only what the supervisor
   escalated or could not resolve. Each human action is a command with
@@ -832,6 +837,64 @@ record of what was judged (§14 of design.md).
      for the gate on this host"). It stays pending until a delivered digest
      carries its tag (`host gate-room-<event>`), however long that takes, so
      it is told once.
+
+     **A host fault is not a verdict on the work either.** When the gate
+     rejects C with `regression: check-tests.sh fails on the candidate`,
+     the integrator reads the failures check-tests.sh printed, from the
+     gate's recorded output, in the check-tests section (from `| ==
+     regression: check-tests.sh must still pass` to the next `| == ` or `|
+     stage gate ` line). In the owner's form (one `| FAILED <test>: <first
+     message line>` per failing test, then the excerpt), the FAILED lines
+     are the failures and the excerpt is not read; in today's form (the
+     40-line excerpt alone) a failure is a `| thread '<test>' panicked at
+     <location>:` line with its message (up to a `note:`, `---- `, `test
+     result:`, `--` or blank line), or the `| Error: ...` line of a test
+     that returned an error. A failure the excerpt cut off is not seen. A
+     failure is the host's when its message is a connection error to the
+     test database (`error connecting to server`, `Connection refused`,
+     `connection closed`, `server closed the connection unexpectedly`,
+     `terminating connection because of crash of another server process`,
+     `the database system is in recovery mode` / `is starting up` / `is
+     shutting down` / `is not yet accepting connections`, `could not resize
+     shared memory segment`, `SqlState(E57P0`, `SqlState(E080`), or a
+     database error of any kind (`db error`, `Error { kind: Db`) while the
+     test database's log (`SPAWN_TEST_DATABASE_LOG`, optional, lines as
+     PostgreSQL writes them with `log_line_prefix` `%m [%p] `, `UTC` or a
+     numeric offset) holds a crash line (`was terminated by signal`,
+     `terminating any other active server processes`, `all server
+     processes terminated; reinitializing`) stamped within the gate's run as
+     the integrator measured it, one second either side. Unset or
+     unreadable, the log is no evidence (said once). At least one failure
+     read and every one the host's: `host_fault`, not `rejected` (and the
+     head is not judged alone). The task stays where it was (`reported`, or
+     `accepted` under review), its revisions and note do not move, nothing
+     goes back to the worker, and neither `gate_rejections` nor
+     `gate_aborts` grows or resets. The record names `base`, `candidate`,
+     `revision`, `scenarios`, `reason` (`host fault: ...`, saying which
+     evidence), `log`, `evidence` (`failures` when every failure is a
+     connection error, else `server_log`), `failures` (per failure its
+     `test`, its message's first line, bounded, and `class`, `connection`
+     or `database`), `crash` (the log lines, when used), `host_faults`,
+     `backoff_ms`, `due_ms` and `escalate`; the store refuses one without
+     its evidence and writes `due_ms` itself, the record's own
+     `recorded_at_ms` plus `backoff_ms`. The fold keeps the mission's host
+     faults in a row (`gate_host_faults`, with the latest one's task and
+     `due_ms`): + 1 on `host_fault`, unchanged on `no_room` and `stale`, 0
+     on every other verdict, on `task.landed` and on `mission.resumed`.
+     After the k-th in a row the task waits
+     `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` (300 by default) x 2^(k-1), at
+     most an hour: no pass gates it before the recorded `due_ms` (the
+     mission's other tasks wait behind it, as behind a `no_room`), and the
+     next pass after it judges it again. The one that makes the run 2
+     carries `escalate`: the dispatcher's digest takes it to the supervisor
+     once, as `host gate-host-fault-<event>` ("host faults at the gate"),
+     naming the task, the mission, the count, the evidence (the crash lines,
+     or the first failure's test and message) and when the task is judged
+     again. A real failure among them, or none read, keeps it `rejected`;
+     any other rejection reason is judged as before. The decision rests on
+     the failures and the crash lines named in the record, the wait on the
+     recorded `due_ms`, never on the reason's text alone or on time without
+     a record (design.md §14).
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
@@ -884,14 +947,18 @@ record of what was judged (§14 of design.md).
   task closes").
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row: `rejected` counts; `accepted` resets
-    the count; `incompatible`, `conflict`, `stale`, `aborted` and `no_room`
-    leave it (three `incompatible` in a row halt nothing);
-  - three gate aborts in a row (`no_room` is not an abort);
+    the count; `incompatible`, `conflict`, `stale`, `aborted`, `no_room`
+    and `host_fault` leave it (three `incompatible` in a row halt nothing);
+  - three gate aborts in a row (`no_room` and `host_fault` are not aborts,
+    and leave the count);
   - the scenario count below its floor (the most scenarios a gate run of
     the mission has counted since it was configured or last resumed);
   - the source's `main` not where the last landing left it.
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
+  No rule counts host faults, however many in a row: a halt needs a human,
+  and a host fault is the host's, so it is judged again after its backoff
+  and escalated at two in a row instead.
 - **A shared source has one baseline.** A landing moves the baseline of
   every mission on that source whose baseline was its `from` and that is not
   halted (the record names them), so RSI and fleet work on the same
