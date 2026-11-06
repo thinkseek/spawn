@@ -70,7 +70,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
 use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, ModelProfile};
@@ -95,9 +95,15 @@ const DELIVERY_MARKS: &str = ".spawn/deliveries";
 /// gets as many ([`crate::dispatch`]'s stop pursuit).
 pub(crate) const DELIVERY_RETRIES: usize = 3;
 
-/// Wait before the first retry; it doubles with every retry, up to
-/// [`RETRY_MAX_MS`].
+/// Wait before the first counted retry of a delivery (the default of
+/// `SPAWN_DELIVERY_RETRY_SECS`, [`Waits::retry_ms`]), and of a failed Stop
+/// or cancel notice; it doubles with every retry, up to [`RETRY_MAX_MS`].
 const RETRY_MS: i64 = 60_000;
+
+/// Wait after the last attempt of a spent first delivery before its
+/// re-issue (the default of `SPAWN_REISSUE_AFTER_SECS`,
+/// [`Waits::reissue_after_ms`]).
+const REISSUE_AFTER_MS: i64 = 5 * 60_000;
 
 /// Wait before a delivery refused because the pane was not ready
 /// ([`PANE_NOT_READY`]) is tried again: nothing was typed, and the pane is
@@ -115,12 +121,107 @@ const RETRY_MAX_MS: i64 = 30 * 60_000;
 /// The wait after the `failures`-th failed attempt before the next:
 /// [`RETRY_MS`], doubling with each failure, at most [`RETRY_MAX_MS`].
 pub(crate) fn retry_wait_ms(failures: usize) -> i64 {
+    backoff(RETRY_MS, failures)
+}
+
+/// `base_ms` after the first failure, doubling with each one after it, at
+/// most [`RETRY_MAX_MS`].
+fn backoff(base_ms: i64, failures: usize) -> i64 {
     let doublings = u32::try_from(failures.saturating_sub(1))
         .unwrap_or(u32::MAX)
         .min(20);
-    RETRY_MS
+    base_ms
         .saturating_mul(1_i64 << doublings)
         .min(RETRY_MAX_MS)
+}
+
+/// The dispatcher's two delivery waits, settings `spawn loop` reads from
+/// its environment ([`Waits::from_env`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Waits {
+    /// Before the first counted retry of a failed delivery
+    /// (`SPAWN_DELIVERY_RETRY_SECS`, default 60): it doubles with every
+    /// failure, up to [`RETRY_MAX_MS`].
+    pub(crate) retry_ms: i64,
+    /// After the last attempt of a spent first delivery, before its
+    /// re-issue (`SPAWN_REISSUE_AFTER_SECS`, default 300).
+    pub(crate) reissue_after_ms: i64,
+}
+
+impl Default for Waits {
+    fn default() -> Self {
+        Self {
+            retry_ms: RETRY_MS,
+            reissue_after_ms: REISSUE_AFTER_MS,
+        }
+    }
+}
+
+impl Waits {
+    /// The waits `spawn loop` reads from its environment, with a warning
+    /// for every value that is not a whole number of seconds (its default
+    /// holds).
+    pub(crate) fn from_env() -> (Self, Vec<String>) {
+        Self::read(crate::config::env_value)
+    }
+
+    fn read(lookup: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut millis = |name: &str, fallback_ms: i64| match lookup(name) {
+            None => fallback_ms,
+            Some(text) => match text.trim().parse::<u64>() {
+                Ok(secs) => i64::try_from(secs)
+                    .unwrap_or(i64::MAX)
+                    .min(i64::MAX / 1000)
+                    .saturating_mul(1000),
+                Err(_) => {
+                    warnings.push(format!(
+                        "{name}={text:?} is not a whole number of seconds; using {}",
+                        fallback_ms / 1000
+                    ));
+                    fallback_ms
+                }
+            },
+        };
+        let waits = Self {
+            retry_ms: millis("SPAWN_DELIVERY_RETRY_SECS", RETRY_MS),
+            reissue_after_ms: millis("SPAWN_REISSUE_AFTER_SECS", REISSUE_AFTER_MS),
+        };
+        (waits, warnings)
+    }
+
+    /// The wait after a delivery's `failures`-th counted failure before
+    /// its next retry.
+    fn retry_wait_ms(&self, failures: usize) -> i64 {
+        backoff(self.retry_ms, failures)
+    }
+}
+
+/// The latest `source.moved` record (a deploy): its event's id, which keys
+/// the extra attempts it gives spent deliveries, and its time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) struct Moved {
+    pub(crate) id: i64,
+    pub(crate) at_ms: i64,
+}
+
+/// One attempt at a delivery, as a re-issue's `task.cancelled` record keeps
+/// it: its command, key and error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Attempt {
+    #[serde(default)]
+    pub(crate) command: Option<i64>,
+    pub(crate) key: String,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
+/// A task to re-issue ([`reissues`]): cancelled and assigned again in one
+/// transaction, its delivery's attempts named in the cancellation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reissue {
+    pub(crate) task: i64,
+    pub(crate) attempts: Vec<Attempt>,
 }
 
 /// One task row from `delivery_rows`.
@@ -149,6 +250,13 @@ pub(crate) struct TaskRow {
     /// The models the task's worker runs on.
     #[serde(default)]
     pub(crate) model: ModelProfile,
+    /// The task this one re-issues (its `task.assigned` names it).
+    #[serde(default)]
+    pub(crate) reissue_of: Option<i64>,
+    /// The attempts of the delivery it re-issues, as that task's
+    /// `task.cancelled` record keeps them.
+    #[serde(default)]
+    pub(crate) reissued_attempts: Option<Vec<Attempt>>,
 }
 
 impl TaskRow {
@@ -162,6 +270,12 @@ impl TaskRow {
     fn is_finished(&self) -> bool {
         matches!(self.state, TaskState::Cancelled | TaskState::Landed)
             || (self.state == TaskState::Accepted && !self.gated)
+    }
+
+    /// A spent delivery of this task is re-issued, not escalated: its first
+    /// delivery (assigned, never sent back), and it is no re-issue itself.
+    fn reissuable(&self) -> bool {
+        self.state == TaskState::Assigned && self.revisions == 0 && self.reissue_of.is_none()
     }
 
     /// Idempotency key of this task's current delivery.
@@ -344,6 +458,10 @@ pub(crate) struct Work {
     pub(crate) retired: Vec<(String, String)>,
     /// Residents whose latest delivered task is cancelled.
     pub(crate) cancelled: Vec<Cancelled>,
+    /// The latest `source.moved` record, if any.
+    pub(crate) moved: Option<Moved>,
+    /// The delivery waits (the defaults, unless the loop set its settings).
+    pub(crate) waits: Waits,
 }
 
 impl Work {
@@ -358,6 +476,9 @@ impl Work {
             retired: store.retired_residents().map_err(error)?,
             cancelled: serde_json::from_value(store.cancelled_deliveries().map_err(error)?)
                 .map_err(|error| format!("cancelled deliveries: {error}"))?,
+            moved: serde_json::from_value(store.latest_source_moved().map_err(error)?)
+                .map_err(|error| format!("latest source.moved: {error}"))?,
+            waits: Waits::default(),
         })
     }
 
