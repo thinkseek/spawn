@@ -282,16 +282,36 @@ pub(crate) enum Why {
     DeliveryFailed,
     /// A Stop of a live execution kept failing.
     StopFailed,
-    /// Free disk on this host crossed the warning threshold (crate::disk).
+    /// Free disk on this host fell under the warning threshold, and is not
+    /// back yet (crate::disk).
     Disk,
-    /// A mission's gate has had no room in TMPDIR for hours
-    /// ([`crate::disk::gate_room_escalations`]).
+    /// Free disk on this host is back above the warning threshold
+    /// (crate::disk): news, see [`Why::is_news`].
+    DiskRecovered,
+    /// A mission's gate has had no room in TMPDIR for hours, and its run of
+    /// `no_room` goes on ([`crate::disk::gate_room_escalations`]).
     GateRoom,
     /// A mission's gate failed twice in a row because the host did (the
     /// test database), not the work ([`digest::host_fault_escalations`]).
     GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
+}
+
+impl Why {
+    /// Whether an item of this kind is news rather than a condition: told
+    /// once, it leaves nothing to resolve. A disk recovery, an approval, a
+    /// human's message and a pair of host faults at the gate (the
+    /// integrator judges again on its own) are news. Every other item is a
+    /// condition that holds while its facts do (a worker's state, a stall,
+    /// a path still low on disk, a gate still without room): told, it stays
+    /// in [`Plan::told`] until its facts change.
+    pub(crate) fn is_news(self) -> bool {
+        matches!(
+            self,
+            Self::DiskRecovered | Self::Approved | Self::Human | Self::GateHostFault
+        )
+    }
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -364,9 +384,10 @@ pub(crate) struct Plan {
     pub(crate) orders: Vec<Order>,
     /// Escalations not delivered yet, whether or not a digest goes out now.
     pub(crate) pending: Vec<Escalation>,
-    /// Escalations that still hold but were already delivered to the
-    /// supervisor (their tag is in its told set): left out of `pending`, so
-    /// never sent again. The attention view shows them as unresolved.
+    /// Escalations already delivered to the supervisor (their tag is in its
+    /// told set) whose condition still holds: left out of `pending`, so
+    /// never sent again. News ([`Why::is_news`]) is not among them: told,
+    /// it is resolved. The attention view shows these as unresolved.
     pub(crate) told: Vec<Escalation>,
 }
 
@@ -429,6 +450,9 @@ pub(crate) fn decide_with(
     (plan.told, plan.pending) = std::mem::take(&mut plan.pending)
         .into_iter()
         .partition(|item| told.contains(&item.tag()));
+    // Every item here holds now (each source gives only what its facts
+    // still say); told news was resolved by the telling.
+    plan.told.retain(|item| !item.why.is_news());
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
             .extend(digest::order(supervisor, &plan.pending, spawn));
