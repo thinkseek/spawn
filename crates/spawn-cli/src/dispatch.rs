@@ -924,17 +924,17 @@ mod tests {
         ];
         let host = super::digest::host_fault_escalations(&records);
         let tags: Vec<String> = host.iter().map(Escalation::tag).collect();
-        assert_eq!(
-            tags,
-            ["host gate-host-fault-41", "host gate-host-fault-52"]
-        );
+        assert_eq!(tags, ["host gate-host-fault-41", "host gate-host-fault-52"]);
         assert!(host.iter().all(|item| item.why == Why::GateHostFault));
         assert!(
-            host[0].line.starts_with("task #9 of mission 3: 2 gate failures in a row were the \
+            host[0].line.starts_with(
+                "task #9 of mission 3: 2 gate failures in a row were the \
                                       host's, not the work's: the test database's log shows a \
-                                      crash during the gate: ")
-                && host[0].line.contains(crash)
-                && host[0].line.contains("terminating any other active server processes")
+                                      crash during the gate: "
+            ) && host[0].line.contains(crash)
+                && host[0]
+                    .line
+                    .contains("terminating any other active server processes")
                 && host[0].line.contains("judged again at 2026-11-06T")
                 && host[0].line.contains("nothing halts"),
             "{}",
@@ -972,7 +972,14 @@ mod tests {
         );
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, &plan.orders[0]);
-        let plan = decide_with(&[supervisor], &Work::default(), &host[..1], true, NOW, "spawn");
+        let plan = decide_with(
+            &[supervisor],
+            &Work::default(),
+            &host[..1],
+            true,
+            NOW,
+            "spawn",
+        );
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"

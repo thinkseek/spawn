@@ -3983,7 +3983,10 @@ mod host_fault_tests {
     }
 
     fn tests_of(failures: &[Failure]) -> Vec<&str> {
-        failures.iter().map(|failure| failure.test.as_str()).collect()
+        failures
+            .iter()
+            .map(|failure| failure.test.as_str())
+            .collect()
     }
 
     /// The owner's form: the FAILED lines are the failures, all of them,
@@ -4063,7 +4066,10 @@ mod host_fault_tests {
     #[test]
     fn the_excerpt_names_the_failures_of_several_binaries() {
         let mut lines = Vec::new();
-        lines.extend(panic_lines("sources::tests::lists_every_source", &[REFUSED]));
+        lines.extend(panic_lines(
+            "sources::tests::lists_every_source",
+            &[REFUSED],
+        ));
         lines.push(
             "test result: FAILED. 41 passed; 1 failed; 0 ignored; 0 measured; finished in 3.02s"
                 .to_string(),
@@ -4079,7 +4085,10 @@ mod host_fault_tests {
             CRASHED.to_string(),
             NOTE.to_string(),
         ]);
-        lines.extend(panic_lines("objective_tasks_keep_their_history", &[RECOVERING]));
+        lines.extend(panic_lines(
+            "objective_tasks_keep_their_history",
+            &[RECOVERING],
+        ));
         lines.push("test result: FAILED. 20 passed; 2 failed; 0 ignored".to_string());
         lines.push("error: 2 targets failed:".to_string());
         let failures = host::check_tests_failures(&output_of(&lines));
@@ -4219,16 +4228,18 @@ mod host_fault_tests {
         for pattern in host::CONNECTION_ERRORS {
             for message in [
                 format!("connect to the test database: {pattern} (os error 111)"),
-                format!("called `Result::unwrap()`: {}", pattern.to_ascii_uppercase()),
+                format!(
+                    "called `Result::unwrap()`: {}",
+                    pattern.to_ascii_uppercase()
+                ),
             ] {
                 assert_eq!(host::classify(&message), Class::Connection, "{message}");
                 let line = format!("FAILED api::tests::one: {message}");
-                let fault = host::host_fault(
-                    host::CHECK_TESTS_REGRESSION,
-                    &gate_output(&[&line]),
-                    || panic!("connection errors need no log"),
-                )
-                .unwrap_or_else(|| panic!("{pattern}: not a host fault"));
+                let fault =
+                    host::host_fault(host::CHECK_TESTS_REGRESSION, &gate_output(&[&line]), || {
+                        panic!("connection errors need no log")
+                    })
+                    .unwrap_or_else(|| panic!("{pattern}: not a host fault"));
                 assert_eq!(fault.evidence(), "failures");
                 assert!(fault.crash.is_empty());
                 assert_eq!(fault.failures_value()[0]["class"], "connection");
@@ -4248,9 +4259,11 @@ mod host_fault_tests {
         let asked = Cell::new(false);
         let crash = || {
             asked.set(true);
-            vec!["2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 9) was terminated \
+            vec![
+                "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 9) was terminated \
                   by signal 11"
-                .to_string()]
+                    .to_string(),
+            ]
         };
         let mut owners = vec![
             format!("FAILED api::tests::claims_in_order: {REFUSED}"),
@@ -4262,7 +4275,10 @@ mod host_fault_tests {
         let reason = host::CHECK_TESTS_REGRESSION;
         assert_eq!(host::host_fault(reason, &output_of(&owners), crash), None);
         let mut today = panic_lines("api::tests::claims_in_order", &[REFUSED]);
-        today.extend(panic_lines("merges::tests::a_conflict", &[ASSERTION, "  left: 1"]));
+        today.extend(panic_lines(
+            "merges::tests::a_conflict",
+            &[ASSERTION, "  left: 1"],
+        ));
         assert_eq!(host::host_fault(reason, &output_of(&today), crash), None);
         assert!(!asked.get(), "a real failure needs no log");
 
@@ -4272,7 +4288,11 @@ mod host_fault_tests {
         // Another reason is judged as today, whatever the output holds.
         let refused = gate_output(&[&format!("FAILED api::tests::one: {REFUSED}")]);
         assert_eq!(
-            host::host_fault("regression: check-e2e.sh fails on the candidate", &refused, crash),
+            host::host_fault(
+                "regression: check-e2e.sh fails on the candidate",
+                &refused,
+                crash
+            ),
             None
         );
         assert_eq!(
@@ -4310,11 +4330,7 @@ mod host_fault_tests {
     #[test]
     fn database_errors_are_the_hosts_only_with_a_crash_in_the_window() {
         let log = server_log();
-        let crash = host::crash_lines(
-            &log,
-            at("2026-11-06T01:46:40Z"),
-            at("2026-11-06T01:47:10Z"),
-        );
+        let crash = host::crash_lines(&log, at("2026-11-06T01:46:40Z"), at("2026-11-06T01:47:10Z"));
         assert_eq!(crash.len(), 3, "{crash:?}");
         assert!(crash[0].contains("(PID 4242) was terminated by signal 11"));
         assert!(crash[2].contains("all server processes terminated; reinitializing"));
@@ -4327,25 +4343,29 @@ mod host_fault_tests {
         let fault = host::host_fault(reason, &output, || crash.clone()).expect("a host fault");
         assert_eq!(fault.evidence(), "server_log");
         assert_eq!(fault.crash, crash);
-        let classes: Vec<serde_json::Value> = fault.failures_value()
+        let classes: Vec<serde_json::Value> = fault
+            .failures_value()
             .as_array()
             .expect("failures")
             .iter()
             .map(|failure| failure["class"].clone())
             .collect();
-        assert_eq!(classes, [json!("database"), json!("database"), json!("connection")]);
+        assert_eq!(
+            classes,
+            [json!("database"), json!("database"), json!("connection")]
+        );
 
         // The gate ran an hour after the old crash, and before the new one.
-        let before = host::crash_lines(
-            &log,
-            at("2026-11-06T01:30:00Z"),
-            at("2026-11-06T01:46:57Z"),
-        );
+        let before =
+            host::crash_lines(&log, at("2026-11-06T01:30:00Z"), at("2026-11-06T01:46:57Z"));
         assert!(before.is_empty(), "{before:?}");
         assert_eq!(host::host_fault(reason, &output, || before.clone()), None);
         // Today's form, the same.
         let mut today = panic_lines("merges::tests::a_conflict_is_recorded", &[LOST_OID]);
-        today.extend(panic_lines("sources::tests::lists_every_source", &[LOST_CACHE]));
+        today.extend(panic_lines(
+            "sources::tests::lists_every_source",
+            &[LOST_CACHE],
+        ));
         assert_eq!(host::host_fault(reason, &output_of(&today), Vec::new), None);
         assert!(host::host_fault(reason, &output_of(&today), || crash.clone()).is_some());
 
@@ -4491,9 +4511,11 @@ mod host_fault_tests {
         );
 
         // By the log: the crash lines named, the first in the reason.
-        let crash = vec!["2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \
+        let crash = vec![
+            "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \
                           terminated by signal 11: Segmentation fault"
-            .to_string()];
+                .to_string(),
+        ];
         let fault = host::host_fault(
             host::CHECK_TESTS_REGRESSION,
             &gate_output(&[&format!("FAILED merges::tests::a: {LOST_OID}\nwith more")]),
@@ -4506,11 +4528,15 @@ mod host_fault_tests {
         assert_eq!(fields["escalate"], true);
         assert_eq!(fields["backoff_ms"], 10_000);
         assert!(
-            fields["reason"].as_str().is_some_and(|reason| reason.starts_with(
-                "host fault: the test database's log shows a crash during the gate (2026-11-06 \
+            fields["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with(
+                    "host fault: the test database's log shows a crash during the gate (2026-11-06 \
                  01:46:58.017 UTC [1] LOG:  server process (PID 4242) was terminated by signal \
                  11"
-            ) && reason.ends_with("is a database error; not a verdict on the work, judged again in 10 s")),
+                ) && reason.ends_with(
+                    "is a database error; not a verdict on the work, judged again in 10 s"
+                )),
             "{fields}"
         );
         // A long message is bounded, its first line only.
@@ -5697,8 +5723,14 @@ mod database_tests {
         );
         db.record(&rejected(1));
         let after = gated(&db, mission);
-        assert_eq!(after.gate_rejections, 2, "the run went on from where it was");
-        assert_eq!(after.gate_host_faults, 0, "a real verdict ends the host faults");
+        assert_eq!(
+            after.gate_rejections, 2,
+            "the run went on from where it was"
+        );
+        assert_eq!(
+            after.gate_host_faults, 0,
+            "a real verdict ends the host faults"
+        );
         assert_eq!(super::halt_reason(&after, 0), None);
 
         // The abort run, the same.
@@ -5789,9 +5821,7 @@ mod database_tests {
             .to_string();
         push_work(&base, &source, &agent, "work.txt");
         let count = || {
-            std::fs::read_to_string(&runs)
-                .map(|text| text.trim().parse::<u32>().unwrap_or(0))
-                .unwrap_or(0)
+            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
         };
         let pass = || {
             integrator.pass_on(&db.store).expect("a pass");
@@ -5826,7 +5856,11 @@ mod database_tests {
         );
         let after = gated(&db, mission);
         assert_eq!(
-            (after.gate_host_faults, after.gate_host_task, after.gate_host_due_ms),
+            (
+                after.gate_host_faults,
+                after.gate_host_task,
+                after.gate_host_due_ms
+            ),
             (1, Some(task), Some(at + 2000))
         );
         assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
@@ -5849,7 +5883,11 @@ mod database_tests {
         assert_eq!(record["evidence"], "server_log");
         assert_eq!(record["failures"][0]["class"], "database");
         let crash = record["crash"].as_array().expect("the crash lines");
-        assert_eq!(crash.len(), 1, "the old crash is outside the window: {record}");
+        assert_eq!(
+            crash.len(),
+            1,
+            "the old crash is outside the window: {record}"
+        );
         assert!(
             crash[0]
                 .as_str()
@@ -5860,10 +5898,17 @@ mod database_tests {
         assert_eq!(record["backoff_ms"], 4000);
         assert_eq!(record["due_ms"], at + 4000);
         let escalations = db.store.gate_host_fault_escalations().expect("escalations");
-        assert_eq!(escalations.as_array().map(Vec::len), Some(1), "{escalations}");
+        assert_eq!(
+            escalations.as_array().map(Vec::len),
+            Some(1),
+            "{escalations}"
+        );
         assert_eq!(escalations[0]["event_id"], event);
         assert_eq!(escalations[0]["mission"], mission);
-        assert!(escalations[0].get("log").is_none(), "the gate's log stays out");
+        assert!(
+            escalations[0].get("log").is_none(),
+            "the gate's log stays out"
+        );
         assert_eq!(gated(&db, mission).gate_host_faults, 2);
 
         pass();
@@ -5881,7 +5926,11 @@ mod database_tests {
             .find(|found| found.id == mission)
             .expect("the mission");
         assert_eq!(
-            (after.gate_host_faults, after.gate_host_task, after.gate_host_due_ms),
+            (
+                after.gate_host_faults,
+                after.gate_host_task,
+                after.gate_host_due_ms
+            ),
             (0, None, None),
             "the landing ends the run"
         );
