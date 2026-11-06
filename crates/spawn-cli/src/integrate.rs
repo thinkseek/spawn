@@ -2431,7 +2431,8 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
                 .is_ok());
         if under_main {
             println!(
-                "integrate: task {}: {candidate} is already under {branch} ({now}), from before                  hold {hold}",
+                "integrate: task {}: {candidate} is already under {branch} ({now}), from before \
+                 hold {hold}",
                 task.id
             );
             record(
@@ -2446,7 +2447,8 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
             .is_some()
         {
             println!(
-                "integrate: task {} waits behind the owner's hold {hold} on {source}: nothing                  lands there until a record ends it",
+                "integrate: task {} waits behind the owner's hold {hold} on {source}: nothing \
+                 lands there until a record ends it",
                 task.id
             );
         }
@@ -2548,7 +2550,8 @@ fn expire_holds(store: &PostgresStore) -> Result<(), String> {
     for hold in expired(&holds) {
         match store.hold_expired(&hold.source, hold.hold) {
             Ok(event) => println!(
-                "integrate: the owner's hold {} on {} reached its bound: expired (record {event});                  landings there resume",
+                "integrate: the owner's hold {} on {} reached its bound: expired (record {event}); \
+                 landings there resume",
                 hold.hold, hold.source
             ),
             Err(error) => eprintln!(
