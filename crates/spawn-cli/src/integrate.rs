@@ -884,17 +884,13 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         crate::config::env_value(PER_GATE_SERVER).as_deref(),
     )
     .map_err(|error| format!("{error}\n{USAGE}"))?;
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
-    let integrator = Integrator::new(root, gate, gate_env, gates);
-    if integrator.judge.host.server_log.is_none() {
-        no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
-    }
-=======
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
     let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
     let integrator = Integrator::new(root, gate, gate_env, host_room, gates);
->>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
+    if integrator.judge.host.server_log.is_none() {
+        no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
+    }
     loop {
         let pass = integrator.pass();
         if once {
@@ -938,9 +934,10 @@ struct Judge {
     gate: PathBuf,
     /// The gate's whole environment ([`gate::gate_env`]).
     gate_env: Vec<(String, String)>,
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
     /// How a rejection is told from a host fault.
     host: HostSettings,
+    /// The host's room, checked before each gate starts ([`gate::Room`]).
+    room: gate::Room,
 }
 
 /// The settings of host faults: the test database's log
@@ -976,10 +973,6 @@ fn no_server_log(why: &str) {
              as the host's only when every failure is a connection error"
         );
     }
-=======
-    /// The host's room, checked before each gate starts ([`gate::Room`]).
-    room: gate::Room,
->>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
 }
 
 /// A task a mission may judge now, waiting for a gate.
@@ -1038,11 +1031,8 @@ impl Integrator {
                 root,
                 gate,
                 gate_env,
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
                 host: HostSettings::from_env(),
-=======
                 room: host_room,
->>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
             },
             gates,
             running: RefCell::new(Vec::new()),
