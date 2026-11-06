@@ -225,6 +225,50 @@ it, on the same ladder.
   that failed is reported as failed) is news until it was told, however
   long that takes.
 
+  **Deliveries that never reached their worker.** A delivery whose retries
+  are spent on a host fault typed nothing (every attempt was refused before
+  typing), so assigning the task again is safe and needs no judgement; a
+  deploy is when such a fault may have gone. So (`deliver.rs`):
+  - *Re-issued.* A task's first delivery (the task `assigned`, revision 0)
+    whose retries are spent and none of whose attempts may have typed
+    (`MAY_HAVE_TYPED`) is re-issued `SPAWN_REISSUE_AFTER_SECS` (300) after
+    its last attempt finished, on the database's clock: in one transaction
+    (`spawn_task_reissue`, owner only) the task is cancelled, its
+    `task.cancelled` naming `by` `spawn-dispatch`, `reissued_as` the new
+    task and `attempts` (every attempt, in order: `command`, `key`,
+    `error`), and a new task is assigned, its `task.assigned` naming
+    `reissue_of` and copying the old task's mission, kind, worker (a
+    resident's; an ephemeral task gets a new worker with the same label),
+    brief, model, objective, scenario and `created_by`. The new task is
+    delivered by the usual rules (it queues behind tasks of its session
+    assigned before it). The old one was never delivered, so its worker is
+    not stopped, set aside or told; an objective keeps a task in flight
+    throughout, so the integrator never assigns it twice. Such a delivery
+    is neither escalated nor a stall.
+  - *Escalated only when the re-issue is spent too.* A re-issue is never
+    re-issued again: its spent delivery is escalated as `delivery failed`
+    (tag `<session> deliver-<task>-<revision>`), the line naming the task,
+    the task it re-issued (`task #<new> (a re-issue of task #<old>) never
+    reached its worker ...`) and the attempts of both. A delivery that may
+    have typed, and a revision's delivery, are escalated as before and never
+    re-issued.
+  - *Tried once more after a deploy.* `spawn mission moved` records
+    `source.moved` for every deploy, also when it moves no mission's
+    baseline. After the latest such record, every task whose current
+    delivery is spent (re-issued or not, escalated or not, never one that
+    may have typed) and was spent before the record gets exactly one more
+    attempt, keyed `deliver-<task>-<revision>-moved-<that record's event
+    id>`, at once (the delivery rules still say when the worker can take
+    it). A success delivers the task (and a re-issue still due for it is
+    not made); a failure leaves it as it was: no new escalation, no attempt
+    again until the next `source.moved`. A re-issue due goes before the
+    deploy's attempt, which its new task does not need.
+  Each rests on recorded facts, never on time or absence alone (design.md
+  §14): the re-issue on the recorded attempts and their outcomes, the extra
+  attempt on a recorded `source.moved`; and each is itself recorded (the
+  cancellation and the assignment name each other, the attempt is a command
+  under its own key).
+
   **Stalls: no task waits silently.** A stall is the absence of an event,
   so the dispatcher also measures, for every open task, the step it waits
   on and since which record, from the log alone (`dispatch/stall.rs`, the
@@ -248,9 +292,10 @@ it, on the same ladder.
   (`stall-mission-<mission>-halted-<record>`), with the reason and the open
   tasks. A failed command (a delivery attempt, a model switch's or a
   retirement's Stop, a resume) is the evidence of the step it blocks, not a
-  step of its own. A delivery whose retries are spent was escalated as
-  `delivery failed`, which is its stall's escalation; one that may have
-  typed the task is not retried, and its stall is escalated at its bound.
+  step of its own. A delivery whose retries are spent is re-issued or was
+  escalated as `delivery failed`, which is its stall's escalation; one that
+  may have typed the task is not retried, and its stall is escalated at its
+  bound.
   A worker at its prompt whose screen says background shells still run
   (Claude Code's `· done … N shells still running`, read from the line the
   engine draws right above its prompt) is treated as active: its `activity`
@@ -284,12 +329,61 @@ it, on the same ladder.
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
   state as JSON), `spawn tail <session>` (screen and recent events) and
-  `spawn submit`. The dispatcher wakes it by typing a digest into its pane
-  while it is idle; digests coalesce while it works. Its memory is its native
-  session (restored by resume) plus the log.
-- **Human**: the attention queue in the UI lists only what the supervisor
-  escalated or could not resolve. Each human action is a command with
-  principal `human`; it is the event the whole system tries to make rarer.
+  `spawn submit`. It never waits on a human (its charter,
+  `supervise::charter`; the owner, 2026-11-06: "no human but can input").
+  Whatever its grants allow it decides and does in the same turn (reviews,
+  accept or send back, assigning, routing and cancelling tasks, nudging a
+  stalled worker, a `continue` after a transient model API error, stopping a
+  worker, proposing or retiring a resident), reporting each as a line
+  "Decided (the owner may reverse): ...". What they do not allow (deploys,
+  owner-protected files, money, deleting data, a `discard` included,
+  changing grants or credentials: approving a resident, setting a
+  mission's gate, resuming a halted mission) is one line "For the owner: ..." that it does
+  not wait on; it moves on to other work. It never ends a turn on a question
+  or a list of decisions for the owner. The dispatcher wakes it by typing a
+  digest into its pane while it is idle; digests coalesce while it works.
+  Idle is its turn stopped at its prompt, whatever Jev judged: a turn that
+  ended on a question for the human (one of the old charter) is judged
+  BLOCKED, and digests still reach it. A digest has one line per
+  session and reason: repeated items of one kind about one worker (a human's
+  notes that could not be delivered, retried) are counted on one line, the
+  latest quoted, so they cannot fill the digest. Its memory is its native
+  session (restored by resume) plus the log. The charter is given when a
+  native session starts (the first, or a handoff); a resume keeps the
+  session it had, and the charter it was given then.
+- **Human**: the attention queue in the UI ("Needs a human", top of the
+  Fleet page) is computed by the dispatcher's own code, not by the UI:
+  `GET /api/attention` runs the plan of the dispatcher's pass for this moment
+  (`dispatch::read_plan`, the function the pass itself calls: the same facts,
+  mission rows, disk and gate-room records and stalls, then `decide_with`)
+  and submits, marks and collects nothing. The queue shows, top to bottom:
+  the supervisor's open question, when its turn ended at its prompt judged
+  BLOCKED or WAITING with `needs_human` at least 0.5 (or with a `HUMAN:` line),
+  in its own words from its transcript, with when it was asked and its last
+  `HUMAN:` line not answered since; then the escalations not yet told to the
+  supervisor; then those its digests told it whose condition still holds
+  (a worker's state, a stall, a path still low on disk, a gate still without
+  room), with when they were told. News (a disk recovery, an approval, a
+  human's message, host faults at the gate) is resolved by being told, in
+  the plan itself (`Why::is_news`), so the digest and the queue agree. A
+  managed worker between tasks is not in it, since the dispatcher does not
+  escalate it. Each item carries its digest heading, its line, its agent and
+  its age. This queue is the UI's only definition of "needs a human": the
+  sidebar's count is its count, and an agent is marked when it has an item
+  in it (pending or told and unresolved) or is the supervisor asking a
+  question (`web/src/attention.ts`, `needsHuman`). A judge's `attention`
+  flag is its opinion, shown with the judgement in the agent detail.
+  A "For the owner:" line is no question: a latest reply that has one
+  asks nothing, whatever Jev judged, unless a `HUMAN:` question of an
+  old-style turn is still open. Those lines are listed apart, below the
+  queue ("For the owner", `supervisor.for_owner`: newest first, each once,
+  at most 10, from the end of its transcript): items to read, counted in no
+  queue; an owner's message clears none of them, since nothing waits on
+  them. The owner can type to the supervisor at any time (its pane, or
+  `spawn submit`); it reads that as an instruction, which may reverse one
+  of its decisions, not as the answer to a question. Each human action is a
+  command with principal `human`; it is the event the whole system tries to
+  make rarer.
 - **Inputs to a busy session wait for its turn.** A person's or the
   supervisor's input (`spawn submit`, any principal but `spawn-dispatch`,
   `spawn-integrate` and `spawn-liveness`) that reaches a pane not ready is
@@ -345,8 +439,8 @@ input of a mission.
 | Layer | Who | Does | Never does |
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
-| Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
-| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, then escalated; a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself, but for a nudge or a `continue` after a transient model API error |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait (`SPAWN_DELIVERY_RETRY_SECS`, 60 s first), 3 times; then a first delivery is re-issued (cancelled and assigned again, once) and any other is escalated, and after each deploy every spent delivery is tried once more (§3, "Deliveries that never reached their worker"); a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once and never re-issued; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
 **Two kinds of worker.**
@@ -505,15 +599,23 @@ decisions per agent-hour over the last 24 h) are computed from the log by
 
 | View | Answers |
 | --- | --- |
-| Attention queue (top of the board) | What reached a human, since when, the question on the screen, which tiers already tried |
-| Fleet board | One card per agent: role, engine, state and for how long, decided by rules / Jev / supervisor, task, current tool |
-| Agent detail | Live terminal; the Jev panel (distribution, needs_human, stuck, evidence, rules-vs-Jev); state timeline; event timeline |
-| Ladder health | Decisions per tier, escalations, human decisions per agent-hour, Jev failures and disagreements with the rules, engine restarts |
-| Missions | Missions with their landing settings; tasks with brief, report and review note; residents waiting for a human's approval |
+| Attention queue (top of the board) | The supervisor's open question in full; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved, each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code); below it, the supervisor's "For the owner:" lines with their age, to read, not counted |
+| Always-on agents (below the queue) | The supervisor, then the residents, pinned live or not: liveness, state and for how long, last activity, uptime, the task each holds |
+| Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor; memory available now against a 4 GiB warning line, of the total; each gated mission's waits for gate room: the run's task, how many `no_room` outcomes since when, whether it was escalated; a value the server could not read shows as unread, never guessed), judgements, the decision ladder and human decisions per agent-hour |
+| Fleet board | The rest of the fleet in groups: on a task (needs a human first, by the attention queue, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
+| Agent detail | Live terminal; the Jev panel (distribution, needs_human, stuck, the judge's attention flag and its reason, evidence, rules-vs-Jev); state timeline; event timeline |
+| Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
-The API is read-only. Humans talk to the supervisor through
-`spawn submit --session session_supervisor --action '{"type":"input",...}'`.
+The API is read-only: `/api/overview`, `/api/fleet` (with
+`/api/fleet/<session>/judgements` and `/commands`), `/api/attention`,
+`/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
+`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
+`/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
+Humans talk to the supervisor
+through its pane, or `spawn submit --session session_supervisor --action
+'{"type":"input",...}'`.
 
 ## 6. Invariants
 
@@ -530,6 +632,7 @@ Known edges, each with its rule:
 | --- | --- |
 | The UI's live terminal reads tmux | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
 | The supervisor's native transcript lives on the host (`~/.claude`, copied to the host's transcript archive) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
+| The attention queue reads the supervisor's question and its "For the owner:" lines from its transcript | A compute peek at the transcript the log names (`session.native_started`), read by the Observer's own reply reader; where it cannot be read, the screen tail stored with the judgement stands in for the question, labelled as such, and no line for the owner is listed |
 | Code lives in git | Artifact storage; every commit is referenced from an event |
 
 - The event log is the only state; every process is restartable.
@@ -642,7 +745,13 @@ controller. Missions, tasks, residents and landings are events in
   `resident.approved`, `resident.retired`, `legacy.imported`, `host.disk`.
   `legacy.imported` carries one row of the mission tables as it stood
   before the control stream existed: a database with mission rows and no
-  records imports them once, on migration.
+  records imports them once, on migration. A `task.cancelled` names `by`,
+  who cancelled: `human` (the owner's login, `spawn task cancel` and a
+  person's close or retirement), `spawn_supervisor`, or the loop that did
+  (`spawn-integrate`, `spawn-dispatch`, `spawn-migrate` for a migration's
+  own records); a record from before it names none and counts as a
+  person's. The fold does not read it; the scorecard does
+  ([design.md](design.md) §15).
 - **Who writes it:** only the checked mission functions, through
   `spawn_control_record`. The integrator's records (`task.gated`,
   `task.landed`, `task.aborted`, `mission.halted`), `source.moved` and the
@@ -716,7 +825,10 @@ the tree's own:
   directory for the gate (it measures that directory's parent). Any other
   status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
-  a timeout or a signal.
+  a timeout or a signal. The integrator measures the same floor, free
+  memory and the test database itself before it starts the gate (§10.3,
+  step 3), so a short host is found before a gate runs; the gate's own
+  check and exit 5 stay, for a `TMPDIR` that fills in between.
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
@@ -756,7 +868,7 @@ record of what was judged (§14 of design.md).
   --revision R`, which the supervisor's digest gives; without it, a human's
   review takes the report as it is now). The checked functions refuse a
   verdict on a revision the task has left, and the fold applies none: a
-  45-minute gate run on revision 0 never lands, or sends back, revision 1.
+  gate run on revision 0 never lands, or sends back, revision 1.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). A mission
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
@@ -793,7 +905,40 @@ record of what was judged (§14 of design.md).
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate on C, with a 45-minute wall clock. When the gate
+  3. measures the host before the gate starts: **the host's room is
+     checked before a gate, not discovered by its crash.** For this
+     judging's task only (one that got a gate slot; a task that waits is
+     neither checked nor recorded), in this order, stopping at the first
+     that falls short:
+     - disk: the free KiB (`df`) of the gate's `TMPDIR` (`/tmp` when unset)
+       against `SPAWN_GATE_MIN_FREE_GB` (default 10, the floor
+       `scripts/disk.sh` reads too: one floor, one meaning);
+     - memory: `MemAvailable` of `/proc/meminfo` in MiB against
+       `SPAWN_GATE_MIN_FREE_MEMORY_MB` (default 2048; the integrator's
+       only, not passed to the gate);
+     - database: when `SPAWN_TEST_DATABASE_URL` is set in the integrator's
+       environment (whatever the owner's-cluster check then decides for the
+       gate), a connection within 10 s, then, in one transaction that
+       changes nothing, `SET LOCAL max_parallel_workers_per_gather = 2`,
+       `parallel_setup_cost = 0`, `parallel_tuple_cost = 0`,
+       `debug_parallel_query = on` (`force_parallel_mode` before
+       PostgreSQL 16) and `SELECT count(*) FROM generate_series(1, 100000)`
+       within 10 s: a Gather with a worker, so the dynamic shared memory the
+       tests need (`/dev/shm` in a container) is exercised. Any error fails
+       it. Not for a mission whose scenarios hold `no-test-database` (§10.4):
+       its gate never gets the URL, so a test server that is down does not
+       hold back its work.
+
+     A threshold of 0 disables its check; one that does not parse is an
+     abort, as a bad `SPAWN_GATE_MIN_FREE_GB` is to the gate. A check that
+     falls short runs no gate: the task is gated `no_room` (step 5) naming
+     the check, its measure and its threshold. On 2026-11-06 a test server
+     with a 64 MB `/dev/shm` failed "could not resize shared memory segment"
+     under the tests' parallel queries and the gate read it, 25 minutes in,
+     as a regression of the candidate; the probe finds it in seconds, before
+     any candidate runs. The decision rests on measures taken at the
+     judging, recorded with their thresholds (design.md §14);
+  4. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
      rejects C and C is a real merge (the pushed head does not contain
      `main`, so C's tree is not the head's), it then judges the head alone
      before recording anything: the same gate, scenarios and task scenario,
@@ -806,11 +951,17 @@ record of what was judged (§14 of design.md).
      commits, never on the text of a reason or on timing. The second run
      happens only for a rejected real merge and doubles that pass's gate
      time;
-  4. records `task.gated` (verdict, log, metric, C as `candidate`) before
-     git moves. A gate
-     that had no room (exit 5 with its fact, §10.2) is gated `no_room`. This
+  5. records `task.gated` (verdict, log, metric, C as `candidate`) before
+     git moves. A check before the gate that fell short (step 3), or a gate
+     that had no room (exit 5 with its fact, §10.2), is gated `no_room`. This
      is no verdict on the work. The task stays where it was, and the record
-     names the reason, `free_kb`, `min_gb` and `tmpdir`. It moves neither
+     names `check` (`disk`, `memory` or `database`; the gate's own floor is
+     `disk`), `measured` and `threshold` (free KiB and the floor in KiB, with
+     `free_kb`, `min_gb` and `tmpdir`; available MiB and the floor in MiB;
+     the error and the probe it failed, with `server` as
+     host:port/database or the socket directory, never the URL's password),
+     `log`, `escalate`, and a reason that names the check, the measure and
+     the threshold, ending "not a verdict, judged again later". It moves neither
      `gate_aborts` nor `gate_rejections`, so a disk that another project
      filled halts no mission. The fold keeps the mission's current run of
      them, which belongs to one task (`gate_room_task`, `gate_room_since_ms`,
@@ -822,16 +973,74 @@ record of what was judged (§14 of design.md).
      again only after a backoff from the latest `no_room`: 5 minutes,
      doubled each time, at most 40. The first `no_room` more than 2 hours
      into a run carries `escalate`. The dispatcher's digest takes that
-     record to the supervisor, with the free space and `TMPDIR` ("no room
-     for the gate on this host"). It stays pending until a delivered digest
+     record to the supervisor, naming the check, its measure and its
+     threshold ("no room for the gate on this host"). It stays pending until a delivered digest
      carries its tag (`host gate-room-<event>`), however long that takes, so
      it is told once.
-  5. moves `main` on the source with a compare-and-swap push
+
+     **A host fault is not a verdict on the work either.** When the gate
+     rejects C with `regression: check-tests.sh fails on the candidate`,
+     the integrator reads the failures check-tests.sh printed, from the
+     gate's recorded output, in the check-tests section (from `| ==
+     regression: check-tests.sh must still pass` to the next `| == ` or `|
+     stage gate ` line). In the owner's form (one `| FAILED <test>: <first
+     message line>` per failing test, then the excerpt), the FAILED lines
+     are the failures and the excerpt is not read; in today's form (the
+     40-line excerpt alone) a failure is a `| thread '<test>' panicked at
+     <location>:` line with its message (up to a `note:`, `---- `, `test
+     result:`, `--` or blank line), or the `| Error: ...` line of a test
+     that returned an error. A failure the excerpt cut off is not seen. A
+     failure is the host's when its message is a connection error to the
+     test database (`error connecting to server`, `Connection refused`,
+     `connection closed`, `server closed the connection unexpectedly`,
+     `terminating connection because of crash of another server process`,
+     `the database system is in recovery mode` / `is starting up` / `is
+     shutting down` / `is not yet accepting connections`, `could not resize
+     shared memory segment`, `SqlState(E57P0`, `SqlState(E080`), or a
+     database error of any kind (`db error`, `Error { kind: Db`) while the
+     test database's log (`SPAWN_TEST_DATABASE_LOG`, optional, lines as
+     PostgreSQL writes them with `log_line_prefix` `%m [%p] `, `UTC` or a
+     numeric offset) holds a crash line (`was terminated by signal`,
+     `terminating any other active server processes`, `all server
+     processes terminated; reinitializing`) stamped within the gate's run as
+     the integrator measured it, one second either side. Unset or
+     unreadable, the log is no evidence (said once). At least one failure
+     read and every one the host's: `host_fault`, not `rejected` (and the
+     head is not judged alone). The task stays where it was (`reported`, or
+     `accepted` under review), its revisions and note do not move, nothing
+     goes back to the worker, and neither `gate_rejections` nor
+     `gate_aborts` grows or resets. The record names `base`, `candidate`,
+     `revision`, `scenarios`, `reason` (`host fault: ...`, saying which
+     evidence), `log`, `evidence` (`failures` when every failure is a
+     connection error, else `server_log`), `failures` (per failure its
+     `test`, its message's first line, bounded, and `class`, `connection`
+     or `database`), `crash` (the log lines, when used), `host_faults`,
+     `backoff_ms`, `due_ms` and `escalate`; the store refuses one without
+     its evidence and writes `due_ms` itself, the record's own
+     `recorded_at_ms` plus `backoff_ms`. The fold keeps the mission's host
+     faults in a row (`gate_host_faults`, with the latest one's task and
+     `due_ms`): + 1 on `host_fault`, unchanged on `no_room` and `stale`, 0
+     on every other verdict, on `task.landed` and on `mission.resumed`.
+     After the k-th in a row the task waits
+     `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` (300 by default) x 2^(k-1), at
+     most an hour: no pass gates it before the recorded `due_ms` (the
+     mission's other tasks wait behind it, as behind a `no_room`), and the
+     next pass after it judges it again. The one that makes the run 2
+     carries `escalate`: the dispatcher's digest takes it to the supervisor
+     once, as `host gate-host-fault-<event>` ("host faults at the gate"),
+     naming the task, the mission, the count, the evidence (the crash lines,
+     or the first failure's test and message) and when the task is judged
+     again. A real failure among them, or none read, keeps it `rejected`;
+     any other rejection reason is judged as before. The decision rests on
+     the failures and the crash lines named in the record, the wait on the
+     recorded `due_ms`, never on the reason's text alone or on time without
+     a record (design.md §14).
+  6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
      record was lost), which is a landing;
-  6. records `task.landed` (`from`, `to` = C).
+  7. records `task.landed` (`from`, `to` = C).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note. A `rejected` decided after a run of the head alone
   names `head`, `head_base` and `head_verdict` (`rejected`), so the record
@@ -878,14 +1087,18 @@ record of what was judged (§14 of design.md).
   task closes").
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row: `rejected` counts; `accepted` resets
-    the count; `incompatible`, `conflict`, `stale`, `aborted` and `no_room`
-    leave it (three `incompatible` in a row halt nothing);
-  - three gate aborts in a row (`no_room` is not an abort);
+    the count; `incompatible`, `conflict`, `stale`, `aborted`, `no_room`
+    and `host_fault` leave it (three `incompatible` in a row halt nothing);
+  - three gate aborts in a row (`no_room` and `host_fault` are not aborts,
+    and leave the count);
   - the scenario count below its floor (the most scenarios a gate run of
     the mission has counted since it was configured or last resumed);
   - the source's `main` not where the last landing left it.
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
+  No rule counts host faults, however many in a row: a halt needs a human,
+  and a host fault is the host's, so it is judged again after its backoff
+  and escalated at two in a row instead.
 - **A shared source has one baseline.** A landing moves the baseline of
   every mission on that source whose baseline was its `from` and that is not
   halted (the record names them), so RSI and fleet work on the same
@@ -966,7 +1179,12 @@ record of what was judged (§14 of design.md).
   "unsolved" is cached, and a regression then lands) or flake another
   mission's candidate toward its halt. The integrator refuses N > 1 (up to
   8) unless `SPAWN_TEST_DATABASE_PER_GATE=1` states that the server is per
-  gate. Each judging records its own verdict and landing, which the next
+  gate. A mission whose scenarios directory holds the file
+  `no-test-database` (its owner's statement that its gate needs no test
+  database, as Supply PA's tests run on PGlite) gets no
+  SPAWN_TEST_DATABASE_URL, so its candidate code cannot reach the shared
+  server: its judgings do not count against N and run beside a Spawn gate,
+  still one per mission and per source. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a

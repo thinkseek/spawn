@@ -6,6 +6,7 @@
 //! conformance suite in [`crate::contract`] runs against both.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -18,8 +19,9 @@ use crate::id::{
     TerminalName, WorkspaceId,
 };
 use crate::port::{
-    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT,
-    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
+    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Hold, Launch,
+    READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
+    WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -87,11 +89,17 @@ struct State {
     /// all fail, as a record the log can never take would.
     branch_records_refused: HashSet<SessionId>,
     terminals: HashSet<TerminalName>,
+    /// Terminals that are there but host no runner ([`MemoryStore::untrack`]),
+    /// with what the host saw.
+    untracked: HashMap<TerminalName, String>,
     /// Every terminal start, in order.
     launches: Vec<Launch>,
     panes: HashMap<TerminalName, String>,
     /// Text staged for a terminal's next submit.
     staged: HashMap<TerminalName, String>,
+    /// For every text submitted to a terminal, in order: whether a
+    /// workspace was held ([`WorkspaceStore::hold`]) while it was.
+    submitted_held: Vec<bool>,
     files: HashMap<String, Vec<u8>>,
     /// Engines that exit at the next liveness check: the file is written
     /// and the terminal closes then, between the Bridge's two reads.
@@ -167,6 +175,17 @@ pub struct MemoryStore {
     project: String,
     clock: Arc<dyn Clock>,
     state: Mutex<State>,
+    /// Workspaces held now ([`WorkspaceStore::hold`]).
+    held: Arc<AtomicUsize>,
+}
+
+/// A hold of a workspace of a [`MemoryStore`], counted until dropped.
+struct Held(Arc<AtomicUsize>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl MemoryStore {
@@ -176,6 +195,7 @@ impl MemoryStore {
             project: project.to_string(),
             clock,
             state: Mutex::new(State::default()),
+            held: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -199,6 +219,20 @@ impl MemoryStore {
             terminal.clone(),
             (path.to_string(), bytes.as_bytes().to_vec()),
         );
+    }
+
+    /// Make `terminal` one that is there but hosts no runner (its runner
+    /// died, and a terminal manager restored the session at a shell prompt
+    /// after a restart): `runner` answers [`Runner::Untracked`] with
+    /// `evidence`; the terminal stays, with its pane, until terminated.
+    /// Starts it when it is not there. Test helper.
+    pub fn untrack(&self, terminal: &TerminalName, evidence: &str) {
+        let mut state = self.lock();
+        state.terminals.insert(terminal.clone());
+        state.panes.entry(terminal.clone()).or_default();
+        state
+            .untracked
+            .insert(terminal.clone(), evidence.to_string());
     }
 
     /// Append to a file the terminal host can read, as an engine would.
@@ -234,6 +268,12 @@ impl MemoryStore {
     /// Test helper.
     pub fn workspace_calls(&self) -> Vec<String> {
         self.lock().workspace_calls.clone()
+    }
+
+    /// For every text submitted to a terminal so far, in order: whether a
+    /// workspace was held while it was. Test helper.
+    pub fn submitted_held(&self) -> Vec<bool> {
+        self.lock().submitted_held.clone()
     }
 
     /// Every terminal start so far, in order. Test helper.
@@ -671,6 +711,11 @@ impl WorkspaceStore for MemoryStore {
 
     fn notices_told(&self, _workspace: &WorkspaceId, _notices: &[String]) {}
 
+    fn hold(&self, _workspace: &WorkspaceId) -> Option<Hold> {
+        self.held.fetch_add(1, Ordering::SeqCst);
+        Some(Box::new(Held(Arc::clone(&self.held))))
+    }
+
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         Ok(self.lock().heads.get(branch).cloned())
     }
@@ -725,6 +770,8 @@ impl TerminalHost for MemoryStore {
         let Some(text) = state.staged.remove(terminal) else {
             return Err(TerminalError(format!("nothing staged for {terminal}")));
         };
+        let held = self.held.load(Ordering::SeqCst) > 0;
+        state.submitted_held.push(held);
         let pane = state.panes.entry(terminal.clone()).or_default();
         pane.push_str(&text);
         pane.push('\n');
@@ -759,6 +806,23 @@ impl TerminalHost for MemoryStore {
             state.terminals.remove(terminal);
         }
         Ok(state.terminals.contains(terminal))
+    }
+
+    fn runner(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<Runner, TerminalError> {
+        if !self.is_alive(terminal, workspace)? {
+            return Ok(Runner::Gone);
+        }
+        Ok(self
+            .lock()
+            .untracked
+            .get(terminal)
+            .map_or(Runner::Running, |evidence| {
+                Runner::Untracked(evidence.clone())
+            }))
     }
 
     fn capture_tail(
@@ -814,6 +878,7 @@ impl TerminalHost for MemoryStore {
         let mut state = self.lock();
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
+        state.untracked.remove(terminal);
         Ok(())
     }
 }

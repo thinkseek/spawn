@@ -3,7 +3,7 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 
 import { usePoll } from "../../api";
-import { clockTime, relativeTime } from "../../format";
+import { absoluteTitle, clockTime, relativeTime } from "../../format";
 import type { RsiTask, TaskVerdict } from "../../rsi";
 import { fetchTask, isSettled } from "../../rsi";
 import { Card, CardHeader, Drawer, EmptyState, Tabs, cx } from "../ui";
@@ -28,7 +28,9 @@ function defaultNote(verdict: TaskVerdict): string {
     case "stale":
       return "Main moved; judged again";
     case "no_room":
-      return "No disk room for the gate; judged again later";
+      return "No room for the gate (disk, memory or the test database); judged again later";
+    case "host_fault":
+      return "The host failed (the test database), not the work; judged again after a backoff";
     default:
       return "";
   }
@@ -138,7 +140,7 @@ export function VerdictList({
                     </span>
                     <span
                       className="tnum text-right text-caption text-faint-foreground"
-                      title={clockTime(verdict.at_ms)}
+                      title={absoluteTitle(verdict.at_ms)}
                     >
                       {relativeTime(verdict.at_ms)}
                     </span>

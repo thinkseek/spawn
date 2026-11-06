@@ -34,6 +34,9 @@ export function verdictColor(verdict: string): string {
     case "conflict":
     case "incompatible":
       return "var(--warning)";
+    // The host's failure, not the work's.
+    case "host_fault":
+      return "var(--info)";
     default:
       return "var(--muted-foreground)";
   }

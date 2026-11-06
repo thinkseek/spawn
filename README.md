@@ -72,7 +72,8 @@ Run `spawn tick` on a schedule (cron, systemd timer or a shell loop), or keep `s
 | `integrate [--once] [--root <dir>] [--gates <n>]` | The one landing path: for each mission with a gate, judges ready work with `scripts/rsi/gate.sh` (one gate at a time: `--gates` above 1 is refused until each gate has a test database server of its own, `SPAWN_TEST_DATABASE_PER_GATE=1`), lands it on the source with a compare-and-swap push, halts a mission on the halt rules, and gives objective missions (RSI) their next backlog tasks, up to the mission's worker limit (`--workers`, default 1) in flight at once. |
 | `fleet` | Every session the login may read, with its judgement, as JSON. |
 | `tail --session <id>` | One session's latest judgement, recent events, judgements and commands, as JSON. |
-| `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
+| `serve` | Read-only dashboard and API (fleet, judgements, commands, live panes, RSI, and the attention queue `/api/attention`: the dispatcher's own escalations and the supervisor's open question) as `spawn_reader`. Binds `127.0.0.1:8787`; on any other address it needs `SPAWN_SERVE_TOKEN`, and every API request then carries it (`Authorization: Bearer <token>` or `?token=<token>`). Open the UI once as `http://<host>:8787/?token=<token>`. |
+| `scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]` | Every dimension at once, from the record alone: throughput, lead time, first-pass quality, rework, autonomy, reliability, cost and gate time, each with its n, direction, previous window and trend, for the fleet, each mission and each UTC day (docs/design.md §15). `<time>` is RFC 3339 or a span back (`36h`, `7d`); the window defaults to the last 7 days. Below 3 landings a dimension says `not enough data`. The dashboard's Scorecard view reads the same JSON from `/api/scorecard`. |
 | `mission`, `task`, `resident` | The mission layer: add, configure, close and resume missions; assign, accept and reject tasks; propose, approve and retire residents. Every command prints JSON. |
 | `task stages --id N` | A task's stages from the control stream, oldest first: `[{stage, verdict, at_ms, took_ms}]`, `took_ms` the time since the task's previous stage. `mission list` and the dashboard's missions page carry the same list on every task. |
 | `run` | Runs the engine inside the terminal and writes its exit status to a file the Bridge reads. Spawn configures this; you do not call it. |
@@ -120,8 +121,11 @@ End to end check of the whole decision ladder (scripted engine, stub Jev, ~20 s)
 | `SPAWN_JUDGE_URL` | unset | Jev judge service; without it the rules judge alone, and a case they cannot settle asks for attention |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | Pause between `spawn loop` passes |
 | `SPAWN_INTEGRATE_GATES` | `1` | Gates `spawn integrate` runs at once, across missions (one per mission; `--gates` overrides it). More than 1 (up to 8) is refused unless `SPAWN_TEST_DATABASE_PER_GATE=1`: the gates share one test database server today |
+| `SPAWN_TEST_DATABASE_LOG` | unset | The test database server's log (`log_line_prefix` `%m [%p] `), read by `spawn integrate` for a crash during a gate: database errors then make a check-tests.sh failure a host fault (`host_fault`), not a rejection. Unset, only connection errors do |
+| `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | Wait after the first host fault in a row before the task is judged again; doubled per host fault in a row, at most an hour |
 | `SPAWN_SERVE_ADDRESS` | `127.0.0.1:8787` | Address `spawn serve` binds (`--address` overrides it) |
 | `SPAWN_SERVE_TOKEN` | unset | Token every `spawn serve` API request must carry; required off loopback |
+| `SPAWN_SERVE_OPEN_NETWORKS` | unset | Comma-separated CIDRs (e.g. `192.168.31.0/24`) whose clients read without the token when they name the server by its address in that network (`http://192.168.31.112:8787/`); a name in `Host` (DNS rebinding) or a foreign `Origin` still needs it; `/0` is refused |
 
 ## Development
 

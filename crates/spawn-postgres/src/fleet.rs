@@ -75,7 +75,10 @@ from (
   join spawn_session_state p using (session_id)
 ) a";
 
-/// How the fleet and the decision ladder did over the last hour and day.
+/// How the fleet and the decision ladder did over the last hour and day,
+/// and each gated mission's gate-room waits. Who needs a human is not
+/// here: that is the dispatcher's own view (`GET /api/attention`), and a
+/// judge's `attention` flag is only its opinion, on each judgement.
 pub(crate) const FLEET_HEALTH: &str = r"
 with
   now as (select spawn_now_ms() as ms),
@@ -103,8 +106,17 @@ select jsonb_build_object(
   'by_state', (select coalesce(jsonb_object_agg(state, n), '{}'::jsonb)
                  from (select coalesce(state, 'UNKNOWN') as state, count(*) as n
                          from agent_status group by 1) t),
-  'attention', (select count(*) from spawn_session_state
-                 where coalesce((observation ->> 'attention')::boolean, false)),
+  -- The run of `no_room` gate outcomes of each gated mission (one task at
+  -- a time, as the store folds them): open or active missions, and any
+  -- whose run goes on.
+  'gate_room', (select coalesce(jsonb_agg(jsonb_build_object(
+                   'mission', m.id, 'text', left(m.text, 200), 'task', m.gate_room_task,
+                   'since_ms', m.gate_room_since_ms, 'last_ms', m.gate_room_last_ms,
+                   'waits', m.gate_room_waits, 'escalated', m.gate_room_escalated)
+                   order by m.id), '[]'::jsonb)
+                  from mission_missions m
+                 where m.gate is not null
+                   and (m.state in ('open', 'active') or m.gate_room_task is not null)),
   'last_hour', jsonb_build_object(
     'judgements', (select count(*) from hour),
     'by_judge', (select coalesce(jsonb_object_agg(judge, n), '{}'::jsonb)
@@ -300,7 +312,52 @@ select coalesce(jsonb_agg(m.file order by m.file), '[]'::jsonb)
                      and c.principal = 'spawn-dispatch'
                      and c.idempotency_key like 'deliver-%'), 0)) m";
 
+/// When each of the tags `$2` was first delivered into session `$1`: the
+/// earliest finish of a successful dispatcher command that filed it (for
+/// the supervisor, the digest that told it of an escalation), as
+/// `{"<tag>": <ms>}`. The same commands `told` reads in [`DISPATCH_FACTS`].
+pub(crate) const TOLD_AT: &str = r"
+select coalesce(jsonb_object_agg(t.tag, t.at_ms), '{}'::jsonb)
+  from (select tag, min(coalesce(c.finished_at_ms, c.created_at_ms)) as at_ms
+          from spawn_commands c
+         cross join lateral jsonb_array_elements_text(
+                 case when jsonb_typeof(c.action -> 'tags') = 'array'
+                      then c.action -> 'tags' else '[]'::jsonb end) tag
+         where c.session_id = $1 and c.principal = 'spawn-dispatch' and c.succeeded
+           and tag = any($2)
+         group by tag) t";
+
+/// Where session `$1`'s engine writes its transcript and when its latest
+/// turn ended: the `transcript_path` of its latest `session.native_started`
+/// that names one, the `workspace` of its latest `execution.started`, and
+/// the `recorded_at_ms` of its latest `turn.stopped` or `turn.failed`
+/// (`turn_ended_at_ms`); each `null` when the log has none.
+pub(crate) const LATEST_TURN: &str = r"
+select jsonb_build_object(
+  'transcript', (select e.kind -> 'detail' ->> 'transcript_path' from spawn_events e
+                  where e.session_id = $1 and e.event_name = 'session.native_started'
+                    and e.kind -> 'detail' ->> 'transcript_path' is not null
+                  order by e.session_seq desc limit 1),
+  'workspace', (select e.kind -> 'detail' ->> 'workspace' from spawn_events e
+                 where e.session_id = $1 and e.event_name = 'execution.started'
+                 order by e.session_seq desc limit 1),
+  'turn_ended_at_ms', (select e.recorded_at_ms from spawn_events e
+                        where e.session_id = $1
+                          and e.event_name in ('turn.stopped', 'turn.failed')
+                        order by e.session_seq desc limit 1))";
+
 impl PostgresStore {
+    /// When each of `tags` was first delivered into `session` ([`TOLD_AT`]).
+    pub fn told_at(&self, session: &str, tags: &[String]) -> Result<Value, StoreError> {
+        self.query_json(TOLD_AT, &[&session, &tags])
+    }
+
+    /// `session`'s transcript, workspace and latest turn's end
+    /// ([`LATEST_TURN`]).
+    pub fn latest_turn(&self, session: &str) -> Result<Value, StoreError> {
+        self.query_json(LATEST_TURN, &[&session])
+    }
+
     /// Files main's merges changed in `session`'s branch since the last
     /// delivery the worker was typed ([`UNTOLD_MERGES`]).
     pub fn untold_merges(&self, session: &str) -> Result<Vec<String>, StoreError> {

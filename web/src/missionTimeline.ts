@@ -11,7 +11,8 @@
  *             → gate       the gate judges (accept = gate)
  *   reviewed  accepted → gate (with a gate) or done; rejected → sent back
  *   gated     accepted → landing; rejected / conflict / incompatible → sent back;
- *             stale / aborted / no_room → still at the gate (judged again)
+ *             stale / aborted / no_room / host_fault → still at the gate (judged
+ *             again; `host_fault` is the host's failure, not the work's)
  *   landed, aborted, cancelled: the bar ends.
  *
  * Sent back, the task waits (`revise`) until it is delivered again, which
@@ -20,6 +21,9 @@
  * halted mission it is stalled rather than live. */
 
 import type { Mission, MissionTask } from "./missions";
+import { compareMissions, missionName } from "./ordering.ts";
+
+export { missionName };
 
 export type Phase = "queued" | "working" | "review" | "gate" | "landing" | "revise";
 
@@ -112,11 +116,27 @@ export interface Lane {
 }
 
 export interface MissionTimeline {
-  /** Newest activity first. */
+  /** In the missions' order (ordering.ts, compareMissions). */
   lanes: Lane[];
   start: number;
   end: number;
   openCount: number;
+}
+
+/** Whether anything moves on its own: an open task in a mission that is
+ * not halted. The clock and the "now" line show only while it is, so a
+ * halted mission's stalled task never pins a marker to page load. */
+export function isLive(timeline: Pick<MissionTimeline, "lanes">): boolean {
+  return timeline.lanes.some((lane) =>
+    lane.bars.some((bar) => bar.end === null && !bar.stalled),
+  );
+}
+
+/** Whether there is a task bar to draw at all. With none the axis has no
+ * extent (its fallback would be epoch 0) and the page shows an empty state
+ * instead of a 1970 axis. */
+export function hasBars(timeline: Pick<MissionTimeline, "lanes">): boolean {
+  return timeline.lanes.some((lane) => lane.bars.length > 0);
 }
 
 /** Gate verdict reasons per task, oldest first (the RSI page has them). */
@@ -127,19 +147,6 @@ const TERMINAL: Record<string, Outcome> = {
   aborted: "aborted",
   cancelled: "cancelled",
 };
-
-/** A mission's short name: its text up to a colon, else its first words. */
-export function missionName(mission: Pick<Mission, "id" | "text">): string {
-  const text = (mission.text ?? "").trim().replace(/\s+/g, " ");
-  if (!text) return mission.id !== null ? `Mission ${mission.id}` : "Mission";
-  const colon = text.indexOf(":");
-  if (colon > 0 && colon <= 40) return text.slice(0, colon);
-  const sentence = text.split(/(?<=[.!?])\s/)[0];
-  if (sentence.length <= 48) return sentence.replace(/[.!?]$/, "");
-  const cut = sentence.slice(0, 47);
-  const space = cut.lastIndexOf(" ");
-  return `${(space > 24 ? cut.slice(0, space) : cut).trimEnd()}…`;
-}
 
 export function laneState(mission: Pick<Mission, "state" | "halted">): LaneState {
   if (mission.halted) return "halted";
@@ -266,6 +273,25 @@ export function taskBar(
     if (phase) segments.push({ phase, start: since, end, attempt });
   }
 
+  // A conflict (like a rejection or incompatibility) explains itself in the
+  // record's `note`, which the integrator keeps as the task's review note;
+  // its `reason` is empty. The note describes the latest send-back, so it
+  // fills that mark alone; a cancel overwrites it, so it says nothing then.
+  const lastRecord = records.at(-1)?.stage;
+  if (
+    task.review_note !== null &&
+    lastRecord !== "cancelled" &&
+    lastRecord !== "aborted"
+  ) {
+    let lastBack = -1;
+    for (let index = 0; index < verdicts.length; index += 1) {
+      if (verdicts[index].sentBack) lastBack = index;
+    }
+    if (lastBack >= 0 && verdicts[lastBack].reason === null) {
+      verdicts[lastBack] = { ...verdicts[lastBack], reason: task.review_note };
+    }
+  }
+
   return {
     key,
     task,
@@ -285,7 +311,7 @@ export function taskBar(
  * its last update, in the phase its state names. */
 function legacyBar(
   task: MissionTask,
-  mission: Pick<Mission, "gate" | "halted">,
+  mission: Pick<Mission, "gate" | "accept" | "halted">,
   key: string,
   label: string,
 ): TaskBar | null {
@@ -298,6 +324,9 @@ function legacyBar(
   };
   const outcome = done[task.state] ?? "open";
   const end = outcome === "open" ? null : Math.max(task.updated_at_ms ?? start, start);
+  // `reported` waits for the supervisor first unless the gate judges it
+  // (accept = gate); `accepted` is at the gate only when there is one.
+  const atGate = mission.gate !== null && mission.accept === "gate";
   const phase: Phase =
     task.state === "assigned"
       ? "queued"
@@ -307,9 +336,15 @@ function legacyBar(
           ? "revise"
           : task.state === "landing"
             ? "landing"
-            : task.state === "reported" || task.state === "accepted"
-              ? "gate"
-              : "working";
+            : task.state === "reported"
+              ? atGate
+                ? "gate"
+                : "review"
+              : task.state === "accepted"
+                ? mission.gate !== null
+                  ? "gate"
+                  : "review"
+                : "working";
   return {
     key,
     task,
@@ -365,9 +400,9 @@ export function deriveMissionTimeline(
       lastActivity,
     });
   }
-  lanes.sort(
-    (a, b) => b.lastActivity - a.lastActivity || (b.mission.id ?? 0) - (a.mission.id ?? 0),
-  );
+  // The one mission order (ordering.ts): open missions, then idle active
+  // ones, then closed ones, each by its latest recorded activity.
+  lanes.sort((a, b) => compareMissions(a.mission, b.mission));
   if (!Number.isFinite(start)) {
     start = now;
     end = now;

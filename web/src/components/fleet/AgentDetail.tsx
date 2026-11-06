@@ -30,7 +30,7 @@ import {
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { LiveBadge, TerminalBlock, TerminalPanel } from "../Terminal";
-import { Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
+import { Ago, Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
 import {
   Fact,
   FleetStateBadge,
@@ -95,6 +95,14 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />
           <LiveBadge live={agent.live} />
+          {agent.attention && (
+            <span
+              className="text-caption font-medium text-warning"
+              title={'In the dispatcher\'s "Needs a human" queue'}
+            >
+              needs a human
+            </span>
+          )}
           <span className="ml-auto" />
           <Button onClick={() => onOpenTimeline(sessionId)} title="Open the event timeline">
             <span className="hidden sm:inline">Session timeline</span>
@@ -157,8 +165,8 @@ function AgentSummary({ agent }: { agent: FleetAgent }) {
             {now.label}
           </span>
         </Fact>
-        <Fact label="Last event">{relativeTime(activity.last_event_at_ms)}</Fact>
-        <Fact label="In state since">{relativeTime(agent.state_since_ms)}</Fact>
+        <Fact label="Last event"><Ago ms={activity.last_event_at_ms} /></Fact>
+        <Fact label="In state since"><Ago ms={agent.state_since_ms} /></Fact>
         <Fact label="Engine · execution" mono>
           {[agent.engine, agent.execution_id].filter(Boolean).join(" · ") || "—"}
         </Fact>
@@ -229,9 +237,7 @@ function JevPanel({
                 Back to latest
               </button>
             )}
-            <span className="tnum" title={at ? new Date(at).toLocaleString() : undefined}>
-              {relativeTime(at)}
-            </span>
+            <Ago ms={at} />
           </>
         }
       />
@@ -250,6 +256,17 @@ function JevPanel({
             </span>
           )}
         </div>
+
+        {judgement.attention && (
+          <p
+            className="text-caption text-muted-foreground"
+            title={'The judge\'s opinion only. Who needs a human is the dispatcher\'s view: the "Needs a human" queue.'}
+          >
+            <span className="font-medium text-foreground">The judge asks for attention</span>
+            {judgement.attention_reason && <> · {reasonText(judgement.attention_reason)}</>}
+            <span className="text-faint-foreground"> · its opinion, not the dispatcher's queue</span>
+          </p>
+        )}
 
         {reason && (
           <div
