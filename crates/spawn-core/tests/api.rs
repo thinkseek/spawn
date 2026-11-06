@@ -308,6 +308,7 @@ fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
                     parent_session_id: None,
                     from: None,
                     model: None,
+                    charter: None,
                 },
             },
         )
@@ -381,6 +382,7 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     );
     tick_fresh(&store);
@@ -443,6 +445,7 @@ fn a_second_bridge_that_missed_the_start_is_refused_by_the_log() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     );
     let mut other = Bridge::new(
@@ -1209,6 +1212,7 @@ fn lease_ttl_expires_and_takes_the_command_again() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     };
     let id = store
