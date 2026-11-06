@@ -129,7 +129,10 @@ pub(crate) type DatabaseProbe =
 ///    environment (whatever [`withhold_owners_cluster`] later decides for
 ///    the gate), a connection within 10 s, then a forced parallel query
 ///    within 10 s ([`spawn_postgres::parallel_query_probe`]). Any error
-///    fails it.
+///    fails it. Not for a gate whose mission's owner said it needs no test
+///    database (`no-test-database`, [`Room::without_test_database`]): that
+///    gate never gets the URL, and a test server that is down must not hold
+///    back work that never reaches it.
 ///
 /// A threshold of 0 disables its check; one that does not parse is an
 /// abort ([`RoomFailure::Bad`]), as a bad floor is to the gate (exit 3). A
@@ -141,6 +144,9 @@ pub(crate) struct Room {
     min_free_memory_mb: Option<String>,
     /// SPAWN_TEST_DATABASE_URL as the integrator's environment sets it.
     test_database_url: Option<String>,
+    /// The gate gets no test database (its mission's `no-test-database`),
+    /// so there is none to check.
+    no_test_database: bool,
     free_kb: std::sync::Arc<FreeKb>,
     available_mb: std::sync::Arc<AvailableMb>,
     probe: std::sync::Arc<DatabaseProbe>,
@@ -243,9 +249,20 @@ impl Room {
         Self {
             min_free_memory_mb: set("SPAWN_GATE_MIN_FREE_MEMORY_MB"),
             test_database_url: set("SPAWN_TEST_DATABASE_URL"),
+            no_test_database: false,
             free_kb: std::sync::Arc::new(measured_free_kb),
             available_mb: std::sync::Arc::new(measured_available_mb),
             probe: std::sync::Arc::new(probed_database),
+        }
+    }
+
+    /// These checks for a gate that gets no test database (its mission's
+    /// scenarios hold `no-test-database`): disk and memory only.
+    pub(crate) fn without_test_database(&self) -> Self {
+        Self {
+            test_database_url: None,
+            no_test_database: true,
+            ..self.clone()
         }
     }
 
@@ -335,7 +352,11 @@ impl Room {
             }
         }
         let Some(url) = self.test_database_url.as_deref() else {
-            log.push_str("database: SPAWN_TEST_DATABASE_URL is unset, nothing to check\n");
+            log.push_str(if self.no_test_database {
+                "database: this gate gets no test database (no-test-database), nothing to check\n"
+            } else {
+                "database: SPAWN_TEST_DATABASE_URL is unset, nothing to check\n"
+            });
             return Ok(log);
         };
         let server = without_password(&server_of(url), url);
@@ -1788,6 +1809,48 @@ mod room_tests {
         let env = vec![("PATH".to_string(), "/bin".to_string())];
         assert!(room(&[], PLENTY, PLENTY, Ok(()), &seen).check(&env).is_ok());
         assert_eq!(seen.lock().expect("taken")[0], "disk /tmp");
+    }
+
+    /// A mission whose gate needs no test database (`no-test-database`)
+    /// is not held back by the test server: no probe, the other checks as
+    /// before.
+    #[test]
+    fn a_gate_without_a_test_database_is_not_probed() {
+        let seen = taken();
+        let room = room(
+            &[("SPAWN_TEST_DATABASE_URL", URL)],
+            PLENTY,
+            PLENTY,
+            Err(shared_memory()),
+            &seen,
+        );
+        let checks = room
+            .without_test_database()
+            .check(&gate_env(&[]))
+            .expect("no database to check");
+        assert_eq!(*seen.lock().expect("taken"), ["disk /data/tmp", "memory"]);
+        assert!(checks.contains("no-test-database"), "{checks}");
+        let (memory, _) = short(
+            room.measured_by(|_| PLENTY, || Some(1), |_| panic!("no probe"))
+                .without_test_database()
+                .check(&gate_env(&[])),
+        );
+        assert_eq!(memory.check(), "memory", "disk and memory still count");
+        // The same room with the database: the probe decides.
+        let (database, _) = short(
+            room_with_url_failing(&taken()).check(&gate_env(&[])),
+        );
+        assert_eq!(database.check(), "database");
+    }
+
+    fn room_with_url_failing(seen: &Arc<Mutex<Vec<String>>>) -> Room {
+        room(
+            &[("SPAWN_TEST_DATABASE_URL", URL)],
+            PLENTY,
+            PLENTY,
+            Err(shared_memory()),
+            seen,
+        )
     }
 
     #[test]
