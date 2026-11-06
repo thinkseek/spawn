@@ -118,7 +118,8 @@ from (
 /// - `tasks`: every open task (the rows [`DELIVERY_TASKS`] reads, but a
 ///   closed ephemeral task only while its worker runs) with `record`, the
 ///   latest control record that put it in its state (`task.assigned`; the
-///   review or verdict that sent it back; `task.delivered`; `task.reported`;
+///   review or verdict that sent it back (`rejected`, `conflict` or
+///   `incompatible`); `task.delivered`; `task.reported`;
 ///   the review that accepted it; the gate's `accepted`; the record that
 ///   closed it), and `stale`, the latest `stale` verdict on it, which moves
 ///   no step;
@@ -161,7 +162,7 @@ select jsonb_build_object(
                when 'assigned' then x.r ->> 'type' = 'task.assigned'
                when 'revise' then (x.r ->> 'type' = 'task.reviewed' and x.r ->> 'accepted' = 'false')
                                or (x.r ->> 'type' = 'task.gated'
-                                   and x.r ->> 'verdict' in ('rejected', 'conflict'))
+                                   and x.r ->> 'verdict' in ('rejected', 'conflict', 'incompatible'))
                when 'delivered' then x.r ->> 'type' = 'task.delivered'
                when 'reported' then x.r ->> 'type' = 'task.reported'
                when 'accepted' then x.r ->> 'type' = 'task.reviewed' and x.r ->> 'accepted' = 'true'
@@ -311,7 +312,8 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
  where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
 
 /// Gate verdicts on one objective's tasks, newest first, from the control
-/// stream: `[{task, verdict, reason, metric, at_ms}]`. `$1` mission,
+/// stream: `[{task, verdict, reason, metric, at_ms}]`, `incompatible` (sent
+/// back because main moved, not a rejection) among them. `$1` mission,
 /// `$2` objective, `$3` limit.
 pub(crate) const OBJECTIVE_HISTORY: &str = r"
 select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
@@ -322,7 +324,7 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
           from spawn_events e
          cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-           and r ->> 'type' = 'task.gated' and r ->> 'verdict' in ('accepted', 'rejected', 'aborted')
+           and r ->> 'type' = 'task.gated' and r ->> 'verdict' in ('accepted', 'rejected', 'incompatible', 'aborted')
            and (r ->> 'id')::bigint in (select id from mission_tasks
                                          where mission_id = $1 and objective = $2)
          order by e.session_seq desc
