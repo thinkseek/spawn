@@ -333,7 +333,6 @@ done
         _ => None,
     });
     let workspace = started.expect("the execution started");
-    assert_eq!(Path::new(workspace.path()), world.resolved().join("agent_one"));
     let deadline = Instant::now() + Duration::from_secs(20);
     let turn_read = loop {
         bridge.tick().expect("tick");
@@ -367,6 +366,7 @@ done
         "the engine's turn reached the log: the Bridge watched {transcripts:?}, the engine wrote \
          under {written:?}"
     );
+    assert_eq!(Path::new(workspace.path()), world.resolved().join("agent_one"));
     submit(&memory, "key_stop", CommandAction::Stop);
     bridge.tick().expect("stop");
     assert!(
