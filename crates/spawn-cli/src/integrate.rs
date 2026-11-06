@@ -1401,9 +1401,6 @@ impl Judge {
             eprintln!("integrate: {warning}");
         }
         let gate_path = pinned(&self.gate);
-        // The candidate's gate run, measured: a crash in the test
-        // database's log counts only inside this window.
-        let window = std::cell::Cell::new((0_i64, 0_i64));
         let run_gate = |base: &str, judged: &str| {
             gate::judge(
                 &gate_path,
@@ -1416,9 +1413,11 @@ impl Judge {
                 gate_wall_clock(),
             )
         };
+        // The candidate's gate run, measured: a crash in the test
+        // database's log counts only inside this window.
         let started = now_ms();
         let judged = run_gate(main, &candidate);
-        window.set((started, now_ms()));
+        let ended = now_ms();
         match judged {
             Ok(verdict) if verdict.accepted => {
                 // The verdict is stored before git moves, so a crash lands
@@ -1440,7 +1439,6 @@ impl Judge {
             // counted, judged again after a backoff.
             Ok(verdict)
                 if let Some(fault) = host::host_fault(&verdict.reason, &verdict.output, || {
-                    let (started, ended) = window.get();
                     self.crash_in(started, ended)
                 }) =>
             {
