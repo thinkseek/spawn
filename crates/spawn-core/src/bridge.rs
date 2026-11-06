@@ -7,6 +7,36 @@
 //! The Bridge is the only writer of a Bridge-sourced `execution.ended`, and
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
+//!
+//! An input to a busy session waits for its turn (docs/design.md §5). An
+//! `Input` from a person or the supervisor (any principal but the loops in
+//! [`LOOP_PRINCIPALS`]) that finds the pane not ready, or a capture that
+//! keeps failing on a live terminal, records `command.step` `waiting` once
+//! (key `<command>:waiting`) and stays unfinished. It is typed on a Ready
+//! reading, and a Ready reading is spent by the typing: the next input needs
+//! one taken after the previous `typed` (or that typing's turn to have
+//! ended). The session's waiting inputs go oldest first: none is typed
+//! before an earlier one still waiting. At most once holds as for any
+//! input: `typed` succeeds, `typing` without `typed` fails with
+//! [`MAY_HAVE_TYPED`]. The loops' own inputs keep their contract: refused at
+//! once while the pane is not ready (they retry on their own), and refused
+//! behind a waiting input too. A waiting input holds nothing else: the
+//! queue hands out what comes behind it (a stop, a discard, a resume, a
+//! later input to be recorded waiting). When the execution ends, its
+//! waiting inputs fail in the same tick or the next: as stopped if a stop or
+//! a discard ended it, otherwise with the end's cause; a resume does not
+//! revive them. An input to a session with no execution still fails at
+//! once.
+//!
+//! The wait has no timeout of its own. Its lease approach: a waiting input
+//! keeps no lease between ticks. The Bridge holds the claim for the rest of
+//! the tick (so a command behind it can be claimed), then releases it
+//! ([`CommandQueue::release`]) to be claimable again after
+//! [`BridgeConfig::input_wait_retry`]; the waiting itself is read from the
+//! log, so another or a restarted Bridge carries on where this one stopped.
+//! The `waiting` record is not activity: the stall layer and the
+//! dispatcher's staleness ignore it, and the Observer covers it like any
+//! command step.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
