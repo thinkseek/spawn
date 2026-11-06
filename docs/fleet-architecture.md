@@ -702,7 +702,10 @@ the tree's own:
   directory for the gate (it measures that directory's parent). Any other
   status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
-  a timeout or a signal.
+  a timeout or a signal. The integrator measures the same floor, free
+  memory and the test database itself before it starts the gate (§10.3,
+  step 3), so a short host is found before a gate runs; the gate's own
+  check and exit 5 stay, for a `TMPDIR` that fills in between.
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
