@@ -1955,10 +1955,9 @@ fn mission_news_reports_human_commands_with_their_outcome_until_told() {
 /// The attention view (`GET /api/attention`) reads when each told
 /// escalation first reached the supervisor: the earliest successful digest
 /// that filed its tag (a failed one told nothing), and nothing for a tag no
-/// digest carried. It also reads where the supervisor's engine writes its
-/// transcript and when its latest turn ended.
+/// digest carried.
 #[test]
-fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
+fn the_attention_view_reads_when_each_tag_was_first_told() {
     let (store, schema) = store("told_at");
     let supervisor = Worker {
         store: &store,
@@ -2014,7 +2013,19 @@ fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
         serde_json::json!({}),
         "another session's digests"
     );
+}
 
+/// The attention view reads where the supervisor's engine writes its
+/// transcript (the latest `session.native_started` that names one) and when
+/// its latest turn ended, whether a turn started since or not.
+#[test]
+fn the_attention_view_reads_the_supervisors_transcript_and_latest_turn() {
+    let (store, schema) = store("latest_turn");
+    let supervisor = Worker {
+        store: &store,
+        agent: AgentId::new("agent_supervisor").expect("valid agent"),
+        session: SessionId::new("session_supervisor").expect("valid session"),
+    };
     let none = store
         .latest_turn("session_supervisor")
         .expect("latest turn");
@@ -2022,7 +2033,8 @@ fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
         none,
         serde_json::json!({"transcript": null, "workspace": null, "turn_ended_at_ms": null})
     );
-    supervisor.started("exec_1", landed);
+    let start = supervisor.input("human", "start-1", None);
+    supervisor.started("exec_1", start);
     let native = |key: &str, path: Option<&str>| {
         supervisor.event(
             "exec_1",
@@ -2052,7 +2064,7 @@ fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
     let turn = store
         .latest_turn("session_supervisor")
         .expect("latest turn");
-    let stopped: i64 = admin
+    let stopped: i64 = admin(&schema)
         .query_one(
             "select recorded_at_ms from spawn_events
               where session_id = 'session_supervisor' and event_name = 'turn.stopped'",
