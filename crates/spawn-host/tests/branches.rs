@@ -1022,3 +1022,164 @@ fn a_conflict_in_a_file_whose_name_is_not_utf8_keeps_its_markers_until_resolved(
     assert_eq!(parents(&fixture, &resolved)[1], main);
     assert!(!pending(&directory, "agent_a").exists());
 }
+
+/// Where the store keeps a branch's lock.
+fn branch_lock(directory: &Path, branch: &str) -> PathBuf {
+    directory
+        .parent()
+        .expect("the workspace root")
+        .join(".index")
+        .join(format!("{branch}.spawn-lock"))
+}
+
+/// Issue #7: a merge into a mounted workspace asks whether the agent is
+/// idle under the branch's lock, right before it would write, and one that
+/// is not keeps its workspace, its branch and its pending state as they
+/// were; asked again once the agent is idle, the merge happens.
+#[test]
+fn a_merge_into_an_agent_that_is_not_idle_waits_and_changes_nothing() {
+    use spawn_core::port::{MERGE_WAITS, WorkspaceError};
+    let fixture = Fixture::new("not-idle", &[("README.md", "base\n"), ("notes.txt", "n\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    let head = fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    fixture.land(&[("README.md", "landed\n"), ("new.txt", "theirs\n")]);
+
+    let asked = std::cell::Cell::new(0);
+    let busy = || {
+        asked.set(asked.get() + 1);
+        // Asked under the branch's lock: a checkpoint (or the Bridge's
+        // typing) cannot take it meanwhile.
+        let lock = fs::File::open(branch_lock(&directory, "agent_a")).expect("the lock file");
+        assert!(lock.try_lock().is_err(), "asked without the branch's lock");
+        Err("a turn is running".to_string())
+    };
+    match fixture.store.merge_base_when(&workspace, &busy) {
+        Err(WorkspaceError::Refused { code, message }) => {
+            assert_eq!(code, MERGE_WAITS);
+            assert_eq!(message, "a turn is running");
+        }
+        other => panic!("the merge must wait: {other:?}"),
+    }
+    assert_eq!(asked.get(), 1);
+    assert_eq!(fixture.head("agent_a"), head, "the branch did not move");
+    assert_eq!(read(&directory, "README.md"), "base\n");
+    assert!(!directory.join("new.txt").exists(), "the workspace is as it was");
+
+    // A conflict waits the same way: no markers, no pending merge.
+    let fixture = Fixture::new("not-idle-conflict", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("README.md", "mine\n")]);
+    fixture.land(&[("README.md", "theirs\n")]);
+    assert!(
+        fixture
+            .store
+            .merge_base_when(&workspace, &|| Err("busy".to_string()))
+            .is_err()
+    );
+    assert_eq!(read(&directory, "README.md"), "mine\n");
+    assert!(!pending(&directory, "agent_a").exists());
+
+    // Idle: the merge happens, as `merge_base` does it.
+    assert!(matches!(
+        fixture.store.merge_base_when(&workspace, &|| Ok(())),
+        Ok(BaseMerge::Conflicted { marked: true, .. })
+    ));
+    assert!(pending(&directory, "agent_a").exists());
+}
+
+/// Issue #7: while the Bridge holds a workspace (it types into the agent's
+/// engine), no merge writes it: the merge waits for the hold, and only then
+/// asks whether the agent is idle.
+#[test]
+fn a_held_workspace_keeps_a_merge_out_until_the_hold_ends() {
+    let fixture = Fixture::new("held", &[("README.md", "base\n")]);
+    let (_, workspace, directory) = fixture.mount("agent_a");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    fixture.land(&[("new.txt", "theirs\n")]);
+
+    let held = fixture.store.hold(&workspace).expect("a git workspace is held");
+    let typing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&typing_done);
+    let store = fixture.store.clone();
+    let merging = std::thread::spawn(move || {
+        store.merge_base_when(&workspace, &|| {
+            // Asked only once the typing is over.
+            assert!(seen.load(std::sync::atomic::Ordering::SeqCst));
+            Ok(())
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!merging.is_finished(), "the merge waits for the hold");
+    assert!(!directory.join("new.txt").exists());
+    typing_done.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(held);
+    assert!(matches!(
+        merging.join().expect("joined"),
+        Ok(BaseMerge::Merged { .. })
+    ));
+    assert_eq!(read(&directory, "new.txt"), "theirs\n");
+}
+
+/// Issue #11: main's copies for a conflict markers cannot show live under
+/// `.spawn/`, which no commit keeps and every mount replaces; the store
+/// records them beside the workspace and every mount puts them back, until
+/// the branch takes main in.
+#[test]
+fn mains_copies_come_back_at_every_mount_until_main_is_in() {
+    let fixture = Fixture::new(
+        "copies-remount",
+        &[("README.md", "base\n"), ("notes.txt", "notes\n")],
+    );
+    let (branch, workspace, directory) = fixture.mount("agent_a");
+    fs::remove_file(directory.join("notes.txt")).expect("delete");
+    fixture.work(&workspace, &[("work.txt", "mine\n")]);
+    let main = fixture.land(&[("notes.txt", "notes, revised\n"), ("new.txt", "theirs\n")]);
+    assert_eq!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Conflicted {
+            files: vec!["notes.txt".to_string()],
+            marked: false,
+        }
+    );
+    let copy = format!("{}/notes.txt", spawn_host::MAIN_COPIES);
+    assert_eq!(read(&directory, &copy), "notes, revised\n");
+    assert_eq!(
+        fixture.store.main_copies("agent_a"),
+        Some((main.clone(), vec!["notes.txt".to_string()]))
+    );
+    assert!(!directory.join("notes.txt").exists(), "the workspace is unchanged");
+
+    // The engine is lost and the workspace goes; a resume merges main only
+    // when it is clean (it is not), then mounts the branch afresh.
+    fixture.store.unmount(&workspace).expect("unmount");
+    assert!(!directory.exists());
+    assert!(matches!(
+        fixture.store.merge_main_clean(&branch).expect("merge"),
+        BaseMerge::Conflicted { marked: false, .. }
+    ));
+    let workspace = fixture.store.mount(&branch).expect("mount");
+    assert_eq!(
+        read(&directory, &copy),
+        "notes, revised\n",
+        "the copy the note names is back"
+    );
+    // And again at the next mount.
+    let workspace = {
+        fixture.store.unmount(&workspace).expect("unmount");
+        fixture.store.mount(&branch).expect("mount")
+    };
+    assert_eq!(read(&directory, &copy), "notes, revised\n");
+
+    // Resolved as the note says (main's version); the next merge takes
+    // main in cleanly, and no mount brings the copies back after that.
+    fs::copy(directory.join(&copy), directory.join("notes.txt")).expect("copy main's version");
+    fixture.work(&workspace, &[]);
+    assert!(matches!(
+        fixture.store.merge_base(&workspace).expect("merge"),
+        BaseMerge::Merged { .. }
+    ));
+    assert_eq!(fixture.store.main_copies("agent_a"), None);
+    fixture.store.unmount(&workspace).expect("unmount");
+    fixture.store.mount(&branch).expect("mount");
+    assert!(!directory.join(&copy).exists());
+}
