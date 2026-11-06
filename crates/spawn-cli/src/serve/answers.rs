@@ -150,7 +150,10 @@ pub(super) fn accepted_age(cache_control: Option<&str>) -> Duration {
         return Duration::ZERO;
     };
     let mut age = Duration::ZERO;
-    for directive in value.split(',').map(|part| part.trim().to_ascii_lowercase()) {
+    for directive in value
+        .split(',')
+        .map(|part| part.trim().to_ascii_lowercase())
+    {
         if directive == "no-cache" || directive == "no-store" {
             return Duration::ZERO;
         }
@@ -178,7 +181,9 @@ pub(super) fn shared(path: &str) -> bool {
             | "/api/rsi"
             | "/api/rsi/pane"
             | "/api/scorecard"
-    ) || path.strip_prefix("/api/pane/").is_some_and(|id| !id.is_empty())
+    ) || path
+        .strip_prefix("/api/pane/")
+        .is_some_and(|id| !id.is_empty())
 }
 
 /// The key a shared answer is kept under: the path and its query without
@@ -356,7 +361,13 @@ pub(super) fn excerpt(text: &str, lines: usize, bytes: usize) -> &str {
 /// ([`excerpt`]), with its whole length in bytes beside it as
 /// `<field>_bytes` (0 for a null or absent one). With `keep` false the
 /// field is null and only its length is sent.
-pub(super) fn trim_texts(object: &mut Value, fields: &[&str], lines: usize, bytes: usize, keep: bool) {
+pub(super) fn trim_texts(
+    object: &mut Value,
+    fields: &[&str],
+    lines: usize,
+    bytes: usize,
+    keep: bool,
+) {
     let Some(object) = object.as_object_mut() else {
         return;
     };
@@ -401,7 +412,13 @@ pub(super) fn slim_board(board: &mut Value) {
         };
         for task in tasks {
             let cancelled = task["state"] == "cancelled";
-            trim_texts(task, &["brief", "review_note"], EXCERPT_LINES, EXCERPT_BYTES, true);
+            trim_texts(
+                task,
+                &["brief", "review_note"],
+                EXCERPT_LINES,
+                EXCERPT_BYTES,
+                true,
+            );
             trim_texts(
                 task,
                 &["report"],
@@ -432,7 +449,13 @@ pub(super) fn slim_rsi(missions: &mut [Value]) {
         }
         if let Some(tasks) = mission.get_mut("tasks").and_then(Value::as_array_mut) {
             for task in tasks {
-                trim_texts(task, &["brief", "review_note"], EXCERPT_LINES, EXCERPT_BYTES, true);
+                trim_texts(
+                    task,
+                    &["brief", "review_note"],
+                    EXCERPT_LINES,
+                    EXCERPT_BYTES,
+                    true,
+                );
             }
         }
     }
@@ -490,7 +513,14 @@ mod tests {
         );
         assert_ne!(early.etag, changed.etag);
         // A pane's capture time likewise; the fleet's clock is part of it.
-        let pane = |at: i64| answer("/api/pane/session_a", Ok(json!({"captured_at_ms": at, "text": "x"})), "").etag;
+        let pane = |at: i64| {
+            answer(
+                "/api/pane/session_a",
+                Ok(json!({"captured_at_ms": at, "text": "x"})),
+                "",
+            )
+            .etag
+        };
         assert_eq!(pane(1), pane(2));
         let fleet = |at: i64| answer("/api/fleet", Ok(json!({"generated_at_ms": at})), "").etag;
         assert_ne!(fleet(1), fleet(2));
@@ -577,7 +607,10 @@ mod tests {
         assert_eq!(after.body, "three");
         assert_eq!(count.load(Ordering::SeqCst), 2);
         // Another key is another answer.
-        assert_eq!(answers.get("j", SHARE_FOR, || computed(&count, "j")).body, "j");
+        assert_eq!(
+            answers.get("j", SHARE_FOR, || computed(&count, "j")).body,
+            "j"
+        );
         // Past its age it is read again.
         std::thread::sleep(Duration::from_millis(30));
         let old = answers.get("k", Duration::from_millis(10), || computed(&count, "five"));
@@ -602,10 +635,17 @@ mod tests {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|handle| handle.join().expect("a request")).collect()
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a request"))
+                .collect()
         });
         assert!(bodies.iter().all(|body| body == "board"));
-        assert_eq!(count.load(Ordering::SeqCst), 1, "eight requests, one computation");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "eight requests, one computation"
+        );
     }
 
     #[test]
@@ -613,7 +653,9 @@ mod tests {
         let answers = Answers::default();
         let count = AtomicUsize::new(0);
         for index in 0..=SWEEP_PAST {
-            answers.get(&format!("k{index}"), Duration::from_millis(1), || computed(&count, "x"));
+            answers.get(&format!("k{index}"), Duration::from_millis(1), || {
+                computed(&count, "x")
+            });
         }
         assert_eq!(answers.len(), SWEEP_PAST + 1);
         std::thread::sleep(SHARE_FOR + Duration::from_millis(50));
@@ -638,7 +680,13 @@ mod tests {
     fn trimmed_texts_keep_their_first_lines_and_their_length() {
         let mut task = json!({"id": 1, "brief": "Title\nline 2\nline 3", "report": "r".repeat(600),
                               "review_note": null});
-        trim_texts(&mut task, &["brief", "report", "review_note", "absent"], 2, 480, true);
+        trim_texts(
+            &mut task,
+            &["brief", "report", "review_note", "absent"],
+            2,
+            480,
+            true,
+        );
         assert_eq!(task["brief"], "Title\nline 2");
         assert_eq!(task["brief_bytes"], 19);
         assert_eq!(task["report"].as_str().map(str::len), Some(480));
@@ -666,12 +714,23 @@ mod tests {
             "residents": []});
         slim_board(&mut board);
         let task = |mission: usize, task: usize| board["missions"][mission]["tasks"][task].clone();
-        assert_eq!(task(0, 0)["report"], "line\n".repeat(6).trim_end_matches('\n'));
+        assert_eq!(
+            task(0, 0)["report"],
+            "line\n".repeat(6).trim_end_matches('\n')
+        );
         assert_eq!(task(0, 0)["report_bytes"], 250);
         assert_eq!(task(0, 0)["review_note"], "n");
-        assert_eq!(task(0, 1)["report"], json!(null), "a cancelled task is folded");
+        assert_eq!(
+            task(0, 1)["report"],
+            json!(null),
+            "a cancelled task is folded"
+        );
         assert_eq!(task(0, 1)["report_bytes"], 1);
-        assert_eq!(task(1, 0)["report"], json!(null), "a closed mission is folded");
+        assert_eq!(
+            task(1, 0)["report"],
+            json!(null),
+            "a closed mission is folded"
+        );
         assert_eq!(task(1, 0)["brief"], "B", "its titles stay");
         assert_eq!(task(2, 0)["report"], "r", "a halted mission is open");
     }
@@ -683,9 +742,17 @@ mod tests {
                                        "tasks": [{"id": 9, "brief": "b\n".repeat(20),
                                                   "review_note": "ok"}]})];
         slim_rsi(&mut missions);
-        assert_eq!(missions[0]["objectives"][0]["prompt"].as_str().map(str::len), Some(1024));
+        assert_eq!(
+            missions[0]["objectives"][0]["prompt"]
+                .as_str()
+                .map(str::len),
+            Some(1024)
+        );
         assert_eq!(missions[0]["objectives"][0]["prompt_bytes"], 5000);
-        assert_eq!(missions[0]["tasks"][0]["brief"], "b\n".repeat(6).trim_end_matches('\n'));
+        assert_eq!(
+            missions[0]["tasks"][0]["brief"],
+            "b\n".repeat(6).trim_end_matches('\n')
+        );
         assert_eq!(missions[0]["tasks"][0]["brief_bytes"], 40);
         assert_eq!(missions[0]["tasks"][0]["review_note"], "ok");
     }

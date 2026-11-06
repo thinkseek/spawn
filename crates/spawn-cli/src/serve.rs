@@ -691,10 +691,17 @@ fn overview() -> Result<Value, String> {
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|state| {
+            // The list shows the judgement's state, reason, confidence and
+            // judge; its evidence (the screen it saw, most of the bytes) is
+            // the session's own read (`/api/session/<id>`, `/api/fleet`).
+            let mut observation = json!(state.observation);
+            if let Some(fields) = observation.as_object_mut() {
+                fields.remove("evidence");
+            }
             json!({
                 "session_id": state.session_id.as_str(),
                 "agent_id": state.agent_id.as_str(),
-                "observation": state.observation,
+                "observation": observation,
                 "session_seq": state.session_seq.0,
                 "recorded_at_ms": state.recorded_at.0,
             })
@@ -1367,10 +1374,27 @@ fn static_file(request: Request, web: &Path, path: &str) -> Result<(), String> {
             .respond(Response::empty(404))
             .map_err(|error| error.to_string());
     };
+    // A file's tag is its bytes'; the build's assets/ are named by their
+    // content and kept by the browser for good, the page asked again.
+    let etag = answers::file_etag(&bytes);
+    let tag = Header::from_bytes("ETag", etag.as_str()).expect("a hex tag is a valid header");
+    let cache = Header::from_bytes("Cache-Control", answers::file_cache_control(&relative))
+        .expect("static header is valid");
+    if answers::not_modified(header(&request, "If-None-Match"), &etag) {
+        let unchanged = Response::empty(304).with_header(tag).with_header(cache);
+        return request
+            .respond(unchanged)
+            .map_err(|error| error.to_string());
+    }
     let header = Header::from_bytes("Content-Type", content_type(&relative))
         .expect("static header is valid");
     request
-        .respond(Response::from_data(bytes).with_header(header))
+        .respond(
+            Response::from_data(bytes)
+                .with_header(header)
+                .with_header(tag)
+                .with_header(cache),
+        )
         .map_err(|error| error.to_string())
 }
 
