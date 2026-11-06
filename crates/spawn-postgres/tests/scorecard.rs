@@ -131,7 +131,6 @@ fn the_facts_project_each_record_to_what_the_measures_read() {
     assert_eq!(assigned["objective"], 11);
     assert_eq!(assigned["created_by"], "spawn-integrate");
     assert_eq!(assigned["session_id"], "session_resident_r1");
-    assert_eq!(assigned["brief"], "b3f2fa1d5bf0a5ac4a9a6d0e5ff9e2a7".len().to_string().len().to_string().replace('2', "x").len().to_string().replace('1', &assigned["brief"].as_str().map_or(0, str::len).to_string()));
     let md5: String = client
         .query_one("select md5('Objective 11')", &[])
         .expect("md5")
