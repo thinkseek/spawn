@@ -155,6 +155,7 @@ impl Rig {
                 parent_session_id: None,
                 from: None,
                 model: None,
+                charter: None,
             },
         );
         rig.tick();

@@ -190,6 +190,7 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     };
     let id = queue

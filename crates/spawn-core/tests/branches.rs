@@ -73,6 +73,7 @@ fn start(store: &MemoryStore, from: Option<&str>) {
             parent_session_id: None,
             from: from.map(str::to_string),
             model: None,
+            charter: None,
         },
     );
 }
@@ -748,6 +749,7 @@ fn a_record_the_log_keeps_refusing_holds_up_only_its_session() {
                     parent_session_id: None,
                     from: None,
                     model: None,
+                    charter: None,
                 },
             },
         )

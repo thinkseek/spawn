@@ -95,6 +95,7 @@ fn profiles_round_trip_and_the_default_is_left_out_of_records() {
         parent_session_id: None,
         from: None,
         model,
+        charter: None,
     };
     let plain = serde_json::to_value(start(None)).expect("serialize");
     assert!(plain.get("model").is_none(), "{plain}");
@@ -166,6 +167,7 @@ impl Fleet {
             parent_session_id: None,
             from: None,
             model,
+            charter: None,
         })
     }
 
