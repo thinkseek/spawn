@@ -60,8 +60,17 @@ const RADIUS = 4;
 const GAP = 2;
 
 type Row =
-  | { kind: "lane"; key: string; lane: Lane; y: number; h: number }
-  | { kind: "section"; key: string; lane: Lane; section: TaskSection; count: number; y: number; h: number }
+  | { kind: "lane"; key: string; lane: Lane; y: number; h: number; folded: boolean }
+  | {
+      kind: "section";
+      key: string;
+      lane: Lane;
+      section: TaskSection;
+      count: number;
+      y: number;
+      h: number;
+      folded: boolean;
+    }
   | {
       kind: "task";
       key: string;
@@ -119,18 +128,18 @@ export function MissionTimeline({
 
   const [missionFilter, pickMission] = useState<number | null>(null);
   const [stateFilter, pickState] = useState<StateFilter>("all");
-  // Folds the reader flipped: a closed mission's lane and the cancelled
-  // section start folded, the rest open (see `folded`).
-  const [toggled, setToggled] = useState<Set<string>>(() => new Set());
+  // Folds the reader set, by lane or section key; the rest follow their
+  // default (see `folded`).
+  const [folds, setFolds] = useState<ReadonlyMap<string, boolean>>(() => new Map());
   const [moreMissions, setMoreMissions] = useState(false);
   // A new filter starts from its own defaults (nothing folded under one).
   const setMissionFilter = (next: number | null) => {
     pickMission(next);
-    setToggled(new Set());
+    setFolds(new Map());
   };
   const setStateFilter = (next: StateFilter) => {
     pickState(next);
-    setToggled(new Set());
+    setFolds(new Map());
   };
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
@@ -139,28 +148,48 @@ export function MissionTimeline({
     () => filterLanes(timeline.lanes, missionFilter, stateFilter),
     [timeline, missionFilter, stateFilter],
   );
-  // A filter shows what it picked: under one, nothing starts folded.
+  // A closed mission's lane and the cancelled section start folded, unless
+  // a filter is on (it shows what it picked) or they hold the selected task
+  // (its row and panel stay in view); a fold the reader set wins.
+  const holdsSelection = useCallback(
+    (bars: readonly TaskBar[]) =>
+      bars.some((bar) => (onSelectTask ? bar.task.id === selectedTask : bar.key === selectedKey)),
+    [onSelectTask, selectedTask, selectedKey],
+  );
   const folded = useCallback(
-    (key: string, byDefault: boolean) =>
-      (byDefault && missionFilter === null && stateFilter === "all") !== toggled.has(key),
-    [toggled, missionFilter, stateFilter],
+    (key: string, byDefault: boolean, bars: readonly TaskBar[]) =>
+      folds.get(key) ??
+      (byDefault && missionFilter === null && stateFilter === "all" && !holdsSelection(bars)),
+    [folds, missionFilter, stateFilter, holdsSelection],
   );
   const rows = useMemo(() => {
     const list: Row[] = [];
     let y = 0;
     for (const lane of lanes) {
+      const laneFolded = !compact && folded(lane.key, missionClass(lane.mission) === "closed", lane.bars);
       if (!compact) {
-        list.push({ kind: "lane", key: lane.key, lane, y, h: LANE_H });
+        list.push({ kind: "lane", key: lane.key, lane, y, h: LANE_H, folded: laneFolded });
         y += LANE_H;
       }
-      if (!compact && folded(lane.key, missionClass(lane.mission) === "closed")) continue;
+      if (laneFolded) continue;
       // The one task order (ordering.ts): in flight, landed or accepted,
       // sent back, cancelled; an objective's retries nest under its latest.
       for (const { section, groups } of groupTasks(lane.bars, (bar) => bar.task, lane.mission)) {
         const sectionKey = `${lane.key}:${section}`;
-        list.push({ kind: "section", key: sectionKey, lane, section, count: groups.length, y, h: SECTION_H });
+        const sectionBars = groups.flatMap((group) => [group.item, ...group.earlier.map((attempt) => attempt.item)]);
+        const sectionFolded = folded(sectionKey, section === "cancelled", sectionBars);
+        list.push({
+          kind: "section",
+          key: sectionKey,
+          lane,
+          section,
+          count: groups.length,
+          y,
+          h: SECTION_H,
+          folded: sectionFolded,
+        });
         y += SECTION_H;
-        if (folded(sectionKey, section === "cancelled")) continue;
+        if (sectionFolded) continue;
         for (const group of groups) {
           list.push({
             kind: "task",
@@ -259,20 +288,15 @@ export function MissionTimeline({
     view.zoomTo(fold.fold(bar.start), fold.fold(bar.end ?? now));
   const choose = (row: Row) => {
     if (row.kind !== "task") {
-      toggleFold(row.key);
+      toggleFold(row.key, row.folded);
       return;
     }
     if (onSelectTask) {
       if (row.bar.task.id !== null) onSelectTask(row.bar.task.id);
     } else setSelectedKey((current) => (current === row.key ? null : row.key));
   };
-  const toggleFold = (key: string) =>
-    setToggled((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  const toggleFold = (key: string, wasFolded: boolean) =>
+    setFolds((current) => new Map(current).set(key, !wasFolded));
 
   const locate = (event: PointerEvent | MouseEvent) => {
     const rect = rowsRef.current!.getBoundingClientRect();
@@ -483,8 +507,8 @@ export function MissionTimeline({
                       row={row}
                       short={labelW < 200}
                       onSurface={compact}
-                      folded={folded(row.key, row.section === "cancelled")}
-                      onToggle={() => toggleFold(row.key)}
+                      folded={row.folded}
+                      onToggle={() => toggleFold(row.key, row.folded)}
                     />
                   ) : (
                     <TaskLabel
@@ -553,8 +577,8 @@ export function MissionTimeline({
                     <LaneLabel
                       key={row.key}
                       row={row}
-                      collapsed={folded(row.lane.key, missionClass(row.lane.mission) === "closed")}
-                      onToggle={() => toggleFold(row.lane.key)}
+                      collapsed={row.folded}
+                      onToggle={() => toggleFold(row.key, row.folded)}
                     />
                   ) : null,
                 )}
@@ -818,9 +842,12 @@ function LaneLabel({
     >
       <button
         type="button"
-        tabIndex={-1}
+        aria-expanded={!collapsed}
         onClick={onToggle}
-        className="pointer-events-auto flex min-w-0 items-center gap-2 rounded-md bg-page-canvas py-0.5 pr-2 text-left outline-none"
+        className={cx(
+          "pointer-events-auto flex min-w-0 items-center gap-2 rounded-md bg-page-canvas py-0.5 pr-2 text-left",
+          FOCUS_RING,
+        )}
       >
         <ChevronRight
           size={13}
