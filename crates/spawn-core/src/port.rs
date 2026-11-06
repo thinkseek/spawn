@@ -252,7 +252,8 @@ pub trait WorkspaceStore: Send + Sync {
     /// Not called by the Bridge, which merges main only at a start or resume
     /// ([`Self::merge_main_clean`]): the integrator calls it on a `conflict`
     /// verdict and the dispatcher before it types a task into a live
-    /// worker, both while the agent is idle between turns. Merge the base
+    /// worker, both while the agent is idle between turns, and both through
+    /// [`Self::merge_base_when`], which checks that it is. Merge the base
     /// into the branch of a mounted workspace whose state is committed: the
     /// directory first, then the branch. A content conflict writes the merge with conflict markers
     /// into the directory and leaves the branch where it is; the checkpoint
