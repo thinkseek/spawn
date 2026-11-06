@@ -110,6 +110,16 @@ pub enum WorkspaceError {
 /// unmounting it; the execution cannot checkpoint again and is ended.
 pub const WORKSPACE_STALE: &str = "WorkspaceStale";
 
+/// The [`WorkspaceError::Refused`] code of a merge of main into a workspace
+/// that did not happen because the agent was not idle
+/// ([`WorkspaceStore::merge_base_when`]): nothing changed, and the merge is
+/// tried again later. The message says why.
+pub const MERGE_WAITS: &str = "MergeWaits";
+
+/// What [`WorkspaceStore::hold`] returns: the workspace is held until it is
+/// dropped.
+pub type Hold = Box<dyn std::any::Any + Send>;
+
 /// Result of a workspace commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Commit {
@@ -253,6 +263,37 @@ pub trait WorkspaceStore: Send + Sync {
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
         let _ = workspace;
         Ok(BaseMerge::Current)
+    }
+
+    /// [`Self::merge_base`], only while `ready` says the agent is idle (no
+    /// turn running, no command in flight). A store asks it as late as it
+    /// can: after its own preparation (a fetch of `main`), under the
+    /// branch's lock, before anything is written, so a turn typed in while
+    /// it prepared is seen (the Bridge types under [`Self::hold`]). When
+    /// `ready` refuses, nothing changes: the merge is refused with
+    /// [`MERGE_WAITS`] and `ready`'s reason. A merge with nothing to write
+    /// (current, or markers still unresolved) need not ask.
+    fn merge_base_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BaseMerge, WorkspaceError> {
+        ready().map_err(|why| WorkspaceError::Refused {
+            code: MERGE_WAITS.to_string(),
+            message: why,
+        })?;
+        self.merge_base(workspace)
+    }
+
+    /// Hold `workspace` against [`Self::merge_base_when`] until the returned
+    /// guard is dropped: the Bridge holds it while it types into the agent's
+    /// engine, so a merge that found the agent idle cannot write the
+    /// workspace under a turn typed in meanwhile, and one that waited for
+    /// the typing sees it. `None`: nothing to hold (or it could not be
+    /// taken; the typing goes on).
+    fn hold(&self, workspace: &WorkspaceId) -> Option<Hold> {
+        let _ = workspace;
+        None
     }
 
     /// Set aside the work on `branch` since the commit `start` (a checkpoint
