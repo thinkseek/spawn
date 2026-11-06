@@ -1132,6 +1132,7 @@ impl Judge {
             .is_ok()
         };
         let deadline = std::time::Instant::now() + PUSH_WAIT;
+        let mut pushed_again = false;
         loop {
             let pushed = sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
                 .map_err(|error| error.to_string())?;
@@ -1143,6 +1144,14 @@ impl Judge {
             );
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
                 return Ok(verdict);
+            }
+            // A recorded checkpoint whose push was lost (issue #8) is pushed
+            // again from this host's mirror, once a pass.
+            if !pushed_again && let Some(checkpoint) = checkpoint.as_deref() {
+                pushed_again = true;
+                if let Some(again) = sources::push_recorded(mirror, source, agent, checkpoint) {
+                    println!("integrate: task {}: {checkpoint} pushed again: {again:?}", task.id);
+                }
             }
             std::thread::sleep(PUSH_POLL);
         }
