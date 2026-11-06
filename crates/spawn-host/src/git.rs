@@ -472,27 +472,33 @@ impl GitWorkspace {
         self.root.join(".index").join(branch)
     }
 
-    /// Tree of the work tree in `directory`, built against `index`, and the
-    /// files over the size cap ([`max_file_bytes`]) left out of it, with
-    /// their sizes.
+    /// Tree of the work tree in `directory` for a checkpoint of `branch`
+    /// whose parent is `head`, built against `index`, and the files over
+    /// the size cap ([`max_file_bytes`]) left out of it, with their sizes.
     ///
     /// Build output and files over the cap leave the index after `add -A`,
     /// so a `.gitignore` inside the tree cannot re-include them; a file over
-    /// the cap is excluded before it is hashed.
+    /// the cap is excluded before it is hashed. The engine's runtime files
+    /// are never added, and the ones the branch already tracks are taken as
+    /// any tracked file is ([`Self::track_runtime_files`]).
     ///
-    /// A file over the cap that git already holds as a blob in one of
-    /// `kept_in` (`main`, a pending merge's `main`) stays a blob: it came
-    /// from the source (main may get one from outside Spawn), and leaving it
-    /// out of the tree would delete it from `main` when the branch lands.
+    /// A file over the cap that git already holds as a blob in `main` or a
+    /// pending merge's `main` ([`Self::source_commits`]) stays a blob: it
+    /// came from the source (main may get one from outside Spawn), and
+    /// leaving it out of the tree would delete it from `main` when the
+    /// branch lands.
     fn tree_of(
         &self,
         directory: &Path,
         index: &Path,
-        kept_in: &[String],
+        branch: &str,
+        head: &str,
     ) -> Result<(String, Vec<(TreePath, u64)>), WorkspaceError> {
         clear_dead_lock(index);
+        let pending_main = self.pending_merge(branch).map(|pending| pending.main);
+        let kept_in = self.source_commits(pending_main.as_deref());
         let (mut oversized, special) = self.left_out_files(directory, index)?;
-        let blobs = self.blobs_in(kept_in, &oversized)?;
+        let blobs = self.blobs_in(&kept_in, &oversized)?;
         oversized.retain(|(path, _)| !blobs.contains(path));
         // A special file (a FIFO, a socket, a device) is never committed:
         // `git add` refuses one at a tracked path, which would fail every
@@ -500,12 +506,13 @@ impl GitWorkspace {
         let mut left_out = oversized.clone();
         left_out.extend(special);
         self.stage_all_but(directory, index, &left_out)?;
+        self.track_runtime_files(directory, index, head, pending_main.as_deref())?;
         self.unstage(directory, index, &left_out)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the cap between the size check and `add`
         // was hashed anyway; it is left out all the same.
         let mut grown = self.oversized_blobs(&tree)?;
-        let blobs = self.blobs_in(kept_in, &grown)?;
+        let blobs = self.blobs_in(&kept_in, &grown)?;
         grown.retain(|(path, _)| !blobs.contains(path));
         if grown.is_empty() {
             return Ok((tree, oversized));
