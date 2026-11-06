@@ -735,15 +735,17 @@ enum Attempts {
 
 /// Where `task`'s current delivery into `facts`' session stands. A failure
 /// that typed nothing is tried again under a key of its own, with a wait
-<<<<<<< b950e25e38d827ef4dc53d420c8f6b4b11083840
-/// that doubles each time, [`DELIVERY_RETRIES`] times. One that may have
-/// typed the task ([`MAY_HAVE_TYPED`]) is not. A refusal because the pane
-/// was not ready ([`PANE_NOT_READY`]) is no failed attempt: nothing was
-/// tried on the worker, so it goes again after [`NOT_READY_RETRY_MS`], once
-/// the worker is ready by the delivery rules, and counts only past
-/// [`NOT_READY_FREE`] of them.
-fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
-    judge_attempts(&delivery_attempts(task, facts))
+/// that doubles each time ([`Waits::retry_ms`] first), [`DELIVERY_RETRIES`]
+/// times. One that may have typed the task ([`MAY_HAVE_TYPED`]) is not, and
+/// neither is a delivery any of whose attempts may have. A refusal because
+/// the pane was not ready ([`PANE_NOT_READY`]) is no failed attempt:
+/// nothing was tried on the worker, so it goes again after
+/// [`NOT_READY_RETRY_MS`], once the worker is ready by the delivery rules,
+/// and counts only past [`NOT_READY_FREE`] of them. A deploy's extra
+/// attempt (`-moved-`) is no retry: one that succeeds delivers the task,
+/// one that fails leaves the delivery as spent as it was.
+fn attempts(waits: &Waits, task: &TaskRow, facts: &Facts) -> Attempts {
+    judge_attempts(waits, &delivery_attempts(task, facts))
 }
 
 /// Whether a delivery's retries are spent, from its attempts (its own
@@ -751,13 +753,20 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
 /// them: the latest failed, typed nothing that may have arrived, and the
 /// failures past the free refusals for a pane not ready are more than
 /// [`DELIVERY_RETRIES`]. The scorecard counts each such delivery as a
-/// failure of the machinery (docs/design.md §15).
+/// failure of the machinery (docs/design.md §15). The waits say when a
+/// retry is due, never whether the retries are spent: the defaults do.
 pub(crate) fn delivery_spent(sent: &[&crate::dispatch::Sent]) -> bool {
-    matches!(judge_attempts(sent), Attempts::Failed { spent: true, .. })
+    matches!(
+        judge_attempts(&Waits::default(), sent),
+        Attempts::Failed { spent: true, .. }
+    )
 }
 
 /// The task and the delivery a delivery command's key names: `deliver-<task>-
 /// <revision>` (the delivery itself) or `<that>-retry-<n>` (a retry of it).
+/// A deploy's extra attempt at a spent delivery (`<that>-moved-<event>`) is
+/// none: the delivery was spent before it, and the scorecard counts the
+/// spend.
 pub(crate) fn delivery_of(key: &str) -> Option<(i64, &str)> {
     let (delivery, retry) = match key.split_once("-retry-") {
         Some((delivery, number)) => (delivery, Some(number)),
@@ -774,20 +783,9 @@ pub(crate) fn delivery_of(key: &str) -> Option<(i64, &str)> {
     Some((task.parse().ok()?, delivery))
 }
 
-/// Where a delivery stands from its attempts, oldest first ([`attempts`]).
-fn judge_attempts(sent: &[&crate::dispatch::Sent]) -> Attempts {
-=======
-/// that doubles each time ([`Waits::retry_ms`] first), [`DELIVERY_RETRIES`]
-/// times. One that may have typed the task ([`MAY_HAVE_TYPED`]) is not, and
-/// neither is a delivery any of whose attempts may have. A refusal because
-/// the pane was not ready ([`PANE_NOT_READY`]) is no failed attempt:
-/// nothing was tried on the worker, so it goes again after
-/// [`NOT_READY_RETRY_MS`], once the worker is ready by the delivery rules,
-/// and counts only past [`NOT_READY_FREE`] of them. A deploy's extra
-/// attempt (`-moved-`) is no retry: one that succeeds delivers the task,
-/// one that fails leaves the delivery as spent as it was.
-fn attempts(waits: &Waits, task: &TaskRow, facts: &Facts) -> Attempts {
-    let sent = delivery_attempts(task, facts);
+/// Where a delivery stands from its attempts, oldest first ([`attempts`]),
+/// with `waits`.
+fn judge_attempts(waits: &Waits, sent: &[&crate::dispatch::Sent]) -> Attempts {
     let Some(latest) = sent.last() else {
         return Attempts::None;
     };
@@ -808,12 +806,12 @@ fn attempts(waits: &Waits, task: &TaskRow, facts: &Facts) -> Attempts {
             last_ms,
         };
     }
-    let moved = format!("{}-moved-", task.delivery_key());
+    // A deploy's extra attempts count for nothing below.
     let sent: Vec<&crate::dispatch::Sent> = sent
-        .into_iter()
-        .filter(|sent| !sent.key.starts_with(&moved))
+        .iter()
+        .copied()
+        .filter(|sent| !sent.key.contains("-moved-"))
         .collect();
->>>>>>> 6db47689e3b230a2f83cd2f7d982cc419a2714c0
     let Some(last) = sent.last() else {
         return Attempts::None;
     };
