@@ -2059,6 +2059,73 @@ mod tests {
         assert_eq!(freed, Some(400), "a freed slot serves again");
     }
 
+    /// The whole answer to one GET of `path` with `headers` (CRLF-ended).
+    fn raw_get(port: u16, path: &str, headers: &str) -> String {
+        use std::io::{Read, Write};
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}Connection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).expect("read");
+        answer
+    }
+
+    /// The value of header `name` in a raw answer.
+    fn raw_header<'a>(answer: &'a str, name: &str) -> Option<&'a str> {
+        answer.split("\r\n\r\n").next()?.lines().find_map(|line| {
+            let (field, value) = line.split_once(':')?;
+            field.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    /// A file carries its tag; asked again with it, it is not sent again.
+    /// The build's assets are kept by the browser for good.
+    #[test]
+    fn a_file_is_tagged_and_an_unchanged_one_is_not_sent_again() {
+        let (port, web) = serving("etag", 4);
+        std::fs::write(web.join("index.html"), "<html>spawn</html>").expect("page");
+        std::fs::create_dir_all(web.join("assets")).expect("assets");
+        std::fs::write(web.join("assets/app-1a2b.js"), "1").expect("asset");
+        let first = raw_get(port, "/index.html", "");
+        let tag = raw_header(&first, "ETag").expect("a tag").to_string();
+        let page_cache = raw_header(&first, "Cache-Control").map(str::to_string);
+        let again = raw_get(port, "/index.html", &format!("If-None-Match: {tag}\r\n"));
+        let other = raw_get(port, "/index.html", "If-None-Match: W/\"0\"\r\n");
+        let asset = raw_get(port, "/assets/app-1a2b.js", "");
+        let _ = std::fs::remove_dir_all(&web);
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(first.ends_with("<html>spawn</html>"));
+        assert!(tag.starts_with("W/\""), "{tag}");
+        assert_eq!(page_cache.as_deref(), Some("no-cache"));
+        assert!(again.starts_with("HTTP/1.1 304"), "{again}");
+        assert_eq!(raw_header(&again, "ETag"), Some(tag.as_str()));
+        assert!(again.ends_with("\r\n\r\n"), "no body: {again}");
+        assert!(other.starts_with("HTTP/1.1 200"), "another tag: {other}");
+        assert_eq!(
+            raw_header(&asset, "Cache-Control"),
+            Some("public, max-age=31536000, immutable")
+        );
+    }
+
+    /// An API answer that failed carries no tag, so it is never "not
+    /// modified": a malformed id answers 400 whatever the request names.
+    #[test]
+    fn an_api_error_is_never_answered_not_modified() {
+        let (port, web) = serving("etag-error", 4);
+        let answer = raw_get(
+            port,
+            "/api/session/not%20a%20session",
+            "If-None-Match: *\r\n",
+        );
+        let _ = std::fs::remove_dir_all(&web);
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+        assert_eq!(raw_header(&answer, "ETag"), None);
+        assert_eq!(raw_header(&answer, "Cache-Control"), Some("no-cache"));
+    }
+
     #[test]
     fn a_rebound_or_cross_origin_api_read_is_refused_before_it_reaches_the_store() {
         // A malformed session id answers 400 without a store: the request
