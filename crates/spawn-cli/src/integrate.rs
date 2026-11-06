@@ -2317,7 +2317,11 @@ fn read_main(
             return Ok(Reading::Nothing);
         }
     };
-    let Some(baseline) = mission.baseline.as_deref().filter(|baseline| *baseline != main) else {
+    let Some(baseline) = mission
+        .baseline
+        .as_deref()
+        .filter(|baseline| *baseline != main)
+    else {
         return Ok(Reading::Judge(main));
     };
     if let Some(request) = held.get(source) {
