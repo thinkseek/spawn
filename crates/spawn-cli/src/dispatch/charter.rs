@@ -262,11 +262,12 @@ mod tests {
             end_cause: None,
             observation: Some(Observation {
                 ambiguity: Some(Ambiguity::TurnStoppedIdle),
-                ..Observation::new(
+                ..Observation::basic(
                     SemanticState::Waiting,
-                    "test",
-                    Confidence::new(0.9).expect("confidence"),
+                    None,
                     SessionSeq(9),
+                    Confidence::new(0.9).expect("confidence"),
+                    "jev",
                 )
             }),
             observation_event_id: Some(50),
