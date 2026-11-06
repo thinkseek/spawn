@@ -1,10 +1,11 @@
-// Read model of `/api/attention`: the "Needs a human" queue as the
-// dispatcher computes it (crates/spawn-cli/src/serve/attention.rs). The
-// server decides what is an escalation, what the supervisor was told and
+// Read model of `/api/attention`: the Escalations queue (what the
+// dispatcher raised, told to the supervisor or not, and what the supervisor
+// asks) as the dispatcher computes it (crates/spawn-cli/src/serve/attention.rs).
+// The server decides what is an escalation, what the supervisor was told and
 // whether the supervisor asks something; this module only normalizes the
 // answer and groups it for display. No dispatcher rule is repeated here.
-// It is also the UI's one definition of who needs a human (`needsHuman`):
-// the queue's count, the sidebar's, and every "needs a human" mark.
+// It is also the UI's one definition of what is escalated (`needsHuman`):
+// the queue's count, the sidebar's, and every "escalated" mark.
 //
 // Pure: no runtime imports, so `node --test` loads it as it is.
 
@@ -236,7 +237,7 @@ function byAge(left: AttentionItem, right: AttentionItem): number {
   return a - b;
 }
 
-/** The queue's sections: the supervisor's open question, then what the
+/** The queue's sections: what the supervisor asks, then what the
  * supervisor was not told yet, then what it was told and is unresolved;
  * beside them, its lines for the owner. */
 export function attentionGroups(attention: Attention): AttentionGroups {
@@ -251,19 +252,20 @@ export function attentionGroups(attention: Attention): AttentionGroups {
   };
 }
 
-/** Who needs a human: the UI's one definition, read from the dispatcher's
- * view and nothing else. */
+/** What is escalated (named `needsHuman` since task 107): the UI's one
+ * definition, read from the dispatcher's view and nothing else. A person
+ * may look at it; nothing in the fleet waits for them to. */
 export interface NeedsHuman {
   /** What a person may need to look at: every pending item, every item
    * told and unresolved, and the supervisor's open question. The queue's
    * count and the sidebar's. */
   count: number;
-  /** The sessions and agents that need a human: those with a pending or
+  /** The sessions and agents marked escalated: those with a pending or
    * told-and-unresolved item, and the supervisor while it asks something. */
   ids: ReadonlySet<string>;
 }
 
-/** Who needs a human, by `/api/attention`. A judge's `attention` flag is not
+/** What is escalated, by `/api/attention`. A judge's `attention` flag is not
  * part of it: that is the judge's opinion, shown with its judgement (the
  * dispatcher decides what to escalate, and does not escalate, for one, a
  * managed worker between tasks). Items about the host or the missions count
@@ -287,7 +289,7 @@ export function needsHuman(attention: Attention): NeedsHuman {
   };
 }
 
-/** Whether `agent` needs a human by `needs` (false while the dispatcher's
+/** Whether `agent` is escalated by `needs` (false while the dispatcher's
  * view is unknown: no mark is guessed). */
 export function agentNeedsHuman(
   needs: NeedsHuman | null,
@@ -299,7 +301,7 @@ export function agentNeedsHuman(
   );
 }
 
-/** `agents` with `attention` set to whether each needs a human by `needs`:
+/** `agents` with `attention` set to whether each is escalated by `needs`:
  * the field the board, the sidebar and their ordering read. */
 export function markNeedsHuman<T extends { session_id: string; agent_id: string; attention: boolean }>(
   agents: readonly T[],
@@ -309,4 +311,38 @@ export function markNeedsHuman<T extends { session_id: string; agent_id: string;
     const attention = agentNeedsHuman(needs, agent);
     return agent.attention === attention ? agent : { ...agent, attention };
   });
+}
+
+/** Whether the told-and-unresolved items start folded to a one-line count:
+ * when nothing is pending (nothing the supervisor was not told yet), they
+ * are old news, each already in a digest. */
+export function toldFolded(groups: AttentionGroups): boolean {
+  return groups.untold.length === 0;
+}
+
+/** What the queue shows of the supervisor's question, in at most three
+ * lines: its `HUMAN:` line, or else its reply's last paragraph; and whether
+ * the whole reply says more. */
+export interface QuestionSummary {
+  /** The line or paragraph shown; null when nothing could be read. */
+  text: string | null;
+  /** The whole reply has more than `text`: offer to show it. */
+  more: boolean;
+}
+
+/** The last paragraph of `text` (paragraphs part at a blank line). */
+export function lastParagraph(text: string): string | null {
+  const paragraphs = text
+    .split(/\n[ \t]*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => paragraph !== "");
+  return paragraphs.at(-1) ?? null;
+}
+
+export function questionSummary(question: SupervisorQuestion): QuestionSummary {
+  const reply = question.text?.trim() ?? "";
+  const human = question.human?.text.trim() ?? "";
+  const text = human !== "" ? human : lastParagraph(reply);
+  const shown = text ?? "";
+  return { text, more: reply !== "" && reply !== shown };
 }

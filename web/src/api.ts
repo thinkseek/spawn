@@ -283,7 +283,8 @@ const TOKEN_KEY = "spawn.serve.token";
 /** The token `spawn serve` wants (`SPAWN_SERVE_TOKEN`): read from the page
  * URL's `?token=` once, then kept in this browser's localStorage, so new
  * tabs, reloads and restarts of the server need no token in the URL. The
- * token only reads; a wrong one is replaced by the next `?token=`.
+ * token reads, and lets this page type into a session; a wrong one is
+ * replaced by the next `?token=`.
  *
  * The token leaves the address bar (and so history and screenshots) before
  * storage is touched: a browser whose storage throws keeps it in memory
@@ -360,10 +361,41 @@ export async function fetchOverview(signal: AbortSignal): Promise<Overview> {
   return normalizeOverview(await getJson("/api/overview", signal));
 }
 
-/** The "Needs a human" queue as the dispatcher computes it. Throws on an
+/** The Escalations queue as the dispatcher computes it. Throws on an
  * older server without `/api/attention` (404): the queue falls back. */
 export async function fetchAttention(signal: AbortSignal): Promise<Attention> {
   return normalizeAttention(await getJson("/api/attention", signal));
+}
+
+/** `POST /api/session/<id>/input` with `body` (a person's input, or the
+ * probe): the HTTP status, null when the server was not reached, and its
+ * JSON answer. The one write of the page (crates/spawn-cli/src/serve.rs):
+ * the browser adds this page's Origin, and the token goes as with reads. */
+export async function postInput(
+  sessionId: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<{ status: number | null; body: unknown }> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/session/${encodeURIComponent(sessionId)}/input`, {
+      method: "POST",
+      signal,
+      cache: "no-store",
+      headers: { ...apiHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+    return { status: null, body: null };
+  }
+  let answer: unknown = null;
+  try {
+    answer = await response.json();
+  } catch {
+    // Not JSON: the status says enough.
+  }
+  return { status: response.status, body: answer };
 }
 
 export async function fetchSession(

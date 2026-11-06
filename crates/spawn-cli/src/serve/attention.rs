@@ -1,4 +1,4 @@
-//! `GET /api/attention`: the UI's "Needs a human" queue, computed by the
+//! `GET /api/attention`: the UI's "Escalations" queue, computed by the
 //! dispatcher's own code.
 //!
 //! The escalations are the plan the dispatcher would make this moment,

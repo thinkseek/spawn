@@ -281,15 +281,22 @@ pub(crate) const SESSION_JUDGEMENTS: &str =
                            from agent_judgements where session_id = $1
                           order by session_seq desc limit $2) j";
 
-/// Commands into one session, newest first, with who sent them.
+/// Commands into one session, newest first, with who sent them, and
+/// `waiting`: whether the Bridge recorded the command's `command.step`
+/// `waiting` (keyed `cmd_<id>:waiting`): an unfinished input that waits for
+/// the session's turn, or a finished one that waited before it was typed.
 /// `$1` session, `$2` limit.
 pub(crate) const SESSION_COMMANDS: &str =
     "select coalesce(jsonb_agg(row_to_json(c) order by c.command_id desc), '[]'::jsonb)
-                   from (select id as command_id, principal, action ->> 'type' as action,
-                                left(coalesce(action ->> 'prompt', action ->> 'text'), 600) as text,
-                                state, succeeded, error, created_at_ms, finished_at_ms
-                           from spawn_commands where session_id = $1
-                          order by id desc limit $2) c";
+                   from (select k.id as command_id, k.principal, k.action ->> 'type' as action,
+                                left(coalesce(k.action ->> 'prompt', k.action ->> 'text'), 600) as text,
+                                k.state, k.succeeded, k.error, k.created_at_ms, k.finished_at_ms,
+                                exists (select 1 from spawn_events w
+                                         where w.session_id = k.session_id and w.source = 'bridge'
+                                           and w.source_event_id = 'cmd_' || k.id || ':waiting')
+                                  as waiting
+                           from spawn_commands k where k.session_id = $1
+                          order by k.id desc limit $2) c";
 
 /// The files main's merges into a session's branch changed that no
 /// delivery has told the worker of yet: those of every `base_merged`

@@ -5,9 +5,12 @@ import {
   agentNeedsHuman,
   attentionGroups,
   itemSince,
+  lastParagraph,
   markNeedsHuman,
   needsHuman,
   normalizeAttention,
+  questionSummary,
+  toldFolded,
 } from "../src/attention.ts";
 import { groupAgents, fleetContext } from "../src/ordering.ts";
 
@@ -361,4 +364,40 @@ test("the supervisor's lines for the owner are read, not counted", () => {
   // An older server sends none.
   delete raw.supervisor.for_owner;
   assert.deepEqual(normalizeAttention(raw).supervisor?.for_owner, []);
+});
+
+test("the supervisor asks in at most its HUMAN: line, else its reply's last paragraph", () => {
+  const view = normalizeAttention(answer());
+  const question = view.supervisor?.question;
+  assert.ok(question);
+  assert.deepEqual(questionSummary(question), {
+    text: "Should I stop `objective_87` now?",
+    more: true,
+  });
+  // No HUMAN: line: the last paragraph of the reply, not the whole reply.
+  const reply = "Status at 11:37.\n\nWorkers:\n- task 92 passed\n\n  \nYour decisions:\n1. Accept 92?\n2. Allow 97?\n";
+  assert.deepEqual(questionSummary({ ...question, text: reply, human: null }), {
+    text: "Your decisions:\n1. Accept 92?\n2. Allow 97?",
+    more: true,
+  });
+  // A reply of one paragraph is all there is: nothing more to show.
+  assert.deepEqual(questionSummary({ ...question, text: "Shall I go on?", human: null }), {
+    text: "Shall I go on?",
+    more: false,
+  });
+  assert.deepEqual(questionSummary({ ...question, text: null, human: null }), {
+    text: null,
+    more: false,
+  });
+  assert.equal(lastParagraph(" \n\n "), null);
+  assert.equal(lastParagraph("one\ntwo"), "one\ntwo", "a single line break is no paragraph");
+});
+
+test("told and unresolved items fold to a count when nothing is pending", () => {
+  const view = normalizeAttention(answer());
+  assert.equal(toldFolded(attentionGroups(view)), false, "three pending: shown");
+  const calm = attentionGroups({ ...view, pending: [] });
+  assert.equal(toldFolded(calm), true);
+  assert.equal(calm.told.length, 2, "folded, still counted");
+  assert.equal(calm.count, needsHuman({ ...view, pending: [] }).count);
 });

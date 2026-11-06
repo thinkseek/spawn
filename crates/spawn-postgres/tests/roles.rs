@@ -79,7 +79,8 @@ impl Drop for Database {
         let logins: Vec<String> = client
             .query(
                 "select rolname::text from pg_roles
-                  where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1)",
+                  where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
+                                    'spawn_human_' || $1)",
                 &[&self.name],
             )
             .map(|rows| rows.iter().map(|row| row.get(0)).collect())

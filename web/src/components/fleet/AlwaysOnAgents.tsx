@@ -156,7 +156,7 @@ function AlwaysOnTile({
             </span>
           )}
           {engine && <span className="text-faint-foreground">· {engine}</span>}
-          {agent.attention && <span className="font-medium text-warning">· needs a human</span>}
+          {agent.attention && <span className="font-medium text-warning">· escalated</span>}
         </dd>
 
         <dt className="text-faint-foreground">Last activity</dt>
