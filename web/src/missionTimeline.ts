@@ -21,6 +21,9 @@
  * halted mission it is stalled rather than live. */
 
 import type { Mission, MissionTask } from "./missions";
+import { compareMissions, missionName } from "./ordering.ts";
+
+export { missionName };
 
 export type Phase = "queued" | "working" | "review" | "gate" | "landing" | "revise";
 
@@ -113,7 +116,7 @@ export interface Lane {
 }
 
 export interface MissionTimeline {
-  /** Newest activity first. */
+  /** In the missions' order (ordering.ts, compareMissions). */
   lanes: Lane[];
   start: number;
   end: number;
@@ -144,19 +147,6 @@ const TERMINAL: Record<string, Outcome> = {
   aborted: "aborted",
   cancelled: "cancelled",
 };
-
-/** A mission's short name: its text up to a colon, else its first words. */
-export function missionName(mission: Pick<Mission, "id" | "text">): string {
-  const text = (mission.text ?? "").trim().replace(/\s+/g, " ");
-  if (!text) return mission.id !== null ? `Mission ${mission.id}` : "Mission";
-  const colon = text.indexOf(":");
-  if (colon > 0 && colon <= 40) return text.slice(0, colon);
-  const sentence = text.split(/(?<=[.!?])\s/)[0];
-  if (sentence.length <= 48) return sentence.replace(/[.!?]$/, "");
-  const cut = sentence.slice(0, 47);
-  const space = cut.lastIndexOf(" ");
-  return `${(space > 24 ? cut.slice(0, space) : cut).trimEnd()}…`;
-}
 
 export function laneState(mission: Pick<Mission, "state" | "halted">): LaneState {
   if (mission.halted) return "halted";
@@ -410,9 +400,9 @@ export function deriveMissionTimeline(
       lastActivity,
     });
   }
-  lanes.sort(
-    (a, b) => b.lastActivity - a.lastActivity || (b.mission.id ?? 0) - (a.mission.id ?? 0),
-  );
+  // The one mission order (ordering.ts): open missions, then idle active
+  // ones, then closed ones, each by its latest recorded activity.
+  lanes.sort((a, b) => compareMissions(a.mission, b.mission));
   if (!Number.isFinite(start)) {
     start = now;
     end = now;

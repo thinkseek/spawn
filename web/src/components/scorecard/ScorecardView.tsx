@@ -2,9 +2,9 @@ import { CalendarDays, Gauge, OctagonAlert, Target } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { usePoll } from "../../api";
-import { relativeTime } from "../../format";
+import { absoluteTitle, localDateTime, relativeTime } from "../../format";
 import type { Missions } from "../../missions";
-import { fetchMissions } from "../../missions";
+import { isQuietScope, orderScopes } from "../../ordering";
 import type {
   DimensionKey,
   Dimensions,
@@ -22,7 +22,6 @@ import {
   directionLabel,
   fetchScorecard,
   formatValue,
-  isoUtc,
   nUnit,
   rawTitle,
   scopeLabel,
@@ -59,10 +58,10 @@ interface Loaded {
  * How the fleet and each mission did over a window: throughput, lead time,
  * first-pass quality, rework, autonomy, reliability, cost and gate time,
  * each against the previous window of the same length. Strictly read-only:
- * the only requests are GET /api/scorecard (and GET /api/missions, for the
- * missions' titles).
+ * the only requests are GET /api/scorecard (and GET /api/missions, polled by
+ * App, for the missions' titles and order).
  */
-export function ScorecardView() {
+export function ScorecardView({ missions }: { missions: Missions | null }) {
   useNow(10_000);
   const [since, chooseSince] = useStoredChoice<WindowPreset>(
     "spawn.scorecard.window",
@@ -79,16 +78,19 @@ export function ScorecardView() {
     }),
     POLL_MS,
   );
-  const missions = usePoll<Missions>("scorecard-missions", fetchMissions, POLL_MS);
   const data = scorecard.data?.card ?? null;
 
   const titles = useMemo(() => {
     const out = new Map<number, string>();
-    for (const entry of missions.data?.missions ?? []) {
+    for (const entry of missions?.missions ?? []) {
       if (entry.id !== null) out.set(entry.id, firstLine(entry.text) ?? "");
     }
     return out;
-  }, [missions.data]);
+  }, [missions]);
+  const scopes = useMemo(
+    () => (data ? orderScopes(data.scopes, missions?.missions ?? []) : []),
+    [data, missions],
+  );
 
   // Every mission the scorecard has answered for stays a choice, so picking
   // one does not hide the others.
@@ -181,7 +183,7 @@ export function ScorecardView() {
               </div>
             )}
             <WindowCard card={data} />
-            {data.scopes.length === 0 ? (
+            {scopes.length === 0 ? (
               <Card>
                 <EmptyState
                   icon={<Gauge size={20} />}
@@ -190,14 +192,23 @@ export function ScorecardView() {
                 />
               </Card>
             ) : (
-              data.scopes.map((scope, index) => (
-                <ScopeCard
-                  key={`${scope.scope}-${scope.mission ?? "all"}-${index}`}
-                  scope={scope}
-                  minN={data.min_n}
-                  title={scope.mission === null ? null : (titles.get(scope.mission) ?? null)}
+              <>
+                {scopes
+                  .filter((scope) => !isQuietScope(scope))
+                  .map((scope, index) => (
+                    <ScopeCard
+                      key={`${scope.scope}-${scope.mission ?? "all"}-${index}`}
+                      scope={scope}
+                      minN={data.min_n}
+                      title={scope.mission === null ? null : (titles.get(scope.mission) ?? null)}
+                    />
+                  ))}
+                <QuietScopes
+                  scopes={scopes.filter(isQuietScope)}
+                  window={since}
+                  titles={titles}
                 />
-              ))
+              </>
             )}
           </div>
         </div>
@@ -268,29 +279,20 @@ function WindowCard({ card }: { card: Scorecard }) {
       <CardHeader
         icon={<CalendarDays size={14} />}
         title="Window"
-        meta={<span>times in UTC</span>}
+        meta={<span>local time · hover for UTC</span>}
       />
       <div className="grid grid-cols-1 gap-x-4 gap-y-2 px-4 py-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Fact label="Since" mono>
-          <span title={card.since_ms === null ? undefined : String(card.since_ms)}>
-            {isoUtc(card.since_ms)}
-          </span>
+        <Fact label="Since">
+          <WindowTime ms={card.since_ms} />
         </Fact>
-        <Fact label="Until" mono>
-          <span title={card.until_ms === null ? undefined : String(card.until_ms)}>
-            {isoUtc(card.until_ms)}
-          </span>
+        <Fact label="Until">
+          <WindowTime ms={card.until_ms} />
         </Fact>
-        <Fact label="Previous window since" mono>
-          <span
-            title={
-              card.previous_since_ms === null
-                ? undefined
-                : `${String(card.previous_since_ms)}; the previous window runs up to this window's start`
-            }
-          >
-            {isoUtc(card.previous_since_ms)}
-          </span>
+        <Fact label="Previous window since">
+          <WindowTime
+            ms={card.previous_since_ms}
+            note="the previous window runs up to this window's start"
+          />
         </Fact>
         <Fact label="Minimum n">
           <span
@@ -301,6 +303,61 @@ function WindowCard({ card }: { card: Scorecard }) {
           </span>
         </Fact>
       </div>
+    </Card>
+  );
+}
+
+/** A window bound in local time; UTC (and the raw milliseconds) in the
+ * tooltip. */
+function WindowTime({ ms, note }: { ms: number | null; note?: string }) {
+  if (ms === null) return <span className="text-faint-foreground">—</span>;
+  return (
+    <time
+      dateTime={new Date(ms).toISOString()}
+      className="tnum"
+      title={`${absoluteTitle(ms)} · ${ms} ms${note ? `; ${note}` : ""}`}
+    >
+      {localDateTime(ms)}
+      <span className="ml-1.5 text-muted-foreground">({relativeTime(ms)})</span>
+    </time>
+  );
+}
+
+/** Missions with no landing in the window: one line each, not a grid of
+ * "not enough data". */
+function QuietScopes({
+  scopes,
+  window,
+  titles,
+}: {
+  scopes: ScorecardScope[];
+  window: WindowPreset;
+  titles: Map<number, string>;
+}) {
+  if (scopes.length === 0) return null;
+  return (
+    <Card className="min-w-0">
+      <ul className="divide-y divide-surface-border">
+        {scopes.map((scope, index) => {
+          const title = scope.mission === null ? null : titles.get(scope.mission);
+          return (
+            <li
+              key={`${scope.mission ?? "all"}-${index}`}
+              className="flex min-w-0 items-center gap-2 px-4 py-2 text-caption"
+            >
+              <Target size={13} aria-hidden="true" className="shrink-0 text-faint-foreground" />
+              <span className="shrink-0 font-medium text-muted-foreground">
+                {scopeLabel(scope)} · no landings in {window}
+              </span>
+              {title && (
+                <span className="min-w-0 truncate text-faint-foreground" title={title}>
+                  {title}
+                </span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
     </Card>
   );
 }
