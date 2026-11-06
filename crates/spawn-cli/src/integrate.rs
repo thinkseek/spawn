@@ -2158,9 +2158,10 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 mod tests {
     use super::{
         Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, no_room,
-        over_budget, pinned, report_freshness, room_backoff, room_wait, task_scenario,
+        over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
+        task_scenario,
     };
-    use crate::gate::GateFailure;
+    use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
 
     /// One gate at a time unless the test server is per gate: more is
@@ -3362,6 +3363,83 @@ mod tests {
         assert_eq!(at(&waiting, 500), false, "told once per run");
         // And it never counts toward the halt the mission already nears.
         assert_eq!(halt_reason(&waiting, 0), None);
+    }
+
+    /// Objective 018: every `no_room` names its check, what it measured and
+    /// the threshold, in its fields and in its reason; a disk one keeps the
+    /// fields and wording it had; the database's names the server, never
+    /// the URL; and escalation is the run's, whatever the check.
+    #[test]
+    fn a_no_room_names_its_check_measure_and_threshold() {
+        let waiting = mission(0, 0, 0);
+        let disk = no_room(&waiting, 4, 3 * 1_048_576, 10, "/data/tmp", "log", 0);
+        assert_eq!(
+            (&disk["check"], &disk["measured"], &disk["threshold"]),
+            (&json!("disk"), &json!(3 * 1_048_576), &json!(10 * 1_048_576))
+        );
+        assert_eq!(
+            (&disk["free_kb"], &disk["min_gb"], &disk["tmpdir"]),
+            (&json!(3 * 1_048_576), &json!(10), &json!("/data/tmp"))
+        );
+
+        let memory = short_of_room(
+            &waiting,
+            4,
+            &Shortfall::Memory {
+                available_mb: 1500,
+                min_mb: 2048,
+            },
+            "memory: 1500 MiB available\n",
+            0,
+        );
+        assert_eq!(
+            memory["reason"],
+            "no room to judge now: the host's memory has 1500 MiB available (MemAvailable), \
+             under SPAWN_GATE_MIN_FREE_MEMORY_MB=2048; not a verdict, judged again later"
+        );
+        assert_eq!(
+            (&memory["check"], &memory["measured"], &memory["threshold"]),
+            (&json!("memory"), &json!(1500), &json!(2048))
+        );
+        assert_eq!(memory["log"], "memory: 1500 MiB available\n");
+        assert_eq!(memory["escalate"], false);
+        assert!(memory.get("free_kb").is_none() && memory.get("tmpdir").is_none());
+
+        let error = "ERROR: could not resize shared memory segment \"/PostgreSQL.2\" to 8388608 \
+                     bytes: No space left on device (53100)";
+        let database = Shortfall::Database {
+            server: "/var/run/test-pg:5433/spawn_test".to_string(),
+            probe: "a parallel query within 10 s".to_string(),
+            error: error.to_string(),
+        };
+        let record = short_of_room(&waiting, 4, &database, "", 0);
+        assert_eq!(
+            (&record["check"], &record["measured"], &record["threshold"]),
+            (
+                &json!("database"),
+                &json!(error),
+                &json!("a parallel query within 10 s")
+            )
+        );
+        assert_eq!(record["server"], "/var/run/test-pg:5433/spawn_test");
+        let reason = record["reason"].as_str().expect("a reason");
+        assert!(
+            reason.starts_with(
+                "no room to judge now: the test database (/var/run/test-pg:5433/spawn_test) \
+                 failed the probe \"a parallel query within 10 s\": ERROR: could not resize"
+            ) && reason.ends_with("not a verdict, judged again later"),
+            "{reason}"
+        );
+
+        // Two hours into the task's run: the first record escalates,
+        // whichever check fell short.
+        let mut long = mission(0, 0, 0);
+        long.gate_room_task = Some(4);
+        long.gate_room_since_ms = Some(0);
+        assert_eq!(
+            short_of_room(&long, 4, &database, "", 121 * MINUTE)["escalate"],
+            true
+        );
     }
 
     #[test]
