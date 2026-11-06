@@ -58,7 +58,9 @@ pub(crate) const GATE_ENV: &[&str] = &[
     "RUSTUP_HOME",
     "SPAWN_TEST_DATABASE_URL",
     // The free space the gate wants in TMPDIR before it starts
-    // (scripts/disk.sh); read outside the sandbox only.
+    // (scripts/disk.sh); read outside the sandbox only. The integrator
+    // checks the same floor before it starts the gate ([`Room`]); its
+    // memory floor, SPAWN_GATE_MIN_FREE_MEMORY_MB, is its own and stays out.
     "SPAWN_GATE_MIN_FREE_GB",
 ];
 
@@ -336,7 +338,7 @@ impl Room {
             log.push_str("database: SPAWN_TEST_DATABASE_URL is unset, nothing to check\n");
             return Ok(log);
         };
-        let server = server_of(url);
+        let server = without_password(&server_of(url), url);
         match (self.probe)(url) {
             Ok(()) => {
                 let _ = writeln!(
