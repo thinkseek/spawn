@@ -330,7 +330,7 @@ export function HealthStrip({
         }
         className="sm:col-span-2 xl:col-span-1"
       >
-        <div className="flex items-baseline gap-2" title={HUMAN_RATE_HINT}>
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5" title={HUMAN_RATE_HINT}>
           <span
             className={cx(
               "tnum text-title-sm leading-none font-semibold",
@@ -343,10 +343,10 @@ export function HealthStrip({
           >
             {formatRate(humanRate)}
           </span>
-          <span className="cursor-help text-caption text-muted-foreground underline decoration-dotted underline-offset-2">
+          <span className="cursor-help whitespace-nowrap text-caption text-muted-foreground underline decoration-dotted underline-offset-2">
             human per agent-hour
           </span>
-          <span className="tnum ml-auto text-caption text-muted-foreground">
+          <span className="tnum ml-auto whitespace-nowrap text-caption text-faint-foreground">
             {health.ladder_24h.human} human ·{" "}
             {health.agent_hours_24h == null ? "—" : health.agent_hours_24h.toFixed(1)} agent-h
           </span>
