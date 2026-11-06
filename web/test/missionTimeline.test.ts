@@ -402,7 +402,7 @@ test("a cancellation's note is not a send-back's reason", () => {
   assert.equal(bar!.verdicts.at(-1)!.reason, null);
 });
 
-test("lanes: newest activity first, counts, state, and the halted mission", () => {
+test("lanes: in the missions' order (open, idle, closed), counts, state, and the halted mission", () => {
   const supply = mission(6, [
     task(16, "landed", [["assigned", 0], ["delivered", 1], ["reported", 5], ["gated", 6, "accepted"], ["landed", 7]]),
     task(17, "landed", [["assigned", 10], ["delivered", 11], ["reported", 15], ["gated", 16, "rejected"], ["delivered", 17], ["reported", 19], ["gated", 20, "accepted"], ["landed", 21]]),
