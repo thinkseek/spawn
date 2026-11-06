@@ -104,7 +104,8 @@ with
      where coalesce(x.ended_at_ms, now.ms) > now.ms - 86400000),
   events as (
     select e.event_name from spawn_events e, now
-     where e.recorded_at_ms > now.ms - 3600000)
+     where e.event_name in ('tool.started', 'tool.failed', 'turn.failed')
+       and e.recorded_at_ms > now.ms - 3600000)
 select jsonb_build_object(
   'generated_at_ms', (select ms from now),
   'agents_total', (select count(*) from agent_status),
