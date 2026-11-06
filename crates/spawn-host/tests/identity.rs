@@ -265,15 +265,11 @@ fn events(store: &MemoryStore) -> Vec<NewEvent> {
         .collect()
 }
 
-/// End to end through the Bridge, a real tmux and a scripted engine that
-/// files its transcript as Claude Code does (under its resolved working
-/// directory): the engine's turn reaches the log. Before the root was
-/// resolved the Bridge watched the literal directory's transcript, which
-/// never received a line, and the turn was never read.
-#[test]
-fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
-    let _exclusive = exclusive();
-    let world = World::new("bridge");
+/// The scripted engine's kit under `world`: a tmux server of the test's
+/// own, a runner standing in for `spawn run` (runs the engine, writes its
+/// exit status), and an engine that files its transcript as Claude Code
+/// does, under its resolved working directory, one turn per typed line.
+fn scripted(world: &World) -> (Server, BridgeConfig) {
     let bin = world.base.join("bin");
     fs::create_dir_all(&bin).expect("bin");
     let projects = world.base.join("projects");
@@ -286,13 +282,11 @@ fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
         ),
         socket,
     };
-    // `spawn run -- <engine> ...`: run the engine, write its exit status.
     let runner = script(
         &bin,
         "runner",
         "#!/bin/sh\nshift 2\n\"$@\"\ncode=$?\nprintf %s \"$code\" >\"$SPAWN_EXIT_FILE\"\nexit $code\n",
     );
-    // Claude Code's transcript lives under its resolved working directory.
     let engine = script(
         &bin,
         "claude",
@@ -321,6 +315,19 @@ done
     config.claude_program = engine;
     config.claude_projects = projects.display().to_string();
     config.environment = vec![("PROJECTS".to_string(), projects.display().to_string())];
+    (server, config)
+}
+
+/// End to end through the Bridge, a real tmux and the scripted engine
+/// ([`scripted`]): the engine's turn reaches the log. Before the root was
+/// resolved the Bridge watched the literal directory's transcript, which
+/// never received a line, and the turn was never read.
+#[test]
+fn the_bridge_reads_the_turn_of_an_engine_under_a_symlinked_root() {
+    let _exclusive = exclusive();
+    let world = World::new("bridge");
+    let (server, config) = scripted(&world);
+    let projects = PathBuf::from(&config.claude_projects);
     let terminals = Arc::new(TmuxHost::local(&server.program));
     let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
     let memory = Arc::new(MemoryStore::new("shop", clock.clone()));
