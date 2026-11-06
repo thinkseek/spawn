@@ -75,7 +75,10 @@ from (
   join spawn_session_state p using (session_id)
 ) a";
 
-/// How the fleet and the decision ladder did over the last hour and day.
+/// How the fleet and the decision ladder did over the last hour and day,
+/// and each gated mission's gate-room waits. Who needs a human is not
+/// here: that is the dispatcher's own view (`GET /api/attention`), and a
+/// judge's `attention` flag is only its opinion, on each judgement.
 pub(crate) const FLEET_HEALTH: &str = r"
 with
   now as (select spawn_now_ms() as ms),
@@ -103,8 +106,16 @@ select jsonb_build_object(
   'by_state', (select coalesce(jsonb_object_agg(state, n), '{}'::jsonb)
                  from (select coalesce(state, 'UNKNOWN') as state, count(*) as n
                          from agent_status group by 1) t),
-  'attention', (select count(*) from spawn_session_state
-                 where coalesce((observation ->> 'attention')::boolean, false)),
+  -- Each gated mission's run of `no_room` gate outcomes (one task's, the
+  -- integrator's fold): open or active missions, and any whose run goes on.
+  'gate_room', (select coalesce(jsonb_agg(jsonb_build_object(
+                   'mission', m.id, 'text', left(m.text, 200), 'task', m.gate_room_task,
+                   'since_ms', m.gate_room_since_ms, 'last_ms', m.gate_room_last_ms,
+                   'waits', m.gate_room_waits, 'escalated', m.gate_room_escalated)
+                   order by m.id), '[]'::jsonb)
+                  from mission_missions m
+                 where m.gate is not null
+                   and (m.state in ('open', 'active') or m.gate_room_task is not null)),
   'last_hour', jsonb_build_object(
     'judgements', (select count(*) from hour),
     'by_judge', (select coalesce(jsonb_object_agg(judge, n), '{}'::jsonb)
