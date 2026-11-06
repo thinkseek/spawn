@@ -53,9 +53,401 @@ pub(crate) const NO_ROOM_EXIT: i32 = 5;
 /// The gate's floor when SPAWN_GATE_MIN_FREE_GB is unset (scripts/disk.sh).
 const DEFAULT_MIN_FREE_GB: u64 = 10;
 
+/// The integrator's floor on available memory when
+/// SPAWN_GATE_MIN_FREE_MEMORY_MB is unset, in MiB.
+const DEFAULT_MIN_FREE_MEMORY_MB: u64 = 2048;
+
+/// How long the test database has to connect, and then to run the parallel
+/// query ([`Room`]).
+const DATABASE_PROBE_LIMIT: Duration = Duration::from_secs(10);
+
 /// Free KiB of the filesystem holding a path, as this host reports it now.
 fn measured_free_kb(path: &Path) -> Option<u64> {
     crate::disk::free_bytes(path).ok().map(|bytes| bytes / 1024)
+}
+
+/// MiB of memory this host has available now: `MemAvailable` of
+/// /proc/meminfo.
+fn measured_available_mb() -> Option<u64> {
+    available_mb(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// The `MemAvailable` line of a /proc/meminfo text, in whole MiB.
+fn available_mb(meminfo: &str) -> Option<u64> {
+    let line = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let mut words = line.split_whitespace();
+    let kib: u64 = words.next()?.parse().ok()?;
+    matches!(words.next(), None | Some("kB")).then_some(kib / 1024)
+}
+
+/// The test database's probe, as `spawn integrate` runs it.
+fn probed_database(url: &str) -> Result<(), spawn_postgres::ProbeFailure> {
+    spawn_postgres::parallel_query_probe(url, DATABASE_PROBE_LIMIT)
+}
+
+/// Free KiB of the filesystem holding a path ([`Room`]'s disk measure).
+pub(crate) type FreeKb = dyn Fn(&Path) -> Option<u64> + Send + Sync;
+/// Available MiB of memory ([`Room`]'s memory measure).
+pub(crate) type AvailableMb = dyn Fn() -> Option<u64> + Send + Sync;
+/// The test database's probe by URL ([`Room`]'s database measure).
+pub(crate) type DatabaseProbe = dyn Fn(&str) -> Result<(), spawn_postgres::ProbeFailure> + Send + Sync;
+
+/// What the integrator measures before it starts a gate, and against what
+/// (objective 018). At the start of each judging, after the candidate is
+/// built and before the gate starts, [`Room::check`] measures, in this
+/// order, stopping at the first that falls short:
+///
+/// 1. disk: the free KiB (`df`) of the gate's TMPDIR (the `TMPDIR` of the
+///    gate's environment, `/tmp` when unset) against
+///    SPAWN_GATE_MIN_FREE_GB (default 10), the floor `scripts/disk.sh`
+///    reads too: one floor, one meaning;
+/// 2. memory: `MemAvailable` in MiB against SPAWN_GATE_MIN_FREE_MEMORY_MB
+///    (default 2048), read by the integrator only;
+/// 3. database: when SPAWN_TEST_DATABASE_URL is set in the integrator's
+///    environment (whatever [`withhold_owners_cluster`] later decides for
+///    the gate), a connection within 10 s, then a forced parallel query
+///    within 10 s ([`spawn_postgres::parallel_query_probe`]). Any error
+///    fails it.
+///
+/// A threshold of 0 disables its check; one that does not parse is an
+/// abort ([`RoomFailure::Bad`]), as a bad floor is to the gate (exit 3). A
+/// measure that cannot be read decides nothing: the gate runs, and checks
+/// its own floor. The three measures are seams for tests.
+#[derive(Clone)]
+pub(crate) struct Room {
+    /// SPAWN_GATE_MIN_FREE_MEMORY_MB as the integrator's environment sets it.
+    min_free_memory_mb: Option<String>,
+    /// SPAWN_TEST_DATABASE_URL as the integrator's environment sets it.
+    test_database_url: Option<String>,
+    free_kb: std::sync::Arc<FreeKb>,
+    available_mb: std::sync::Arc<AvailableMb>,
+    probe: std::sync::Arc<DatabaseProbe>,
+}
+
+/// What fell short before a gate: the check, what it measured, and the
+/// threshold it measured against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Shortfall {
+    /// Free KiB in the gate's TMPDIR under SPAWN_GATE_MIN_FREE_GB (GiB).
+    Disk {
+        free_kb: u64,
+        min_gb: u64,
+        tmpdir: String,
+    },
+    /// Available MiB under SPAWN_GATE_MIN_FREE_MEMORY_MB.
+    Memory { available_mb: u64, min_mb: u64 },
+    /// The test database failed a probe: the server (host:port/database or
+    /// the socket directory, never the password), the probe and its error.
+    Database {
+        server: String,
+        probe: String,
+        error: String,
+    },
+}
+
+impl Shortfall {
+    /// The check's name in the record: `disk`, `memory` or `database`.
+    pub(crate) fn check(&self) -> &'static str {
+        match self {
+            Self::Disk { .. } => "disk",
+            Self::Memory { .. } => "memory",
+            Self::Database { .. } => "database",
+        }
+    }
+
+    /// What the check measured: free KiB, available MiB, or the error.
+    pub(crate) fn measured(&self) -> serde_json::Value {
+        match self {
+            Self::Disk { free_kb, .. } => (*free_kb).into(),
+            Self::Memory { available_mb, .. } => (*available_mb).into(),
+            Self::Database { error, .. } => error.as_str().into(),
+        }
+    }
+
+    /// What it measured against: the floor in KiB, the floor in MiB, or
+    /// the probe it failed.
+    pub(crate) fn threshold(&self) -> serde_json::Value {
+        match self {
+            Self::Disk { min_gb, .. } => min_gb.saturating_mul(1_048_576).into(),
+            Self::Memory { min_mb, .. } => (*min_mb).into(),
+            Self::Database { probe, .. } => probe.as_str().into(),
+        }
+    }
+
+    /// The measure against its threshold, in one line for the log.
+    fn line(&self) -> String {
+        match self {
+            Self::Disk {
+                free_kb,
+                min_gb,
+                tmpdir,
+            } => format!(
+                "disk: {free_kb} KiB free in {tmpdir} (TMPDIR), under SPAWN_GATE_MIN_FREE_GB={min_gb} \
+                 ({} KiB)",
+                min_gb.saturating_mul(1_048_576)
+            ),
+            Self::Memory {
+                available_mb,
+                min_mb,
+            } => format!(
+                "memory: {available_mb} MiB available (MemAvailable), under \
+                 SPAWN_GATE_MIN_FREE_MEMORY_MB={min_mb}"
+            ),
+            Self::Database {
+                server,
+                probe,
+                error,
+            } => format!("database: the test database ({server}) failed \"{probe}\": {error}"),
+        }
+    }
+}
+
+/// Why [`Room::check`] says the gate may not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RoomFailure {
+    /// A check fell short: no room to judge now, not a verdict. `log` lists
+    /// every check made, with its measure and threshold.
+    Short { short: Shortfall, log: String },
+    /// A threshold that does not parse: an abort, as the gate's exit 3 for a
+    /// bad SPAWN_GATE_MIN_FREE_GB.
+    Bad(String),
+}
+
+impl Room {
+    /// The checks as the integrator's environment (`lookup`) sets them, on
+    /// this host's measures.
+    pub(crate) fn from_env(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let set = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        Self {
+            min_free_memory_mb: set("SPAWN_GATE_MIN_FREE_MEMORY_MB"),
+            test_database_url: set("SPAWN_TEST_DATABASE_URL"),
+            free_kb: std::sync::Arc::new(measured_free_kb),
+            available_mb: std::sync::Arc::new(measured_available_mb),
+            probe: std::sync::Arc::new(probed_database),
+        }
+    }
+
+    /// These checks on other measures (tests).
+    #[cfg(test)]
+    pub(crate) fn measured_by(
+        self,
+        free_kb: impl Fn(&Path) -> Option<u64> + Send + Sync + 'static,
+        available_mb: impl Fn() -> Option<u64> + Send + Sync + 'static,
+        probe: impl Fn(&str) -> Result<(), spawn_postgres::ProbeFailure> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            free_kb: std::sync::Arc::new(free_kb),
+            available_mb: std::sync::Arc::new(available_mb),
+            probe: std::sync::Arc::new(probe),
+            ..self
+        }
+    }
+
+    /// Measure the host before a gate whose environment is `env`
+    /// ([`gate_env`]): its TMPDIR and SPAWN_GATE_MIN_FREE_GB come from
+    /// there. `Ok` with the log of the checks made when the gate may run.
+    pub(crate) fn check(&self, env: &[(String, String)]) -> Result<String, RoomFailure> {
+        let min_gb = threshold(
+            "SPAWN_GATE_MIN_FREE_GB",
+            env_value(env, "SPAWN_GATE_MIN_FREE_GB"),
+            DEFAULT_MIN_FREE_GB,
+            "GiB",
+        )?;
+        let min_mb = threshold(
+            "SPAWN_GATE_MIN_FREE_MEMORY_MB",
+            self.min_free_memory_mb.as_deref(),
+            DEFAULT_MIN_FREE_MEMORY_MB,
+            "MiB",
+        )?;
+        let mut log = String::new();
+        let short = |short: Shortfall, mut log: String| {
+            let _ = writeln!(log, "{}: the gate did not run", short.line());
+            Err(RoomFailure::Short { short, log })
+        };
+        if min_gb == 0 {
+            log.push_str("disk: SPAWN_GATE_MIN_FREE_GB=0, not checked\n");
+        } else {
+            let tmpdir = env_value(env, "TMPDIR").unwrap_or("/tmp");
+            match (self.free_kb)(Path::new(tmpdir)) {
+                None => {
+                    let _ = writeln!(
+                        log,
+                        "disk: the free space of {tmpdir} (TMPDIR) cannot be read; the gate \
+                         checks it itself"
+                    );
+                }
+                Some(free_kb) if free_kb < min_gb.saturating_mul(1_048_576) => {
+                    let disk = Shortfall::Disk {
+                        free_kb,
+                        min_gb,
+                        tmpdir: tmpdir.to_string(),
+                    };
+                    return short(disk, log);
+                }
+                Some(free_kb) => {
+                    let _ = writeln!(
+                        log,
+                        "disk: {free_kb} KiB free in {tmpdir} (TMPDIR), SPAWN_GATE_MIN_FREE_GB={min_gb}: ok"
+                    );
+                }
+            }
+        }
+        if min_mb == 0 {
+            log.push_str("memory: SPAWN_GATE_MIN_FREE_MEMORY_MB=0, not checked\n");
+        } else {
+            match (self.available_mb)() {
+                None => log.push_str("memory: MemAvailable cannot be read; not checked\n"),
+                Some(available_mb) if available_mb < min_mb => {
+                    let memory = Shortfall::Memory {
+                        available_mb,
+                        min_mb,
+                    };
+                    return short(memory, log);
+                }
+                Some(available_mb) => {
+                    let _ = writeln!(
+                        log,
+                        "memory: {available_mb} MiB available, SPAWN_GATE_MIN_FREE_MEMORY_MB={min_mb}: ok"
+                    );
+                }
+            }
+        }
+        let Some(url) = self.test_database_url.as_deref() else {
+            log.push_str("database: SPAWN_TEST_DATABASE_URL is unset, nothing to check\n");
+            return Ok(log);
+        };
+        let server = server_of(url);
+        match (self.probe)(url) {
+            Ok(()) => {
+                let _ = writeln!(
+                    log,
+                    "database: the test database ({server}) connected and ran a parallel query: ok"
+                );
+                Ok(log)
+            }
+            Err(failure) => {
+                let database = Shortfall::Database {
+                    server,
+                    probe: without_password(&failure.probe, url),
+                    error: without_password(&failure.error, url),
+                };
+                short(database, log)
+            }
+        }
+    }
+}
+
+/// A threshold from its text (`None`: unset, the default): whole units, as
+/// `scripts/disk.sh` reads SPAWN_GATE_MIN_FREE_GB.
+fn threshold(name: &str, text: Option<&str>, default: u64, unit: &str) -> Result<u64, RoomFailure> {
+    let Some(text) = text else {
+        return Ok(default);
+    };
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| text.parse::<u64>().ok())
+        .flatten()
+        .ok_or_else(|| {
+            RoomFailure::Bad(format!(
+                "{name} is a whole number of {unit}, not '{text}'; the gate did not run"
+            ))
+        })
+}
+
+/// The server a postgres URL names, without its login: `host:port/database`
+/// (the host a decoded socket directory when it is one; port 5432 when
+/// absent).
+pub(crate) fn server_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let parameter = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+            .map(percent_decoded)
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && (!host.starts_with('[') || host.ends_with(']')) =>
+        {
+            (percent_decoded(host), port.to_string())
+        }
+        _ => (percent_decoded(authority), String::new()),
+    };
+    let host = if host.is_empty() {
+        parameter("host").unwrap_or_default()
+    } else {
+        host
+    };
+    let port = if port.is_empty() {
+        parameter("port").unwrap_or_else(|| "5432".to_string())
+    } else {
+        port
+    };
+    let database = if path.is_empty() {
+        parameter("dbname").unwrap_or_default()
+    } else {
+        percent_decoded(path)
+    };
+    format!("{host}:{port}/{database}")
+}
+
+/// `text` with the password of `url` (as written, and decoded) masked: what
+/// a probe says about the URL reaches the record without it.
+pub(crate) fn without_password(text: &str, url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let mut secrets: Vec<String> = Vec::new();
+    if let Some((login, _)) = authority.rsplit_once('@')
+        && let Some((_, password)) = login.split_once(':')
+    {
+        secrets.push(password.to_string());
+    }
+    for pair in query.split('&') {
+        if let Some(password) = pair.strip_prefix("password=") {
+            secrets.push(password.to_string());
+        }
+    }
+    let decoded: Vec<String> = secrets.iter().map(|secret| percent_decoded(secret)).collect();
+    secrets.extend(decoded);
+    // The longest first, so a password that contains another is masked whole.
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    let mut text = text.to_string();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        text = text.replace(secret.as_str(), "***");
+    }
+    text
+}
+
+/// `%XX` escapes decoded; anything else as it is.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = |at: usize| bytes.get(at).and_then(|byte| (*byte as char).to_digit(16));
+        match (bytes[index], hex(index + 1), hex(index + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                // Two hex digits make one byte.
+                out.push(u8::try_from(high * 16 + low).unwrap_or(b'?'));
+                index += 3;
+            }
+            (byte, _, _) => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// One gate verdict.
