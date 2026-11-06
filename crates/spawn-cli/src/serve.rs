@@ -719,13 +719,32 @@ fn now_ms() -> i64 {
 /// `/api/missions`: the board, each task with its stages from the store
 /// (`stages`: `[{stage, verdict?, at_ms, took_ms?}]`, oldest first) and its
 /// last gate verdict (`last_gate`: `{verdict, reason, metric, candidate,
-/// at_ms}` or null).
+/// at_ms}` or null). A task's `brief`, `review_note` and `report` are their
+/// first lines, each with its length in bytes (`brief_bytes`, ...); a
+/// closed mission's or a cancelled task's report is its length alone
+/// ([`answers::slim_board`]). The texts in full are
+/// `/api/missions/task/<id>`.
 fn missions() -> Result<Value, String> {
     let store = open_store()?;
     let mut board = store.mission_board(50).map_err(err)?;
     let gates = store.last_gates().map_err(err)?;
     with_last_gates(&mut board, &gates);
+    answers::slim_board(&mut board);
     Ok(board)
+}
+
+/// `/api/missions/task/<id>`: one task's brief, report and review note in
+/// full, `{id, mission_id, brief, report, review_note, updated_at_ms}`, as
+/// the Missions page asks when a task is opened.
+fn mission_task(task: &str) -> Result<Value, String> {
+    let id: i64 = task
+        .parse()
+        .map_err(|_| format!("{BAD_REQUEST}bad task {task}"))?;
+    let store = open_store()?;
+    store
+        .task_texts(id)
+        .map_err(err)?
+        .ok_or_else(|| format!("task {id} does not exist"))
 }
 
 /// Put each task's last gate verdict from `gates` (keyed by task id) on the
@@ -800,6 +819,11 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 /// }
 /// ```
 ///
+/// An objective's `prompt` is its first lines (about 1 KB) and a task's
+/// `brief` and `review_note` theirs ([`answers::slim_rsi`]), each with its
+/// length in bytes beside it (`prompt_bytes`, `brief_bytes`,
+/// `review_note_bytes`).
+///
 /// `GET /api/rsi/task/<id>` answers one task: the fields above plus the full
 /// `brief`, `report`, `gate_log` (the latest), `mission_id`, and `log` on
 /// every gate verdict.
@@ -809,10 +833,12 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 /// `/api/pane/<session>` plus `session_id`.
 fn rsi_overview() -> Result<Value, String> {
     let store = open_store()?;
+    let mut missions = objective_missions(&store)?;
+    answers::slim_rsi(&mut missions);
     Ok(json!({
         "generated_at_ms": now_ms(),
         "halt_after": HALT_AFTER,
-        "missions": objective_missions(&store)?,
+        "missions": missions,
     }))
 }
 
