@@ -126,10 +126,10 @@ struct State {
     started: bool,
 }
 
+#[cfg(test)]
 impl State {
     /// Whether `key` is owed a push: queued, or being pushed now. A push
     /// leaves the queue when it starts and comes back only if it failed.
-    #[cfg(test)]
     fn owes(&self, key: &Key) -> bool {
         self.dirty.contains_key(key) || self.pushing.contains(key)
     }
