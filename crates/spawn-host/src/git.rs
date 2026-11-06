@@ -548,17 +548,22 @@ impl GitWorkspace {
     }
 
     /// Make the index's entries for the engine's runtime files
-    /// ([`ENGINE_RUNTIME_FILES`]) exactly the ones the branch already
-    /// tracks, each as the work tree in `directory` holds it now.
+    /// ([`ENGINE_RUNTIME_FILES`]) exactly the ones the project tracks, each
+    /// as the work tree in `directory` holds it now.
     ///
-    /// A runtime file is tracked when `head` (the checkpoint's parent)
-    /// holds it, and, while a merge of `main` waits on its markers
-    /// (`pending_main`), as `main` left it since the merge base: the merge
-    /// wrote `main`'s changes into the directory. A tracked one is
-    /// committed like any tracked file, git's rule for a tracked file an
-    /// ignore rule names: the engine's edits to it, and its deletion. Spawn
-    /// never takes one out of a branch on its own (the owner removes it
-    /// from the project). One that is not tracked never enters the index
+    /// A runtime file is tracked when the branch holds it and so does
+    /// `main`: the project's own, committed on purpose or by mistake. The
+    /// branch is `head` (the checkpoint's parent), and, while a merge of
+    /// `main` waits on its markers (`pending_main`), `head` with what that
+    /// `main` changed since the merge base: the merge wrote those changes
+    /// into the directory. A tracked one is committed like any tracked
+    /// file, git's rule for a tracked file an ignore rule names: the
+    /// engine's edits to it, and its deletion. Spawn never takes one out
+    /// of `main` (the owner removes it). One only the branch holds (a
+    /// checkpoint from before this rule committed it), or one `main` no
+    /// longer holds (the owner removed it), leaves the branch: either way
+    /// the landing changes nothing in `main` for it, and does not conflict
+    /// on it. One the branch does not hold never enters the index
     /// ([`Self::stage_all_but`]).
     ///
     /// The kept index is only a stat cache (a fresh one after a failure,
@@ -609,13 +614,24 @@ impl GitWorkspace {
             .map(OsString::from)
             .into();
         listing.extend(specs);
-        let tracked = listed_paths(&self.listing_in(directory, index, &listing)?);
+        let held: Vec<(TreePath, u64)> = listed_paths(&self.listing_in(directory, index, &listing)?)
+            .into_iter()
+            .map(|path| (path, 0))
+            .collect();
+        if held.is_empty() {
+            return Ok(());
+        }
+        let in_main = match self.commit_id_of(&format!("refs/heads/{BASE}")) {
+            Ok(main) => self.blobs_in(&[main], &held)?,
+            Err(_) => held.iter().map(|(path, _)| path.clone()).collect(),
+        };
         // git adds nothing beyond a symbolic link and refuses a directory or
         // a special file: what is not a file there now is gone from the
         // index, as `add -A` would have it.
-        let (present, gone): (Vec<TreePath>, Vec<TreePath>) = tracked
+        let (present, gone): (Vec<TreePath>, Vec<TreePath>) = held
             .into_iter()
-            .partition(|path| is_file_in(directory, path));
+            .map(|(path, _)| path)
+            .partition(|path| in_main.contains(path) && is_file_in(directory, path));
         for (flag, paths) in [("--add", present), ("--force-remove", gone)] {
             if paths.is_empty() {
                 continue;
