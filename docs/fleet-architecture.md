@@ -803,7 +803,7 @@ record of what was judged (§14 of design.md).
 
      A threshold of 0 disables its check; one that does not parse is an
      abort, as a bad `SPAWN_GATE_MIN_FREE_GB` is to the gate. A check that
-     falls short runs no gate: the task is gated `no_room` (step 4) naming
+     falls short runs no gate: the task is gated `no_room` (step 5) naming
      the check, its measure and its threshold. On 2026-11-06 a test server
      with a 64 MB `/dev/shm` failed "could not resize shared memory segment"
      under the tests' parallel queries and the gate read it, 25 minutes in,
