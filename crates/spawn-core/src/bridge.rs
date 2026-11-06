@@ -281,7 +281,11 @@ struct Inputs {
 }
 
 /// `at` is later than `than` in the same execution.
-fn after(at: Option<&(ExecutionId, GlobalPosition)>, execution: &ExecutionId, than: GlobalPosition) -> bool {
+fn after(
+    at: Option<&(ExecutionId, GlobalPosition)>,
+    execution: &ExecutionId,
+    than: GlobalPosition,
+) -> bool {
     at.is_some_and(|(seen, position)| seen == execution && *position > than)
 }
 
@@ -699,8 +703,7 @@ impl Bridge {
                 break;
             };
             if waited.contains(&claimed.command_id) {
-                self.queue
-                    .release(&claimed, self.config.input_wait_retry)?;
+                self.queue.release(&claimed, self.config.input_wait_retry)?;
                 self.held.insert(claimed.command_id, claimed);
                 break;
             }
@@ -710,8 +713,7 @@ impl Bridge {
                     self.queue.finish(&claimed, &outcome)?;
                 }
                 Handled::Waiting => {
-                    self.queue
-                        .release(&claimed, self.config.input_wait_retry)?;
+                    self.queue.release(&claimed, self.config.input_wait_retry)?;
                     waited.insert(claimed.command_id);
                     self.held.insert(claimed.command_id, claimed);
                 }
@@ -2412,10 +2414,9 @@ impl Bridge {
         let Some(active) = self.running(&claimed.session_id) else {
             // One that waited outlived its execution: it is never typed.
             if let Some(waited_on) = waited {
-                return finished(Outcome::Failed(self.ended_untyped(
-                    &claimed.session_id,
-                    waited_on.as_ref(),
-                )));
+                return finished(Outcome::Failed(
+                    self.ended_untyped(&claimed.session_id, waited_on.as_ref()),
+                ));
             }
             return finished(Outcome::Failed(format!(
                 "{} runs no execution",
@@ -2516,9 +2517,7 @@ impl Bridge {
                         if waits(&claimed.principal) {
                             return self.not_yet(claimed, &active, shown, None);
                         }
-                        return finished(Outcome::Failed(format!(
-                            "terminal disappeared: {error}"
-                        )));
+                        return finished(Outcome::Failed(format!("terminal disappeared: {error}")));
                     }
                     if last {
                         return self.not_yet(
