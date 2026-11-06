@@ -257,7 +257,8 @@ if has "\$1" "\$2" "\$3" hostB.txt; then
         recovering stalls::delivery_is_measured_from_its_record
         echo "| test result: FAILED. 41 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s"
     else
-        stamp=\$(date -u '+%Y-%m-%d %H:%M:%S.000 UTC')
+        sleep 1
+        stamp=\$(date -u '+%Y-%m-%d %H:%M:%S.%3N UTC')
         {
             printf '%s [1] LOG:  server process (PID 4242) was terminated by signal 11: Segmentation fault\n' "\$stamp"
             printf '%s [1] DETAIL:  Failed process was running: select * from spawn_claim(\$1)\n' "\$stamp"
