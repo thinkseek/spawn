@@ -50,6 +50,7 @@ export function AttentionQueue({
         attention={view.data}
         agents={agents}
         onSelect={onSelect}
+        stale={view.error}
       />
     );
   }
@@ -84,10 +85,13 @@ function DispatcherQueue({
   attention,
   agents,
   onSelect,
+  stale,
 }: {
   attention: Attention;
   agents: FleetAgent[];
   onSelect: (sessionId: string) => void;
+  /** Why the latest poll failed, while the last view stays on screen. */
+  stale: string | null;
 }) {
   const groups = attentionGroups(attention);
   const known = new Set(agents.map((agent) => agent.session_id));
@@ -110,6 +114,7 @@ function DispatcherQueue({
             The dispatcher holds no escalation and the supervisor asks nothing.
           </div>
         </div>
+        <Stale error={stale} />
         <SupervisorStatus supervisor={supervisor} />
       </section>
     );
@@ -134,6 +139,7 @@ function DispatcherQueue({
         >
           from the dispatcher
         </span>
+        <Stale error={stale} />
         <span className="ml-auto">
           <SupervisorStatus supervisor={supervisor} />
         </span>
@@ -168,6 +174,19 @@ function DispatcherQueue({
         </p>
       )}
     </section>
+  );
+}
+
+/** A view the latest poll could not refresh. */
+function Stale({ error }: { error: string | null }) {
+  if (!error) return null;
+  return (
+    <span
+      className="text-micro font-medium text-warning"
+      title={`/api/attention: ${error}`}
+    >
+      not refreshed
+    </span>
   );
 }
 

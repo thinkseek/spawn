@@ -41,7 +41,9 @@
 //! escalations) and the step; [`worker`] is the per-worker ladder and
 //! [`digest`] the supervisor digest. Task delivery (the mission layer's
 //! rules) lives in [`crate::deliver`]; this module combines both into one
-//! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
+//! [`Plan`] ([`decide_with`]), reads it from the store ([`read_plan`], which
+//! the UI's attention queue calls too: `GET /api/attention`) and submits it
+//! ([`step`]).
 
 mod digest;
 mod stall;
