@@ -1274,8 +1274,10 @@ $$;
 -- `spawn_control_apply`, in the same transaction as the event. The checked
 -- functions below validate against the tables, then record. Applying a
 -- record never validates: the log is the truth, and replaying it must give
--- the same tables.
-create or replace function spawn_control_apply(p_record jsonb, p_at bigint)
+-- the same tables. `p_at` is the record's time and `p_event` its event's id
+-- (a hold is named by its `source.held` event).
+drop function if exists spawn_control_apply(jsonb, bigint);
+create or replace function spawn_control_apply(p_record jsonb, p_at bigint, p_event bigint)
 returns void language plpgsql as $$
 declare
     v_type text := p_record ->> 'type';
@@ -1341,6 +1343,25 @@ begin
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
+    when 'source.held' then
+        -- The owner holds landings on a source (spawn_source_hold): the
+        -- source's active hold is this one. A hold on a source already held
+        -- renews it: the previous one ends here, with no record of its own.
+        insert into mission_source_holds (source, hold, main, by, reason, held_at_ms, expires_ms)
+        values (p_record ->> 'source', p_event, p_record ->> 'main', p_record ->> 'by',
+                p_record ->> 'reason', p_at, (p_record ->> 'expires_ms')::bigint)
+        on conflict (source) do update
+           set hold = excluded.hold, main = excluded.main, by = excluded.by,
+               reason = excluded.reason, held_at_ms = excluded.held_at_ms,
+               expires_ms = excluded.expires_ms;
+    when 'source.released', 'source.hold_expired' then
+        -- The record that ends a hold: only the one naming the active hold.
+        delete from mission_source_holds
+         where source = p_record ->> 'source' and hold = (p_record ->> 'hold')::bigint;
+    when 'task.held' then
+        -- A landing that pushed nothing: its source is held. It stays
+        -- `landing`, waiting behind that hold.
+        update mission_tasks set held_by = (p_record ->> 'hold')::bigint where id = v_id;
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
                                  delivered_at_ms = p_at, updated_at_ms = p_at
@@ -1563,7 +1584,15 @@ begin
            set kind = jsonb_set(kind, '{detail,record}', p_record)
          where id = v_id;
     end if;
-    perform spawn_control_apply(p_record, v_at);
+    -- An owner's hold expires `bound_s` after its own record, the same way.
+    if p_record ->> 'type' = 'source.held' and jsonb_typeof(p_record -> 'bound_s') = 'number' then
+        p_record := p_record || jsonb_build_object(
+            'expires_ms', v_at + (p_record ->> 'bound_s')::numeric::bigint * 1000);
+        update spawn_events
+           set kind = jsonb_set(kind, '{detail,record}', p_record)
+         where id = v_id;
+    end if;
+    perform spawn_control_apply(p_record, v_at, v_id);
     return v_id;
 end $$;
 
@@ -1575,16 +1604,17 @@ declare
     v_event record;
 begin
     perform pg_advisory_xact_lock(1399957335);
+    delete from mission_source_holds;
     delete from mission_tasks;
     delete from mission_residents;
     delete from mission_missions;
     for v_event in
-        select e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
+        select e.id, e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
           from spawn_events e
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
          order by e.session_seq
     loop
-        perform spawn_control_apply(v_event.record, v_event.recorded_at_ms);
+        perform spawn_control_apply(v_event.record, v_event.recorded_at_ms, v_event.id);
     end loop;
 end $$;
 
