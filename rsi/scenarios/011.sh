@@ -362,7 +362,9 @@ waiting_after_stop() {
                and event_name = 'observation.recorded' and session_seq > $stopped
                and kind -> 'detail' -> 'observation' ->> 'state' = 'WAITING'")" -ge 1 ]
 }
-wait_for 15 waiting_after_stop ||
+# Premise waits, not the contract: generous, so a loaded host (other jobs
+# share it) does not fail the setup; they return as soon as the fact is there.
+wait_for 45 waiting_after_stop ||
     fail "the worker was never judged WAITING after its turn ended ($(explain))"
 first_waiting=$(q "select min(session_seq) from spawn_events
                     where session_id = '$session' and source = 'observer'
@@ -373,7 +375,7 @@ screen_after() {
              where session_id = '$session' and event_name = 'screen.observed'
                and session_seq > $first_waiting")" -ge 1 ]
 }
-wait_for 10 screen_after ||
+wait_for 30 screen_after ||
     fail "no screen reading recorded after the WAITING judgement that followed the turn's end: the screen settling at the prompt is a fact and is recorded ($(explain))"
 
 # --- (1) the judgement covers the latest fact -------------------------------------
