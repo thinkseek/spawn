@@ -123,6 +123,49 @@ impl Story {
         self
     }
 
+    /// A command that succeeded.
+    fn ok(&mut self, principal: &str, key: &str, session: &str, created: i64) -> &mut Self {
+        self.command(
+            principal,
+            key,
+            session,
+            "input",
+            created,
+            Some(true),
+            None,
+            &[],
+        )
+    }
+
+    /// A dispatcher's command that failed with `error`.
+    fn failed(&mut self, key: &str, session: &str, created: i64, error: &str) -> &mut Self {
+        self.command(
+            "spawn-dispatch",
+            key,
+            session,
+            "input",
+            created,
+            Some(false),
+            Some(error),
+            &[],
+        )
+    }
+
+    /// A digest to the supervisor carrying `tags`.
+    fn digest(&mut self, principal: &str, created: i64, tags: &[&str]) -> &mut Self {
+        let key = format!("digest-{created}");
+        self.command(
+            principal,
+            &key,
+            "session_supervisor",
+            "input",
+            created,
+            Some(true),
+            None,
+            tags,
+        )
+    }
+
     fn message(&mut self, agent: &str, when: i64, model: &str, tokens: i64) -> &mut Self {
         let id = format!("msg_{}", self.messages.len());
         self.messages.push(Message {
@@ -546,24 +589,24 @@ fn autonomy_counts_the_owners_interventions() {
         .assign(at(1), 2, 2, None, "spawn_supervisor")
         .assign(at(1), 3, 1, None, "human");
     // Cancel and reassign: by nobody named or a person; not by a loop.
-    story
-        .assign(at(2), 10, 1, Some(7), "spawn-integrate")
-        .cancelled(at(3), 10, None)
-        .assign(at(4), 11, 1, Some(7), "spawn-integrate")
-        .assign(at(2), 12, 1, Some(8), "spawn-integrate")
-        .cancelled(at(3), 12, Some("spawn-dispatch"))
-        .assign(at(4), 13, 1, Some(8), "spawn-integrate")
-        .assign(at(2), 14, 1, Some(9), "spawn-integrate")
-        .cancelled(at(3), 14, Some("spawn_supervisor"))
-        .assign(at(4), 15, 1, Some(9), "spawn-integrate");
+    for (first, objective, by) in [
+        (10, 7, None),
+        (12, 8, Some("spawn-dispatch")),
+        (14, 9, Some("spawn_supervisor")),
+    ] {
+        story
+            .assign(at(2), first, 1, Some(objective), "spawn-integrate")
+            .cancelled(at(3), first, by)
+            .assign(at(4), first + 1, 1, Some(objective), "spawn-integrate");
+    }
     // Without an objective, the same brief; another brief is new work.
     story
         .assign(at(5), 16, 2, None, "spawn_supervisor")
         .cancelled(at(6), 16, Some("human"));
     story.rec(
         at(7),
-        json!({"type": "task.assigned", "id": 17, "mission_id": 2, "agent_id": "a", "session_id": "s",
-               "brief": "brief 16", "created_by": "spawn_supervisor"}),
+        json!({"type": "task.assigned", "id": 17, "mission_id": 2, "agent_id": "a",
+               "session_id": "s", "brief": "brief 16", "created_by": "spawn_supervisor"}),
     );
     story
         .assign(at(5), 18, 2, None, "spawn_supervisor")
@@ -572,46 +615,10 @@ fn autonomy_counts_the_owners_interventions() {
     story.rec(at(8), json!({"type": "mission.resumed", "id": 1}));
     // Commands: a person's and the CLI's count; Spawn's loops' do not.
     story
-        .command(
-            "human",
-            "board-1",
-            "session_1",
-            "input",
-            at(9),
-            Some(true),
-            None,
-            &[],
-        )
-        .command(
-            "spawn",
-            "cli-1",
-            "elsewhere",
-            "stop",
-            at(9),
-            Some(true),
-            None,
-            &[],
-        )
-        .command(
-            "spawn-dispatch",
-            "deliver-1-0",
-            "session_1",
-            "start",
-            at(9),
-            Some(true),
-            None,
-            &[],
-        )
-        .command(
-            "spawn_supervisor",
-            "s-1",
-            "session_1",
-            "input",
-            at(9),
-            Some(true),
-            None,
-            &[],
-        );
+        .ok("human", "board-1", "session_1", at(9))
+        .ok("spawn", "cli-1", "elsewhere", at(9))
+        .ok("spawn-dispatch", "deliver-1-0", "session_1", at(9))
+        .ok("spawn_supervisor", "s-1", "session_1", at(9));
     let history = story.history();
     let autonomy = dimension(
         &counts(&history, Scope::Fleet, window_hours(0, 24)),
@@ -659,85 +666,38 @@ fn reliability_counts_failures_of_the_machinery() {
         .gated(at(4), 8, "no_room", None)
         .gated(at(5), 8, "host_fault", None)
         .gated(at(6), 8, "rejected", None);
-    let host = "start terminal: new-session failed";
     // Task 6: four failed attempts, nothing typed: spent, at the last finish.
-    for (index, key) in [
-        "deliver-6-0",
-        "deliver-6-0-retry-1",
-        "deliver-6-0-retry-2",
-        "deliver-6-0-retry-3",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let minutes = i64::try_from(index).expect("few") * 600_000;
-        story.command(
-            "spawn-dispatch",
-            key,
-            "session_6",
-            "start",
-            at(2) + minutes,
-            Some(false),
-            Some(host),
-            &[],
-        );
-    }
+    let host = "start terminal: new-session failed";
+    story
+        .failed("deliver-6-0", "session_6", at(2), host)
+        .failed("deliver-6-0-retry-1", "session_6", at(2) + 600_000, host)
+        .failed("deliver-6-0-retry-2", "session_6", at(2) + 1_200_000, host)
+        .failed("deliver-6-0-retry-3", "session_6", at(2) + 1_800_000, host);
     // Task 8: a refusal for a pane not ready, then delivered: not spent.
     story
-        .command(
-            "spawn-dispatch",
+        .failed(
             "deliver-8-0",
             "session_8",
-            "input",
             at(2),
-            Some(false),
-            Some("pane state Busy does not accept input"),
-            &[],
+            "pane state Busy does not accept input",
         )
-        .command(
+        .ok(
             "spawn-dispatch",
             "deliver-8-0-retry-1",
             "session_8",
-            "input",
             at(2) + 5000,
-            Some(true),
-            None,
-            &[],
         );
     // A stall tag sent twice counts once, at the first digest; another
     // principal's tags count nothing.
     let tag = "session_9 stall-9-activity-1";
     story
-        .command(
+        .digest("spawn-dispatch", at(7), &[tag])
+        .digest(
             "spawn-dispatch",
-            "digest-a",
-            "session_supervisor",
-            "input",
-            at(7),
-            Some(true),
-            None,
-            &[tag],
-        )
-        .command(
-            "spawn-dispatch",
-            "digest-b",
-            "session_supervisor",
-            "input",
             at(8),
-            Some(true),
-            None,
             &[tag, "session_9 stall-9-judgement-4"],
         )
-        .command(
-            "human",
-            "board",
-            "session_supervisor",
-            "input",
-            at(9),
-            Some(true),
-            None,
-            &["session_9 stall-9-delivery-5"],
-        );
+        .digest("human", at(9), &["session_9 stall-9-delivery-5"]);
     let history = story.history();
     let reliability = dimension(
         &counts(&history, Scope::Mission(1), window_hours(0, 24)),
