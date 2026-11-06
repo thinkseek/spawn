@@ -591,9 +591,8 @@ impl GitWorkspace {
         let specs = runtime_pathspecs("");
         if pending_main.is_none() {
             // `--with-tree`: the index's entries and `head`'s together.
-            let mut probe: Vec<OsString> = ["ls-files", "-z", "--cached"]
-                .map(OsString::from)
-                .into();
+            let mut probe: Vec<OsString> =
+                ["ls-files", "-z", "--cached"].map(OsString::from).into();
             probe.push(OsString::from(format!("--with-tree={head}")));
             probe.push(OsString::from("--"));
             probe.extend(specs.iter().cloned());
