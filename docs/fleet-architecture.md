@@ -290,6 +290,20 @@ it, on the same ladder.
 - **Human**: the attention queue in the UI lists only what the supervisor
   escalated or could not resolve. Each human action is a command with
   principal `human`; it is the event the whole system tries to make rarer.
+- **Inputs to a busy session wait for its turn.** A person's or the
+  supervisor's input (`spawn submit`, any principal but `spawn-dispatch`,
+  `spawn-integrate` and `spawn-liveness`) that reaches a pane not ready is
+  not refused: the Bridge records it `waiting` (`command.step`, once) and
+  types it on the next Ready reading, the session's waiting inputs oldest
+  first, each on a Ready reading of its own, at most once. It holds no stop,
+  discard or resume behind it; if the execution ends first it fails, as
+  stopped or with the end's cause, and a resume does not revive it. Spawn's
+  own loops keep their contract: their inputs are refused at once while the
+  pane is not ready (and behind a waiting input) and they retry on their
+  own, as the nudge and delivery retries above describe. The wait has no
+  timeout: a stall shows on the session's task like any other, and the
+  `waiting` record is no activity (it moves no stall step and does not make
+  a judgement look stale).
 - **Authority** comes from grants and DB roles. The dispatcher and the
   supervisor submit as their own principals and only for worker sessions.
   Neither can write observations or runtime events.
