@@ -414,7 +414,9 @@ that took them landed them in `main` (Supply PA's `main` got
   `.claude/routines/.state/`, `.claude/worktrees/`, `.claude/checkpoints/`,
   `.claude/mailbox/`, `.claude/agent-registry.json`,
   `.claude/agent-memory-local`, `.claude/first-run`,
-  `.claude/assistant-daemon-state.json`. A workspace has no `.git`, so
+  `.claude/assistant-daemon-state.json`; and `.claude/settings.local.json`,
+  the local permissions Claude Code writes when a person allows a tool,
+  which a project never commits. A workspace has no `.git`, so
   Claude Code writes those rules nowhere there. The live workspaces held
   only the lock when the rule came in. A new engine version that writes
   another file means a new entry. `.claude/scheduled_tasks.json` holds the

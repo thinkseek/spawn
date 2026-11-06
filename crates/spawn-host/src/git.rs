@@ -65,10 +65,13 @@ const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
 /// directory, and everything under it. Claude Code is the only engine
 /// (`spawn_core::event::ENGINE`), and the list is its own: the paths it
 /// writes to a checkout's `.git/info/exclude` under `# claude-code-runtime`
-/// (Claude Code 2.1.318). An exported workspace has no `.git`, so Claude
-/// Code writes none there.
-pub const ENGINE_RUNTIME_FILES: [&str; 10] = [
+/// (Claude Code 2.1.318), plus `.claude/settings.local.json`, the local
+/// permissions it writes when a person allows a tool, which a project never
+/// commits. An exported workspace has no `.git`, so Claude Code writes none
+/// there.
+pub const ENGINE_RUNTIME_FILES: [&str; 11] = [
     ".claude/scheduled_tasks.lock",
+    ".claude/settings.local.json",
     ".claude/scheduled_tasks.json",
     ".claude/routines/.state/",
     ".claude/worktrees/",

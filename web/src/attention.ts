@@ -48,6 +48,15 @@ export interface SupervisorQuestion {
   human: { text: string; at_ms: number | null } | null;
 }
 
+/** A line the supervisor wrote for the owner ("For the owner: ..."): what
+ * its grants do not cover. It does not wait on it, so it asks nothing and
+ * nothing answers it; it is there to be read. */
+export interface OwnerNote {
+  text: string;
+  /** When it wrote the line, if the transcript says. */
+  at_ms: number | null;
+}
+
 export interface SupervisorView {
   session_id: string;
   agent_id: string;
@@ -58,6 +67,8 @@ export interface SupervisorView {
   turn_ended: boolean;
   judgement: SupervisorJudgement | null;
   question: SupervisorQuestion | null;
+  /** Its lines for the owner, newest first. */
+  for_owner: OwnerNote[];
 }
 
 export interface Attention {
@@ -77,6 +88,9 @@ export interface AttentionGroups {
   told: AttentionItem[];
   /** Everything a person may need to look at. */
   count: number;
+  /** The supervisor's lines for the owner, newest first: to read, not
+   * counted, since the supervisor does not wait on them. */
+  forOwner: OwnerNote[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -157,6 +171,14 @@ function normalizeQuestion(value: unknown): SupervisorQuestion | null {
   };
 }
 
+function normalizeNotes(value: unknown): OwnerNote[] {
+  return list(value).flatMap((entry) => {
+    const raw = object(entry);
+    const note = raw ? optionalText(raw.text) : null;
+    return raw && note ? [{ text: note, at_ms: optionalNumber(raw.at_ms) }] : [];
+  });
+}
+
 function normalizeSupervisor(value: unknown): SupervisorView | null {
   const raw = object(value);
   if (!raw) return null;
@@ -170,6 +192,7 @@ function normalizeSupervisor(value: unknown): SupervisorView | null {
     turn_ended: raw.turn_ended === true,
     judgement: normalizeJudgement(raw.judgement),
     question: normalizeQuestion(raw.question),
+    for_owner: normalizeNotes(raw.for_owner),
   };
 }
 
@@ -214,7 +237,8 @@ function byAge(left: AttentionItem, right: AttentionItem): number {
 }
 
 /** The queue's sections: the supervisor's open question, then what the
- * supervisor was not told yet, then what it was told and is unresolved. */
+ * supervisor was not told yet, then what it was told and is unresolved;
+ * beside them, its lines for the owner. */
 export function attentionGroups(attention: Attention): AttentionGroups {
   const untold = [...attention.pending].sort(byAge);
   const told = [...attention.told].sort(byAge);
@@ -223,6 +247,7 @@ export function attentionGroups(attention: Attention): AttentionGroups {
     untold,
     told,
     count: needsHuman(attention).count,
+    forOwner: attention.supervisor?.for_owner ?? [],
   };
 }
 
