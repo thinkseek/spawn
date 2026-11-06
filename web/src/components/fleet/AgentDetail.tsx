@@ -29,6 +29,7 @@ import {
   stateLabelUpper,
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
+import { freshAt } from "../../validated";
 import { LiveBadge, TerminalBlock, TerminalPanel } from "../Terminal";
 import { Ago, Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
 import {

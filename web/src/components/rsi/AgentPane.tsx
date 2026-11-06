@@ -1,5 +1,6 @@
 import { usePoll } from "../../api";
 import { relativeTime } from "../../format";
+import { freshAt } from "../../validated";
 import { fetchPane } from "../../rsi";
 import { LiveBadge, TerminalPanel } from "../Terminal";
 import { useNow } from "./Phase";
