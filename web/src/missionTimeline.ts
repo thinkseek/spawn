@@ -119,6 +119,22 @@ export interface MissionTimeline {
   openCount: number;
 }
 
+/** Whether anything moves on its own: an open task in a mission that is
+ * not halted. The clock and the "now" line show only while it is, so a
+ * halted mission's stalled task never pins a marker to page load. */
+export function isLive(timeline: Pick<MissionTimeline, "lanes">): boolean {
+  return timeline.lanes.some((lane) =>
+    lane.bars.some((bar) => bar.end === null && !bar.stalled),
+  );
+}
+
+/** Whether there is a task bar to draw at all. With none the axis has no
+ * extent (its fallback would be epoch 0) and the page shows an empty state
+ * instead of a 1970 axis. */
+export function hasBars(timeline: Pick<MissionTimeline, "lanes">): boolean {
+  return timeline.lanes.some((lane) => lane.bars.length > 0);
+}
+
 /** Gate verdict reasons per task, oldest first (the RSI page has them). */
 export type VerdictReasons = ReadonlyMap<number, ReadonlyArray<string | null>>;
 
@@ -266,6 +282,25 @@ export function taskBar(
     if (phase) segments.push({ phase, start: since, end, attempt });
   }
 
+  // A conflict (like a rejection or incompatibility) explains itself in the
+  // record's `note`, which the integrator keeps as the task's review note;
+  // its `reason` is empty. The note describes the latest send-back, so it
+  // fills that mark alone; a cancel overwrites it, so it says nothing then.
+  const lastRecord = records.at(-1)?.stage;
+  if (
+    task.review_note !== null &&
+    lastRecord !== "cancelled" &&
+    lastRecord !== "aborted"
+  ) {
+    let lastBack = -1;
+    for (let index = 0; index < verdicts.length; index += 1) {
+      if (verdicts[index].sentBack) lastBack = index;
+    }
+    if (lastBack >= 0 && verdicts[lastBack].reason === null) {
+      verdicts[lastBack] = { ...verdicts[lastBack], reason: task.review_note };
+    }
+  }
+
   return {
     key,
     task,
@@ -285,7 +320,7 @@ export function taskBar(
  * its last update, in the phase its state names. */
 function legacyBar(
   task: MissionTask,
-  mission: Pick<Mission, "gate" | "halted">,
+  mission: Pick<Mission, "gate" | "accept" | "halted">,
   key: string,
   label: string,
 ): TaskBar | null {
@@ -298,6 +333,9 @@ function legacyBar(
   };
   const outcome = done[task.state] ?? "open";
   const end = outcome === "open" ? null : Math.max(task.updated_at_ms ?? start, start);
+  // `reported` waits for the supervisor first unless the gate judges it
+  // (accept = gate); `accepted` is at the gate only when there is one.
+  const atGate = mission.gate !== null && mission.accept === "gate";
   const phase: Phase =
     task.state === "assigned"
       ? "queued"
@@ -307,9 +345,15 @@ function legacyBar(
           ? "revise"
           : task.state === "landing"
             ? "landing"
-            : task.state === "reported" || task.state === "accepted"
-              ? "gate"
-              : "working";
+            : task.state === "reported"
+              ? atGate
+                ? "gate"
+                : "review"
+              : task.state === "accepted"
+                ? mission.gate !== null
+                  ? "gate"
+                  : "review"
+                : "working";
   return {
     key,
     task,
