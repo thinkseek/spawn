@@ -339,182 +339,182 @@ export function MissionTimeline({
         />
       ) : (
         <>
-        {!compact && (
-          <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 pb-2 sm:px-5">
-            {timeline.lanes.length > 1 && (
-              <Chips
-                label="Mission"
-                value={missionFilter}
-                onChange={setMissionFilter}
-                options={[
-                  { id: null, label: "All missions" },
-                  ...timeline.lanes.map((lane) => ({ id: lane.mission.id, label: lane.name })),
-                ]}
-              />
-            )}
-            <Chips
-              label="Task state"
-              value={stateFilter}
-              onChange={setStateFilter}
-              options={STATE_FILTERS.map((entry) => ({ id: entry.id, label: entry.label }))}
-            />
-          </div>
-        )}
-
-        {!compact && (
-          <div className="flex shrink-0 items-stretch px-4 sm:px-5">
-            <div
-              className="flex shrink-0 flex-col justify-center pr-3 text-caption"
-              style={{ width: labelW - 16 }}
-            >
-              <span className="tnum text-muted-foreground">
-                {formatDuration(timeline.end - timeline.start)}
-              </span>
-              <span className="tnum truncate text-faint-foreground">
-                {totalTasks} task{totalTasks === 1 ? "" : "s"}
-                {timeline.openCount > 0 && ` · ${timeline.openCount} open`}
-              </span>
-            </div>
-            <Overview
-              lines={overviewLines}
-              extent={extent}
-              domain={domain}
-              width={plotW}
-              onDomain={view.setDomain}
-              onGlide={view.glideTo}
-            />
-          </div>
-        )}
-
-        <div className="relative flex min-h-0 flex-1">
-          <div className="flex min-w-0 flex-1 flex-col">
-            <AxisRow
-              ticks={ticks}
-              breaks={breaks}
-              labelW={labelW}
-              plotW={plotW}
-              caption={compact ? "Task" : "Mission · task"}
-            />
-            <div ref={scrollRef} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-6">
-              {rows.list.length === 0 ? (
-                <p className="px-5 py-10 text-center text-caption text-faint-foreground">
-                  No task matches these filters.
-                </p>
-              ) : (
-                <div
-                  ref={rowsRef}
-                  role="tree"
-                  aria-label="Missions timeline"
-                  tabIndex={0}
-                  onKeyDown={onKeyDown}
-                  onPointerDown={onPointerDown}
-                  onPointerMove={onPointerMove}
-                  onPointerUp={onPointerUp}
-                  onPointerCancel={() => pan.cancel()}
-                  onPointerLeave={() => setHover(null)}
-                  onDoubleClick={(event) => {
-                    const { row, x } = locate(event);
-                    if (row?.kind === "task" && x >= 0) zoomToBar(row.bar);
-                  }}
-                  className={cx(
-                    "relative select-none outline-none",
-                    pan.dragging ? "cursor-grabbing" : "cursor-default",
-                  )}
-                  style={{ height: rows.height }}
-                >
-                  {rows.list.map((row) =>
-                    row.kind === "lane" ? null : (
-                      <TaskLabel
-                        key={row.key}
-                        row={row}
-                        labelW={labelW}
-                        hovered={hover?.key === row.key}
-                        selected={selected?.key === row.key}
-                        onSelect={() => choose(row)}
-                      />
-                    ),
-                  )}
-
-                  <svg
-                    aria-hidden="true"
-                    width={plotW}
-                    height={rows.height}
-                    className="pointer-events-none absolute top-0 overflow-hidden"
-                    style={{ left: labelW }}
-                  >
-                    <defs>
-                      {(Object.keys(PHASE_COLOR) as Array<keyof typeof PHASE_COLOR>).map((phase) => (
-                        <TailGradient key={phase} id={`${ids}-tail-${phase}`} color={PHASE_COLOR[phase]} />
-                      ))}
-                      <pattern
-                        id={`${ids}-hatch`}
-                        width={5}
-                        height={5}
-                        patternUnits="userSpaceOnUse"
-                        patternTransform="rotate(45)"
-                      >
-                        <rect width={5} height={5} fill="var(--warning)" opacity={0.14} />
-                        <line x1={0} y1={0} x2={0} y2={5} stroke="var(--warning)" strokeWidth={2} opacity={0.75} />
-                      </pattern>
-                      <clipPath id={`${ids}-plot`}>
-                        <rect x={0} y={0} width={plotW} height={rows.height} />
-                      </clipPath>
-                    </defs>
-                    <g clipPath={`url(#${ids}-plot)`}>
-                      <BreakBands breaks={breaks} height={rows.height} />
-                      <Gridlines ticks={ticks} height={rows.height} />
-                      <NowLine x={nowX} height={rows.height} plotW={plotW} />
-                      {rows.list.map((row) =>
-                        row.kind === "lane" ? (
-                          <LaneBand key={row.key} row={row} px={px} now={now} />
-                        ) : (
-                          <Bar
-                            key={row.key}
-                            bar={row.bar}
-                            cy={row.y + row.h / 2 + 3}
-                            px={px}
-                            plotW={plotW}
-                            now={now}
-                            ids={ids}
-                            hovered={hover?.key === row.key ? hover.verdict : null}
-                          />
-                        ),
-                      )}
-                    </g>
-                  </svg>
-                  {/* Lane headers sit above the plot, on the canvas colour, so
-                      their text never runs over a gridline. */}
-                  {rows.list.map((row) =>
-                    row.kind === "lane" ? (
-                      <LaneLabel
-                        key={row.key}
-                        row={row}
-                        collapsed={collapsed.has(row.lane.key)}
-                        onToggle={() => toggleLane(row.lane.key)}
-                      />
-                    ) : null,
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {!onSelectTask && (
-            <AnimatePresence>
-              {selectedRow && (
-                <TaskPanel
-                  key="task"
-                  bar={selectedRow.bar}
-                  lane={selectedRow.lane}
-                  now={now}
-                  reduceMotion={reduceMotion}
-                  onClose={() => setSelectedKey(null)}
-                  onZoom={() => zoomToBar(selectedRow.bar)}
+          {!compact && (
+            <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 pb-2 sm:px-5">
+              {timeline.lanes.length > 1 && (
+                <Chips
+                  label="Mission"
+                  value={missionFilter}
+                  onChange={setMissionFilter}
+                  options={[
+                    { id: null, label: "All missions" },
+                    ...timeline.lanes.map((lane) => ({ id: lane.mission.id, label: lane.name })),
+                  ]}
                 />
               )}
-            </AnimatePresence>
+              <Chips
+                label="Task state"
+                value={stateFilter}
+                onChange={setStateFilter}
+                options={STATE_FILTERS.map((entry) => ({ id: entry.id, label: entry.label }))}
+              />
+            </div>
           )}
-        </div>
+
+          {!compact && (
+            <div className="flex shrink-0 items-stretch px-4 sm:px-5">
+              <div
+                className="flex shrink-0 flex-col justify-center pr-3 text-caption"
+                style={{ width: labelW - 16 }}
+              >
+                <span className="tnum text-muted-foreground">
+                  {formatDuration(timeline.end - timeline.start)}
+                </span>
+                <span className="tnum truncate text-faint-foreground">
+                  {totalTasks} task{totalTasks === 1 ? "" : "s"}
+                  {timeline.openCount > 0 && ` · ${timeline.openCount} open`}
+                </span>
+              </div>
+              <Overview
+                lines={overviewLines}
+                extent={extent}
+                domain={domain}
+                width={plotW}
+                onDomain={view.setDomain}
+                onGlide={view.glideTo}
+              />
+            </div>
+          )}
+
+          <div className="relative flex min-h-0 flex-1">
+            <div className="flex min-w-0 flex-1 flex-col">
+              <AxisRow
+                ticks={ticks}
+                breaks={breaks}
+                labelW={labelW}
+                plotW={plotW}
+                caption={compact ? "Task" : "Mission · task"}
+              />
+              <div ref={scrollRef} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-6">
+                {rows.list.length === 0 ? (
+                  <p className="px-5 py-10 text-center text-caption text-faint-foreground">
+                    No task matches these filters.
+                  </p>
+                ) : (
+                  <div
+                    ref={rowsRef}
+                    role="tree"
+                    aria-label="Missions timeline"
+                    tabIndex={0}
+                    onKeyDown={onKeyDown}
+                    onPointerDown={onPointerDown}
+                    onPointerMove={onPointerMove}
+                    onPointerUp={onPointerUp}
+                    onPointerCancel={() => pan.cancel()}
+                    onPointerLeave={() => setHover(null)}
+                    onDoubleClick={(event) => {
+                      const { row, x } = locate(event);
+                      if (row?.kind === "task" && x >= 0) zoomToBar(row.bar);
+                    }}
+                    className={cx(
+                      "relative select-none outline-none",
+                      pan.dragging ? "cursor-grabbing" : "cursor-default",
+                    )}
+                    style={{ height: rows.height }}
+                  >
+                    {rows.list.map((row) =>
+                      row.kind === "lane" ? null : (
+                        <TaskLabel
+                          key={row.key}
+                          row={row}
+                          labelW={labelW}
+                          hovered={hover?.key === row.key}
+                          selected={selected?.key === row.key}
+                          onSelect={() => choose(row)}
+                        />
+                      ),
+                    )}
+
+                    <svg
+                      aria-hidden="true"
+                      width={plotW}
+                      height={rows.height}
+                      className="pointer-events-none absolute top-0 overflow-hidden"
+                      style={{ left: labelW }}
+                    >
+                      <defs>
+                        {(Object.keys(PHASE_COLOR) as Array<keyof typeof PHASE_COLOR>).map((phase) => (
+                          <TailGradient key={phase} id={`${ids}-tail-${phase}`} color={PHASE_COLOR[phase]} />
+                        ))}
+                        <pattern
+                          id={`${ids}-hatch`}
+                          width={5}
+                          height={5}
+                          patternUnits="userSpaceOnUse"
+                          patternTransform="rotate(45)"
+                        >
+                          <rect width={5} height={5} fill="var(--warning)" opacity={0.14} />
+                          <line x1={0} y1={0} x2={0} y2={5} stroke="var(--warning)" strokeWidth={2} opacity={0.75} />
+                        </pattern>
+                        <clipPath id={`${ids}-plot`}>
+                          <rect x={0} y={0} width={plotW} height={rows.height} />
+                        </clipPath>
+                      </defs>
+                      <g clipPath={`url(#${ids}-plot)`}>
+                        <BreakBands breaks={breaks} height={rows.height} />
+                        <Gridlines ticks={ticks} height={rows.height} />
+                        <NowLine x={nowX} height={rows.height} plotW={plotW} />
+                        {rows.list.map((row) =>
+                          row.kind === "lane" ? (
+                            <LaneBand key={row.key} row={row} px={px} now={now} />
+                          ) : (
+                            <Bar
+                              key={row.key}
+                              bar={row.bar}
+                              cy={row.y + row.h / 2 + 3}
+                              px={px}
+                              plotW={plotW}
+                              now={now}
+                              ids={ids}
+                              hovered={hover?.key === row.key ? hover.verdict : null}
+                            />
+                          ),
+                        )}
+                      </g>
+                    </svg>
+                    {/* Lane headers sit above the plot, on the canvas colour, so
+                        their text never runs over a gridline. */}
+                    {rows.list.map((row) =>
+                      row.kind === "lane" ? (
+                        <LaneLabel
+                          key={row.key}
+                          row={row}
+                          collapsed={collapsed.has(row.lane.key)}
+                          onToggle={() => toggleLane(row.lane.key)}
+                        />
+                      ) : null,
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {!onSelectTask && (
+              <AnimatePresence>
+                {selectedRow && (
+                  <TaskPanel
+                    key="task"
+                    bar={selectedRow.bar}
+                    lane={selectedRow.lane}
+                    now={now}
+                    reduceMotion={reduceMotion}
+                    onClose={() => setSelectedKey(null)}
+                    onZoom={() => zoomToBar(selectedRow.bar)}
+                  />
+                )}
+              </AnimatePresence>
+            )}
+          </div>
         </>
       )}
 
