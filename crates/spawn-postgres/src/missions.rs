@@ -505,6 +505,15 @@ select (select jsonb_build_object(
                 and r ->> 'id' = k.id::text), '[]'::jsonb))
           from mission_tasks k where k.id = $1)";
 
+/// One task's texts in full, as the board's list sends only their first
+/// lines: `{id, mission_id, brief, report, review_note, updated_at_ms}`;
+/// null when there is no such task. `$1` task.
+pub(crate) const TASK_TEXTS: &str = r"
+select (select jsonb_build_object(
+          'id', k.id, 'mission_id', k.mission_id, 'brief', k.brief, 'report', k.report,
+          'review_note', k.review_note, 'updated_at_ms', k.updated_at_ms)
+          from mission_tasks k where k.id = $1)";
+
 /// The integrator's advisory lock: one integrator per store (database and
 /// schema). The two-key form pairs this class with the schema's name, so
 /// stores in other schemas of the same database (tests, the e2e) never
@@ -846,6 +855,12 @@ impl PostgresStore {
     /// `None` when there is no such task.
     pub fn objective_task(&self, task: i64) -> Result<Option<Value>, StoreError> {
         Ok(self.query_one(OBJECTIVE_TASK, &[&task])?.get(0))
+    }
+
+    /// One task's brief, report and review note in full ([`TASK_TEXTS`]);
+    /// `None` when there is no such task.
+    pub fn task_texts(&self, task: i64) -> Result<Option<Value>, StoreError> {
+        Ok(self.query_one(TASK_TEXTS, &[&task])?.get(0))
     }
 
     /// Tasks the dispatcher has to deliver, watch or wind down.
