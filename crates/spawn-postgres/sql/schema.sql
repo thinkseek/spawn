@@ -1319,6 +1319,15 @@ begin
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
+        -- An owner's landing also names the missions on the source with no
+        -- baseline yet (new, or resumed), not halted: they take the new main
+        -- as their first baseline, so a gate of theirs that was judging
+        -- against the old main when it landed does not leave them at it.
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+         where sources ->> 0 = p_record ->> 'source' and baseline is null
+           and jsonb_typeof(p_record -> 'without_baseline') = 'array'
+           and id in (select m::bigint
+                        from jsonb_array_elements_text(p_record -> 'without_baseline') m);
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
                                  delivered_at_ms = p_at, updated_at_ms = p_at
@@ -2149,7 +2158,8 @@ begin
     -- at most one. A move names the request's source, where main went from
     -- and to, and is the owner's (`by`); the missions it moves are those on
     -- the source whose baseline was its `from` and that are not halted, as
-    -- spawn_source_moved names them.
+    -- spawn_source_moved names them (`missions`), and those with no
+    -- baseline yet, not halted (`without_baseline`).
     if p_record ->> 'type' in ('source.moved', 'source.push_refused') then
         if coalesce(p_record ->> 'request', '') !~ '^[0-9]{1,18}$' then
             raise exception 'an owner landing''s outcome names its request: %', p_record;
@@ -2181,7 +2191,15 @@ begin
                 select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
                   from mission_missions m
                  where m.sources ->> 0 = p_record ->> 'source'
-                   and m.baseline = p_record ->> 'from' and m.halted is null));
+                   and m.baseline = p_record ->> 'from' and m.halted is null),
+                -- No baseline yet: a gate of theirs judging against the old
+                -- main would make it their first one, and halt them at the
+                -- next pass. They take the new main instead.
+                'without_baseline', (
+                select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
+                  from mission_missions m
+                 where m.sources ->> 0 = p_record ->> 'source'
+                   and m.baseline is null and m.halted is null));
         else
             if coalesce(p_record ->> 'reason', '') = '' then
                 raise exception 'a source.push_refused names its reason: %', p_record;
