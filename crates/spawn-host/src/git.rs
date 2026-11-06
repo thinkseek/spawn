@@ -17,6 +17,15 @@
 //! it from the tree. The branch head alone is the whole workspace
 //! (docs/storage.md).
 //!
+//! The files the engine writes for itself in its working directory
+//! ([`ENGINE_RUNTIME_FILES`]: Claude Code's scheduler lock, worktrees and
+//! the rest of its own list) never enter a checkpoint, whatever the
+//! project's `.gitignore` says: they are excluded by pathspec at every
+//! staging, so a workspace mounted before this rule is covered at its next
+//! checkpoint. The rest of `.claude/` is the project's and is committed. A
+//! runtime file the project tracks (both the branch and `main` hold it) is
+//! committed like any tracked file; Spawn never removes it from `main`.
+//!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
 //! part before the colon, so every call rebuilds the mapping from the
 //! identifier alone.

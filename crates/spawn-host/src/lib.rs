@@ -14,8 +14,8 @@ pub mod tree_path;
 mod audit;
 
 pub use git::{
-    DEFAULT_MAX_FILE_MB, GitWorkspace, LARGE_FILE_TRAILER, MAIN_COPIES, has_conflict_block,
-    has_conflict_block_sized, max_file_bytes, names_files_outside_git,
+    DEFAULT_MAX_FILE_MB, ENGINE_RUNTIME_FILES, GitWorkspace, LARGE_FILE_TRAILER, MAIN_COPIES,
+    has_conflict_block, has_conflict_block_sized, max_file_bytes, names_files_outside_git,
 };
 pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
