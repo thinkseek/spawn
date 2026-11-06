@@ -694,7 +694,9 @@ fn now_ms() -> i64 {
 /// `/api/missions`: the board, each task with its stages from the store
 /// (`stages`: `[{stage, verdict?, at_ms, took_ms?}]`, oldest first) and its
 /// last gate verdict (`last_gate`: `{verdict, reason, metric, candidate,
-/// at_ms}` or null).
+/// at_ms}` or null), each mission with the owner's `hold` on its source (the
+/// active hold's event id, or null), and `holds`: every active hold
+/// (`{source, hold, main, by, reason, held_at_ms, expires_ms, waiting}`).
 fn missions() -> Result<Value, String> {
     let store = open_store()?;
     let mut board = store.mission_board(50).map_err(err)?;
