@@ -367,7 +367,7 @@ impl GitWorkspace {
     ) -> Result<Vec<u8>, WorkspaceError> {
         let mut with_input: Vec<&OsStr> = arguments.iter().map(AsRef::as_ref).collect();
         with_input.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(OsStr::new));
-        self.listing_in_with_input(directory, index, &with_input, nul_terminated(specs))
+        self.listing_in_with_input(directory, index, &with_input, &nul_terminated(specs))
     }
 
     /// [`Self::listing_in`] for a command that reads `input` on standard
@@ -377,7 +377,7 @@ impl GitWorkspace {
         directory: &Path,
         index: &Path,
         arguments: &[S],
-        input: Vec<u8>,
+        input: &[u8],
     ) -> Result<Vec<u8>, WorkspaceError> {
         let word = shown_arguments(arguments);
         let mut child = self
@@ -393,7 +393,7 @@ impl GitWorkspace {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 use std::io::Write;
-                stdin.map(|mut stdin| stdin.write_all(&input))
+                stdin.map(|mut stdin| stdin.write_all(input))
             });
             report_listing(child.wait_with_output(), &word)
         })
@@ -625,22 +625,22 @@ impl GitWorkspace {
             .map(OsString::from)
             .into();
         listing.extend(specs);
-        let held: Vec<(TreePath, u64)> =
+        let entries: Vec<(TreePath, u64)> =
             listed_paths(&self.listing_in(directory, index, &listing)?)
                 .into_iter()
                 .map(|path| (path, 0))
                 .collect();
-        if held.is_empty() {
+        if entries.is_empty() {
             return Ok(());
         }
         let in_main = match self.commit_id_of(&format!("refs/heads/{BASE}")) {
-            Ok(main) => self.blobs_in(&[main], &held)?,
-            Err(_) => held.iter().map(|(path, _)| path.clone()).collect(),
+            Ok(main) => self.blobs_in(&[main], &entries)?,
+            Err(_) => entries.iter().map(|(path, _)| path.clone()).collect(),
         };
         // git adds nothing beyond a symbolic link and refuses a directory or
         // a special file: what is not a file there now is gone from the
         // index, as `add -A` would have it.
-        let (present, gone): (Vec<TreePath>, Vec<TreePath>) = held
+        let (present, gone): (Vec<TreePath>, Vec<TreePath>) = entries
             .into_iter()
             .map(|(path, _)| path)
             .partition(|path| in_main.contains(path) && is_file_in(directory, path));
@@ -656,7 +656,7 @@ impl GitWorkspace {
                 directory,
                 index,
                 &["update-index", flag, "-z", "--stdin"],
-                nul_terminated(&names),
+                &nul_terminated(&names),
             )?;
         }
         Ok(())
