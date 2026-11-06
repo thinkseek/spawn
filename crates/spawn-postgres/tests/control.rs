@@ -383,6 +383,137 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
     );
 }
 
+/// Objective 018: a `no_room` the integrator records when a check before
+/// the gate falls short names `check` (`disk`, `memory`, `database`),
+/// `measured` and `threshold` (a disk one still `free_kb` and `tmpdir`).
+/// The store accepts it, refuses one that leaves its measure out, and folds
+/// it as every `no_room`: the task stays where it was, neither count
+/// moves, and the mission's run of them counts on; the escalation names the
+/// check.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_no_room_with_its_check_measure_and_threshold_folds_as_before() {
+    let (store, schema) = store("control_no_room_checks");
+    let mission = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            None,
+        )
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    let mut client = admin(&schema);
+    let no_room = |fields: serde_json::Value| {
+        let mut record = json!({"type": "task.gated", "id": task, "revision": 0,
+                                "verdict": "no_room", "base": "b1", "scenarios": 7,
+                                "reason": "no room to judge now; not a verdict, judged again later",
+                                "log": "the gate did not run", "escalate": false});
+        record
+            .as_object_mut()
+            .expect("object")
+            .extend(fields.as_object().expect("object").clone());
+        store.integrator_record(&record)
+    };
+    let mission_row = |client: &mut Client| tables(client)["missions"][0].clone();
+
+    no_room(json!({"check": "memory", "measured": 1500, "threshold": 2048}))
+        .expect("a memory no_room names no free_kb or tmpdir");
+    let after = tables(&mut client);
+    assert_eq!(after["tasks"][0]["state"], "reported", "the task stays");
+    assert_eq!(after["tasks"][0]["gate_log"], "the gate did not run");
+    let row = &after["missions"][0];
+    assert_eq!(
+        (&row["gate_aborts"], &row["gate_rejections"]),
+        (&json!(0), &json!(0))
+    );
+    assert_eq!(
+        (&row["gate_room_task"], &row["gate_room_waits"]),
+        (&json!(task), &json!(1))
+    );
+    assert!(row["gate_room_since_ms"].is_number() && row["gate_room_last_ms"].is_number());
+    assert_eq!(row["gate_room_escalated"], false);
+
+    no_room(json!({"check": "database",
+                   "measured": "ERROR: could not resize shared memory segment (53100)",
+                   "threshold": "a parallel query within 10 s",
+                   "server": "/run/test-pg:5432/spawn_test", "escalate": true}))
+    .expect("a database no_room");
+    no_room(
+        json!({"check": "disk", "measured": 1024, "threshold": 10_485_760,
+                   "free_kb": 1024, "min_gb": 10, "tmpdir": "/tmp"}),
+    )
+    .expect("a disk no_room");
+    no_room(json!({"free_kb": 0, "min_gb": 10, "tmpdir": "/data/tmp"}))
+        .expect("the gate's own fact, as before, names no check");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (
+            &row["gate_room_task"],
+            &row["gate_room_waits"],
+            &row["gate_room_escalated"]
+        ),
+        (&json!(task), &json!(4), &json!(true)),
+        "one run, counted on"
+    );
+    assert_eq!(
+        (&row["gate_aborts"], &row["gate_rejections"]),
+        (&json!(0), &json!(0))
+    );
+
+    // A no_room that leaves out what it measured is refused, and moves nothing.
+    for refused in [
+        json!({"check": "disk", "measured": 1024, "threshold": 10_485_760}),
+        json!({"check": "memory", "threshold": 2048}),
+        json!({"check": "memory", "measured": 1500}),
+        json!({"check": "database", "measured": "", "threshold": "connect within 10 s"}),
+        json!({"check": "cpu", "measured": 1, "threshold": 2, "free_kb": 1, "tmpdir": "/t"}),
+        json!({"check": null, "measured": 1, "threshold": 2, "free_kb": 1, "tmpdir": "/t"}),
+        json!({}),
+    ] {
+        assert!(no_room(refused.clone()).is_err(), "{refused}");
+    }
+    assert_eq!(mission_row(&mut client)["gate_room_waits"], 4);
+
+    let escalations = store.gate_room_escalations().expect("escalations");
+    assert_eq!(
+        escalations.as_array().map(Vec::len),
+        Some(1),
+        "{escalations}"
+    );
+    assert_eq!(escalations[0]["check"], "database");
+    assert_eq!(escalations[0]["threshold"], "a parallel query within 10 s");
+    assert_eq!(escalations[0]["mission"], mission);
+
+    // A gate that judges ends the run, as before.
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                   "verdict": "aborted", "reason": "the gate failed"}))
+        .expect("an abort");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (&row["gate_room_waits"], &row["gate_aborts"]),
+        (&json!(0), &json!(1))
+    );
+    assert!(row["gate_room_task"].is_null());
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
+
 /// Objective 16: `incompatible` (the head passes the gate alone and fails
 /// only merged with main) sends the task back like `conflict`: `revise`, one
 /// more revision, the note kept, `gate_rejections` where it was and

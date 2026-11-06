@@ -223,28 +223,63 @@ no new executions start; free space (old workspaces, build output) or tell the o
 /// The digest items for `records`, the integrator's `no_room` gate records
 /// that carry `escalate` and that no delivered digest told yet
 /// (`PostgresStore::gate_room_escalations`): a mission's gate has had no
-/// room in TMPDIR for more than two hours. No time window: a record stays
-/// an item until a digest carrying its tag reaches the supervisor, and the
-/// integrator writes one per run, so the supervisor is told once.
+/// room to judge for more than two hours. Each names the check that fell
+/// short (`disk`, `memory` or `database`; a record that names none is the
+/// gate's own disk floor), its measure and its threshold. No time window: a
+/// record stays an item until a digest carrying its tag reaches the
+/// supervisor, and the integrator writes one per run, so the supervisor is
+/// told once.
 pub(crate) fn gate_room_escalations(records: &[Value]) -> Vec<Escalation> {
     records
         .iter()
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
-            let free = gib(record["free_kb"].as_u64()?.saturating_mul(1024));
-            let tmpdir = record["tmpdir"].as_str()?;
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "a mission".to_string(), |id| format!("mission {id}"));
+            let check = record["check"].as_str().unwrap_or("disk");
+            let text = |name: &str| match &record[name] {
+                Value::String(text) => text.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            let (what, advice) = match check {
+                "memory" => (
+                    format!(
+                        "{} MiB of memory available, under SPAWN_GATE_MIN_FREE_MEMORY_MB={}",
+                        text("measured"),
+                        text("threshold")
+                    ),
+                    "free memory on this host",
+                ),
+                "database" => (
+                    format!(
+                        "the test database{} failed the probe \"{}\": {}",
+                        record["server"]
+                            .as_str()
+                            .map_or_else(String::new, |server| format!(" ({server})")),
+                        text("threshold"),
+                        text("measured")
+                    ),
+                    "repair the test database server (its /dev/shm, its connections)",
+                ),
+                _ => (
+                    format!(
+                        "{} free in TMPDIR {}, under SPAWN_GATE_MIN_FREE_GB={}",
+                        gib(record["free_kb"].as_u64()?.saturating_mul(1024)),
+                        record["tmpdir"].as_str()?,
+                        record["min_gb"].as_u64().unwrap_or_default()
+                    ),
+                    "free space there (old gate scratch, build output)",
+                ),
+            };
             Some(Escalation {
                 session_id: "host".to_string(),
                 id: format!("gate-room-{id}"),
                 why: Why::GateRoom,
                 line: format!(
-                    "the gate of {mission} has had no room to judge for over two hours: {free} \
-free in TMPDIR {tmpdir}, under SPAWN_GATE_MIN_FREE_GB={}. Its work waits (no halt counts); free \
-space there (old gate scratch, build output) or tell the owner.",
-                    record["min_gb"].as_u64().unwrap_or_default()
+                    "{check} check: the gate of {mission} has had no room to judge for over two \
+hours: {what}. Its work waits (no halt counts); {advice} or tell the owner."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })
@@ -610,5 +645,57 @@ free in TMPDIR /data/tmp, under SPAWN_GATE_MIN_FREE_GB=10"
             "{}",
             items[0].line
         );
+        assert!(
+            items[0].line.starts_with("disk check: "),
+            "{}",
+            items[0].line
+        );
+    }
+
+    /// Objective 018: the item names the check that fell short, its measure
+    /// and its threshold: memory and the test database too.
+    #[test]
+    fn a_gate_without_room_is_told_with_its_check_measure_and_threshold() {
+        let records = [
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 4,
+                   "check": "memory", "measured": 1500, "threshold": 2048,
+                   "event_id": 21, "mission": 7}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 5,
+                   "check": "database",
+                   "measured": "ERROR: could not resize shared memory segment (53100)",
+                   "threshold": "a parallel query within 10 s",
+                   "server": "/run/test-pg:5432/spawn_test", "event_id": 22, "mission": 8}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 6,
+                   "check": "disk", "measured": 1_048_576, "threshold": 10_485_760,
+                   "free_kb": 1_048_576, "min_gb": 10, "tmpdir": "/tmp",
+                   "event_id": 23, "mission": 9}),
+        ];
+        let items = gate_room_escalations(&records);
+        let lines: Vec<&str> = items.iter().map(|item| item.line.as_str()).collect();
+        assert_eq!(
+            lines[0],
+            "memory check: the gate of mission 7 has had no room to judge for over two hours: \
+1500 MiB of memory available, under SPAWN_GATE_MIN_FREE_MEMORY_MB=2048. Its work waits (no halt \
+counts); free memory on this host or tell the owner."
+        );
+        assert!(
+            lines[1].starts_with(
+                "database check: the gate of mission 8 has had no room to judge for over two \
+hours: the test database (/run/test-pg:5432/spawn_test) failed the probe \"a parallel query \
+within 10 s\": ERROR: could not resize shared memory segment (53100)."
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with(
+                "disk check: the gate of mission 9 has had no room to judge for over two hours: \
+1.0 GiB free in TMPDIR /tmp, under SPAWN_GATE_MIN_FREE_GB=10."
+            ),
+            "{}",
+            lines[2]
+        );
+        assert!(items.iter().all(|item| item.why == Why::GateRoom));
+        assert_eq!(items[1].tag(), "host gate-room-22");
     }
 }

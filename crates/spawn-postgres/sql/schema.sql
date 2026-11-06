@@ -1078,7 +1078,8 @@ create table if not exists mission_missions (
     gate_rejections integer not null default 0,
     gate_aborts     integer not null default 0,
     -- The gate's current run of `no_room` outcomes (TMPDIR short of room,
-    -- scripts/disk.sh) on one task, `gate_room_task`: when the first and
+    -- scripts/disk.sh, or a check the integrator makes before a gate:
+    -- disk, memory, the test database) on one task, `gate_room_task`: when the first and
     -- the latest were recorded, how many, and whether one of them escalated
     -- to the supervisor. No verdict on the work, so it counts toward no
     -- halt. A gate that judged (or aborted) ends the run, and so does its
@@ -1360,8 +1361,10 @@ begin
            set baseline = coalesce(baseline, p_record ->> 'base'),
                gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
                                                 when 'accepted' then 0 else gate_rejections end,
-               -- `no_room`: the gate found no room in TMPDIR to judge, a
-               -- fact about the host, not the work. It moves neither count.
+               -- `no_room`: no room to judge (TMPDIR's free space, the
+               -- host's memory or the test database, measured before the
+               -- gate or by the gate's own floor), a fact about the host,
+               -- not the work. It moves neither count.
                -- `host_fault`: the gate failed because the host did (the
                -- test database): neither count grows nor resets.
                gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
@@ -2096,11 +2099,21 @@ begin
         raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
                         p_record;
     end if;
-    -- No room to judge names what it saw: the free space and the directory.
+    -- No room to judge names what it measured: the check that fell short
+    -- (`disk`, `memory` or `database`), its `measured` and its `threshold`
+    -- (the integrator's checks before a gate, docs/fleet-architecture.md
+    -- §10.3); a disk one, or one that names no check (the gate's own fact,
+    -- and records from before the checks), the free space and the directory.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'no_room'
-       and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
-            or p_record ->> 'tmpdir' is null) then
-        raise exception 'a no_room verdict names free_kb and tmpdir: %', p_record;
+       and ((p_record ? 'check'
+             and (coalesce(p_record ->> 'check', '') not in ('disk', 'memory', 'database')
+                  or coalesce(p_record ->> 'measured', '') = ''
+                  or coalesce(p_record ->> 'threshold', '') = ''))
+            or (coalesce(p_record ->> 'check', 'disk') = 'disk'
+                and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
+                     or p_record ->> 'tmpdir' is null))) then
+        raise exception 'a no_room verdict names its check, measured and threshold, and a disk one free_kb and tmpdir: %',
+                        p_record;
     end if;
     -- The gate runs for minutes: the task may have been closed meanwhile.
     -- A verdict only moves work that is still waiting for it.

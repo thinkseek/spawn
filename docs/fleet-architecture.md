@@ -748,7 +748,10 @@ the tree's own:
   directory for the gate (it measures that directory's parent). Any other
   status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
   `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
-  a timeout or a signal.
+  a timeout or a signal. The integrator measures the same floor, free
+  memory and the test database itself before it starts the gate (§10.3,
+  step 3), so a short host is found before a gate runs; the gate's own
+  check and exit 5 stay, for a `TMPDIR` that fills in between.
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
@@ -825,7 +828,40 @@ record of what was judged (§14 of design.md).
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
+  3. measures the host before the gate starts: **the host's room is
+     checked before a gate, not discovered by its crash.** For this
+     judging's task only (one that got a gate slot; a task that waits is
+     neither checked nor recorded), in this order, stopping at the first
+     that falls short:
+     - disk: the free KiB (`df`) of the gate's `TMPDIR` (`/tmp` when unset)
+       against `SPAWN_GATE_MIN_FREE_GB` (default 10, the floor
+       `scripts/disk.sh` reads too: one floor, one meaning);
+     - memory: `MemAvailable` of `/proc/meminfo` in MiB against
+       `SPAWN_GATE_MIN_FREE_MEMORY_MB` (default 2048; the integrator's
+       only, not passed to the gate);
+     - database: when `SPAWN_TEST_DATABASE_URL` is set in the integrator's
+       environment (whatever the owner's-cluster check then decides for the
+       gate), a connection within 10 s, then, in one transaction that
+       changes nothing, `SET LOCAL max_parallel_workers_per_gather = 2`,
+       `parallel_setup_cost = 0`, `parallel_tuple_cost = 0`,
+       `debug_parallel_query = on` (`force_parallel_mode` before
+       PostgreSQL 16) and `SELECT count(*) FROM generate_series(1, 100000)`
+       within 10 s: a Gather with a worker, so the dynamic shared memory the
+       tests need (`/dev/shm` in a container) is exercised. Any error fails
+       it. Not for a mission whose scenarios hold `no-test-database` (§10.4):
+       its gate never gets the URL, so a test server that is down does not
+       hold back its work.
+
+     A threshold of 0 disables its check; one that does not parse is an
+     abort, as a bad `SPAWN_GATE_MIN_FREE_GB` is to the gate. A check that
+     falls short runs no gate: the task is gated `no_room` (step 5) naming
+     the check, its measure and its threshold. On 2026-11-06 a test server
+     with a 64 MB `/dev/shm` failed "could not resize shared memory segment"
+     under the tests' parallel queries and the gate read it, 25 minutes in,
+     as a regression of the candidate; the probe finds it in seconds, before
+     any candidate runs. The decision rests on measures taken at the
+     judging, recorded with their thresholds (design.md §14);
+  4. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
      rejects C and C is a real merge (the pushed head does not contain
      `main`, so C's tree is not the head's), it then judges the head alone
      before recording anything: the same gate, scenarios and task scenario,
@@ -838,11 +874,17 @@ record of what was judged (§14 of design.md).
      commits, never on the text of a reason or on timing. The second run
      happens only for a rejected real merge and doubles that pass's gate
      time;
-  4. records `task.gated` (verdict, log, metric, C as `candidate`) before
-     git moves. A gate
-     that had no room (exit 5 with its fact, §10.2) is gated `no_room`. This
+  5. records `task.gated` (verdict, log, metric, C as `candidate`) before
+     git moves. A check before the gate that fell short (step 3), or a gate
+     that had no room (exit 5 with its fact, §10.2), is gated `no_room`. This
      is no verdict on the work. The task stays where it was, and the record
-     names the reason, `free_kb`, `min_gb` and `tmpdir`. It moves neither
+     names `check` (`disk`, `memory` or `database`; the gate's own floor is
+     `disk`), `measured` and `threshold` (free KiB and the floor in KiB, with
+     `free_kb`, `min_gb` and `tmpdir`; available MiB and the floor in MiB;
+     the error and the probe it failed, with `server` as
+     host:port/database or the socket directory, never the URL's password),
+     `log`, `escalate`, and a reason that names the check, the measure and
+     the threshold, ending "not a verdict, judged again later". It moves neither
      `gate_aborts` nor `gate_rejections`, so a disk that another project
      filled halts no mission. The fold keeps the mission's current run of
      them, which belongs to one task (`gate_room_task`, `gate_room_since_ms`,
@@ -854,8 +896,8 @@ record of what was judged (§14 of design.md).
      again only after a backoff from the latest `no_room`: 5 minutes,
      doubled each time, at most 40. The first `no_room` more than 2 hours
      into a run carries `escalate`. The dispatcher's digest takes that
-     record to the supervisor, with the free space and `TMPDIR` ("no room
-     for the gate on this host"). It stays pending until a delivered digest
+     record to the supervisor, naming the check, its measure and its
+     threshold ("no room for the gate on this host"). It stays pending until a delivered digest
      carries its tag (`host gate-room-<event>`), however long that takes, so
      it is told once.
 
@@ -916,12 +958,12 @@ record of what was judged (§14 of design.md).
      the failures and the crash lines named in the record, the wait on the
      recorded `due_ms`, never on the reason's text alone or on time without
      a record (design.md §14).
-  5. moves `main` on the source with a compare-and-swap push
+  6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
      record was lost), which is a landing;
-  6. records `task.landed` (`from`, `to` = C).
+  7. records `task.landed` (`from`, `to` = C).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note. A `rejected` decided after a run of the head alone
   names `head`, `head_base` and `head_verdict` (`rejected`), so the record
