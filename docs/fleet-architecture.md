@@ -225,6 +225,50 @@ it, on the same ladder.
   that failed is reported as failed) is news until it was told, however
   long that takes.
 
+  **Deliveries that never reached their worker.** A delivery whose retries
+  are spent on a host fault typed nothing (every attempt was refused before
+  typing), so assigning the task again is safe and needs no judgement; a
+  deploy is when such a fault may have gone. So (`deliver.rs`):
+  - *Re-issued.* A task's first delivery (the task `assigned`, revision 0)
+    whose retries are spent and none of whose attempts may have typed
+    (`MAY_HAVE_TYPED`) is re-issued `SPAWN_REISSUE_AFTER_SECS` (300) after
+    its last attempt finished, on the database's clock: in one transaction
+    (`spawn_task_reissue`, owner only) the task is cancelled, its
+    `task.cancelled` naming `by` `spawn-dispatch`, `reissued_as` the new
+    task and `attempts` (every attempt, in order: `command`, `key`,
+    `error`), and a new task is assigned, its `task.assigned` naming
+    `reissue_of` and copying the old task's mission, kind, worker (a
+    resident's; an ephemeral task gets a new worker with the same label),
+    brief, model, objective, scenario and `created_by`. The new task is
+    delivered by the usual rules (it queues behind tasks of its session
+    assigned before it). The old one was never delivered, so its worker is
+    not stopped, set aside or told; an objective keeps a task in flight
+    throughout, so the integrator never assigns it twice. Such a delivery
+    is neither escalated nor a stall.
+  - *Escalated only when the re-issue is spent too.* A re-issue is never
+    re-issued again: its spent delivery is escalated as `delivery failed`
+    (tag `<session> deliver-<task>-<revision>`), the line naming the task,
+    the task it re-issued (`task #<new> (a re-issue of task #<old>) never
+    reached its worker ...`) and the attempts of both. A delivery that may
+    have typed, and a revision's delivery, are escalated as before and never
+    re-issued.
+  - *Tried once more after a deploy.* `spawn mission moved` records
+    `source.moved` for every deploy, also when it moves no mission's
+    baseline. After the latest such record, every task whose current
+    delivery is spent (re-issued or not, escalated or not, never one that
+    may have typed) and was spent before the record gets exactly one more
+    attempt, keyed `deliver-<task>-<revision>-moved-<that record's event
+    id>`, at once (the delivery rules still say when the worker can take
+    it). A success delivers the task (and a re-issue still due for it is
+    not made); a failure leaves it as it was: no new escalation, no attempt
+    again until the next `source.moved`. A re-issue due goes before the
+    deploy's attempt, which its new task does not need.
+  Each rests on recorded facts, never on time or absence alone (design.md
+  §14): the re-issue on the recorded attempts and their outcomes, the extra
+  attempt on a recorded `source.moved`; and each is itself recorded (the
+  cancellation and the assignment name each other, the attempt is a command
+  under its own key).
+
   **Stalls: no task waits silently.** A stall is the absence of an event,
   so the dispatcher also measures, for every open task, the step it waits
   on and since which record, from the log alone (`dispatch/stall.rs`, the
@@ -248,9 +292,10 @@ it, on the same ladder.
   (`stall-mission-<mission>-halted-<record>`), with the reason and the open
   tasks. A failed command (a delivery attempt, a model switch's or a
   retirement's Stop, a resume) is the evidence of the step it blocks, not a
-  step of its own. A delivery whose retries are spent was escalated as
-  `delivery failed`, which is its stall's escalation; one that may have
-  typed the task is not retried, and its stall is escalated at its bound.
+  step of its own. A delivery whose retries are spent is re-issued or was
+  escalated as `delivery failed`, which is its stall's escalation; one that
+  may have typed the task is not retried, and its stall is escalated at its
+  bound.
   A worker at its prompt whose screen says background shells still run
   (Claude Code's `· done … N shells still running`, read from the line the
   engine draws right above its prompt) is treated as active: its `activity`
@@ -346,7 +391,7 @@ input of a mission.
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
 | Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
-| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, then escalated; a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
+| Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait (`SPAWN_DELIVERY_RETRY_SECS`, 60 s first), 3 times; then a first delivery is re-issued (cancelled and assigned again, once) and any other is escalated, and after each deploy every spent delivery is tried once more (§3, "Deliveries that never reached their worker"); a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once and never re-issued; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
 **Two kinds of worker.**
