@@ -106,17 +106,19 @@
 #
 # Today (b950e25, two runs each way; three more on 13668eb, the deploy
 # before it, behaved the same): it fails at (1) in 1-2 s. With
-# BB_030_MEASURE=1 it runs 118-143 s and every check fails: no alert of any
+# BB_030_MEASURE=1 it runs 118-147 s and every check fails: no alert of any
 # kind is recorded or shown, GET /api/alerts answers 404 and the follow mode
 # exits at once. What shows the conditions today, in Spawn's own record: the
-# halt reaches the supervisor's digest as a `halted` stall 155-234 ms after
+# halt reaches the supervisor's digest as a `halted` stall 155-362 ms after
 # `mission.halted` (SPAWN_STALL_HALTED_SECS 0); r1's stuck judgement,
 # recorded 1.7-1.8 s after its line was submitted, sets `spawn fleet`'s
 # attention but reaches no digest within 38 s (dispatch.rs skips a managed
 # worker between tasks); nothing shows the task changes, the failed
 # command, the crash lines, memory, /tmp, the undelivered task (its delivery
-# stall is 600 s), the admission wait, the backups, the drill or the model
-# login.
+# stall is 600 s), the admission wait, the backups, the drill, the model
+# login, 033's base-disagreement record or 031's over-alert record (one more
+# measure run on b950e25 with them, 2026-11-06 18:25 CST: 147 s, the halt's
+# digest 362 ms after its record, nothing else shown).
 set -eu
 
 asserted=""
@@ -1019,7 +1021,7 @@ today "model login expired" "$(event_at "$auth")" "exec_bb_auth|session_worker_b
 today "three bases in a row that disagreed with themselves (033)" "$(event_at "$gbd")" "base|011\\.sh"
 if [ -n "$missing" ]; then
     over=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-over.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id, \"over_alert\": true, \"held_bytes\": 8100000000, \"written_bytes\": 2400100, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
-    today "R2 over its alert threshold (031)" "$(event_at "$over")" "R2|budget|over"
+    today "R2 over its alert threshold (031)" "$(event_at "$over")" "R2|budget|over" 5
 fi
 if [ -z "$missing" ]; then
     waited=$(($(now_ms) - $(event_at "$wait_rec")))
