@@ -755,7 +755,30 @@ fi
     measured_fail "(2) the second record's held_bytes [$(field "$rec2" '.held_bytes')] is not the $held1 bytes the bucket held before it"
 echo "031: dump 2: $(field "$rec2" '.events') events, $(field "$rec2" '.stored_bytes') bytes stored, in $dump2_ms ms"
 
-# --- (3) the daily bundle ------------------------------------------------------------
+# --- (3) the daily bundle: full, then incremental ------------------------------------
+
+# unpack_bundle <key> <dir>: the object decrypted (its sha256 checked against
+# the record $2's) and untarred into <dir>; 1 when it does not decrypt.
+unpack_bundle() {
+    stored=$(object "$1")
+    decrypt "$stored" "$WORK/bundle.raw" || return 1
+    magic=$(head -c 4 "$WORK/bundle.raw" | od -An -tx1 | tr -d ' \n')
+    case "$magic" in
+    1f8b*) gzip -dc <"$WORK/bundle.raw" >"$WORK/bundle.tar" ;;
+    28b52ffd)
+        command -v zstd >/dev/null 2>&1 || harness "the bundle is zstd-compressed and zstd is not installed"
+        zstd -q -dc <"$WORK/bundle.raw" >"$WORK/bundle.tar"
+        ;;
+    *) cp "$WORK/bundle.raw" "$WORK/bundle.tar" ;;
+    esac
+    mkdir -p "$2"
+    tar -xf "$WORK/bundle.tar" -C "$2" 2>"$WORK/tar.err" ||
+        fail "(3) the bundle $1 decrypts to no tar archive (magic $magic): $(head -c 200 "$WORK/tar.err")"
+}
+heads_of() { git --git-dir="$1" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort; }
+bundle_heads() { git bundle list-heads "$1" 2>/dev/null | awk '$2 != "HEAD"' | sort; }
+# The files of the archive modified within the window (14 days), sorted.
+window_files() { (cd "$archive" && find . -type f -mtime -14 | sed 's#^\./##' | sort); }
 
 lines=$(log_lines)
 backup bundle
@@ -764,28 +787,18 @@ bundle_ms=$took
 bun=$(newest backup.bundled)
 [ -n "$bun" ] || fail "(3) \`spawn backup bundle\` exited 0 and recorded no backup.bundled"
 bkey=$(field "$bun" '.keys[0] // empty')
-printf '%s' "$bkey" | grep -Eq '^bundles/daily/' && has_object "$bkey" ||
-    fail "(3) the bundle's key [$bkey] is no object under bundles/daily/"
-bstored=$(object "$bkey")
-decrypt "$bstored" "$WORK/bundle" ||
+week1=$(date -u +%G%V)
+printf '%s' "$bkey" | grep -Eq '^bundles/full/' && has_object "$bkey" ||
+    fail "(3) the first bundle's key [$bkey] is no object under bundles/full/ (the first bundle, with none before it, is a full one)"
+[ "$(field "$bun" '.kind // empty')" = full ] ||
+    measured_fail "(3) the first bundle is recorded kind [$(field "$bun" '.kind // empty')], not full"
+unpack_bundle "$bkey" "$WORK/unpacked" ||
     fail "(3) the bundle $bkey does not decrypt with the passphrase file: $(head -c 300 "$WORK/gpg.err")"
-[ "$(sha "$WORK/bundle")" = "$(field "$bun" '.sha256')" ] ||
+[ "$(sha "$WORK/bundle.raw")" = "$(field "$bun" '.sha256')" ] ||
     measured_fail "(3) the bundle's sha256 is not the record's"
-magic=$(head -c 4 "$WORK/bundle" | od -An -tx1 | tr -d ' \n')
-case "$magic" in
-1f8b*) gzip -dc <"$WORK/bundle" >"$WORK/bundle.tar" ;;
-28b52ffd)
-    command -v zstd >/dev/null 2>&1 || harness "the bundle is zstd-compressed and zstd is not installed"
-    zstd -q -dc <"$WORK/bundle" >"$WORK/bundle.tar"
-    ;;
-*) cp "$WORK/bundle" "$WORK/bundle.tar" ;;
-esac
-mkdir -p "$WORK/unpacked"
-tar -xf "$WORK/bundle.tar" -C "$WORK/unpacked" 2>"$WORK/tar.err" ||
-    fail "(3) the bundle decrypts to no tar archive (magic $magic): $(head -c 200 "$WORK/tar.err")"
+[ "$(jq -r '.kind // empty' "$WORK/unpacked/manifest.json" 2>/dev/null)" = full ] ||
+    measured_fail "(3) the full bundle holds no manifest.json of kind full: $(head -c 200 "$WORK/unpacked/manifest.json" 2>/dev/null)"
 git init -q --bare "$WORK/check.git"
-heads_of() { git --git-dir="$1" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort; }
-bundle_heads() { git bundle list-heads "$1" 2>/dev/null | awk '$2 != "HEAD"' | sort; }
 for src in "$src_spawn" "$src_other"; do
     want=$(heads_of "$src")
     found=""
@@ -802,22 +815,112 @@ for src in "$src_spawn" "$src_other"; do
         git clone -q -b spawn/agent_worker_objective_7 "$found" "$WORK/clone" 2>"$WORK/clone.err" &&
             [ "$(cat "$WORK/clone/work.txt" 2>/dev/null)" = "the agent work, checkpointed" ] ||
             measured_fail "(3) the agent's branch spawn/agent_worker_objective_7 does not come back from the bundle with its work.txt"
+        full_spawn=$found
     fi
 done
 files=0
 bytes=0
-for path in $(cd "$archive" && find . -type f | sed 's#^\./##' | sort); do
+for path in $(window_files); do
     files=$((files + 1))
     bytes=$((bytes + $(size "$archive/$path")))
     cmp -s "$archive/$path" "$WORK/unpacked/transcripts/$path" ||
         measured_fail "(3) the bundle has no transcripts/$path with the archive's bytes"
 done
+[ ! -e "$WORK/unpacked/transcripts/$old_transcript" ] ||
+    measured_fail "(3) the full bundle holds $old_transcript, last written 20 days ago: outside the 14-day window"
 [ "$(field "$bun" '.transcripts.files')" = "$files" ] && [ "$(field "$bun" '.transcripts.bytes')" = "$bytes" ] ||
-    measured_fail "(3) the record's transcripts [$(field "$bun" '.transcripts' | tr -d ' \n')] are not the archive's $files files, $bytes bytes"
+    measured_fail "(3) the record's transcripts [$(field "$bun" '.transcripts | {files, bytes}' | tr -d ' \n')] are not the window's $files files, $bytes bytes"
 named=$(field "$bun" '[.repos[]?.source] | sort | join(" ")')
 [ "$named" = "$(printf '%s\n%s\n' "$src_other" "$src_spawn" | sort | tr '\n' ' ' | sed 's/ $//')" ] ||
     measured_fail "(3) the record names the sources [$named], not the two missions' $src_spawn and $src_other"
-echo "031: bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and two sources, in $bundle_ms ms"
+echo "031: full bundle: $(field "$bun" '.stored_bytes') bytes stored for $bytes bytes of transcripts and two sources, in $bundle_ms ms"
+
+# The archive grows (one file appended to, one new), the agent's branch
+# moves, other.git does not: the next bundle the same day is an increment.
+sup=agent_supervisor/0b7e3c52-5d1e-4c1a-9a36-1f0c6f2d0001.jsonl
+wrk=agent_worker_objective_7/5f2a9e10-7c44-4b8e-8f00-2a4e9d3c0002.jsonl
+new=agent_worker_objective_7/9c1d4e77-2b6a-4f0e-8d11-7e5a3c9b0003.jsonl
+sup_before=$(size "$archive/$sup")
+awk 'BEGIN { for (i = 1501; i <= 1700; i++)
+    printf "{\"type\":\"assistant\",\"uuid\":\"s-%d\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"step %d: the next day, still nothing needs a person\"}]}}\n", i, i }' \
+    >>"$archive/$sup"
+awk 'BEGIN { for (i = 1; i <= 120; i++)
+    printf "{\"type\":\"user\",\"uuid\":\"n-%d\",\"message\":{\"role\":\"user\",\"content\":\"a new session, line %d\"}}\n", i, i }' \
+    >"$archive/$new"
+printf 'more agent work\n' >>"$WORK/seed/work.txt"
+git -C "$WORK/seed" add -A
+git -C "$WORK/seed" commit -qm "spawn checkpoint exec_8"
+git -C "$WORK/seed" push -q "$src_spawn" work:refs/heads/spawn/agent_worker_objective_7
+lines=$(log_lines)
+backup bundle
+[ "$status" -eq 0 ] || fail "(3) the second \`spawn backup bundle\` exited $status: $(err | tail -n 2 | tr '\n' ' ')"
+incr_ms=$took
+inc=$(newest backup.bundled)
+[ "$(event_of "$inc")" != "$(event_of "$bun")" ] || fail "(3) the second \`spawn backup bundle\` recorded nothing"
+ikey=$(field "$inc" '.keys[0] // empty')
+puts=$(requests_since "$lines" | awk '$1 == "PUT" && $3 == 200 && $2 ~ /^bundles\//' | wc -l | tr -d ' ')
+if [ "$(date -u +%G%V)" != "$week1" ]; then
+    echo "031: the ISO week turned between the two bundles: the second is a week's first, so a full one; the increment is not judged in this run"
+else
+    printf '%s' "$ikey" | grep -Eq '^bundles/incr/' && has_object "$ikey" && [ "$puts" = 1 ] ||
+        measured_fail "(3) the second bundle of the day stored $puts objects, keys $(field "$inc" '.keys' | tr -d ' \n'): one, under bundles/incr/ (an increment of the full one)"
+    [ "$(field "$inc" '.kind // empty')" = incremental ] && [ "$(field "$inc" '.base_event_id // empty')" = "$(event_of "$bun")" ] ||
+        measured_fail "(3) the second bundle is recorded kind [$(field "$inc" '.kind // empty')] base_event_id [$(field "$inc" '.base_event_id // empty')], not incremental of the full one (event $(event_of "$bun"))"
+    if [ -n "$ikey" ] && has_object "$ikey"; then
+        unpack_bundle "$ikey" "$WORK/unpacked2" ||
+            fail "(3) the increment $ikey does not decrypt with the passphrase file: $(head -c 300 "$WORK/gpg.err")"
+        manifest=$WORK/unpacked2/manifest.json
+        [ "$(jq -r '.kind // empty' "$manifest" 2>/dev/null)" = incremental ] ||
+            measured_fail "(3) the increment holds no manifest.json of kind incremental: $(head -c 200 "$manifest" 2>/dev/null)"
+        # The grown file: its appended bytes alone, at the full one's size.
+        tail -c "+$((sup_before + 1))" "$archive/$sup" >"$WORK/appended"
+        [ "$(jq -r --arg p "$sup" '.transcripts[]? | select(.path == $p) | .offset' "$manifest" 2>/dev/null)" = "$sup_before" ] &&
+            cmp -s "$WORK/appended" "$WORK/unpacked2/transcripts/$sup" ||
+            measured_fail "(3) the increment does not hold exactly the $(size "$WORK/appended") bytes appended to $sup at offset $sup_before (manifest: $(jq -c --arg p "$sup" '[.transcripts[]? | select(.path == $p)]' "$manifest" 2>/dev/null); held: $(size "$WORK/unpacked2/transcripts/$sup" 2>/dev/null || echo none) bytes)"
+        [ "$(jq -r --arg p "$new" '.transcripts[]? | select(.path == $p) | .offset' "$manifest" 2>/dev/null)" = 0 ] &&
+            cmp -s "$archive/$new" "$WORK/unpacked2/transcripts/$new" ||
+            measured_fail "(3) the increment does not hold the new transcript $new whole at offset 0"
+        [ ! -e "$WORK/unpacked2/transcripts/$wrk" ] ||
+            measured_fail "(3) the increment holds $wrk, which did not change since the full bundle"
+        # The full bundle and the increment give the window back.
+        for path in $(window_files); do
+            if [ -f "$WORK/unpacked2/transcripts/$path" ]; then
+                off=$(jq -r --arg p "$path" '[.transcripts[]? | select(.path == $p) | .offset][0] // 0' "$manifest")
+                { if [ "$off" -gt 0 ]; then head -c "$off" "$WORK/unpacked/transcripts/$path"; fi
+                  cat "$WORK/unpacked2/transcripts/$path"; } >"$WORK/restored"
+            else
+                cp "$WORK/unpacked/transcripts/$path" "$WORK/restored" 2>/dev/null || : >"$WORK/restored"
+            fi
+            cmp -s "$WORK/restored" "$archive/$path" ||
+                measured_fail "(3) the full bundle and the increment do not give $path back byte for byte"
+        done
+        # spawn.git: a bundle whose prerequisites the full one holds, which
+        # gives exactly the source's branches now; other.git unchanged.
+        want=$(heads_of "$src_spawn")
+        found=""
+        for b in "$WORK"/unpacked2/repos/*.bundle; do
+            [ -f "$b" ] || continue
+            if [ "$(bundle_heads "$b")" = "$want" ]; then found=$b; break; fi
+        done
+        if [ -z "$found" ]; then
+            measured_fail "(3) no repos/*.bundle in the increment lists exactly spawn.git's branches now (bundles: $(cd "$WORK/unpacked2" && find . -name '*.bundle' | tr '\n' ' '))"
+        else
+            [ "$(git bundle verify "$found" 2>&1 | grep -ci 'requires')" -ge 1 ] && [ -n "${full_spawn-}" ] ||
+                measured_fail "(3) spawn.git's bundle in the increment names no prerequisites: a whole copy, not an increment"
+            if [ -n "${full_spawn-}" ]; then
+                git init -q --bare "$WORK/restore.git"
+                git --git-dir="$WORK/restore.git" fetch -q "$full_spawn" 'refs/*:refs/*' 2>"$WORK/fetch.err" &&
+                    git --git-dir="$WORK/restore.git" fetch -q "$found" 'refs/*:refs/*' 2>>"$WORK/fetch.err" &&
+                    [ "$(heads_of "$WORK/restore.git")" = "$want" ] ||
+                    measured_fail "(3) the full bundle of spawn.git and the increment's, fetched in turn, do not give the source's branches: $(head -c 200 "$WORK/fetch.err")"
+            fi
+        fi
+        [ "$(jq -r --arg s "$src_other" '[.repos[]? | select(.source == $s) | .unchanged][0] // empty' "$manifest" 2>/dev/null)" = true ] &&
+            [ "$(field "$inc" --arg s "$src_other" '[.repos[]? | select(.source == $s) | .unchanged][0] // empty' 2>/dev/null || true)" != false ] ||
+            measured_fail "(3) the increment does not mark other.git unchanged (no ref of it moved): $(jq -c '.repos' "$manifest" 2>/dev/null)"
+    fi
+    echo "031: increment: $(field "$inc" '.stored_bytes') bytes stored for $(field "$inc" '.transcripts.bytes') bytes of transcripts, in $incr_ms ms"
+fi
 
 # --- (4) the restore drill -------------------------------------------------------------
 
@@ -896,7 +999,7 @@ if [ -n "$left" ] && [ "$left" != "$SPAWN_DB_NAME" ] && db_exists "$left"; then
 fi
 echo "031: corrupted dump: the drill failed in $corrupt_ms ms: $(field "$bad" '.reason // empty' | head -c 200)"
 
-# --- (6) the budget ------------------------------------------------------------------------
+# --- (6) the alert and the limit -------------------------------------------------------
 
 junk=junk/kept-elsewhere.bin
 head -c 1500000 /dev/urandom >"$(object "$junk")"
@@ -904,24 +1007,40 @@ jq -n --arg key "$junk" --argjson size 1500000 \
     '{key: $key, etag: "0", size: $size, meta: {}, modified: "2026-01-01T00:00:00.000Z"}' >"$(object "$junk").json"
 held6=$(held)
 lines=$(log_lines)
-backup bundle SPAWN_BACKUP_R2_BUDGET_MB=1
-bun2=$(newest backup.bundled)
-puts=$(requests_since "$lines" | awk '$1 == "PUT" && $2 ~ /^bundles\//' | head -n 3)
-[ -z "$puts" ] ||
-    measured_fail "(6) with $held6 bytes held and a budget of 1 MB the bundle was still stored: $puts"
-[ "$(event_of "$bun2")" != "$(event_of "$bun")" ] && [ "$(field "$bun2" '.keys | length')" = 0 ] &&
-    [ "$(field "$bun2" '.skipped | length')" -ge 1 ] && [ "$(field "$bun2" '.budget_bytes')" = 1000000 ] &&
-    [ "$(field "$bun2" '.held_bytes')" = "$held6" ] &&
-    field "$bun2" '[.skipped[]?.reason] | join(" ")' | grep -qi budget ||
-    measured_fail "(6) the bundle over the budget recorded no skipped tiers with the budget (budget_bytes 1000000, held_bytes $held6): $(printf '%s' "$bun2" | cut -d'|' -f2- | head -c 300)"
-lines=$(log_lines)
-backup dump SPAWN_BACKUP_R2_BUDGET_MB=1
-[ "$status" -eq 0 ] || fail "(6) the dump over the budget exited $status: $(err | tail -n 2 | tr '\n' ' ')"
+backup dump SPAWN_BACKUP_R2_ALERT_MB=1
+[ "$status" -eq 0 ] || fail "(6) a dump over the alert (and under the limit) exited $status: $(err | tail -n 2 | tr '\n' ' ')"
 rec6=$(newest backup.dumped)
 key6=$(field "$rec6" '.keys[0] // empty')
 printf '%s' "$key6" | grep -Eq '^postgres/hourly/' && has_object "$key6" && [ "$key6" != "$key2" ] &&
-    [ "$(field "$rec6" '.over_budget')" = true ] ||
-    measured_fail "(6) over the budget the hourly dump must still be stored and recorded over_budget: key [$key6], over_budget [$(field "$rec6" '.over_budget')]"
+    [ "$(field "$rec6" '.over_alert')" = true ] && [ "$(field "$rec6" '.alert_bytes')" = 1000000 ] &&
+    [ "$(field "$rec6" '.limit_bytes')" = 10000000000 ] && [ "$(field "$rec6" '.held_bytes')" = "$held6" ] ||
+    measured_fail "(6) with $held6 bytes held and an alert at 1 MB the dump must store its hourly copy and record over_alert true, alert_bytes 1000000, limit_bytes 10000000000 and held_bytes $held6: key [$key6], $(printf '%s' "$rec6" | cut -d'|' -f2- | jq -c '{over_alert, alert_bytes, limit_bytes, held_bytes, written_bytes}' 2>/dev/null)"
+held7=$(held)
+lines=$(log_lines)
+backup bundle SPAWN_BACKUP_R2_ALERT_MB=1 SPAWN_BACKUP_R2_LIMIT_MB=1
+bun2=$(newest backup.bundled)
+puts=$(requests_since "$lines" | awk '$1 == "PUT" && $2 ~ /^bundles\//' | head -n 3)
+[ -z "$puts" ] ||
+    measured_fail "(6) with $held7 bytes held and a limit of 1 MB the bundle was still stored: $puts"
+[ "$(event_of "$bun2")" != "$(event_of "$inc")" ] && [ "$(field "$bun2" '.keys | length')" = 0 ] &&
+    [ "$(field "$bun2" '.skipped | length')" -ge 1 ] && [ "$(field "$bun2" '.limit_bytes')" = 1000000 ] &&
+    [ "$(field "$bun2" '.held_bytes')" = "$held7" ] &&
+    field "$bun2" '[.skipped[]?.reason] | join(" ")' | grep -qi limit ||
+    measured_fail "(6) the bundle over the limit recorded no skipped tier with the limit (limit_bytes 1000000, held_bytes $held7): $(printf '%s' "$bun2" | cut -d'|' -f2- | head -c 300)"
+dumped_before=$(count_records backup.dumped)
+lines=$(log_lines)
+backup dump SPAWN_BACKUP_R2_ALERT_MB=1 SPAWN_BACKUP_R2_LIMIT_MB=1
+[ "$status" -eq 4 ] ||
+    measured_fail "(6) a dump whose hourly copy the limit kept out exited $status, not 4: $(err | tail -n 2 | tr '\n' ' ')"
+rec7=$(newest backup.dumped)
+puts=$(requests_since "$lines" | awk '$1 == "PUT"' | head -n 3)
+[ -z "$puts" ] ||
+    measured_fail "(6) with $held7 bytes held and a limit of 1 MB the dump still wrote to R2: $puts"
+[ "$(count_records backup.dumped)" -gt "$dumped_before" ] && [ "$(field "$rec7" '.keys | length')" = 0 ] &&
+    [ "$(field "$rec7" '[.skipped[]? | select(.tier == "hourly")] | length')" -ge 1 ] &&
+    [ "$(field "$rec7" '.limit_bytes')" = 1000000 ] &&
+    field "$rec7" '[.skipped[]?.reason] | join(" ")' | grep -qi limit ||
+    measured_fail "(6) the dump the limit kept out recorded no hourly tier skipped for the limit (keys [], limit_bytes 1000000): $(printf '%s' "$rec7" | cut -d'|' -f2- | head -c 300)"
 
 if [ -n "$failed_any" ]; then
     asserted=1
