@@ -235,7 +235,7 @@ function GateRoomList({ rows }: { rows: GateRoom[] | null }) {
           </span>
           <span className="shrink-0 font-mono text-micro text-faint-foreground">T{row.task}</span>
           <span className="tnum ml-auto shrink-0 text-warning">
-            {row.waits}× · {ago(row.since_ms)}
+            {row.waits}× for {ago(row.since_ms)}
           </span>
           {row.escalated && <span className="shrink-0 text-micro text-warning">escalated</span>}
         </div>
