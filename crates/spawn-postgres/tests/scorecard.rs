@@ -68,10 +68,11 @@ fn by_type<'a>(facts: &'a Value, kind: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-#[test]
-fn the_facts_project_each_record_to_what_the_measures_read() {
-    let (store, schema) = store("scorecard_control");
-    let mut client = admin(&schema);
+/// A gated mission's task through assignment, three gate runs (one log with
+/// several stage lines, one with `gate_ms`, one with no total), a person's
+/// cancellation, a halt and resume, a row from before the stream, and a
+/// landing at 8000.
+fn control_history(client: &mut Client) {
     let log = "| == candidate: build\n| stage gate passed 120ms build\n\
                | stage gate rejected 300000ms total\n| more\n  | stage gate accepted 600000ms total  \n\
                | stage gate accepted 999ms total and more\n! the integrator's note";
@@ -137,8 +138,15 @@ fn the_facts_project_each_record_to_what_the_measures_read() {
             json!({"type": "task.landed", "id": 4, "from": "a", "to": "b"}),
         ),
     ] {
-        record(&mut client, at, &value);
+        record(client, at, &value);
     }
+}
+
+#[test]
+fn the_facts_project_each_record_to_what_the_measures_read() {
+    let (store, schema) = store("scorecard_control");
+    let mut client = admin(&schema);
+    control_history(&mut client);
     let facts = store.scorecard_facts(8000).expect("the facts");
     let types: Vec<&str> = facts["control"]
         .as_array()
@@ -210,27 +218,18 @@ fn the_facts_project_each_record_to_what_the_measures_read() {
     );
 }
 
-#[test]
-fn the_facts_hold_the_commands_a_measure_reads() {
-    let (store, schema) = store("scorecard_commands");
-    let mut client = admin(&schema);
+/// Commands of every kind a measure reads, and some it does not, created at
+/// 100 to 1000.
+fn command_history(client: &mut Client) {
     let input = json!({"type": "input", "text": "x"});
     let start = json!({"type": "start", "engine": "claude", "prompt": "Task #6"});
     let digest = json!({"type": "input", "text": "stalled",
                         "tags": ["session_resident_r1 stall-9-activity-1",
                                  "session_worker_i_12 report-12-0"]});
     let plain_digest = json!({"type": "input", "text": "reports", "tags": ["s report-12-0"]});
+    command(client, "human", "board-1", &input, Some(true), None, 100);
     command(
-        &mut client,
-        "human",
-        "board-1",
-        &input,
-        Some(true),
-        None,
-        100,
-    );
-    command(
-        &mut client,
+        client,
         "spawn",
         "cli-stop-1",
         &json!({"type": "stop"}),
@@ -239,7 +238,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         200,
     );
     command(
-        &mut client,
+        client,
         "spawn-dispatch",
         "deliver-6-0",
         &start,
@@ -248,7 +247,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         300,
     );
     command(
-        &mut client,
+        client,
         "spawn-dispatch",
         "deliver-6-0-retry-1",
         &start,
@@ -257,7 +256,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         400,
     );
     command(
-        &mut client,
+        client,
         "spawn-dispatch",
         "dispatch-nudge-1",
         &input,
@@ -266,7 +265,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         500,
     );
     command(
-        &mut client,
+        client,
         "spawn-dispatch",
         "dispatch-resume-1",
         &input,
@@ -275,7 +274,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         600,
     );
     command(
-        &mut client,
+        client,
         "spawn-dispatch",
         "digest-a",
         &digest,
@@ -284,7 +283,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         700,
     );
     command(
-        &mut client,
+        client,
         "spawn-dispatch",
         "digest-b",
         &plain_digest,
@@ -293,7 +292,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         800,
     );
     command(
-        &mut client,
+        client,
         "spawn_supervisor",
         "s-1",
         &input,
@@ -302,7 +301,7 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         900,
     );
     command(
-        &mut client,
+        client,
         "spawn-dispatch",
         "deliver-7-0",
         &start,
@@ -310,15 +309,14 @@ fn the_facts_hold_the_commands_a_measure_reads() {
         None,
         950,
     );
-    command(
-        &mut client,
-        "human",
-        "board-2",
-        &input,
-        Some(true),
-        None,
-        1000,
-    );
+    command(client, "human", "board-2", &input, Some(true), None, 1000);
+}
+
+#[test]
+fn the_facts_hold_the_commands_a_measure_reads() {
+    let (store, schema) = store("scorecard_commands");
+    let mut client = admin(&schema);
+    command_history(&mut client);
     let facts = store.scorecard_facts(1000).expect("the facts");
     let commands = facts["commands"].as_array().expect("commands");
     let keys: Vec<&str> = commands
