@@ -134,6 +134,7 @@ spawn fleet
 | `loop` | 常驻：每 500 ms 跑一轮 Bridge、Observer、派发与存活规则（`SPAWN_LOOP_INTERVAL_MS`） |
 | `integrate` | 常驻：对已验收任务跑黑盒门禁，宿主机提交并以 CAS 前移来源基线 |
 | `serve` | 常驻：只读看板与 HTTP 查询 |
+| `scorecard` | 只读记录，一次量出八个维度（吞吐、前导时间、一次通过率、返工、自主、可靠、成本、门禁耗时），带 n、方向、上一窗口与趋势（[design.md](design.md) §15） |
 | `mission` / `task` / `resident` | 任务域控制流：添加、配置、关闭、恢复任务，分派与验收子任务，提议、批准、退役常驻 worker |
 | `fleet` / `tail` | 舰队概览（每个会话及其判定）、单个会话的判定与事件尾随 |
 | `version` | 打印 `spawn <版本>` |
