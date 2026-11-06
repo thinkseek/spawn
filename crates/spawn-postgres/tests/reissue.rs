@@ -10,7 +10,6 @@
 
 use postgres::Client;
 use serde_json::{Value, json};
-use spawn_postgres::PostgresStore;
 
 mod common;
 use common::{admin, store};
