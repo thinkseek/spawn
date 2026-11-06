@@ -926,16 +926,16 @@ else
             cmp -s "$WORK/restored" "$archive/$path" ||
                 measured_fail "(3) the full bundle and the increment do not give $path back byte for byte"
         done
-        # spawn.git: a bundle whose prerequisites the full one holds, which
-        # gives exactly the source's branches now; other.git unchanged.
+        # spawn.git: the bundle its manifest names (an increment lists only
+        # the refs that moved), with prerequisites the full one holds, which
+        # fetched after the full one gives exactly the source's branches now;
+        # other.git unchanged.
         want=$(heads_of "$src_spawn")
         found=""
-        for b in "$WORK"/unpacked2/repos/*.bundle; do
-            [ -f "$b" ] || continue
-            if [ "$(bundle_heads "$b")" = "$want" ]; then found=$b; break; fi
-        done
+        f=$(jq -r --arg s "$src_spawn" '[.repos[]? | select(.source == $s) | .file][0] // empty' "$manifest" 2>/dev/null)
+        [ -n "$f" ] && [ -f "$WORK/unpacked2/$f" ] && found=$WORK/unpacked2/$f
         if [ -z "$found" ]; then
-            measured_fail "(3) no repos/*.bundle in the increment lists exactly spawn.git's branches now (bundles: $(cd "$WORK/unpacked2" && find . -name '*.bundle' | tr '\n' ' '))"
+            measured_fail "(3) the increment's manifest names no bundle of spawn.git, whose agent branch moved: $(jq -c '.repos' "$manifest" 2>/dev/null) (bundles: $(cd "$WORK/unpacked2" && find . -name '*.bundle' | tr '\n' ' '))"
         else
             # A v2 bundle's header: its prerequisites are the lines that
             # start with `-`, before the first blank line.
