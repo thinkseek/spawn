@@ -5575,20 +5575,12 @@ mod database_tests {
         assert_eq!(after.gate_aborts, 3);
         assert_eq!(after.gate_room_waits, 0, "a gate that ran ends the run");
         assert!(after.gate_room_since_ms.is_none() && !after.gate_room_escalated);
-        assert_eq!(
-            db.store
-                .gate_room_escalations()
-                .expect("escalations")
-                .as_array()
-                .map(Vec::len),
-            Some(0),
+        let plan = gate_room_plan(&db, &tag);
+        assert!(
+            plan.told.is_empty() && plan.pending.is_empty(),
             "told, and its run is over: resolved"
         );
-        let health = db.store.fleet_health().expect("health");
-        let room = health["gate_room"]
-            .as_array()
-            .and_then(|missions| missions.iter().find(|row| row["mission"] == mission))
-            .expect("the mission's gate room");
+        let room = gate_room_row(&db, mission);
         assert_eq!(
             (&room["task"], &room["waits"], &room["escalated"]),
             (&json!(null), &json!(0), &json!(false)),
