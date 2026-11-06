@@ -373,6 +373,19 @@ pub struct Launch {
     pub environment: Vec<(String, String)>,
 }
 
+/// What a terminal hosts ([`TerminalHost::runner`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runner {
+    /// The runner the host started there, alive.
+    Running,
+    /// No terminal of that name.
+    Gone,
+    /// A terminal of that name that does not host that runner: why, as the
+    /// host saw it (a dead pane and its status, or what the pane was started
+    /// with and runs now).
+    Untracked(String),
+}
+
 /// The most bytes one [`TerminalHost::read_from`] returns: a file an agent
 /// writes cannot make the Bridge hold an unbounded buffer.
 pub const READ_LIMIT: usize = 8 << 20;
@@ -431,6 +444,26 @@ pub trait TerminalHost: Send + Sync {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError>;
+
+    /// Whether the terminal hosts the runner this host started in it
+    /// ([`Self::start`]), alive: what the Bridge asks before it calls an
+    /// execution running or types into it. A terminal of that name can
+    /// outlive its runner: a pane left dead (`remain-on-exit`), or a session
+    /// a terminal manager restored after a restart, at a shell prompt. Such
+    /// a terminal runs no engine of Spawn's, whatever its screen shows, so
+    /// its execution is lost ([`Runner::Untracked`], with what the host saw).
+    /// A host that cannot tell answers from [`Self::is_alive`].
+    fn runner(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<Runner, TerminalError> {
+        Ok(if self.is_alive(terminal, workspace)? {
+            Runner::Running
+        } else {
+            Runner::Gone
+        })
+    }
 
     /// Last `lines` lines of the terminal screen, newest last.
     fn capture_tail(
