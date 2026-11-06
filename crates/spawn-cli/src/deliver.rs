@@ -881,7 +881,8 @@ pub(crate) fn delivery_status(
     };
     let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
     let mut given_up = false;
-    let next = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
+    let attempts = found.map_or(Attempts::None, |facts| attempts(&work.waits, task, facts));
+    let next = match attempts {
         Attempts::None => held(task, found, settled).map_or_else(
             || "its first attempt goes on the next pass".to_string(),
             |why| format!("its first attempt is held: {why}"),
@@ -904,7 +905,25 @@ pub(crate) fn delivery_status(
                 )
             }
         }
-        Attempts::Failed { why, spent } => {
+        // A first delivery spent without typing is re-issued, not escalated.
+        Attempts::Failed {
+            spent: true,
+            last_ms,
+            ..
+        } if task.reissuable() => {
+            given_up = true;
+            let due = last_ms.saturating_add(work.waits.reissue_after_ms);
+            let when = if now_ms < due {
+                format!("in {}s", (due - now_ms).saturating_add(999) / 1000)
+            } else {
+                "now".to_string()
+            };
+            format!(
+                "not tried again: its retries are spent and nothing was typed; it is re-issued \
+                 (cancelled and assigned again) {when}"
+            )
+        }
+        Attempts::Failed { why, spent, .. } => {
             given_up = spent;
             format!("not tried again: it {why} (escalated as delivery failed)")
         }
@@ -915,8 +934,12 @@ pub(crate) fn delivery_status(
     }
 }
 
-/// Where each waiting task's delivery stands, with the task.
-fn waiting_attempts<'a>(work: &'a Work, rows: &[Facts]) -> Vec<(&'a TaskRow, Attempts)> {
+/// Where each waiting task's delivery stands, with the task and its
+/// session's facts.
+fn waiting_attempts<'a, 'r>(
+    work: &'a Work,
+    rows: &'r [Facts],
+) -> Vec<(&'a TaskRow, &'r Facts, Attempts)> {
     work.tasks
         .iter()
         .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
@@ -924,7 +947,7 @@ fn waiting_attempts<'a>(work: &'a Work, rows: &[Facts]) -> Vec<(&'a TaskRow, Att
             let facts = rows
                 .iter()
                 .find(|facts| facts.session_id == task.session_id)?;
-            Some((task, attempts(task, facts)))
+            Some((task, facts, attempts(&work.waits, task, facts)))
         })
         .collect()
 }
@@ -934,9 +957,26 @@ fn waiting_attempts<'a>(work: &'a Work, rows: &[Facts]) -> Vec<(&'a TaskRow, Att
 pub(crate) fn delivered(work: &Work, rows: &[Facts]) -> Vec<(i64, i64)> {
     waiting_attempts(work, rows)
         .into_iter()
-        .filter_map(|(task, attempts)| match attempts {
+        .filter_map(|(task, _, attempts)| match attempts {
             Attempts::Delivered(command) => Some((task.id, command)),
             _ => None,
+        })
+        .collect()
+}
+
+/// The tasks to re-issue now, at `now_ms` (the database's clock): first
+/// deliveries whose retries are spent, none of whose attempts may have
+/// typed, [`Waits::reissue_after_ms`] after their latest attempt finished
+/// ([`reissue_due`]), each with every attempt of its delivery. Rests on the
+/// recorded attempts and their outcomes; the re-issue (one cancellation and
+/// one assignment naming each other) is itself recorded.
+pub(crate) fn reissues(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Reissue> {
+    waiting_attempts(work, rows)
+        .into_iter()
+        .filter(|(task, _, attempts)| reissue_due(work, task, *attempts, now_ms))
+        .map(|(task, facts, _)| Reissue {
+            task: task.id,
+            attempts: attempt_records(task, facts),
         })
         .collect()
 }
@@ -956,8 +996,9 @@ pub(crate) fn next_up(work: &Work) -> BTreeSet<i64> {
         .collect()
 }
 
-/// Delivery orders for the current facts: a task's delivery, or its retry
-/// once due ([`attempts`]).
+/// Delivery orders for the current facts: a task's delivery, its retry
+/// once due ([`attempts`]), or the one more attempt a deploy gives a spent
+/// delivery ([`moved_attempt`]) unless it is re-issued now ([`reissues`]).
 pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
     let facts: BTreeMap<&str, &Facts> = rows
         .iter()
@@ -973,10 +1014,23 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                 if !next.contains(&task.id) {
                     continue;
                 }
-                let key = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
+                let attempts =
+                    found.map_or(Attempts::None, |facts| attempts(&work.waits, task, facts));
+                let key = match attempts {
                     Attempts::None => task.delivery_key(),
                     Attempts::Retry { number, due_ms } if now_ms >= due_ms => {
                         format!("{}-retry-{number}", task.delivery_key())
+                    }
+                    // Spent: after a deploy, tried once more, at once.
+                    Attempts::Failed {
+                        spent: true,
+                        last_ms,
+                        ..
+                    } if !reissue_due(work, task, attempts, now_ms) => {
+                        match found.and_then(|facts| moved_attempt(work, task, facts, last_ms)) {
+                            Some(key) => key,
+                            None => continue,
+                        }
                     }
                     Attempts::Retry { .. }
                     | Attempts::Open
@@ -1216,17 +1270,74 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             line: message.line(),
         });
     }
-    for (task, attempts) in waiting_attempts(work, rows) {
-        if let Attempts::Failed { why, .. } = attempts {
-            items.push(Escalation {
-                session_id: task.session_id.clone(),
-                id: task.delivery_key(),
-                why: Why::DeliveryFailed,
-                line: format!("task #{} {why}", task.id),
-            });
+    for (task, facts, attempts) in waiting_attempts(work, rows) {
+        let Attempts::Failed { why, spent, .. } = attempts else {
+            continue;
+        };
+        // A first delivery spent without typing is re-issued instead.
+        if spent && task.reissuable() {
+            continue;
         }
+        let line = match task.reissue_of {
+            Some(old) if spent => reissue_spent(task, facts, old),
+            _ => format!("task #{} {why}", task.id),
+        };
+        items.push(Escalation {
+            session_id: task.session_id.clone(),
+            id: task.delivery_key(),
+            why: Why::DeliveryFailed,
+            line,
+        });
     }
     items
+}
+
+/// The escalation of a re-issue whose delivery is spent too: it names the
+/// task and the task it re-issued, and the attempts of both.
+fn reissue_spent(task: &TaskRow, facts: &Facts, old: i64) -> String {
+    let own = attempt_records(task, facts);
+    let before = task.reissued_attempts.as_deref().unwrap_or_default();
+    format!(
+        "task #{id} (a re-issue of task #{old}) never reached its worker; nor did task #{old} \
+         before it, so nothing was typed and the host likely refuses it. Task #{id}'s attempts: \
+         {}; task #{old}'s: {}. Fix the host: a deploy (`spawn mission moved`) tries it once \
+         more; or cancel it",
+        attempts_line(&own),
+        attempts_line(before),
+        id = task.id,
+    )
+}
+
+/// `attempts` in one line: each run of attempts that failed with the same
+/// error, with its first and last key, how many, and the error.
+fn attempts_line(attempts: &[Attempt]) -> String {
+    if attempts.is_empty() {
+        return "none recorded".to_string();
+    }
+    let mut runs: Vec<(&Attempt, &Attempt, usize)> = Vec::new();
+    for attempt in attempts {
+        match runs.last_mut() {
+            Some((_, last, count)) if last.error == attempt.error => {
+                *last = attempt;
+                *count += 1;
+            }
+            _ => runs.push((attempt, attempt, 1)),
+        }
+    }
+    runs.iter()
+        .map(|(first, last, count)| {
+            let error = one_line(first.error.as_deref().unwrap_or("no error recorded"), 160);
+            if *count == 1 {
+                format!("`{}` failed ({error})", first.key)
+            } else {
+                format!(
+                    "`{}` to `{}` ({count} attempts) failed ({error})",
+                    first.key, last.key
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Move a collected report to `.spawn/reports/task-<id>.md` under the
