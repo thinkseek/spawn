@@ -2220,15 +2220,10 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-<<<<<<< b950e25e38d827ef4dc53d420c8f6b4b11083840
         Freshness, Mission, NO_TEST_DATABASE, aborted, freshness, halt_reason, markers_note,
         merged_tree, needs_test_database, no_room, over_budget, pinned, report_freshness,
-        room_backoff, room_wait, task_scenario, waits_for_gate, wall_clock_minutes,
-=======
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, no_room,
-        over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
-        task_scenario, wall_clock_minutes,
->>>>>>> 15736e4f00fd4256d749cfa34e26a940ff970c52
+        room_backoff, room_wait, short_of_room, task_scenario, waits_for_gate,
+        wall_clock_minutes,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
