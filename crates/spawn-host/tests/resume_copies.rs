@@ -111,6 +111,7 @@ fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     );
     bridge.tick().expect("start");

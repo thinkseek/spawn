@@ -517,6 +517,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 parent_session_id: None,
                 from: None,
                 model,
+                charter: None,
             },
         )),
     }
@@ -1270,6 +1271,7 @@ mod tests {
             resumed_young: 0,
             turn_ended: idle,
             checkpoint: None,
+            charter: None,
         }
     }
 

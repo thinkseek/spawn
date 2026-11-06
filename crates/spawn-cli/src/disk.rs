@@ -545,6 +545,7 @@ mod tests {
                 parent_session_id: None,
                 from: None,
                 model: None,
+                charter: None,
             }),
             order(CommandAction::Input {
                 text: "next".to_string(),

@@ -174,6 +174,14 @@ select jsonb_build_object(
 /// anything was typed (a pane not ready, no execution, a source that did not
 /// answer) told the worker nothing: the worker's last delivery is still the
 /// one before it, and its own retry is not judged against itself.
+///
+/// `charter`, for the supervisor only (null for every other session), is
+/// what decides which charter its running native session holds: `start`,
+/// the command of the execution that first named its current native session
+/// (the latest `session.native_started`'s id); `given`, that start's
+/// `charter` (null for a start that recorded none); `inputs`, every input
+/// the dispatcher sent into the session after that start that files a
+/// `charter <hash>` tag, oldest first, with its outcome, however long ago.
 pub(crate) const DISPATCH_FACTS: &str = concat!(
     r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
@@ -258,9 +266,45 @@ from (
     r")
         and ",
     died_young!("x"),
-    r") as resumed_young
+    r") as resumed_young,
+    case when s.session_id = 'session_supervisor' then jsonb_build_object(
+      'start', born.command_id,
+      'given', born.charter,
+      'inputs', (select coalesce(jsonb_agg(jsonb_build_object(
+                     'id', c.id,
+                     'key', c.idempotency_key,
+                     'hash', t.hash,
+                     'finished_at_ms', c.finished_at_ms,
+                     'succeeded', c.succeeded,
+                     'error', c.error) order by c.id), '[]'::jsonb)
+                   from spawn_commands c
+                   cross join lateral (
+                     select min(substr(tag, length('charter ') + 1)) as hash
+                       from jsonb_array_elements_text(
+                              case when jsonb_typeof(c.action -> 'tags') = 'array'
+                                   then c.action -> 'tags' else '[]'::jsonb end) tag
+                      where starts_with(tag, 'charter ')) t
+                  where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+                    and c.action ->> 'type' = 'input' and t.hash is not null
+                    and c.id > coalesce(born.command_id, 0)))
+    end as charter
   from agent_status s
   join spawn_session_state p using (session_id)
+  -- The supervisor's current native session (the one its latest
+  -- `session.native_started` names, which a resume resumes) and the start
+  -- that began it: the command of the execution that named it first.
+  left join lateral (select c.id as command_id, c.action ->> 'charter' as charter
+     from spawn_events n
+     join spawn_events x on x.session_id = n.session_id and x.event_name = 'execution.started'
+                        and x.execution_id = n.execution_id
+     join spawn_commands c on c.id = (x.kind -> 'detail' ->> 'command_id')::bigint
+    where s.session_id = 'session_supervisor'
+      and n.session_id = s.session_id and n.event_name = 'session.native_started'
+      and n.kind -> 'detail' ->> 'native_session_id' =
+          (select l.kind -> 'detail' ->> 'native_session_id' from spawn_events l
+            where l.session_id = s.session_id and l.event_name = 'session.native_started'
+            order by l.id desc limit 1)
+    order by n.id limit 1) born on true
   left join lateral (select c.id, c.action from spawn_commands c
      where c.session_id = s.session_id
        and (c.principal <> 'spawn-dispatch'

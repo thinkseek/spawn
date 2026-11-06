@@ -1673,6 +1673,9 @@ impl Bridge {
                 parent_session_id,
                 from,
                 model,
+                // The control layer's record of the charter it gave: nothing
+                // the Bridge does depends on it.
+                charter: _,
             } => self.start(
                 claimed,
                 &Begin {

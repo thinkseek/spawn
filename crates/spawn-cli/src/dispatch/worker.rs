@@ -117,11 +117,13 @@ fn resume_lost(facts: &Facts) -> Decision {
 /// in flight, or failed after typing may have begun. One that failed before
 /// typing (a pane not ready, a terminal gone) told the worker nothing.
 fn reached(sent: &Sent) -> bool {
-    sent.succeeded != Some(false)
-        || sent
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains(MAY_HAVE_TYPED))
+    reached_with(sent.succeeded, sent.error.as_deref())
+}
+
+/// [`reached`], from a command's outcome: `succeeded` (`None` while in
+/// flight) and its `error`.
+pub(super) fn reached_with(succeeded: Option<bool>, error: Option<&str>) -> bool {
+    succeeded != Some(false) || error.is_some_and(|error| error.contains(MAY_HAVE_TYPED))
 }
 
 /// Nudges that reached this worker within the last hour, across episodes.
