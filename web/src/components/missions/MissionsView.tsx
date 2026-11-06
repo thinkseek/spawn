@@ -578,9 +578,9 @@ function EarlierAttempts({ group, missionName }: { group: TaskGroup<MissionTask>
         Earlier attempt{group.earlier.length === 1 ? "" : "s"} · {group.earlier.length}
       </SectionLabel>
       <ul className="mt-1 space-y-1">
-        {group.earlier.map((attempt) => (
+        {group.earlier.map((attempt, index) => (
           <li
-            key={attempt.task.id ?? attempt.outcome}
+            key={attempt.task.id ?? `attempt-${index}`}
             className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 border-l border-border-strong pl-2.5 text-caption"
           >
             <span className="tnum shrink-0 font-mono text-micro text-faint-foreground">

@@ -785,7 +785,6 @@ function SectionRowLabel({
     <div
       role="treeitem"
       aria-level={2}
-      aria-expanded={!folded}
       className="pointer-events-none absolute inset-x-0 flex items-end pl-7"
       style={{ top: row.y, height: row.h }}
       onPointerDown={(event) => event.stopPropagation()}
@@ -835,7 +834,6 @@ function LaneLabel({
     <div
       role="treeitem"
       aria-level={1}
-      aria-expanded={!collapsed}
       className="pointer-events-none absolute inset-x-0 flex items-end px-3 pb-1.5"
       style={{ top: row.y, height: row.h }}
       onPointerDown={(event) => event.stopPropagation()}
