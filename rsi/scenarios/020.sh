@@ -3,34 +3,43 @@
 # When check-tests.sh fails on the candidate and every failure is a
 # connection error to the test database (or the test database's own log
 # shows a server crash during the gate), the integrator records a host fault,
-# not a rejection: it does not count toward the halt, nothing goes back to
-# the worker, the gate runs again (once objective 018's checks pass), and two
-# host faults in a row halt the mission's landings for a human. A real test
-# failure among them keeps it a rejection.
+# not a rejection: it counts toward no halt, nothing goes back to the worker,
+# and the task is judged again after a backoff that doubles with each host
+# fault in a row. Two in a row are escalated to the supervisor, naming the
+# host's evidence; a host fault never halts a mission. A real test failure
+# among them keeps it a rejection, and a real verdict or a landing ends the
+# run of host faults.
 #
-# A real loop (`spawn loop`: the Bridge, its pusher, the dispatcher, no
-# model judge, no supervisor) runs four residents of one gated mission
-# (accept = gate) on a fake engine that writes `<name>.txt` and reports.
-# `spawn integrate --once` passes, run by the scenario one at a time, judge
-# through a recording gate (SPAWN_GATE) that prints what scripts/rsi/gate.sh
-# prints when check-tests.sh fails (its section header, check-tests.sh's
-# lines: each failing test's `thread '<name>' panicked at <file>:` and its
-# message, `test result: FAILED. ...`) and the verdict `rejected`, reason
-# `regression: check-tests.sh fails on the candidate`, by what the candidate
-# holds:
-#   - hostA.txt (until the host is "fixed"): three failures, each a
-#     connection error (`error connecting to server: Connection refused`,
-#     SQLSTATE E57P02 `terminating connection because of crash of another
-#     server process`, `the database system is in recovery mode`);
-#   - mixed.txt: two connection errors and one real assertion failure;
-#   - olddb.txt: two database errors that are not connection errors (`could
-#     not open relation with OID`, `cache lookup failed`), with a crash in
-#     the test database's log an hour before the gate ran;
-#   - hostB.txt: on its first run, two connection errors; on its second, the
-#     database errors of olddb.txt while the gate appends a crash to the test
-#     database's log (`server process (PID n) was terminated by signal 11:
-#     Segmentation fault`, `terminating any other active server processes`,
-#     `all server processes terminated; reinitializing`, stamped now, UTC);
+# A real loop (`spawn loop`: the Bridge, its pusher, the dispatcher, the
+# supervisor, no model judge) runs four residents of one gated mission
+# (accept = gate) on a fake engine that writes `<name>.txt` and reports; the
+# supervisor runs on the same fake engine. `spawn integrate --once` passes,
+# run by the scenario one at a time with SPAWN_GATE_HOST_FAULT_BACKOFF_SECS=5,
+# judge through a recording gate (SPAWN_GATE) that prints what
+# scripts/rsi/gate.sh prints when check-tests.sh fails and the verdict
+# `rejected`, reason `regression: check-tests.sh fails on the candidate`.
+# check-tests.sh's output comes in two forms: the owner's (one line per
+# failing test, `FAILED <name>: <first message line>`, then the 40-line
+# excerpt) and today's (the excerpt alone: each failing test's `thread
+# '<name>' panicked at <file>:` and its message, `test result: FAILED. ...`,
+# cut at 40 lines). By what the candidate holds:
+#   - hostA.txt (until the host is "fixed"), owner's form: three failures,
+#     each a connection error (`error connecting to server: Connection
+#     refused`, SQLSTATE E57P02 `terminating connection because of crash of
+#     another server process`, `the database system is in recovery mode`);
+#     the excerpt, cut short, shows only the first;
+#   - mixed.txt, owner's form: two connection errors and one real assertion
+#     failure that only the FAILED lines show (the excerpt is cut before it);
+#   - olddb.txt, today's form: two database errors that are not connection
+#     errors (`could not open relation with OID`, `cache lookup failed`),
+#     with a crash in the test database's log an hour before the gate ran;
+#   - hostB.txt: its first run, today's form, two connection errors; its
+#     second, owner's form, the database errors of olddb.txt while the gate
+#     appends a crash to the test database's log (`server process (PID n) was
+#     terminated by signal 11: Segmentation fault`, `terminating any other
+#     active server processes`, `all server processes terminated;
+#     reinitializing`, stamped now, UTC); its third run is accepted (the host
+#     recovered);
 #   - anything else: accepted.
 # The integrator reads that log from SPAWN_TEST_DATABASE_LOG. The four tasks
 # are judged in id order (hostA, mixed, olddb, hostB), all reported first.
@@ -39,33 +48,41 @@
 #       gate_rejections and gate_aborts where they were, the task stays
 #       `reported` with its revisions unchanged (nothing goes back to the
 #       worker), the mission is not halted; the record names `evidence`
-#       `failures` and `failures`, one entry per failing test with its
-#       `test` name.
-#   (2) the gate runs again: the host fixed, the next pass judges hostA again
-#       (no other wait), accepted, and it lands.
+#       `failures`, `failures` with all three tests (from the FAILED lines:
+#       the excerpt shows one), `host_faults` 1, `escalate` false,
+#       `backoff_ms` 5000 and `due_ms` its own time + 5000.
+#   (2) judged again after the backoff: the host fixed, passes run every half
+#       second; hostA's gate does not run before `due_ms`, then runs,
+#       accepted, and it lands; the mission's gate_host_faults is 0.
 #   (3) mixed: `rejected`, gate_rejections + 1 (a real failure among
-#       connection errors is the work's).
+#       connection errors is the work's, though only the FAILED lines show it).
 #   (4) olddb: `rejected`, gate_rejections + 1 (database errors that are not
 #       connection errors, and the log's crash is outside the gate's window).
-#   (5) hostB: `host_fault` (`host_faults` 1), then `host_fault` again, by
-#       the log (`evidence` `server_log`, `crash` holding the signal line,
-#       `host_faults` 2, `escalate` true); then the mission halts with a
-#       reason naming the host faults, and the gate does not run a third
-#       time on hostB.
+#   (5) hostB: `host_fault` from today's 40-line form (`host_faults` 1,
+#       `backoff_ms` 5000); after its due time, `host_fault` again by the log
+#       (`evidence` `server_log`, `crash` holding the signal line,
+#       `host_faults` 2, `backoff_ms` 10000, `escalate` true); within 60 s the
+#       supervisor gets a digest tagged `host gate-host-fault-<that record's
+#       event id>` whose line names task #hostB and the crash line; the
+#       mission is never halted; after its due time hostB is judged a third
+#       time, accepted, and lands; gate_host_faults is back to 0 and the host
+#       faults were escalated once.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
 # error exits 2, never 1.
 #
-# Fails with 1 at (1) on the live main (06cc205, the deployed binary built
-# from it): hostA's candidate, whose every failure is a connection error to
-# the test database, is gated `rejected` (regression: check-tests.sh fails
-# on the candidate), counted toward the halt (gate_rejections 0 -> 1) and
-# sent back to its worker. It passes once the integrator, when check-tests.sh
-# fails on the candidate, reads the failures check-tests.sh printed and the
-# test database's log over the gate's window and records `host_fault` when
-# every failure is the host's, `rejected` otherwise, and halts the mission
-# after two host faults in a row.
+# Fails with 1 at (1) on the live main (b92c914; the deployed binary is
+# built from 06cc205): hostA's candidate, whose every failure is a
+# connection error to the test database, is gated `rejected` (regression:
+# check-tests.sh fails on the candidate), counted toward the halt
+# (gate_rejections 0 -> 1) and sent back to its worker. It passes once the
+# integrator, when check-tests.sh fails on the candidate, reads the failures
+# check-tests.sh printed (its FAILED lines when there are, else the excerpt)
+# and the test database's log over the gate's window, records `host_fault`
+# when every failure is the host's and `rejected` otherwise, judges a host
+# fault again after a doubling backoff, and escalates two in a row to the
+# supervisor without halting.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN and
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, uses a
 # private tmux socket, no network. Every wait is bounded in time.
@@ -240,6 +257,8 @@ asserted() {
     echo "|  right: 2"
     echo "| --"
 }
+# failed <test> <first message line>: the owner's one line per failing test.
+failed() { echo "| FAILED \$1: \$2"; }
 header() {
     echo "== candidate: build"
     echo "| build: ok"
@@ -247,16 +266,23 @@ header() {
     echo "| == regression: check-tests.sh must still pass"
 }
 cand=\$3
+REFUSED='connect to the test database: error connecting to server: Connection refused (os error 111)'
+CRASHED='called \`Result::unwrap()\` on an \`Err\` value: Error { kind: Db, cause: Some(DbError { severity: "FATAL", parsed_severity: Some(Fatal), code: SqlState(E57P02), message: "terminating connection because of crash of another server process" }) }'
+RECOVERING='db error: FATAL: the database system is in recovery mode'
+LOST_OID='called \`Result::unwrap()\` on an \`Err\` value: Database("db error: ERROR: could not open relation with OID 16421")'
+LOST_CACHE='db error: ERROR: cache lookup failed for relation 16388'
 if has "\$1" "\$2" "\$3" hostB.txt; then
     n=\$(cat '$WORK/hostB-runs' 2>/dev/null || echo 0)
     n=\$((n + 1))
     echo "\$n" >'$WORK/hostB-runs'
-    header
     if [ "\$n" -eq 1 ]; then
+        # Today's form: the excerpt alone.
+        header
         refused sources::tests::lists_every_source
         recovering stalls::delivery_is_measured_from_its_record
         echo "| test result: FAILED. 41 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s"
-    else
+        reject hostB-\$n
+    elif [ "\$n" -eq 2 ]; then
         sleep 1
         stamp=\$(date -u '+%Y-%m-%d %H:%M:%S.%3N UTC')
         {
@@ -266,13 +292,23 @@ if has "\$1" "\$2" "\$3" hostB.txt; then
             printf '%s [1] LOG:  all server processes terminated; reinitializing\n' "\$stamp"
         } >>'$pglog'
         sleep 1
+        header
+        failed merges::tests::a_conflict_is_recorded "\$LOST_OID"
+        failed sources::tests::lists_every_source "\$LOST_CACHE"
         lost_oid merges::tests::a_conflict_is_recorded
         lost_cache sources::tests::lists_every_source
         echo "| test result: FAILED. 41 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s"
+        reject hostB-\$n
     fi
-    reject hostB-\$n
+    printf '%s %s %s\n' "\$(date +%s)" hostB-\$n "\$cand" >>'$WORK/judged.log'
+    echo "== candidate: build"
+    echo "| build: ok"
+    printf '{"verdict":"accepted"}\n' >"\$SPAWN_GATE_VERDICT"
+    echo '{"verdict":"accepted"}'
+    exit 0
 fi
 if has "\$1" "\$2" "\$3" olddb.txt; then
+    # Today's form.
     header
     lost_oid merges::tests::a_conflict_is_recorded
     lost_cache sources::tests::lists_every_source
@@ -280,20 +316,22 @@ if has "\$1" "\$2" "\$3" olddb.txt; then
     reject olddb
 fi
 if has "\$1" "\$2" "\$3" mixed.txt; then
+    # The owner's form; the excerpt is cut before the assertion.
     header
+    failed api::tests::claims_in_order "\$REFUSED"
+    failed control::tests::the_fold_replays "\$CRASHED"
+    failed integrate::tests::a_landing_moves_main_once 'assertion \`left == right\` failed: the landing moved main'
     refused api::tests::claims_in_order
     crashed control::tests::the_fold_replays
-    echo "| test result: FAILED. 41 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.97s"
-    asserted integrate::tests::a_landing_moves_main_once
-    echo "| test result: FAILED. 230 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.10s"
     reject mixed
 fi
 if has "\$1" "\$2" "\$3" hostA.txt && [ ! -e '$WORK/fixed-hostA' ]; then
+    # The owner's form; the excerpt is cut after the first failure.
     header
+    failed api::tests::claims_in_order "\$REFUSED"
+    failed control::tests::the_fold_replays "\$CRASHED"
+    failed stalls::tests::delivery_is_measured_from_its_record "\$RECOVERING"
     refused api::tests::claims_in_order
-    crashed control::tests::the_fold_replays
-    recovering stalls::tests::delivery_is_measured_from_its_record
-    echo "| test result: FAILED. 40 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.85s"
     reject hostA
 fi
 printf '%s %s %s\n' "\$(date +%s)" accept "\$cand" >>'$WORK/judged.log'
