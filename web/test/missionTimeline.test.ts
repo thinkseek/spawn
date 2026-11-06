@@ -226,6 +226,39 @@ test("stale and aborted verdicts keep the task at the gate", () => {
   assert.equal(bar!.end, null);
 });
 
+test("the clock and the now line run only while a task is live", () => {
+  const working = task(20, "delivered", [
+    ["assigned", 0],
+    ["delivered", 2],
+  ]);
+  const now = T0 + 30 * MIN;
+  const running = deriveMissionTimeline([mission(1, [working])], now);
+  assert.equal(running.openCount, 1);
+  assert.equal(isLive(running), true);
+
+  // A halted mission counts its open task for the axis, but nothing moves:
+  // the marker would otherwise stay where the page loaded.
+  const halted = deriveMissionTimeline(
+    [mission(1, [working], { halted: "3 gate rejections in a row" })],
+    now,
+  );
+  assert.equal(halted.openCount, 1);
+  assert.equal(halted.lanes[0].bars[0].stalled, true);
+  assert.equal(isLive(halted), false);
+});
+
+test("a mission without tasks has no bar to draw", () => {
+  const taskless = deriveMissionTimeline([mission(1, [])], T0);
+  assert.equal(hasBars(taskless), false);
+  assert.equal(taskless.openCount, 0);
+
+  const working = deriveMissionTimeline(
+    [mission(1, [task(20, "delivered", [["assigned", 0], ["delivered", 2]])])],
+    T0 + 10 * MIN,
+  );
+  assert.equal(hasBars(working), true);
+});
+
 test("an open task runs to now; a halted mission's open task is stalled", () => {
   const working = task(20, "delivered", [
     ["assigned", 0],
