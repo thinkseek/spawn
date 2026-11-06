@@ -9,6 +9,8 @@ import {
   STATE_FILTERS,
   deriveMissionTimeline,
   filterLanes,
+  hasBars,
+  isLive,
   phaseAt,
 } from "../../missionTimeline";
 import type {
@@ -43,7 +45,7 @@ import {
   useWheelZoom,
   useWidth,
 } from "../timeaxis/useTimeWindow";
-import { cx } from "../ui";
+import { EmptyState, cx } from "../ui";
 import { useStoredChoice } from "../ViewToggle";
 import { TaskPanel } from "./TaskPanel";
 import { PHASE_COLOR, PHASE_LEGEND, verdictColor } from "./timelineStyle";
@@ -89,8 +91,10 @@ export function MissionTimeline({
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const ids = useId();
-  const all = useMemo(() => deriveMissionTimeline(missions, 0, reasons), [missions, reasons]);
-  const live = all.lanes.some((lane) => lane.bars.some((bar) => bar.end === null && !bar.stalled));
+  // Seeded at the wall clock so a board with no bars at all (a mission
+  // before its first task) has today's fallback extent, not epoch 0.
+  const all = useMemo(() => deriveMissionTimeline(missions, Date.now(), reasons), [missions, reasons]);
+  const live = isLive(all);
   const now = useNowWhile(live);
   // Ordering and extent depend on now only through open bars.
   const timeline = useMemo(
@@ -290,214 +294,229 @@ export function MissionTimeline({
   };
 
   const hoveredRow = hover ? rows.list.find((row) => row.key === hover.key) : undefined;
-  const nowX = timeline.openCount > 0 ? px(now) : null;
+  // The marker follows the clock: it shows only while a task is live, never
+  // frozen at page load for a halted mission's stalled task.
+  const nowX = live ? px(now) : null;
   const totalTasks = timeline.lanes.reduce((sum, lane) => sum + lane.bars.length, 0);
+  const empty = !hasBars(timeline);
 
   return (
     <div ref={rootRef} className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-5">
         {header}
-        <Legend />
-        <div className="ml-auto flex items-center gap-1">
-          {fold !== LINEAR || folding === "off" ? (
-            <button
-              type="button"
-              aria-pressed={folding === "on"}
-              onClick={() => setFolding(folding === "on" ? "off" : "on")}
-              title={
-                folding === "on"
-                  ? "Idle stretches of 30 min or more are folded into marked breaks; click for a linear axis"
-                  : "A linear axis; click to fold idle stretches into breaks"
-              }
-              className={cx(
-                "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption transition-colors hover:bg-surface-hover",
-                folding === "on" ? "text-foreground" : "text-muted-foreground",
-              )}
-            >
-              <FoldHorizontal size={13} />
-              {folding === "on" ? "Idle folded" : "Linear"}
-            </button>
-          ) : null}
-          <ZoomControls view={view} fitLabel="Fit every task" />
-        </div>
+        {!empty && <Legend />}
+        {!empty && (
+          <div className="ml-auto flex items-center gap-1">
+            {fold !== LINEAR || folding === "off" ? (
+              <button
+                type="button"
+                aria-pressed={folding === "on"}
+                onClick={() => setFolding(folding === "on" ? "off" : "on")}
+                title={
+                  folding === "on"
+                    ? "Idle stretches of 30 min or more are folded into marked breaks; click for a linear axis"
+                    : "A linear axis; click to fold idle stretches into breaks"
+                }
+                className={cx(
+                  "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption transition-colors hover:bg-surface-hover",
+                  folding === "on" ? "text-foreground" : "text-muted-foreground",
+                )}
+              >
+                <FoldHorizontal size={13} />
+                {folding === "on" ? "Idle folded" : "Linear"}
+              </button>
+            ) : null}
+            <ZoomControls view={view} fitLabel="Fit every task" />
+          </div>
+        )}
       </div>
 
-      {!compact && (
-        <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 pb-2 sm:px-5">
-          {timeline.lanes.length > 1 && (
-            <Chips
-              label="Mission"
-              value={missionFilter}
-              onChange={setMissionFilter}
-              options={[
-                { id: null, label: "All missions" },
-                ...timeline.lanes.map((lane) => ({ id: lane.mission.id, label: lane.name })),
-              ]}
-            />
+      {empty ? (
+        <EmptyState
+          className="flex-1"
+          title="No tasks yet"
+          hint="Tasks appear here once the integrator assigns one."
+        />
+      ) : (
+        <>
+          {!compact && (
+            <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 pb-2 sm:px-5">
+              {timeline.lanes.length > 1 && (
+                <Chips
+                  label="Mission"
+                  value={missionFilter}
+                  onChange={setMissionFilter}
+                  options={[
+                    { id: null, label: "All missions" },
+                    ...timeline.lanes.map((lane) => ({ id: lane.mission.id, label: lane.name })),
+                  ]}
+                />
+              )}
+              <Chips
+                label="Task state"
+                value={stateFilter}
+                onChange={setStateFilter}
+                options={STATE_FILTERS.map((entry) => ({ id: entry.id, label: entry.label }))}
+              />
+            </div>
           )}
-          <Chips
-            label="Task state"
-            value={stateFilter}
-            onChange={setStateFilter}
-            options={STATE_FILTERS.map((entry) => ({ id: entry.id, label: entry.label }))}
-          />
-        </div>
-      )}
 
-      {!compact && (
-        <div className="flex shrink-0 items-stretch px-4 sm:px-5">
-          <div
-            className="flex shrink-0 flex-col justify-center pr-3 text-caption"
-            style={{ width: labelW - 16 }}
-          >
-            <span className="tnum text-muted-foreground">
-              {formatDuration(timeline.end - timeline.start)}
-            </span>
-            <span className="tnum truncate text-faint-foreground">
-              {totalTasks} task{totalTasks === 1 ? "" : "s"}
-              {timeline.openCount > 0 && ` · ${timeline.openCount} open`}
-            </span>
-          </div>
-          <Overview
-            lines={overviewLines}
-            extent={extent}
-            domain={domain}
-            width={plotW}
-            onDomain={view.setDomain}
-            onGlide={view.glideTo}
-          />
-        </div>
-      )}
-
-      <div className="relative flex min-h-0 flex-1">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <AxisRow
-            ticks={ticks}
-            breaks={breaks}
-            labelW={labelW}
-            plotW={plotW}
-            caption={compact ? "Task" : "Mission · task"}
-          />
-          <div ref={scrollRef} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-6">
-            {rows.list.length === 0 ? (
-              <p className="px-5 py-10 text-center text-caption text-faint-foreground">
-                No task matches these filters.
-              </p>
-            ) : (
+          {!compact && (
+            <div className="flex shrink-0 items-stretch px-4 sm:px-5">
               <div
-                ref={rowsRef}
-                role="tree"
-                aria-label="Missions timeline"
-                tabIndex={0}
-                onKeyDown={onKeyDown}
-                onPointerDown={onPointerDown}
-                onPointerMove={onPointerMove}
-                onPointerUp={onPointerUp}
-                onPointerCancel={() => pan.cancel()}
-                onPointerLeave={() => setHover(null)}
-                onDoubleClick={(event) => {
-                  const { row, x } = locate(event);
-                  if (row?.kind === "task" && x >= 0) zoomToBar(row.bar);
-                }}
-                className={cx(
-                  "relative select-none outline-none",
-                  pan.dragging ? "cursor-grabbing" : "cursor-default",
-                )}
-                style={{ height: rows.height }}
+                className="flex shrink-0 flex-col justify-center pr-3 text-caption"
+                style={{ width: labelW - 16 }}
               >
-                {rows.list.map((row) =>
-                  row.kind === "lane" ? null : (
-                    <TaskLabel
-                      key={row.key}
-                      row={row}
-                      labelW={labelW}
-                      hovered={hover?.key === row.key}
-                      selected={selected?.key === row.key}
-                      onSelect={() => choose(row)}
-                    />
-                  ),
-                )}
+                <span className="tnum text-muted-foreground">
+                  {formatDuration(timeline.end - timeline.start)}
+                </span>
+                <span className="tnum truncate text-faint-foreground">
+                  {totalTasks} task{totalTasks === 1 ? "" : "s"}
+                  {timeline.openCount > 0 && ` · ${timeline.openCount} open`}
+                </span>
+              </div>
+              <Overview
+                lines={overviewLines}
+                extent={extent}
+                domain={domain}
+                width={plotW}
+                onDomain={view.setDomain}
+                onGlide={view.glideTo}
+              />
+            </div>
+          )}
 
-                <svg
-                  aria-hidden="true"
-                  width={plotW}
-                  height={rows.height}
-                  className="pointer-events-none absolute top-0 overflow-hidden"
-                  style={{ left: labelW }}
-                >
-                  <defs>
-                    {(Object.keys(PHASE_COLOR) as Array<keyof typeof PHASE_COLOR>).map((phase) => (
-                      <TailGradient key={phase} id={`${ids}-tail-${phase}`} color={PHASE_COLOR[phase]} />
-                    ))}
-                    <pattern
-                      id={`${ids}-hatch`}
-                      width={5}
-                      height={5}
-                      patternUnits="userSpaceOnUse"
-                      patternTransform="rotate(45)"
-                    >
-                      <rect width={5} height={5} fill="var(--warning)" opacity={0.14} />
-                      <line x1={0} y1={0} x2={0} y2={5} stroke="var(--warning)" strokeWidth={2} opacity={0.75} />
-                    </pattern>
-                    <clipPath id={`${ids}-plot`}>
-                      <rect x={0} y={0} width={plotW} height={rows.height} />
-                    </clipPath>
-                  </defs>
-                  <g clipPath={`url(#${ids}-plot)`}>
-                    <BreakBands breaks={breaks} height={rows.height} />
-                    <Gridlines ticks={ticks} height={rows.height} />
-                    <NowLine x={nowX} height={rows.height} plotW={plotW} />
+          <div className="relative flex min-h-0 flex-1">
+            <div className="flex min-w-0 flex-1 flex-col">
+              <AxisRow
+                ticks={ticks}
+                breaks={breaks}
+                labelW={labelW}
+                plotW={plotW}
+                caption={compact ? "Task" : "Mission · task"}
+              />
+              <div ref={scrollRef} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-6">
+                {rows.list.length === 0 ? (
+                  <p className="px-5 py-10 text-center text-caption text-faint-foreground">
+                    No task matches these filters.
+                  </p>
+                ) : (
+                  <div
+                    ref={rowsRef}
+                    role="tree"
+                    aria-label="Missions timeline"
+                    tabIndex={0}
+                    onKeyDown={onKeyDown}
+                    onPointerDown={onPointerDown}
+                    onPointerMove={onPointerMove}
+                    onPointerUp={onPointerUp}
+                    onPointerCancel={() => pan.cancel()}
+                    onPointerLeave={() => setHover(null)}
+                    onDoubleClick={(event) => {
+                      const { row, x } = locate(event);
+                      if (row?.kind === "task" && x >= 0) zoomToBar(row.bar);
+                    }}
+                    className={cx(
+                      "relative select-none outline-none",
+                      pan.dragging ? "cursor-grabbing" : "cursor-default",
+                    )}
+                    style={{ height: rows.height }}
+                  >
                     {rows.list.map((row) =>
-                      row.kind === "lane" ? (
-                        <LaneBand key={row.key} row={row} px={px} now={now} />
-                      ) : (
-                        <Bar
+                      row.kind === "lane" ? null : (
+                        <TaskLabel
                           key={row.key}
-                          bar={row.bar}
-                          cy={row.y + row.h / 2 + 3}
-                          px={px}
-                          plotW={plotW}
-                          now={now}
-                          ids={ids}
-                          hovered={hover?.key === row.key ? hover.verdict : null}
+                          row={row}
+                          labelW={labelW}
+                          hovered={hover?.key === row.key}
+                          selected={selected?.key === row.key}
+                          onSelect={() => choose(row)}
                         />
                       ),
                     )}
-                  </g>
-                </svg>
-                {/* Lane headers sit above the plot, on the canvas colour, so
-                    their text never runs over a gridline. */}
-                {rows.list.map((row) =>
-                  row.kind === "lane" ? (
-                    <LaneLabel
-                      key={row.key}
-                      row={row}
-                      collapsed={collapsed.has(row.lane.key)}
-                      onToggle={() => toggleLane(row.lane.key)}
-                    />
-                  ) : null,
+
+                    <svg
+                      aria-hidden="true"
+                      width={plotW}
+                      height={rows.height}
+                      className="pointer-events-none absolute top-0 overflow-hidden"
+                      style={{ left: labelW }}
+                    >
+                      <defs>
+                        {(Object.keys(PHASE_COLOR) as Array<keyof typeof PHASE_COLOR>).map((phase) => (
+                          <TailGradient key={phase} id={`${ids}-tail-${phase}`} color={PHASE_COLOR[phase]} />
+                        ))}
+                        <pattern
+                          id={`${ids}-hatch`}
+                          width={5}
+                          height={5}
+                          patternUnits="userSpaceOnUse"
+                          patternTransform="rotate(45)"
+                        >
+                          <rect width={5} height={5} fill="var(--warning)" opacity={0.14} />
+                          <line x1={0} y1={0} x2={0} y2={5} stroke="var(--warning)" strokeWidth={2} opacity={0.75} />
+                        </pattern>
+                        <clipPath id={`${ids}-plot`}>
+                          <rect x={0} y={0} width={plotW} height={rows.height} />
+                        </clipPath>
+                      </defs>
+                      <g clipPath={`url(#${ids}-plot)`}>
+                        <BreakBands breaks={breaks} height={rows.height} />
+                        <Gridlines ticks={ticks} height={rows.height} />
+                        <NowLine x={nowX} height={rows.height} plotW={plotW} />
+                        {rows.list.map((row) =>
+                          row.kind === "lane" ? (
+                            <LaneBand key={row.key} row={row} px={px} now={now} />
+                          ) : (
+                            <Bar
+                              key={row.key}
+                              bar={row.bar}
+                              cy={row.y + row.h / 2 + 3}
+                              px={px}
+                              plotW={plotW}
+                              now={now}
+                              ids={ids}
+                              hovered={hover?.key === row.key ? hover.verdict : null}
+                            />
+                          ),
+                        )}
+                      </g>
+                    </svg>
+                    {/* Lane headers sit above the plot, on the canvas colour, so
+                        their text never runs over a gridline. */}
+                    {rows.list.map((row) =>
+                      row.kind === "lane" ? (
+                        <LaneLabel
+                          key={row.key}
+                          row={row}
+                          collapsed={collapsed.has(row.lane.key)}
+                          onToggle={() => toggleLane(row.lane.key)}
+                        />
+                      ) : null,
+                    )}
+                  </div>
                 )}
               </div>
+            </div>
+
+            {!onSelectTask && (
+              <AnimatePresence>
+                {selectedRow && (
+                  <TaskPanel
+                    key="task"
+                    bar={selectedRow.bar}
+                    lane={selectedRow.lane}
+                    now={now}
+                    reduceMotion={reduceMotion}
+                    onClose={() => setSelectedKey(null)}
+                    onZoom={() => zoomToBar(selectedRow.bar)}
+                  />
+                )}
+              </AnimatePresence>
             )}
           </div>
-        </div>
-
-        {!onSelectTask && (
-          <AnimatePresence>
-            {selectedRow && (
-              <TaskPanel
-                key="task"
-                bar={selectedRow.bar}
-                lane={selectedRow.lane}
-                now={now}
-                reduceMotion={reduceMotion}
-                onClose={() => setSelectedKey(null)}
-                onZoom={() => zoomToBar(selectedRow.bar)}
-              />
-            )}
-          </AnimatePresence>
-        )}
-      </div>
+        </>
+      )}
 
       {hover && hover.x >= 0 && !pan.dragging && hoveredRow?.kind === "task" && (
         <FloatingTip
