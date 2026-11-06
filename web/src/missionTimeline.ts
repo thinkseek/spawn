@@ -333,6 +333,9 @@ function legacyBar(
   };
   const outcome = done[task.state] ?? "open";
   const end = outcome === "open" ? null : Math.max(task.updated_at_ms ?? start, start);
+  // `reported` waits for the supervisor first unless the gate judges it
+  // (accept = gate); `accepted` is at the gate only when there is one.
+  const atGate = mission.gate !== null && mission.accept === "gate";
   const phase: Phase =
     task.state === "assigned"
       ? "queued"
@@ -342,9 +345,15 @@ function legacyBar(
           ? "revise"
           : task.state === "landing"
             ? "landing"
-            : task.state === "reported" || task.state === "accepted"
-              ? "gate"
-              : "working";
+            : task.state === "reported"
+              ? atGate
+                ? "gate"
+                : "review"
+              : task.state === "accepted"
+                ? mission.gate !== null
+                  ? "gate"
+                  : "review"
+                : "working";
   return {
     key,
     task,
