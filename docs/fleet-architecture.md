@@ -687,7 +687,13 @@ controller. Missions, tasks, residents and landings are events in
   `resident.approved`, `resident.retired`, `legacy.imported`, `host.disk`.
   `legacy.imported` carries one row of the mission tables as it stood
   before the control stream existed: a database with mission rows and no
-  records imports them once, on migration.
+  records imports them once, on migration. A `task.cancelled` names `by`,
+  who cancelled: `human` (the owner's login, `spawn task cancel` and a
+  person's close or retirement), `spawn_supervisor`, or the loop that did
+  (`spawn-integrate`, `spawn-dispatch`, `spawn-migrate` for a migration's
+  own records); a record from before it names none and counts as a
+  person's. The fold does not read it; the scorecard does
+  ([design.md](design.md) §15).
 - **Who writes it:** only the checked mission functions, through
   `spawn_control_record`. The integrator's records (`task.gated`,
   `task.landed`, `task.aborted`, `mission.halted`), `source.moved` and the
@@ -801,7 +807,7 @@ record of what was judged (§14 of design.md).
   --revision R`, which the supervisor's digest gives; without it, a human's
   review takes the report as it is now). The checked functions refuse a
   verdict on a revision the task has left, and the fold applies none: a
-  45-minute gate run on revision 0 never lands, or sends back, revision 1.
+  gate run on revision 0 never lands, or sends back, revision 1.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). A mission
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
@@ -838,7 +844,7 @@ record of what was judged (§14 of design.md).
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate on C, with a 45-minute wall clock. When the gate
+  3. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
      rejects C and C is a real merge (the pushed head does not contain
      `main`, so C's tree is not the head's), it then judges the head alone
      before recording anything: the same gate, scenarios and task scenario,
@@ -1011,7 +1017,12 @@ record of what was judged (§14 of design.md).
   "unsolved" is cached, and a regression then lands) or flake another
   mission's candidate toward its halt. The integrator refuses N > 1 (up to
   8) unless `SPAWN_TEST_DATABASE_PER_GATE=1` states that the server is per
-  gate. Each judging records its own verdict and landing, which the next
+  gate. A mission whose scenarios directory holds the file
+  `no-test-database` (its owner's statement that its gate needs no test
+  database, as Supply PA's tests run on PGlite) gets no
+  SPAWN_TEST_DATABASE_URL, so its candidate code cannot reach the shared
+  server: its judgings do not count against N and run beside a Spawn gate,
+  still one per mission and per source. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a

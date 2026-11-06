@@ -138,7 +138,10 @@
 //!   gate's candidate could disturb the first's base runs. N up to
 //!   [`MAX_GATES`] is allowed only with [`PER_GATE_SERVER`]`=1`, once each
 //!   gate has a server of its own. A ready task over the cap waits for a
-//!   later pass (said once).
+//!   later pass (said once). A mission whose scenarios directory holds
+//!   [`NO_TEST_DATABASE`] gets no SPAWN_TEST_DATABASE_URL, so its judgings
+//!   cannot reach the shared server and do not count against the cap: they
+//!   run beside the others, still one per mission and per source.
 //!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
 //! before; the pass reads those records, never the thread's result. A
@@ -191,9 +194,28 @@ const ROOM_BACKOFF_MAX: Duration = Duration::from_mins(40);
 /// told, once per run.
 const ROOM_ESCALATE_AFTER: Duration = Duration::from_hours(2);
 
-/// Wall clock of one gate run: two builds, clippy, the tests, the e2e and
-/// the black-box scenarios fit well inside it.
-const GATE_WALL_CLOCK: Duration = Duration::from_mins(45);
+/// Wall clock of one gate run: `SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by
+/// default. The gate grows with every objective whose scenario it runs (an
+/// unsolved one runs twice on the base), so the bound is a setting: on
+/// 2026-11-06 a fixed 45 minutes aborted a healthy gate still in its
+/// regression phase, and three such aborts halt a mission. Keep it below the
+/// scratch age at which spawn-maintenance removes a gate's leftovers
+/// (SPAWN_MAINTENANCE_SCRATCH_AGE_MIN, 180 in
+/// deploy/systemd/spawn-maintenance.service), or a live gate's scratch could go.
+fn gate_wall_clock() -> Duration {
+    wall_clock_minutes(crate::config::env_value("SPAWN_GATE_WALL_CLOCK_MINUTES").as_deref())
+}
+
+/// [`gate_wall_clock`] from the setting's text: a whole number of minutes
+/// from 1 up; anything else is the default.
+fn wall_clock_minutes(text: Option<&str>) -> Duration {
+    const DEFAULT_MINUTES: u64 = 120;
+    let minutes = text
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|minutes| *minutes > 0)
+        .unwrap_or(DEFAULT_MINUTES);
+    Duration::from_mins(minutes)
+}
 
 /// Guard against runaway candidates.
 const MAX_PATCH_BYTES: usize = 1 << 20;
@@ -687,7 +709,29 @@ struct Running {
     mission: i64,
     source: String,
     task: i64,
+    /// Whether this judging's gate gets the shared test server
+    /// ([`needs_test_database`]): only those count against `--gates`.
+    shares_server: bool,
     handle: std::thread::JoinHandle<()>,
+}
+
+/// The marker a mission's owner puts in its scenarios directory when its gate
+/// needs no test database (Supply PA's tests run on PGlite in process).
+pub(crate) const NO_TEST_DATABASE: &str = "no-test-database";
+
+/// Whether the gate of a mission whose scenarios are `scenarios` gets
+/// SPAWN_TEST_DATABASE_URL: yes unless its owner put [`NO_TEST_DATABASE`]
+/// there. One that does not get it cannot reach the shared server, whose gate
+/// login is a superuser, so its judging does not count against `--gates`:
+/// it may run beside one that does (still one per mission and per source).
+pub(crate) fn needs_test_database(scenarios: &Path) -> bool {
+    !scenarios.join(NO_TEST_DATABASE).exists()
+}
+
+/// Whether a judging must wait for a gate: only one that shares the test
+/// server, when `shared_running` such judgings already fill the `cap`.
+fn waits_for_gate(shares_server: bool, shared_running: usize, cap: usize) -> bool {
+    shares_server && shared_running >= cap
 }
 
 impl Integrator {
@@ -950,8 +994,14 @@ impl Integrator {
             if taken {
                 continue;
             }
-            let running = self.running.borrow().len();
-            if running >= self.gates {
+            let shares_server = needs_test_database(Path::new(&candidate.gated.gate));
+            let running = self
+                .running
+                .borrow()
+                .iter()
+                .filter(|gate| gate.shares_server)
+                .count();
+            if waits_for_gate(shares_server, running, self.gates) {
                 if self.waiting.borrow_mut().insert(candidate.task.id) {
                     println!(
                         "integrate: mission {}: task {} waits for a gate ({running} of {} \
@@ -963,7 +1013,7 @@ impl Integrator {
             }
             self.waiting.borrow_mut().remove(&candidate.task.id);
             let mission = candidate.mission;
-            if let Err(error) = self.start_judging(store, candidate, running) {
+            if let Err(error) = self.start_judging(store, candidate, running, shares_server) {
                 eprintln!("integrate: mission {mission}: {error}");
             }
         }
@@ -975,6 +1025,7 @@ impl Integrator {
         store: &Arc<PostgresStore>,
         candidate: Ready,
         running: usize,
+        shares_server: bool,
     ) -> Result<(), String> {
         let Ready {
             mission: mission_id,
@@ -996,15 +1047,24 @@ impl Integrator {
                 });
             })
             .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
-        println!(
-            "integrate: mission {mission_id}: judging task {task_id} ({} of {} gates)",
-            running + 1,
-            self.gates
-        );
+        if shares_server {
+            println!(
+                "integrate: mission {mission_id}: judging task {task_id} ({} of {} gates)",
+                running + 1,
+                self.gates
+            );
+        } else {
+            println!(
+                "integrate: mission {mission_id}: judging task {task_id} (no test database: \
+                 beside the {running} of {} gates)",
+                self.gates
+            );
+        }
         self.running.borrow_mut().push(Running {
             mission: mission_id,
             source,
             task: task_id,
+            shares_server,
             handle,
         });
         Ok(())
@@ -1208,10 +1268,13 @@ impl Judge {
         // The test server must not be the owner's, by identity, asked now:
         // a socket mount or a DNS name can change between gate runs.
         let owner = std::env::var("SPAWN_DATABASE_URL").ok();
-        let (gate_env, warning) =
+        let (mut gate_env, warning) =
             gate::withhold_owners_cluster(&self.gate_env, owner.as_deref(), |url| {
                 spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
             });
+        if !needs_test_database(scenarios) {
+            gate_env.retain(|(name, _)| name != "SPAWN_TEST_DATABASE_URL");
+        }
         if let Some(warning) = warning {
             eprintln!("integrate: {warning}");
         }
@@ -1225,7 +1288,7 @@ impl Judge {
                 scenarios,
                 scenario.as_deref(),
                 &gate_env,
-                GATE_WALL_CLOCK,
+                gate_wall_clock(),
             )
         };
         match run_gate(main, &candidate) {
@@ -2034,8 +2097,9 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, no_room,
-        over_budget, pinned, report_freshness, room_backoff, room_wait, task_scenario,
+        Freshness, Mission, NO_TEST_DATABASE, aborted, freshness, halt_reason, markers_note,
+        merged_tree, needs_test_database, no_room, over_budget, pinned, report_freshness,
+        room_backoff, room_wait, task_scenario, waits_for_gate, wall_clock_minutes,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
@@ -3239,6 +3303,42 @@ mod tests {
         assert_eq!(at(&waiting, 500), false, "told once per run");
         // And it never counts toward the halt the mission already nears.
         assert_eq!(halt_reason(&waiting, 0), None);
+    }
+
+    #[test]
+    fn a_gate_without_the_test_database_does_not_wait_for_one_that_has_it() {
+        // One shared-server gate allowed: a second one waits, a gate that gets
+        // no test database never does, however many share the server.
+        assert!(!waits_for_gate(true, 0, 1));
+        assert!(waits_for_gate(true, 1, 1));
+        assert!(!waits_for_gate(false, 1, 1));
+        assert!(!waits_for_gate(false, 8, 1));
+        assert!(!waits_for_gate(true, 2, 3));
+    }
+
+    #[test]
+    fn the_owner_marks_a_mission_whose_gate_needs_no_test_database() {
+        let dir = std::env::temp_dir().join(format!("spawn-no-test-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        assert!(
+            needs_test_database(&dir),
+            "the default is the shared server"
+        );
+        std::fs::write(dir.join(NO_TEST_DATABASE), "").expect("the marker");
+        assert!(!needs_test_database(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_gate_wall_clock_is_a_setting_with_a_default() {
+        let minutes = |text: Option<&str>| wall_clock_minutes(text).as_secs() / 60;
+        assert_eq!(minutes(None), 120);
+        assert_eq!(minutes(Some("90")), 90);
+        assert_eq!(minutes(Some(" 240 ")), 240);
+        // Nothing that is not a whole number of minutes from 1 up is taken.
+        for bad in ["", "0", "-5", "1.5", "two hours"] {
+            assert_eq!(minutes(Some(bad)), 120, "{bad:?}");
+        }
     }
 
     #[test]
