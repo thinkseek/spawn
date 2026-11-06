@@ -281,6 +281,7 @@ fn a_runtime_file_only_a_checkpoint_from_before_put_in_the_branch_leaves_it() {
     // The checkpoint of the version before: `add -A` against the kept
     // index, whatever the engine wrote.
     let index = root.join(".index").join(agent().as_str());
+    fs::create_dir_all(root.join(".index")).expect("create the index directory");
     git_in(&checkout, &directory, &index, &["add", "-A"]);
     let tree = git_in(&checkout, &directory, &index, &["write-tree"]);
     let reference = agent().to_string();
