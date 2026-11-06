@@ -874,7 +874,6 @@ record of what was judged (§14 of design.md).
      threshold ("no room for the gate on this host"). It stays pending until a delivered digest
      carries its tag (`host gate-room-<event>`), however long that takes, so
      it is told once.
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
 
      **A host fault is not a verdict on the work either.** When the gate
      rejects C with `regression: check-tests.sh fails on the candidate`,
@@ -933,10 +932,7 @@ record of what was judged (§14 of design.md).
      the failures and the crash lines named in the record, the wait on the
      recorded `due_ms`, never on the reason's text alone or on time without
      a record (design.md §14).
-  5. moves `main` on the source with a compare-and-swap push
-=======
   6. moves `main` on the source with a compare-and-swap push
->>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
