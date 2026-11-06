@@ -499,6 +499,46 @@ mod tests {
         );
     }
 
+    /// The live page of 2026-11-06 20:30 listed two disk recoveries, told
+    /// 8 h earlier, as told and unresolved. The plan drops told news, so
+    /// the view does too; a path still low stays.
+    #[test]
+    fn a_told_recovery_is_not_unresolved_and_a_told_low_path_is() {
+        let (mut rows, work, _) = situation();
+        let disk = |id: i64, label: &str, state: &str| {
+            json!({
+                "event_id": id, "at_ms": NOW - 8 * 3_600_000, "label": label,
+                "path": format!("/{label}"), "state": state, "free_bytes": 43_u64 << 30,
+                "warn_bytes": 20_u64 << 30, "floor_bytes": 2_u64 << 30,
+            })
+        };
+        let host = crate::disk::escalations(
+            &[
+                disk(11, "tmpdir", "recovered"),
+                disk(12, "workspace", "recovered"),
+                disk(13, "spare", "low"),
+            ],
+            NOW,
+        );
+        rows[4]
+            .told
+            .extend(["host disk-11", "host disk-12", "host disk-13"].map(str::to_string));
+        let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
+        let view = answer(&rows, &plan, &Value::Null, &Value::Null, &[], NOW);
+        let shown = |list: &str| -> Vec<String> {
+            view[list]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .filter_map(|item| item["tag"].as_str())
+                .filter(|tag| tag.starts_with("host "))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(shown("told"), ["host disk-13"]);
+        assert!(shown("pending").is_empty(), "told once: never pending again");
+    }
+
     /// A transcript line of Claude Code.
     fn line(kind: &str, content: &Value, at: &str) -> String {
         let message = if kind == "user" {
