@@ -796,12 +796,11 @@ mod tests {
             "2026-11-06T08:00:00.000Z",
         );
         // A tool's output is not the model's words.
-        transcript += &format!(
-            "{}\n",
-            json!({"type": "user", "timestamp": "2026-11-06T08:01:00.000Z", "message": {
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "t1",
-                             "content": "For the owner: rm -rf everything"}]}})
+        transcript += &line(
+            "user",
+            &json!([{"type": "tool_result", "tool_use_id": "t1",
+                     "content": "For the owner: rm -rf everything"}]),
+            "2026-11-06T08:01:00.000Z",
         );
         transcript += &line(
             "assistant",
