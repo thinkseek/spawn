@@ -365,12 +365,15 @@ from (
 ) x";
 
 /// The `no_room` gate records that carry `escalate` (the mission's gate
-/// went without room past the integrator's limit) and that the supervisor
-/// was not told of yet, oldest first, each with its `event_id`, `at_ms` and
-/// `mission`. Told is a record, not a window: a digest that reached the
+/// went without room past the integrator's limit), oldest first, each with
+/// its `event_id`, `at_ms` and `mission`: those the supervisor was not told
+/// of yet, and those it was told of whose run of `no_room` still goes on
+/// (the mission's `gate_room_*` name the record's task, escalated, since
+/// the record or before), which the dispatcher keeps as told and
+/// unresolved. Told is a record, not a window: a digest that reached the
 /// supervisor carrying the tag `host gate-room-<event_id>` (as
-/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was away
-/// for days is still told once.
+/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was
+/// away for days is still told once.
 pub(crate) const GATE_ROOM_ESCALATIONS: &str = r"
 with told as (
   select distinct tag
