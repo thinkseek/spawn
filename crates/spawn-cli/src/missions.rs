@@ -18,7 +18,19 @@ const USAGE: &str = "usage:
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
                 resident takes one, per-task workers the rest)
   spawn mission resume --id N
-  spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
+  spawn mission push --source <path> --commit <commit> [--repo <dir>] [--wait <seconds>]
+      (owner: land a commit on a mission source's main. <commit> is resolved in the git
+       repository of the current directory (--repo: another), or is already in the source;
+       it is put in the source at refs/spawn-owner/<hash>, no branch moves, and the request
+       is recorded (source.push_requested): prints {request, source, commit}. The running
+       integrator applies it between its own steps, under the landing hold: main moves to
+       the commit (a fast-forward) or to a merge of it, and one source.moved naming the
+       request moves the baselines; a conflict is source.push_refused. Nothing halts, no
+       gate is stopped, and spawn-integrate is never stopped for it. --wait: wait that long
+       for the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
+  spawn mission moved --source <path> --from <commit> --to <commit>
+      (owner: main was moved behind Spawn's back, forward; record it so the missions take
+       the new main as their baseline instead of halting)
   spawn mission list [--limit N]   (every task with its stages)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
@@ -212,6 +224,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             store.mission_resume(mission).map_err(err)?;
             print(&json!({ "mission": mission, "resumed": true }));
         }
+        "push" => return push(&store, &flags),
         "moved" => {
             let source = text(&flags, "source")?;
             crate::sources::MissionSource::parse(&source)?;
@@ -256,6 +269,120 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
+}
+
+/// `spawn mission push`: put the owner's commit in the source at
+/// `refs/spawn-owner/<hash>` and record the request the integrator applies
+/// (docs/fleet-architecture.md §10.3, "The owner's landings"). Exit 0, or,
+/// with `--wait`, 0 when applied, 1 when refused, 3 when still pending.
+fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, String> {
+    use crate::integrate::owner::{full_hash, owner_ref};
+    use crate::sources::controller_git;
+
+    let source = text(flags, "source")?;
+    crate::sources::MissionSource::parse(&source)?;
+    if !source.starts_with('/') {
+        return Err(format!(
+            "its source {source} is remote: agents' branches reach only a directory on this \
+             host, so nothing lands on it"
+        ));
+    }
+    let wanted = text(flags, "commit")?;
+    let wait = flags
+        .get("wait")
+        .map(|text| {
+            text.parse::<u64>()
+                .map_err(|_| format!("--wait must be a number of seconds, not {text}"))
+        })
+        .transpose()?;
+    let repo = match directory(flags, "repo")? {
+        Some(repo) => repo,
+        None => std::env::current_dir()
+            .map_err(|error| format!("the current directory: {error}"))?
+            .display()
+            .to_string(),
+    };
+    // Resolved where the owner works; a commit the source already has (by
+    // its full hash, or a name the source knows) does too.
+    let resolve = |place: &[&str]| -> Option<String> {
+        let output = controller_git()
+            .args(place)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{wanted}^{{commit}}"),
+            ])
+            .output()
+            .ok()?;
+        let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (output.status.success() && full_hash(&hash)).then_some(hash)
+    };
+    let reference;
+    let commit = if let Some(commit) = resolve(&["-C", &repo]) {
+        reference = owner_ref(&commit);
+        // Into the source without touching any branch.
+        let pushed = controller_git()
+            .args([
+                "-C",
+                &repo,
+                "push",
+                "--quiet",
+                "--",
+                &source,
+                &format!("{commit}:{reference}"),
+            ])
+            .output()
+            .map_err(|error| format!("run git push: {error}"))?;
+        if !pushed.status.success() {
+            return Err(format!(
+                "git push of {commit} to {source} ({reference}): {}",
+                String::from_utf8_lossy(&pushed.stderr).trim()
+            ));
+        }
+        commit
+    } else if let Some(commit) = resolve(&["--git-dir", &source]) {
+        reference = owner_ref(&commit);
+        crate::sources::git(&["--git-dir", &source, "update-ref", &reference, &commit])
+            .map_err(|error| error.to_string())?;
+        commit
+    } else {
+        return Err(format!(
+            "{wanted} is not a commit in {repo} nor in the source {source}"
+        ));
+    };
+    let request = store
+        .source_push_request(&source, &commit, &reference)
+        .map_err(|error| error.to_string())?;
+    let mut answer = json!({ "request": request, "source": source, "commit": commit });
+    let Some(seconds) = wait else {
+        print(&answer);
+        return Ok(0);
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let outcome = loop {
+        let outcome = store
+            .source_push_outcome(request)
+            .map_err(|error| error.to_string())?;
+        if outcome.is_some() || std::time::Instant::now() >= deadline {
+            break outcome;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    let (state, code) = match outcome
+        .as_ref()
+        .and_then(|record| record.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("source.moved") => ("applied", 0),
+        Some(_) => ("refused", 1),
+        None => ("pending", 3),
+    };
+    answer["state"] = json!(state);
+    answer["outcome"] = outcome.unwrap_or(Value::Null);
+    print(&answer);
+    Ok(code)
 }
 
 /// `spawn task ...`
