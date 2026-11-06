@@ -20,6 +20,8 @@
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
 
+mod attention;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -464,6 +466,7 @@ fn handle(
         "/api/rsi" => rsi_overview(),
         "/api/rsi/pane" => rsi_pane(query),
         "/api/fleet" => fleet(),
+        "/api/attention" => attention::attention(),
         "/api/missions" => missions(),
         "/api/events" => events(query),
         "/api/scorecard" => scorecard(query),
