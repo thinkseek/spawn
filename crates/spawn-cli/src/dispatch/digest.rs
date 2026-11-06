@@ -12,7 +12,8 @@ use spawn_core::observation::SemanticState;
 use super::{Escalation, Facts, Order, Why};
 use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
 
-/// Escalations per digest; the rest wait for the next one.
+/// Lines per digest (each line one session and reason); the rest wait
+/// for the next one.
 const DIGEST_ITEMS: usize = 8;
 
 /// Escalations the supervisor already received: the tags of the digests
@@ -61,18 +62,60 @@ fn heading(why: Why) -> &'static str {
     }
 }
 
+/// Escalations about one session for one reason, told as one line: a
+/// worker's repeated news of one kind (a human's notes that could not be
+/// delivered, retried every few seconds) is one thing to act on, and as
+/// separate lines it would fill every digest and starve the rest.
+struct Line<'a> {
+    first: &'a Escalation,
+    latest: &'a Escalation,
+    count: usize,
+}
+
+/// The pending escalations grouped by session and reason, in the order
+/// their first item is pending.
+fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
+    let mut lines: Vec<(Line<'_>, Vec<String>)> = Vec::new();
+    for item in pending {
+        match lines.iter_mut().find(|(line, _)| {
+            line.first.session_id == item.session_id && line.first.why == item.why
+        }) {
+            Some((line, tags)) => {
+                line.latest = item;
+                line.count += 1;
+                tags.push(item.tag());
+            }
+            None => lines.push((
+                Line {
+                    first: item,
+                    latest: item,
+                    count: 1,
+                },
+                vec![item.tag()],
+            )),
+        }
+    }
+    lines
+}
+
 /// The digest typed into the supervisor's pane.
-fn text(items: &[Escalation], spawn: &str) -> String {
+fn text(lines: &[Line<'_>], spawn: &str) -> String {
     let mut text = format!(
         "Spawn dispatcher: {} update{} for you. Check a worker with `{spawn} tail --session \
 <session>` before acting; missions and tasks with `{spawn} mission list`.\n",
-        items.len(),
-        if items.len() == 1 { "" } else { "s" },
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" },
     );
-    for item in items {
+    for line in lines {
+        let item = line.latest;
+        let repeated = if line.count > 1 {
+            format!(" ({} of them, the latest)", line.count)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             text,
-            "- {} — {}: {}",
+            "- {} — {}{repeated}: {}",
             item.session_id,
             heading(item.why),
             item.line
@@ -87,8 +130,9 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
     if pending.is_empty() || !supervisor_idle(supervisor) {
         return None;
     }
-    let items: Vec<Escalation> = pending.iter().take(DIGEST_ITEMS).cloned().collect();
-    let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+    let (lines, tags): (Vec<Line<'_>>, Vec<Vec<String>>) =
+        lines(pending).into_iter().take(DIGEST_ITEMS).unzip();
+    let tags: Vec<String> = tags.into_iter().flatten().collect();
     Some(Order {
         agent_id: SUPERVISOR_AGENT.to_string(),
         session_id: SUPERVISOR_SESSION.to_string(),
@@ -99,7 +143,7 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
             crate::sources::fnv(&tags.join("\n"))
         ),
         action: CommandAction::Input {
-            text: text(&items, spawn),
+            text: text(&lines, spawn),
             tags,
         },
         task: None,

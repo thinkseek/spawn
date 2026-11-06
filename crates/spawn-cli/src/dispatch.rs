@@ -886,6 +886,51 @@ mod tests {
         );
     }
 
+    /// The live sequence of 2026-11-06: 100 human notes to one worker could
+    /// not be delivered, each its own line, and they filled 16 digests in a
+    /// row while a report waited behind them. One session's items of one
+    /// kind are one line, every tag filed.
+    #[test]
+    fn repeated_items_about_one_session_are_one_digest_line() {
+        let human = |n: usize| Escalation {
+            session_id: "session_worker_b".to_string(),
+            id: format!("human-{n}"),
+            why: Why::Human,
+            line: format!("note {n} could not be delivered"),
+        };
+        let mut host: Vec<Escalation> = (1..=20).map(human).collect();
+        host.push(Escalation {
+            session_id: "session_worker_c".to_string(),
+            id: "report-9-0".to_string(),
+            why: Why::Report,
+            line: "task #9 reported".to_string(),
+        });
+        let plan = decide_with(
+            &[idle_supervisor()],
+            &Work::default(),
+            &host,
+            true,
+            NOW,
+            "spawn",
+        );
+        let [digest] = plan.orders.as_slice() else {
+            panic!("one digest: {:?}", plan.orders);
+        };
+        let CommandAction::Input { text, tags } = &digest.action else {
+            panic!("a typed digest");
+        };
+        assert!(text.starts_with("Spawn dispatcher: 2 updates"), "{text}");
+        assert!(
+            text.contains("human message (20 of them, the latest): note 20 could not"),
+            "{text}"
+        );
+        assert!(
+            text.contains("task #9 reported"),
+            "the report is not starved"
+        );
+        assert_eq!(tags.len(), 21, "every item it stands for is told");
+    }
+
     /// The live sequence of 2026-11-06: the supervisor ended its turn on a
     /// question for the human, Jev judged it BLOCKED at its prompt, and no
     /// digest reached it for four hours while a worker sat idle.

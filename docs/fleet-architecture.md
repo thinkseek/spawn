@@ -287,7 +287,10 @@ it, on the same ladder.
   `spawn submit`. The dispatcher wakes it by typing a digest into its pane
   while it is idle; digests coalesce while it works. Idle is its turn stopped
   at its prompt, whatever Jev judged: a turn that ended on a question for the
-  human is judged BLOCKED, and digests still reach it. Its memory is its native
+  human is judged BLOCKED, and digests still reach it. A digest has one line per
+  session and reason: repeated items of one kind about one worker (a human's
+  notes that could not be delivered, retried) are counted on one line, the
+  latest quoted, so they cannot fill the digest. Its memory is its native
   session (restored by resume) plus the log.
 - **Human**: the attention queue in the UI lists only what the supervisor
   escalated or could not resolve. Each human action is a command with
