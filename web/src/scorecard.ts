@@ -537,7 +537,10 @@ export function dimensionParts(
             { label: "landed", value: formatDecimal(d.landed, 0) },
             {
               label: "open hours",
-              value: formatDecimal(d.open_hours, 1),
+              value: d.open_hours.toLocaleString("en-US", {
+                minimumFractionDigits: 1,
+                maximumFractionDigits: 1,
+              }),
               title: String(d.open_hours),
             },
           ],
