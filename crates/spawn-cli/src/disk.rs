@@ -8,8 +8,11 @@
 //! [`RECOVERY_MARGIN`] above that, so a path hovering at the threshold does
 //! not flap. The latest record per path is read back from the log on start,
 //! so a restart records nothing twice. The supervisor's digest carries each
-//! record of the last day once (a [`Why::Disk`] escalation); the fleet view's
-//! health shows the records and the free space now.
+//! path's latest record once ([`escalations`]): a `low` one is a condition
+//! ([`Why::Disk`]) that holds until a `recovered` record replaces it, told
+//! or not; a `recovered` one is news ([`Why::DiskRecovered`]) for a day, and
+//! told, it is done. The fleet view's health shows the records and the free
+//! space now.
 //!
 //! Under `SPAWN_DISK_FLOOR_GB` (default 2 GiB) on any of the paths, the loop
 //! starts no new executions: the dispatcher's `start` and `resume` orders
@@ -37,10 +40,10 @@ pub(crate) const CHECK_EVERY: Duration = Duration::from_mins(1);
 /// is recorded as recovered.
 pub(crate) const RECOVERY_MARGIN: u64 = GIB;
 
-/// The window in which a record reaches the supervisor's digest: the same
-/// day the dispatcher reads delivered digests back over, so a record told
-/// once is not told again.
-const DIGEST_WINDOW_MS: i64 = 86_400_000;
+/// How long a `recovered` record is news for the supervisor's digest: one
+/// nobody was told of within a day is stale. A `low` record has no window:
+/// it holds until its path recovers.
+const RECOVERY_NEWS_MS: i64 = 86_400_000;
 
 /// The thresholds, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,37 +187,42 @@ pub(crate) fn hold_new_executions(orders: &mut Vec<Order>) -> usize {
     before - orders.len()
 }
 
-/// The digest items for `records` (the latest per path, as
-/// `PostgresStore::host_disk` returns them) recorded within the last day.
+/// The digest items for `records`, the latest per path (as
+/// `PostgresStore::host_disk` returns them): a `low` record, whatever its
+/// age, since its path has not recovered ([`Why::Disk`], a condition); a
+/// `recovered` one of the last [`RECOVERY_NEWS_MS`] ([`Why::DiskRecovered`],
+/// news: once told, [`crate::dispatch::decide_with`] drops it).
 pub(crate) fn escalations(records: &[Value], now_ms: i64) -> Vec<Escalation> {
     records
         .iter()
-        .filter(|record| {
-            record["at_ms"]
-                .as_i64()
-                .is_some_and(|at| now_ms - at < DIGEST_WINDOW_MS)
-        })
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
+            let at_ms = record["at_ms"].as_i64()?;
             let free = gib(record["free_bytes"].as_u64()?);
             let path = record["path"].as_str()?;
             let label = record["label"].as_str().unwrap_or("disk");
-            let line = match record["state"].as_str()? {
-                "low" => format!(
-                    "{label} {path} has {free} free, under {} (`SPAWN_DISK_WARN_GB`). Under {} \
+            let (why, line) = match record["state"].as_str()? {
+                "low" => (
+                    Why::Disk,
+                    format!(
+                        "{label} {path} has {free} free, under {} (`SPAWN_DISK_WARN_GB`). Under {} \
 no new executions start; free space (old workspaces, build output) or tell the owner.",
-                    gib(record["warn_bytes"].as_u64().unwrap_or_default()),
-                    gib(record["floor_bytes"].as_u64().unwrap_or_default()),
+                        gib(record["warn_bytes"].as_u64().unwrap_or_default()),
+                        gib(record["floor_bytes"].as_u64().unwrap_or_default()),
+                    ),
                 ),
-                "recovered" => format!("{label} {path} has {free} free again"),
+                "recovered" if now_ms - at_ms < RECOVERY_NEWS_MS => (
+                    Why::DiskRecovered,
+                    format!("{label} {path} has {free} free again"),
+                ),
                 _ => return None,
             };
             Some(Escalation {
                 session_id: "host".to_string(),
                 id: format!("disk-{id}"),
-                why: Why::Disk,
+                why,
                 line,
-                since_ms: record["at_ms"].as_i64(),
+                since_ms: Some(at_ms),
             })
         })
         .collect()
