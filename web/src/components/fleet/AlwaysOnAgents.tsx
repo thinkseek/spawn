@@ -68,7 +68,8 @@ export function AlwaysOnAgents({
             </li>
           ))}
           {missing.map((entry) => (
-            <li key={`missing:${entry.role}:${entry.name}`} className="min-w-0 bg-warning/[0.05] px-4 py-3">
+            <li key={`missing:${entry.role}:${entry.name}`} className="min-w-0 bg-surface">
+              <div className="h-full bg-warning/[0.05] px-4 py-3">
               <div className="flex min-w-0 items-center gap-2">
                 <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-warning" />
                 <span className="shrink-0 text-label font-semibold text-foreground">
@@ -81,6 +82,7 @@ export function AlwaysOnAgents({
                   ? "The fleet has no supervisor session."
                   : "Approved, but the fleet has no session for it: never started, or gone."}
               </p>
+              </div>
             </li>
           ))}
         </ul>
