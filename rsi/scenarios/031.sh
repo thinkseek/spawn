@@ -792,6 +792,7 @@ echo "031: dump 2: $(field "$rec2" '.events') events, $(field "$rec2" '.stored_b
 # the record $2's) and untarred into <dir>; 1 when it does not decrypt.
 unpack_bundle() {
     stored=$(object "$1")
+    rm -f "$WORK/bundle.raw" "$WORK/bundle.tar"
     decrypt "$stored" "$WORK/bundle.raw" || return 1
     magic=$(head -c 4 "$WORK/bundle.raw" | od -An -tx1 | tr -d ' \n')
     case "$magic" in
