@@ -21,8 +21,8 @@ use spawn_postgres::PostgresStore;
 mod common;
 use common::{admin, store};
 
-const SESSION: &str = "session_waiting";
-const AGENT: &str = "agent_waiting";
+const SESSION: &str = "session_resident_waiting";
+const AGENT: &str = "agent_resident_waiting";
 
 fn submit(store: &PostgresStore, principal: &str, key: &str, action: CommandAction) -> CommandId {
     store
