@@ -1,4 +1,4 @@
-import { Activity, Gauge, LayoutGrid, Orbit, Rows3, Target, Waypoints } from "lucide-react";
+import { Activity, BellRing, Gauge, LayoutGrid, Orbit, Rows3, Target, Waypoints } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary, SessionState } from "../api";
@@ -301,8 +301,9 @@ function SessionRow({
           className="text-label font-medium text-foreground"
         />
         {attention && (
-          <span className="ml-auto shrink-0 text-micro font-medium text-warning">
-            needs a human
+          <span className="ml-auto flex shrink-0 text-warning" title="Needs a human">
+            <BellRing size={11} aria-hidden="true" />
+            <span className="sr-only">needs a human</span>
           </span>
         )}
       </span>

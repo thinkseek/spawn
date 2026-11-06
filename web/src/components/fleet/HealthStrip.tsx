@@ -2,7 +2,7 @@ import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
-import { formatDuration } from "../../format";
+import { absoluteTitle, formatDuration } from "../../format";
 import { cx } from "../ui";
 
 const LADDER: Array<{
@@ -212,20 +212,18 @@ export function HealthStrip({
             className="flex min-w-0 items-baseline gap-1"
             title={
               liveness.shortest
-                ? `${liveness.shortest.name}'s current execution started ${new Date(liveness.shortest.since).toLocaleString()}`
-                : undefined
+                ? `The ${liveness.shortest.name}'s current execution started ${absoluteTitle(liveness.shortest.since)}`
+                : "No always-on agent is running"
             }
           >
             <span className="shrink-0">Shortest uptime</span>
+            {liveness.shortest && (
+              <span className="min-w-0 truncate text-faint-foreground">· {liveness.shortest.name}</span>
+            )}
             <span className="tnum ml-auto shrink-0 font-medium text-foreground">
               {liveness.shortest ? formatDuration(liveness.shortest.ms) : "—"}
             </span>
           </div>
-          {liveness.shortest && (
-            <div className="truncate text-right text-micro text-faint-foreground">
-              {liveness.shortest.name}
-            </div>
-          )}
           <div className="flex items-baseline gap-1" title={LIVENESS.hint}>
             <span>Liveness restarts · 24h</span>
             <span
