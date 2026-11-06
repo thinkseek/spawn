@@ -369,8 +369,27 @@ task; when it is finished, write `{REPORT}`.",
 
 #[cfg(test)]
 mod tests {
-    use super::{Revive, charter, decide};
+    use super::{Charter, Revive, charter, decide};
     use spawn_postgres::LivenessFacts;
+
+    /// The hash a start records names the text it gave: the same text, the
+    /// same hash, on any host and build; any change to it (the program it
+    /// names included), another.
+    #[test]
+    fn the_charter_hash_names_its_text() {
+        let one = Charter::of(charter("spawn", "mission.md"));
+        assert_eq!(one.text, charter("spawn", "mission.md"));
+        assert_eq!(one, Charter::of(charter("spawn", "mission.md")));
+        assert_eq!(one.hash.len(), 16);
+        assert!(one.hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            Charter::of(String::new()).hash,
+            "cbf29ce484222325",
+            "FNV-1a, stable across builds"
+        );
+        assert_ne!(one.hash, Charter::of(charter("/opt/spawn", "mission.md")).hash);
+        assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
+    }
 
     #[test]
     fn the_charter_says_when_a_task_runs_cheap() {
