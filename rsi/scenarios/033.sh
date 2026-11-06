@@ -95,7 +95,7 @@
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, uses a
 # private tmux socket, no network. Every wait is bounded in time.
 #
-# Today (five runs, 2026-11-06): the task is reported 8.8-9.3 s after its
+# Today (six runs, 2026-11-06): the task is reported 8.8-9.4 s after its
 # assignment; run 1 is gated `aborted` ("the gate failed: the gate ended with
 # exit status: 4"; gate_aborts 0 -> 1); run 2 starts in the next pass,
 # 0.34-0.42 s after run 1's record, `aborted` (2), with no wait of any kind;
@@ -103,10 +103,10 @@
 # mission "3 gate aborts in a row", 1.25-1.43 s after the first abort: three
 # disagreeing bases halt a mission for a person in under a second and a half
 # (the halt reaches the supervisor only as 013's halted-mission stall; 1800 s
-# here), and no alert. No record names the scenario, its exits or the gate's setup time
-# (they are only in the gate's log). Resumed by hand, runs 4 and 5 are
-# aborted (gate_aborts 1, 2) and run 6 is accepted and lands, as (5)
-# requires. It fails at (1) in 15-26 s; a measure run takes 31-52 s.
+# here), and no alert. No record names the scenario, its exits or the
+# gate's setup time (they are only in the gate's log). Resumed by hand, runs
+# 4 and 5 are aborted (gate_aborts 1, 2) and run 6 is accepted and lands, as
+# (5) requires. It fails at (1) in 15-26 s; a measure run takes 25-52 s.
 set -eu
 
 asserted=""
