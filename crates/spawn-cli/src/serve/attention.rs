@@ -621,7 +621,15 @@ mod tests {
             .told
             .extend(["host disk-11", "host disk-12", "host disk-13"].map(str::to_string));
         let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
-        let view = answer(&rows, &plan, &Value::Null, &Value::Null, &[], NOW);
+        let view = answer(
+            &rows,
+            &plan,
+            &Value::Null,
+            &Value::Null,
+            &json!([]),
+            &[],
+            NOW,
+        );
         let shown = |list: &str| -> Vec<String> {
             view[list]
                 .as_array()
