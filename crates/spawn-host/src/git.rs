@@ -45,6 +45,60 @@ const BASE: &str = "main";
 /// Paths that never enter a commit.
 const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
 
+/// Files the engine writes for itself in its working directory, at any
+/// depth: its runtime state (a session's scheduler lock, its worktrees, its
+/// checkpoints, its mailbox), never the project's. No checkpoint adds one,
+/// whatever the project's `.gitignore` says; the rest of `.claude/` (the
+/// settings, agents and commands a project commits) is committed as usual
+/// ([`GitWorkspace::track_runtime_files`], docs/storage.md).
+///
+/// An entry that ends in `/` is a directory; any other is a file, or a
+/// directory, and everything under it. Claude Code is the only engine
+/// (`spawn_core::event::ENGINE`), and the list is its own: the paths it
+/// writes to a checkout's `.git/info/exclude` under `# claude-code-runtime`
+/// (Claude Code 2.1.318). An exported workspace has no `.git`, so Claude
+/// Code writes none there.
+pub const ENGINE_RUNTIME_FILES: [&str; 10] = [
+    ".claude/scheduled_tasks.lock",
+    ".claude/scheduled_tasks.json",
+    ".claude/routines/.state/",
+    ".claude/worktrees/",
+    ".claude/checkpoints/",
+    ".claude/mailbox/",
+    ".claude/agent-registry.json",
+    ".claude/agent-memory-local",
+    ".claude/first-run",
+    ".claude/assistant-daemon-state.json",
+];
+
+/// Pathspecs that match the engine's runtime files
+/// ([`ENGINE_RUNTIME_FILES`]) at any depth, each with `glob` magic and
+/// `magic` before it (`exclude`, or nothing). A glob pathspec never matches
+/// what is under a directory it names, so a directory gets `<path>/**`.
+fn runtime_pathspecs(magic: &str) -> Vec<OsString> {
+    let magic = if magic.is_empty() {
+        "glob".to_string()
+    } else {
+        format!("{magic},glob")
+    };
+    ENGINE_RUNTIME_FILES
+        .iter()
+        .flat_map(|entry| {
+            let (path, directory) = match entry.strip_suffix('/') {
+                Some(path) => (path, true),
+                None => (*entry, false),
+            };
+            let under = format!(":({magic})**/{path}/**");
+            if directory {
+                vec![under]
+            } else {
+                vec![format!(":({magic})**/{path}"), under]
+            }
+        })
+        .map(OsString::from)
+        .collect()
+}
+
 /// Where main's version of each file that conflicts with the branch in a
 /// way markers cannot show is copied, relative to the workspace (under
 /// `.spawn/`, never committed), for a worker that cannot run git. Every
