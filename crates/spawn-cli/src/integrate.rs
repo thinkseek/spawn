@@ -713,8 +713,8 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     .map_err(|error| format!("{error}\n{USAGE}"))?;
     // What the host must have before a gate starts, read once like the
     // gate's environment (gate::Room).
-    let room = gate::Room::from_env(|name| std::env::var(name).ok());
-    let integrator = Integrator::new(root, gate, gate_env, room, gates);
+    let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
+    let integrator = Integrator::new(root, gate, gate_env, host_room, gates);
     loop {
         let pass = integrator.pass();
         if once {
@@ -788,7 +788,7 @@ impl Integrator {
         root: PathBuf,
         gate: PathBuf,
         gate_env: Vec<(String, String)>,
-        room: gate::Room,
+        host_room: gate::Room,
         gates: usize,
     ) -> Self {
         Self {
@@ -796,7 +796,7 @@ impl Integrator {
                 root,
                 gate,
                 gate_env,
-                room,
+                room: host_room,
             },
             gates,
             running: RefCell::new(Vec::new()),
