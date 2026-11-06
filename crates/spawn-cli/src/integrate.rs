@@ -6013,4 +6013,33 @@ mod database_tests {
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Objective 20 beside main's `no-test-database`: a mission whose gate
+    /// needs no test database has no host faults. Its check-tests.sh
+    /// failures, connection errors though they are, stay a rejection.
+    #[test]
+    fn a_mission_without_the_test_database_has_no_host_faults() {
+        let gate = "echo '| == regression: check-tests.sh must still pass'\n\
+                    echo '| FAILED api::tests::one: error connecting to server: Connection refused (os error 111)'\n\
+                    echo '| stage gate rejected 5ms regression: check-tests.sh must still pass'\n\
+                    printf '{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+        let (base, source, scenarios, integrator) = world("host-fault-no-db", gate);
+        std::fs::write(scenarios.join(super::NO_TEST_DATABASE), "").expect("the marker");
+        let db = Db::new("host_fault_no_db");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        let (record, _, _) = last_verdict(&db);
+        assert_eq!(record["id"], task);
+        assert_eq!(record["verdict"], "rejected", "{record}");
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_rejections, after.gate_host_faults), (1, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
