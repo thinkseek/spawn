@@ -498,7 +498,6 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
     Ok(())
 }
 
-<<<<<<< 4bd4c19bb866659500033efdfca36db64186d47e
 /// One pass's plan, read from the store before anything is submitted.
 pub(crate) struct Reading {
     /// The facts the plan was made from.
@@ -526,32 +525,6 @@ pub(crate) fn read_plan(
 ) -> Result<Reading, String> {
     let (rows, work) = loaded;
     let mut lines = Vec::new();
-=======
-/// Run one dispatcher step against the store: collect reports from idle
-/// workers under `root`, then submit the plan, with the stalls past their
-/// `bounds` among its escalations ([`stall`]), without its new executions
-/// while the disk is under its floor ([`crate::disk`]), delivering with
-/// `waits`. Returns log lines.
-pub(crate) fn step(
-    store: &std::sync::Arc<PostgresStore>,
-    supervised: bool,
-    spawn: &str,
-    root: Option<&Path>,
-    disk: &crate::disk::Monitor,
-    bounds: &Bounds,
-    waits: deliver::Waits,
-) -> Result<Vec<String>, String> {
-    let (mut rows, mut work) = load(store)?;
-    work.waits = waits;
-    let mut lines = root.map_or_else(Vec::new, |root| {
-        deliver::collect_reports(store, &work, &rows, root)
-    });
-    if !lines.is_empty() {
-        // Collecting a report changed a task's state.
-        (rows, work) = load(store)?;
-        work.waits = waits;
-    }
->>>>>>> 3507ae04337ca0bb051e24d94e36024394f9065e
     let now = now_ms();
     let mut host = disk(now);
     host.extend(crate::disk::gate_room_escalations(
@@ -586,8 +559,8 @@ pub(crate) fn step(
 /// Run one dispatcher step against the store: collect reports from idle
 /// workers under `root`, then submit the plan ([`read_plan`]), with the
 /// stalls past their `bounds` among its escalations ([`stall`]), without
-/// its new executions while the disk is under its floor ([`crate::disk`]).
-/// Returns log lines.
+/// its new executions while the disk is under its floor ([`crate::disk`]),
+/// delivering with `waits` ([`deliver::Waits`]). Returns log lines.
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -595,14 +568,15 @@ pub(crate) fn step(
     root: Option<&Path>,
     disk: &crate::disk::Monitor,
     bounds: &Bounds,
+    waits: deliver::Waits,
 ) -> Result<Vec<String>, String> {
-    let (mut rows, mut work) = load(store)?;
+    let (mut rows, mut work) = load(store, waits)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
         deliver::collect_reports(store, &work, &rows, root)
     });
     if !lines.is_empty() {
         // Collecting a report changed a task's state.
-        (rows, work) = load(store)?;
+        (rows, work) = load(store, waits)?;
     }
     let Reading {
         work,
