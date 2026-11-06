@@ -864,12 +864,15 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 }
 
 /// The fleet board: every session with its judgement and activity, plus
-/// fleet health and the decision ladder. Computed by SQL from storage,
-/// except the health's `disk`: free space read now ([`crate::disk::report`]).
+/// fleet health, the decision ladder and each gated mission's gate-room
+/// waits. Computed by SQL from storage, except what the host has now, read
+/// at this request: the health's `disk` (free space, [`crate::disk::report`])
+/// and `memory` (`/proc/meminfo`, [`crate::memory::report`]).
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
+    health["memory"] = crate::memory::report();
     Ok(json!({
         "agents": store.fleet_board().map_err(err)?,
         "health": health,
