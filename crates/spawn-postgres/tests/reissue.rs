@@ -167,7 +167,10 @@ fn only_a_task_waiting_for_its_first_delivery_is_reissued_and_only_once() {
         .expect("assign");
     store.task_delivered(delivered, 1).expect("delivered");
     let refused = refusal(store.task_reissue(delivered, &attempts(delivered, 14)));
-    assert!(refused.contains("not waiting for its first delivery"), "{refused}");
+    assert!(
+        refused.contains("not waiting for its first delivery"),
+        "{refused}"
+    );
 
     // Sent back: a revision's delivery is escalated, never re-issued.
     assert!(store.task_reported(delivered, "done").expect("reported"));
@@ -175,13 +178,20 @@ fn only_a_task_waiting_for_its_first_delivery_is_reissued_and_only_once() {
         .task_review(delivered, false, "again", None)
         .expect("send back");
     let refused = refusal(store.task_reissue(delivered, &attempts(delivered, 14)));
-    assert!(refused.contains("not waiting for its first delivery"), "{refused}");
+    assert!(
+        refused.contains("not waiting for its first delivery"),
+        "{refused}"
+    );
 
     let cancelled = store
         .task_assign(mission, "ephemeral", "w", "cancelled", "default")
         .expect("assign");
     store.task_cancel(cancelled).expect("cancel");
-    assert!(store.task_reissue(cancelled, &attempts(cancelled, 14)).is_err());
+    assert!(
+        store
+            .task_reissue(cancelled, &attempts(cancelled, 14))
+            .is_err()
+    );
     assert!(store.task_reissue(9_999, &attempts(9_999, 14)).is_err());
 
     // No attempts named: nothing to rest the re-issue on.
@@ -263,7 +273,10 @@ fn an_objective_tasks_reissue_keeps_its_objective_in_flight() {
     assert_eq!(row["created_by"], "spawn-integrate");
     assert_eq!(row["agent_id"], "agent_resident_rsi");
     let doubled = refusal(store.objective_assign(mission, 19, None, "again"));
-    assert!(doubled.contains("already has a task in flight"), "{doubled}");
+    assert!(
+        doubled.contains("already has a task in flight"),
+        "{doubled}"
+    );
 }
 
 /// Every deploy is recorded, also one that moves no mission's baseline

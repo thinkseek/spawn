@@ -513,7 +513,8 @@ pub(crate) fn step(
     for reissue in plan.reissues {
         // A refusal (the task moved on since the facts were read) costs this
         // pass nothing else: the next pass reads the task as it is.
-        let attempts = serde_json::to_value(&reissue.attempts).map_err(|error| error.to_string())?;
+        let attempts =
+            serde_json::to_value(&reissue.attempts).map_err(|error| error.to_string())?;
         lines.push(match store.task_reissue(reissue.task, &attempts) {
             Ok(new) => format!(
                 "dispatch: task #{} re-issued as task #{new}: its delivery never reached its \

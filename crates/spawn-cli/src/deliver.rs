@@ -165,9 +165,7 @@ fn backoff(base_ms: i64, failures: usize) -> i64 {
     let doublings = u32::try_from(failures.saturating_sub(1))
         .unwrap_or(u32::MAX)
         .min(20);
-    base_ms
-        .saturating_mul(1_i64 << doublings)
-        .min(RETRY_MAX_MS)
+    base_ms.saturating_mul(1_i64 << doublings).min(RETRY_MAX_MS)
 }
 
 /// The dispatcher's two delivery waits, settings `spawn loop` reads from
@@ -2818,7 +2816,10 @@ mod tests {
         });
         assert_eq!(waits.reissue_after_ms, 300_000, "the default holds");
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("SPAWN_REISSUE_AFTER_SECS"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("SPAWN_REISSUE_AFTER_SECS"),
+            "{warnings:?}"
+        );
     }
 
     /// The first counted retry waits `SPAWN_DELIVERY_RETRY_SECS`, doubling.
@@ -2903,7 +2904,11 @@ mod tests {
         let items = news_items(&tasks, &rows);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
-        assert!(items[0].line.contains("may or may not"), "{}", items[0].line);
+        assert!(
+            items[0].line.contains("may or may not"),
+            "{}",
+            items[0].line
+        );
         let status = super::delivery_status(&tasks, &tasks.tasks[0], rows.first(), 60_000);
         assert!(!status.given_up, "its stall is escalated");
     }
@@ -2939,8 +2944,14 @@ mod tests {
         assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
         let line = &items[0].line;
         assert!(line.starts_with("task #4 (a re-issue of task #3) never reached its worker"));
-        assert!(line.contains("`deliver-4-0` to `deliver-4-0-retry-13` (14 attempts)"), "{line}");
-        assert!(line.contains("`deliver-3-0` to `deliver-3-0-retry-13` (14 attempts)"), "{line}");
+        assert!(
+            line.contains("`deliver-4-0` to `deliver-4-0-retry-13` (14 attempts)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("`deliver-3-0` to `deliver-3-0-retry-13` (14 attempts)"),
+            "{line}"
+        );
         assert!(line.contains("command too long"), "{line}");
         assert!(!line.contains('\n'));
         let status = super::delivery_status(&tasks, &tasks.tasks[0], rows.first(), 60_000);
@@ -2979,7 +2990,10 @@ mod tests {
             ..sent(200, "deliver-4-0-moved-90", 60_002, None)
         });
         assert!(super::orders(&tasks, &[flying.clone()], 90_000).is_empty());
-        let first = with(vec![task(4, TaskState::Assigned, "resident")], moved(90, 60_000));
+        let first = with(
+            vec![task(4, TaskState::Assigned, "resident")],
+            moved(90, 60_000),
+        );
         assert!(super::reissues(&first, &[flying], i64::MAX / 2).is_empty());
 
         // Succeeded: the task is delivered by it; a pending re-issue is not made.
@@ -2999,7 +3013,11 @@ mod tests {
         assert!(super::orders(&tasks, &[refused.clone()], i64::MAX / 2).is_empty());
         let items = news_items(&tasks, &[refused.clone()]);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].tag(), "session_resident_core deliver-4-0", "the same item");
+        assert_eq!(
+            items[0].tag(),
+            "session_resident_core deliver-4-0",
+            "the same item"
+        );
         assert!(news_items(&first, &[refused.clone()]).is_empty());
         assert_eq!(super::reissues(&first, &[refused.clone()], 72_000).len(), 1);
         // The next deploy: one attempt more.
