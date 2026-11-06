@@ -27,7 +27,8 @@
 //! free disk in the gate's TMPDIR against SPAWN_GATE_MIN_FREE_GB (the
 //! floor `scripts/disk.sh` reads too), `MemAvailable` against
 //! SPAWN_GATE_MIN_FREE_MEMORY_MB (default 2048 MiB), and, when
-//! SPAWN_TEST_DATABASE_URL is set, the test database: a connection, then a
+//! SPAWN_TEST_DATABASE_URL is set (and the mission's gate gets it: not one
+//! marked `no-test-database`), the test database: a connection, then a
 //! forced parallel query, each within 10 s, so a server without the shared
 //! memory a parallel query needs (/dev/shm in a container) is found before
 //! the workspace tests are. A check that falls short ([`Shortfall`]) means
