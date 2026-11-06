@@ -578,6 +578,9 @@ impl GitWorkspace {
     /// The kept index is only a stat cache (a fresh one after a failure,
     /// one that saw no merge of main, one written before this rule), so
     /// its runtime entries are first reset from `head`, never trusted.
+    /// When neither `head` nor the index holds a runtime file and no merge
+    /// waits (nearly every checkpoint), one listing says so and nothing
+    /// else runs.
     fn track_runtime_files(
         &self,
         directory: &Path,
@@ -586,6 +589,18 @@ impl GitWorkspace {
         pending_main: Option<&str>,
     ) -> Result<(), WorkspaceError> {
         let specs = runtime_pathspecs("");
+        if pending_main.is_none() {
+            // `--with-tree`: the index's entries and `head`'s together.
+            let mut probe: Vec<OsString> = ["ls-files", "-z", "--cached"]
+                .map(OsString::from)
+                .into();
+            probe.push(OsString::from(format!("--with-tree={head}")));
+            probe.push(OsString::from("--"));
+            probe.extend(specs.iter().cloned());
+            if self.listing_in(directory, index, &probe)?.is_empty() {
+                return Ok(());
+            }
+        }
         let mut reset: Vec<OsString> = ["reset", "-q", "--no-refresh", head, "--"]
             .map(OsString::from)
             .into();
