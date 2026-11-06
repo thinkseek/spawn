@@ -1987,11 +1987,21 @@ begin
                                           'aborted', 'stale', 'no_room') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
     end if;
-    -- No room to judge names what it saw: the free space and the directory.
+    -- No room to judge names what it measured: the check that fell short
+    -- (`disk`, `memory` or `database`), its `measured` and its `threshold`
+    -- (the integrator's checks before a gate, docs/fleet-architecture.md
+    -- §10.3); a disk one, or one that names no check (the gate's own fact,
+    -- and records from before the checks), the free space and the directory.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'no_room'
-       and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
-            or p_record ->> 'tmpdir' is null) then
-        raise exception 'a no_room verdict names free_kb and tmpdir: %', p_record;
+       and ((p_record ? 'check'
+             and (coalesce(p_record ->> 'check', '') not in ('disk', 'memory', 'database')
+                  or coalesce(p_record ->> 'measured', '') = ''
+                  or coalesce(p_record ->> 'threshold', '') = ''))
+            or (coalesce(p_record ->> 'check', 'disk') = 'disk'
+                and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
+                     or p_record ->> 'tmpdir' is null))) then
+        raise exception 'a no_room verdict names its check, measured and threshold, and a disk one free_kb and tmpdir: %',
+                        p_record;
     end if;
     -- The gate runs for minutes: the task may have been closed meanwhile.
     -- A verdict only moves work that is still waiting for it.
