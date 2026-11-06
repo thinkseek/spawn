@@ -36,7 +36,7 @@ pub(super) fn told(supervisor: Option<&Facts>) -> BTreeSet<String> {
 /// the human is judged BLOCKED but sits at its prompt all the same: if
 /// that verdict held digests back, one question would silence every
 /// escalation until a human answered it.
-fn supervisor_idle(supervisor: &Facts) -> bool {
+pub(super) fn supervisor_idle(supervisor: &Facts) -> bool {
     supervisor.turn_stopped_idle()
         || (supervisor.live_and_free()
             && supervisor.current_observation().is_some_and(|observation| {
@@ -67,6 +67,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::GateRoom => "no room for the gate on this host",
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
         Why::Stalled => "stalled",
+        Why::Charter => "new charter not typed",
     }
 }
 
