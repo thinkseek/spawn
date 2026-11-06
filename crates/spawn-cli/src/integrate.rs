@@ -173,7 +173,7 @@ use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
 use crate::config::{loop_interval, workspace_root};
-use crate::gate::{self, GateFailure};
+use crate::gate::{self, GateFailure, RoomFailure, Shortfall};
 use crate::{Flags, env_or, open_store};
 use crate::{main_merge, objectives, sources};
 
@@ -682,7 +682,10 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         crate::config::env_value(PER_GATE_SERVER).as_deref(),
     )
     .map_err(|error| format!("{error}\n{USAGE}"))?;
-    let integrator = Integrator::new(root, gate, gate_env, gates);
+    // What the host must have before a gate starts, read once like the
+    // gate's environment (gate::Room).
+    let room = gate::Room::from_env(|name| std::env::var(name).ok());
+    let integrator = Integrator::new(root, gate, gate_env, room, gates);
     loop {
         let pass = integrator.pass();
         if once {
@@ -726,6 +729,8 @@ struct Judge {
     gate: PathBuf,
     /// The gate's whole environment ([`gate::gate_env`]).
     gate_env: Vec<(String, String)>,
+    /// The host's room, checked before each gate starts ([`gate::Room`]).
+    room: gate::Room,
 }
 
 /// A task a mission may judge now, waiting for a gate.
@@ -750,12 +755,19 @@ struct Running {
 }
 
 impl Integrator {
-    fn new(root: PathBuf, gate: PathBuf, gate_env: Vec<(String, String)>, gates: usize) -> Self {
+    fn new(
+        root: PathBuf,
+        gate: PathBuf,
+        gate_env: Vec<(String, String)>,
+        room: gate::Room,
+        gates: usize,
+    ) -> Self {
         Self {
             judge: Judge {
                 root,
                 gate,
                 gate_env,
+                room,
             },
             gates,
             running: RefCell::new(Vec::new()),
@@ -1264,6 +1276,29 @@ impl Judge {
         }
 
         let scenario = task_scenario(scenarios, task.scenario.as_deref());
+        // The host's room, measured now, before any gate starts: a gate
+        // must never be how the integrator learns the host had none.
+        match self.room.check(&self.gate_env) {
+            Ok(checks) => println!(
+                "integrate: task {}: room to judge: {}",
+                task.id,
+                checks.lines().collect::<Vec<_>>().join("; ")
+            ),
+            Err(RoomFailure::Short { short, log }) => {
+                println!(
+                    "integrate: task {}: no room to judge now ({}); the gate does not run",
+                    task.id,
+                    short.check()
+                );
+                return gated(
+                    "no_room",
+                    short_of_room(mission, task.id, &short, &log, now_ms()),
+                );
+            }
+            Err(RoomFailure::Bad(reason)) => {
+                return gated("aborted", json!({ "reason": reason }));
+            }
+        }
         // The test server must not be the owner's, by identity, asked now:
         // a socket mount or a DNS name can change between gate runs.
         let owner = std::env::var("SPAWN_DATABASE_URL").ok();
