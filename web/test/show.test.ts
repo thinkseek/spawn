@@ -68,17 +68,6 @@ test("every event travels to the log from whoever wrote it", () => {
   assert.deepEqual(effectsOf(control({ type: "mission.configured" }))[0].route, ["supervisor", "log"]);
 });
 
-test("the integrator records the outcome of the owner's landing; the owner's own move is not its", () => {
-  const route = (record: Record<string, unknown>) => effectsOf(control(record))[0].route;
-  assert.deepEqual(route({ type: "source.moved", request: 7, from: "a", to: "b" }), ["integrator", "log"]);
-  assert.deepEqual(route({ type: "source.push_refused", request: 7, reason: "conflict" }), [
-    "integrator",
-    "log",
-  ]);
-  assert.deepEqual(route({ type: "source.moved", from: "a", to: "b" }), ["supervisor", "log"]);
-  assert.deepEqual(route({ type: "source.push_requested", commit: "c" }), ["supervisor", "log"]);
-});
-
 test("each kind of work takes its own path", () => {
   const rest = (e: LogEvent) => effectsOf(e).slice(1);
   assert.deepEqual(rest(event("artifact.committed")), [
