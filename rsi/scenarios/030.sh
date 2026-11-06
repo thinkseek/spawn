@@ -984,8 +984,8 @@ fi
 max_id=$(q "select max(id) from spawn_events")
 sha=$(printf 'bb-030-%s' "$run" | sha256sum | cut -d' ' -f1)
 wait_rec=$(append_record '{"type": "admission.waiting", "kind": "execution", "agent_id": "agent_worker_bb_wait", "session_id": "session_worker_bb_wait", "envelope_bytes": 6442450944, "measure": "host", "measured_bytes": 2147483648, "threshold_bytes": 6442450944}')
-dump1=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-1.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400000, \"events\": 8106, \"max_event_id\": $max_id}")
-bundle1=$(append_record "{\"type\": \"backup.bundled\", \"key\": \"bundles/daily/spawn-bb-1.tar.gpg\", \"sha256\": \"$sha\", \"bytes\": 31000000}")
+dump1=$(append_record "{\"type\": \"backup.dumped\", \"keys\": [\"postgres/hourly/spawn-bb-1.dump.gpg\"], \"sha256\": \"$sha\", \"bytes\": 2400000, \"events\": 8106, \"max_event_id\": $max_id}")
+bundle1=$(append_record "{\"type\": \"backup.bundled\", \"kind\": \"full\", \"keys\": [\"bundles/full/spawn-bb-1.tar.gpg\"], \"sha256\": \"$sha\", \"bytes\": 31000000}")
 drill_bad=$(append_record "{\"type\": \"backup.verified\", \"key\": \"postgres/hourly/spawn-bb-1.dump.gpg\", \"ok\": false, \"reason\": \"the restored database holds 8105 events; the dump's record says 8106\", \"events\": 8105, \"max_event_id\": $max_id, \"expected\": {\"events\": 8106, \"max_event_id\": $max_id}}")
 auth=$(append_record '{"type": "execution.interrupted", "agent_id": "agent_worker_bb_auth", "session_id": "session_worker_bb_auth", "execution_id": "exec_bb_auth", "cause": "model_auth", "evidence": {"error": "authentication_failed", "status": 401, "text": "Please run /login · API Error: 401"}, "path": "wait", "attempt": 1, "due_ms": null}')
 # 033's alert before this objective: the third base in a row on T1's mission
@@ -1020,7 +1020,7 @@ today "restore drill failed" "$(event_at "$drill_bad")" "drill|8105"
 today "model login expired" "$(event_at "$auth")" "exec_bb_auth|session_worker_bb_auth|login"
 today "three bases in a row that disagreed with themselves (033)" "$(event_at "$gbd")" "base|011\\.sh"
 if [ -n "$missing" ]; then
-    over=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-over.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id, \"over_alert\": true, \"held_bytes\": 8100000000, \"written_bytes\": 2400100, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
+    over=$(append_record "{\"type\": \"backup.dumped\", \"keys\": [\"postgres/hourly/spawn-bb-over.dump.gpg\"], \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id, \"over_alert\": true, \"held_bytes\": 8100000000, \"written_bytes\": 2400100, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
     today "R2 over its alert threshold (031)" "$(event_at "$over")" "R2|budget|over" 5
 fi
 if [ -z "$missing" ]; then
@@ -1028,8 +1028,8 @@ if [ -z "$missing" ]; then
     admitted=$(append_record "{\"type\": \"admission.admitted\", \"kind\": \"execution\", \"agent_id\": \"agent_worker_bb_wait\", \"session_id\": \"session_worker_bb_wait\", \"envelope_bytes\": 6442450944, \"waited_ms\": $waited}")
     # The dump that clears the stale one also finds R2 over its alert
     # threshold (031's `over_alert`).
-    dump2=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-2.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id, \"over_alert\": true, \"held_bytes\": 8100000000, \"written_bytes\": 2400100, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
-    bundle2=$(append_record "{\"type\": \"backup.bundled\", \"key\": \"bundles/daily/spawn-bb-2.tar.gpg\", \"sha256\": \"$sha\", \"bytes\": 31000100}")
+    dump2=$(append_record "{\"type\": \"backup.dumped\", \"keys\": [\"postgres/hourly/spawn-bb-2.dump.gpg\"], \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id, \"over_alert\": true, \"held_bytes\": 8100000000, \"written_bytes\": 2400100, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
+    bundle2=$(append_record "{\"type\": \"backup.bundled\", \"kind\": \"incremental\", \"keys\": [\"bundles/incr/spawn-bb-2.tar.gpg\"], \"sha256\": \"$sha\", \"bytes\": 31000100}")
     drill_ok=$(append_record "{\"type\": \"backup.verified\", \"key\": \"postgres/hourly/spawn-bb-2.dump.gpg\", \"ok\": true, \"reason\": \"\", \"events\": 8107, \"max_event_id\": $max_id, \"expected\": {\"events\": 8107, \"max_event_id\": $max_id}}")
     auth_ok=$(append_record "{\"type\": \"execution.cleared\", \"execution_id\": \"exec_bb_auth\", \"session_id\": \"session_worker_bb_auth\", \"cause\": \"model_auth\", \"evidence\": {\"credentials\": \"changed\"}, \"waited_ms\": $waited}")
     for check in "admission_wait agent_worker_bb_wait $admitted" "backup_stale dump $dump2" \
@@ -1053,7 +1053,7 @@ if [ -z "$missing" ]; then
             [ "$(field .evidence.held_bytes)" = 8100000000 ] && [ "$(field .evidence.alert_bytes)" = 8000000000 ] ||
             measured_fail "(8) R2's alert is $alert; wanted key backup_budget:$dump2, evidence.event_id $dump2, held_bytes 8100000000 and alert_bytes 8000000000"
         within "(8) R2 over its alert threshold (031)" "$(event_at "$dump2")" 5000
-        dump3=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-3.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400200, \"events\": 8108, \"max_event_id\": $max_id, \"over_alert\": false, \"held_bytes\": 7900000000, \"written_bytes\": 2400200, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
+        dump3=$(append_record "{\"type\": \"backup.dumped\", \"keys\": [\"postgres/hourly/spawn-bb-3.dump.gpg\"], \"sha256\": \"$sha\", \"bytes\": 2400200, \"events\": 8108, \"max_event_id\": $max_id, \"over_alert\": false, \"held_bytes\": 7900000000, \"written_bytes\": 2400200, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
         if cleared 8 backup_budget r2 "(8) R2 back under its alert threshold (031)"; then
             [ "$(field .cleared_evidence.event_id)" = "$dump3" ] ||
                 measured_fail "(8) R2's alert was cleared naming $(field '.cleared_evidence | tostring'), not the record under the threshold (event $dump3)"
