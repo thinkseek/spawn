@@ -303,9 +303,50 @@ it, on the same ladder.
   session and reason: repeated items of one kind about one worker (a human's
   notes that could not be delivered, retried) are counted on one line, the
   latest quoted, so they cannot fill the digest. Its memory is its native
-  session (restored by resume) plus the log. The charter is given when a
-  native session starts (the first, or a handoff); a resume keeps the
-  session it had, and the charter it was given then.
+  session (restored by resume) plus the log.
+
+  **A changed charter reaches it by record.** The charter
+  (`supervise::charter`) is the prompt of a new native session (the first,
+  or a handoff), and that start records the charter's hash (the `Start`
+  command's `charter`, FNV-1a of the text). A restarted `spawn loop`, a
+  resume (after an engine exit, a crash or a reboot) and a compaction keep
+  the native session, and the charter it holds. Which charter that is, is
+  read from records only (`dispatch_facts`' `charter`,
+  `dispatch/charter.rs`): the start of the execution that first named the
+  current native session (the latest `session.native_started`'s id) gave the
+  hash it recorded (none, for a start that recorded none: a person's, or
+  one from before the record), and the newest charter input the dispatcher
+  sent into the session since that start which reached it (an input tagged
+  `charter <hash>` that succeeded, or failed after typing may have begun)
+  replaced it. When that is not the hash of the charter the running build
+  writes, the dispatcher types the deployed charter in at the supervisor's
+  next idle prompt, through the digest's path and in that pass's digest's
+  place (the digest waits for the next idle prompt, its items pending): one
+  input that opens with a line saying the charter changed and that the text
+  replaces, in full, the one given earlier, tagged `charter <hash>` and
+  keyed `dispatch-charter-<hash>-over-<command>`, `<command>` being the
+  record it replaces (the start, or the charter input before it), so a
+  restarted loop submits the same key, and a charter reverted and deployed
+  again is typed again over the one that replaced it. Typed, the input is
+  the record of the delivery: nothing is sent again for that hash, whatever
+  restarts, and a new native session started with the charter holds it from
+  its start and gets nothing. An attempt refused before anything was typed
+  (a pane not ready, an execution gone) told nothing: it goes again under
+  `<key>-retry-<n>` at an idle prompt judged on a fact after it (its own
+  `command.finished` is one), 3 attempts in all, then it is escalated (`new
+  charter not typed`, a condition that holds while those records do: the
+  owner types it, or a handoff gives it) and not sent again. One that may
+  have typed is not typed again. No step reads the time or the pane's text.
+
+  Residents need none of this. A resident's charter is not Spawn's code: it
+  is the text the supervisor proposed and a person approved
+  (`resident.proposed`), which no deploy changes and which cannot change
+  once approved (a proposal for a resident that is not a proposal is
+  refused). The code around it holds no rule that a running resident could
+  miss: the role line (`deliver::resident_role`, given at a start) only
+  names the resident and its charter, and the report contract
+  (`deliver::report_contract`) is typed again with every new task. A rule
+  added to the role line would need the same record.
 - **Human**: the attention queue in the UI ("Needs a human", top of the
   Fleet page) is computed by the dispatcher's own code, not by the UI:
   `GET /api/attention` runs the plan of the dispatcher's pass for this moment
@@ -373,6 +414,7 @@ the system. Its continuity is a design requirement, not a best effort:
 | A transcript Claude Code deleted | The resume puts it back from the transcript archive (`<root>/.transcripts`, copied at turn ends and execution ends; docs/storage.md, "The transcript archive"); one gone with no copy fails the resume instead of starting blank under the old id |
 | The native session cannot be resumed (transcript lost with no copy, resume fails three times) | `start` a fresh native session inside the same Spawn session, with a handoff prompt rebuilt from the log: mission, open worker tasks, recent escalations and decisions |
 | The context window fills | Claude Code compacts on its own; the handoff path above is the fallback when it cannot |
+| A deploy changes its charter | Each new native session's start records the hash of the charter it gives; when the native session that runs holds another (after a loop restart, a resume or a compaction), the dispatcher types the new charter in at its next idle prompt, once, by record (§3, the supervisor) |
 | The supervisor hangs or loops | Its own observations (rules, then Jev) flag `stuck`; that goes to a human, never to an automatic stop |
 
 Rules for the session itself:
