@@ -6,6 +6,7 @@
 //! conformance suite in [`crate::contract`] runs against both.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -18,8 +19,9 @@ use crate::id::{
     TerminalName, WorkspaceId,
 };
 use crate::port::{
-    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Launch, READ_LIMIT,
-    StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
+    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Hold, Launch,
+    READ_LIMIT, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
+    WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -92,6 +94,9 @@ struct State {
     panes: HashMap<TerminalName, String>,
     /// Text staged for a terminal's next submit.
     staged: HashMap<TerminalName, String>,
+    /// For every text submitted to a terminal, in order: whether a
+    /// workspace was held ([`WorkspaceStore::hold`]) while it was.
+    submitted_held: Vec<bool>,
     files: HashMap<String, Vec<u8>>,
     /// Engines that exit at the next liveness check: the file is written
     /// and the terminal closes then, between the Bridge's two reads.
@@ -167,6 +172,17 @@ pub struct MemoryStore {
     project: String,
     clock: Arc<dyn Clock>,
     state: Mutex<State>,
+    /// Workspaces held now ([`WorkspaceStore::hold`]).
+    held: Arc<AtomicUsize>,
+}
+
+/// A hold of a workspace of a [`MemoryStore`], counted until dropped.
+struct Held(Arc<AtomicUsize>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl MemoryStore {
@@ -176,6 +192,7 @@ impl MemoryStore {
             project: project.to_string(),
             clock,
             state: Mutex::new(State::default()),
+            held: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -234,6 +251,12 @@ impl MemoryStore {
     /// Test helper.
     pub fn workspace_calls(&self) -> Vec<String> {
         self.lock().workspace_calls.clone()
+    }
+
+    /// For every text submitted to a terminal so far, in order: whether a
+    /// workspace was held while it was. Test helper.
+    pub fn submitted_held(&self) -> Vec<bool> {
+        self.lock().submitted_held.clone()
     }
 
     /// Every terminal start so far, in order. Test helper.
@@ -725,6 +748,8 @@ impl TerminalHost for MemoryStore {
         let Some(text) = state.staged.remove(terminal) else {
             return Err(TerminalError(format!("nothing staged for {terminal}")));
         };
+        let held = self.held.load(Ordering::SeqCst) > 0;
+        state.submitted_held.push(held);
         let pane = state.panes.entry(terminal.clone()).or_default();
         pane.push_str(&text);
         pane.push('\n');
