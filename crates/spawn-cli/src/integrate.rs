@@ -420,6 +420,12 @@ pub(crate) struct Mission {
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
     pub(crate) source: Option<String>,
+    /// The owner's active hold on its source (the `source.held` record's
+    /// event id), if one, as the pass read it: which of its landing tasks
+    /// wait behind it ([`Mission::in_flight`]). A landing never trusts it:
+    /// [`land`] reads the hold from the store under the landing lock.
+    #[serde(default)]
+    pub(crate) hold: Option<i64>,
     /// Its tasks the closure rule lets go on: every open task of an open
     /// mission; of a done one, delivered, reported, accepted and landing.
     #[serde(default)]
@@ -461,6 +467,10 @@ pub(crate) struct Task {
     /// left it ready): how long it has waited for a gate.
     #[serde(default)]
     pub(crate) updated_at_ms: i64,
+    /// The owner's hold its landing last waited behind (its latest
+    /// `task.held`), if any.
+    #[serde(default)]
+    pub(crate) held_by: Option<i64>,
 }
 
 impl Mission {
@@ -478,6 +488,16 @@ impl Mission {
         self.tasks
             .iter()
             .find(|task| task.state == TaskState::Landing)
+    }
+
+    /// A landing in flight: a task in `landing` whose push may have moved
+    /// main before its record. Not one whose `task.held` names the active
+    /// hold on its source: its `land()` pushed nothing, so main says nothing
+    /// about it.
+    fn in_flight(&self) -> Option<&Task> {
+        self.tasks.iter().find(|task| {
+            task.state == TaskState::Landing && !(task.held_by.is_some() && task.held_by == self.hold)
+        })
     }
 }
 
@@ -828,7 +848,7 @@ fn git(arguments: &[&str]) -> Result<String, String> {
 }
 
 /// The source's default branch and its commit, as `git ls-remote` sees it.
-fn source_head(source: &str) -> Result<(String, String), String> {
+pub(crate) fn source_head(source: &str) -> Result<(String, String), String> {
     let source = sources::MissionSource::parse(source)?;
     let listing = git(&["ls-remote", "--symref", "--", source.as_str(), "HEAD"])?;
     let mut branch = "refs/heads/main".to_string();
@@ -1117,6 +1137,9 @@ impl Integrator {
 
     /// One pass over every gated mission, holding the integrator's lock.
     fn pass_on(&self, store: &Arc<PostgresStore>) -> Result<(), String> {
+        // A hold past its bound ends by its record, before any mission's
+        // step: nothing lands on its source until then.
+        expire_holds(store)?;
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
@@ -1179,11 +1202,18 @@ impl Integrator {
         // gate of its own, or of another mission on its source, runs (they
         // share the mirror and the main it judges against).
         let mut judgeable = None;
+        // A task that waits behind the owner's hold on the source keeps the
+        // mission's other ready tasks waiting (one task per mission between
+        // its gate and its landing) and ends nothing early.
+        let mut held = false;
         if !self.busy(mission) {
             let mirror = sources::ensure_mirror(&self.judge.root, Some(source))
                 .map_err(|error| error.to_string())?;
             if let Some(task) = mission.landing() {
-                return land(store, &mirror, source, task).map(|()| true);
+                match land(store, &mirror, source, task)? {
+                    Landing::Held(_) => held = true,
+                    Landing::Landed | Landing::Stale | Landing::Gone => return Ok(true),
+                }
             }
             // Another mission's landing on this source may have moved main
             // without its record yet (a crash between the push and
@@ -1233,6 +1263,9 @@ impl Integrator {
             && let Err(error) = objectives::assign_next(store, mission)
         {
             eprintln!("integrate: mission {}: {error}", mission.id);
+        }
+        if held {
+            return Ok(false);
         }
         if let (Some((mirror, main)), Some(task)) = (judgeable, mission.ready()) {
             // The gate had no room last time: wait out the backoff, then try.
@@ -1661,7 +1694,8 @@ impl Judge {
                     candidate: Some(candidate),
                     ..task.clone()
                 };
-                land(store, mirror, source, &landing)
+                // On a held source this records its `task.held`: it waits.
+                land(store, mirror, source, &landing).map(|_| ())
             }
             // A rejection whose every failure is the host's (the test
             // database failed) is no verdict on the work: `host_fault`, not
@@ -2328,22 +2362,46 @@ fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
+/// What [`land`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// Recorded `task.landed`: the push moved main, or the candidate was
+    /// already under it.
+    Landed,
+    /// Main moved past the task's base without it (or it had none): gated
+    /// `stale`, judged again.
+    Stale,
+    /// No longer landing (its mission was dropped).
+    Gone,
+    /// Its source is held (the hold's event id): nothing was pushed, and the
+    /// task waits behind the hold, `task.held` recorded once per hold.
+    Held(i64),
+}
+
 /// Move the source's default branch from the task's base to its candidate,
 /// only if it is still at the base, and record the landing. A branch that
 /// moved meanwhile sends the task back to be judged again, unless the
 /// candidate is already in its history: a push of an earlier pass that was
 /// never recorded (the integrator stopped in between), with main moved on
 /// top of it since. That landing happened, and is recorded so.
-fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Result<(), String> {
+///
+/// The owner's hold on the source is read from the store under the landing
+/// lock, before any push, never from memory: on a held source nothing is
+/// pushed. A candidate already under main landed before the hold and is
+/// recorded `task.landed`; any other records `task.held` (once per task and
+/// hold) and stays `landing`. So a hold never splits a push from its record.
+fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Result<Landing, String> {
     let (Some(base), Some(candidate)) = (task.base.as_deref(), task.candidate.as_deref()) else {
         return record(
             store,
             &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
                     "revision": task.revisions}),
-        );
+        )
+        .map(|()| Landing::Stale);
     };
-    // Held until the landing is recorded: dropping the mission waits for it.
-    let Some(_hold) = store
+    // Held until the landing is recorded: dropping the mission waits for it,
+    // and so does an owner's hold.
+    let Some(_lock) = store
         .landing_hold(task.id)
         .map_err(|error| error.to_string())?
     else {
@@ -2351,10 +2409,50 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
             "integrate: task {} is no longer landing (its mission was dropped)",
             task.id
         );
-        return Ok(());
+        return Ok(Landing::Gone);
     };
-    let (branch, _) = source_head(source)?;
     let mirror_path = mirror.to_string_lossy().to_string();
+    if let Some(hold) = store
+        .active_hold(source)
+        .map_err(|error| error.to_string())?
+    {
+        let (branch, now) = source_head(source)?;
+        // A fetch that fails shows nothing under main: the task waits.
+        let under_main = now == candidate
+            || (sources::refresh(mirror, source).is_ok()
+                && git(&[
+                    "--git-dir",
+                    &mirror_path,
+                    "merge-base",
+                    "--is-ancestor",
+                    candidate,
+                    &now,
+                ])
+                .is_ok());
+        if under_main {
+            println!(
+                "integrate: task {}: {candidate} is already under {branch} ({now}), from before                  hold {hold}",
+                task.id
+            );
+            record(
+                store,
+                &json!({"type": "task.landed", "id": task.id, "from": base, "to": candidate}),
+            )?;
+            return Ok(Landing::Landed);
+        }
+        if store
+            .task_held(task.id, hold, source)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            println!(
+                "integrate: task {} waits behind the owner's hold {hold} on {source}: nothing                  lands there until a record ends it",
+                task.id
+            );
+        }
+        return Ok(Landing::Held(hold));
+    }
+    let (branch, _) = source_head(source)?;
     let pushed = git(&[
         "--git-dir",
         &mirror_path,
@@ -2390,7 +2488,8 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
                 store,
                 &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
                         "revision": task.revisions}),
-            );
+            )
+            .map(|()| Landing::Stale);
         }
         println!(
             "integrate: task {}: {candidate} is already under {branch} ({now})",
@@ -2410,6 +2509,54 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
         &json!({"type": "task.landed", "id": task.id, "from": base, "to": candidate}),
     )?;
     println!("integrate: task {} landed {candidate} on {source}", task.id);
+    Ok(Landing::Landed)
+}
+
+/// One active owner's hold, as [`PostgresStore::source_holds`] reads it.
+#[derive(Debug, Clone, Deserialize)]
+struct Hold {
+    source: String,
+    hold: i64,
+    expires_ms: i64,
+}
+
+/// The active holds and the database's clock when they were read.
+#[derive(Debug, Clone, Deserialize)]
+struct Holds {
+    now_ms: i64,
+    #[serde(default)]
+    holds: Vec<Hold>,
+}
+
+/// The holds whose `expires_ms` the database's clock (`now_ms`) has reached.
+fn expired(holds: &Holds) -> impl Iterator<Item = &Hold> {
+    holds
+        .holds
+        .iter()
+        .filter(move |hold| hold.expires_ms <= holds.now_ms)
+}
+
+/// Record `source.hold_expired` for every active hold whose `expires_ms` the
+/// database's clock has reached, whichever missions are on its source. Only
+/// that record ends the hold: past `expires_ms` without it nothing lands.
+/// The store refuses it for a hold released or renewed meanwhile (the
+/// record first wins), which is said and changes nothing.
+fn expire_holds(store: &PostgresStore) -> Result<(), String> {
+    let holds: Holds =
+        serde_json::from_value(store.source_holds().map_err(|error| error.to_string())?)
+            .map_err(|error| format!("source holds: {error}"))?;
+    for hold in expired(&holds) {
+        match store.hold_expired(&hold.source, hold.hold) {
+            Ok(event) => println!(
+                "integrate: the owner's hold {} on {} reached its bound: expired (record {event});                  landings there resume",
+                hold.hold, hold.source
+            ),
+            Err(error) => eprintln!(
+                "integrate: the owner's hold {} on {}: {error}",
+                hold.hold, hold.source
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -2430,12 +2577,14 @@ fn unlandable(source: &str) -> Option<String> {
 }
 
 /// Another mission's task landing on `mission`'s source, if one is:
-/// `(mission, task)`. Its push may have moved main before its record.
+/// `(mission, task)`. Its push may have moved main before its record. A task
+/// waiting behind the active hold on the source is not one
+/// ([`Mission::in_flight`]).
 fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Option<(i64, i64)> {
     missions
         .iter()
         .filter(|other| other.id != mission.id && other.source == mission.source)
-        .find_map(|other| other.landing().map(|task| (other.id, task.id)))
+        .find_map(|other| other.in_flight().map(|task| (other.id, task.id)))
 }
 
 fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
