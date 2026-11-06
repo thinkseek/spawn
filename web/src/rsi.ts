@@ -402,27 +402,17 @@ export function metricPoints(objective: RsiObjective | null): MetricPoint[] {
   }));
 }
 
-async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(url, {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) throw apiError(response.status);
-  return response.json();
-}
-
 export async function fetchDashboard(
   signal: AbortSignal,
 ): Promise<RsiDashboard> {
-  return normalizeDashboard(await getJson("/api/rsi", signal));
+  return readApi("/api/rsi", signal, normalizeDashboard);
 }
 
 export async function fetchTask(
   task: number,
   signal: AbortSignal,
 ): Promise<RsiTaskDetail> {
-  return normalizeTaskDetail(await getJson(`/api/rsi/task/${task}`, signal));
+  return readApi(`/api/rsi/task/${task}`, signal, normalizeTaskDetail);
 }
 
 export async function fetchPane(
@@ -430,5 +420,5 @@ export async function fetchPane(
   signal: AbortSignal,
 ): Promise<RsiPane> {
   const query = mission === null ? "" : `?mission=${mission}`;
-  return normalizePane(await getJson(`/api/rsi/pane${query}`, signal));
+  return readApi(`/api/rsi/pane${query}`, signal, normalizePane);
 }

@@ -442,28 +442,10 @@ export function normalizeCommands(value: unknown): CommandRecord[] {
   });
 }
 
-async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(url, {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      detail = text(object(await response.json()).error);
-    } catch {
-      // Not JSON; the status is enough.
-    }
-    throw apiError(response.status, detail);
-  }
-  return response.json();
-}
-
 const sessionPath = (id: string) => encodeURIComponent(id);
 
 export async function fetchFleet(signal: AbortSignal): Promise<Fleet> {
-  return normalizeFleet(await getJson("/api/fleet", signal));
+  return readApi("/api/fleet", signal, normalizeFleet);
 }
 
 export async function fetchJudgements(
@@ -471,11 +453,10 @@ export async function fetchJudgements(
   signal: AbortSignal,
   limit = 60,
 ): Promise<JudgementRecord[]> {
-  return normalizeJudgements(
-    await getJson(
-      `/api/fleet/${sessionPath(sessionId)}/judgements?limit=${limit}`,
-      signal,
-    ),
+  return readApi(
+    `/api/fleet/${sessionPath(sessionId)}/judgements?limit=${limit}`,
+    signal,
+    normalizeJudgements,
   );
 }
 
@@ -484,11 +465,10 @@ export async function fetchCommands(
   signal: AbortSignal,
   limit = 40,
 ): Promise<CommandRecord[]> {
-  return normalizeCommands(
-    await getJson(
-      `/api/fleet/${sessionPath(sessionId)}/commands?limit=${limit}`,
-      signal,
-    ),
+  return readApi(
+    `/api/fleet/${sessionPath(sessionId)}/commands?limit=${limit}`,
+    signal,
+    normalizeCommands,
   );
 }
 
@@ -496,9 +476,7 @@ export async function fetchAgentPane(
   sessionId: string,
   signal: AbortSignal,
 ): Promise<RsiPane> {
-  return normalizePane(
-    await getJson(`/api/pane/${sessionPath(sessionId)}`, signal),
-  );
+  return readApi(`/api/pane/${sessionPath(sessionId)}`, signal, normalizePane);
 }
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 // server that omits one (or sends null) renders an empty value instead of
 // crashing. Read-only: this module only ever issues GET requests.
 
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
 import type { RsiSummary } from "./api";
 
 export const TASK_STATES = [
@@ -331,13 +331,7 @@ export function normalizeMissions(value: unknown): Missions {
 }
 
 export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
-  const response = await fetch("/api/missions", {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) throw apiError(response.status);
-  return normalizeMissions(await response.json());
+  return readApi("/api/missions", signal, normalizeMissions);
 }
 
 /** How a task's record shows as a step: what it moved the task to.
