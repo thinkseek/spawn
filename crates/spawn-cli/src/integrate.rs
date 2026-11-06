@@ -3979,6 +3979,42 @@ mod tests {
         assert_eq!(over_budget(&json!({}), i64::MAX, i64::MAX), None);
     }
 
+    /// Objective 34: a task whose `task.held` names the active hold on its
+    /// source pushed nothing, so it is no landing in flight: the other
+    /// missions on the source do not wait for it. A `landing` task without
+    /// one (not held yet, or held by a hold that ended) still makes them
+    /// wait, as before.
+    #[test]
+    fn landing_elsewhere_ignores_a_task_waiting_behind_the_active_hold() {
+        let on_source = |id: i64, hold: Option<i64>, held_by: Option<i64>| {
+            let mut found = mission(0, 0, 0);
+            found.id = id;
+            found.source = Some("/srv/s.git".to_string());
+            found.hold = hold;
+            found.tasks = serde_json::from_value(json!([
+                {"id": id * 10, "agent_id": "agent_a", "session_id": "session_a",
+                 "state": "landing", "held_by": held_by},
+            ]))
+            .expect("tasks");
+            found
+        };
+        let waiting = on_source(2, None, None);
+        for (hold, held_by, waits) in [
+            (Some(7), Some(7), false),
+            (Some(7), None, true),
+            (Some(9), Some(7), true),
+            (None, Some(7), true),
+            (None, None, true),
+        ] {
+            let missions = [waiting.clone(), on_source(1, hold, held_by)];
+            assert_eq!(
+                super::landing_elsewhere(&missions, &missions[0]),
+                waits.then_some((1, 10)),
+                "hold {hold:?}, held_by {held_by:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_ready_task_follows_the_acceptance_rule() {
         let mut gated = mission(0, 0, 0);
@@ -6774,6 +6810,308 @@ mod database_tests {
         assert_eq!(record["verdict"], "rejected", "{record}");
         let after = gated(&db, mission);
         assert_eq!((after.gate_rejections, after.gate_host_faults), (1, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- the owner's hold (objective 034) --------------------------------
+
+    /// A stub gate that accepts every candidate.
+    const ACCEPTING_GATE: &str = "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+
+    /// Hold `source` for `bound` seconds as `spawn mission hold` does: the
+    /// hold's event id.
+    fn hold(db: &Db, source: &str, bound: i32) -> i64 {
+        crate::missions::hold_source(&db.store, source, bound, Some("owner gate test"))
+            .expect("the hold")["hold"]
+            .as_i64()
+            .expect("the hold's event id")
+    }
+
+    /// The event ids of the control records of type `kind` naming task
+    /// `task` (`id`), oldest first.
+    fn task_records(db: &Db, kind: &str, task: i64) -> Vec<i64> {
+        db.admin()
+            .query(
+                "select id from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = $1
+                    and kind -> 'detail' -> 'record' ->> 'id' = $2
+                  order by session_seq",
+                &[&kind, &task.to_string()],
+            )
+            .expect("records")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// The control records of type `kind` (`source.%`), oldest first, as
+    /// `(event id, record)`.
+    fn source_records(db: &Db, kind: &str) -> Vec<(i64, Value)> {
+        db.admin()
+            .query(
+                "select id, kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = $1
+                  order by session_seq",
+                &[&kind],
+            )
+            .expect("records")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    fn task_state(db: &Db, mission: i64, task: i64) -> String {
+        db.mission(mission)["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == task)
+            .and_then(|row| row["state"].as_str())
+            .expect("the task's state")
+            .to_string()
+    }
+
+    /// `land()` on a held source pushes nothing: it records one `task.held`
+    /// naming the hold (a second call, and the passes after, record none)
+    /// and leaves the task `landing`.
+    #[test]
+    fn a_landing_on_a_held_source_pushes_nothing_and_waits_once_per_hold() {
+        let (base, source, scenarios, integrator) = world("held-landing", "exit 1\n");
+        let db = Db::new("held_landing");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        let work = push_work(&base, &source, &agent_of(&db, mission, task), "w.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": work}));
+        let held = hold(&db, &source, 600);
+        let mirror = crate::sources::ensure_mirror(&integrator.judge.root, Some(&source))
+            .expect("mirror");
+        let landing = ready_task(&db, task);
+        for _ in 0..2 {
+            assert_eq!(
+                super::land(&db.store, &mirror, &source, &landing),
+                Ok(super::Landing::Held(held))
+            );
+        }
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(source_main(&source), b0, "nothing was pushed");
+        assert_eq!(task_records(&db, "task.held", task).len(), 1, "once per task and hold");
+        assert!(task_records(&db, "task.landed", task).is_empty());
+        assert_eq!(task_state(&db, mission, task), "landing");
+        assert!(db.mission(mission)["halted"].is_null());
+        assert_eq!(db.mission(mission)["hold"], held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A candidate already in the source's main (a push from before the hold
+    /// whose record was lost) landed before the hold: recorded `task.landed`
+    /// under the hold, as without one, and main is left where it is.
+    #[test]
+    fn a_landing_already_under_main_is_recorded_landed_under_a_hold() {
+        let (base, source, scenarios, integrator) = world("held-under-main", "exit 1\n");
+        let db = Db::new("held_under_main");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        let c1 = main_moves(&base, &source, "landed.txt");
+        let c2 = main_moves(&base, &source, "on-top.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": c1}));
+        hold(&db, &source, 600);
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(task_state(&db, mission, task), "landed");
+        assert!(task_records(&db, "task.held", task).is_empty());
+        assert_eq!(db.mission(mission)["baseline"], c1.as_str());
+        assert_eq!(source_main(&source), c2, "main is left where it is");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The hold is taken under the landing lock: while a landing holds it
+    /// (its compare-and-swap push begun), the hold waits for the landing's
+    /// record, then names the main that landing left.
+    #[test]
+    fn a_hold_taken_while_a_landing_holds_the_lock_waits_for_its_record() {
+        let (base, source, scenarios, _integrator) = world("hold-waits", "exit 1\n");
+        let db = Db::new("hold_waits");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": "c"}));
+        let owner = PostgresStore::connect_in_schema(&db.url, &db.schema).expect("the owner's CLI");
+        let lock = db
+            .store
+            .landing_hold(task)
+            .expect("the landing lock")
+            .expect("still landing");
+        let held_source = source.clone();
+        let holder = std::thread::spawn(move || {
+            crate::missions::hold_source(&owner, &held_source, 600, None)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert!(!holder.is_finished(), "the hold waits for the landing's lock");
+        let c1 = main_moves(&base, &source, "landed.txt");
+        db.record(&json!({"type": "task.landed", "id": task, "from": b0, "to": c1}));
+        drop(lock);
+        let held = holder.join().expect("the holder").expect("the hold");
+        assert_eq!(held["main"], c1.as_str(), "the main the landing left");
+        let landed = task_records(&db, "task.landed", task);
+        assert!(
+            held["hold"].as_i64() > landed.first().copied(),
+            "the landing's record comes first: {held} after {landed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A task waiting behind the hold ends nothing early: its mission's step
+    /// goes on to assign its next objective, and its source is not counted
+    /// as moved. Once its `task.held` names the active hold, another mission
+    /// on the held source is judged as usual (its gate runs and records its
+    /// verdict), and its accepted task waits behind the hold too.
+    #[test]
+    fn a_task_waiting_behind_a_hold_ends_nothing_early() {
+        let marks = fresh_marks("spawn-db-held-step");
+        let _release = Release(marks.clone());
+        let (base, source, scenarios, integrator) = world("held-step", &holding_gate(&marks));
+        let db = Db::new("held_step");
+        let b0 = source_main(&source);
+        let a = objective_mission(&db, &base, &source, &scenarios, "rh", 2);
+        integrator.pass_on(&db.store).expect("objective 1 is assigned");
+        let tasks = |mission: i64| db.mission(mission)["tasks"].as_array().map_or(0, Vec::len);
+        assert_eq!(tasks(a), 1);
+        let first = db.mission(a)["tasks"][0]["id"].as_i64().expect("its task");
+        db.store.task_delivered(first, 1).expect("delivered");
+        assert!(db.store.task_reported(first, "done").expect("reported"));
+        let work = push_work(&base, &source, &agent_of(&db, a, first), "a.txt");
+        db.record(&json!({"type": "task.gated", "id": first, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": work}));
+        let c = db.gated_mission(&source, &scenarios);
+        let ready = db.reported_task(c, "c");
+        let pushed = push_work(&base, &source, &agent_of(&db, c, ready), "c.txt");
+        let held = hold(&db, &source, 600);
+        std::fs::write(
+            base.join("backlog-rh").join("002.json"),
+            r#"{"id": 2, "title": "Two", "prompt": "Do two."}"#,
+        )
+        .expect("objective 2");
+
+        integrator.pass_on(&db.store).expect("a pass under the hold");
+        assert_eq!(tasks(a), 2, "objective 2 is assigned while the source is held");
+        assert_eq!(task_records(&db, "task.held", first).len(), 1);
+        assert!(started(&marks).is_empty(), "C waited for A's task, not held yet when read");
+        integrator.pass_on(&db.store).expect("the next pass");
+        let started = wait_started(&marks, 1);
+        let mirror = mirror_of(&integrator, &source);
+        assert_eq!(
+            parent(&[&mirror], &started[0], 2),
+            pushed,
+            "C's gate runs on the held source: A's waiting task is no landing in flight and \
+             its source was not counted as moved"
+        );
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert_eq!(verdicts(&db, ready), ["accepted"], "the gate on a held source recorded");
+        assert_eq!(task_state(&db, c, ready), "landing");
+        assert_eq!(task_records(&db, "task.held", ready).len(), 1, "its judging's land()");
+        assert_eq!(task_state(&db, a, first), "landing");
+        assert_eq!(source_main(&source), b0, "nothing landed on the held source");
+        for mission in [a, c] {
+            assert!(db.mission(mission)["halted"].is_null());
+            assert_eq!(db.mission(mission)["hold"], held);
+        }
+        for base in [base, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// After the release a waiting task lands at the next pass, after the
+    /// release's record. When main moved meanwhile (an owner deploy that
+    /// recorded `source.moved`), its landing is `stale` and it is judged
+    /// again against the new main: never discarded, never counted, no halt.
+    #[test]
+    fn after_the_release_a_waiting_task_lands_or_is_judged_again_on_a_moved_main() {
+        let (base, source, scenarios, integrator) = world("held-release", ACCEPTING_GATE);
+        let db = Db::new("held_release");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let first = db.reported_task(mission, "one");
+        push_work(&base, &source, &agent_of(&db, mission, first), "one.txt");
+        hold(&db, &source, 600);
+        integrator.pass_on(&db.store).expect("judged under the hold");
+        integrator.settle();
+        assert_eq!(verdicts(&db, first), ["accepted"]);
+        integrator.pass_on(&db.store).expect("a pass under the hold");
+        assert_eq!(task_state(&db, mission, first), "landing");
+        assert_eq!(task_records(&db, "task.held", first).len(), 1);
+        assert_eq!(source_main(&source), b0);
+        let released = db.store.source_release(&source).expect("the release");
+        assert_eq!(released["waiting"], json!([first]));
+        integrator.pass_on(&db.store).expect("the pass after the release");
+        assert_eq!(task_state(&db, mission, first), "landed");
+        let (release, _) = source_records(&db, "source.released")[0].clone();
+        assert!(task_records(&db, "task.landed", first)[0] > release);
+        let landed = source_main(&source);
+        assert_ne!(landed, b0);
+
+        // Held again; the owner moves main and records it; then the release.
+        let second = db.reported_task(mission, "two");
+        push_work(&base, &source, &agent_of(&db, mission, second), "two.txt");
+        hold(&db, &source, 600);
+        integrator.pass_on(&db.store).expect("judged under the hold");
+        integrator.settle();
+        assert_eq!(task_state(&db, mission, second), "landing");
+        let deployed = main_moves(&base, &source, "deploy.txt");
+        assert_eq!(db.store.source_moved(&source, &landed, &deployed).expect("moved"), 1);
+        db.store.source_release(&source).expect("the release");
+        integrator.pass_on(&db.store).expect("its landing finds main moved");
+        assert_eq!(verdicts(&db, second), ["accepted", "stale"]);
+        assert_eq!(task_state(&db, mission, second), "reported", "judged again, not discarded");
+        integrator.pass_on(&db.store).expect("judged again on the new main");
+        integrator.settle();
+        assert_eq!(verdicts(&db, second), ["accepted", "stale", "accepted"]);
+        assert_eq!(task_state(&db, mission, second), "landed");
+        assert_eq!(parent(&[&source], &source_main(&source), 1), deployed);
+        let after = db.mission(mission);
+        assert!(after["halted"].is_null(), "halted: {}", after["halted"]);
+        assert_eq!(after["gate_rejections"], 0);
+        assert_eq!(after["gate_aborts"], 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A hold past its bound is recorded expired at the start of a pass,
+    /// before anything lands, once; the task waiting behind it is named in
+    /// the record and lands after it.
+    #[test]
+    fn an_expired_hold_is_recorded_before_anything_lands_once() {
+        let (base, source, scenarios, integrator) = world("held-expired", "exit 1\n");
+        let db = Db::new("held_expired");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        let work = push_work(&base, &source, &agent_of(&db, mission, task), "w.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": work}));
+        let held = hold(&db, &source, 1);
+        integrator.pass_on(&db.store).expect("a pass under the hold");
+        assert_eq!(task_state(&db, mission, task), "landing");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        integrator.pass_on(&db.store).expect("the pass after its bound");
+        let expired = source_records(&db, "source.hold_expired");
+        assert_eq!(expired.len(), 1);
+        let (event, record) = &expired[0];
+        assert_eq!(record["hold"], held);
+        assert_eq!(record["source"], source.as_str());
+        assert_eq!(record["waiting"], json!([task]));
+        assert_eq!(task_state(&db, mission, task), "landed");
+        assert!(task_records(&db, "task.landed", task)[0] > *event, "the expiry first");
+        assert_eq!(source_main(&source), work);
+        integrator.pass_on(&db.store).expect("another pass");
+        assert_eq!(source_records(&db, "source.hold_expired").len(), 1, "once");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
