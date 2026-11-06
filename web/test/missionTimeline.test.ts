@@ -5,6 +5,8 @@ import type { Mission, MissionTask, TaskStage } from "../src/missions.ts";
 import {
   deriveMissionTimeline,
   filterLanes,
+  hasBars,
+  isLive,
   laneState,
   missionName,
   phaseAt,
