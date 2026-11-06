@@ -9,6 +9,8 @@ import {
   STATE_FILTERS,
   deriveMissionTimeline,
   filterLanes,
+  hasBars,
+  isLive,
   phaseAt,
 } from "../../missionTimeline";
 import type {
