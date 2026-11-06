@@ -30,7 +30,8 @@ use std::process::{Command, Output, Stdio};
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    BaseMerge, Branch, Commit, ForkFrom, SetAside, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, Commit, ForkFrom, Hold, MERGE_WAITS, SetAside, WORKSPACE_STALE,
+    WorkspaceError, WorkspaceStore,
 };
 
 use crate::tree_path::{TreePath, nul_fields};
@@ -43,6 +44,16 @@ const BASE: &str = "main";
 
 /// Paths that never enter a commit.
 const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
+
+/// Where main's version of each file that conflicts with the branch in a
+/// way markers cannot show is copied, relative to the workspace (under
+/// `.spawn/`, never committed), for a worker that cannot run git. Every
+/// mount puts the copies back while the conflict is open
+/// ([`GitWorkspace::restore_main_copies`]).
+pub const MAIN_COPIES: &str = ".spawn/main";
+
+/// First field of the record of main's copies ([`GitWorkspace::main_copies`]).
+const COPIES_TAG: &str = "main-copies";
 
 /// The size cap of one file in a checkpoint, in MiB, when
 /// `SPAWN_MAX_FILE_MB` does not set one: git stores every version of a file
@@ -1737,6 +1748,124 @@ impl GitWorkspace {
 
     fn clear_pending(&self, branch: &str) {
         let _ = std::fs::remove_file(self.pending_path(branch));
+    }
+
+    /// Where the record of main's copies for `branch` lives, beside the
+    /// workspaces and outside every one, so no remount wipes it:
+    /// NUL-separated, [`COPIES_TAG`], `main`'s commit, then the files
+    /// copied.
+    fn copies_path(&self, branch: &str) -> PathBuf {
+        self.root.join(".main-copies").join(branch)
+    }
+
+    /// The open conflict markers cannot show of `branch`, as recorded when
+    /// main's versions were copied ([`MAIN_COPIES`]): main's commit and the
+    /// files copied (those main has), shown. `None`: none is recorded.
+    pub fn main_copies(&self, branch: &str) -> Option<(String, Vec<String>)> {
+        self.read_main_copies(branch)
+            .map(|(main, files)| (main, shown_paths(&files)))
+    }
+
+    fn read_main_copies(&self, branch: &str) -> Option<(String, Vec<TreePath>)> {
+        let bytes = std::fs::read(self.copies_path(branch)).ok()?;
+        let mut fields = nul_fields(&bytes);
+        if fields.next()? != COPIES_TAG.as_bytes() {
+            return None;
+        }
+        let main = fields.next()?;
+        if main.is_empty() || !main.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        Some((
+            String::from_utf8_lossy(main).into_owned(),
+            fields.map(TreePath::from_bytes).collect(),
+        ))
+    }
+
+    fn clear_main_copies(&self, branch: &str) {
+        let _ = std::fs::remove_file(self.copies_path(branch));
+    }
+
+    /// Main's version of `path` at `main`, if main has it as a file.
+    fn mains_version(&self, main: &str, path: &TreePath) -> Option<Vec<u8>> {
+        let mut spec = OsString::from(format!("{main}:"));
+        spec.push(OsStr::from_bytes(path.as_bytes()));
+        let output = self
+            .command()
+            .arg("cat-file")
+            .arg("blob")
+            .arg(spec)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
+    }
+
+    /// Write main's version of each of `files` that main has into
+    /// [`MAIN_COPIES`] in `directory`, then record what was copied, atomically,
+    /// so a mount can put the copies back ([`Self::restore_main_copies`]).
+    /// A record that cannot be written fails the merge: the note would
+    /// promise copies a remount loses.
+    fn copy_mains_versions(
+        &self,
+        branch: &str,
+        directory: &Path,
+        main: &str,
+        files: &[TreePath],
+    ) -> Result<(), WorkspaceError> {
+        let copied: Vec<&TreePath> = files
+            .iter()
+            .filter(|file| self.copy_mains_version(directory, main, file))
+            .collect();
+        let path = self.copies_path(branch);
+        let unavailable = |what: &str, error: std::io::Error| {
+            WorkspaceError::Unavailable(format!("{what} {}: {error}", path.display()))
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| unavailable("create", error))?;
+        }
+        let mut text = format!("{COPIES_TAG}\0{main}\0").into_bytes();
+        for file in copied {
+            text.extend_from_slice(file.as_bytes());
+            text.push(0);
+        }
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, text).map_err(|error| unavailable("write", error))?;
+        std::fs::rename(&temporary, &path).map_err(|error| unavailable("rename", error))
+    }
+
+    /// Copy main's version of `file` at `main` into [`MAIN_COPIES`] in
+    /// `directory` (never through a symlink the agent put there); whether it
+    /// was copied.
+    fn copy_mains_version(&self, directory: &Path, main: &str, file: &TreePath) -> bool {
+        let Some(bytes) = self.mains_version(main, file) else {
+            return false;
+        };
+        let mut copy = format!("{MAIN_COPIES}/").into_bytes();
+        copy.extend_from_slice(file.as_bytes());
+        crate::agent_files::replace_with(directory, &TreePath::from_bytes(copy), &bytes).is_ok()
+    }
+
+    /// At a mount: put main's copies of the branch's open conflict markers
+    /// cannot show back into the fresh `directory`, from their record, so
+    /// the note that names them still holds after the workspace was
+    /// exported again (an engine lost, a host restart, a resume). A branch
+    /// that contains the recorded main has no such conflict any more: the
+    /// record goes.
+    fn restore_main_copies(&self, branch: &str, directory: &Path) {
+        let Some((main, files)) = self.read_main_copies(branch) else {
+            return;
+        };
+        let contained = self
+            .commit_id_of(&format!("refs/heads/{branch}"))
+            .and_then(|head| self.is_ancestor(&main, &head));
+        if matches!(contained, Ok(true)) {
+            self.clear_main_copies(branch);
+            return;
+        }
+        for file in &files {
+            self.copy_mains_version(directory, &main, file);
+        }
     }
 
     /// When a workspace's directory goes (unmount) or is exported afresh
