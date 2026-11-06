@@ -23,7 +23,7 @@ use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::{ENGINE, EventKind, GlobalPosition, NewEvent};
 use spawn_core::id::{AgentId, BranchName, IdempotencyKey, Principal, SessionId, WorkspaceId};
 use spawn_core::memory::MemoryStore;
-use spawn_core::port::{Commit, CommandQueue, EventLog, TerminalHost, WorkspaceStore};
+use spawn_core::port::{CommandQueue, Commit, EventLog, TerminalHost, WorkspaceStore};
 use spawn_core::time::{ManualClock, Timestamp};
 use spawn_host::{GitWorkspace, TmuxHost};
 
@@ -46,7 +46,8 @@ struct World {
 
 impl World {
     fn new(tag: &str) -> Self {
-        let base = std::env::temp_dir().join(format!("spawn-identity-{tag}-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("spawn-identity-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("real/ws")).expect("create the root");
         let base = fs::canonicalize(&base).expect("resolve the scratch directory");
@@ -136,7 +137,11 @@ fn a_workspace_under_a_symlinked_root_is_named_where_its_engine_writes() {
     store.ensure_branch(&branch(), None).expect("branch");
     let workspace = store.mount(&branch()).expect("mount");
     let resolved = world.resolved().join("agent_one");
-    assert_eq!(Path::new(workspace.path()), resolved, "the id names the resolved directory");
+    assert_eq!(
+        Path::new(workspace.path()),
+        resolved,
+        "the id names the resolved directory"
+    );
     // The engine starts where the id says (the pane's -c) and sees the
     // resolved directory; so does a process started through the link.
     let engine_cwd = seen_from(workspace.path());
@@ -148,7 +153,10 @@ fn a_workspace_under_a_symlinked_root_is_named_where_its_engine_writes() {
     let projects = world.base.join("projects").display().to_string();
     assert_eq!(
         transcript_path(&projects, &workspace, "native-1"),
-        format!("{projects}/{}/native-1.jsonl", claude_directory(&engine_cwd)),
+        format!(
+            "{projects}/{}/native-1.jsonl",
+            claude_directory(&engine_cwd)
+        ),
         "the Bridge watches the transcript the engine writes"
     );
     // The literal spelling would name another project directory: the test
@@ -174,7 +182,11 @@ fn an_id_recorded_under_the_configured_root_still_names_the_workspace() {
     ))
     .expect("valid workspace");
     assert_ne!(old, workspace);
-    assert_eq!(store.canonical(&old), workspace, "the same directory, its one name");
+    assert_eq!(
+        store.canonical(&old),
+        workspace,
+        "the same directory, its one name"
+    );
     assert_eq!(store.canonical(&workspace), workspace);
     // Another directory keeps its name, and stays outside the store.
     let elsewhere = WorkspaceId::new(format!(
@@ -183,11 +195,16 @@ fn an_id_recorded_under_the_configured_root_still_names_the_workspace() {
     ))
     .expect("valid workspace");
     assert_eq!(store.canonical(&elsewhere), elsewhere);
-    assert!(store.commit(&elsewhere, "nope").is_err(), "outside the root");
+    assert!(
+        store.commit(&elsewhere, "nope").is_err(),
+        "outside the root"
+    );
     // The old id checkpoints and unmounts the workspace as the new one does.
     fs::write(Path::new(workspace.path()).join("work.txt"), "work\n").expect("write");
     assert!(matches!(
-        store.commit(&old, "work").expect("commit through the old id"),
+        store
+            .commit(&old, "work")
+            .expect("commit through the old id"),
         Commit::Created(_)
     ));
     store.unmount(&old).expect("unmount through the old id");
@@ -328,10 +345,12 @@ done
         },
     );
     bridge.tick().expect("start");
-    let started = events(&memory).into_iter().find_map(|event| match event.kind {
-        EventKind::ExecutionStarted { workspace, .. } => Some(workspace),
-        _ => None,
-    });
+    let started = events(&memory)
+        .into_iter()
+        .find_map(|event| match event.kind {
+            EventKind::ExecutionStarted { workspace, .. } => Some(workspace),
+            _ => None,
+        });
     let workspace = started.expect("the execution started");
     let deadline = Instant::now() + Duration::from_secs(20);
     let turn_read = loop {
@@ -366,7 +385,10 @@ done
         "the engine's turn reached the log: the Bridge watched {transcripts:?}, the engine wrote \
          under {written:?}"
     );
-    assert_eq!(Path::new(workspace.path()), world.resolved().join("agent_one"));
+    assert_eq!(
+        Path::new(workspace.path()),
+        world.resolved().join("agent_one")
+    );
     submit(&memory, "key_stop", CommandAction::Stop);
     bridge.tick().expect("stop");
     assert!(

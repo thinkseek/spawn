@@ -718,9 +718,14 @@ mod tests {
         let Runner::Untracked(why) = runner_of(&terminal, "0\t\tbash\t") else {
             panic!("a restored shell hosts no runner");
         };
-        assert!(why.contains("no command") && why.contains("`bash`"), "{why}");
+        assert!(
+            why.contains("no command") && why.contains("`bash`"),
+            "{why}"
+        );
         // A dead pane (remain-on-exit) hosts nothing, whatever it ran.
-        let dead = launched.replacen('0', "1", 1).replacen("\t\t", "\t137\t", 1);
+        let dead = launched
+            .replacen('0', "1", 1)
+            .replacen("\t\t", "\t137\t", 1);
         let Runner::Untracked(why) = runner_of(&terminal, &dead) else {
             panic!("a dead pane hosts no runner");
         };

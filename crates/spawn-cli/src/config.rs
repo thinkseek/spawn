@@ -206,7 +206,10 @@ mod tests {
         std::os::unix::fs::symlink(base.join("real"), base.join("link")).expect("link");
         let real = std::fs::canonicalize(base.join("real/ws")).expect("resolve");
         let configured = base.join("link/ws").display().to_string();
-        assert_eq!(super::canonical_workspace_root(&configured), real.display().to_string());
+        assert_eq!(
+            super::canonical_workspace_root(&configured),
+            real.display().to_string()
+        );
         let flags = Flags::parse(&["--root".to_string(), configured.clone()]).expect("flags");
         assert_eq!(
             workspace_root(&flags).as_deref(),
