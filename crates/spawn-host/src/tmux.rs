@@ -795,14 +795,23 @@ mod tests {
             stderr
         };
         for (socket, start) in [
-            (dir.join("none/socket"), false),
-            (dir.join("not-a-server"), false),
-            (dir.join("live"), true),
+            ("none/socket", false),
+            ("not-a-server", false),
+            // A server of its own per locale: one killed is not gone yet
+            // when the next would start on its socket.
+            ("live", true),
         ] {
-            let socket = socket.to_str().unwrap();
+            let at = |locale: &str| {
+                let name = if start {
+                    format!("{socket}-{locale}")
+                } else {
+                    socket.to_string()
+                };
+                dir.join(name).to_str().unwrap().to_string()
+            };
             assert_eq!(
-                answer("zh_CN.UTF-8", Some("zh_CN:zh"), socket, start),
-                answer("C", None, socket, start),
+                answer("zh_CN.UTF-8", Some("zh_CN:zh"), &at("zh"), start),
+                answer("C", None, &at("c"), start),
                 "{socket}"
             );
         }
