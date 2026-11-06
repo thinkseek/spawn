@@ -177,6 +177,8 @@ use crate::gate::{self, GateFailure};
 use crate::{Flags, env_or, open_store};
 use crate::{main_merge, objectives, sources};
 
+mod host;
+
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
 
@@ -190,6 +192,22 @@ const ROOM_BACKOFF_MAX: Duration = Duration::from_mins(40);
 /// How long a mission's gate may go without room before the supervisor is
 /// told, once per run.
 const ROOM_ESCALATE_AFTER: Duration = Duration::from_hours(2);
+
+/// The wait after the first host fault in a row, unless
+/// `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` says otherwise; it doubles with each
+/// host fault in a row, up to [`HOST_FAULT_BACKOFF_MAX`].
+const HOST_FAULT_BACKOFF: Duration = Duration::from_mins(5);
+
+/// The longest wait after a host fault.
+const HOST_FAULT_BACKOFF_MAX: Duration = Duration::from_hours(1);
+
+/// The host fault in a row that is escalated to the supervisor (once per
+/// run: the later ones are not).
+const HOST_FAULT_ESCALATE_AT: u32 = 2;
+
+/// The test database server's log (`log_line_prefix` `%m [%p] `), read for
+/// a crash in a gate's window. Optional.
+const TEST_DATABASE_LOG: &str = "SPAWN_TEST_DATABASE_LOG";
 
 /// Wall clock of one gate run: `SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by
 /// default. The gate grows with every objective whose scenario it runs (an
@@ -317,6 +335,15 @@ pub(crate) struct Mission {
     pub(crate) gate_room_waits: u32,
     #[serde(default)]
     pub(crate) gate_room_escalated: bool,
+    /// The mission's current run of `host_fault` gate outcomes, folded by
+    /// the store: how many in a row, the task the latest was about, and the
+    /// latest record's `due_ms` (its own time plus its backoff).
+    #[serde(default)]
+    pub(crate) gate_host_faults: u32,
+    #[serde(default)]
+    pub(crate) gate_host_task: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_host_due_ms: Option<i64>,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
@@ -427,6 +454,90 @@ pub(crate) fn room_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Dur
     let backoff = i64::try_from(room_backoff(mission.gate_room_waits).as_millis()).ok()?;
     let left = last.saturating_add(backoff).saturating_sub(now_ms);
     (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
+}
+
+/// The wait after the `faults`-th host fault in a row: `base`
+/// (`SPAWN_GATE_HOST_FAULT_BACKOFF_SECS`, [`HOST_FAULT_BACKOFF`] by
+/// default), doubled with each, at most [`HOST_FAULT_BACKOFF_MAX`]. Zero
+/// before the first.
+pub(crate) fn host_fault_backoff(base: Duration, faults: u32) -> Duration {
+    if faults == 0 {
+        return Duration::ZERO;
+    }
+    base.saturating_mul(2u32.saturating_pow(faults - 1))
+        .min(HOST_FAULT_BACKOFF_MAX)
+}
+
+/// [`host_fault_backoff`]'s base from the setting's text: a whole number of
+/// seconds from 1 up; anything else is [`HOST_FAULT_BACKOFF`].
+pub(crate) fn host_fault_base(text: Option<&str>) -> Duration {
+    text.and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(HOST_FAULT_BACKOFF, Duration::from_secs)
+}
+
+/// How long `task`'s gate still waits after a host fault at `now_ms`, read
+/// from the store's record of the latest one (its `due_ms`, folded into the
+/// mission), never from memory. None when the gate may run: no run of host
+/// faults, or the latest was about another task.
+pub(crate) fn host_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Duration> {
+    if mission.gate_host_faults == 0 || mission.gate_host_task != Some(task) {
+        return None;
+    }
+    let left = mission.gate_host_due_ms?.saturating_sub(now_ms);
+    (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
+}
+
+/// A wait as the integrator says it: whole minutes, else seconds.
+fn spoken(wait: Duration) -> String {
+    let seconds = wait.as_secs();
+    if seconds >= 60 && seconds.is_multiple_of(60) {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// The record of a gate whose rejection was the host's (`fault`), the
+/// `faults`-th host fault in a row on the mission, with its `backoff`: the
+/// reason naming the evidence, the evidence itself, the gate's output, the
+/// count and `escalate` (the second in a row only). Its `due_ms` is the
+/// record's own time plus the backoff, written by the store.
+pub(crate) fn host_fault_fields(
+    fault: &host::HostFault,
+    faults: u32,
+    backoff: Duration,
+    log: &str,
+) -> Value {
+    let count = fault.failures.len();
+    let evidence = if fault.crash.is_empty() {
+        format!(
+            "every failure check-tests.sh printed ({count}) is a connection error to the test \
+             database"
+        )
+    } else {
+        format!(
+            "the test database's log shows a crash during the gate ({}), and every failure \
+             check-tests.sh printed ({count}) is a database error",
+            fault.crash[0]
+        )
+    };
+    let mut fields = json!({
+        "reason": format!(
+            "host fault: {evidence}; not a verdict on the work, judged again in {}",
+            spoken(backoff)
+        ),
+        "log": log,
+        "evidence": fault.evidence(),
+        "failures": fault.failures_value(),
+        "host_faults": faults,
+        "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+        "escalate": faults == HOST_FAULT_ESCALATE_AT,
+    });
+    if !fault.crash.is_empty() {
+        fields["crash"] = json!(fault.crash);
+    }
+    fields
 }
 
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
