@@ -259,6 +259,8 @@ fn environment_files() -> Vec<String> {
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name.starts_with(&prefix))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -273,9 +275,9 @@ fn a_launch_is_asked_again_only_of_a_server_that_left() {
     let calls = server.directory.join("calls");
     let left = server.directory.join("left");
     let logged = || {
-        let calls = fs::read_to_string(&calls).unwrap_or_default();
-        fs::remove_file(server.directory.join("calls")).ok();
-        calls.lines().map(str::to_string).collect::<Vec<_>>()
+        let logged = fs::read_to_string(&calls).unwrap_or_default();
+        let _ = fs::remove_file(&calls);
+        logged.lines().map(str::to_string).collect::<Vec<_>>()
     };
     // `new-session` meets a server that left while the marker `left` is
     // there (`once`: the first time only); every call is logged.
