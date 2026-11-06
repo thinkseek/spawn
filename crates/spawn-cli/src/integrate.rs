@@ -48,6 +48,31 @@
 //!    compare-and-swap push and records the landing. A rejection sends the
 //!    task back to its worker with the gate's output as the note;
 //!
+//!    **A head broken only by main's moves is sent back, not rejected.**
+//!    When the gate rejects C and C is a real merge (the pushed head does
+//!    not contain main, so C's tree is not the head's), the integrator
+//!    judges the head alone before it records anything ([`rejection`]): the
+//!    same gate, scenarios and task scenario, base `head_base` = `git
+//!    merge-base <head> <main>` (the main the head last took in), candidate
+//!    the pushed head itself. The head passes: `incompatible`, which, like
+//!    `conflict`, sends the task back (`revise`, one more revision) and does
+//!    not count toward the three-rejections halt (`gate_rejections` stays,
+//!    `gate_aborts` resets as on `conflict`). Its record names `candidate`
+//!    (C), `head`, `head_base`, `head_verdict` (`accepted`), `main_commits`
+//!    (main's first-parent commits in `head_base..base`, oldest first: what
+//!    the work must adapt to), C's `reason` and `log`, and a `note` that
+//!    quotes C's gate output and lists those commits by hash and subject;
+//!    the dispatcher's delivery of the revision merges main into the idle
+//!    workspace, as every delivery does. The head fails too: `rejected`, as
+//!    before, counted, naming `head`, `head_base` and `head_verdict`
+//!    (`rejected`). The head's run gives no verdict: `aborted` (or
+//!    `no_room`) naming the head, never `incompatible` on no evidence. When
+//!    the head contains main, a rejection of C is a rejection, with no
+//!    second run. The decision rests on two recorded gate verdicts on named
+//!    commits, never on timing or the text of a reason. Cost: the second
+//!    gate run happens only when C is rejected and is a real merge, and
+//!    doubles that pass's gate time; nothing else changes;
+//!
 //!    **Stale pushes do not land.** The pushed head must be the commit of
 //!    the agent's latest `artifact.committed` event (its last checkpoint or
 //!    merge of main) or a descendant of it. A push that lags (behind,
