@@ -1271,6 +1271,7 @@ mod tests {
             resumed_young: 0,
             turn_ended: idle,
             checkpoint: None,
+            charter: None,
         }
     }
 

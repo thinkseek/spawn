@@ -795,6 +795,7 @@ mod tests {
             resumed_young: 0,
             turn_ended: true,
             checkpoint: None,
+            charter: None,
         }
     }
 
@@ -897,6 +898,7 @@ mod tests {
             resumed_young: 0,
             turn_ended: true,
             checkpoint: None,
+            charter: None,
         }
     }
 
