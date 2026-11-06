@@ -203,7 +203,7 @@ function ApprovalQueue({ residents }: { residents: Resident[] }) {
                 </span>
               )}
               <span className="tnum ml-auto text-micro text-faint-foreground">
-                {relativeTime(resident.created_at_ms)}
+                <Ago ms={resident.created_at_ms} />
               </span>
             </div>
             {resident.charter && (
