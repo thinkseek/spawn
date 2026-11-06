@@ -393,7 +393,11 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
-   and not exists (select 1 from told where tag = 'host gate-room-' || e.id)";
+   and (not exists (select 1 from told where tag = 'host gate-room-' || e.id)
+        or exists (select 1 from mission_missions m
+                    where m.id = k.mission_id and m.gate_room_escalated
+                      and m.gate_room_task = (r ->> 'id')::bigint
+                      and m.gate_room_since_ms <= e.recorded_at_ms))";
 
 /// The `host_fault` gate records that carry `escalate` (the mission's second
 /// host fault in a row) and that the supervisor was not told of yet, oldest
