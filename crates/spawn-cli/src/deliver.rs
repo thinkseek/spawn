@@ -644,14 +644,32 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
 }
 
 /// The attempts at a task's current delivery into its session: the
-/// delivery's own command, then its retries (`<key>-retry-<n>`), in order.
+/// delivery's own command, then its retries (`<key>-retry-<n>`) and the
+/// extra attempts deploys gave it once spent (`<key>-moved-<event>`), in
+/// order.
 fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dispatch::Sent> {
     let key = task.delivery_key();
     let retry = format!("{key}-retry-");
+    let moved = format!("{key}-moved-");
     facts
         .dispatched
         .iter()
-        .filter(|sent| sent.key == key || sent.key.starts_with(&retry))
+        .filter(|sent| {
+            sent.key == key || sent.key.starts_with(&retry) || sent.key.starts_with(&moved)
+        })
+        .collect()
+}
+
+/// Every attempt at `task`'s current delivery, as a re-issue's
+/// cancellation names them.
+fn attempt_records(task: &TaskRow, facts: &Facts) -> Vec<Attempt> {
+    delivery_attempts(task, facts)
+        .into_iter()
+        .map(|sent| Attempt {
+            command: sent.id,
+            key: sent.key.clone(),
+            error: sent.error.clone(),
+        })
         .collect()
 }
 
@@ -669,21 +687,56 @@ enum Attempts {
     /// goes at `due_ms`.
     Retry { number: usize, due_ms: i64 },
     /// The latest attempt failed and is not tried again: why, for the
-    /// supervisor, and whether its retries are spent (`false`: it may have
-    /// typed the task, so it is not tried again).
-    Failed { why: &'static str, spent: bool },
+    /// supervisor, whether its retries are spent (`false`: an attempt may
+    /// have typed the task, so it is never tried again), and when the
+    /// latest attempt finished. A spent one is re-issued if it is a first
+    /// delivery ([`reissues`]), and tried once more after a deploy
+    /// ([`moved_attempt`]).
+    Failed {
+        why: &'static str,
+        spent: bool,
+        last_ms: i64,
+    },
 }
 
 /// Where `task`'s current delivery into `facts`' session stands. A failure
 /// that typed nothing is tried again under a key of its own, with a wait
-/// that doubles each time, [`DELIVERY_RETRIES`] times. One that may have
-/// typed the task ([`MAY_HAVE_TYPED`]) is not. A refusal because the pane
-/// was not ready ([`PANE_NOT_READY`]) is no failed attempt: nothing was
-/// tried on the worker, so it goes again after [`NOT_READY_RETRY_MS`], once
-/// the worker is ready by the delivery rules, and counts only past
-/// [`NOT_READY_FREE`] of them.
-fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
+/// that doubles each time ([`Waits::retry_ms`] first), [`DELIVERY_RETRIES`]
+/// times. One that may have typed the task ([`MAY_HAVE_TYPED`]) is not, and
+/// neither is a delivery any of whose attempts may have. A refusal because
+/// the pane was not ready ([`PANE_NOT_READY`]) is no failed attempt:
+/// nothing was tried on the worker, so it goes again after
+/// [`NOT_READY_RETRY_MS`], once the worker is ready by the delivery rules,
+/// and counts only past [`NOT_READY_FREE`] of them. A deploy's extra
+/// attempt (`-moved-`) is no retry: one that succeeds delivers the task,
+/// one that fails leaves the delivery as spent as it was.
+fn attempts(waits: &Waits, task: &TaskRow, facts: &Facts) -> Attempts {
     let sent = delivery_attempts(task, facts);
+    let Some(latest) = sent.last() else {
+        return Attempts::None;
+    };
+    match latest.succeeded {
+        None => return Attempts::Open,
+        Some(true) => return latest.id.map_or(Attempts::Open, Attempts::Delivered),
+        Some(false) => {}
+    }
+    let last_ms = latest.finished_at_ms.unwrap_or(latest.created_at_ms);
+    if sent.iter().any(|sent| {
+        sent.error
+            .as_deref()
+            .is_some_and(|error| error.contains(MAY_HAVE_TYPED))
+    }) {
+        return Attempts::Failed {
+            why: "may or may not have reached its worker; ask the worker before assigning it again",
+            spent: false,
+            last_ms,
+        };
+    }
+    let moved = format!("{}-moved-", task.delivery_key());
+    let sent: Vec<&crate::dispatch::Sent> = sent
+        .into_iter()
+        .filter(|sent| !sent.key.starts_with(&moved))
+        .collect();
     let Some(last) = sent.last() else {
         return Attempts::None;
     };
@@ -697,37 +750,47 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
     let refusals = sent.iter().filter(|sent| not_ready(sent)).count();
     // Failed attempts: every failure but the refusals still free.
     let failures = sent.len() - refusals.min(NOT_READY_FREE);
-    match last.succeeded {
-        None => Attempts::Open,
-        Some(true) => last.id.map_or(Attempts::Open, Attempts::Delivered),
-        Some(false) => {
-            let error = last.error.as_deref().unwrap_or_default();
-            if error.contains(MAY_HAVE_TYPED) {
-                return Attempts::Failed {
-                    why: "may or may not have reached its worker; ask the worker before assigning \
-                          it again",
-                    spent: false,
-                };
-            }
-            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
-            if not_ready(last) && refusals <= NOT_READY_FREE {
-                return Attempts::Retry {
-                    number: sent.len(),
-                    due_ms: finished.saturating_add(NOT_READY_RETRY_MS),
-                };
-            }
-            if failures > DELIVERY_RETRIES {
-                return Attempts::Failed {
-                    why: "never reached its worker; cancel it and assign it again",
-                    spent: true,
-                };
-            }
-            Attempts::Retry {
-                number: sent.len(),
-                due_ms: finished.saturating_add(retry_wait_ms(failures)),
-            }
-        }
+    let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+    if not_ready(last) && refusals <= NOT_READY_FREE {
+        return Attempts::Retry {
+            number: sent.len(),
+            due_ms: finished.saturating_add(NOT_READY_RETRY_MS),
+        };
     }
+    if failures > DELIVERY_RETRIES {
+        return Attempts::Failed {
+            why: "never reached its worker; cancel it and assign it again",
+            spent: true,
+            last_ms,
+        };
+    }
+    Attempts::Retry {
+        number: sent.len(),
+        due_ms: finished.saturating_add(waits.retry_wait_ms(failures)),
+    }
+}
+
+/// Whether `task`'s spent delivery is re-issued now: a first delivery
+/// ([`TaskRow::reissuable`]) whose retries are spent and none of whose
+/// attempts may have typed, [`Waits::reissue_after_ms`] after its latest
+/// attempt finished (the database's clock, as `now_ms`).
+fn reissue_due(work: &Work, task: &TaskRow, attempts: Attempts, now_ms: i64) -> bool {
+    matches!(attempts, Attempts::Failed { spent: true, last_ms, .. }
+        if task.reissuable() && now_ms >= last_ms.saturating_add(work.waits.reissue_after_ms))
+}
+
+/// The key of the one more attempt a deploy gives `task`'s spent delivery,
+/// if it is due: the latest `source.moved` record came after the
+/// delivery's latest attempt finished, and no attempt was made for it yet
+/// (`<key>-moved-<its event id>`). Rests on that record and the recorded
+/// attempts, never on time alone.
+fn moved_attempt(work: &Work, task: &TaskRow, facts: &Facts, last_ms: i64) -> Option<String> {
+    let moved = work.moved?;
+    if moved.at_ms < last_ms {
+        return None;
+    }
+    let key = format!("{}-moved-{}", task.delivery_key(), moved.id);
+    (!facts.dispatched.iter().any(|sent| sent.key == key)).then_some(key)
 }
 
 /// Why a delivery due now is not sent, if it is held: what [`delivery`]
