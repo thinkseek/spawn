@@ -506,10 +506,11 @@ decisions per agent-hour over the last 24 h) are computed from the log by
 | View | Answers |
 | --- | --- |
 | Attention queue (top of the board) | What reached a human, since when, the question on the screen, which tiers already tried |
-| Fleet board | One card per agent: role, engine, state and for how long, decided by rules / Jev / supervisor, task, current tool |
+| Always-on agents (below the queue) | The supervisor, then the residents, pinned live or not: liveness, state and for how long, last activity, uptime, the task each holds |
+| Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor), judgements, the decision ladder and human decisions per agent-hour |
+| Fleet board | The rest of the fleet in groups: on a task (needs a human first, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
 | Agent detail | Live terminal; the Jev panel (distribution, needs_human, stuck, evidence, rules-vs-Jev); state timeline; event timeline |
-| Ladder health | Decisions per tier, escalations, human decisions per agent-hour, Jev failures and disagreements with the rules, engine restarts |
-| Missions | Missions with their landing settings; tasks with brief, report and review note; residents waiting for a human's approval |
+| Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
 The API is read-only. Humans talk to the supervisor through
