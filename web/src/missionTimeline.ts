@@ -119,6 +119,22 @@ export interface MissionTimeline {
   openCount: number;
 }
 
+/** Whether anything moves on its own: an open task in a mission that is
+ * not halted. The clock and the "now" line show only while it is, so a
+ * halted mission's stalled task never pins a marker to page load. */
+export function isLive(timeline: Pick<MissionTimeline, "lanes">): boolean {
+  return timeline.lanes.some((lane) =>
+    lane.bars.some((bar) => bar.end === null && !bar.stalled),
+  );
+}
+
+/** Whether there is a task bar to draw at all. With none the axis has no
+ * extent (its fallback would be epoch 0) and the page shows an empty state
+ * instead of a 1970 axis. */
+export function hasBars(timeline: Pick<MissionTimeline, "lanes">): boolean {
+  return timeline.lanes.some((lane) => lane.bars.length > 0);
+}
+
 /** Gate verdict reasons per task, oldest first (the RSI page has them). */
 export type VerdictReasons = ReadonlyMap<number, ReadonlyArray<string | null>>;
 
