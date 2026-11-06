@@ -21,6 +21,7 @@ export function AgentPane({
     `rsi-pane-${mission ?? "none"}`,
     (signal) => fetchPane(mission, signal),
     1_000,
+    { checked: true },
   );
   useNow(1_000);
   const data = pane.data;
@@ -42,7 +43,7 @@ export function AgentPane({
         <>
           {data?.captured_at_ms ? (
             <span className="tnum hidden text-caption text-faint-foreground sm:inline">
-              {relativeTime(data.captured_at_ms)}
+              {relativeTime(freshAt(data.captured_at_ms, pane.checkedAt))}
             </span>
           ) : null}
           <LiveBadge live={data?.live === true} known={data !== null} />
