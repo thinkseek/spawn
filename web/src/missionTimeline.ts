@@ -320,7 +320,7 @@ export function taskBar(
  * its last update, in the phase its state names. */
 function legacyBar(
   task: MissionTask,
-  mission: Pick<Mission, "gate" | "halted">,
+  mission: Pick<Mission, "gate" | "accept" | "halted">,
   key: string,
   label: string,
 ): TaskBar | null {
