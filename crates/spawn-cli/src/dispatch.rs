@@ -464,12 +464,17 @@ pub(crate) fn decide_with(
     plan
 }
 
-/// Facts and mission rows, read once.
-pub(crate) fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
+/// Facts and mission rows, read once, delivering with `waits`.
+pub(crate) fn load(
+    store: &PostgresStore,
+    waits: deliver::Waits,
+) -> Result<(Vec<Facts>, Work), String> {
     let rows: Vec<Facts> =
         serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
             .map_err(|error| format!("dispatch facts: {error}"))?;
-    Ok((rows, Work::load(store)?))
+    let mut work = Work::load(store)?;
+    work.waits = waits;
+    Ok((rows, work))
 }
 
 /// What stalls are measured from, read after the facts and rows: a record
