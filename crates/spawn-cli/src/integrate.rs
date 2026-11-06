@@ -1131,14 +1131,7 @@ impl Judge {
             println!("integrate: task {} gated: {verdict}", task.id);
             Ok(())
         };
-        let rejected = |reason: &str, log: &str| {
-            gated(
-                "rejected",
-                json!({"log": log, "reason": reason, "note": format!(
-                    "The gate rejected this work: {reason}.\n\nGate output (tail):\n{}",
-                    tail(log, NOTE_LOG_CHARS))}),
-            )
-        };
+        let rejected = |reason: &str, log: &str| gated("rejected", rejected_fields(reason, log));
 
         let mirror_path = mirror.to_string_lossy().to_string();
         let Some(branch) = branch.map(str::to_string) else {
@@ -1197,16 +1190,20 @@ impl Judge {
         if let Some(warning) = warning {
             eprintln!("integrate: {warning}");
         }
-        match gate::judge(
-            &pinned(&self.gate),
-            mirror,
-            main,
-            &candidate,
-            scenarios,
-            scenario.as_deref(),
-            &gate_env,
-            GATE_WALL_CLOCK,
-        ) {
+        let gate_path = pinned(&self.gate);
+        let run_gate = |base: &str, judged: &str| {
+            gate::judge(
+                &gate_path,
+                mirror,
+                base,
+                judged,
+                scenarios,
+                scenario.as_deref(),
+                &gate_env,
+                GATE_WALL_CLOCK,
+            )
+        };
+        match run_gate(main, &candidate) {
             Ok(verdict) if verdict.accepted => {
                 // The verdict is stored before git moves, so a crash lands
                 // on the next pass instead of judging again.
@@ -1222,7 +1219,26 @@ impl Judge {
                 };
                 land(store, mirror, source, &landing)
             }
-            Ok(verdict) => rejected(&verdict.reason, &verdict.output),
+            // A rejected merge is judged again as the head alone, against
+            // the main the head last took in: main's moves alone may have
+            // broken it (`incompatible`, never counted).
+            Ok(verdict) => match rejection(&mirror_path, main, &candidate, &branch, &verdict, &run_gate)? {
+                Rejection::Record(verdict, extra) => gated(verdict, extra),
+                Rejection::HeadNoRoom {
+                    free_kb,
+                    min_gb,
+                    tmpdir,
+                    log,
+                    head,
+                } => {
+                    let mut extra =
+                        no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms());
+                    if let (Some(target), Some(head)) = (extra.as_object_mut(), head.as_object()) {
+                        target.extend(head.clone());
+                    }
+                    gated("no_room", extra)
+                }
+            },
             // No room in TMPDIR: a fact about the host, never a count.
             Err(GateFailure::NoRoom {
                 free_kb,
@@ -1543,6 +1559,206 @@ fn markers_note(pending: bool, marked: &[String]) -> Option<String> {
          Resolve them first: edit the marked regions (<<<<<<< / ======= / >>>>>>>), keeping \
          both sides' intent; do not rewrite the files from memory. Then report again."
     ))
+}
+
+/// What a candidate the gate rejected comes to, once its head was judged
+/// alone when that can say something ([`rejection`]).
+#[derive(Debug)]
+enum Rejection {
+    /// Record this verdict with these fields.
+    Record(&'static str, Value),
+    /// The head's own run found no room in TMPDIR: `no_room`, as any, with
+    /// `head` (the fields naming the head and the rejected merge) added.
+    HeadNoRoom {
+        free_kb: u64,
+        min_gb: u64,
+        tmpdir: String,
+        log: String,
+        head: Value,
+    },
+}
+
+/// The record of a gate rejection: the reason, the gate's output and the
+/// note that quotes its tail.
+fn rejected_fields(reason: &str, log: &str) -> Value {
+    json!({"log": log, "reason": reason, "note": format!(
+        "The gate rejected this work: {reason}.\n\nGate output (tail):\n{}",
+        tail(log, NOTE_LOG_CHARS))})
+}
+
+/// The main the pushed `head` last took in, `git merge-base <head> <main>`,
+/// when the landing candidate is a real merge: `None` when `head` contains
+/// `main` (the candidate's tree is the head's, so a rejection of it is a
+/// rejection of the head) or the two share no history.
+fn head_base(mirror_path: &str, main: &str, head: &str) -> Option<String> {
+    let contains = git(&[
+        "--git-dir",
+        mirror_path,
+        "merge-base",
+        "--is-ancestor",
+        main,
+        head,
+    ])
+    .is_ok();
+    if contains {
+        return None;
+    }
+    git(&["--git-dir", mirror_path, "merge-base", head, main])
+        .ok()
+        .filter(|base| !base.is_empty())
+}
+
+/// Main's first-parent commits in `head_base..main`, oldest first:
+/// `(full hash, subject)`. The commits a head judged on `head_base` must
+/// adapt to.
+fn main_commits(
+    mirror_path: &str,
+    head_base: &str,
+    main: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let listing = git(&[
+        "--git-dir",
+        mirror_path,
+        "log",
+        "--first-parent",
+        "--reverse",
+        "--format=%H %s",
+        &format!("{head_base}..{main}"),
+    ])?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| {
+            let (hash, subject) = line.split_once(' ').unwrap_or((line, ""));
+            (!hash.is_empty()).then(|| (hash.to_string(), subject.to_string()))
+        })
+        .collect())
+}
+
+/// Main's commits a note lists at most; the record lists them all.
+const NOTE_COMMITS: usize = 40;
+
+/// The note an `incompatible` verdict sends back, from the record alone:
+/// what happened, the rejected merge's gate output (its tail, as `rejected`
+/// quotes it), main's commits since the head's base by their 12-digit prefix
+/// and subject, and what to do.
+fn incompatible_note(
+    reason: &str,
+    log: &str,
+    head_base: &str,
+    main: &str,
+    commits: &[(String, String)],
+) -> String {
+    let short = |hash: &str| hash.chars().take(12).collect::<String>();
+    let mut note = format!(
+        "Main moved under this work. It passes the gate on its own base ({}), but not merged \
+         with the source's main ({}): {reason}. The merge was clean as text; what main's \
+         commits changed breaks it.\n\nMain's commits since your work's base, oldest first \
+         (adapt the work to them):\n",
+        short(head_base),
+        short(main),
+    );
+    for (hash, subject) in commits.iter().take(NOTE_COMMITS) {
+        let _ = writeln!(note, "- {} {subject}", short(hash));
+    }
+    if commits.len() > NOTE_COMMITS {
+        let _ = writeln!(
+            note,
+            "- and {} more (`git log --first-parent {}..{}`)",
+            commits.len() - NOTE_COMMITS,
+            short(head_base),
+            short(main)
+        );
+    }
+    let _ = write!(
+        note,
+        "\nMain is merged into your workspace with this revision. Adapt the work to those \
+         commits (the gate output below names what fails), check it, then report again. \
+         This is not counted as a rejection of your work.\n\nGate output on the merge \
+         (tail):\n{}",
+        tail(log, NOTE_LOG_CHARS)
+    );
+    note
+}
+
+/// The verdict on `candidate`, the landing merge of `main` and the pushed
+/// `head`, which the gate rejected (`merged`). When the merge is real (the
+/// head does not contain main), the head alone is judged by the same gate
+/// (`run_gate(base, candidate)`) against [`head_base`]: it passes, and the
+/// work is `incompatible` (sent back with main's commits, not counted); it
+/// fails, and the work is `rejected`, naming the head's verdict; its run
+/// gives no verdict, and the pass is `aborted` (or `no_room`), naming the
+/// head. The decision rests on the two verdicts alone, never on the text
+/// of a reason.
+fn rejection(
+    mirror_path: &str,
+    main: &str,
+    candidate: &str,
+    head: &str,
+    merged: &gate::Verdict,
+    run_gate: &dyn Fn(&str, &str) -> Result<gate::Verdict, GateFailure>,
+) -> Result<Rejection, String> {
+    let fields = rejected_fields(&merged.reason, &merged.output);
+    let Some(head_base) = head_base(mirror_path, main, head) else {
+        return Ok(Rejection::Record("rejected", fields));
+    };
+    let named = json!({"candidate": candidate, "head": head, "head_base": head_base});
+    let with = |mut value: Value, extra: &Value| {
+        if let (Some(target), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+            target.extend(extra.clone());
+        }
+        value
+    };
+    Ok(match run_gate(&head_base, head) {
+        Ok(alone) if alone.accepted => {
+            let commits = main_commits(mirror_path, &head_base, main)?;
+            let note = incompatible_note(
+                &merged.reason,
+                &merged.output,
+                &head_base,
+                main,
+                &commits,
+            );
+            let hashes: Vec<&str> = commits.iter().map(|(hash, _)| hash.as_str()).collect();
+            Rejection::Record(
+                "incompatible",
+                with(
+                    named,
+                    &json!({"head_verdict": "accepted", "main_commits": hashes,
+                            "reason": merged.reason, "log": merged.output, "note": note}),
+                ),
+            )
+        }
+        Ok(alone) => Rejection::Record(
+            "rejected",
+            with(
+                with(fields, &named),
+                &json!({"head_verdict": "rejected", "head_reason": alone.reason}),
+            ),
+        ),
+        Err(GateFailure::NoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log,
+        }) => Rejection::HeadNoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log,
+            head: named,
+        },
+        Err(failure) => {
+            let mut record = aborted(&failure);
+            if let Some(reason) = record["reason"].as_str() {
+                record["reason"] = json!(format!(
+                    "judging the head {head} alone against {head_base}, after the gate \
+                     rejected the merge with main ({}): {reason}",
+                    merged.reason
+                ));
+            }
+            Rejection::Record("aborted", with(record, &named))
+        }
+    })
 }
 
 /// The record of a gate run without a verdict to believe. A gate that never
