@@ -169,7 +169,7 @@ pub(crate) struct OpenTask {
 pub(crate) struct Verdict {
     pub(crate) mission_id: i64,
     pub(crate) id: i64,
-    /// `accepted`, `rejected`, `conflict` or `aborted`.
+    /// `accepted`, `rejected`, `conflict`, `incompatible` or `aborted`.
     #[serde(rename = "verdict")]
     pub(crate) outcome: String,
     #[serde(default)]

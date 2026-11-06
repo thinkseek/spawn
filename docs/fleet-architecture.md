@@ -793,7 +793,19 @@ record of what was judged (§14 of design.md).
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate on C, with a 45-minute wall clock;
+  3. runs the gate on C, with a 45-minute wall clock. When the gate
+     rejects C and C is a real merge (the pushed head does not contain
+     `main`, so C's tree is not the head's), it then judges the head alone
+     before recording anything: the same gate, scenarios and task scenario,
+     base `head_base` = `git merge-base <head> <main>` (the `main` the head
+     last took in), candidate the pushed head. The head passes: the verdict
+     is `incompatible` (below). The head fails too: `rejected`. The head's
+     run gives no verdict: `aborted` (or `no_room`), naming the head. When
+     the head contains `main`, a rejection of C is a rejection and no second
+     run happens. The decision rests on two recorded verdicts on named
+     commits, never on the text of a reason or on timing. The second run
+     happens only for a rejected real merge and doubles that pass's gate
+     time;
   4. records `task.gated` (verdict, log, metric, C as `candidate`) before
      git moves. A gate
      that had no room (exit 5 with its fact, §10.2) is gated `no_room`. This
@@ -821,7 +833,23 @@ record of what was judged (§14 of design.md).
      record was lost), which is a landing;
   6. records `task.landed` (`from`, `to` = C).
 - **On rejection:** the task goes back to the worker (`revise`), with the
-  gate log as the note.
+  gate log as the note. A `rejected` decided after a run of the head alone
+  names `head`, `head_base` and `head_verdict` (`rejected`), so the record
+  shows why it counted.
+- **On incompatible** (the head passes alone and fails only merged with
+  `main`: a semantic conflict, like task 36 adding fields to a struct that
+  task 48's new test builds): the task goes back (`revise`, one more
+  revision), as on `conflict`, and it is not a rejection of the work. Its
+  record names `base` (`main`), `revision`, `scenarios`, `candidate` (C),
+  `head` (C's second parent), `head_base`, `head_verdict` (`accepted`),
+  `main_commits` (`main`'s first-parent commits in `head_base..base`,
+  oldest first, full hashes: what the work must adapt to), `reason` and
+  `log` (C's) and `note`. The note says the work passes on its own base but
+  not merged with `main`, quotes C's gate output (its tail), lists each of
+  `main_commits` by its 12-digit prefix and subject, and says `main` is
+  merged into the workspace with this revision: the dispatcher's delivery
+  of the revision merges `main` into the idle workspace, as every delivery
+  does.
 - **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
   mission is closed, or a task's resident retired, work goes on only where
   it asks nothing new of a worker:
@@ -849,7 +877,9 @@ record of what was judged (§14 of design.md).
   the task's work set aside and is told before anything else (§3.2, "When a
   task closes").
 - **Halt rules,** per mission and read from the log:
-  - three gate rejections in a row;
+  - three gate rejections in a row: `rejected` counts; `accepted` resets
+    the count; `incompatible`, `conflict`, `stale`, `aborted` and `no_room`
+    leave it (three `incompatible` in a row halt nothing);
   - three gate aborts in a row (`no_room` is not an abort);
   - the scenario count below its floor (the most scenarios a gate run of
     the mission has counted since it was configured or last resumed);
