@@ -37,7 +37,8 @@
 #   (1) the owner holds SA while the integrator runs: the command prints the
 #       hold (`hold`: its `source.held` event id), whose record names
 #       `source` SA, `main` SA's main, `by` human and `expires_ms` = its own
-#       time + 10800000 (the default bound). Then mission A gets its backlog
+#       time + 10800000 (the default bound); it prints that main too.
+#       Then mission A gets its backlog
 #       (objective 1: alpha writes alpha.txt) and beta's task beta1 is
 #       assigned on SB. Gates on SA still run: alpha's task is gated
 #       `accepted`; beta1 lands on SB while SA is held. Over several passes
