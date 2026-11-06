@@ -184,7 +184,7 @@ pub const GIT_LOCALE: &str = "C";
 /// messages are bytes to git in any locale.
 pub fn git_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
-    let _ = GIT_LOCALE; // DISABLED FOR BEFORE RUN
+    command.env("LC_ALL", GIT_LOCALE).env_remove("LANGUAGE");
     command
 }
 
