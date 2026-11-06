@@ -2159,20 +2159,6 @@ begin
                           from mission_tasks k
                          where k.state = 'landing' and k.held_by = v_hold.hold)));
     end if;
-    -- A landing that waits behind the active hold of its mission's source,
-    -- recorded once per task and hold.
-    if p_record ->> 'type' = 'task.held' then
-        select h.* into v_hold
-          from mission_tasks k
-          join mission_missions m on m.id = k.mission_id
-          join mission_source_holds h on h.source = m.sources ->> 0
-         where k.id = (p_record ->> 'id')::bigint;
-        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold'
-           or v_hold.source is distinct from p_record ->> 'source' then
-            raise exception 'hold % is not the active hold on task %''s source %',
-                            p_record ->> 'hold', p_record ->> 'id', p_record ->> 'source';
-        end if;
-    end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
                                           'aborted', 'stale', 'no_room', 'host_fault') then
@@ -2220,7 +2206,21 @@ begin
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
     end if;
-    -- One `task.held` per task and hold: a second records nothing.
+    -- A landing that waits behind the active hold of its mission's source
+    -- (the integrator read it under the landing lock and pushed nothing),
+    -- recorded once per task and hold: a second records nothing.
+    if p_record ->> 'type' = 'task.held' then
+        select h.* into v_hold
+          from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+          join mission_source_holds h on h.source = m.sources ->> 0
+         where k.id = (p_record ->> 'id')::bigint;
+        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold'
+           or v_hold.source is distinct from p_record ->> 'source' then
+            raise exception 'hold % is not the active hold on task %''s source %',
+                            p_record ->> 'hold', p_record ->> 'id', p_record ->> 'source';
+        end if;
+    end if;
     if p_record ->> 'type' = 'task.held' and exists (
         select 1 from spawn_events e
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
