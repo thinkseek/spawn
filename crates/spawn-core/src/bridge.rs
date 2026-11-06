@@ -1681,6 +1681,51 @@ impl Bridge {
         self.sessions.get(session)?.active.clone()
     }
 
+    /// The session's open execution: the Bridge's view's, or, when that
+    /// runs none, the log's ([`EventLog::open_execution`]), taken back into
+    /// the view as its `execution.started` has it, with a warning. The view
+    /// follows the log, but one that missed a record would otherwise answer
+    /// "runs no execution" while the log refuses every start until an end
+    /// that nothing would write. Taking the record back adopts no engine:
+    /// what runs it is checked next ([`Self::settle`], the stop's end).
+    fn open(
+        &mut self,
+        claimed: &Claimed,
+        report: &mut TickReport,
+    ) -> Result<Option<Active>, StoreError> {
+        if let Some(active) = self.running(&claimed.session_id) {
+            return Ok(Some(active));
+        }
+        let Some(record) = self.log.open_execution(&claimed.session_id)? else {
+            return Ok(None);
+        };
+        let (
+            EventKind::ExecutionStarted {
+                workspace,
+                transcript_from,
+                ..
+            },
+            Some(execution),
+        ) = (&record.event.kind, record.event.execution_id.clone())
+        else {
+            return Ok(None);
+        };
+        let active = Active::started(
+            execution,
+            self.workspaces.canonical(workspace),
+            *transcript_from,
+        );
+        report.warnings.push(format!(
+            "{}: the log holds execution {} open and this Bridge's view had none; it is \
+             followed again",
+            claimed.session_id, active.execution_id
+        ));
+        if let Some(view) = self.sessions.get_mut(&claimed.session_id) {
+            view.active = Some(active.clone());
+        }
+        Ok(Some(active))
+    }
+
     /// Before a start, a resume or an input acts on its session: the
     /// session's open execution (the log's, which the Bridge's view
     /// follows) is checked against what runs. One that no runner of the
@@ -1704,7 +1749,7 @@ impl Bridge {
         claimed: &Claimed,
         tick: &mut TickReport,
     ) -> Result<Option<Settled>, StoreError> {
-        let Some(mut active) = self.running(&claimed.session_id) else {
+        let Some(mut active) = self.open(claimed, tick)? else {
             return Ok(None);
         };
         if active.execution_id == ExecutionId::for_command(claimed.command_id)
@@ -2841,9 +2886,9 @@ impl Bridge {
         discard: bool,
         tick: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
-        // The Bridge's view follows the log: no execution here is none the
-        // log holds open, so there is no end to wait for.
-        let Some(mut active) = self.running(&claimed.session_id) else {
+        // No execution open in the log: no end to wait for. One the log
+        // holds open is ended here even when this Bridge's view had lost it.
+        let Some(mut active) = self.open(claimed, tick)? else {
             return Ok(Outcome::Succeeded);
         };
         let mut report = TickReport::default();
