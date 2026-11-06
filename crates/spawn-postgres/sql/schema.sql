@@ -2086,15 +2086,13 @@ begin
     -- each the host's, and, when the test database's log decided it, the
     -- crash lines stamped inside the gate's window; and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
-       and (p_record ->> 'evidence' is distinct from 'failures'
-            and p_record ->> 'evidence' is distinct from 'server_log'
-            or jsonb_typeof(p_record -> 'failures') is distinct from 'array'
-            or jsonb_array_length(coalesce(nullif(p_record -> 'failures', 'null'::jsonb),
-                                           '[]'::jsonb)) = 0
+       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log')
+            or case when jsonb_typeof(p_record -> 'failures') = 'array'
+                    then jsonb_array_length(p_record -> 'failures') else 0 end = 0
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' = 'server_log'
-                and (jsonb_typeof(p_record -> 'crash') is distinct from 'array'
-                     or jsonb_array_length(p_record -> 'crash') = 0))) then
+                and case when jsonb_typeof(p_record -> 'crash') = 'array'
+                         then jsonb_array_length(p_record -> 'crash') else 0 end = 0)) then
         raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
                         p_record;
     end if;
