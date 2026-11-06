@@ -3,6 +3,12 @@
 //!
 //! The tmux and git adapters call an external program and read its exit
 //! code, so they share the same failure rules as the programs they wrap.
+//!
+//! What either program answers is read the same on every host, whatever its
+//! locale. git runs in the C locale ([`git_command`]). tmux is given none:
+//! it has no translations (its messages and the system errors it quotes
+//! are English under any `LANG`), and a locale given to the command that
+//! starts its server would reach every pane, the engine's included.
 
 pub mod agent_files;
 pub mod git;
