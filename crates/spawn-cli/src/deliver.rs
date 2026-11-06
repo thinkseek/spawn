@@ -2202,7 +2202,8 @@ mod tests {
             .push(sent(12, "deliver-4-0-retry-2", 300_000, None));
         assert_eq!(delivered(&tasks, &rows(&landed)), vec![(4, 12)]);
 
-        // Once the retries are spent, a person is asked, and nothing is sent.
+        // Once the retries are spent nothing is sent. A first delivery is
+        // re-issued, not escalated; a re-issue's is: a person is asked.
         for retry in 2..=DELIVERY_RETRIES {
             facts.dispatched.push(sent(
                 20,
@@ -2212,7 +2213,14 @@ mod tests {
             ));
         }
         assert!(super::orders(&tasks, &rows(&facts), i64::MAX / 2).is_empty());
-        let items = news_items(&tasks, &rows(&facts));
+        assert!(news_items(&tasks, &rows(&facts)).is_empty(), "re-issued");
+        let reissue = work(vec![TaskRow {
+            reissue_of: Some(3),
+            ..task(4, TaskState::Assigned, "resident")
+        }]);
+        assert!(super::orders(&reissue, &rows(&facts), i64::MAX / 2).is_empty());
+        assert!(super::reissues(&reissue, &rows(&facts), i64::MAX / 2).is_empty());
+        let items = news_items(&reissue, &rows(&facts));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
         assert_eq!(items[0].tag(), "session_resident_core deliver-4-0");
@@ -2311,18 +2319,24 @@ mod tests {
             "deliver-4-0-retry-6"
         );
 
-        // Refusals without end count once past the free ones: escalated.
+        // Refusals without end count once past the free ones: spent, and
+        // escalated (a revision's delivery is never re-issued).
         let mut stuck = worker(true, true);
         for n in 0..=(super::NOT_READY_FREE + DELIVERY_RETRIES) {
             let key = if n == 0 {
-                "deliver-4-0".to_string()
+                "deliver-4-1".to_string()
             } else {
-                format!("deliver-4-0-retry-{n}")
+                format!("deliver-4-1-retry-{n}")
             };
             stuck.dispatched.push(sent(40, &key, 1_000, Some(busy)));
         }
-        assert!(super::orders(&tasks, &[stuck.clone()], i64::MAX / 2).is_empty());
-        let items = news_items(&tasks, &[stuck]);
+        let revision = work(vec![TaskRow {
+            revisions: 1,
+            ..task(4, TaskState::Revise, "resident")
+        }]);
+        assert!(super::orders(&revision, &[stuck.clone()], i64::MAX / 2).is_empty());
+        assert!(super::reissues(&revision, &[stuck.clone()], i64::MAX / 2).is_empty());
+        let items = news_items(&revision, &[stuck]);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].why, Why::DeliveryFailed);
     }
