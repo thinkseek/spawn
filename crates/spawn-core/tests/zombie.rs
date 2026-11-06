@@ -220,7 +220,10 @@ fn a_start_ends_an_execution_nothing_runs_and_starts() {
         assert_eq!((ends[0].0.as_str(), ends[0].1), ("exec_1", EndCause::Lost));
         assert!(saw(ends[0].2.as_ref(), how), "{how:?}: {:?}", ends[0].2);
         assert!(
-            ends[0].2.as_deref().is_some_and(|text| text.contains("cmd_2")),
+            ends[0]
+                .2
+                .as_deref()
+                .is_some_and(|text| text.contains("cmd_2")),
             "the evidence names the command that found it: {:?}",
             ends[0].2
         );
