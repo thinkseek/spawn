@@ -98,7 +98,6 @@
 //!    other gate failure, the gate's own exit 3 included (a missing bind
 //!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
 //!
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
 //!    **A host fault is not a verdict.** When the gate rejects C with
 //!    [`host::CHECK_TESTS_REGRESSION`], the integrator reads the failures
 //!    check-tests.sh printed in the gate's recorded output
@@ -134,7 +133,7 @@
 //!    judged as before. The decision rests on the failures and the crash
 //!    lines named in the record, never on the reason's text alone; the wait
 //!    rests on the recorded `due_ms`;
-=======
+//!
 //!    **The host's room is measured before the gate, never learned from
 //!    its crash** ([`gate::Room`]). At the start of each judging, after the
 //!    candidate is built and before the gate starts (only for a task that
@@ -165,7 +164,6 @@
 //!    §14): a host whose test database cannot run a parallel query is found
 //!    in seconds, not by a gate whose every database test fails 25 minutes
 //!    in and reads as a regression;
->>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
 //!
 //!    **A report is judged against the checkpoint of the turn that produced
 //!    it.** The dispatcher collects a report only after the turn that wrote
