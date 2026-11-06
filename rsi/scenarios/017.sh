@@ -368,13 +368,20 @@ cp "$WORK/out.txt" "$WORK/card.json"
     fail "(1) \`spawn scorecard --since $SINCE --until $UNTIL --json\` exited $status: $(err | head -c 400)"
 jq -e . "$WORK/card.json" >/dev/null 2>&1 || fail "(1) the scorecard's answer is not JSON: $(head -c 400 "$WORK/card.json")"
 
-# check <file> <jq path> <expected JSON value> <what>: compared as JSON
-# values (1 equals 1.0; null equals null).
+# check <file> <jq path> <expected JSON value> <what>: the path must give
+# exactly one value, compared as a JSON value (1 equals 1.0; a missing field
+# is not null).
 check() {
-    got=$(jq -c "$2" "$1" 2>/dev/null) || got="(no such path)"
-    jq -e -n --argjson got "${got:-null}" --argjson want "$3" '$got == $want' >/dev/null 2>&1 ||
-        fail "$4: $2 is $got, expected $3"
+    got=$(jq -c "[ $2 ]" "$1" 2>/dev/null) || got="(no such path)"
+    case "$got" in
+    "[]" | "(no such path)") fail "$4: $2 is missing, expected $3" ;;
+    esac
+    jq -e -n --argjson got "$got" --argjson want "$3" \
+        '($got | length) == 1 and $got[0] == $want' >/dev/null 2>&1 ||
+        fail "$4: $2 is ${got#[}, expected $3"
 }
+# A field that is null must be there and null, not absent.
+has_null_field() { :; }
 card=$WORK/card.json
 check "$card" '.min_n' 3 "(1) the minimum n"
 check "$card" '.since_ms' "$(scalar "select (extract(epoch from timestamptz '2026-10-02 00:00:00+00') * 1000)::bigint")" "(1) the window's start"
