@@ -162,7 +162,8 @@ pub(crate) fn measure(
         previous_since,
     )
     .map_err(Failure::Record)?;
-    let history = History::from_record(&facts, &messages);
+    let mut history = History::from_record(&facts, &messages);
+    history.clip(previous_since, window.until);
     card(&history, window, mission)
 }
 
