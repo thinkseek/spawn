@@ -1439,3 +1439,346 @@ mod tests {
         assert!(warning.is_none());
     }
 }
+
+/// Objective 018: the host's room, measured before a gate starts, on fake
+/// measures ([`Room::measured_by`]).
+#[cfg(test)]
+mod room_tests {
+    use super::{Room, RoomFailure, Shortfall, available_mb, server_of, without_password};
+    use spawn_postgres::ProbeFailure;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    const URL: &str = "postgres://gate:hunter2@%2Fvar%2Frun%2Ftest-pg:5433/spawn_test";
+
+    /// The integrator's environment: these names set, nothing else.
+    fn integrator_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// The gate's environment: PATH, TMPDIR, and these.
+    fn gate_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("TMPDIR".to_string(), "/data/tmp".to_string()),
+        ];
+        env.extend(
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
+        );
+        env
+    }
+
+    /// A room whose measures say `free_kb`, `available_mb` and `probe`,
+    /// noting each measure taken in `taken`.
+    fn room(
+        integrator: &[(&str, &str)],
+        free_kb: Option<u64>,
+        available_mb: Option<u64>,
+        probe: Result<(), ProbeFailure>,
+        taken: &Arc<Mutex<Vec<String>>>,
+    ) -> Room {
+        let (disk, memory, database) = (Arc::clone(taken), Arc::clone(taken), Arc::clone(taken));
+        Room::from_env(integrator_env(integrator)).measured_by(
+            move |path: &Path| {
+                disk.lock()
+                    .expect("taken")
+                    .push(format!("disk {}", path.display()));
+                free_kb
+            },
+            move || {
+                memory.lock().expect("taken").push("memory".to_string());
+                available_mb
+            },
+            move |url: &str| {
+                database
+                    .lock()
+                    .expect("taken")
+                    .push(format!("database {url}"));
+                probe.clone()
+            },
+        )
+    }
+
+    fn taken() -> Arc<Mutex<Vec<String>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn short(result: Result<String, RoomFailure>) -> (Shortfall, String) {
+        match result {
+            Err(RoomFailure::Short { short, log }) => (short, log),
+            other => panic!("a check falls short: {other:?}"),
+        }
+    }
+
+    const GIB_KB: u64 = 1_048_576;
+    const PLENTY: Option<u64> = Some(u64::MAX / 2);
+
+    fn shared_memory() -> ProbeFailure {
+        ProbeFailure {
+            probe: "a parallel query within 10 s".to_string(),
+            error: "ERROR: could not resize shared memory segment \"/PostgreSQL.2\" to 8388608 \
+                    bytes: No space left on device (53100)"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn each_check_short_names_its_measure_and_threshold() {
+        // Disk: the gate's TMPDIR under the default floor of 10 GiB.
+        let seen = taken();
+        let (disk, log) = short(room(&[], Some(3 * GIB_KB), PLENTY, Ok(()), &seen).check(&gate_env(&[])));
+        assert_eq!(
+            disk,
+            Shortfall::Disk {
+                free_kb: 3 * GIB_KB,
+                min_gb: 10,
+                tmpdir: "/data/tmp".to_string()
+            }
+        );
+        assert_eq!(disk.check(), "disk");
+        assert_eq!(disk.measured(), 3 * GIB_KB);
+        assert_eq!(disk.threshold(), 10 * GIB_KB, "the floor in KiB");
+        assert!(log.contains("SPAWN_GATE_MIN_FREE_GB=10"), "{log}");
+        assert_eq!(*seen.lock().expect("taken"), ["disk /data/tmp"]);
+        // The floor the gate reads, from the gate's environment.
+        let (disk, _) = short(
+            room(&[], Some(3 * GIB_KB), PLENTY, Ok(()), &taken())
+                .check(&gate_env(&[("SPAWN_GATE_MIN_FREE_GB", "4")])),
+        );
+        assert_eq!(disk.threshold(), 4 * GIB_KB);
+
+        // Memory: MemAvailable under the default floor of 2048 MiB.
+        let (memory, log) =
+            short(room(&[], PLENTY, Some(1500), Ok(()), &taken()).check(&gate_env(&[])));
+        assert_eq!(
+            memory,
+            Shortfall::Memory {
+                available_mb: 1500,
+                min_mb: 2048
+            }
+        );
+        assert_eq!(
+            (memory.check(), memory.measured(), memory.threshold()),
+            ("memory", 1500.into(), 2048.into())
+        );
+        assert!(log.contains("disk: ") && log.contains(": ok"), "{log}");
+        let (memory, _) = short(
+            room(
+                &[("SPAWN_GATE_MIN_FREE_MEMORY_MB", "100000000")],
+                PLENTY,
+                Some(30_000),
+                Ok(()),
+                &taken(),
+            )
+            .check(&gate_env(&[])),
+        );
+        assert_eq!(memory.threshold(), 100_000_000);
+
+        // Database: the probe's error and the probe it failed.
+        let failure = ProbeFailure {
+            probe: "connect within 10 s".to_string(),
+            error: "error connecting to server: No such file or directory (os error 2)".to_string(),
+        };
+        let (database, _) = short(
+            room(
+                &[("SPAWN_TEST_DATABASE_URL", URL)],
+                PLENTY,
+                PLENTY,
+                Err(failure),
+                &taken(),
+            )
+            .check(&gate_env(&[])),
+        );
+        assert_eq!(database.check(), "database");
+        assert_eq!(
+            database.measured(),
+            "error connecting to server: No such file or directory (os error 2)"
+        );
+        assert_eq!(database.threshold(), "connect within 10 s");
+        assert!(matches!(
+            database,
+            Shortfall::Database { ref server, .. } if server == "/var/run/test-pg:5433/spawn_test"
+        ));
+    }
+
+    #[test]
+    fn a_threshold_of_zero_disables_its_check() {
+        let seen = taken();
+        let checks = room(
+            &[("SPAWN_GATE_MIN_FREE_MEMORY_MB", "0")],
+            Some(0),
+            Some(0),
+            Ok(()),
+            &seen,
+        )
+        .check(&gate_env(&[("SPAWN_GATE_MIN_FREE_GB", "0")]))
+        .expect("nothing is checked, so nothing falls short");
+        assert!(seen.lock().expect("taken").is_empty(), "no measure taken");
+        assert!(checks.contains("SPAWN_GATE_MIN_FREE_GB=0, not checked"), "{checks}");
+        assert!(
+            checks.contains("SPAWN_GATE_MIN_FREE_MEMORY_MB=0, not checked"),
+            "{checks}"
+        );
+        // One disabled, the other still checked.
+        let (memory, _) = short(
+            room(&[], Some(0), Some(10), Ok(()), &taken())
+                .check(&gate_env(&[("SPAWN_GATE_MIN_FREE_GB", "0")])),
+        );
+        assert_eq!(memory.check(), "memory");
+    }
+
+    #[test]
+    fn the_checks_run_disk_memory_database_and_stop_at_the_first_short() {
+        let database = [("SPAWN_TEST_DATABASE_URL", URL)];
+        let order = |free_kb, available_mb, probe| {
+            let seen = taken();
+            let result = room(&database, free_kb, available_mb, probe, &seen).check(&gate_env(&[]));
+            let seen = seen.lock().expect("taken").clone();
+            (result, seen)
+        };
+        let (result, seen) = order(PLENTY, PLENTY, Ok(()));
+        let checks = result.expect("every check met");
+        assert_eq!(
+            seen,
+            ["disk /data/tmp", "memory", &format!("database {URL}")],
+            "every check, in order"
+        );
+        assert_eq!(checks.lines().count(), 3, "{checks}");
+        let (result, seen) = order(Some(0), Some(0), Err(shared_memory()));
+        assert_eq!(short(result).0.check(), "disk");
+        assert_eq!(seen, ["disk /data/tmp"], "disk short: nothing else measured");
+        let (result, seen) = order(PLENTY, Some(0), Err(shared_memory()));
+        assert_eq!(short(result).0.check(), "memory");
+        assert_eq!(seen, ["disk /data/tmp", "memory"], "memory short: no probe");
+        let (result, _) = order(PLENTY, PLENTY, Err(shared_memory()));
+        assert_eq!(short(result).0.check(), "database");
+    }
+
+    #[test]
+    fn a_parallel_query_short_of_shared_memory_is_the_database_check() {
+        let (database, log) = short(
+            room(
+                &[("SPAWN_TEST_DATABASE_URL", URL)],
+                PLENTY,
+                PLENTY,
+                Err(shared_memory()),
+                &taken(),
+            )
+            .check(&gate_env(&[])),
+        );
+        assert_eq!(database.check(), "database");
+        assert!(
+            database
+                .measured()
+                .as_str()
+                .is_some_and(|error| error.contains("could not resize shared memory segment")),
+            "{database:?}"
+        );
+        assert_eq!(database.threshold(), "a parallel query within 10 s");
+        assert!(log.contains("could not resize shared memory segment"), "{log}");
+        assert!(log.contains("the gate did not run"), "{log}");
+    }
+
+    #[test]
+    fn the_password_never_leaves_the_check() {
+        // The password as written (percent-encoded) and decoded, in the
+        // probe's words: neither survives, and the server is named alone.
+        let url = "postgres://gate:hun%40ter2@db.internal:5434/spawn_test?sslmode=disable";
+        let failure = ProbeFailure {
+            probe: "connect within 10 s".to_string(),
+            error: format!("password authentication failed for gate:hun@ter2 ({url})"),
+        };
+        let (database, log) = short(
+            room(
+                &[("SPAWN_TEST_DATABASE_URL", url)],
+                PLENTY,
+                PLENTY,
+                Err(failure),
+                &taken(),
+            )
+            .check(&gate_env(&[])),
+        );
+        let text = format!("{database:?} {log}");
+        assert!(!text.contains("hun@ter2") && !text.contains("hun%40ter2"), "{text}");
+        assert!(matches!(
+            database,
+            Shortfall::Database { ref server, .. } if server == "db.internal:5434/spawn_test"
+        ));
+        assert_eq!(
+            without_password("x postgres://u:pw@h/d?password=other y other", "postgres://u:pw@h/d?password=other"),
+            "x postgres://u:***@h/d?password=*** y ***"
+        );
+        assert_eq!(without_password("no secret", "postgres://u@h/d"), "no secret");
+    }
+
+    #[test]
+    fn a_threshold_that_does_not_parse_is_an_abort() {
+        for (gate, integrator) in [
+            (vec![("SPAWN_GATE_MIN_FREE_GB", "lots")], vec![]),
+            (vec![("SPAWN_GATE_MIN_FREE_GB", "+5")], vec![]),
+            (vec![], vec![("SPAWN_GATE_MIN_FREE_MEMORY_MB", "2G")]),
+            (vec![], vec![("SPAWN_GATE_MIN_FREE_MEMORY_MB", "-1")]),
+            (vec![], vec![("SPAWN_GATE_MIN_FREE_MEMORY_MB", "99999999999999999999999")]),
+        ] {
+            let seen = taken();
+            let result = room(&integrator, Some(0), Some(0), Ok(()), &seen).check(&gate_env(&gate));
+            assert!(
+                matches!(&result, Err(RoomFailure::Bad(reason))
+                         if reason.contains("SPAWN_GATE_MIN_FREE_") && reason.contains("whole number")),
+                "{gate:?} {integrator:?}: {result:?}"
+            );
+            assert!(seen.lock().expect("taken").is_empty(), "nothing measured");
+        }
+    }
+
+    #[test]
+    fn no_test_database_url_probes_nothing_and_an_unreadable_measure_decides_nothing() {
+        let seen = taken();
+        let checks = room(&[], None, None, Err(shared_memory()), &seen)
+            .check(&gate_env(&[]))
+            .expect("the gate runs and checks its own floor");
+        assert_eq!(*seen.lock().expect("taken"), ["disk /data/tmp", "memory"]);
+        assert!(checks.contains("SPAWN_TEST_DATABASE_URL is unset"), "{checks}");
+        assert!(checks.contains("cannot be read"), "{checks}");
+        // TMPDIR unset in the gate's environment: /tmp, as gate.sh reads it.
+        let seen = taken();
+        let env = vec![("PATH".to_string(), "/bin".to_string())];
+        assert!(room(&[], PLENTY, PLENTY, Ok(()), &seen).check(&env).is_ok());
+        assert_eq!(seen.lock().expect("taken")[0], "disk /tmp");
+    }
+
+    #[test]
+    fn mem_available_is_read_in_mib() {
+        let meminfo = "MemTotal:       32800860 kB\nMemFree:         1000000 kB\n\
+                       MemAvailable:   20293592 kB\nBuffers:          100 kB\n";
+        assert_eq!(available_mb(meminfo), Some(19_817));
+        assert_eq!(available_mb("MemTotal: 1 kB\n"), None, "no MemAvailable line");
+        assert_eq!(available_mb("MemAvailable: lots kB\n"), None);
+    }
+
+    #[test]
+    fn the_server_is_named_without_its_login() {
+        assert_eq!(
+            server_of("postgres://u:p@%2Fhome%2Fu%2Fsock/spawn_test"),
+            "/home/u/sock:5432/spawn_test"
+        );
+        assert_eq!(server_of("postgresql://u:p@127.0.0.1:15434/x?sslmode=disable"), "127.0.0.1:15434/x");
+        assert_eq!(server_of("postgres://u:p@[::1]:5433/x"), "[::1]:5433/x");
+        assert_eq!(
+            server_of("postgres:///spawn_test?host=/run/pg&port=5433&password=p"),
+            "/run/pg:5433/spawn_test"
+        );
+        assert_eq!(server_of("postgres://u:p@db/"), "db:5432/");
+    }
+}
