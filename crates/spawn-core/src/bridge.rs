@@ -830,8 +830,7 @@ impl Bridge {
                 if let Some(execution_id) = event.execution_id.clone() {
                     view.active = Some(Active {
                         execution_id,
-                        // As the store names it now: a record from before
-                        // the root was resolved names the same directory.
+                        // As the store names it now (an older record: its root unresolved).
                         workspace: self.workspaces.canonical(workspace),
                         checkpoint: None,
                         reported_end: None,
@@ -1883,10 +1882,7 @@ impl Bridge {
         fresh: bool,
     ) -> Result<Outcome, StoreError> {
         // Nothing is typed into a terminal that does not host the runner.
-        match self
-            .terminals
-            .runner(&active.terminal(), &active.workspace)
-        {
+        match self.terminals.runner(&active.terminal(), &active.workspace) {
             Ok(Runner::Running) => {}
             Ok(Runner::Gone) => {
                 return Ok(Outcome::Failed(format!(
@@ -2845,14 +2841,8 @@ impl Bridge {
         // A stop that finds no runner of its own there (the terminal gone,
         // or hosting no runner) still writes the end the log waits for, and
         // says what it found.
-        if active.reported_end.is_none()
-            && !active.unmounting
-            && active.follow.evidence.is_none()
-        {
-            let seen = match self
-                .terminals
-                .runner(&active.terminal(), &active.workspace)
-            {
+        if active.reported_end.is_none() && !active.unmounting && active.follow.evidence.is_none() {
+            let seen = match self.terminals.runner(&active.terminal(), &active.workspace) {
                 Ok(Runner::Gone) => Some(format!("its terminal {} is gone", active.terminal())),
                 Ok(Runner::Untracked(seen)) => Some(seen),
                 Ok(Runner::Running) | Err(_) => None,
