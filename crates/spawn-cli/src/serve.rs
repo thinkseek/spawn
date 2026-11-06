@@ -466,6 +466,7 @@ fn handle(
         "/api/fleet" => fleet(),
         "/api/missions" => missions(),
         "/api/events" => events(query),
+        "/api/scorecard" => scorecard(query),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 session(id, query)
@@ -1083,6 +1084,56 @@ fn events(query: &str) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({ "events": events, "next": next.0, "now_ms": now_ms() }))
+}
+
+/// `/api/scorecard?mission=&since=&until=`: exactly the JSON of `spawn
+/// scorecard --json` with the same flags (crate::scorecard), read through
+/// the reader login and from this server's own transcript archive
+/// (`SPAWN_WORKSPACE_ROOT`). An empty parameter is one not given.
+fn scorecard(query: &str) -> Result<Value, String> {
+    let given = |name: &str| -> Result<Option<String>, String> {
+        parameter(query, name)
+            .map(|text| {
+                percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad {name} {text}"))
+            })
+            .transpose()
+            .map(|value| value.filter(|text| !text.is_empty()))
+    };
+    let asked = crate::scorecard::Query {
+        mission: given("mission")?,
+        since: given("since")?,
+        until: given("until")?,
+    };
+    let store = open_store()?;
+    let root = env_value("SPAWN_WORKSPACE_ROOT");
+    crate::scorecard::measure(&store, root.as_deref().map(Path::new), &asked).map_err(|failure| {
+        match failure {
+            crate::scorecard::Failure::Request(error) => format!("{BAD_REQUEST}{error}"),
+            crate::scorecard::Failure::Record(error) => error,
+        }
+    })
+}
+
+/// A query parameter's value with its `%XX` escapes decoded (a `+` stays a
+/// `+`: a time zone offset is one); `None` when it decodes to no UTF-8.
+fn percent_decoded(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(byte) = text
+                .get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            out.push(byte);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).ok()
 }
 
 fn parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {
