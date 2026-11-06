@@ -219,6 +219,7 @@ use crate::{Flags, env_or, open_store};
 use crate::{main_merge, objectives, sources};
 
 mod host;
+pub(crate) mod owner;
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
@@ -289,6 +290,15 @@ const PUSH_POLL: Duration = Duration::from_millis(500);
 
 /// Who the integrator's commands come from.
 const PRINCIPAL: &str = "spawn-integrate";
+
+/// The process's half of the landing hold. The store's hold
+/// (`spawn_landing_hold`, `spawn_source_push_hold`) is a session lock, and
+/// every judging records through the integrator's one connection, on which
+/// a session lock is granted again at once: so every landing ([`land`]) and
+/// every owner landing ([`owner::apply`]) takes this first, then the
+/// store's, and keeps both until its record is written. No task landing's
+/// push and its record are ever split by an owner landing.
+static LANDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>] [--gates <n>]";
 
@@ -2199,7 +2209,11 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
                     "revision": task.revisions}),
         );
     };
-    // Held until the landing is recorded: dropping the mission waits for it.
+    // Held until the landing is recorded: dropping the mission waits for it,
+    // and an owner landing on any source waits too.
+    let _landing = LANDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(_hold) = store
         .landing_hold(task.id)
         .map_err(|error| error.to_string())?
