@@ -284,6 +284,9 @@ pub(crate) enum Why {
     /// A mission's gate has had no room in TMPDIR for hours
     /// ([`crate::disk::gate_room_escalations`]).
     GateRoom,
+    /// A mission's gate failed twice in a row because the host did (the
+    /// test database), not the work ([`digest::host_fault_escalations`]).
+    GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
 }
@@ -476,6 +479,13 @@ pub(crate) fn step(
         store
             .gate_room_escalations()
             .map_err(|error| format!("gate room records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::host_fault_escalations(
+        store
+            .gate_host_fault_escalations()
+            .map_err(|error| format!("gate host fault records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
