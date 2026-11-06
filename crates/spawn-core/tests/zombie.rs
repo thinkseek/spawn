@@ -441,6 +441,13 @@ fn an_engine_its_runner_still_runs_is_never_ended_by_a_start() {
     assert!(error.contains("already runs"), "{error}");
     assert!(ends(&store).is_empty());
     assert!(store.is_alive(&first(), &any_workspace()).expect("alive"));
+    // Its mount, which the view took for an orphan's, was kept.
+    let unmounts = store
+        .workspace_calls()
+        .iter()
+        .filter(|call| *call == "unmount")
+        .count();
+    assert_eq!(unmounts, 1, "only the refused start's own mount went");
     // And a person's input goes to it: recorded waiting for its turn on
     // exec_1, not refused as "runs no execution".
     submit(
