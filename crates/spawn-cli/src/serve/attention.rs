@@ -23,6 +23,10 @@
 //!     "told": false, "told_at_ms": null
 //!   }],
 //!   "told": [ ...the same, "told": true, "told_at_ms": <first digest that carried it> | null ],
+//!   "holds": [{                    // the owner's holds with a task waiting behind them
+//!     "source", "hold", "main", "by", "reason", "held_at_ms", "expires_ms",
+//!     "waiting": [12]              // the tasks waiting, oldest first
+//!   }],
 //!   "supervisor": null | {
 //!     "session_id", "agent_id", "live", "execution_id", "end_cause",
 //!     "busy",                      // a command into it is in flight
@@ -40,6 +44,11 @@
 //!   "warnings": ["dispatch: stalls: ..."]   // what could not be read
 //! }
 //! ```
+//!
+//! `holds` is not among `pending` or `told`: the supervisor is told of a
+//! hold's expiry, never of a hold. It lists the owner's active holds on
+//! mission sources (`spawn mission hold`) that have at least one task waiting
+//! behind them, as the mission board shows them: work a person is holding.
 //!
 //! The supervisor's question is shown when its turn ended at its prompt
 //! and its judgement asks for a person: BLOCKED or WAITING with
@@ -144,7 +153,14 @@ pub(super) fn attention() -> Result<Value, String> {
         .iter()
         .map(|(text, at_ms)| json!({ "text": text, "at_ms": at_ms }))
         .collect();
-    Ok(answer(
+    let holds = match store.source_holds() {
+        Ok(holds) => waiting_holds(&holds),
+        Err(error) => {
+            warnings.push(format!("attention: the owner's holds: {error}"));
+            Value::Array(Vec::new())
+        }
+    };
+    let mut view = answer(
         &reading.rows,
         &reading.plan,
         &told_at,
@@ -152,7 +168,25 @@ pub(super) fn attention() -> Result<Value, String> {
         &Value::Array(for_owner),
         &warnings,
         super::now_ms(),
-    ))
+    );
+    if let Some(fields) = view.as_object_mut() {
+        fields.insert("holds".to_string(), holds);
+    }
+    Ok(view)
+}
+
+/// The owner's holds of `holds` (`PostgresStore::source_holds`: `{now_ms,
+/// holds}`) that have at least one task waiting behind them.
+fn waiting_holds(holds: &Value) -> Value {
+    Value::Array(
+        holds["holds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|hold| hold["waiting"].as_array().is_some_and(|tasks| !tasks.is_empty()))
+            .cloned()
+            .collect(),
+    )
 }
 
 /// The answer from what was read: `plan` as [`dispatch::decide_with`] made
