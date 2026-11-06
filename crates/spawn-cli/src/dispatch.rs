@@ -17,6 +17,12 @@
 //! A Stop that failed, whoever sent it, is sent again and then escalated
 //! ([`stops`]): until then the worker gets no task, no nudge.
 //!
+//! A changed charter reaches the running supervisor ([`charter`]): when the
+//! charter its native session holds (the hash its start recorded, or the
+//! one a later charter input typed) is not the one this build writes, the
+//! new one is typed in at its next idle prompt, once, in place of that
+//! pass's digest.
+//!
 //! No task waits silently ([`stall`]): every open task is at one step
 //! (`delivery`, `activity`, `judgement`, `landing`, `stop`, or its mission
 //! `halted`), measured from the record that started it on the database's
@@ -45,6 +51,7 @@
 //! the UI's attention queue calls too: `GET /api/attention`) and submits it
 //! ([`step`]).
 
+mod charter;
 mod digest;
 mod stall;
 mod stops;
@@ -65,7 +72,7 @@ use spawn_core::port::CommandQueue;
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::{self, Work};
-use crate::supervise::SUPERVISOR_SESSION;
+use crate::supervise::{Charter, SUPERVISOR_SESSION};
 
 /// One command the dispatcher sent.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -167,6 +174,10 @@ pub(crate) struct Facts {
     /// execution started (none when it is not live), oldest first.
     #[serde(default)]
     pub(crate) stops: Vec<StopSent>,
+    /// For the supervisor: the records of the charter its current native
+    /// session holds ([`charter::Records`]); `None` for every other session.
+    #[serde(default)]
+    pub(crate) charter: Option<charter::Records>,
 }
 
 impl Facts {
@@ -296,6 +307,10 @@ pub(crate) enum Why {
     GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
+    /// The deployed charter could not be typed into the supervisor's pane:
+    /// every attempt was refused before typing, and the retries are spent
+    /// ([`charter`]).
+    Charter,
 }
 
 impl Why {
@@ -446,6 +461,7 @@ pub(crate) fn decide_with(
         }
     }
     plan.pending.extend(deliver::news_items(work, rows));
+    plan.pending.extend(supervisor.and_then(charter::escalation));
     plan.pending.extend_from_slice(host);
     (plan.told, plan.pending) = std::mem::take(&mut plan.pending)
         .into_iter()
@@ -508,9 +524,12 @@ pub(crate) struct Reading {
 /// The plan for this moment, reading only: the host's news (the disk items
 /// `disk` gives for the moment's clock, the gate-room and gate host-fault
 /// records, the stalls past their `bounds`, [`stall`]) added to the facts and mission rows
-/// `loaded` ([`load`]), then [`decide_with`]. [`step`] submits what it
-/// returns; `GET /api/attention` (crate::serve) shows it. One function for
-/// both, so the queue a person reads is the dispatcher's own.
+/// `loaded` ([`load`]), then [`decide_with`], then the input that gives the
+/// supervisor the `deployed` charter if it holds another ([`charter::give`];
+/// `None`: no input, as for a reader that submits nothing). [`step`]
+/// submits what it returns; `GET /api/attention` (crate::serve) shows it.
+/// One function for both, so the queue a person reads is the dispatcher's
+/// own.
 pub(crate) fn read_plan(
     store: &PostgresStore,
     loaded: (Vec<Facts>, Work),
@@ -518,6 +537,7 @@ pub(crate) fn read_plan(
     bounds: &Bounds,
     supervised: bool,
     spawn: &str,
+    deployed: Option<&Charter>,
 ) -> Result<Reading, String> {
     let (rows, work) = loaded;
     let mut lines = Vec::new();
@@ -543,7 +563,10 @@ pub(crate) fn read_plan(
         Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
         Err(error) => lines.push(format!("dispatch: stalls: {error}")),
     }
-    let plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    if let Some(deployed) = deployed.filter(|_| supervised) {
+        charter::give(&mut plan, &rows, deployed);
+    }
     Ok(Reading {
         rows,
         work,
@@ -585,6 +608,7 @@ pub(crate) fn step(
         bounds,
         supervised,
         spawn,
+        Some(&Charter::deployed(spawn)),
     )?;
     lines.extend(read);
     if disk.below_floor() {

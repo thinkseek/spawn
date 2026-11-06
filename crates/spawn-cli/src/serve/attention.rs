@@ -102,6 +102,8 @@ pub(super) fn attention() -> Result<Value, String> {
         &bounds,
         crate::config::supervised(),
         &crate::config::spawn_program(),
+        // It submits nothing: no charter input to plan.
+        None,
     )?;
     let mut warnings = reading.lines;
     let tags: Vec<String> = reading.plan.told.iter().map(Escalation::tag).collect();
