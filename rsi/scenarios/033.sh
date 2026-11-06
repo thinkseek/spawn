@@ -12,9 +12,15 @@
 # on a host so loaded that the gate's setup took 244 s instead of 28; task 87
 # was gated again at 15:27:56 CST, accepted, and landed. Required: such a gate is
 # recorded `host_fault` (objective 020's verdict) with the evidence
-# `base_disagrees`, the scenario and both exits; it counts toward no halt,
-# the task is judged again after 020's doubling backoff, and two host faults
-# in a row are escalated to the supervisor with that evidence. Every other
+# `base_disagrees`, the scenario and both exits; it counts toward no halt
+# and the task is judged again after 020's doubling backoff. By the owner's
+# ruling (2026-11-06) such a host fault is never escalated at two in a row;
+# three in a row on one mission raise an alert instead. Objective 030, which
+# owns Spawn's alerts, comes after this one in the owner's order, so the
+# alert is recorded in the third host fault's own `task.gated` record
+# (`alert` true, `base_disagrees` 3) and the dispatcher's digest takes it to
+# the supervisor once (tag `host gate-base-disagrees-<event id>`); 030 later
+# raises its `gate_base_disagrees` alert from that same record. Every other
 # harness error on the base (a first run that exits 2, `1, then 2`) stays an
 # abort, as today.
 #
@@ -46,23 +52,27 @@
 #       not halted; the record names `evidence` `base_disagrees`, `scenario`
 #       `011.sh` (the gate's own line, not the nested gate's 102.sh), `exits`
 #       [1, 0], `setup_s` 244 (from the gate time line), `host_faults` 1 (and
-#       the mission's gate_host_faults 1), `escalate` false, `backoff_ms` 4000
-#       and `due_ms` its own time + 4000.
+#       the mission's gate_host_faults 1), `base_disagrees` 1 (and the
+#       mission's gate_base_disagrees 1), `escalate` false, `alert` false,
+#       `backoff_ms` 4000 and `due_ms` its own time + 4000.
 #   (2) passes every half second do not run the gate again before `due_ms`;
 #       then run 2 is gated.
-#   (3) run 2 is `host_fault` again: `host_faults` 2, `backoff_ms` 8000,
-#       `due_ms`, `escalate` true, gate_aborts 0, no halt; within 60 s a digest
-#       tagged `host gate-host-fault-<that record's event id>` reaches the
-#       supervisor, its line naming task #<id>, 011.sh and `1, then 0`.
+#   (3) run 2 is `host_fault` again: `host_faults` 2, `base_disagrees` 2,
+#       `backoff_ms` 8000, `due_ms`, `escalate` false, `alert` false,
+#       gate_aborts 0, no halt (no escalation at two: checked in (5)).
 #   (4) not before run 2's due time, run 3 is `host_fault` (`host_faults` 3,
-#       `backoff_ms` 16000, `escalate` false): three disagreeing bases in a row,
-#       and after two more passes the mission is still not halted, gate_aborts
-#       0.
+#       `base_disagrees` 3 and the mission's gate_base_disagrees 3,
+#       `backoff_ms` 16000, `escalate` false, `alert` true): three disagreeing
+#       bases in a row raise the alert, recorded in that record; within 60 s
+#       a digest tagged `host gate-base-disagrees-<that record's event id>`
+#       reaches the supervisor, its line naming task #<id>, 011.sh,
+#       `1, then 0` and `3 in a row`; after two more passes the mission is
+#       still not halted, gate_aborts 0.
 #   (5) control, not before run 3's due time: run 4 (exit 2 first) is
-#       `aborted`, gate_aborts 1, gate_host_faults 0; run 5 (`1, then 2`) is
-#       `aborted`, gate_aborts 2; run 6 is accepted and the task lands;
-#       gate_aborts 0, the mission never halted, exactly one host-fault
-#       escalation delivered.
+#       `aborted`, gate_aborts 1, gate_host_faults 0, gate_base_disagrees 0;
+#       run 5 (`1, then 2`) is `aborted`, gate_aborts 2; run 6 is accepted and
+#       the task lands; gate_aborts 0, the mission never halted, exactly one
+#       base-disagreement alert delivered and no host-fault escalation.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -77,9 +87,10 @@
 # (`| <name> exited 1, then 0 on the base: a harness error, not a verdict;
 # the gate aborts` followed by `| stage gate aborted <ms>ms base: <name> again
 # (unsolved needs two runs that agree)`), records `host_fault` with evidence
-# `base_disagrees`, holds the task for 020's doubling backoff, escalates the
-# second host fault in a row, never halts on them, and still records every
-# other base harness error as an abort.
+# `base_disagrees`, holds the task for 020's doubling backoff, never halts on
+# them, raises the alert at the third in a row (in that record, and to the
+# supervisor once), and still records every other base harness error as an
+# abort.
 # Runs inside the gate's sandbox (scripts/rsi/gate.sh): needs SPAWN_BIN and
 # SPAWN_TEST_DATABASE_URL, creates and drops its own database, uses a
 # private tmux socket, no network. Every wait is bounded in time.
@@ -92,7 +103,7 @@
 # mission "3 gate aborts in a row", 1.25-1.43 s after the first abort: three
 # disagreeing bases halt a mission for a person in under a second and a half
 # (the halt reaches the supervisor only as 013's halted-mission stall; 1800 s
-# here). No record names the scenario, its exits or the gate's setup time
+# here), and no alert. No record names the scenario, its exits or the gate's setup time
 # (they are only in the gate's log). Resumed by hand, runs 4 and 5 are
 # aborted (gate_aborts 1, 2) and run 6 is accepted and lands, as (5)
 # requires. It fails at (1) in 15-26 s; a measure run takes 31-52 s.
@@ -404,7 +415,8 @@ SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
 SPAWN_SUPERVISOR=1
 SPAWN_MISSION_FILE=$WORK/mission.md
-# The stall bounds out of the way: only the host-fault escalation is checked.
+# The stall bounds out of the way: only the base-disagreement alert's digest
+# is checked.
 SPAWN_STALL_DELIVERY_SECS=1800
 SPAWN_STALL_ACTIVITY_SECS=1800
 SPAWN_STALL_REVIEW_SECS=1800
@@ -447,6 +459,10 @@ halted() { q "select coalesce(halted, '') from mission_missions where id = $miss
 # 020's column; empty where the store has none (today).
 host_faults() {
     q "select coalesce((to_jsonb(m) ->> 'gate_host_faults'), '') from mission_missions m where id = $mission"
+}
+# This objective's column; empty where the store has none (today).
+base_disagrees() {
+    q "select coalesce((to_jsonb(m) ->> 'gate_base_disagrees'), '') from mission_missions m where id = $mission"
 }
 tasks_line() { q "select string_agg(id || ':' || state, ' ' order by id) from mission_tasks"; }
 log_tail() { grep -v '^| ' "$WORK/integrate.log" 2>/dev/null | tail -n 6 | tr '\n' ' '; }
@@ -616,6 +632,9 @@ expect_eq "$(field "$e1" setup_s)" 244 "(1) the gate's setup time the host fault
 expect_eq "$(field "$e1" host_faults)" 1 "(1) the host fault's count in a row"
 expect_eq "$(host_faults)" 1 "(1) the mission's gate_host_faults"
 expect_eq "$(field "$e1" escalate)" false "(1) the first host fault's escalate"
+expect_eq "$(field "$e1" base_disagrees)" 1 "(1) the base disagreements in a row the first host fault names"
+expect_eq "$(base_disagrees)" 1 "(1) the mission's gate_base_disagrees"
+expect_eq "$(field "$e1" alert)" false "(1) the first host fault's alert"
 expect_eq "$(field "$e1" backoff_ms)" $((BACKOFF_SECS * 1000)) "(1) the first host fault's backoff"
 due1=$(field "$e1" due_ms)
 expect_eq "$due1" $((t1 + BACKOFF_SECS * 1000)) "(1) the first host fault's due time"
@@ -637,7 +656,7 @@ case "$due1" in
     ;;
 esac
 
-# --- (3) the second in a row is escalated ------------------------------------------------------
+# --- (3) the second in a row: no escalation at two -------------------------------------------
 
 if [ "$verdict" != host_fault ]; then
     measured_fail "(3) task #$task's second disagreeing base in a row was gated '$verdict' ($(field "$e2" reason)), not 'host_fault'; gate_aborts $before -> $after"
@@ -649,31 +668,13 @@ expect_eq "$(host_faults)" 2 "(3) the mission's gate_host_faults after two in a 
 expect_eq "$(field "$e2" backoff_ms)" $((2 * BACKOFF_SECS * 1000)) "(3) the second host fault's backoff (doubled)"
 due2=$(field "$e2" due_ms)
 expect_eq "$due2" $((t2 + 2 * BACKOFF_SECS * 1000)) "(3) the second host fault's due time"
-expect_eq "$(field "$e2" escalate)" true "(3) the second host fault's escalate"
+expect_eq "$(field "$e2" escalate)" false "(3) the second host fault's escalate (no escalation at two: the owner's ruling)"
+expect_eq "$(field "$e2" base_disagrees)" 2 "(3) the base disagreements in a row the second host fault names"
+expect_eq "$(base_disagrees)" 2 "(3) the mission's gate_base_disagrees after two in a row"
+expect_eq "$(field "$e2" alert)" false "(3) the second host fault's alert"
 expect_eq "$(halted)" "" "(3) the mission's halt after two disagreeing bases in a row"
-tag="host gate-host-fault-$e2"
-if [ "$verdict" = host_fault ]; then
-    deadline=$(($(now) + 60))
-    until [ "$(digests_like "$tag")" -ge 1 ]; do
-        [ "$(now)" -lt "$deadline" ] || {
-            measured_fail "(3) two disagreeing bases in a row on task #$task were not escalated to the supervisor within 60 s (no digest tagged '$tag')"
-            break
-        }
-        ping_supervisor
-        sleep 0.5
-    done
-    if [ "$(digests_like "$tag")" -ge 1 ]; then
-        line=$(digest_text_tagged "$tag" | grep -F "task #$task" | head -n 1)
-        case "$line" in
-        *"task #$task"*011.sh*"1, then 0"* | *"task #$task"*"1, then 0"*011.sh*) ;;
-        *) measured_fail "(3) the escalation of two disagreeing bases does not name task #$task, 011.sh and its exits (1, then 0): [$line]" ;;
-        esac
-    fi
-else
-    measured_fail "(3) the supervisor was not told of two disagreeing bases in a row (no host fault was recorded)"
-fi
 
-# --- (4) three in a row never halt -----------------------------------------------------------
+# --- (4) three in a row raise an alert and never halt ------------------------------------------
 
 judge_or_halt "$task" "$e2" "(4)"
 e3=$event
@@ -689,8 +690,48 @@ if [ "$verdict" != host_fault ]; then
 fi
 expect_eq "$(field "$e3" host_faults)" 3 "(4) the third host fault's count in a row"
 expect_eq "$(field "$e3" backoff_ms)" $((4 * BACKOFF_SECS * 1000)) "(4) the third host fault's backoff (doubled again)"
-expect_eq "$(field "$e3" escalate)" false "(4) the third host fault's escalate (the run was escalated once)"
+expect_eq "$(field "$e3" escalate)" false "(4) the third host fault's escalate"
+expect_eq "$(field "$e3" base_disagrees)" 3 "(4) the base disagreements in a row the third host fault names"
+expect_eq "$(base_disagrees)" 3 "(4) the mission's gate_base_disagrees after three in a row"
+expect_eq "$(field "$e3" alert)" true "(4) the third host fault's alert (three in a row raise one, recorded in that record)"
 due3=$(field "$e3" due_ms)
+# Before objective 030 exists the record is the alert, and the digest takes
+# it to the supervisor once.
+tag="host gate-base-disagrees-$e3"
+if [ "$verdict" = host_fault ]; then
+    deadline=$(($(now) + 60))
+    until [ "$(digests_like "$tag")" -ge 1 ]; do
+        [ "$(now)" -lt "$deadline" ] || {
+            measured_fail "(4) three disagreeing bases in a row on task #$task did not reach the supervisor within 60 s (no digest tagged '$tag')"
+            break
+        }
+        ping_supervisor
+        sleep 0.5
+    done
+    if [ "$(digests_like "$tag")" -ge 1 ]; then
+        line=$(digest_text_tagged "$tag" | grep -F "task #$task" | head -n 1)
+        case "$line" in
+        *"task #$task"*) ;;
+        *) line="" ;;
+        esac
+        case "$line" in
+        *011.sh*) ;;
+        *) line="" ;;
+        esac
+        case "$line" in
+        *"1, then 0"*) ;;
+        *) line="" ;;
+        esac
+        case "$line" in
+        *"3 in a row"*) ;;
+        *) line="" ;;
+        esac
+        [ -n "$line" ] ||
+            measured_fail "(4) the alert of three disagreeing bases does not name task #$task, 011.sh, its exits (1, then 0) and \`3 in a row\`: [$(digest_text_tagged "$tag" | head -n 3 | tr '\n' ' ')]"
+    fi
+else
+    measured_fail "(4) the supervisor was not told of three disagreeing bases in a row (no host fault was recorded)"
+fi
 # Two more passes: a halt rule fires at the start of a pass.
 integrate_once
 sleep 0.3
@@ -715,6 +756,7 @@ esac
     fail "(5) task #$task, whose base run of 011.sh exited 2 (a harness error, not a disagreement), was gated '$verdict' ($(field "$e4" reason)), not 'aborted'"
 assert_eq "$after" "$((before + 1))" "(5) gate_aborts after a base that exited 2 (was $before)"
 expect_eq "$(host_faults)" 0 "(5) the mission's gate_host_faults after a real abort"
+expect_eq "$(base_disagrees)" 0 "(5) the mission's gate_base_disagrees after a real abort"
 judge_or_halt "$task" "$e4" "(5)"
 e5=$event
 [ "$verdict" = aborted ] ||
@@ -730,7 +772,8 @@ until [ "$(task_state "$task")" = landed ]; do
 done
 assert_eq "$(aborts)" 0 "(5) gate_aborts after the landing"
 expect_eq "$(halted)" "" "(5) the mission's halt at the end"
-expect_eq "$(digests_like 'host gate-host-fault-%')" 1 "(5) host-fault escalations delivered"
+expect_eq "$(digests_like 'host gate-base-disagrees-%')" 1 "(5) base-disagreement alerts delivered"
+expect_eq "$(digests_like 'host gate-host-fault-%')" 0 "(5) host-fault escalations delivered (none at two for a base that disagrees with itself)"
 expect_eq "$(q "select count(*) from spawn_events where session_id = 'session_control'
                   and kind -> 'detail' -> 'record' ->> 'type' = 'mission.halted'
                   and kind -> 'detail' -> 'record' ->> 'id' = '$mission'")" 0 \
@@ -741,5 +784,5 @@ if [ -n "$failed_any" ]; then
     asserted=1
     exit 1
 fi
-echo "033: three bases that disagreed with themselves were recorded as host faults, not counted, judged again after a doubling backoff, escalated once at two in a row, and never halted the mission; real harness errors on the base stayed aborts"
+echo "033: three bases that disagreed with themselves were recorded as host faults, not counted, judged again after a doubling backoff, never escalated at two, alerted once at three in a row, and never halted the mission; real harness errors on the base stayed aborts"
 exit 0
