@@ -7137,10 +7137,13 @@ mod database_tests {
         assert_eq!(verdicts(&db, second), ["accepted", "stale", "accepted"]);
         assert_eq!(task_state(&db, mission, second), "landed");
         assert_eq!(parent(&[&source], &source_main(&source), 1), deployed);
-        let after = db.mission(mission);
-        assert!(after["halted"].is_null(), "halted: {}", after["halted"]);
-        assert_eq!(after["gate_rejections"], 0);
-        assert_eq!(after["gate_aborts"], 0);
+        let after = gated(&db, mission);
+        assert_eq!(after.halted, None);
+        assert_eq!(
+            (after.gate_rejections, after.gate_aborts),
+            (0, 0),
+            "nothing counted"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
