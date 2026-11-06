@@ -1783,6 +1783,9 @@ impl Bridge {
         )?;
         self.catch_up()?;
         if ended {
+            // The command being handled is finished by the tick, with its
+            // own outcome; every other input waiting on the execution fails.
+            self.held.remove(&claimed.command_id);
             self.fail_waiting(&claimed.session_id, Some(cause))?;
             tick.warnings.append(&mut report.warnings);
             return Ok(Some(Settled::Ended(format!(
