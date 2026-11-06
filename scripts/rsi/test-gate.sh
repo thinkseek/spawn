@@ -904,6 +904,9 @@ gate_copy=$work/gate-copy/scripts
 mkdir -p "$gate_copy/rsi"
 cp "$(dirname "$gate")"/../*.sh "$gate_copy/"
 cp "$gate" "$gate_copy/rsi/gate.sh"
+# The suite runs from a deployed controller too, a read-only tree whose
+# modes cp carries over: the copy is the suite's own, so it is made writable.
+chmod -R u+w "$gate_copy"
 printf '# changed\n' >>"$gate_copy/rsi/gate.sh"
 saved_gate=$gate
 gate=$gate_copy/rsi/gate.sh
