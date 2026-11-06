@@ -16,12 +16,18 @@
 //! Every checkpoint's branch is published, in the background
 //! ([`crate::push`]), to the source's `spawn/<agent>` when the source is a
 //! directory on this host ([`receives_branches`]); the integrator lands what
-//! was published there, never a mounted workspace. The pusher's queue is in
-//! memory: a process that ends cleanly pushes what waits ([`Drop`]), and a
+//! was published there, never a mounted workspace. Every store of a process
+//! pushes through the process's one pusher per source
+//! ([`crate::push::shared`]). Its queue is in memory: a process that ends
+//! cleanly pushes what waits ([`Drop`] of the store the Bridge runs on), a
 //! new one queues again the branch of every agent with an open task
-//! ([`MissionWorkspaces::republish`]), so a push lost with a killed process
-//! is made after the restart. A branch lives on this host: nothing is taken
-//! from the source but `main`.
+//! ([`MissionWorkspaces::republish`]), and the integrator pushes again a
+//! branch whose recorded checkpoint the source still lacks
+//! ([`push_recorded`]), so a push lost with a killed process is made after
+//! the restart. A one-shot store (a merge of main, a set-aside;
+//! [`MissionWorkspaces::one_shot`]) publishes what it changed itself
+//! ([`publish`]) and leaves the rest of the queue alone. A branch lives on
+//! this host: nothing is taken from the source but `main`.
 //!
 //! A source is git run as the owner, so it is checked before git sees it
 //! ([`MissionSource`]: an absolute path, `https://` or `ssh://`), and every
@@ -36,11 +42,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{BaseMerge, Branch, Commit, SetAside, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{
+    BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore,
+};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
-use crate::push::{Pusher, pushed_ref};
+use crate::push::{Pushed, Pusher, pushed_ref};
 
 /// Least time between two refreshes of one mirror's `main` at turn ends.
 pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(30);
@@ -57,7 +65,9 @@ pub(crate) struct MissionWorkspaces {
     mirrors: Mutex<HashMap<String, Routed>>,
     /// When each mirror's `main` was last fetched.
     refreshed: Mutex<HashMap<PathBuf, Instant>>,
-    pusher: Pusher,
+    /// Whether dropping the store pushes what waits on the process's
+    /// pushers: the store a process runs on, not a one-shot one.
+    flush_on_drop: bool,
 }
 
 /// One agent's store and, for a mission with a source, where its mirror
@@ -209,14 +219,30 @@ impl MissionWorkspaces {
             factory,
             mirrors: Mutex::new(HashMap::new()),
             refreshed: Mutex::new(HashMap::new()),
-            pusher: Pusher::new(),
+            flush_on_drop: true,
+        }
+    }
+
+    /// A store for one change inside a process that goes on (a merge of
+    /// main, a set-aside): its pushes go to the process's pushers like any
+    /// store's, its caller publishes what it changed ([`publish`]), and
+    /// dropping it pushes nothing else.
+    pub(crate) fn one_shot(
+        default: GitWorkspace,
+        root: &Path,
+        store: Arc<PostgresStore>,
+        factory: Factory,
+    ) -> Self {
+        Self {
+            flush_on_drop: false,
+            ..Self::new(default, root, store, factory)
         }
     }
 
     /// Queue a push of an agent's branch, to a source that receives them.
     fn mark(&self, mirror: &Path, source: &str, agent: &str) {
         if receives_branches(source) {
-            self.pusher.mark(mirror, source, agent);
+            crate::push::shared(source).mark(mirror, source, agent);
         }
     }
 
@@ -230,7 +256,7 @@ impl MissionWorkspaces {
             .store
             .publishing_agents()
             .map_err(|error| format!("agents to publish: {error}"))?;
-        Ok(republish(&self.pusher, &self.root, &agents))
+        Ok(republish(&self.root, &agents, crate::push::shared))
     }
 
     /// Fetch a mirror's `main` from its source, unless that happened less
@@ -335,10 +361,14 @@ pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf
 }
 
 /// Queue a push of each `(agent, source)` branch that this host's mirror
-/// of a source receiving branches holds. A branch the source already has
-/// is pushed as a no-op; one it lacks, or has behind, is published. Returns
-/// how many were queued.
-fn republish(pusher: &Pusher, root: &Path, agents: &[(String, Option<String>)]) -> usize {
+/// of a source receiving branches holds, on `pusher_of(source)`. A branch
+/// the source already has is pushed as a no-op; one it lacks, or has
+/// behind, is published. Returns how many were queued.
+fn republish(
+    root: &Path,
+    agents: &[(String, Option<String>)],
+    pusher_of: impl Fn(&str) -> Arc<Pusher>,
+) -> usize {
     let mut queued = 0;
     for (agent, source) in agents {
         let Some(source) = source.as_deref().filter(|source| receives_branches(source)) else {
@@ -346,11 +376,51 @@ fn republish(pusher: &Pusher, root: &Path, agents: &[(String, Option<String>)]) 
         };
         let mirror = root.join(".sources").join(mirror_name(source));
         if mirror.is_dir() && has_branch(&mirror, agent) {
-            pusher.mark(&mirror, source, agent);
+            pusher_of(source).mark(&mirror, source, agent);
             queued += 1;
         }
     }
     queued
+}
+
+/// Push `agent`'s branch from `mirror` to `source` now, through the
+/// process's pusher for `source` ([`Pusher::push_now`]): what a one-shot
+/// store changed (a merge of main) is published before its caller goes on.
+/// A push that failed is not dropped: the branch stays queued on that
+/// pusher, which retries it. `None`: `source` receives no branches.
+pub(crate) fn publish(mirror: &Path, source: &str, agent: &str) -> Option<Pushed> {
+    publish_with(&crate::push::shared(source), mirror, source, agent)
+}
+
+/// [`publish`] on `pusher`.
+pub(crate) fn publish_with(
+    pusher: &Pusher,
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+) -> Option<Pushed> {
+    receives_branches(source).then(|| pusher.push_now(mirror, source, agent))
+}
+
+/// Push `agent`'s branch from this host's mirror again when its head is
+/// `recorded`, the agent's latest recorded checkpoint, which the source
+/// lacks: a push queued in a process that died before it was made (a merge
+/// of main's, whose record is in the log) would otherwise leave the
+/// integrator judging the task `stale` on every pass, forever (issue #8). A
+/// head past the record is not pushed: its own record is due, and its push
+/// with it. `None`: nothing was pushed (another head, no branch, a source
+/// that receives none).
+pub(crate) fn push_recorded(
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+    recorded: &str,
+) -> Option<Pushed> {
+    let head = ref_commit(mirror, &format!("refs/heads/{agent}"))?;
+    if head != recorded {
+        return None;
+    }
+    publish(mirror, source, agent)
 }
 
 /// Bring a mirror's `main` up to its source's default branch. A source that
@@ -485,15 +555,30 @@ impl WorkspaceStore for MissionWorkspaces {
     }
 
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+        self.merge_base_when(workspace, &|| Ok(()))
+    }
+
+    /// Main is fetched first, then the routed store asks `ready` under the
+    /// branch's lock: the slow fetch is never between the question and the
+    /// merge.
+    fn merge_base_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BaseMerge, WorkspaceError> {
         let routed = self.route(workspace.sandbox())?;
         if let Some((repo, source)) = &routed.mirror {
             self.refresh_main(repo, source, false);
         }
-        let merged = routed.store.merge_base(workspace)?;
+        let merged = routed.store.merge_base_when(workspace, ready)?;
         if let (BaseMerge::Merged { .. }, Some((repo, source))) = (&merged, &routed.mirror) {
             self.mark(repo, source, workspace.sandbox());
         }
         Ok(merged)
+    }
+
+    fn hold(&self, workspace: &WorkspaceId) -> Option<Hold> {
+        self.route(workspace.sandbox()).ok()?.store.hold(workspace)
     }
 
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
@@ -540,9 +625,12 @@ impl WorkspaceStore for MissionWorkspaces {
 }
 
 impl Drop for MissionWorkspaces {
-    /// A process that ends (`spawn tick`) pushes what is still waiting.
+    /// A process that ends (`spawn tick`, `spawn loop` after SIGTERM) pushes
+    /// what is still waiting, its one-shot stores' failed pushes included.
     fn drop(&mut self) {
-        self.pusher.flush();
+        if self.flush_on_drop {
+            crate::push::flush_shared();
+        }
     }
 }
 
@@ -684,14 +772,17 @@ mod tests {
         );
 
         // The next process: its pusher starts empty.
-        let pusher = Pusher::new();
+        let pusher = std::sync::Arc::new(Pusher::new());
         let agents = [
             ("agent_x".to_string(), Some(source.clone())),
             ("agent_none".to_string(), Some(source.clone())),
             ("agent_scratch".to_string(), None),
         ];
-        assert_eq!(super::republish(&pusher, &root, &agents), 1);
-        pusher.flush();
+        assert_eq!(
+            super::republish(&root, &agents, |_| std::sync::Arc::clone(&pusher)),
+            1
+        );
+        assert_eq!(pusher.flush(), 0);
         assert_eq!(
             fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
             Some(head)
