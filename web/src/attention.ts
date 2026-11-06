@@ -3,6 +3,8 @@
 // server decides what is an escalation, what the supervisor was told and
 // whether the supervisor asks something; this module only normalizes the
 // answer and groups it for display. No dispatcher rule is repeated here.
+// It is also the UI's one definition of who needs a human (`needsHuman`):
+// the queue's count, the sidebar's, and every "needs a human" mark.
 //
 // Pure: no runtime imports, so `node --test` loads it as it is.
 
@@ -244,8 +246,9 @@ export interface NeedsHuman {
 export function needsHuman(attention: Attention): NeedsHuman {
   const ids = new Set<string>();
   for (const item of [...attention.pending, ...attention.told]) {
+    // `host` and `missions` name no agent's session.
+    if (item.session_id) ids.add(item.session_id);
     if (item.agent_id) ids.add(item.agent_id);
-    if (item.session_id && item.agent_id) ids.add(item.session_id);
   }
   const supervisor = attention.supervisor;
   const question = supervisor?.question ?? null;
