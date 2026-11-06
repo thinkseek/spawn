@@ -724,11 +724,11 @@ impl GitWorkspace {
             .collect())
     }
 
-    /// Paths git would commit (tracked or untracked, ignore rules applied)
-    /// that a checkpoint leaves out: the files over the size cap, with their
-    /// sizes; then the paths that hold something other than a regular file,
-    /// a symlink or a directory (a FIFO, a socket, a device), which git
-    /// cannot add.
+    /// Paths git would commit (tracked or untracked, ignore rules applied,
+    /// the engine's runtime files aside) that a checkpoint leaves out: the
+    /// files over the size cap, with their sizes; then the paths that hold
+    /// something other than a regular file, a symlink or a directory (a
+    /// FIFO, a socket, a device), which git cannot add.
     fn left_out_files(&self, directory: &Path, index: &Path) -> Result<LeftOut, WorkspaceError> {
         let listed = self.listing_in(
             directory,
