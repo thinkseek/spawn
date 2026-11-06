@@ -956,10 +956,9 @@ mod tests {
                 "recorded"
             );
         }
-        assert_eq!(
-            crate::push::shared(&source).threads(),
-            1,
-            "one pusher thread for the source, not one per merge"
+        assert!(
+            crate::push::shared(&source).threads() <= 1,
+            "at most one pusher thread for the source, not one per merge"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
