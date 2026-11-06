@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 
 import type { PollResult } from "../../api";
+import type { Attention } from "../../attention";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { FleetContext } from "../../ordering";
@@ -15,7 +16,10 @@ import { HealthStrip } from "./HealthStrip";
 import type { Liveness } from "./HealthStrip";
 
 interface FleetViewProps {
+  /** Its agents marked by who needs a human (App, attention.ts). */
   fleet: PollResult<Fleet>;
+  /** The dispatcher's view, `/api/attention` (App polls it). */
+  attention: PollResult<Attention>;
   /** Residents and held tasks, from /api/missions (App polls it). */
   context: FleetContext;
   selectedId: string | null;
@@ -26,11 +30,12 @@ interface FleetViewProps {
 /**
  * The landing page, in the order an observer asks: who needs a human, are
  * the always-on agents alive and moving, are resources fine, then how the
- * rest of the fleet works (on a task, idle, ended). The fleet poll lives in
- * App so the sidebar can show the attention count from any view.
+ * rest of the fleet works (on a task, idle, ended). The fleet and attention
+ * polls live in App so the sidebar can show who needs a human from any view.
  */
 export function FleetView({
   fleet,
+  attention,
   context,
   selectedId,
   onSelect,
@@ -91,7 +96,7 @@ export function FleetView({
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
-            <AttentionQueue agents={data.agents} onSelect={onSelect} />
+            <AttentionQueue view={attention} agents={data.agents} onSelect={onSelect} />
             <AlwaysOnAgents
               agents={alwaysOn}
               missing={missing}

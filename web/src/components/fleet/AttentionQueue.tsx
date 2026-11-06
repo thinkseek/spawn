@@ -6,7 +6,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 
-import { fetchAttention, usePoll } from "../../api";
+import type { PollResult } from "../../api";
 import type {
   Attention,
   AttentionItem,
@@ -32,18 +32,19 @@ import { FleetStateBadge, JudgeBadge, RoleBadge } from "./bits";
  * "Needs a human", top of the Fleet page. It shows what the dispatcher's own
  * code holds (`/api/attention`): the supervisor's open question, then the
  * escalations not yet told to the supervisor, then those it was told that
- * still hold. An older server without that endpoint gets today's list of
- * agents whose latest judgement asks for attention, marked as such.
+ * still hold. An older server without that endpoint gets the list of agents
+ * whose latest judgement asks for attention, labelled as the judges' only.
  */
 export function AttentionQueue({
+  view,
   agents,
   onSelect,
 }: {
+  /** `/api/attention`, polled by App; a failed poll keeps the last view. */
+  view: PollResult<Attention>;
   agents: FleetAgent[];
   onSelect: (sessionId: string) => void;
 }) {
-  // Polled like the fleet; a failed poll keeps the last view on screen.
-  const view = usePoll("attention", fetchAttention, 3_000);
   if (view.data) {
     return (
       <DispatcherQueue
@@ -416,7 +417,8 @@ function ItemRow({
 
 // ---------------------------------------------------------------------------
 // Fallback: an older server without `/api/attention`. The list of agents
-// whose latest Jev judgement asks for attention, as before.
+// whose latest judgement asks for attention (the judge's flag), as before,
+// labelled as judgements only.
 
 /** When the agent started waiting for a person, as far as the API says. */
 export function waitingSince(agent: FleetAgent): number | null {
@@ -457,7 +459,7 @@ function JudgementQueue({
   onSelect: (sessionId: string) => void;
   unavailable: string;
 }) {
-  const queue = agents.filter((agent) => agent.attention).sort(rank);
+  const queue = agents.filter((agent) => agent.judgement?.attention === true).sort(rank);
 
   if (queue.length === 0) {
     return (
@@ -468,10 +470,10 @@ function JudgementQueue({
         <CircleCheck size={18} className="shrink-0 text-success" />
         <div className="min-w-0 flex-1">
           <div className="text-label font-medium text-foreground">
-            No one needs a human
+            No judge asks for attention
           </div>
           <div className="text-caption text-muted-foreground">
-            Every agent is either working or settled without you.
+            Who needs a human is the dispatcher's to say, and its view could not be read.
           </div>
         </div>
         <Unavailable error={unavailable} />
@@ -487,7 +489,7 @@ function JudgementQueue({
       <header className="flex h-9 items-center gap-2 border-b border-warning/20 px-4">
         <BellRing size={14} className="shrink-0 text-warning" />
         <h2 className="text-label font-medium text-foreground">
-          Needs a human
+          Judges ask for attention
         </h2>
         <span className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning">
           {queue.length}

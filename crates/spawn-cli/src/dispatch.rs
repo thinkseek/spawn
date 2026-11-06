@@ -282,16 +282,36 @@ pub(crate) enum Why {
     DeliveryFailed,
     /// A Stop of a live execution kept failing.
     StopFailed,
-    /// Free disk on this host crossed the warning threshold (crate::disk).
+    /// Free disk on this host fell under the warning threshold, and is not
+    /// back yet (crate::disk).
     Disk,
-    /// A mission's gate has had no room in TMPDIR for hours
-    /// ([`crate::disk::gate_room_escalations`]).
+    /// Free disk on this host is back above the warning threshold
+    /// (crate::disk): news, see [`Why::is_news`].
+    DiskRecovered,
+    /// A mission's gate has had no room in TMPDIR for hours, and its run of
+    /// `no_room` goes on ([`crate::disk::gate_room_escalations`]).
     GateRoom,
     /// A mission's gate failed twice in a row because the host did (the
     /// test database), not the work ([`digest::host_fault_escalations`]).
     GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
+}
+
+impl Why {
+    /// Whether an item of this kind is news rather than a condition: told
+    /// once, it leaves nothing to resolve. A disk recovery, an approval, a
+    /// human's message and a pair of host faults at the gate (the
+    /// integrator judges again on its own) are news. Every other item is a
+    /// condition that holds while its facts do (a worker's state, a stall,
+    /// a path still low on disk, a gate still without room): told, it stays
+    /// in [`Plan::told`] until its facts change.
+    pub(crate) fn is_news(self) -> bool {
+        matches!(
+            self,
+            Self::DiskRecovered | Self::Approved | Self::Human | Self::GateHostFault
+        )
+    }
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -364,9 +384,10 @@ pub(crate) struct Plan {
     pub(crate) orders: Vec<Order>,
     /// Escalations not delivered yet, whether or not a digest goes out now.
     pub(crate) pending: Vec<Escalation>,
-    /// Escalations that still hold but were already delivered to the
-    /// supervisor (their tag is in its told set): left out of `pending`, so
-    /// never sent again. The attention view shows them as unresolved.
+    /// Escalations already delivered to the supervisor (their tag is in its
+    /// told set) whose condition still holds: left out of `pending`, so
+    /// never sent again. News ([`Why::is_news`]) is not among them: told,
+    /// it is resolved. The attention view shows these as unresolved.
     pub(crate) told: Vec<Escalation>,
 }
 
@@ -429,6 +450,9 @@ pub(crate) fn decide_with(
     (plan.told, plan.pending) = std::mem::take(&mut plan.pending)
         .into_iter()
         .partition(|item| told.contains(&item.tag()));
+    // Every item here holds now (each source gives only what its facts
+    // still say); told news was resolved by the telling.
+    plan.told.retain(|item| !item.why.is_news());
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
             .extend(digest::order(supervisor, &plan.pending, spawn));
@@ -988,6 +1012,83 @@ mod tests {
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
         );
+        assert_eq!(
+            plan.told, host,
+            "told, and the path is still low: unresolved"
+        );
+    }
+
+    /// The live page of 2026-11-06 20:30: two disk recoveries told 8 h
+    /// earlier were listed as told and unresolved. A recovery is news: told
+    /// once, then resolved, while a low path stays unresolved until its
+    /// recovery replaces it (crate::disk::escalations).
+    #[test]
+    fn a_told_recovery_is_resolved_and_a_told_low_path_is_not() {
+        let record = |id: i64, path: &str, state: &str, free: u64| {
+            serde_json::json!({"type": "host.disk", "label": "tmpdir", "path": path,
+                               "state": state, "free_bytes": free << 30, "warn_bytes": 20_u64 << 30,
+                               "floor_bytes": 2_u64 << 30, "event_id": id,
+                               "at_ms": NOW - 8 * 3_600_000})
+        };
+        let host = crate::disk::escalations(
+            &[
+                record(7, "/data/tmp", "recovered", 43),
+                record(8, "/ws", "low", 5),
+            ],
+            NOW,
+        );
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
+        let pending: Vec<String> = plan.pending.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            pending,
+            ["host disk-7", "host disk-8"],
+            "both news until told"
+        );
+        let CommandAction::Input { text, .. } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert!(
+            text.contains(
+                "- host — disk space back on this host: tmpdir /data/tmp has 43.0 GiB free again\n"
+            ),
+            "{text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty(),
+            "told once"
+        );
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host disk-8"], "the recovery is not unresolved");
+    }
+
+    /// News of every kind is resolved by being told: a told approval, human
+    /// message or pair of host faults is never kept as unresolved, even if
+    /// its source still gives it.
+    #[test]
+    fn told_news_is_never_unresolved() {
+        let item = |why: Why, id: &str| Escalation {
+            session_id: "host".to_string(),
+            id: id.to_string(),
+            why,
+            line: String::new(),
+            since_ms: None,
+        };
+        let host = [
+            item(Why::Approved, "approved-core"),
+            item(Why::Human, "human-4"),
+            item(Why::GateHostFault, "gate-host-fault-9"),
+            item(Why::GateRoom, "gate-room-12"),
+        ];
+        let mut supervisor = idle_supervisor();
+        supervisor.told = host.iter().map(Escalation::tag).collect();
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(plan.pending.is_empty());
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host gate-room-12"], "only the condition holds");
     }
 
     /// The live sequence of 2026-11-06: 100 human notes to one worker could
