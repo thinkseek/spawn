@@ -4,6 +4,10 @@
 
 import { apiError, apiHeaders } from "./api";
 import type { RsiSummary } from "./api";
+import { normalizeHolds } from "./attention";
+import type { SourceHold } from "./attention";
+
+export type { SourceHold } from "./attention";
 
 export const TASK_STATES = [
   "assigned",
@@ -47,7 +51,8 @@ export interface LastGate {
 /** One of a task's records in the control stream (`spawn task stages`). */
 export interface TaskStage {
   /** The record type without `task.`: assigned, delivered, reported,
-   * reviewed, gated, landed, aborted or cancelled. */
+   * reviewed, gated, held (waits behind the owner's hold), landed, aborted
+   * or cancelled. */
   stage: string;
   /** A gate's verdict, or a review's (`accepted`, `rejected`). */
   verdict: string | null;
@@ -113,6 +118,8 @@ export interface MissionTask {
   stages: TaskStage[];
   /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
   model: string | null;
+  /** The owner's hold its landing last waited behind, if any. */
+  held_by: number | null;
   created_by: string | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
@@ -136,6 +143,9 @@ export interface Mission {
   halted: string | null;
   /** Objective missions: the backlog and the resident that works it. */
   objectives: { backlog: string | null; resident: string | null } | null;
+  /** The owner's active hold on its source (its event id): no task lands
+   * there while it lasts. */
+  hold: number | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
   tasks: MissionTask[];
@@ -157,6 +167,8 @@ export interface Resident {
 export interface Missions {
   missions: Mission[];
   residents: Resident[];
+  /** Every active owner's hold, with the tasks waiting behind it. */
+  holds: SourceHold[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -237,6 +249,7 @@ function normalizeTask(value: unknown): MissionTask | null {
       .map(normalizeStage)
       .filter((stage): stage is TaskStage => stage !== null),
     model: optionalText(value.model),
+    held_by: optionalNumber(value.held_by),
     created_by: optionalText(value.created_by),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
@@ -279,6 +292,7 @@ function normalizeMission(value: unknown): Mission | null {
           resident: optionalText(value.objectives.resident),
         }
       : null,
+    hold: optionalNumber(value.hold),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
     tasks,
@@ -327,7 +341,7 @@ export function normalizeMissions(value: unknown): Missions {
         RESIDENT_RANK[left.state] - RESIDENT_RANK[right.state] ||
         (left.name ?? "").localeCompare(right.name ?? ""),
     );
-  return { missions, residents };
+  return { missions, residents, holds: normalizeHolds(raw.holds) };
 }
 
 export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
@@ -368,6 +382,9 @@ export function stageStep(stage: TaskStage): StageStep {
             ? "back"
             : "forward",
       };
+    case "held":
+      // Its source is held by the owner: nothing was pushed, it waits.
+      return { label: "waits behind the owner's hold", tone: "forward" };
     case "aborted":
     case "cancelled":
       return { label: stage.stage, tone: "closed" };
