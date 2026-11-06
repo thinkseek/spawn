@@ -4,7 +4,8 @@
 //! input so it can be recorded waiting too), while an unfinished command
 //! with no `waiting` step still holds everything behind it. `spawn_release`
 //! makes a held command claimable again after the given time, and only for
-//! the lease that holds it.
+//! the lease that holds it. The `waiting` step is no activity: it moves
+//! neither the dispatcher's latest evidence nor a session's latest fact.
 //!
 //! A real database is required (`SPAWN_TEST_DATABASE_URL`); every case runs
 //! in a schema of its own.
@@ -160,4 +161,41 @@ fn a_release_moves_only_the_lease_that_holds_the_command() {
     store.finish(&claimed, &Outcome::Succeeded).expect("finish");
     store.release(&claimed, Duration::ZERO).expect("release");
     assert!(store.claim("w1", Duration::from_mins(1)).expect("claim").is_none());
+}
+
+/// The dispatcher's `evidence_seq` (what a judgement must cover not to look
+/// stale) does not move with a `waiting` step; another command step does.
+#[test]
+fn a_waiting_step_is_not_evidence_the_judgement_must_cover() {
+    let (store, _schema) = store("waiting_evidence");
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new(AGENT).expect("valid agent"),
+            session_id: SessionId::new(SESSION).expect("valid session"),
+            execution_id: None,
+            source: Source::Claude,
+            source_event_id: Some("message-1".to_string()),
+            kind: EventKind::MessageReceived,
+        })
+        .expect("append");
+    let evidence = || store.dispatch_facts().expect("facts")[0]["evidence_seq"].clone();
+    let before = evidence();
+    assert!(before.is_u64(), "{before}");
+    waiting(&store, CommandId(1), Source::Bridge);
+    assert_eq!(evidence(), before, "a waiting input is not activity");
+    store
+        .append(NewEvent {
+            agent_id: AgentId::new(AGENT).expect("valid agent"),
+            session_id: SessionId::new(SESSION).expect("valid session"),
+            execution_id: None,
+            source: Source::Bridge,
+            source_event_id: Some("cmd_1:typing".to_string()),
+            kind: EventKind::CommandStepped {
+                command_id: CommandId(1),
+                step: CommandStep::Typing,
+                workspace: None,
+            },
+        })
+        .expect("append");
+    assert_ne!(evidence(), before, "the typing is");
 }
