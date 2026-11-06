@@ -1,4 +1,4 @@
-import { Activity, LayoutGrid, Orbit, Rows3, Target, Waypoints } from "lucide-react";
+import { Activity, Gauge, LayoutGrid, Orbit, Rows3, Target, Waypoints } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { OverviewSession, RsiSummary } from "../api";
@@ -20,6 +20,7 @@ interface SidebarProps {
   onShowFleet: () => void;
   onShowMissions: () => void;
   onShowRsi: () => void;
+  onShowScorecard: () => void;
   onShowShow: () => void;
   onShowSessions: () => void;
   onSelect: (sessionId: string) => void;
@@ -48,6 +49,7 @@ export function Sidebar({
   onShowFleet,
   onShowMissions,
   onShowRsi,
+  onShowScorecard,
   onShowShow,
   onSelect,
 }: SidebarProps) {
@@ -91,6 +93,12 @@ export function Sidebar({
               </span>
             )
           }
+        />
+        <NavItem
+          active={view === "scorecard"}
+          onClick={onShowScorecard}
+          icon={<Gauge size={15} />}
+          label="Scorecard"
         />
         <NavItem
           active={view === "show"}
@@ -234,6 +242,7 @@ export function MobileNav({
   onShowFleet,
   onShowMissions,
   onShowRsi,
+  onShowScorecard,
   onShowShow,
   onShowSessions,
 }: Pick<
@@ -243,18 +252,20 @@ export function MobileNav({
   | "onShowFleet"
   | "onShowMissions"
   | "onShowRsi"
+  | "onShowScorecard"
   | "onShowShow"
   | "onShowSessions"
 >) {
   return (
     <div className="flex h-12 shrink-0 items-center gap-3 border-b border-sidebar-border bg-sidebar px-3 md:hidden">
       <Brand />
-      <div className="ml-auto flex rounded-lg border border-surface-border bg-surface p-0.5">
+      <div className="ml-auto flex min-w-0 overflow-x-auto rounded-lg border border-surface-border bg-surface p-0.5">
         {(
           [
             ["fleet", "Fleet", <LayoutGrid key="f" size={13} />, onShowFleet],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
+            ["scorecard", "Score", <Gauge key="g" size={13} />, onShowScorecard],
             ["show", "Show", <Waypoints key="w" size={13} />, onShowShow],
             ["sessions", "Sessions", <Rows3 key="s" size={13} />, onShowSessions],
           ] as const
