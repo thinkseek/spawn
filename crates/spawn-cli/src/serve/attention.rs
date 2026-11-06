@@ -389,7 +389,7 @@ fn for_owner(line: &str) -> Option<&str> {
         .strip_prefix(':')?;
     Some(
         rest.trim_start_matches(|c: char| c.is_whitespace() || emphasis(c))
-            .trim_end(),
+            .trim_end_matches(|c: char| c.is_whitespace() || c == '*'),
     )
 }
 
@@ -531,7 +531,7 @@ mod tests {
     fn the_views_pending_is_the_dispatchers_pending() {
         let (rows, work, host) = situation();
         let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
-        let view = answer(&rows, &plan, &Value::Null, &Value::Null, &[], NOW);
+        let view = answer(&rows, &plan, &Value::Null, &Value::Null, &json!([]), &[], NOW);
         let pending = view["pending"].as_array().expect("pending");
         assert_eq!(pending.len(), plan.pending.len());
         for (shown, planned) in pending.iter().zip(&plan.pending) {
@@ -569,7 +569,7 @@ mod tests {
         let told_at = json!({
             "session_worker_objective_90 resume-exec_agent_worker_objective_90": NOW - 4_000_000,
         });
-        let view = answer(&rows, &plan, &told_at, &Value::Null, &[], NOW);
+        let view = answer(&rows, &plan, &told_at, &Value::Null, &json!([]), &[], NOW);
         let told = view["told"].as_array().expect("told");
         assert_eq!(told.len(), 1, "a told tag no longer current is not shown");
         assert_eq!(told[0]["told"], true);
@@ -637,7 +637,7 @@ mod tests {
         ]
         .concat();
         let turn = json!({"transcript": "/t.jsonl", "workspace": "a:/w", "turn_ended_at_ms": NOW - 14_000_000});
-        let asked = question(supervisor, observation, &turn, Some(transcript.as_bytes()));
+        let asked = question(supervisor, observation, &turn, Some(&said(transcript.as_bytes())));
         assert_eq!(
             asked["text"],
             "Another failed delivery.\nMy question about stopping `objective_87` is still open.",
@@ -651,7 +651,7 @@ mod tests {
             crate::scorecard::time::parse_rfc3339("2026-11-06T05:15:56.850Z").expect("a time")
         );
         let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
-        let view = answer(&rows, &plan, &Value::Null, &asked, &[], NOW);
+        let view = answer(&rows, &plan, &Value::Null, &asked, &json!([]), &[], NOW);
         let shown = &view["supervisor"];
         assert_eq!(shown["live"], true);
         assert_eq!(shown["judgement"]["state"], "BLOCKED");
