@@ -174,6 +174,9 @@ export function TaskPanel({
                       {verdict.by === "reviewed" ? "review" : "gate"} {verdict.verdict}
                     </span>
                     {verdict.sentBack && <span className="text-warning"> · sent back</span>}
+                    {verdict.verdict === "host_fault" && (
+                      <span className="text-info"> · the host's, not the work's</span>
+                    )}
                     {verdict.reason && (
                       <span className="block truncate text-caption text-muted-foreground" title={verdict.reason}>
                         {verdict.reason}

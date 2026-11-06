@@ -21,7 +21,7 @@
 
 mod history;
 mod measure;
-mod time;
+pub(crate) mod time;
 mod transcripts;
 
 #[cfg(test)]

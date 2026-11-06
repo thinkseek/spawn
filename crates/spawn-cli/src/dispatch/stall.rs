@@ -169,7 +169,8 @@ pub(crate) struct OpenTask {
 pub(crate) struct Verdict {
     pub(crate) mission_id: i64,
     pub(crate) id: i64,
-    /// `accepted`, `rejected`, `conflict`, `incompatible` or `aborted`.
+    /// `accepted`, `rejected`, `conflict`, `incompatible`, `aborted`,
+    /// `no_room` or `host_fault`.
     #[serde(rename = "verdict")]
     pub(crate) outcome: String,
     #[serde(default)]
@@ -468,8 +469,13 @@ fn gate(
         || "no verdict in the mission yet".to_string(),
         |verdict| {
             format!(
-                "the mission's latest verdict: {} on task #{} (record {}, {} ago)",
+                "the mission's latest verdict: {}{} on task #{} (record {}, {} ago)",
                 verdict.outcome,
+                if verdict.outcome == "host_fault" {
+                    " (the host's, not the work's: judged again after its backoff)"
+                } else {
+                    ""
+                },
                 verdict.task.as_deref().unwrap_or("?"),
                 verdict.id,
                 took(now - verdict.at_ms)
