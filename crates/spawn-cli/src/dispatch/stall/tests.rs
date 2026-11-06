@@ -508,7 +508,14 @@ fn a_delivery_given_up_gets_no_stall_item() {
         "spawn",
     );
     assert!(plan.pending.is_empty(), "{:?}", plan.pending);
-    assert_eq!(plan.reissues.len(), 1, "due: its last attempt is long past");
+    assert!(
+        plan.reissues.is_empty(),
+        "its last attempt finished 100 s ago: the re-issue waits 300 s"
+    );
+    let later = NOW + 200_000;
+    let plan = decide_with(&[facts.clone()], &first, &[], false, later, "spawn");
+    assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+    assert_eq!(plan.reissues.len(), 1);
     assert_eq!(plan.reissues[0].task, 7);
     // One that may have typed: not retried, and its stall is escalated.
     let mut unsure = worker(SemanticState::Waiting, true);
