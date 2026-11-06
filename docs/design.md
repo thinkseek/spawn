@@ -372,6 +372,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 审计第 1、2、3、9、16、23 条已修复（分支 `audit-stops`）：失败的 Stop，不论谁发的，调度器都从命令队列读出当前执行的 Stop 及其结果，换新键重发、等待加倍，三次后升级给 supervisor（`dispatch/stops.rs`）；集成器先提交中止的 Stop 再记 `task.aborted`；没打进去的 nudge 不算催过；人发的命令完成后才算消息，失败的照实说；`done-<episode>` 看记下的 `end_cause`；`dispatched` 保留当前回合的 nudge 与当前执行的 resume，关闭的临时任务在工人仍在跑时留在投递行里，批准与人的消息直到告知为止都算消息：不再凭 24 小时窗口判断“没发过”或“不是消息”。
 
+用尽的投递也按这条规则处理（objective 19，`deliver.rs`）：首次投递的重试用尽、且没有一次尝试可能打进去（错误里没有 `MAY_HAVE_TYPED`）时，调度器在最后一次尝试结束 `SPAWN_REISSUE_AFTER_SECS` 之后（数据库时钟）重发它，依据是记下的每次尝试及其结果，而不是“一直没送到”或单纯的时间；重发本身是记录：同一事务里的 `task.cancelled`（`by`、`reissued_as`、`attempts`）与 `task.assigned`（`reissue_of`）互相指名。重发的任务不再重发，它的投递也用尽时才升级给 supervisor。部署后的那次补试依据一条记下的 `source.moved`（`spawn mission moved` 每次部署都记，哪怕没有任务组的基线移动），它是一条有自己键（`deliver-<task>-<revision>-moved-<事件 id>`）的命令，结果照常检查；失败就保持原状，等下一条 `source.moved`。
+
 所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
 
 停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
