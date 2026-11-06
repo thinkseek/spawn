@@ -79,6 +79,27 @@ create index if not exists spawn_events_session_name
 create index if not exists spawn_events_agent_name
     on spawn_events (agent_id, event_name, id);
 
+-- The dashboard's reads (`spawn serve`; docs/view-architecture.md §8 has
+-- the plans). A session's judgements by time: when its current state began
+-- (the fleet board's `state_since_ms`) is the judgement after the latest one
+-- of another state, found newest first instead of by reading them all.
+create index if not exists spawn_events_observation_time
+    on spawn_events (session_id, recorded_at_ms)
+    where event_name = 'observation.recorded';
+
+-- A tool call's end by its `tool_use_id`: `agent_open_tools` (a live
+-- session's current tool) looks each start's end up instead of reading
+-- every end of the session for every start.
+create index if not exists spawn_events_tool_done
+    on spawn_events (session_id, (kind -> 'detail' ->> 'tool_use_id'))
+    where event_name in ('tool.completed', 'tool.failed');
+
+-- Events of one kind in a window, across sessions: the fleet's health (the
+-- last hour's tool calls and failures, the day's judgements and
+-- executions) reads the window, not the whole log.
+create index if not exists spawn_events_name_time
+    on spawn_events (event_name, recorded_at_ms);
+
 -- Projection: one row per session, written by `spawn_append` in the same
 -- transaction as the event, so `agent_state`, `agent_status` and
 -- `agent_freshness` read one row instead of folding the log. The log stays
