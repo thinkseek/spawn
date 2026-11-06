@@ -214,6 +214,7 @@ no new executions start; free space (old workspaces, build output) or tell the o
                 id: format!("disk-{id}"),
                 why: Why::Disk,
                 line,
+                since_ms: record["at_ms"].as_i64(),
             })
         })
         .collect()
@@ -245,6 +246,7 @@ free in TMPDIR {tmpdir}, under SPAWN_GATE_MIN_FREE_GB={}. Its work waits (no hal
 space there (old gate scratch, build output) or tell the owner.",
                     record["min_gb"].as_u64().unwrap_or_default()
                 ),
+                since_ms: record["at_ms"].as_i64(),
             })
         })
         .collect()
