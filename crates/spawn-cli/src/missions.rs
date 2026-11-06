@@ -68,6 +68,28 @@ fn hold_bound(text: Option<&str>) -> Result<i32, String> {
         })
 }
 
+/// Hold landings on `source` for `bound` seconds (`spawn mission hold`):
+/// under the integrator's landing lock, so a landing whose push has begun
+/// records its outcome first, the main read here is the one it left, and no
+/// landing starts before the hold is recorded. The hold as printed:
+/// `{hold, source, main, expires_ms, renews}`.
+pub(crate) fn hold_source(
+    store: &spawn_postgres::PostgresStore,
+    source: &str,
+    bound: i32,
+    reason: Option<&str>,
+) -> Result<Value, String> {
+    let lock = store
+        .source_hold_lock(source)
+        .map_err(|error| error.to_string())?;
+    let (_, main) = crate::integrate::source_head(source)?;
+    let held = store
+        .source_hold(source, &main, bound, reason)
+        .map_err(|error| error.to_string())?;
+    drop(lock);
+    Ok(held)
+}
+
 fn print(value: &Value) {
     println!(
         "{}",
@@ -281,16 +303,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
                     reason.chars().count()
                 ));
             }
-            // Under the integrator's landing lock: a landing whose push has
-            // begun records its outcome first, so the main read here is the
-            // one it left, and no landing starts before the hold is recorded.
-            let lock = store.source_hold_lock(&source).map_err(err)?;
-            let (_, main) = crate::integrate::source_head(&source)?;
-            let held = store
-                .source_hold(&source, &main, bound, reason.as_deref())
-                .map_err(err)?;
-            drop(lock);
-            print(&held);
+            print(&hold_source(&store, &source, bound, reason.as_deref())?);
         }
         "release" => {
             let source = text(&flags, "source")?;
