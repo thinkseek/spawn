@@ -1247,23 +1247,27 @@ impl Judge {
             // A rejected merge is judged again as the head alone, against
             // the main the head last took in: main's moves alone may have
             // broken it (`incompatible`, never counted).
-            Ok(verdict) => match rejection(&mirror_path, main, &candidate, &branch, &verdict, &run_gate)? {
-                Rejection::Record(verdict, extra) => gated(verdict, extra),
-                Rejection::HeadNoRoom {
-                    free_kb,
-                    min_gb,
-                    tmpdir,
-                    log,
-                    head,
-                } => {
-                    let mut extra =
-                        no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms());
-                    if let (Some(target), Some(head)) = (extra.as_object_mut(), head.as_object()) {
-                        target.extend(head.clone());
+            Ok(verdict) => {
+                match rejection(&mirror_path, main, &candidate, &branch, &verdict, &run_gate)? {
+                    Rejection::Record(verdict, extra) => gated(verdict, extra),
+                    Rejection::HeadNoRoom {
+                        free_kb,
+                        min_gb,
+                        tmpdir,
+                        log,
+                        head,
+                    } => {
+                        let mut extra =
+                            no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms());
+                        if let (Some(target), Some(head)) =
+                            (extra.as_object_mut(), head.as_object())
+                        {
+                            target.extend(head.clone());
+                        }
+                        gated("no_room", extra)
                     }
-                    gated("no_room", extra)
                 }
-            },
+            }
             // No room in TMPDIR: a fact about the host, never a count.
             Err(GateFailure::NoRoom {
                 free_kb,
@@ -1795,13 +1799,8 @@ fn rejection(
     Ok(match run_gate(&head_base, head) {
         Ok(alone) if alone.accepted => {
             let commits = main_commits(mirror_path, &head_base, main)?;
-            let note = incompatible_note(
-                &merged.reason,
-                &merged.output,
-                &head_base,
-                main,
-                &commits,
-            );
+            let note =
+                incompatible_note(&merged.reason, &merged.output, &head_base, main, &commits);
             let hashes: Vec<&str> = commits.iter().map(|(hash, _)| hash.as_str()).collect();
             Rejection::Record(
                 "incompatible",
@@ -2850,7 +2849,8 @@ mod tests {
         head_on_main: bool,
     ) -> (std::path::PathBuf, String, String, String, String) {
         let git = crate::sources::git;
-        let base = std::env::temp_dir().join(format!("spawn-semantic-{tag}-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("spawn-semantic-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).expect("seed directory");
@@ -2859,7 +2859,7 @@ mod tests {
         std::fs::write(seed.join("struct.txt"), "a b\n").expect("write");
         commit_in(&seed_path, "base: Facts {a, b}");
         let m0 = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("m0");
-        let mut work = |from: &str| {
+        let work = |from: &str| {
             git(&["-C", &seed_path, "checkout", "-qb", "work", from]).expect("branch");
             std::fs::write(seed.join("use.txt"), format!("{uses}\n")).expect("write");
             commit_in(&seed_path, "spawn checkpoint exec_1");
@@ -2944,14 +2944,18 @@ mod tests {
                 &scenarios,
                 None,
                 &env,
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_mins(1),
             )
         };
         let candidate = super::landing_candidate(mirror, main, head, "Work (task 48)\n")
             .expect("a candidate")
             .expect("a clean merge");
         let merged = run_gate(main, &candidate).expect("a verdict on the merge");
-        assert!(!merged.accepted, "the merge fails the gate: {}", merged.output);
+        assert!(
+            !merged.accepted,
+            "the merge fails the gate: {}",
+            merged.output
+        );
         let rejection =
             super::rejection(mirror, main, &candidate, head, &merged, &run_gate).expect("judged");
         (candidate, rejection)
@@ -2984,7 +2988,8 @@ mod tests {
         let note = record["note"].as_str().expect("a note");
         let first = note.lines().next().unwrap_or_default();
         assert!(
-            first.contains("missing field `c` in initializer of `Facts`") && first.contains(&m1[..12]),
+            first.contains("missing field `c` in initializer of `Facts`")
+                && first.contains(&m1[..12]),
             "the first line says it all: {first}"
         );
         for wanted in [
@@ -3072,7 +3077,12 @@ mod tests {
     #[test]
     fn an_incompatible_note_bounds_the_commits_it_lists() {
         let commits: Vec<(String, String)> = (0..super::NOTE_COMMITS + 3)
-            .map(|n| (format!("{n:012x}{}", "a".repeat(28)), format!("landing {n}")))
+            .map(|n| {
+                (
+                    format!("{n:012x}{}", "a".repeat(28)),
+                    format!("landing {n}"),
+                )
+            })
             .collect();
         let note = super::incompatible_note(
             "candidate tests do not build",
@@ -3085,8 +3095,14 @@ mod tests {
         let first = note.lines().next().unwrap_or_default();
         assert!(first.contains(&format!("{:012x}", 4)), "{first}");
         assert!(!first.contains(&format!("{:012x}", 5)), "{first}");
-        assert!(first.contains("38 more") && first.ends_with(": error: x"), "{first}");
-        assert!(!note.contains(&format!("landing {}\n", super::NOTE_COMMITS)), "{note}");
+        assert!(
+            first.contains("38 more") && first.ends_with(": error: x"),
+            "{first}"
+        );
+        assert!(
+            !note.contains(&format!("landing {}\n", super::NOTE_COMMITS)),
+            "{note}"
+        );
         assert!(note.contains("and 3 more"), "{note}");
         assert!(note.ends_with("error: x\n"), "{note}");
     }

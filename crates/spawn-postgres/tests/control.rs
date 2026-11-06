@@ -477,7 +477,13 @@ fn an_incompatible_verdict_sends_the_task_back_and_counts_no_rejection() {
         .collect();
     assert_eq!(
         verdicts,
-        vec!["incompatible", "incompatible", "incompatible", "aborted", "rejected"]
+        vec![
+            "incompatible",
+            "incompatible",
+            "incompatible",
+            "aborted",
+            "rejected"
+        ]
     );
     assert!(
         store
@@ -489,7 +495,11 @@ fn an_incompatible_verdict_sends_the_task_back_and_counts_no_rejection() {
 
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
 }
 
 #[test]
