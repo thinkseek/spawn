@@ -2648,6 +2648,10 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     let on_source = mission_at(&store, source, "b0");
     let halted = mission_at(&store, source, "b0");
     let elsewhere = mission_at(&store, other, "b0");
+    // No verdict yet, so no baseline: the owner's move gives it its first.
+    let fresh = store
+        .mission_add("New on the source", &json!([source]), "human")
+        .expect("add");
     store
         .integrator_record(&json!({"type": "mission.halted", "id": halted, "reason": "stop"}))
         .expect("halt");
@@ -2742,18 +2746,19 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
         .expect("moved");
     let recorded = record_of(&mut client, moved);
     assert_eq!(recorded["missions"], json!([on_source]), "{recorded}");
+    assert_eq!(recorded["without_baseline"], json!([fresh]), "{recorded}");
     assert_eq!(recorded["request"], json!(second));
     assert_eq!(recorded["by"], "human");
     let baselines: Vec<String> = client
         .query(
             "select baseline from mission_missions where id = any($1) order by id",
-            &[&vec![on_source, halted, elsewhere]],
+            &[&vec![on_source, halted, elsewhere, fresh]],
         )
         .expect("baselines")
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(baselines, ["n1", "b0", "b0"]);
+    assert_eq!(baselines, ["n1", "b0", "b0", "n1"]);
     let outcome = store
         .source_push_outcome(second)
         .expect("outcome")
