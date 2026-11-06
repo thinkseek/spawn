@@ -166,7 +166,7 @@ pub fn names_files_outside_git(message: &str) -> bool {
 
 /// The locale every git Spawn runs gets (`LC_ALL`): git's own, untranslated
 /// messages.
-pub const GIT_LOCALE: &str = "C";
+const GIT_LOCALE: &str = "C";
 
 /// A command that runs `program` (the git to run) the way Spawn runs every
 /// git: in the C locale, [`GIT_LOCALE`] as `LC_ALL` and no `LANGUAGE`.
