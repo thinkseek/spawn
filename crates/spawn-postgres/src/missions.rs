@@ -574,9 +574,44 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
                                                       where k.agent_id = a.agent_id))
                   order by a.agent_id";
 
+/// The owner's landing requests (`source.push_requested`, `spawn mission
+/// push`) that have no outcome yet (a `source.moved` or a
+/// `source.push_refused` naming them), oldest first: `[{request, source,
+/// commit, ref, at_ms}]`, `request` the request's event id. Read through the
+/// `spawn_events_source_push` index.
+pub(crate) const SOURCE_PUSHES_PENDING: &str = r"
+with owner as (
+  select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
+    from spawn_events e
+   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+     and e.kind -> 'detail' -> 'record' ->> 'type'
+         in ('source.push_requested', 'source.push_refused', 'source.moved'))
+select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 'source',
+                                             'commit', q.r ->> 'commit', 'ref', q.r ->> 'ref',
+                                             'at_ms', q.recorded_at_ms)
+                          order by q.session_seq), '[]'::jsonb)
+  from owner q
+ where q.r ->> 'type' = 'source.push_requested'
+   and not exists (select 1 from owner o where o.r ->> 'request' = q.id::text)";
+
+/// The outcome of the owner's landing request `$1` (its event id): the
+/// `source.moved` or `source.push_refused` record naming it, with its own
+/// `event_id` and `at_ms`; no row while it is pending.
+pub(crate) const SOURCE_PUSH_OUTCOME: &str = r"
+select e.kind -> 'detail' -> 'record' || jsonb_build_object('event_id', e.id,
+                                                            'at_ms', e.recorded_at_ms)
+  from spawn_events e
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type'
+       in ('source.push_requested', 'source.push_refused', 'source.moved')
+   and e.kind -> 'detail' -> 'record' ->> 'request' = ($1::bigint)::text
+ order by e.session_seq
+ limit 1";
+
 // Delivery bookkeeping, run by the dispatcher as the owner.
 
-/// A landing held by [`PostgresStore::landing_hold`]; released when dropped
+/// A landing held by [`PostgresStore::landing_hold`] or
+/// [`PostgresStore::source_push_hold`]; released when dropped
 /// (and with the connection, if the process dies first).
 pub struct LandingHold<'store> {
     store: &'store PostgresStore,
@@ -711,7 +746,50 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// Record a gate verdict, a landing, an abort or a halt (owner only).
+    /// Ask for `commit` on `source`'s main (`spawn mission push`, owner
+    /// only): the commit waits in the source at `reference`
+    /// (`refs/spawn-owner/<commit>`). Records `source.push_requested` and
+    /// returns its event id; the integrator applies it.
+    pub fn source_push_request(
+        &self,
+        source: &str,
+        commit: &str,
+        reference: &str,
+    ) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_source_push_request($1, $2, $3)",
+                &[&source, &commit, &reference],
+            )?
+            .get(0))
+    }
+
+    /// The owner's landing requests without an outcome yet, oldest first
+    /// ([`SOURCE_PUSHES_PENDING`]).
+    pub fn source_pushes_pending(&self) -> Result<Value, StoreError> {
+        self.query_json(SOURCE_PUSHES_PENDING, &[])
+    }
+
+    /// The outcome of the owner's landing request `request`, `None` while it
+    /// is pending ([`SOURCE_PUSH_OUTCOME`]).
+    pub fn source_push_outcome(&self, request: i64) -> Result<Option<Value>, StoreError> {
+        Ok(self
+            .query_opt(SOURCE_PUSH_OUTCOME, &[&request])?
+            .map(|row| row.get(0)))
+    }
+
+    /// Hold an owner's landing (owner only): the lock of
+    /// [`Self::landing_hold`], so no task landing's push and its record are
+    /// split by it. Take it before reading the source's main and keep it
+    /// until the outcome is recorded.
+    pub fn source_push_hold(&self) -> Result<LandingHold<'_>, StoreError> {
+        self.execute("select spawn_source_push_hold()", &[])?;
+        Ok(LandingHold { store: self })
+    }
+
+    /// Record a gate verdict, a landing, an abort or a halt, or the outcome
+    /// of an owner's landing request (`source.moved` naming its `request`,
+    /// `source.push_refused`) (owner only).
     pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
         Ok(self
             .query_one("select spawn_integrator_record($1)", &[record])?
