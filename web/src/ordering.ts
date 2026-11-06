@@ -226,8 +226,8 @@ function byStart(left: MissionTask, right: MissionTask): number {
 /**
  * A mission's tasks in sections (only the non-empty ones, in
  * TASK_SECTIONS order). Tasks that share an objective are one group whose
- * row is the latest attempt, or the latest open one when attempts overlap
- * (an open attempt is never nested under a closed one); the row's section
+ * row is the latest attempt, or the latest in flight when attempts overlap
+ * (work in flight is never nested under an ended attempt); the row's section
  * decides the group's. In flight
  * runs oldest first, so the longest-running is on top; the rest newest
  * first. `items` may be tasks or anything that carries one (a timeline bar).
@@ -250,8 +250,8 @@ export function groupTasks<T>(
   const sections = new Map<TaskSection, TaskGroup<T>[]>();
   for (const [key, bucket] of buckets) {
     const ordered = [...bucket].sort((left, right) => byStart(taskOf(left), taskOf(right)));
-    const open = ordered.filter((entry) => isOpenTask(taskOf(entry), mission));
-    const item = open.length > 0 ? open[open.length - 1] : ordered[ordered.length - 1];
+    const flying = ordered.filter((entry) => taskSection(taskOf(entry), mission) === "in_flight");
+    const item = flying.length > 0 ? flying[flying.length - 1] : ordered[ordered.length - 1];
     const task = taskOf(item);
     const section = taskSection(task, mission);
     const earlier = ordered
