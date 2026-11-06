@@ -312,8 +312,16 @@ fn moved_from(
     let (Some(baseline), None) = (only.next(), only.next()) else {
         return main.to_string();
     };
-    let parent =
-        |n: u8| git(&["--git-dir", source, "rev-parse", "--verify", "--quiet", &format!("{main}^{n}")]);
+    let parent = |n: u8| {
+        git(&[
+            "--git-dir",
+            source,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{main}^{n}"),
+        ])
+    };
     let ours = if main == commit {
         contains(source, baseline, main)
     } else {
