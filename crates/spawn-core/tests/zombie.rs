@@ -336,7 +336,9 @@ fn a_stop_writes_the_end_it_finds_no_runner_for() {
 /// issue's reporter found (input "runs no execution", start refused by the
 /// log, stop "succeeded" without an end). Asked directly, the log answers
 /// truly.
-struct Missed(Arc<MemoryStore>);
+/// With `mount` the view misses the start's mount record too, so nothing
+/// at recover points at the execution: the command finds it in the log.
+struct Missed(Arc<MemoryStore>, bool);
 
 impl EventLog for Missed {
     fn append(&self, event: NewEvent) -> Result<spawn_core::event::Appended, StoreError> {
@@ -354,8 +356,16 @@ impl EventLog for Missed {
             .read_global(after, limit)?
             .into_iter()
             .filter(|record| {
-                !(matches!(record.event.kind, EventKind::ExecutionStarted { .. })
-                    && record.event.execution_id.as_ref() == Some(&first))
+                let start = matches!(record.event.kind, EventKind::ExecutionStarted { .. })
+                    && record.event.execution_id.as_ref() == Some(&first);
+                let mount = matches!(
+                    record.event.kind,
+                    EventKind::CommandStepped {
+                        command_id: CommandId(1),
+                        ..
+                    }
+                );
+                !(start || (self.1 && mount))
             })
             .collect())
     }
@@ -367,9 +377,10 @@ impl EventLog for Missed {
 
 #[test]
 fn an_execution_the_view_lost_and_the_log_holds_open_is_ended_by_each_command() {
-    // Input: ended as lost, not "runs no execution".
+    // Input: ended as lost, not "runs no execution". The view missed the
+    // start's mount too: the input finds the execution in the log.
     let store = zombie(Gone::Restored);
-    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone()));
+    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone(), true));
     submit(
         &store,
         "key_digest",
@@ -393,9 +404,11 @@ fn an_execution_the_view_lost_and_the_log_holds_open_is_ended_by_each_command() 
     );
     assert_eq!(ends(&store).len(), 1);
 
-    // Start: the log's guard no longer refuses it.
+    // Start: the log's guard no longer refuses it. (The view saw the
+    // mount: recover keeps it, the execution's own, and follows the
+    // execution again; its final checkpoint then commits.)
     let store = zombie(Gone::Restored);
-    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone()));
+    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone(), false));
     submit(&store, "key_again", "spawn-liveness", start("charter"));
     tick_over(missed, &store);
     let (succeeded, error) = outcome(&store, 2);
@@ -404,7 +417,7 @@ fn an_execution_the_view_lost_and_the_log_holds_open_is_ended_by_each_command() 
 
     // Stop: it writes the end the log waits for.
     let store = zombie(Gone::Restored);
-    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone()));
+    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone(), false));
     submit(&store, "key_stop", "tester", CommandAction::Stop);
     tick_over(missed, &store);
     assert!(outcome(&store, 2).0);
@@ -420,7 +433,7 @@ fn an_engine_its_runner_still_runs_is_never_ended_by_a_start() {
     let store = store();
     submit(&store, "key_start", "tester", start("watch the fleet"));
     tick_fresh(&store);
-    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone()));
+    let missed: Arc<dyn EventLog> = Arc::new(Missed(store.clone(), false));
     submit(&store, "key_again", "spawn-liveness", start("charter"));
     tick_over(missed, &store);
     let (succeeded, error) = outcome(&store, 2);
@@ -439,7 +452,7 @@ fn an_engine_its_runner_still_runs_is_never_ended_by_a_start() {
             tags: Vec::new(),
         },
     );
-    tick_over(Arc::new(Missed(store.clone())), &store);
+    tick_over(Arc::new(Missed(store.clone(), false)), &store);
     let waits_on_first = events(&store).into_iter().any(|event| {
         matches!(
             event.kind,
