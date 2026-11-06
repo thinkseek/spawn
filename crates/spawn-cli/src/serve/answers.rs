@@ -438,8 +438,9 @@ const PROMPT_LINES: usize = 10;
 const PROMPT_BYTES: usize = 1024;
 
 /// `/api/rsi`'s missions as the page shows them: each objective's prompt
-/// and each task's brief and review note cut to their first lines (the
-/// task in full is `/api/rsi/task/<id>`).
+/// cut to its first lines, and each task's brief and review note as their
+/// lengths alone (no list of the page shows them; the task in full is
+/// `/api/rsi/task/<id>`).
 pub(super) fn slim_rsi(missions: &mut [Value]) {
     for mission in missions {
         if let Some(objectives) = mission.get_mut("objectives").and_then(Value::as_array_mut) {
@@ -454,7 +455,7 @@ pub(super) fn slim_rsi(missions: &mut [Value]) {
                     &["brief", "review_note"],
                     EXCERPT_LINES,
                     EXCERPT_BYTES,
-                    true,
+                    false,
                 );
             }
         }
@@ -736,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn the_rsi_page_gets_its_prompts_and_briefs_cut() {
+    fn the_rsi_page_gets_its_prompts_cut_and_its_tasks_texts_as_lengths() {
         let prompt = "p".repeat(5000);
         let mut missions = vec![json!({"objectives": [{"id": 1, "prompt": prompt}],
                                        "tasks": [{"id": 9, "brief": "b\n".repeat(20),
@@ -749,12 +750,10 @@ mod tests {
             Some(1024)
         );
         assert_eq!(missions[0]["objectives"][0]["prompt_bytes"], 5000);
-        assert_eq!(
-            missions[0]["tasks"][0]["brief"],
-            "b\n".repeat(6).trim_end_matches('\n')
-        );
+        assert_eq!(missions[0]["tasks"][0]["brief"], json!(null));
         assert_eq!(missions[0]["tasks"][0]["brief_bytes"], 40);
-        assert_eq!(missions[0]["tasks"][0]["review_note"], "ok");
+        assert_eq!(missions[0]["tasks"][0]["review_note"], json!(null));
+        assert_eq!(missions[0]["tasks"][0]["review_note_bytes"], 2);
     }
 
     #[test]

@@ -44,8 +44,8 @@ export interface RsiTask {
   brief: string | null;
   review_note: string | null;
   /** Whole lengths in bytes of `brief` and `review_note`, which
-   * `/api/rsi` sends as their first lines (the task's own read,
-   * `/api/rsi/task/<id>`, sends them whole: null there). */
+   * `/api/rsi` sends as null (no list shows them; the task's own read,
+   * `/api/rsi/task/<id>`, sends them whole, and no length). */
   brief_bytes?: number | null;
   review_note_bytes?: number | null;
   created_by: string | null;
