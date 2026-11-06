@@ -21,7 +21,8 @@
 //! halt's: the escalation is about the mission, once per `mission.halted`.
 //! A failed command (a delivery attempt, a Stop, a resume) is the evidence
 //! of the step it blocks, never a step of its own; a delivery whose retries
-//! are spent was escalated as [`Why::DeliveryFailed`], and gets no stall.
+//! are spent is re-issued (a first delivery that typed nothing) or was
+//! escalated as [`Why::DeliveryFailed`], and gets no stall.
 //!
 //! The tag is `<session> stall-<task>-<step>-<n>`, where `n` names the
 //! record the step is measured from (a control record's id, or for

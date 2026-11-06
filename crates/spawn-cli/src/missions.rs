@@ -19,6 +19,8 @@ const USAGE: &str = "usage:
                 resident takes one, per-task workers the rest)
   spawn mission resume --id N
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
+      (recorded as source.moved for every deploy, also when no mission's baseline moves;
+       after it every delivery whose retries are spent, having typed nothing, is tried once more)
   spawn mission list [--limit N]   (every task with its stages)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>

@@ -52,9 +52,43 @@
 //!   delivered tasks are, and only a report written after their own mark.
 //!
 //! Missions, reports, approvals, human commands to workers (with their
-//! outcome) and failed deliveries become digest items for the supervisor ([`news_items`]). Like
-//! the dispatcher, delivery keeps no state: idempotency keys and the task
-//! rows say what was already done.
+//! outcome) and failed deliveries become digest items for the supervisor
+//! ([`news_items`]). Like the dispatcher, delivery keeps no state:
+//! idempotency keys and the task rows say what was already done.
+//!
+//! **A delivery that never reached its worker** (docs/fleet-architecture.md
+//! §3). A delivery that fails having typed nothing is retried, under
+//! `<key>-retry-<n>`, after `SPAWN_DELIVERY_RETRY_SECS` (60) doubling, up
+//! to [`DELIVERY_RETRIES`] times past the free refusals of a pane not ready
+//! ([`attempts`], [`Waits`]). Its retries spent:
+//!
+//! - a task's first delivery (the task `assigned`, revision 0), none of
+//!   whose attempts may have typed ([`MAY_HAVE_TYPED`]), is re-issued, not
+//!   escalated: `SPAWN_REISSUE_AFTER_SECS` (300) after its last attempt
+//!   finished (the database's clock), the task is cancelled and assigned
+//!   again in one transaction (`spawn_task_reissue`, [`reissues`]), the
+//!   `task.cancelled` naming `by` `spawn-dispatch`, `reissued_as` and every
+//!   attempt, the new `task.assigned` naming `reissue_of` and copying the
+//!   task. The new task is delivered by the usual rules; the old one was
+//!   never delivered, so its worker is not stopped, set aside or told, and
+//!   an objective keeps a task in flight throughout;
+//! - a re-issue is never re-issued again: its spent delivery is escalated
+//!   ([`Why::DeliveryFailed`], tag `<session> deliver-<task>-<revision>`),
+//!   naming the task, the task it re-issued and the attempts of both. A
+//!   delivery that may have typed, and a revision's, are escalated and never
+//!   re-issued;
+//! - after a deploy (the latest `source.moved` record, which `spawn mission
+//!   moved` writes for every deploy) every spent delivery, spent before the
+//!   record and none of whose attempts may have typed, gets exactly one more
+//!   attempt, at once, keyed `<key>-moved-<the record's event id>`
+//!   ([`moved_attempt`]). A success delivers the task (a re-issue still due
+//!   is then not made); a failure leaves it as it was, with no new
+//!   escalation and no further attempt until the next record. A re-issue
+//!   due goes before it.
+//!
+//! The re-issue rests on the recorded attempts and their outcomes, the
+//! extra attempt on a recorded `source.moved`, never on time or absence
+//! alone, and each is itself recorded (docs/design.md §14).
 //!
 //! A waiting task that does not move is not left to wait silently: the
 //! task whose turn it is ([`next_up`]) is at its `delivery` step from the
@@ -62,7 +96,8 @@
 //! (`dispatch::stall`) escalates it once its bound
 //! (`SPAWN_STALL_DELIVERY_SECS`) has passed, naming every attempt and its
 //! outcome and the retry still due or held ([`delivery_status`]). One whose
-//! retries are spent was escalated as delivery failed, and gets no stall.
+//! retries are spent is re-issued or was escalated as delivery failed, and
+//! gets no stall.
 //!
 //! [`orders`] is pure; [`collect_reports`] is the one step with side effects
 //! (the report file and the task row).
@@ -838,7 +873,8 @@ fn held(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<String> 
 /// ([`crate::dispatch`]'s `stall`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeliveryStatus {
-    /// Its retries are spent: [`Why::DeliveryFailed`] was its escalation.
+    /// Its retries are spent: it is re-issued, or [`Why::DeliveryFailed`]
+    /// was its escalation.
     pub(crate) given_up: bool,
     /// Every attempt with its key and outcome (a failed one with its
     /// error), then what comes next: a retry due, or due and held and why,
