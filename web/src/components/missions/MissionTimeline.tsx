@@ -91,8 +91,10 @@ export function MissionTimeline({
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const ids = useId();
-  const all = useMemo(() => deriveMissionTimeline(missions, 0, reasons), [missions, reasons]);
-  const live = all.lanes.some((lane) => lane.bars.some((bar) => bar.end === null && !bar.stalled));
+  // Seeded at the wall clock so a board with no bars at all (a mission
+  // before its first task) has today's fallback extent, not epoch 0.
+  const all = useMemo(() => deriveMissionTimeline(missions, Date.now(), reasons), [missions, reasons]);
+  const live = isLive(all);
   const now = useNowWhile(live);
   // Ordering and extent depend on now only through open bars.
   const timeline = useMemo(
