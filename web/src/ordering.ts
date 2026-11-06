@@ -1,7 +1,7 @@
 /* One ordering and grouping model for every list, so the Fleet board, the
  * sidebar's session list, the Missions timeline and cards, and the
- * scorecard agree. Pure: type-only imports plus the pure missionTimeline
- * module, tested in web/test/ordering.test.ts.
+ * scorecard agree. Pure (type-only imports), tested in
+ * web/test/ordering.test.ts.
  *
  * Agents fall into four groups, in this order: always on (the supervisor,
  * then the residents), on a task, idle, ended. Missions into three classes:
@@ -10,7 +10,6 @@
  * retries of one objective are one group, its latest attempt the row. */
 
 import type { FleetAgent } from "./fleet";
-import { missionName } from "./missionTimeline.ts";
 import type { Mission, MissionTask, Missions, TaskState } from "./missions";
 import type { ScorecardScope } from "./scorecard";
 
@@ -266,6 +265,20 @@ export function groupTasks<T>(
 
 // ---------------------------------------------------------------------------
 // Missions
+
+/** A mission's short name: its text up to a colon, else its first words. */
+export function missionName(mission: Pick<Mission, "id" | "text">): string {
+  const text = (mission.text ?? "").trim().replace(/\s+/g, " ");
+  if (!text) return mission.id !== null ? `Mission ${mission.id}` : "Mission";
+  const colon = text.indexOf(":");
+  if (colon > 0 && colon <= 40) return text.slice(0, colon);
+  const sentence = text.split(/(?<=[.!?])\s/)[0];
+  if (sentence.length <= 48) return sentence.replace(/[.!?]$/, "");
+  const cut = sentence.slice(0, 47);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > 24 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
 
 /** `open`: active with tasks in flight or sent back; `idle`: active with
  * none; `closed`: done, cancelled or any other end. A halted mission is
