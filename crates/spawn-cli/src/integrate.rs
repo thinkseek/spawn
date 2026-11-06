@@ -5446,18 +5446,24 @@ mod database_tests {
             .expect("the mission")
     }
 
-    /// `mission`'s row of the fleet view's gate room (`fleet_health`).
-    fn gate_room_row(db: &Db, mission: i64) -> Value {
+    /// The fleet view's gate room (`fleet_health`) shows `mission`'s run of
+    /// `no_room` as the mission row folds it.
+    fn assert_gate_room_shown(db: &Db, mission: i64) {
         let health = db.store.fleet_health().expect("health");
         assert!(
             health.get("attention").is_none(),
             "who needs a human is /api/attention's, not a count of judge flags"
         );
-        health["gate_room"]
+        let row = health["gate_room"]
             .as_array()
             .and_then(|missions| missions.iter().find(|row| row["mission"] == mission))
-            .cloned()
-            .expect("the mission's gate room")
+            .expect("the mission's gate room");
+        let fold = gated(db, mission);
+        assert_eq!(row["task"].as_i64(), fold.gate_room_task);
+        assert_eq!(row["waits"].as_u64(), Some(u64::from(fold.gate_room_waits)));
+        assert_eq!(row["escalated"].as_bool(), Some(fold.gate_room_escalated));
+        assert_eq!(row["since_ms"].as_i64(), fold.gate_room_since_ms);
+        assert_eq!(row["last_ms"].as_i64(), fold.gate_room_last_ms);
     }
 
     /// The dispatcher's plan over the gate-room records the store gives now,
@@ -5508,13 +5514,7 @@ mod database_tests {
         );
         assert!(after.halted.is_none());
         assert_eq!(after.gate_room_task, Some(task));
-        let room = gate_room_row(&db, mission);
-        assert_eq!(
-            (&room["task"], &room["waits"], &room["escalated"]),
-            (&json!(task), &json!(5), &json!(true))
-        );
-        assert_eq!(room["since_ms"].as_i64(), after.gate_room_since_ms);
-        assert_eq!(room["last_ms"].as_i64(), after.gate_room_last_ms);
+        assert_gate_room_shown(&db, mission);
         let escalations = db.store.gate_room_escalations().expect("escalations");
         assert_eq!(
             escalations.as_array().map(Vec::len),
@@ -5584,12 +5584,7 @@ mod database_tests {
             plan.told.is_empty() && plan.pending.is_empty(),
             "told, and its run is over: resolved"
         );
-        let room = gate_room_row(&db, mission);
-        assert_eq!(
-            (&room["task"], &room["waits"], &room["escalated"]),
-            (&json!(null), &json!(0), &json!(false)),
-            "no wait now"
-        );
+        assert_gate_room_shown(&db, mission);
         assert!(super::halt_reason(&after, 0).is_some_and(|reason| reason.contains("aborts")));
         let _ = std::fs::remove_dir_all(&base);
     }
