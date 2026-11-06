@@ -477,6 +477,26 @@ mod tests {
         assert!(refused.contains("default or cheap"), "{refused}");
     }
 
+    /// Commit everything in the checkout `directory`, whatever the host's
+    /// git configuration.
+    fn commit_in(directory: &str, message: &str) {
+        use crate::sources::git;
+        git(&["-C", directory, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            directory,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--no-gpg-sign",
+            "-qm",
+            message,
+        ])
+        .expect("commit");
+    }
+
     /// A scratch world: a bare source with one commit on main, and the
     /// owner's clone of it. `(base, source, owner)`.
     fn owner_world(tag: &str) -> (std::path::PathBuf, String, String) {
@@ -488,7 +508,7 @@ mod tests {
         let seed_path = seed.to_string_lossy().to_string();
         git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
         std::fs::write(seed.join("README.md"), "base\n").expect("write");
-        crate::integrate::tests::commit_in(&seed_path, "base");
+        commit_in(&seed_path, "base");
         let source = base.join("source.git").to_string_lossy().to_string();
         git(&["clone", "-q", "--bare", &seed_path, &source]).expect("source");
         let owner = base.join("owner").to_string_lossy().to_string();
@@ -506,7 +526,7 @@ mod tests {
         let (base, source, owner) = owner_world("put");
         let main = git(&["--git-dir", &source, "rev-parse", "refs/heads/main"]).expect("main");
         std::fs::write(std::path::Path::new(&owner).join("CONTRACT.md"), "v1\n").expect("write");
-        crate::integrate::tests::commit_in(&owner, "owner: the contract");
+        commit_in(&owner, "owner: the contract");
         let head = git(&["-C", &owner, "rev-parse", "HEAD"]).expect("head");
 
         let (commit, reference) = super::put_in_source(&source, &owner, "HEAD").expect("put");
