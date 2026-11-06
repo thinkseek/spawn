@@ -24,7 +24,12 @@
 //! The built UI's static files are served without it:
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
+//!
+//! How a read is sent (validators and 304, the boards' answers shared for a
+//! second among the pages that poll, the lists' first lines) is
+//! [`answers`]'s.
 
+mod answers;
 mod attention;
 
 use std::net::SocketAddr;
@@ -600,38 +605,58 @@ fn handle(
             return refuse(request, token.is_some());
         }
     }
-    let answer = match path {
-        "/api/overview" => overview(),
-        "/api/rsi" => rsi_overview(),
-        "/api/rsi/pane" => rsi_pane(query),
-        "/api/fleet" => fleet(),
-        "/api/attention" => attention::attention(),
-        "/api/missions" => missions(),
-        "/api/events" => events(query),
-        "/api/scorecard" => scorecard(query),
+    let Some(read) = reader(path, query) else {
+        return static_file(request, web, path);
+    };
+    // A board's answer may be one computed for another page this second
+    // (answers::SHARE_FOR), when the request accepts one that old; any
+    // other is read now. A malformed identifier is the caller's mistake
+    // (400), not the server's.
+    let compute = || answers::answer(path, read(), BAD_REQUEST);
+    let answer = if answers::shared(path) {
+        answers::ANSWERS.get(
+            &answers::key(path, query),
+            answers::accepted_age(header(&request, "Cache-Control")),
+            compute,
+        )
+    } else {
+        Arc::new(compute())
+    };
+    let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+    answers::respond(request, &answer, if_none_match.as_deref())
+}
+
+/// One API read, not run yet.
+type Read<'a> = Box<dyn FnOnce() -> Result<Value, String> + 'a>;
+
+/// The read at `path` with `query`, or `None` when `path` is no API read
+/// (a static file, or a 404).
+fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
+    Some(match path {
+        "/api/overview" => Box::new(overview),
+        "/api/rsi" => Box::new(rsi_overview),
+        "/api/rsi/pane" => Box::new(move || rsi_pane(query)),
+        "/api/fleet" => Box::new(fleet),
+        "/api/attention" => Box::new(attention::attention),
+        "/api/missions" => Box::new(missions),
+        "/api/events" => Box::new(move || events(query)),
+        "/api/scorecard" => Box::new(move || scorecard(query)),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
-                session(id, query)
+                Box::new(move || session(id, query))
             } else if let Some(task) = path.strip_prefix("/api/rsi/task/") {
-                rsi_task(task)
+                Box::new(move || rsi_task(task))
+            } else if let Some(task) = path.strip_prefix("/api/missions/task/") {
+                Box::new(move || mission_task(task))
             } else if let Some(id) = path.strip_prefix("/api/pane/") {
-                pane(id, None)
+                Box::new(move || pane(id, None))
             } else if let Some(rest) = path.strip_prefix("/api/fleet/") {
-                fleet_session(rest, query)
+                Box::new(move || fleet_session(rest, query))
             } else {
-                return static_file(request, web, path);
+                return None;
             }
         }
-    };
-    let (status, body) = match answer {
-        Ok(body) => (200, body),
-        // A malformed identifier is the caller's mistake, not the server's.
-        Err(error) if error.starts_with(BAD_REQUEST) => (400, json!({ "error": error })),
-        Err(error) => (500, json!({ "error": error })),
-    };
-    request
-        .respond(json_response(status, &body))
-        .map_err(|error| error.to_string())
+    })
 }
 
 /// Answer a refused API request: 401 with a bearer challenge when a token
