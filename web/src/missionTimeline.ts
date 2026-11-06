@@ -10,7 +10,7 @@
  *   reported  → review     the supervisor reviews (accept = review, or no gate)
  *             → gate       the gate judges (accept = gate)
  *   reviewed  accepted → gate (with a gate) or done; rejected → sent back
- *   gated     accepted → landing; rejected / conflict → sent back;
+ *   gated     accepted → landing; rejected / conflict / incompatible → sent back;
  *             stale / aborted / no_room → still at the gate (judged again)
  *   landed, aborted, cancelled: the bar ends.
  *
@@ -226,7 +226,8 @@ export function taskBar(
       }
       case "gated": {
         const verdict = record.verdict ?? "unknown";
-        const back = verdict === "rejected" || verdict === "conflict";
+        const back =
+          verdict === "rejected" || verdict === "conflict" || verdict === "incompatible";
         const reason =
           reasons?.[gateCount] ??
           (task.last_gate && task.last_gate.at_ms === record.at_ms

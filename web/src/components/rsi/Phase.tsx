@@ -66,6 +66,8 @@ const PHASE: Record<string, PhaseStyle> = {
   rejected: DESTRUCTIVE,
   aborted: MUTED,
   conflict: { ...WARNING, pulse: false },
+  // Sent back because main moved under it: not a rejection.
+  incompatible: { ...WARNING, pulse: false },
   stale: MUTED,
   no_room: MUTED,
 };

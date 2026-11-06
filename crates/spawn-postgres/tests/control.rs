@@ -383,6 +383,126 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
     );
 }
 
+/// Objective 16: `incompatible` (the head passes the gate alone and fails
+/// only merged with main) sends the task back like `conflict`: `revise`, one
+/// more revision, the note kept, `gate_rejections` where it was and
+/// `gate_aborts` reset. Three in a row count nothing toward the halt. The
+/// objective history, the stall facts' `revise` record and the store's
+/// check all know it.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn an_incompatible_verdict_sends_the_task_back_and_counts_no_rejection() {
+    let (store, schema) = store("control_incompatible");
+    let mission = store
+        .mission_add("Improve", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let objectives = json!({"backlog": "/controller/rsi/backlog", "resident": "rsi"});
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            Some(&objectives),
+        )
+        .expect("configure");
+    store
+        .resident_propose("rsi", "Pursues objectives")
+        .expect("propose");
+    store.resident_approve("rsi").expect("approve");
+    let task = store
+        .objective_assign(mission, 16, None, "Objective 16: semantic conflicts")
+        .expect("assign");
+    let mut client = admin(&schema);
+
+    let report = |revision: i64| {
+        store.task_delivered(task, revision + 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+    };
+    let gated = |revision: i64, verdict: &str, note: &str| {
+        store.integrator_record(&json!({
+            "type": "task.gated", "id": task, "revision": revision, "verdict": verdict,
+            "base": "m1", "scenarios": 3, "candidate": "c", "head": "h", "head_base": "m0",
+            "head_verdict": "accepted", "main_commits": ["m1"],
+            "reason": "candidate tests do not build", "log": "error[E0063]", "note": note}))
+    };
+
+    // One real rejection and one abort first: the count is 1, aborts 1.
+    report(0);
+    gated(0, "rejected", "wrong").expect("rejected");
+    report(1);
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 1,
+                                   "verdict": "aborted", "base": "m1", "reason": "timeout"}))
+        .expect("aborted");
+    let after = tables(&mut client);
+    assert_eq!(after["missions"][0]["gate_rejections"], 1);
+    assert_eq!(after["missions"][0]["gate_aborts"], 1);
+
+    for revision in 1..=3 {
+        let note = format!("adapt to m1 ({revision})");
+        gated(revision, "incompatible", &note).expect("the store accepts incompatible");
+        let after = tables(&mut client);
+        let row = &after["tasks"][0];
+        assert_eq!(row["state"], "revise", "{after}");
+        assert_eq!(row["revisions"], revision + 1, "{after}");
+        assert_eq!(row["review_note"], note.as_str());
+        assert_eq!(
+            after["missions"][0]["gate_rejections"], 1,
+            "an incompatible verdict is no rejection"
+        );
+        assert_eq!(after["missions"][0]["gate_aborts"], 0, "as on conflict");
+        assert!(after["missions"][0]["halted"].is_null(), "{after}");
+
+        // The dispatcher measures the step from the verdict that sent it back.
+        let facts = store.stall_facts().expect("stall facts");
+        let open = facts["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == task)
+            .expect("the task is open");
+        assert_eq!(open["state"], "revise");
+        assert_eq!(open["record"]["type"], "task.gated", "{open}");
+        if revision < 3 {
+            report(revision + 1);
+        }
+    }
+
+    let history = store.objective_history(mission, 16, 10).expect("history");
+    let verdicts: Vec<&str> = history
+        .as_array()
+        .expect("history")
+        .iter()
+        .filter_map(|row| row["verdict"].as_str())
+        .collect();
+    assert_eq!(
+        verdicts,
+        vec![
+            "incompatible",
+            "incompatible",
+            "incompatible",
+            "aborted",
+            "rejected"
+        ]
+    );
+    assert!(
+        store
+            .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 4,
+                                       "verdict": "semantic", "base": "m1"}))
+            .is_err(),
+        "an unknown verdict is still refused"
+    );
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
+
 #[test]
 fn objective_tasks_go_to_the_missions_resident_and_keep_their_history() {
     let (store, schema) = store("control_objectives");

@@ -358,7 +358,9 @@ export function stageStep(stage: TaskStage): StageStep {
       return {
         label: `gate ${stage.verdict ?? "verdict"}`,
         tone:
-          stage.verdict === "rejected" || stage.verdict === "conflict"
+          stage.verdict === "rejected" ||
+          stage.verdict === "conflict" ||
+          stage.verdict === "incompatible"
             ? "back"
             : "forward",
       };
