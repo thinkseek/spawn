@@ -5446,10 +5446,39 @@ mod database_tests {
             .expect("the mission")
     }
 
+    /// `mission`'s row of the fleet view's gate room (`fleet_health`).
+    fn gate_room_row(db: &Db, mission: i64) -> Value {
+        let health = db.store.fleet_health().expect("health");
+        assert!(
+            health.get("attention").is_none(),
+            "who needs a human is /api/attention's, not a count of judge flags"
+        );
+        health["gate_room"]
+            .as_array()
+            .and_then(|missions| missions.iter().find(|row| row["mission"] == mission))
+            .cloned()
+            .expect("the mission's gate room")
+    }
+
+    /// The dispatcher's plan over the gate-room records the store gives now,
+    /// for a supervisor whose digests told it `tag`.
+    fn gate_room_plan(db: &Db, tag: &str) -> crate::dispatch::Plan {
+        let records = db.store.gate_room_escalations().expect("escalations");
+        let items =
+            crate::disk::gate_room_escalations(records.as_array().map_or(&[][..], Vec::as_slice));
+        let supervisor: crate::dispatch::Facts = serde_json::from_value(json!({
+            "session_id": "session_supervisor", "agent_id": "agent_supervisor", "told": [tag],
+        }))
+        .expect("facts");
+        let work = crate::deliver::Work::default();
+        crate::dispatch::decide_with(&[supervisor], &work, &items, false, 0, "spawn")
+    }
+
     /// Task 40: the fold. `no_room` keeps the task where it was, names the
     /// free space, moves neither the abort nor the rejection count, and
     /// folds the mission's run of them; a gate that judged ends the run, and
-    /// a real abort still counts.
+    /// a real abort still counts. The fleet view's health carries the run,
+    /// and a told escalation stays told and unresolved while the run goes on.
     #[test]
     fn no_room_counts_toward_no_halt_and_a_real_abort_still_does() {
         let (base, source, scenarios, _) = world("no-room-fold", "exit 1\n");
@@ -5479,21 +5508,13 @@ mod database_tests {
         );
         assert!(after.halted.is_none());
         assert_eq!(after.gate_room_task, Some(task));
-        // The fleet view's health carries the run, per gated mission.
-        let health = db.store.fleet_health().expect("health");
-        let room = health["gate_room"]
-            .as_array()
-            .and_then(|missions| missions.iter().find(|row| row["mission"] == mission))
-            .expect("the mission's gate room");
-        assert_eq!(room["task"], task);
-        assert_eq!(room["waits"], 5);
-        assert_eq!(room["escalated"], true);
+        let room = gate_room_row(&db, mission);
+        assert_eq!(
+            (&room["task"], &room["waits"], &room["escalated"]),
+            (&json!(task), &json!(5), &json!(true))
+        );
         assert_eq!(room["since_ms"].as_i64(), after.gate_room_since_ms);
         assert_eq!(room["last_ms"].as_i64(), after.gate_room_last_ms);
-        assert!(
-            health.get("attention").is_none(),
-            "who needs a human is /api/attention's, not a count of judge flags"
-        );
         let escalations = db.store.gate_room_escalations().expect("escalations");
         assert_eq!(
             escalations.as_array().map(Vec::len),
@@ -5530,33 +5551,12 @@ mod database_tests {
         );
         digest("dispatch-digest-told", true);
         // Told once, by its record: the dispatcher's told set has its tag,
-        // so it is never pending again. Its run goes on, so it is still
-        // read, and the plan holds it as told and unresolved.
-        let held = db.store.gate_room_escalations().expect("escalations");
-        assert_eq!(held.as_array().map(Vec::len), Some(1), "{held}");
-        let items =
-            crate::disk::gate_room_escalations(held.as_array().map_or(&[][..], Vec::as_slice));
-        let supervisor: crate::dispatch::Facts = serde_json::from_value(json!({
-            "session_id": "session_supervisor", "agent_id": "agent_supervisor", "told": [tag],
-        }))
-        .expect("facts");
-        let plan = crate::dispatch::decide_with(
-            &[supervisor],
-            &crate::deliver::Work::default(),
-            &items,
-            false,
-            0,
-            "spawn",
-        );
+        // so it is never pending again. Its run goes on, so the plan holds
+        // it as told and unresolved.
+        let plan = gate_room_plan(&db, &tag);
         assert!(plan.pending.is_empty(), "told once: {:?}", plan.pending);
-        assert_eq!(
-            plan.told
-                .iter()
-                .map(crate::dispatch::Escalation::tag)
-                .collect::<Vec<_>>(),
-            [tag.clone()],
-            "told, and the gate still has no room"
-        );
+        let told: Vec<String> = plan.told.iter().map(crate::dispatch::Escalation::tag).collect();
+        assert_eq!(told, [tag.as_str()], "told, and the gate still has no room");
 
         // A no_room that names no free space or TMPDIR is refused.
         assert!(
