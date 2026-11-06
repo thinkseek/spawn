@@ -525,9 +525,11 @@ impl GitWorkspace {
         Ok((tree, oversized))
     }
 
-    /// `git add -A` of the work tree in `directory` except `left_out`, which
-    /// is never hashed. The paths go to git on standard input, so any number
-    /// of them fits.
+    /// `git add -A` of the work tree in `directory` except `left_out` and
+    /// the engine's runtime files ([`ENGINE_RUNTIME_FILES`]), which are
+    /// never hashed: an exclude pathspec, so no ignore rule of the project
+    /// (a `.gitignore` that re-includes one) brings one in. The paths go to
+    /// git on standard input, so any number of them fits.
     fn stage_all_but(
         &self,
         directory: &Path,
@@ -540,8 +542,96 @@ impl GitWorkspace {
                 .iter()
                 .map(|(path, _)| path.pathspec("exclude,literal")),
         );
+        add.extend(runtime_pathspecs("exclude"));
         self.listing_in_with_pathspecs(directory, index, &["add", "-A"], &add)
             .map(|_| ())
+    }
+
+    /// Make the index's entries for the engine's runtime files
+    /// ([`ENGINE_RUNTIME_FILES`]) exactly the ones the branch already
+    /// tracks, each as the work tree in `directory` holds it now.
+    ///
+    /// A runtime file is tracked when `head` (the checkpoint's parent)
+    /// holds it, and, while a merge of `main` waits on its markers
+    /// (`pending_main`), as `main` left it since the merge base: the merge
+    /// wrote `main`'s changes into the directory. A tracked one is
+    /// committed like any tracked file, git's rule for a tracked file an
+    /// ignore rule names: the engine's edits to it, and its deletion. Spawn
+    /// never takes one out of a branch on its own (the owner removes it
+    /// from the project). One that is not tracked never enters the index
+    /// ([`Self::stage_all_but`]).
+    ///
+    /// The kept index is only a stat cache (a fresh one after a failure,
+    /// one that saw no merge of main, one written before this rule), so
+    /// its runtime entries are first reset from `head`, never trusted.
+    fn track_runtime_files(
+        &self,
+        directory: &Path,
+        index: &Path,
+        head: &str,
+        pending_main: Option<&str>,
+    ) -> Result<(), WorkspaceError> {
+        let specs = runtime_pathspecs("");
+        let mut reset: Vec<OsString> = ["reset", "-q", "--no-refresh", head, "--"]
+            .map(OsString::from)
+            .into();
+        reset.extend(specs.iter().cloned());
+        self.listing_in(directory, index, &reset)?;
+        if let Some(main) = pending_main
+            && let Ok(base) = self.git_output(&["merge-base", head, main])
+        {
+            let mut changed: Vec<OsString> = [
+                "diff-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                base.as_str(),
+                main,
+                "--",
+            ]
+            .map(OsString::from)
+            .into();
+            changed.extend(specs.iter().cloned());
+            let changed = listed_paths(&self.git_listing(&changed)?);
+            if !changed.is_empty() {
+                let literal: Vec<OsString> =
+                    changed.iter().map(|path| path.pathspec("literal")).collect();
+                self.listing_in_with_pathspecs(
+                    directory,
+                    index,
+                    &["reset", "-q", "--no-refresh", main],
+                    &literal,
+                )?;
+            }
+        }
+        let mut listing: Vec<OsString> = ["ls-files", "-z", "--cached", "--"]
+            .map(OsString::from)
+            .into();
+        listing.extend(specs);
+        let tracked = listed_paths(&self.listing_in(directory, index, &listing)?);
+        // git adds nothing beyond a symbolic link and refuses a directory or
+        // a special file: what is not a file there now is gone from the
+        // index, as `add -A` would have it.
+        let (present, gone): (Vec<TreePath>, Vec<TreePath>) = tracked
+            .into_iter()
+            .partition(|path| is_file_in(directory, path));
+        for (flag, paths) in [("--add", present), ("--force-remove", gone)] {
+            if paths.is_empty() {
+                continue;
+            }
+            let names: Vec<OsString> = paths
+                .iter()
+                .map(|path| path.as_path().as_os_str().to_os_string())
+                .collect();
+            self.listing_in_with_input(
+                directory,
+                index,
+                &["update-index", flag, "-z", "--stdin"],
+                nul_terminated(&names),
+            )?;
+        }
+        Ok(())
     }
 
     /// Take build output and `paths` out of the index. Paths go to git as
