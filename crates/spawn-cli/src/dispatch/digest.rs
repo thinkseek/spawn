@@ -15,6 +15,10 @@ use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
 /// Escalations per digest; the rest wait for the next one.
 const DIGEST_ITEMS: usize = 8;
 
+/// The words every digest opens with: a prompt in the supervisor's
+/// transcript that starts with them is a digest, not a person's answer.
+pub(crate) const OPENING: &str = "Spawn dispatcher:";
+
 /// Escalations the supervisor already received: the tags of the digests
 /// that reached its pane.
 pub(super) fn told(supervisor: Option<&Facts>) -> BTreeSet<String> {
@@ -59,7 +63,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
 /// The digest typed into the supervisor's pane.
 fn text(items: &[Escalation], spawn: &str) -> String {
     let mut text = format!(
-        "Spawn dispatcher: {} update{} for you. Check a worker with `{spawn} tail --session \
+        "{OPENING} {} update{} for you. Check a worker with `{spawn} tail --session \
 <session>` before acting; missions and tasks with `{spawn} mission list`.\n",
         items.len(),
         if items.len() == 1 { "" } else { "s" },

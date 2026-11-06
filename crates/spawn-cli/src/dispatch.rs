@@ -48,7 +48,7 @@ mod stall;
 mod stops;
 mod worker;
 
-pub(crate) use digest::heading;
+pub(crate) use digest::{OPENING as DIGEST_OPENING, heading};
 pub(crate) use stall::Bounds;
 
 use std::collections::BTreeSet;
