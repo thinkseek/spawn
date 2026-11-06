@@ -296,24 +296,27 @@ pub(super) fn respond(
         .etag
         .as_deref()
         .map(|etag| Header::from_bytes("ETag", etag).expect("a hex tag is a valid header"));
-    let response = if let Some(tag) = tag
-        && answer
-            .etag
-            .as_deref()
-            .is_some_and(|etag| not_modified(if_none_match, etag))
-    {
-        Response::empty(304).with_header(tag).with_header(cache)
-    } else {
-        let kind = Header::from_bytes("Content-Type", "application/json; charset=utf-8")
-            .expect("static header");
-        let mut response = Response::from_string(answer.body.clone())
-            .with_status_code(answer.status)
-            .with_header(kind)
-            .with_header(cache);
-        if let Some(tag) = tag {
-            response.add_header(tag);
+    let unchanged = answer
+        .etag
+        .as_deref()
+        .is_some_and(|etag| not_modified(if_none_match, etag));
+    let response = match tag {
+        Some(tag) if unchanged => Response::empty(304)
+            .with_header(tag)
+            .with_header(cache)
+            .boxed(),
+        tag => {
+            let kind = Header::from_bytes("Content-Type", "application/json; charset=utf-8")
+                .expect("static header");
+            let mut response = Response::from_string(answer.body.clone())
+                .with_status_code(answer.status)
+                .with_header(kind)
+                .with_header(cache);
+            if let Some(tag) = tag {
+                response.add_header(tag);
+            }
+            response.boxed()
         }
-        response.boxed()
     };
     request.respond(response).map_err(|error| error.to_string())
 }
