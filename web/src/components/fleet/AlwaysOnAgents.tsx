@@ -118,11 +118,22 @@ function AlwaysOnTile({
 
       <dl className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-caption">
         <dt className="text-faint-foreground">State</dt>
-        <dd className="flex min-w-0 items-center gap-1.5 whitespace-nowrap">
+        <dd className="flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap">
           <span className="text-foreground">{stateLabelUpper(agent.state)}</span>
           <span className="text-muted-foreground">
             for <span className="tnum" title={absoluteTitle(agent.state_since_ms)}>{sinceText(agent.state_since_ms)}</span>
           </span>
+          <span aria-hidden="true" className="text-faint-foreground">·</span>
+          {agent.live ? (
+            <span className="tnum text-muted-foreground" title={`Current execution started ${absoluteTitle(agent.started_at_ms) ?? "at an unknown time"}`}>
+              up {uptime === null ? "—" : formatDuration(uptime)}
+            </span>
+          ) : (
+            <span className="font-medium text-warning">
+              ended <Ago ms={agent.ended_at_ms} />
+            </span>
+          )}
+          {engine && <span className="text-faint-foreground">· {engine}</span>}
           {agent.attention && <span className="font-medium text-warning">· needs a human</span>}
         </dd>
 
@@ -133,18 +144,6 @@ function AlwaysOnTile({
             {now.label}
           </span>
           <Ago ms={now.at} className="shrink-0 text-muted-foreground" />
-        </dd>
-
-        <dt className="text-faint-foreground">{agent.live ? "Up" : "Ended"}</dt>
-        <dd className="tnum min-w-0 truncate text-muted-foreground">
-          {agent.live ? (
-            <span title={absoluteTitle(agent.started_at_ms)}>
-              {uptime === null ? "—" : formatDuration(uptime)}
-            </span>
-          ) : (
-            <Ago ms={agent.ended_at_ms} className="font-medium text-warning" />
-          )}
-          {engine && <span className="text-faint-foreground"> · {engine}</span>}
         </dd>
 
         <dt className="text-faint-foreground">Task</dt>
