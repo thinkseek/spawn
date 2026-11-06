@@ -119,9 +119,11 @@
 //! before; the pass reads those records, never the thread's result. A
 //! finished thread is reaped only at the start of a pass, before the
 //! missions are read, so no pass acts on a snapshot older than a judging's
-//! records. A judging that errs or panics before any record of its own is
-//! recorded `aborted` ([`judged_or_aborted`]), so the three-aborts halt
-//! bounds it. A restart mid-gate behaves as before: the process (and the
+//! records. A judging that panics before any record of its own is recorded
+//! `aborted` ([`judged_or_aborted`]), so the three-aborts halt bounds a bug.
+//! One that returns an error records nothing, as before threads: the error
+//! is the operator's to read (a git that cannot run a merge is the host's,
+//! not the work's; objective 008), and a later pass judges the task again. A restart mid-gate behaves as before: the process (and the
 //! gate under it) dies before any record, so the next integrator judges the
 //! task again.
 //!
@@ -1236,10 +1238,11 @@ impl Judge {
     }
 }
 
-/// Run a judging, and when it errs or panics, record its abort unless it
-/// recorded something already: a judging that ends without a record of its
-/// own would be judged again on every pass, forever; an abort counts toward
-/// the mission's three-aborts halt.
+/// Run a judging. When it panics, record its abort unless it recorded
+/// something already: a panic that ends a judging without a record of its
+/// own would recur on every pass, forever, and an abort counts toward the
+/// mission's three-aborts halt. An error is shown and records nothing: no
+/// verdict on the work (objective 008), and a later pass judges again.
 fn judged_or_aborted(
     store: &PostgresStore,
     task: &Task,
@@ -1249,7 +1252,11 @@ fn judged_or_aborted(
 ) {
     let reason = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(judging)) {
         Ok(Ok(_)) => return,
-        Ok(Err(error)) => format!("the judging failed before its verdict: {error}"),
+        // An error is no verdict: shown, not recorded, judged again later.
+        Ok(Err(error)) => {
+            eprintln!("integrate: mission {mission}: task {}: {error}", task.id);
+            return;
+        }
         Err(panic) => format!(
             "the judging panicked: {}",
             panic
@@ -3633,12 +3640,12 @@ mod database_tests {
             .collect()
     }
 
-    /// A judging that errs or panics before any record of its own records
-    /// an abort, so the three-aborts halt bounds it instead of a judging
-    /// again on every pass; one that recorded something gets no abort on
-    /// top of it.
+    /// A judging that panics before any record of its own records an
+    /// abort, so the three-aborts halt bounds a bug; one that returns an
+    /// error records nothing (objective 008: an environment error is shown,
+    /// not judged); one that recorded something gets no abort on top of it.
     #[test]
-    fn a_judging_that_fails_before_its_verdict_is_recorded_aborted() {
+    fn a_judging_that_panics_before_its_verdict_is_recorded_aborted() {
         let (base, source, scenarios, integrator) = world("judging-fails", "exit 1\n");
         let db = Db::new("judging_fails");
         let main = source_main(&source);
@@ -3648,9 +3655,12 @@ mod database_tests {
         super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
             Err("fetch the pushed branch: no such repository".to_string())
         });
-        assert_eq!(verdicts(&db, task), vec!["aborted"]);
+        assert!(verdicts(&db, task).is_empty(), "an error is no verdict");
         super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
             panic!("a bug in the judging")
+        });
+        super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
+            panic!("another bug, {}", "formatted")
         });
         assert_eq!(verdicts(&db, task), vec!["aborted", "aborted"]);
         let reasons: Vec<String> = db
@@ -3666,8 +3676,8 @@ mod database_tests {
             .iter()
             .map(|row| row.get(0))
             .collect();
-        assert!(reasons[0].contains("no such repository"), "{reasons:?}");
-        assert!(reasons[1].contains("a bug in the judging"), "{reasons:?}");
+        assert!(reasons[0].contains("a bug in the judging"), "{reasons:?}");
+        assert!(reasons[1].contains("another bug, formatted"), "{reasons:?}");
 
         // One that recorded its verdict, then failed: no abort on top.
         let judged = ready_task(&db, task);
@@ -3688,7 +3698,7 @@ mod database_tests {
         let other = db.reported_task(mission, "x");
         for _ in 0..3 {
             super::judged_or_aborted(&db.store, &ready_task(&db, other), &main, mission, || {
-                Err("again".to_string())
+                panic!("again")
             });
         }
         assert_eq!(verdicts(&db, other), vec!["aborted"; 3]);
