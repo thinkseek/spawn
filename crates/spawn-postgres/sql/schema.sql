@@ -1296,6 +1296,11 @@ begin
                          when 'accepted' then 'landing'
                          when 'rejected' then 'revise'
                          when 'conflict' then 'revise'
+                         -- `incompatible`: the head passes the gate alone and
+                         -- fails only merged with main (the integrator judged
+                         -- both): sent back like `conflict`, never counted as
+                         -- a rejection (docs/fleet-architecture.md §10.3).
+                         when 'incompatible' then 'revise'
                          when 'stale' then case when v_accept = 'gate' then 'reported' else 'accepted' end
                          else state end,
                base = coalesce(p_record ->> 'base', base),
@@ -1303,9 +1308,9 @@ begin
                                 when v_verdict in ('aborted', 'no_room') then candidate end,
                gate_log = coalesce(p_record ->> 'log', gate_log),
                metric = case when v_verdict = 'accepted' then p_record ->> 'metric' else metric end,
-               review_note = case when v_verdict in ('rejected', 'conflict') then p_record ->> 'note'
+               review_note = case when v_verdict in ('rejected', 'conflict', 'incompatible') then p_record ->> 'note'
                                   else review_note end,
-               revisions = revisions + case when v_verdict in ('rejected', 'conflict') then 1 else 0 end,
+               revisions = revisions + case when v_verdict in ('rejected', 'conflict', 'incompatible') then 1 else 0 end,
                updated_at_ms = p_at
          where id = v_id;
         update mission_missions
@@ -1978,8 +1983,8 @@ begin
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     if p_record ->> 'type' = 'task.gated'
-       and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'aborted', 'stale',
-                                          'no_room') then
+       and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
+                                          'aborted', 'stale', 'no_room') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
     end if;
     -- No room to judge names what it saw: the free space and the directory.
