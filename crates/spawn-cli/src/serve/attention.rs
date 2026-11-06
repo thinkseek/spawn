@@ -324,7 +324,7 @@ fn is_digest(line: &str) -> bool {
 /// A transcript line's `timestamp`, in epoch milliseconds.
 fn line_time(line: &str) -> Option<i64> {
     let value = serde_json::from_str::<Value>(line).ok()?;
-    crate::scorecard::parse_rfc3339(value["timestamp"].as_str()?)
+    crate::scorecard::time::parse_rfc3339(value["timestamp"].as_str()?)
 }
 
 #[cfg(test)]
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(asked["human"]["text"], "Should I stop `objective_87` now?");
         assert_eq!(
             asked["human"]["at_ms"],
-            crate::scorecard::parse_rfc3339("2026-11-06T05:15:56.850Z").expect("a time")
+            crate::scorecard::time::parse_rfc3339("2026-11-06T05:15:56.850Z").expect("a time")
         );
         let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
         let view = answer(&rows, &plan, &Value::Null, &asked, &[], NOW);
