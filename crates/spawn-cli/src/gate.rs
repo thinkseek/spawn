@@ -266,13 +266,13 @@ impl Room {
     /// ([`gate_env`]): its TMPDIR and SPAWN_GATE_MIN_FREE_GB come from
     /// there. `Ok` with the log of the checks made when the gate may run.
     pub(crate) fn check(&self, env: &[(String, String)]) -> Result<String, RoomFailure> {
-        let min_gb = threshold(
+        let disk_floor_gb = threshold(
             "SPAWN_GATE_MIN_FREE_GB",
             env_value(env, "SPAWN_GATE_MIN_FREE_GB"),
             DEFAULT_MIN_FREE_GB,
             "GiB",
         )?;
-        let min_mb = threshold(
+        let memory_floor_mb = threshold(
             "SPAWN_GATE_MIN_FREE_MEMORY_MB",
             self.min_free_memory_mb.as_deref(),
             DEFAULT_MIN_FREE_MEMORY_MB,
@@ -283,7 +283,7 @@ impl Room {
             let _ = writeln!(log, "{}: the gate did not run", short.line());
             Err(RoomFailure::Short { short, log })
         };
-        if min_gb == 0 {
+        if disk_floor_gb == 0 {
             log.push_str("disk: SPAWN_GATE_MIN_FREE_GB=0, not checked\n");
         } else {
             let tmpdir = env_value(env, "TMPDIR").unwrap_or("/tmp");
@@ -295,10 +295,10 @@ impl Room {
                          checks it itself"
                     );
                 }
-                Some(free_kb) if free_kb < min_gb.saturating_mul(1_048_576) => {
+                Some(free_kb) if free_kb < disk_floor_gb.saturating_mul(1_048_576) => {
                     let disk = Shortfall::Disk {
                         free_kb,
-                        min_gb,
+                        min_gb: disk_floor_gb,
                         tmpdir: tmpdir.to_string(),
                     };
                     return short(disk, log);
@@ -306,27 +306,27 @@ impl Room {
                 Some(free_kb) => {
                     let _ = writeln!(
                         log,
-                        "disk: {free_kb} KiB free in {tmpdir} (TMPDIR), SPAWN_GATE_MIN_FREE_GB={min_gb}: ok"
+                        "disk: {free_kb} KiB free in {tmpdir} (TMPDIR), SPAWN_GATE_MIN_FREE_GB={disk_floor_gb}: ok"
                     );
                 }
             }
         }
-        if min_mb == 0 {
+        if memory_floor_mb == 0 {
             log.push_str("memory: SPAWN_GATE_MIN_FREE_MEMORY_MB=0, not checked\n");
         } else {
             match (self.available_mb)() {
                 None => log.push_str("memory: MemAvailable cannot be read; not checked\n"),
-                Some(available_mb) if available_mb < min_mb => {
+                Some(available_mb) if available_mb < memory_floor_mb => {
                     let memory = Shortfall::Memory {
                         available_mb,
-                        min_mb,
+                        min_mb: memory_floor_mb,
                     };
                     return short(memory, log);
                 }
                 Some(available_mb) => {
                     let _ = writeln!(
                         log,
-                        "memory: {available_mb} MiB available, SPAWN_GATE_MIN_FREE_MEMORY_MB={min_mb}: ok"
+                        "memory: {available_mb} MiB available, SPAWN_GATE_MIN_FREE_MEMORY_MB={memory_floor_mb}: ok"
                     );
                 }
             }
