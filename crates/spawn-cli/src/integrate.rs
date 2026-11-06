@@ -1121,45 +1121,10 @@ impl Integrator {
                     mission.id
                 );
             } else {
-                // A fetch that failed leaves the mirror's last copy of main,
-                // which is no reading of the source's main: no halt, no
-                // verdict by it.
-                match sources::refresh(&mirror, source).and_then(|()| {
-                    git(&[
-                        "--git-dir",
-                        &mirror.to_string_lossy(),
-                        "rev-parse",
-                        "refs/heads/main",
-                    ])
-                }) {
-                    Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
-                    Ok(main) => match &mission.baseline {
-                        // An owner's landing on the source is pending: it
-                        // may have moved main before its record (an
-                        // integrator stopped in between), so main says
-                        // nothing until it is applied or refused. No halt,
-                        // and nothing judged against that main.
-                        Some(baseline) if *baseline != main && held.contains_key(source) => {
-                            println!(
-                                "integrate: mission {}: the source's main is {main}, its \
-                                 baseline {baseline}; no halt while the owner's landing (request \
-                                 {}) is pending",
-                                mission.id, held[source]
-                            );
-                        }
-                        Some(baseline) if *baseline != main => {
-                            return halt(
-                                store,
-                                mission,
-                                &format!(
-                                    "the source's main is {main}, but the last landing left \
-                                     {baseline}"
-                                ),
-                            )
-                            .map(|()| false);
-                        }
-                        _ => judgeable = Some((mirror, main)),
-                    },
+                match read_main(store, mission, source, &mirror, held)? {
+                    Reading::Judge(main) => judgeable = Some((mirror, main)),
+                    Reading::Nothing => {}
+                    Reading::Halted => return Ok(false),
                 }
             }
         }
@@ -2310,6 +2275,65 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
     )?;
     println!("integrate: task {} landed {candidate} on {source}", task.id);
     Ok(())
+}
+
+/// What a mission's step reads of its source's main.
+enum Reading {
+    /// Main, from a fetch that succeeded, where the last landing left it (or
+    /// the mission has no baseline yet): the mission may be judged against it.
+    Judge(String),
+    /// No reading this pass: the fetch failed, or main is not at the
+    /// baseline while an owner's landing on the source is pending.
+    Nothing,
+    /// Main moved with no record that explains it: the mission was halted.
+    Halted,
+}
+
+/// Fetch `source`'s main into `mirror` and check it against `mission`'s
+/// baseline. A fetch that failed leaves the mirror's last copy of main,
+/// which is no reading of the source's main: no halt, no verdict by it. A
+/// main not at the baseline halts the mission, unless an owner's landing on
+/// the source is pending (`held`): it may have moved main before its record
+/// (an integrator stopped in between), so main says nothing until it is
+/// applied or refused, and nothing is judged against it.
+fn read_main(
+    store: &PostgresStore,
+    mission: &Mission,
+    source: &str,
+    mirror: &Path,
+    held: &std::collections::HashMap<String, i64>,
+) -> Result<Reading, String> {
+    let main = match sources::refresh(mirror, source).and_then(|()| {
+        git(&[
+            "--git-dir",
+            &mirror.to_string_lossy(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+    }) {
+        Ok(main) => main,
+        Err(error) => {
+            eprintln!("integrate: mission {}: {error}", mission.id);
+            return Ok(Reading::Nothing);
+        }
+    };
+    let Some(baseline) = mission.baseline.as_deref().filter(|baseline| *baseline != main) else {
+        return Ok(Reading::Judge(main));
+    };
+    if let Some(request) = held.get(source) {
+        println!(
+            "integrate: mission {}: the source's main is {main}, its baseline {baseline}; no \
+             halt while the owner's landing (request {request}) is pending",
+            mission.id
+        );
+        return Ok(Reading::Nothing);
+    }
+    halt(
+        store,
+        mission,
+        &format!("the source's main is {main}, but the last landing left {baseline}"),
+    )?;
+    Ok(Reading::Halted)
 }
 
 /// Why a mission on `source` can never land, if it cannot: agents' branches
