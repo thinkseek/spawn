@@ -13,6 +13,7 @@ import {
   heldTask,
   isQuietScope,
   lastTask,
+  missingAlwaysOn,
   missionClass,
   orderMissions,
   orderScopes,
@@ -214,6 +215,16 @@ test("a sent-back task that was redone and landed nests under the redo, not unde
   ]);
 });
 
+test("overlapping attempts: an open attempt is the row, never nested under a closed one", () => {
+  const m = mission(6, [
+    task(1, "delivered", [["assigned", 1], ["delivered", 2]], { objective: 5 }),
+    task(2, "cancelled", [["assigned", 3], ["cancelled", 4]], { objective: 5 }),
+  ]);
+  assert.deepEqual(ids(groupTasks(m.tasks, (t) => t, m), (t) => t), [
+    ["in_flight", [[1, "2: cancelled"]]],
+  ]);
+});
+
 test("tasks without an objective are their own rows; items may be anything that carries a task", () => {
   const m = mission(7, [
     task(92, "delivered", [["assigned", 50], ["delivered", 51]]),
@@ -358,8 +369,25 @@ test("a worker whose engine ended while it holds an open task stays on a task", 
   assert.equal(ended.agents.length, 0);
 });
 
+test("approved residents and the supervisor without a session are missing, not silently absent", () => {
+  const context = fleetContext(fleetMissions());
+  assert.equal(context.known, true);
+  assert.deepEqual(
+    missingAlwaysOn([agent("agent_resident_supply"), agent("agent_worker_x_1")], context),
+    [
+      { role: "supervisor", name: "supervisor" },
+      { role: "resident", name: "rsi" },
+    ],
+  );
+  assert.deepEqual(
+    missingAlwaysOn([agent("agent_supervisor", { role: "supervisor" }), agent("agent_resident_rsi"), agent("agent_resident_supply")], context),
+    [],
+  );
+});
+
 test("before /api/missions answers, an agent_resident_ id is a resident", () => {
   const context = fleetContext(null);
+  assert.equal(context.known, false);
   const groups = groupAgents(
     [agent("agent_worker_x_1"), agent("agent_resident_supply"), agent("agent_supervisor", { role: "supervisor" })],
     context,
@@ -393,10 +421,18 @@ function scope(missionId: number | null, landed: number): ScorecardScope {
   };
 }
 
-test("a mission scope with no landings is quiet; scopes follow the missions' order, quiet ones last", () => {
+test("a mission scope where nothing happened is quiet; scopes follow the missions' order, quiet ones last", () => {
   assert.equal(isQuietScope(scope(1, 0)), true);
   assert.equal(isQuietScope(scope(4, 3)), false);
   assert.equal(isQuietScope(scope(null, 0)), false);
+  // No landing, but the gate ran: its time and rework are data, not quiet.
+  const rejected = scope(7, 0);
+  (rejected.dimensions as unknown as Record<string, unknown>).gate_time = { n: 6, runs: 6 };
+  assert.equal(isQuietScope(rejected), false);
+  // A drop from landings in the previous window to none is news.
+  const dropped = scope(8, 0);
+  dropped.dimensions.throughput.previous = 1.5;
+  assert.equal(isQuietScope(dropped), false);
   const missions = [
     mission(4, [task(85, "reported", [["assigned", 0]])]),
     mission(6, [task(101, "delivered", [["assigned", 50]])]),
