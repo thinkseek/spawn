@@ -27,6 +27,7 @@ import {
   stateLabelUpper,
 } from "../../fleet";
 import { clockTime, formatDuration } from "../../format";
+import { HeldSources } from "../missions/HeldSources";
 import { cx } from "../ui";
 import { FleetStateBadge, JudgeBadge, RoleBadge } from "./bits";
 
@@ -86,7 +87,8 @@ function age(since: number | null): string | null {
 }
 
 /** The dispatcher's view: question, then untold, then told; then the
- * supervisor's lines for the owner. */
+ * owner's holds with tasks waiting behind them, and the supervisor's lines
+ * for the owner. */
 function DispatcherQueue(props: {
   attention: Attention;
   agents: FleetAgent[];
@@ -96,6 +98,11 @@ function DispatcherQueue(props: {
   return (
     <>
       <Queue {...props} />
+      <HeldSources
+        holds={props.attention.holds}
+        title="Held by the owner"
+        hint="no task lands on these sources until the hold is released or expires; their gates still run"
+      />
       <OwnerNotes notes={attentionGroups(props.attention).forOwner} />
     </>
   );
