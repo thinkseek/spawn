@@ -36,13 +36,20 @@ export function Collapsible({
   label,
   children,
   defaultOpen = false,
+  onToggle,
 }: {
   label: string;
   children: ReactNode;
   defaultOpen?: boolean;
+  /** Told when the section opens or closes. */
+  onToggle?: (open: boolean) => void;
 }) {
   return (
-    <details open={defaultOpen} className="group min-w-0">
+    <details
+      open={defaultOpen}
+      className="group min-w-0"
+      onToggle={onToggle ? (event) => onToggle(event.currentTarget.open) : undefined}
+    >
       <summary className="flex cursor-pointer list-none items-center gap-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground select-none hover:text-muted-foreground [&::-webkit-details-marker]:hidden">
         <ChevronRight
           size={12}
