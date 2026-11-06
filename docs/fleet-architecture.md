@@ -796,9 +796,6 @@ record of what was judged (§14 of design.md).
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-<<<<<<< 13668eb67b550a978e5eeed294e51646ef0c2557
-  3. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
-=======
   3. measures the host before the gate starts: **the host's room is
      checked before a gate, not discovered by its crash.** For this
      judging's task only (one that got a gate slot; a task that waits is
@@ -830,8 +827,7 @@ record of what was judged (§14 of design.md).
      as a regression of the candidate; the probe finds it in seconds, before
      any candidate runs. The decision rests on measures taken at the
      judging, recorded with their thresholds (design.md §14);
-  4. runs the gate on C, with a 45-minute wall clock. When the gate
->>>>>>> b6c4f24d2d4a341498012322571145be309dce56
+  4. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
      rejects C and C is a real merge (the pushed head does not contain
      `main`, so C's tree is not the head's), it then judges the head alone
      before recording anything: the same gate, scenarios and task scenario,
