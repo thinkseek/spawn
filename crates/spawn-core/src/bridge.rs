@@ -215,6 +215,27 @@ struct Active {
 }
 
 impl Active {
+    /// An execution as its `execution.started` record has it.
+    fn started(
+        execution_id: ExecutionId,
+        workspace: WorkspaceId,
+        transcript_from: Option<u64>,
+    ) -> Self {
+        Self {
+            execution_id,
+            workspace,
+            checkpoint: None,
+            reported_end: None,
+            unmounting: false,
+            // The execution's lines are the ones after where the transcript
+            // ended when it started, after a restart too.
+            follow: Follow {
+                offset: transcript_from.unwrap_or(0),
+                ..Follow::default()
+            },
+        }
+    }
+
     /// The terminal that hosts the execution: always `spawn-<execution>`,
     /// so it is derived, never stored.
     fn terminal(&self) -> TerminalName {
@@ -828,20 +849,10 @@ impl Bridge {
             } => {
                 view.model = *model;
                 if let Some(execution_id) = event.execution_id.clone() {
-                    view.active = Some(Active {
-                        execution_id,
-                        // As the store names it now (an older record: its root unresolved).
-                        workspace: self.workspaces.canonical(workspace),
-                        checkpoint: None,
-                        reported_end: None,
-                        unmounting: false,
-                        // The execution's lines are the ones after where the
-                        // transcript ended when it started, after a restart too.
-                        follow: Follow {
-                            offset: transcript_from.unwrap_or(0),
-                            ..Follow::default()
-                        },
-                    });
+                    // As the store names it now: a record from before the
+                    // root was resolved names the same directory.
+                    let workspace = self.workspaces.canonical(workspace);
+                    view.active = Some(Active::started(execution_id, workspace, *transcript_from));
                 }
             }
             // After a restart, the last recorded screen. The Bridge's own
