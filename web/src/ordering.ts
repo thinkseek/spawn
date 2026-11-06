@@ -226,7 +226,9 @@ function byStart(left: MissionTask, right: MissionTask): number {
 /**
  * A mission's tasks in sections (only the non-empty ones, in
  * TASK_SECTIONS order). Tasks that share an objective are one group whose
- * row is the latest attempt; its section decides the group's. In flight
+ * row is the latest attempt, or the latest open one when attempts overlap
+ * (an open attempt is never nested under a closed one); the row's section
+ * decides the group's. In flight
  * runs oldest first, so the longest-running is on top; the rest newest
  * first. `items` may be tasks or anything that carries one (a timeline bar).
  */
@@ -248,11 +250,12 @@ export function groupTasks<T>(
   const sections = new Map<TaskSection, TaskGroup<T>[]>();
   for (const [key, bucket] of buckets) {
     const ordered = [...bucket].sort((left, right) => byStart(taskOf(left), taskOf(right)));
-    const item = ordered[ordered.length - 1];
+    const open = ordered.filter((entry) => isOpenTask(taskOf(entry), mission));
+    const item = open.length > 0 ? open[open.length - 1] : ordered[ordered.length - 1];
     const task = taskOf(item);
     const section = taskSection(task, mission);
     const earlier = ordered
-      .slice(0, -1)
+      .filter((entry) => entry !== item)
       .reverse()
       .map((entry) => ({
         item: entry,
@@ -366,9 +369,14 @@ export interface TaskRef {
 }
 
 export interface FleetContext {
+  /** Whether /api/missions has answered: before it has, no agent is known
+   * to hold a task. */
+  known: boolean;
   /** Resident name by session id and by agent id; null before /api/missions
    * answers, when an `agent_resident_` id is taken as a resident's. */
   residents: Map<string, string> | null;
+  /** The approved residents, which are expected to run. */
+  approved: Array<{ name: string; agent_id: string | null; session_id: string | null }>;
   /** The open task each session (or agent) holds. */
   openTasks: Map<string, TaskRef>;
   /** The latest task of each session (or agent), open or not. */
@@ -383,14 +391,18 @@ function holdRank(task: TaskRef): number {
 export function fleetContext(missions: Missions | null): FleetContext {
   const openTasks = new Map<string, TaskRef>();
   const lastTasks = new Map<string, TaskRef>();
-  if (!missions) return { residents: null, openTasks, lastTasks };
+  if (!missions) return { known: false, residents: null, approved: [], openTasks, lastTasks };
 
   const residents = new Map<string, string>();
+  const approved: FleetContext["approved"] = [];
   for (const resident of missions.residents) {
     if (resident.state === "retired") continue;
     const name = resident.name ?? resident.agent_id ?? resident.session_id ?? "resident";
     if (resident.session_id) residents.set(resident.session_id, name);
     if (resident.agent_id) residents.set(resident.agent_id, name);
+    if (resident.state === "approved") {
+      approved.push({ name, agent_id: resident.agent_id, session_id: resident.session_id });
+    }
   }
 
   for (const mission of missions.missions) {
@@ -422,7 +434,30 @@ export function fleetContext(missions: Missions | null): FleetContext {
       }
     }
   }
-  return { residents, openTasks, lastTasks };
+  return { known: true, residents, approved, openTasks, lastTasks };
+}
+
+/** An always-on agent that should run but has no session in the fleet: the
+ * supervisor, or an approved resident never started (or gone). */
+export interface MissingAgent {
+  role: "supervisor" | "resident";
+  name: string;
+}
+
+export function missingAlwaysOn(
+  agents: ReadonlyArray<Pick<AgentFacts, "session_id" | "agent_id" | "role">>,
+  context: FleetContext,
+): MissingAgent[] {
+  const missing: MissingAgent[] = [];
+  if (!agents.some((agent) => agent.role === "supervisor")) {
+    missing.push({ role: "supervisor", name: "supervisor" });
+  }
+  const present = new Set(agents.flatMap((agent) => [agent.session_id, agent.agent_id]));
+  for (const resident of context.approved) {
+    const ids = [resident.session_id, resident.agent_id].filter((id): id is string => id !== null);
+    if (!ids.some((id) => present.has(id))) missing.push({ role: "resident", name: resident.name });
+  }
+  return missing;
 }
 
 export type AgentFacts = Pick<
@@ -543,11 +578,23 @@ export function splitId(id: string): { head: string; tail: string } {
 // ---------------------------------------------------------------------------
 // Scorecard
 
-/** A mission scope with no landing in the window: one line, not a grid of
- * "not enough data". */
+/** A mission scope where nothing happened in the window: no landing, no
+ * gate run, no send-back, intervention or reliability event, and none
+ * landed in the previous window either (a drop to zero is news). One line,
+ * not a grid of "not enough data". */
 export function isQuietScope(scope: Pick<ScorecardScope, "scope" | "dimensions">): boolean {
-  const throughput = scope.dimensions.throughput;
-  return scope.scope === "mission" && throughput.n === 0 && throughput.landed === 0;
+  const d = scope.dimensions;
+  return (
+    scope.scope === "mission" &&
+    d.throughput.n === 0 &&
+    d.throughput.landed === 0 &&
+    !((d.throughput.previous ?? 0) > 0) &&
+    (d.gate_time?.n ?? 0) === 0 &&
+    (d.gate_time?.runs ?? 0) === 0 &&
+    (d.rework?.send_backs ?? 0) === 0 &&
+    (d.autonomy?.interventions ?? 0) === 0 &&
+    (d.reliability?.events ?? 0) === 0
+  );
 }
 
 /** The fleet first, then missions in the missions' order (unknown ones
