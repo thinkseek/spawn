@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use serde_json::Value;
 use spawn_core::command::CommandAction;
 use spawn_core::observation::SemanticState;
 
@@ -51,8 +52,86 @@ fn heading(why: Why) -> &'static str {
         Why::StopFailed => "stop failed",
         Why::Disk => "disk space on this host",
         Why::GateRoom => "no room for the gate on this host",
+        Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
         Why::Stalled => "stalled",
     }
+}
+
+/// Crash lines and failures an escalation quotes at most.
+const HOST_FAULT_QUOTED: usize = 3;
+
+/// The digest items for `records`, the integrator's `host_fault` gate
+/// records that carry `escalate` (the mission's second host fault in a row)
+/// and that no delivered digest told yet
+/// (`PostgresStore::gate_host_fault_escalations`). Each names the task, the
+/// mission, the count, the host's evidence (the crash lines from the test
+/// database's log, or the first failure's test and message) and when the
+/// task is judged again (the record's `due_ms`). No time window: a record
+/// stays an item until a digest carrying its tag
+/// (`host gate-host-fault-<event id>`) reaches the supervisor, so it is told
+/// once.
+pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let task = record["id"].as_i64()?;
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            let faults = record["host_faults"].as_u64().unwrap_or(2);
+            let quoted = |values: &Value, line: &dyn Fn(&Value) -> Option<String>| {
+                values
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(line)
+                    .take(HOST_FAULT_QUOTED)
+                    .collect::<Vec<String>>()
+                    .join(" / ")
+            };
+            let crash = quoted(&record["crash"], &|line| {
+                line.as_str().map(|line| one_line(line, 300))
+            });
+            let evidence = if crash.is_empty() {
+                let failures = record["failures"].as_array().map_or(0, Vec::len);
+                format!(
+                    "every check-tests.sh failure ({failures}) was a connection error to the \
+                     test database, first {}",
+                    quoted(&record["failures"], &|failure| {
+                        Some(format!(
+                            "{}: {}",
+                            failure["test"].as_str()?,
+                            one_line(failure["message"].as_str().unwrap_or_default(), 300)
+                        ))
+                    })
+                )
+            } else {
+                format!("the test database's log shows a crash during the gate: {crash}")
+            };
+            let due = record["due_ms"].as_i64().map_or_else(
+                || "after its backoff".to_string(),
+                |due| format!("at {}", crate::scorecard::time::format_rfc3339(due)),
+            );
+            Some(Escalation {
+                session_id: "host".to_string(),
+                id: format!("gate-host-fault-{id}"),
+                why: Why::GateHostFault,
+                line: format!(
+                    "task #{task} of {mission}: {faults} gate failures in a row were the \
+                     host's, not the work's: {evidence}. It is judged again {due}; nothing is \
+                     counted and nothing halts. Check the test database's host (its memory, \
+                     /dev/shm, its log) or tell the owner."
+                ),
+            })
+        })
+        .collect()
+}
+
+/// `text` on one line (newlines become spaces), cut to `limit` characters.
+fn one_line(text: &str, limit: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.chars().take(limit).collect()
 }
 
 /// The digest typed into the supervisor's pane.
