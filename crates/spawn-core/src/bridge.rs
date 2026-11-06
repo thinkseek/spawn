@@ -2485,6 +2485,20 @@ impl Bridge {
         if let Some(why) = held {
             return self.not_yet(claimed, &active, shown, Some(&why));
         }
+        self.type_when_ready(claimed, &active, text, waited.is_some(), shown)
+    }
+
+    /// Read the pane and type `text` if it is ready, else leave the input to
+    /// [`Self::not_yet`]. `waited`: the input was recorded waiting before.
+    fn type_when_ready(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        text: &str,
+        waited: bool,
+        shown: ScreenState,
+    ) -> Result<Handled, StoreError> {
+        let finished = |outcome| Ok(Handled::Finished(outcome));
         // A failed capture or a staging refused, on a terminal still there,
         // spends one attempt; out of attempts, the input is not ready, which
         // typed nothing. Only a terminal that is gone fails one that cannot
@@ -2499,13 +2513,13 @@ impl Bridge {
             let pane =
                 match self
                     .terminals
-                    .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
+                    .capture_tail(active.terminal(), active.workspace, TAIL_LINES)
                 {
                     Ok(pane) => pane,
                     Err(error) => {
-                        if self.terminal_gone(&active) {
+                        if self.terminal_gone(active) {
                             if waits(&claimed.principal) {
-                                return self.not_yet(claimed, &active, shown, None);
+                                return self.not_yet(claimed, active, shown, None);
                             }
                             return finished(Outcome::Failed(format!(
                                 "terminal disappeared: {error}"
@@ -2514,7 +2528,7 @@ impl Bridge {
                         if last {
                             return self.not_yet(
                                 claimed,
-                                &active,
+                                active,
                                 ScreenState::Unknown,
                                 Some(&format!("pane unread ({error})")),
                             );
@@ -2525,11 +2539,11 @@ impl Bridge {
             let reading = read_claude_screen(&pane);
             // A waiting input's busy readings are not recorded again each
             // time it is tried: they are no new fact.
-            if reading.state.accepts_input() || waited.is_none() {
+            if reading.state.accepts_input() || !waited {
                 self.append(
                     &claimed.agent_id,
                     &claimed.session_id,
-                    Some(&active.execution_id),
+                    Some(active.execution_id),
                     Source::Bridge,
                     None,
                     EventKind::ScreenObserved {
@@ -2539,21 +2553,21 @@ impl Bridge {
                 )?;
             }
             if !reading.state.accepts_input() {
-                return self.not_yet(claimed, &active, reading.state, None);
+                return self.not_yet(claimed, active, reading.state, None);
             }
-            match self.type_once(claimed, &active, text)? {
+            match self.type_once(claimed, active, text)? {
                 Ok(()) => return finished(Outcome::Succeeded),
                 Err(Untyped::Refused(error)) => {
-                    if self.terminal_gone(&active) {
+                    if self.terminal_gone(active) {
                         if waits(&claimed.principal) {
-                            return self.not_yet(claimed, &active, shown, None);
+                            return self.not_yet(claimed, active, shown, None);
                         }
                         return finished(Outcome::Failed(format!("terminal disappeared: {error}")));
                     }
                     if last {
                         return self.not_yet(
                             claimed,
-                            &active,
+                            active,
                             reading.state,
                             Some(&format!("submit text refused before typing ({error})")),
                         );
