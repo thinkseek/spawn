@@ -8,6 +8,7 @@ import type { RsiDashboard, RsiMission, RsiObjective, RsiTask } from "../../rsi"
 import {
   chartObjective,
   fetchDashboard,
+  promptTitle,
   focusObjective,
   metricPoints,
   openTask,
@@ -34,7 +35,7 @@ interface RsiViewProps {
 /** The RSI objective mission(s): objectives from the backlog, the task in
  * flight, what the gate said, and the resident's terminal. */
 export function RsiView({ onOpenSession }: RsiViewProps) {
-  const dashboard = usePoll<RsiDashboard>("rsi", fetchDashboard, 2_000);
+  const dashboard = usePoll<RsiDashboard>("rsi", fetchDashboard, 2_000, { checked: true });
   const [chosenMission, setChosenMission] = useState<number | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [chosenObjective, setChosenObjective] = useState<number | null>(null);
@@ -82,7 +83,11 @@ export function RsiView({ onOpenSession }: RsiViewProps) {
         )}
         <LiveStatus
           error={dashboard.error}
-          label={data ? `Updated ${relativeTime(data.generated_at_ms)}` : "Connecting"}
+          label={
+            data
+              ? `Updated ${relativeTime(freshAt(data.generated_at_ms, dashboard.checkedAt))}`
+              : "Connecting"
+          }
         />
         {residentSession && (
           <Button onClick={() => onOpenSession(residentSession)}>
@@ -211,7 +216,7 @@ function ObjectiveCard({ mission }: { mission: RsiMission }) {
           </Eyebrow>
           <h2
             className="mt-0.5 truncate text-title-sm font-semibold text-foreground"
-            title={objective.prompt}
+            title={promptTitle(objective)}
           >
             {objective.title}
           </h2>
@@ -580,7 +585,7 @@ function ObjectivesCard({
               </span>
               <span
                 className="min-w-0 flex-1 truncate text-label text-foreground/90"
-                title={objective.prompt}
+                title={promptTitle(objective)}
               >
                 {objective.title}
               </span>
