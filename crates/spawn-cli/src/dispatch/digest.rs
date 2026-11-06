@@ -229,7 +229,7 @@ pub(crate) fn hold_expiries(records: &[Value]) -> Vec<Escalation> {
             );
             let main = record["main"].as_str().map_or_else(
                 || "its main".to_string(),
-                |main| format!("its main {}", &main[..main.len().min(12)]),
+                |main| format!("its main {}", main.chars().take(12).collect::<String>()),
             );
             let waiting: Vec<String> = record["waiting"]
                 .as_array()
