@@ -1350,17 +1350,6 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             since_ms: None,
         });
     }
-<<<<<<< 4bd4c19bb866659500033efdfca36db64186d47e
-    for (task, attempts) in waiting_attempts(work, rows) {
-        if let Attempts::Failed { why, .. } = attempts {
-            items.push(Escalation {
-                session_id: task.session_id.clone(),
-                id: task.delivery_key(),
-                why: Why::DeliveryFailed,
-                line: format!("task #{} {why}", task.id),
-                since_ms: None,
-            });
-=======
     for (task, facts, attempts) in waiting_attempts(work, rows) {
         let Attempts::Failed { why, spent, .. } = attempts else {
             continue;
@@ -1368,7 +1357,6 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         // A first delivery spent without typing is re-issued instead.
         if spent && task.reissuable() {
             continue;
->>>>>>> 3507ae04337ca0bb051e24d94e36024394f9065e
         }
         let line = match task.reissue_of {
             Some(old) if spent => reissue_spent(task, facts, old),
@@ -1379,6 +1367,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             id: task.delivery_key(),
             why: Why::DeliveryFailed,
             line,
+            since_ms: None,
         });
     }
     items
