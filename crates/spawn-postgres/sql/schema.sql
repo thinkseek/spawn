@@ -2118,21 +2118,67 @@ begin
 end $$;
 
 -- The integrator's records (`spawn integrate`, owner only): gate verdicts,
--- landings, aborts over budget, and halts.
+-- landings, aborts over budget, halts, the landings an owner's hold keeps
+-- waiting (`task.held`) and the holds past their bound (`source.hold_expired`).
+-- Returns the record's event id; null for a `task.held` already recorded for
+-- the task and hold (it records nothing).
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
     v_mission bigint;
     v_stale bigint;
     v_recorded bigint;
+    v_hold mission_source_holds;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted') then
+    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
+                                   'task.held', 'source.hold_expired') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- A hold past its bound ends by this record alone, and only the active
+    -- hold of its source, once the database's clock has reached its
+    -- `expires_ms`: a release or a renewal recorded first wins. The store
+    -- names the bound and the tasks waiting behind it, oldest first.
+    if p_record ->> 'type' = 'source.hold_expired' then
+        select * into v_hold from mission_source_holds where source = p_record ->> 'source';
+        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold' then
+            raise exception 'hold % is not the active hold of %', p_record ->> 'hold',
+                            p_record ->> 'source';
+        end if;
+        if spawn_now_ms() < v_hold.expires_ms then
+            raise exception 'hold % on % expires at %, not before', v_hold.hold, v_hold.source,
+                            v_hold.expires_ms;
+        end if;
+        return spawn_control_record(p_record || jsonb_build_object(
+            'expires_ms', v_hold.expires_ms,
+            'waiting', (select coalesce(jsonb_agg(k.id order by k.id), '[]'::jsonb)
+                          from mission_tasks k
+                         where k.state = 'landing' and k.held_by = v_hold.hold)));
+    end if;
+    -- A landing that waits behind the active hold of its mission's source,
+    -- recorded once per task and hold.
+    if p_record ->> 'type' = 'task.held' then
+        select h.* into v_hold
+          from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+          join mission_source_holds h on h.source = m.sources ->> 0
+         where k.id = (p_record ->> 'id')::bigint;
+        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold'
+           or v_hold.source is distinct from p_record ->> 'source' then
+            raise exception 'hold % is not the active hold on task %''s source %',
+                            p_record ->> 'hold', p_record ->> 'id', p_record ->> 'source';
+        end if;
+        if exists (select 1 from spawn_events e
+                    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+                      and e.kind -> 'detail' -> 'record' ->> 'id' = p_record ->> 'id'
+                      and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.held'
+                      and e.kind -> 'detail' -> 'record' ->> 'hold' = p_record ->> 'hold') then
+            return null;
+        end if;
     end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
@@ -2176,6 +2222,7 @@ begin
          where id = (p_record ->> 'id')::bigint
            and state = any (case p_record ->> 'type'
                               when 'task.landed' then array['landing']
+                              when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
