@@ -96,6 +96,35 @@
 //!    other gate failure, the gate's own exit 3 included (a missing bind
 //!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
 //!
+//!    **The host's room is measured before the gate, never learned from
+//!    its crash** ([`gate::Room`]). At the start of each judging, after the
+//!    candidate is built and before the gate starts (only for a task that
+//!    got a gate slot: a task that waits is neither checked nor recorded),
+//!    the integrator checks, in this order, stopping at the first that falls
+//!    short: the free KiB (`df`) of the gate's TMPDIR against
+//!    SPAWN_GATE_MIN_FREE_GB (default 10, the floor `scripts/disk.sh` reads:
+//!    one floor, one meaning); `MemAvailable` in MiB against
+//!    SPAWN_GATE_MIN_FREE_MEMORY_MB (default 2048, the integrator's only);
+//!    and, when SPAWN_TEST_DATABASE_URL is set in the integrator's
+//!    environment (whatever [`gate::withhold_owners_cluster`] then decides
+//!    for the gate), a connection to the test database within 10 s and a
+//!    forced parallel query (a Gather with a worker, so its dynamic shared
+//!    memory is exercised) within 10 s. A check that falls short runs no
+//!    gate: the task is gated `no_room`, the path above, unchanged in its
+//!    meaning (no verdict, no count, the same `gate_room_*` run, backoff and
+//!    escalation), and the record names `check` (`disk`, `memory`,
+//!    `database`), `measured` and `threshold` (free KiB and the floor in
+//!    KiB, with `free_kb`, `min_gb` and `tmpdir`; available MiB and the
+//!    floor in MiB; the error and the probe, with the server named
+//!    host:port/database, never the URL's password), and a reason that names
+//!    the three ([`short_of_room`]). A threshold of 0 disables its check; one
+//!    that does not parse is an abort. Every check met: the gate runs as
+//!    before, its own floor and exit 5 included. The decision rests on
+//!    measures taken at the judging, recorded with their thresholds (design
+//!    §14): a host whose test database cannot run a parallel query is found
+//!    in seconds, not by a gate whose every database test fails 25 minutes
+//!    in and reads as a regression;
+//!
 //!    **A report is judged against the checkpoint of the turn that produced
 //!    it.** The dispatcher collects a report only after the turn that wrote
 //!    it ended in the log, and the Bridge records a turn's checkpoint before
