@@ -452,7 +452,7 @@ fn line_time(line: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said};
+    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said, waiting_holds};
     use crate::deliver::Work;
     use crate::dispatch::{Escalation, Facts, Why, decide_with};
     use serde_json::{Value, json};
@@ -956,5 +956,23 @@ mod tests {
             observation.ambiguity = None;
         }
         assert!(asking(&working).is_none());
+    }
+    /// Objective 34: the attention view lists the owner's holds only while a
+    /// task waits behind them, beside `pending` and `told`, never among them.
+    #[test]
+    fn a_hold_is_listed_only_while_a_task_waits_behind_it() {
+        let holds = json!({"now_ms": 5, "holds": [
+            {"source": "/srv/a.git", "hold": 7, "main": "m", "by": "human", "reason": null,
+             "held_at_ms": 1, "expires_ms": 10_800_001_i64, "waiting": [12, 15]},
+            {"source": "/srv/b.git", "hold": 9, "main": "n", "by": "human",
+             "reason": "owner gate", "held_at_ms": 2, "expires_ms": 20_002, "waiting": []},
+        ]});
+        let listed = waiting_holds(&holds);
+        assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+        assert_eq!(listed[0]["source"], "/srv/a.git");
+        assert_eq!(listed[0]["hold"], 7);
+        assert_eq!(listed[0]["waiting"], json!([12, 15]));
+        assert_eq!(waiting_holds(&json!({"now_ms": 5, "holds": []})), json!([]));
+        assert_eq!(waiting_holds(&json!({})), json!([]));
     }
 }
