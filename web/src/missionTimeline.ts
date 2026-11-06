@@ -282,6 +282,25 @@ export function taskBar(
     if (phase) segments.push({ phase, start: since, end, attempt });
   }
 
+  // A conflict (like a rejection or incompatibility) explains itself in the
+  // record's `note`, which the integrator keeps as the task's review note;
+  // its `reason` is empty. The note describes the latest send-back, so it
+  // fills that mark alone; a cancel overwrites it, so it says nothing then.
+  const lastRecord = records.at(-1)?.stage;
+  if (
+    task.review_note !== null &&
+    lastRecord !== "cancelled" &&
+    lastRecord !== "aborted"
+  ) {
+    let lastBack = -1;
+    for (let index = 0; index < verdicts.length; index += 1) {
+      if (verdicts[index].sentBack) lastBack = index;
+    }
+    if (lastBack >= 0 && verdicts[lastBack].reason === null) {
+      verdicts[lastBack] = { ...verdicts[lastBack], reason: task.review_note };
+    }
+  }
+
   return {
     key,
     task,
