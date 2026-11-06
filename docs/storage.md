@@ -33,12 +33,15 @@ over a size cap stays out of git (below).
 ## Branching and merging
 
 A workspace snapshot is one git commit: its tree holds every file git would
-commit, each up to the size cap ("Files over the cap", below). The branch
-head alone is the whole workspace, so everything below is a git operation.
+commit, each up to the size cap ("Files over the cap", below), except build
+output, `.spawn/` and the engine's own runtime files ("The engine's runtime
+files", below). The branch head alone is the whole workspace, so everything
+below is a git operation.
 
 - **Checkpoint** (every tool call, turn end, exit): the Bridge commits the
   tree against the kept index (a stat cache: only changed files are hashed).
-  Cost is proportional to what changed.
+  Cost is proportional to what changed. The same tree is built for the
+  workspace a set-aside keeps and for a stale workspace's snapshot.
 - **A turn's checkpoint is part of the turn's end.** When the Bridge reads a
   turn's end from the transcript, it commits the workspace and records the
   `artifact.committed` first, then the `turn.stopped` (or `turn.failed`),
@@ -336,6 +339,53 @@ head alone is the whole workspace, so everything below is a git operation.
   head carries that trailer is refused at mount (`FilesOutsideGit`, naming
   the trailer): its tree is not the whole workspace. The live fleet had no
   such commits when the store was removed.
+
+## The engine's runtime files
+
+The engine writes files for itself in its working directory, the
+workspace: Claude Code keeps its session's scheduler lock in
+`.claude/scheduled_tasks.lock`, its worktrees under `.claude/worktrees/`,
+and more. They are the engine's state, not the project's, and a checkpoint
+that took them landed them in `main` (Supply PA's `main` got
+`.claude/scheduled_tasks.lock` from `spawn checkpoint exec_212`, 5a386e2).
+
+- **The list** is the engine's own (`ENGINE_RUNTIME_FILES` in
+  `spawn_host::git`): the paths Claude Code (2.1.318) writes to a
+  checkout's `.git/info/exclude` under `# claude-code-runtime`, at any
+  depth: `.claude/scheduled_tasks.lock`, `.claude/scheduled_tasks.json`,
+  `.claude/routines/.state/`, `.claude/worktrees/`, `.claude/checkpoints/`,
+  `.claude/mailbox/`, `.claude/agent-registry.json`,
+  `.claude/agent-memory-local`, `.claude/first-run`,
+  `.claude/assistant-daemon-state.json`. A workspace has no `.git`, so
+  Claude Code writes those rules nowhere there. The live workspaces held
+  only the lock when the rule came in. A new engine version that writes
+  another file means a new entry. `.claude/scheduled_tasks.json` holds the
+  engine's durable schedule (`CronCreate` with `durable`), so such a
+  schedule lasts only as long as the workspace stays mounted.
+- **Never added.** Every staging (`git add -A`) excludes them by pathspec,
+  so no project rule decides it: a project with no `.gitignore` entry for
+  them, or one that re-includes one, commits none. Nothing is written into
+  the mirror or the workspace for it, so a workspace mounted before this
+  rule is covered at its next checkpoint, its kept index included (the
+  index's entries for them are reset from the checkpoint's parent, never
+  trusted). The rest of `.claude/` is the project's and is committed as
+  usual: `.claude/settings.json`, agents, commands, skills, and a file
+  that only looks like one (`.claude/worktrees.md`). The files stay in
+  the workspace (the engine holds them) and go with it at the unmount.
+- **A runtime file the project tracks**, one the branch and `main` both
+  hold, is committed like any tracked file, as git treats a tracked file
+  that an ignore rule names: the engine's edits to it, and its deletion.
+  Spawn never removes one from `main`: the owner does (`git rm --cached`
+  and an ignore rule, as for Supply PA, 37641e9). While a merge of `main`
+  waits on its markers, the branch counts with what that `main` changed
+  since the merge base, so a runtime file `main` added in the merge stays
+  and one it removed stays out.
+- **One only the branch holds** leaves the branch at its next checkpoint:
+  one a checkpoint from before this rule committed (`main` never had it),
+  or one the owner has since removed from `main`. The landing then changes
+  nothing in `main` for it and does not conflict on it (the owner's
+  removal against the engine's edits would be a modify/delete conflict).
+  The engine's file stays in the workspace.
 
 ## The transcript archive
 
