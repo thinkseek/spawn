@@ -754,6 +754,9 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
     )
     .map_err(|error| format!("{error}\n{USAGE}"))?;
     let integrator = Integrator::new(root, gate, gate_env, gates);
+    if integrator.judge.host.server_log.is_none() {
+        no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
+    }
     loop {
         let pass = integrator.pass();
         if once {
@@ -797,6 +800,43 @@ struct Judge {
     gate: PathBuf,
     /// The gate's whole environment ([`gate::gate_env`]).
     gate_env: Vec<(String, String)>,
+    /// How a rejection is told from a host fault.
+    host: HostSettings,
+}
+
+/// The settings of host faults: the test database's log
+/// ([`TEST_DATABASE_LOG`], none when unset) and the first backoff
+/// (`SPAWN_GATE_HOST_FAULT_BACKOFF_SECS`, [`host_fault_base`]).
+#[derive(Clone, Debug)]
+struct HostSettings {
+    server_log: Option<PathBuf>,
+    backoff: Duration,
+}
+
+impl HostSettings {
+    fn from_env() -> Self {
+        Self {
+            server_log: crate::config::env_value(TEST_DATABASE_LOG).map(PathBuf::from),
+            backoff: host_fault_base(
+                crate::config::env_value("SPAWN_GATE_HOST_FAULT_BACKOFF_SECS").as_deref(),
+            ),
+        }
+    }
+}
+
+/// Whether the integrator said it has no log evidence: said once.
+static SAID_NO_SERVER_LOG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say once, in the integrator's output, that the test database's log gives
+/// no evidence, and why.
+fn no_server_log(why: &str) {
+    if !SAID_NO_SERVER_LOG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "integrate: {why}: no log evidence of a test database crash; a gate failure is read \
+             as the host's only when every failure is a connection error"
+        );
+    }
 }
 
 /// A task a mission may judge now, waiting for a gate.
@@ -827,6 +867,7 @@ impl Integrator {
                 root,
                 gate,
                 gate_env,
+                host: HostSettings::from_env(),
             },
             gates,
             running: RefCell::new(Vec::new()),
@@ -1036,6 +1077,20 @@ impl Integrator {
                     mission.id,
                     task.id,
                     wait.as_secs()
+                );
+                return Ok(false);
+            }
+            // The gate's last run on it was a host fault: wait until the
+            // recorded due time, then judge it again. The mission's other
+            // tasks wait behind it, as they do behind a `no_room`.
+            if let Some(wait) = host_wait(mission, task.id, now_ms()) {
+                println!(
+                    "integrate: mission {}: the gate's last run on task {} was a host fault ({} \
+                     in a row); it is judged again in {}s",
+                    mission.id,
+                    task.id,
+                    mission.gate_host_faults,
+                    wait.as_millis().div_ceil(1000)
                 );
                 return Ok(false);
             }
@@ -1346,6 +1401,9 @@ impl Judge {
             eprintln!("integrate: {warning}");
         }
         let gate_path = pinned(&self.gate);
+        // The candidate's gate run, measured: a crash in the test
+        // database's log counts only inside this window.
+        let window = std::cell::Cell::new((0_i64, 0_i64));
         let run_gate = |base: &str, judged: &str| {
             gate::judge(
                 &gate_path,
@@ -1358,7 +1416,10 @@ impl Judge {
                 gate_wall_clock(),
             )
         };
-        match run_gate(main, &candidate) {
+        let started = now_ms();
+        let judged = run_gate(main, &candidate);
+        window.set((started, now_ms()));
+        match judged {
             Ok(verdict) if verdict.accepted => {
                 // The verdict is stored before git moves, so a crash lands
                 // on the next pass instead of judging again.
@@ -1373,6 +1434,26 @@ impl Judge {
                     ..task.clone()
                 };
                 land(store, mirror, source, &landing)
+            }
+            // A rejection whose every failure is the host's (the test
+            // database failed) is no verdict on the work: `host_fault`, not
+            // counted, judged again after a backoff.
+            Ok(verdict)
+                if let Some(fault) = host::host_fault(&verdict.reason, &verdict.output, || {
+                    let (started, ended) = window.get();
+                    self.crash_in(started, ended)
+                }) =>
+            {
+                let faults = mission.gate_host_faults.saturating_add(1);
+                let backoff = host_fault_backoff(self.host.backoff, faults);
+                let mut extra = host_fault_fields(&fault, faults, backoff, &verdict.output);
+                extra["candidate"] = json!(candidate);
+                println!(
+                    "integrate: task {}: {}",
+                    task.id,
+                    extra["reason"].as_str().unwrap_or_default()
+                );
+                gated("host_fault", extra)
             }
             // A rejected merge is judged again as the head alone, against
             // the main the head last took in: main's moves alone may have
@@ -1409,6 +1490,28 @@ impl Judge {
                 no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms()),
             ),
             Err(failure) => gated("aborted", aborted(&failure)),
+        }
+    }
+}
+
+impl Judge {
+    /// The test database's log lines that show a crash stamped inside the
+    /// gate's window [`started`, `ended`] (with [`host::WINDOW_SLACK_MS`]
+    /// around it). None to read (unset, unreadable): no evidence, said once.
+    fn crash_in(&self, started: i64, ended: i64) -> Vec<String> {
+        let Some(path) = &self.host.server_log else {
+            no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
+            return Vec::new();
+        };
+        match host::read_log(path) {
+            Ok(text) => host::crash_lines(&text, started, ended),
+            Err(error) => {
+                no_server_log(&format!(
+                    "{TEST_DATABASE_LOG} ({}) cannot be read: {error}",
+                    path.display()
+                ));
+                Vec::new()
+            }
         }
     }
 }
