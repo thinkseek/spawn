@@ -10,8 +10,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::command::{Claimed, Outcome, Submission};
-use crate::event::{Appended, EventRecord, Fork, GlobalPosition, NewEvent};
-use crate::id::{AgentId, BranchName, CommandId, CommitId, Principal, TerminalName, WorkspaceId};
+use crate::event::{Appended, EventKind, EventRecord, Fork, GlobalPosition, NewEvent, Source};
+use crate::id::{
+    AgentId, BranchName, CommandId, CommitId, Principal, SessionId, TerminalName, WorkspaceId,
+};
 
 /// Storage failure.
 #[derive(Debug, Error)]
@@ -50,6 +52,44 @@ pub trait EventLog: Send + Sync {
         after: GlobalPosition,
         limit: usize,
     ) -> Result<Vec<EventRecord>, StoreError>;
+
+    /// The session's open execution as the log has it: the record of its
+    /// latest `execution.started` when no `execution.ended` the Bridge wrote
+    /// follows it, the rule by which the log refuses a second start. The
+    /// Bridge asks when its own view of the session runs nothing, so a view
+    /// that diverged from the log (whatever made it) cannot leave the log
+    /// waiting forever for an end the Bridge sees no reason to write. The
+    /// default reads the whole log.
+    fn open_execution(&self, session: &SessionId) -> Result<Option<EventRecord>, StoreError> {
+        const BATCH: usize = 1000;
+        let mut after = GlobalPosition(0);
+        let mut open: Option<EventRecord> = None;
+        loop {
+            let batch = self.read_global(after, BATCH)?;
+            for record in &batch {
+                let event = &record.event;
+                if event.session_id != *session || event.execution_id.is_none() {
+                    continue;
+                }
+                match &event.kind {
+                    EventKind::ExecutionStarted { .. } => open = Some(record.clone()),
+                    EventKind::ExecutionEnded { .. }
+                        if event.source == Source::Bridge
+                            && open.as_ref().is_some_and(|started| {
+                                started.event.execution_id == event.execution_id
+                            }) =>
+                    {
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+            match batch.last() {
+                Some(last) if batch.len() == BATCH => after = last.position,
+                _ => return Ok(open),
+            }
+        }
+    }
 }
 
 /// Leased command queue.
