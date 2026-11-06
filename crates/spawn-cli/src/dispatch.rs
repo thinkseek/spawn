@@ -482,8 +482,8 @@ pub(crate) struct Reading {
 }
 
 /// The plan for this moment, reading only: the host's news (the disk items
-/// `disk` gives for the moment's clock, the gate-room records, the stalls
-/// past their `bounds`, [`stall`]) added to the facts and mission rows
+/// `disk` gives for the moment's clock, the gate-room and gate host-fault
+/// records, the stalls past their `bounds`, [`stall`]) added to the facts and mission rows
 /// `loaded` ([`load`]), then [`decide_with`]. [`step`] submits what it
 /// returns; `GET /api/attention` (crate::serve) shows it. One function for
 /// both, so the queue a person reads is the dispatcher's own.
@@ -503,6 +503,13 @@ pub(crate) fn read_plan(
         store
             .gate_room_escalations()
             .map_err(|error| format!("gate room records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::host_fault_escalations(
+        store
+            .gate_host_fault_escalations()
+            .map_err(|error| format!("gate host fault records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
@@ -542,31 +549,6 @@ pub(crate) fn step(
         // Collecting a report changed a task's state.
         (rows, work) = load(store)?;
     }
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
-    let now = now_ms();
-    let mut host = disk.escalations(now);
-    host.extend(crate::disk::gate_room_escalations(
-        store
-            .gate_room_escalations()
-            .map_err(|error| format!("gate room records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::host_fault_escalations(
-        store
-            .gate_host_fault_escalations()
-            .map_err(|error| format!("gate host fault records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    // A stall read that failed costs this pass its stall items, never its
-    // deliveries: the next pass measures the same stalls again.
-    match load_stalls(store) {
-        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
-        Err(error) => lines.push(format!("dispatch: stalls: {error}")),
-    }
-    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
-=======
     let Reading {
         work,
         mut plan,
@@ -581,7 +563,6 @@ pub(crate) fn step(
         spawn,
     )?;
     lines.extend(read);
->>>>>>> 717804c87e8a0f03573afec63460616fe978477b
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
         if held > 0 {

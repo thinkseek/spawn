@@ -128,6 +128,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      counted and nothing halts. Check the test database's host (its memory, \
                      /dev/shm, its log) or tell the owner."
                 ),
+                since_ms: record["at_ms"].as_i64(),
             })
         })
         .collect()
