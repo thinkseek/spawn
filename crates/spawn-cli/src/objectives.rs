@@ -265,7 +265,12 @@ pub(crate) fn brief(task: &Task, current: Option<f64>, history: &[GateRecord]) -
                 brief,
                 "- task {}: {}{}{}",
                 verdict.task,
-                verdict.verdict,
+                if verdict.verdict == "incompatible" {
+                    "incompatible (passed the gate alone, failed only merged with main; not a \
+                     rejection)"
+                } else {
+                    &verdict.verdict
+                },
                 verdict
                     .reason
                     .as_deref()
