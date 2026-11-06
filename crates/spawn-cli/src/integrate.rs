@@ -1025,6 +1025,22 @@ impl Integrator {
 
     /// One pass over every gated mission, holding the integrator's lock.
     fn pass_on(&self, store: &Arc<PostgresStore>) -> Result<(), String> {
+        // Step 0: the owner's landings, applied before any mission's step
+        // reads its source's main, so no baseline check sees a main the
+        // owner moved without its record. A source whose request is still
+        // pending has its halts by baseline held this pass.
+        let held = owner::apply_pending(store)?;
+        self.steps(store, &held)
+    }
+
+    /// Every mission's step, after step 0: `held` names the sources with an
+    /// owner's landing still pending (each with its oldest request), whose
+    /// missions do not halt by baseline this pass.
+    fn steps(
+        &self,
+        store: &Arc<PostgresStore>,
+        held: &std::collections::HashMap<String, i64>,
+    ) -> Result<(), String> {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
@@ -1041,7 +1057,7 @@ impl Integrator {
             if source.as_ref().is_some_and(|source| moved.contains(source)) {
                 continue;
             }
-            match self.mission(store, &missions, mission, &mut ready) {
+            match self.mission(store, &missions, mission, held, &mut ready) {
                 Ok(true) => {
                     if let Some(source) = source {
                         moved.insert(source);
@@ -1060,12 +1076,13 @@ impl Integrator {
     /// moved). A ready task it may judge goes to `ready`; the gates are
     /// given out after every mission had its step ([`Self::start_ready`]).
     /// `missions` is every mission of the pass, for the landings on a
-    /// shared source.
+    /// shared source; `held`, the sources with an owner's landing pending.
     fn mission(
         &self,
         store: &Arc<PostgresStore>,
         missions: &[Mission],
         mission: &Mission,
+        held: &std::collections::HashMap<String, i64>,
         ready: &mut Vec<Ready>,
     ) -> Result<bool, String> {
         if mission.halted.is_some() {
@@ -1116,10 +1133,21 @@ impl Integrator {
                     ])
                 }) {
                     Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
-                    Ok(main) => {
-                        if let Some(baseline) = &mission.baseline
-                            && *baseline != main
-                        {
+                    Ok(main) => match &mission.baseline {
+                        // An owner's landing on the source is pending: it
+                        // may have moved main before its record (an
+                        // integrator stopped in between), so main says
+                        // nothing until it is applied or refused. No halt,
+                        // and nothing judged against that main.
+                        Some(baseline) if *baseline != main && held.contains_key(source) => {
+                            println!(
+                                "integrate: mission {}: the source's main is {main}, its \
+                                 baseline {baseline}; no halt while the owner's landing (request \
+                                 {}) is pending",
+                                mission.id, held[source]
+                            );
+                        }
+                        Some(baseline) if *baseline != main => {
                             return halt(
                                 store,
                                 mission,
@@ -1130,8 +1158,8 @@ impl Integrator {
                             )
                             .map(|()| false);
                         }
-                        judgeable = Some((mirror, main));
-                    }
+                        _ => judgeable = Some((mirror, main)),
+                    },
                 }
             }
         }
