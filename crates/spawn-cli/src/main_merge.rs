@@ -895,8 +895,9 @@ mod tests {
     /// Issues #7, #8 and #12 through `merge_main` itself: with an input in
     /// flight in the worker's session, main is not merged (the workspace and
     /// the branch stay as they were); with none, every merge is recorded and
-    /// published to the source before `merge_main` returns, and all of them
-    /// run on one pusher, with one thread, for the source.
+    /// published to the source, the one whose push lost the ref lock on the
+    /// retry, and all of them run on one pusher, with one thread, for the
+    /// source.
     #[test]
     fn merge_main_waits_for_a_busy_worker_and_publishes_every_merge_on_one_pusher() {
         use spawn_core::command::{CommandAction, Submission};
@@ -931,6 +932,11 @@ mod tests {
                 .expect("fetch")
         };
         let busy_head = head(&mirror, &busy);
+        // The first merge's push loses the source's ref lock to another
+        // push (issue #8): it is retried, and lands.
+        let lock = Path::new(&source).join(format!("refs/heads/spawn/{idle}.lock"));
+        std::fs::create_dir_all(lock.parent().expect("refs")).expect("refs");
+        std::fs::write(&lock, "").expect("lock");
         for round in 0..3 {
             main_moves(&base, &source, &mirror, |clone| {
                 std::fs::write(clone.join(format!("main-{round}.txt")), "from main\n")
@@ -945,10 +951,20 @@ mod tests {
             let Merge::Merged { commit, .. } = &merge else {
                 panic!("an idle worker gets main: {merge:?}");
             };
+            if round == 0 {
+                assert_ne!(landing(&idle).as_deref(), Some(commit.as_str()));
+                std::fs::remove_file(&lock).expect("the other push ends");
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while landing(&idle).as_deref() != Some(commit.as_str())
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             assert_eq!(
                 landing(&idle).as_deref(),
                 Some(commit.as_str()),
-                "published before merge_main returned"
+                "published (round {round})"
             );
             assert_eq!(
                 db.store.latest_checkpoint(&idle).expect("checkpoint").as_deref(),
@@ -956,9 +972,10 @@ mod tests {
                 "recorded"
             );
         }
-        assert!(
-            crate::push::shared(&source).threads() <= 1,
-            "at most one pusher thread for the source, not one per merge"
+        assert_eq!(
+            crate::push::shared(&source).threads(),
+            1,
+            "one pusher thread for the source (it retried the failed push), not one per merge"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

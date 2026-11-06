@@ -791,6 +791,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Issue #8: a push that loses the source's ref lock to another push
+    /// (git says `[remote rejected]`) is a failure, retried until it lands;
+    /// only git's own refusal of a rewritten branch (`[rejected]`) is not
+    /// retried. Such a push used to count as refused, and was never made.
+    #[test]
+    fn a_push_that_loses_the_ref_lock_is_retried_and_a_rewritten_branch_is_refused() {
+        let base = std::env::temp_dir().join(format!("spawn-sources-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            &seed_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let root = base.join("host");
+        let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
+        let host = GitWorkspace::new(&mirror, &root);
+        let landing = "refs/spawn-integrate/agent_x";
+        checkpoint(&host, "agent_x", "one.txt");
+        assert_eq!(push_branch(&mirror, &source, "agent_x"), Pushed::Done);
+        let head = checkpoint(&host, "agent_x", "two.txt");
+
+        // Another push holds the ref's lock.
+        let lock = Path::new(&source).join("refs/heads/spawn/agent_x.lock");
+        std::fs::write(&lock, "").expect("lock");
+        let pusher = Pusher::with(
+            Box::new(push_branch),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(50),
+        );
+        assert!(
+            matches!(
+                pusher.push_now(&mirror, &source, "agent_x"),
+                Pushed::Failed(_)
+            ),
+            "a lost lock is no refusal"
+        );
+        assert!(pusher.waiting(&mirror, "agent_x"), "it waits for its retry");
+        std::fs::remove_file(&lock).expect("the other push ends");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pusher.waiting(&mirror, "agent_x") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
+            Some(head),
+            "the retry landed it"
+        );
+
+        // A branch rewritten under its published head is refused, not
+        // retried and not overwritten.
+        let path = mirror.to_string_lossy().to_string();
+        let main = git(&["--git-dir", &path, "rev-parse", "refs/heads/main"]).expect("main");
+        git(&["--git-dir", &path, "update-ref", "refs/heads/agent_x", &main]).expect("rewrite");
+        checkpoint(&host, "agent_x", "three.txt");
+        assert!(matches!(
+            push_branch(&mirror, &source, "agent_x"),
+            Pushed::Rejected(why) if why.contains("[rejected]")
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn only_a_directory_on_this_host_receives_branches() {
         let here = std::env::temp_dir();
