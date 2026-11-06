@@ -527,6 +527,41 @@ fn gate(
         },
     })
 }
+/// A landing's `landing` step, from its accepted verdict (`record`), or
+/// from the later record that ended the owner's hold on its source; none
+/// while its source is held (it waits behind the hold, not for the
+/// integrator).
+fn landing(task: &OpenTask, record: &Record, now: i64, bound_ms: i64) -> Option<Measured> {
+    if task.held {
+        return None;
+    }
+    let accepted = format!("the gate accepted it: {}", named(record, now));
+    Some(match &task.hold_end {
+        Some(end) if end.at_ms > record.at_ms => Measured {
+            step: Step::Landing,
+            n: end.id,
+            since_ms: end.at_ms,
+            bound_ms,
+            line: format!(
+                "{accepted}; the owner's hold on its source ended by {}; the integrator lands it \
+                 on its next pass of mission #{}",
+                named(end, now),
+                task.mission_id
+            ),
+        },
+        _ => Measured {
+            step: Step::Landing,
+            n: record.id,
+            since_ms: record.at_ms,
+            bound_ms,
+            line: format!(
+                "{accepted}; the integrator lands it on its next pass of mission #{}",
+                task.mission_id
+            ),
+        },
+    })
+}
+
 /// The step `task` waits on, measured, or none: it is queued, closed with
 /// no worker left, the halt's, or its delivery was given up.
 fn measure(
@@ -588,35 +623,7 @@ fn measure(
         TaskState::Reported | TaskState::Accepted if task.gated => {
             gate(task, record, context, bounds.gate)
         }
-        // Behind the owner's hold on its source: not the integrator's to land.
-        TaskState::Landing if !task.halted && task.held => None,
-        TaskState::Landing if !task.halted => {
-            let accepted = format!("the gate accepted it: {}", named(record, now));
-            Some(match &task.hold_end {
-                // The hold it may have waited behind ended after it was
-                // accepted: the step starts again from that record.
-                Some(end) if end.at_ms > record.at_ms => Measured {
-                    step: Step::Landing,
-                    n: end.id,
-                    since_ms: end.at_ms,
-                    bound_ms: bounds.landing,
-                    line: format!(
-                        "{accepted}; the owner's hold on its source ended by {}; the integrator \
-                         lands it on its next pass of mission #{}",
-                        named(end, now),
-                        task.mission_id
-                    ),
-                },
-                _ => since_record(
-                    Step::Landing,
-                    bounds.landing,
-                    format!(
-                        "{accepted}; the integrator lands it on its next pass of mission #{}",
-                        task.mission_id
-                    ),
-                ),
-            })
-        }
+        TaskState::Landing if !task.halted => landing(task, record, now, bounds.landing),
         TaskState::Accepted | TaskState::Landed | TaskState::Cancelled
             if task.kind == "ephemeral" && facts.is_some_and(|facts| facts.live) =>
         {
