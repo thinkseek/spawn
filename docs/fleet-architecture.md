@@ -478,7 +478,8 @@ repository). Each worker's workspace is a branch of that mirror.
 git run as the owner, so `spawn_mission_add` refuses any other shape (an
 `ext::` command, a relative path, an option), the supervisor may name only a
 source a human already gave a mission, and every git the controller runs
-allows only file, https and ssh (`GIT_ALLOW_PROTOCOL`).
+allows only file, https and ssh (`GIT_ALLOW_PROTOCOL`), in the C locale
+(docs/storage.md, "Branching and merging").
 
 **Limits.** None fixed. The supervisor decides fleet size; humans stop what
 overreaches, and the UI shows the live workers.
