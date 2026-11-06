@@ -150,9 +150,10 @@ function capitalize(text: string): string {
 /**
  * A task row's title: its objective's title when it has one (the
  * integrator's brief starts `Objective N: <title>`; a bare `Task N` is a
- * stand-in, not a title), otherwise the first line of its text. A leading
- * `<mission name>:` is dropped, since the row already sits under the
- * mission. Truncated to `max` characters; null when the task has no text.
+ * stand-in, not a title), otherwise the first line of its text, without a
+ * lead-in that repeats the mission (`<mission name>:`, `Owner work on X
+ * (…).`) or says `Goal:`, since the row already sits under the mission.
+ * Truncated to `max` characters; null when the task has no text.
  */
 export function taskTitle(
   task: Pick<MissionTask, "brief">,
@@ -172,13 +173,29 @@ export function taskTitle(
     if (!PLACEHOLDER.test(title)) return clip(title, max);
     return lines[1] ? clip(lines[1], max) : clip(lines[0], max);
   }
-  let line = lines[0];
-  const name = options.missionName?.trim();
-  if (name && line.toLowerCase().startsWith(`${name.toLowerCase()}:`)) {
-    const rest = line.slice(name.length + 1).trim();
-    if (rest) line = capitalize(rest);
+  return clip(withoutLead(lines[0], options.missionName ?? null), max);
+}
+
+/** `Owner work on Spawn (protected files: …). ` and the like: who the work
+ * is for, which the mission's lane already says. */
+const OWNER_LEAD = /^owner[\w-]*\s+work\s+on\s+[^():.]+?\s*(?:\([^)]*\))?\s*[:.]\s+/i;
+const GOAL_LEAD = /^goal:\s*/i;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** A first line without the lead-in that repeats its mission (`<mission
+ * name>:`, `Owner work on X (…).`) or announces the goal (`Goal:`). */
+function withoutLead(line: string, missionName: string | null): string {
+  let rest = line;
+  const name = missionName?.trim();
+  if (name) {
+    const lead = new RegExp(`^${escapeRegExp(name)}\\s*(?:\\([^)]*\\))?\\s*[:.]\\s+`, "i");
+    rest = rest.replace(lead, "");
   }
-  return clip(line, max);
+  rest = rest.replace(OWNER_LEAD, "").replace(GOAL_LEAD, "");
+  return rest.trim() ? capitalize(rest.trim()) : line;
 }
 
 export interface Attempt<T> {
