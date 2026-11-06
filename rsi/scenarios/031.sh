@@ -103,7 +103,9 @@
 # the `SET transaction_timeout = 0;` pg_restore 17+ writes), and the
 # archive's SQL without that one line restores in 97-116 ms; git bundles of
 # the two sources 1,058-1,060 bytes; the transcripts, 319,613 bytes, 13,901
-# bytes with tar and gzip -6; the stand-in received no request.
+# bytes with tar and gzip -6 (324,195 and 14,579 since the archive also
+# holds a 20-day-old file, one measure run at 18:19 CST); the stand-in
+# received no request.
 # A reference of the contract in shell (curl --aws-sigv4, gpg, pg_dump,
 # git bundle, tar) passes every check in 10.5 s, on the host and in a
 # sandbox like the gate's; variants of it that compare the drill with the
