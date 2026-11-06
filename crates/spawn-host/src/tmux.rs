@@ -333,7 +333,6 @@ impl TerminalHost for TmuxHost {
             .map(str::to_string),
         );
         arguments.push(file.to_string_lossy().into_owned());
-        let environment_file = Some(file);
         arguments.push(launch.program.clone());
         arguments.extend(launch.arguments.iter().cloned());
 
@@ -342,16 +341,12 @@ impl TerminalHost for TmuxHost {
             Ok(run) if run.code == Some(0) => return Ok(()),
             Ok(run) => run,
             Err(error) => {
-                if let Some(file) = &environment_file {
-                    let _ = std::fs::remove_file(file);
-                }
+                let _ = std::fs::remove_file(&file);
                 return Err(error);
             }
         };
         // No pane ran to remove it.
-        if let Some(file) = &environment_file {
-            let _ = std::fs::remove_file(file);
-        }
+        let _ = std::fs::remove_file(&file);
         let stderr = run.stderr.trim();
         if stderr.contains("duplicate session") {
             return Err(TerminalError(format!("{} already exists", launch.terminal)));
