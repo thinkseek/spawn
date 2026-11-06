@@ -682,6 +682,12 @@ pub struct LandingHold<'store> {
     store: &'store PostgresStore,
 }
 
+impl std::fmt::Debug for LandingHold<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LandingHold")
+    }
+}
+
 impl Drop for LandingHold<'_> {
     fn drop(&mut self) {
         // A failure here is a broken connection, which releases it too.
