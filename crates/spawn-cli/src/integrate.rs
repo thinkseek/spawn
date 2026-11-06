@@ -2779,6 +2779,250 @@ mod tests {
         assert_eq!(freshness(None, None, history), Freshness::Nothing);
     }
 
+    /// A scratch repository for the semantic-conflict tests: main M0 with
+    /// `struct.txt` naming `a b`; a work branch from M0 whose head adds
+    /// `use.txt` naming `uses`; main then moves to M1 (`struct.txt` names
+    /// `a b c`, subject `Add field c (objective 1, task 36)`). With
+    /// `head_on_main`, the work branch starts from M1 instead (its head
+    /// contains main). `(base, mirror, m0, m1, head)`.
+    fn semantic_world(
+        tag: &str,
+        uses: &str,
+        head_on_main: bool,
+    ) -> (std::path::PathBuf, String, String, String, String) {
+        let git = crate::sources::git;
+        let base = std::env::temp_dir().join(format!("spawn-semantic-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("struct.txt"), "a b\n").expect("write");
+        commit_in(&seed_path, "base: Facts {a, b}");
+        let m0 = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("m0");
+        let mut work = |from: &str| {
+            git(&["-C", &seed_path, "checkout", "-qb", "work", from]).expect("branch");
+            std::fs::write(seed.join("use.txt"), format!("{uses}\n")).expect("write");
+            commit_in(&seed_path, "spawn checkpoint exec_1");
+            let head = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("head");
+            git(&["-C", &seed_path, "checkout", "-q", "main"]).expect("main");
+            head
+        };
+        let early = (!head_on_main).then(|| work(&m0));
+        std::fs::write(seed.join("struct.txt"), "a b c\n").expect("write");
+        commit_in(&seed_path, "Add field c (objective 1, task 36)");
+        let m1 = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("m1");
+        let head = early.unwrap_or_else(|| work(&m1));
+        (base, format!("{seed_path}/.git"), m0, m1, head)
+    }
+
+    /// A fake gate that "builds" a tree: `use.txt`, when there, must name
+    /// what `struct.txt` names, or it rejects with `candidate tests do not
+    /// build` and a compiler line. It notes `<base> <candidate>` per run in
+    /// `<base>/judged`. With `abort_alone`, a candidate that is not a merge
+    /// (a head judged alone) gets no verdict.
+    fn semantic_gate(base: &std::path::Path, abort_alone: bool) -> std::path::PathBuf {
+        let judged = base.join("judged");
+        let abort = if abort_alone {
+            "git --git-dir=\"$1\" rev-parse -q --verify \"$3^2\" >/dev/null || { echo 'dies'; exit 3; }\n"
+        } else {
+            ""
+        };
+        let script = format!(
+            "echo \"$2 $3\" >>'{}'\n{abort}\
+             s=$(git --git-dir=\"$1\" show \"$3:struct.txt\")\n\
+             u=$(git --git-dir=\"$1\" show \"$3:use.txt\" 2>/dev/null) || u=$s\n\
+             if [ \"$s\" = \"$u\" ]; then\n\
+               printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               echo '{{\"verdict\":\"accepted\"}}'\n\
+             else\n\
+               echo 'error[E0063]: missing field `c` in initializer of `Facts`'\n\
+               printf '{{\"verdict\":\"rejected\",\"reason\":\"candidate tests do not build\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               echo '{{\"verdict\":\"rejected\",\"reason\":\"candidate tests do not build\"}}'\n\
+             fi\n",
+            judged.display()
+        );
+        let path = base.join("gate.sh");
+        std::fs::write(&path, script).expect("gate");
+        path
+    }
+
+    /// The runs the semantic gate noted: `(base, candidate)`.
+    fn semantic_runs(base: &std::path::Path) -> Vec<(String, String)> {
+        std::fs::read_to_string(base.join("judged"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                line.split_once(' ')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+            })
+            .collect()
+    }
+
+    /// Judge the landing of `head` on `main` with the semantic gate, as
+    /// `judge_pushed` does once the merge is rejected: the rejected merge's
+    /// verdict (it must be a rejection), the landing candidate and what
+    /// [`super::rejection`] makes of it.
+    fn judge_semantic(
+        base: &std::path::Path,
+        mirror: &str,
+        main: &str,
+        head: &str,
+        abort_alone: bool,
+    ) -> (String, super::Rejection) {
+        let gate_path = semantic_gate(base, abort_alone);
+        let scenarios = base.join("scenarios");
+        std::fs::create_dir_all(&scenarios).expect("scenarios");
+        let env: Vec<(String, String)> = std::env::var("PATH")
+            .map(|path| vec![("PATH".to_string(), path)])
+            .unwrap_or_default();
+        let run_gate = |against: &str, judged: &str| {
+            crate::gate::judge(
+                &gate_path,
+                std::path::Path::new(mirror),
+                against,
+                judged,
+                &scenarios,
+                None,
+                &env,
+                std::time::Duration::from_secs(60),
+            )
+        };
+        let candidate = super::landing_candidate(mirror, main, head, "Work (task 48)\n")
+            .expect("a candidate")
+            .expect("a clean merge");
+        let merged = run_gate(main, &candidate).expect("a verdict on the merge");
+        assert!(!merged.accepted, "the merge fails the gate: {}", merged.output);
+        let rejection =
+            super::rejection(mirror, main, &candidate, head, &merged, &run_gate).expect("judged");
+        (candidate, rejection)
+    }
+
+    /// Objective 16: a head right on its own base, broken only by what
+    /// landed on main beside it, is `incompatible`: sent back with the
+    /// gate's output and main's commits, judged by the head's own verdict
+    /// against its merge-base with main.
+    #[test]
+    fn a_rejected_merge_whose_head_passes_alone_is_incompatible() {
+        let (base, mirror, m0, m1, head) = semantic_world("incompatible", "a b", false);
+        let (candidate, rejection) = judge_semantic(&base, &mirror, &m1, &head, false);
+        let super::Rejection::Record(verdict, record) = rejection else {
+            panic!("a record: {rejection:?}");
+        };
+        assert_eq!(verdict, "incompatible", "{record}");
+        assert_eq!(record["candidate"], candidate.as_str());
+        assert_eq!(record["head"], head.as_str());
+        assert_eq!(record["head_base"], m0.as_str());
+        assert_eq!(record["head_verdict"], "accepted");
+        assert_eq!(record["main_commits"], json!([m1]));
+        assert_eq!(record["reason"], "candidate tests do not build");
+        assert!(
+            record["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("missing field `c`")),
+            "{record}"
+        );
+        let note = record["note"].as_str().expect("a note");
+        for wanted in [
+            "error[E0063]: missing field `c` in initializer of `Facts`",
+            &m1[..12],
+            "Add field c (objective 1, task 36)",
+            "passes the gate on its own base",
+            "Main is merged into your workspace with this revision",
+        ] {
+            assert!(note.contains(wanted), "{wanted:?} in {note}");
+        }
+        assert_eq!(
+            semantic_runs(&base),
+            vec![(m1.clone(), candidate), (m0, head)],
+            "the merge against main, then the head alone against its base"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The head fails the gate on its own base too: a rejection, counted,
+    /// that names the head's verdict.
+    #[test]
+    fn a_rejected_merge_whose_head_fails_alone_is_rejected() {
+        let (base, mirror, m0, m1, head) = semantic_world("head-fails", "a b z", false);
+        let (candidate, rejection) = judge_semantic(&base, &mirror, &m1, &head, false);
+        let super::Rejection::Record(verdict, record) = rejection else {
+            panic!("a record: {rejection:?}");
+        };
+        assert_eq!(verdict, "rejected", "{record}");
+        assert_eq!(record["head"], head.as_str());
+        assert_eq!(record["head_base"], m0.as_str());
+        assert_eq!(record["head_verdict"], "rejected");
+        assert_eq!(record["candidate"], candidate.as_str());
+        assert!(
+            record["note"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("The gate rejected this work")),
+            "{record}"
+        );
+        assert_eq!(semantic_runs(&base).len(), 2, "the head was judged alone");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A head that contains main is what the gate judged: a rejection of
+    /// the candidate is a rejection, with no second run.
+    #[test]
+    fn a_rejected_candidate_whose_head_contains_main_is_rejected_without_a_second_run() {
+        let (base, mirror, _m0, m1, head) = semantic_world("head-on-main", "a b", true);
+        let (candidate, rejection) = judge_semantic(&base, &mirror, &m1, &head, false);
+        let super::Rejection::Record(verdict, record) = rejection else {
+            panic!("a record: {rejection:?}");
+        };
+        assert_eq!(verdict, "rejected", "{record}");
+        assert!(record.get("head_verdict").is_none(), "{record}");
+        assert!(record.get("head").is_none(), "{record}");
+        assert_eq!(semantic_runs(&base), vec![(m1, candidate)], "one run");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The head's own run gives no verdict: an abort naming the head, never
+    /// `incompatible` on no evidence.
+    #[test]
+    fn a_head_run_without_a_verdict_is_aborted() {
+        let (base, mirror, m0, m1, head) = semantic_world("head-aborts", "a b", false);
+        let (candidate, rejection) = judge_semantic(&base, &mirror, &m1, &head, true);
+        let super::Rejection::Record(verdict, record) = rejection else {
+            panic!("a record: {rejection:?}");
+        };
+        assert_eq!(verdict, "aborted", "{record}");
+        assert_eq!(record["head"], head.as_str());
+        assert_eq!(record["head_base"], m0.as_str());
+        assert_eq!(record["candidate"], candidate.as_str());
+        assert!(record.get("head_verdict").is_none(), "{record}");
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(&head) && reason.contains("gate failed")),
+            "{record}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The note lists at most [`super::NOTE_COMMITS`] of main's commits and
+    /// says how many more there are.
+    #[test]
+    fn an_incompatible_note_bounds_the_commits_it_lists() {
+        let commits: Vec<(String, String)> = (0..super::NOTE_COMMITS + 3)
+            .map(|n| (format!("{n:040x}"), format!("landing {n}")))
+            .collect();
+        let note = super::incompatible_note(
+            "candidate tests do not build",
+            "error: x\n",
+            &"b".repeat(40),
+            &"c".repeat(40),
+            &commits,
+        );
+        assert!(note.contains("landing 0\n"), "{note}");
+        assert!(!note.contains(&format!("landing {}\n", super::NOTE_COMMITS)), "{note}");
+        assert!(note.contains("and 3 more"), "{note}");
+        assert!(note.ends_with("error: x\n"), "{note}");
+    }
+
     #[test]
     fn unresolved_markers_send_work_back_before_the_gate() {
         assert_eq!(markers_note(false, &[]), None);
