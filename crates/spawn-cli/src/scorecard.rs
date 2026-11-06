@@ -310,34 +310,9 @@ fn counts_of(value: &Value, order: &[&str]) -> String {
         .join(", ")
 }
 
-/// One dimension's line: its value (or `not enough data`, with n and the
-/// minimum), its parts, its direction, the previous value and the trend.
-fn line(name: &str, dimension: &Value, min_n: &Value) -> String {
-    let field = |key: &str| dimension.get(key).cloned().unwrap_or(Value::Null);
-    let enough = field("enough").as_bool().unwrap_or(false);
-    let n = show(&field("n"));
-    let as_ms = matches!(name, "lead_time" | "gate_time");
-    let shown = |value: &Value| if as_ms { ms(value) } else { show(value) };
-    let value = if enough && !field("value").is_null() {
-        match name {
-            "throughput" => format!("{} landings per open hour", show(&field("value"))),
-            "lead_time" => format!(
-                "median {}, p90 {}, n {n}",
-                ms(&field("value")),
-                ms(&field("p90"))
-            ),
-            "first_pass" => format!("{} of landings, n {n}", show(&field("value"))),
-            "rework" => format!("{} send-backs per landing, n {n}", show(&field("value"))),
-            "autonomy" => format!("{} interventions per landing, n {n}", show(&field("value"))),
-            "reliability" => format!("{} failures per landing, n {n}", show(&field("value"))),
-            "cost" => format!("{} tokens per landing, n {n}", show(&field("value"))),
-            "gate_time" => format!("median {} over {n} runs", ms(&field("value"))),
-            _ => show(&field("value")),
-        }
-    } else {
-        format!("not enough data (n {n}, minimum {})", show(min_n))
-    };
-    let parts = match name {
+/// A dimension's parts, in words.
+fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
+    match name {
         "throughput" => format!(
             "landed {}, open hours {}",
             show(&field("landed")),
@@ -401,7 +376,37 @@ fn line(name: &str, dimension: &Value, min_n: &Value) -> String {
         }
         "gate_time" => format!("runs {}", show(&field("runs"))),
         _ => String::new(),
+    }
+}
+
+/// One dimension's line: its value (or `not enough data`, with n and the
+/// minimum), its parts, its direction, the previous value and the trend.
+fn line(name: &str, dimension: &Value, min_n: &Value) -> String {
+    let field = |key: &str| dimension.get(key).cloned().unwrap_or(Value::Null);
+    let enough = field("enough").as_bool().unwrap_or(false);
+    let n = show(&field("n"));
+    let as_ms = matches!(name, "lead_time" | "gate_time");
+    let shown = |value: &Value| if as_ms { ms(value) } else { show(value) };
+    let value = if enough && !field("value").is_null() {
+        match name {
+            "throughput" => format!("{} landings per open hour", show(&field("value"))),
+            "lead_time" => format!(
+                "median {}, p90 {}, n {n}",
+                ms(&field("value")),
+                ms(&field("p90"))
+            ),
+            "first_pass" => format!("{} of landings, n {n}", show(&field("value"))),
+            "rework" => format!("{} send-backs per landing, n {n}", show(&field("value"))),
+            "autonomy" => format!("{} interventions per landing, n {n}", show(&field("value"))),
+            "reliability" => format!("{} failures per landing, n {n}", show(&field("value"))),
+            "cost" => format!("{} tokens per landing, n {n}", show(&field("value"))),
+            "gate_time" => format!("median {} over {n} runs", ms(&field("value"))),
+            _ => show(&field("value")),
+        }
+    } else {
+        format!("not enough data (n {n}, minimum {})", show(min_n))
     };
+    let parts = parts_of(name, &field);
     let previous = field("previous");
     let previous = if previous.is_null() {
         "previous none".to_string()
