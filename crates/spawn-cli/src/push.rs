@@ -591,7 +591,7 @@ mod tests {
         wait_for(&count, 2);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(count.load(Ordering::SeqCst), 2, "failed once, then done");
-        assert!(!pusher.waiting(mirror, "agent_a"));
+        assert!(pusher.settled(mirror, "agent_a", Duration::from_mins(1)));
 
         // A refusal is not retried: the branch was rewritten, and a person
         // must look.
@@ -629,9 +629,8 @@ mod tests {
         pusher.mark(mirror, "/s", "agent_a");
         assert_eq!(pusher.flush(), 1);
         assert!(pusher.waiting(mirror, "agent_a"), "still owed its push");
-        wait_for(&count, 3);
+        assert!(pusher.settled(mirror, "agent_a", Duration::from_mins(1)));
         assert_eq!(count.load(Ordering::SeqCst), 3, "the retry pushed it");
-        assert!(!pusher.waiting(mirror, "agent_a"));
     }
 
     /// A push made at once never runs beside the thread's push of the same
