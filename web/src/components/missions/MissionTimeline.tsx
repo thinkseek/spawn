@@ -515,6 +515,8 @@ export function MissionTimeline({
           </AnimatePresence>
         )}
       </div>
+        </>
+      )}
 
       {hover && hover.x >= 0 && !pan.dragging && hoveredRow?.kind === "task" && (
         <FloatingTip
