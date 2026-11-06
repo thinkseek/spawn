@@ -85,12 +85,14 @@ fn unavailable(text: String) -> WorkspaceError {
 /// git itself, before any helper runs.
 pub(crate) const ALLOWED_PROTOCOLS: &str = "file:https:ssh";
 
-/// `git`, as every controller-side call runs it: only
-/// [`ALLOWED_PROTOCOLS`], whatever the installed git defaults to or the
-/// host's configuration allows (`GIT_ALLOW_PROTOCOL` overrides
-/// `protocol.*.allow`), and no standard input.
+/// `git`, as every controller-side call runs it: in the C locale
+/// ([`spawn_host::git_command`]), so what it answers reads the same on a
+/// host whose locale is translated; only [`ALLOWED_PROTOCOLS`], whatever
+/// the installed git defaults to or the host's configuration allows
+/// (`GIT_ALLOW_PROTOCOL` overrides `protocol.*.allow`); and no standard
+/// input.
 pub(crate) fn controller_git() -> Command {
-    let mut command = Command::new("git");
+    let mut command = spawn_host::git_command("git");
     command
         .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
         .env("GIT_PROTOCOL_FROM_USER", "0")
