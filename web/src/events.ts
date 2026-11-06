@@ -46,13 +46,7 @@ export async function fetchEvents(
   signal: AbortSignal,
 ): Promise<EventPage> {
   const from = "after" in start ? `after=${start.after}` : `since_ms=${Math.max(0, Math.floor(start.sinceMs))}`;
-  const response = await fetch(`/api/events?${from}&limit=${PAGE}`, {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) throw apiError(response.status);
-  return normalizeEventPage(await response.json());
+  return readApi(`/api/events?${from}&limit=${PAGE}`, signal, normalizeEventPage);
 }
 
 /** Every event from `sinceMs` to now, page after page; with `before`,

@@ -308,21 +308,7 @@ export async function fetchScorecard(
   query: ScorecardQuery,
   signal: AbortSignal,
 ): Promise<Scorecard> {
-  const response = await fetch(`/api/scorecard${scorecardQuery(query)}`, {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      detail = text(object(await response.json()).error);
-    } catch {
-      // Not JSON; the status is enough.
-    }
-    throw apiError(response.status, detail);
-  }
-  return normalizeScorecard(await response.json());
+  return readApi(`/api/scorecard${scorecardQuery(query)}`, signal, normalizeScorecard);
 }
 
 // ---------------------------------------------------------------------------
