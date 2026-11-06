@@ -908,8 +908,7 @@ mod tests {
         let (idle, idle_session) = db.task_on(&source, "idle");
         for agent in [&busy, &idle] {
             agent_with_work(&store, agent, |directory| {
-                std::fs::write(directory.join(format!("{}.txt", directory.display().to_string().len())), "mine\n")
-                    .expect("write");
+                std::fs::write(directory.join("work.txt"), "mine\n").expect("write");
             });
         }
         // A person types into the busy worker: the input is in flight.
@@ -957,8 +956,9 @@ mod tests {
                 "recorded"
             );
         }
-        assert!(
-            crate::push::shared(&source).threads() <= 1,
+        assert_eq!(
+            crate::push::shared(&source).threads(),
+            1,
             "one pusher thread for the source, not one per merge"
         );
         let _ = std::fs::remove_dir_all(&base);
