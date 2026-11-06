@@ -2566,8 +2566,15 @@ mod tests {
         use super::owner::{full_hash, owner_ref};
         assert!(full_hash(&"a1".repeat(20)));
         assert!(full_hash(&"0f".repeat(32)));
-        for bad in ["HEAD", "--all", "main", &"A1".repeat(20), &"a1".repeat(19), "", &"g".repeat(40)]
-        {
+        for bad in [
+            "HEAD",
+            "--all",
+            "main",
+            &"A1".repeat(20),
+            &"a1".repeat(19),
+            "",
+            &"g".repeat(40),
+        ] {
             assert!(!full_hash(bad), "{bad}");
         }
         assert_eq!(owner_ref("abc"), "refs/spawn-owner/abc");
@@ -2583,7 +2590,10 @@ mod tests {
             message.starts_with("Owner landing (request 42): owner: the contract\n\n"),
             "{message}"
         );
-        assert!(message.contains("c0ffee") && message.contains("ba5e"), "{message}");
+        assert!(
+            message.contains("c0ffee") && message.contains("ba5e"),
+            "{message}"
+        );
         assert!(
             message.ends_with("\n\nSpawn-Owner-Request: 42\nSpawn-Owner-Commit: c0ffee\n"),
             "{message}"

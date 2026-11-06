@@ -554,7 +554,11 @@ mod tests {
             main
         );
 
-        for wanted in ["no-such-branch", "--all", "0123456789abcdef0123456789abcdef01234567"] {
+        for wanted in [
+            "no-such-branch",
+            "--all",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
             let refused = super::put_in_source(&source, &owner, wanted).expect_err(wanted);
             assert!(refused.contains("is not a commit"), "{wanted}: {refused}");
         }
