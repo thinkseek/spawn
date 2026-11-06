@@ -202,19 +202,20 @@ impl Waits {
         let mut warnings = Vec::new();
         let mut millis = |name: &str, fallback_ms: i64| match lookup(name) {
             None => fallback_ms,
-            Some(text) => match text.trim().parse::<u64>() {
-                Ok(secs) => i64::try_from(secs)
-                    .unwrap_or(i64::MAX)
-                    .min(i64::MAX / 1000)
-                    .saturating_mul(1000),
-                Err(_) => {
+            Some(text) => {
+                if let Ok(secs) = text.trim().parse::<u64>() {
+                    i64::try_from(secs)
+                        .unwrap_or(i64::MAX)
+                        .min(i64::MAX / 1000)
+                        .saturating_mul(1000)
+                } else {
                     warnings.push(format!(
                         "{name}={text:?} is not a whole number of seconds; using {}",
                         fallback_ms / 1000
                     ));
                     fallback_ms
                 }
-            },
+            }
         };
         let waits = Self {
             retry_ms: millis("SPAWN_DELIVERY_RETRY_SECS", RETRY_MS),
@@ -2973,10 +2974,10 @@ mod tests {
         let moved = |id, at_ms| Some(super::Moved { id, at_ms });
         // A deploy before the delivery was spent gives it nothing.
         let early = with(vec![reissue.clone()], moved(70, 40_000));
-        assert!(super::orders(&early, &[facts.clone()], 60_000).is_empty());
+        assert!(super::orders(&early, std::slice::from_ref(&facts), 60_000).is_empty());
         // One after it: one attempt at once, delivering the task.
         let tasks = with(vec![reissue.clone()], moved(90, 60_000));
-        let tried = super::orders(&tasks, &[facts.clone()], 60_001);
+        let tried = super::orders(&tasks, std::slice::from_ref(&facts), 60_001);
         assert_eq!(tried.len(), 1, "{tried:?}");
         assert_eq!(tried[0].key, "deliver-4-0-moved-90");
         assert_eq!(tried[0].task, Some(4));

@@ -91,9 +91,9 @@ fn a_reissue_cancels_and_assigns_again_in_one_transaction_each_naming_the_other(
     assert!(new > old);
     let cancelled_id = latest(&mut client, "task.cancelled", old);
     let reassigned_id = latest(&mut client, "task.assigned", new);
-    let (cancelled, cancelled_in) = record(&mut client, cancelled_id);
-    let (reassigned, reassigned_in) = record(&mut client, reassigned_id);
-    assert_eq!(cancelled_in, reassigned_in, "one transaction");
+    let (cancelled, cancel_xact) = record(&mut client, cancelled_id);
+    let (reassigned, assign_xact) = record(&mut client, reassigned_id);
+    assert_eq!(cancel_xact, assign_xact, "one transaction");
     assert_eq!(cancelled["by"], "spawn-dispatch");
     assert_eq!(cancelled["reissued_as"], new);
     assert_eq!(cancelled["attempts"], attempts(old, 14));
