@@ -1366,8 +1366,14 @@ impl Judge {
 
         let scenario = task_scenario(scenarios, task.scenario.as_deref());
         // The host's room, measured now, before any gate starts: a gate
-        // must never be how the integrator learns the host had none.
-        match self.room.check(&self.gate_env) {
+        // must never be how the integrator learns the host had none. A gate
+        // that gets no test database has none to probe.
+        let room = if needs_test_database(scenarios) {
+            self.room.clone()
+        } else {
+            self.room.without_test_database()
+        };
+        match room.check(&self.gate_env) {
             Ok(checks) => println!(
                 "integrate: task {}: room to judge: {}",
                 task.id,
