@@ -1,7 +1,9 @@
 #!/bin/sh
 # Black box: the event log is backed up off the host every hour, the mission
-# repositories and the transcripts every day, encrypted, inside a byte
-# budget that keeps R2 in its free tier, and a restore drill proves the
+# repositories and the transcripts every day (a full bundle a week, an
+# increment on the other days), encrypted, in short windows that keep R2
+# in its free tier, with an alert at 8 GB and nothing ever written past
+# 10 GB (the owner's ruling, 2026-11-06), and a restore drill proves the
 # latest dump restores and holds what its record says. Today one
 # `pg-backup.sh` run a day (spawn-backup.timer, 03:30 CST, 19:30 UTC the day
 # before, + up to 45 min) dumps the database to R2; nothing backs up the
@@ -23,8 +25,9 @@
 # the row count), a throwaway passphrase file and R2 credentials file (mode
 # 600), two mission sources (spawn.git with main and an agent's branch,
 # other.git), and a transcript archive (<workspace root>/.transcripts, two
-# agents). HOME is a scratch directory: nothing here can read the owner's
-# ~/.config/spawn. Checked:
+# agents written now and a third's file last written 20 days ago). HOME is
+# a scratch directory: nothing here can read the owner's ~/.config/spawn.
+# Checked:
 #   (1) `spawn backup dump` exits 0 and records `backup.dumped`; its keys
 #       exist in the stand-in, the first under postgres/hourly/ and one under
 #       postgres/daily/ (the day's first dump); the stored object is no
@@ -39,13 +42,23 @@
 #   (2) Hourly: after more records, a second dump the same UTC day stores
 #       one new object, under postgres/hourly/ only, holding more events
 #       than the first; its `held_bytes` is the bucket's total before it.
-#   (3) `spawn backup bundle` exits 0 and records `backup.bundled`: its key
-#       under bundles/daily/, encrypted with the same passphrase, a tar
-#       (plain, gzip or zstd) holding for each mission source a git bundle
-#       that verifies alone and lists exactly the source's branches at their
-#       commits (the agent's work is in its branch), and every transcript
-#       file under transcripts/<agent>/<file>, the same bytes; the record
-#       names both sources and the transcripts' file count and bytes.
+#   (3) `spawn backup bundle` exits 0 and records `backup.bundled` kind
+#       `full` (none before it): its key under bundles/full/, encrypted with
+#       the same passphrase, a tar (plain, gzip or zstd) holding
+#       manifest.json, for each mission source a git bundle that verifies
+#       alone and lists exactly the source's branches at their commits (the
+#       agent's work is in its branch), and every transcript file modified
+#       within 14 days under transcripts/<agent>/<file>, the same bytes, and
+#       not the 20-day-old one; the record names both sources and the
+#       window's file count and bytes. Then one transcript grows, a new one
+#       appears, the agent's branch moves and other.git does not: a second
+#       bundle the same day records kind `incremental`, `base_event_id` the
+#       full one's, one object under bundles/incr/, holding the grown file's
+#       appended bytes alone (the manifest's offset its old size), the new
+#       file whole (offset 0), nothing of the unchanged one; a git bundle of
+#       spawn.git with prerequisites that, fetched after the full one's,
+#       gives exactly the source's branches, and other.git `unchanged`; the
+#       full bundle and the increment give the window back byte for byte.
 #   (4) After more records (the database now holds more events than the
 #       dump), `spawn backup verify` exits 0 and records `backup.verified`
 #       ok, naming the newest dump's key and its record's event id, with the
@@ -58,10 +71,13 @@
 #       not. With the newest dump's stored objects corrupted (one byte
 #       flipped in the middle of each), the drill fails: exit 1, a
 #       `backup.verified` not ok with its reason, no scratch database left.
-#   (6) The budget: the bucket holds more than SPAWN_BACKUP_R2_BUDGET_MB=1
-#       allows (a 1.5 MB object); the bundle stores nothing under bundles/
-#       and its record names the skipped tiers and the budget; the dump
-#       still stores its hourly copy, recorded `over_budget`.
+#   (6) The alert and the limit, with a 1.5 MB object in the bucket: with
+#       SPAWN_BACKUP_R2_ALERT_MB=1 a dump stores its hourly copy and records
+#       `over_alert` true, `alert_bytes` 1000000 and `limit_bytes`
+#       10000000000 (the default); with SPAWN_BACKUP_R2_LIMIT_MB=1 as well,
+#       the bundle stores nothing under bundles/ and records the skipped tier
+#       with the limit, and the dump writes nothing at all (no PUT), exits 4
+#       and records no keys and the hourly tier skipped for the limit.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -93,6 +109,11 @@
 # sandbox like the gate's; variants of it that compare the drill with the
 # live counts, record the row count as the watermark, ignore the budget,
 # upload the dump unencrypted, or bundle main alone each fail at their check.
+# That was the contract before the owner's ruling (task 96); the reference
+# updated to it (full and incremental bundles, the limit, the alert) passes
+# every check as they now stand, and variants of it that bundle every
+# increment whole, write past the limit or never set `over_alert` fail at
+# (3) and (6).
 set -eu
 
 asserted=""
@@ -216,6 +237,7 @@ measured_fail() {
 # git's config in the scratch.
 for name in SPAWN_R2_ENDPOINT SPAWN_R2_BUCKET SPAWN_R2_ACCESS_KEY_ID SPAWN_R2_SECRET_ACCESS_KEY \
     SPAWN_R2_ENV_FILE SPAWN_BACKUP_KEY_FILE SPAWN_BACKUP_DRILL_DATABASE_URL SPAWN_BACKUP_R2_BUDGET_MB \
+    SPAWN_BACKUP_R2_ALERT_MB SPAWN_BACKUP_R2_LIMIT_MB SPAWN_BACKUP_TRANSCRIPT_DAYS \
     SPAWN_BACKUP_PG_BIN SPAWN_BACKUP_DUMP_COMPRESS SPAWN_ENV_FILE SPAWN_BACKUP_DIR XDG_CONFIG_HOME \
     SPAWN_WORKSPACE_ROOT SPAWN_GIT_REPO; do
     unset "$name" 2>/dev/null || true
@@ -528,6 +550,15 @@ awk 'BEGIN { for (i = 1; i <= 400; i++)
     printf "{\"type\":\"user\",\"uuid\":\"w-%d\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_%d\",\"content\":\"ok %d\"}]}}\n", i, i, i * 7 }' \
     >"$archive/agent_worker_objective_7/5f2a9e10-7c44-4b8e-8f00-2a4e9d3c0002.jsonl"
 
+# A third agent's transcript, last written 20 days ago: outside the
+# bundles' 14-day window (SPAWN_BACKUP_TRANSCRIPT_DAYS).
+old_transcript=agent_worker_objective_3/3e8b1f20-4a6c-4d2e-9b70-6c1a2f8e0004.jsonl
+mkdir -p "$archive/agent_worker_objective_3"
+awk 'BEGIN { for (i = 1; i <= 50; i++)
+    printf "{\"type\":\"user\",\"uuid\":\"o-%d\",\"message\":{\"role\":\"user\",\"content\":\"an old session, line %d\"}}\n", i, i }' \
+    >"$archive/$old_transcript"
+touch -d '20 days ago' "$archive/$old_transcript"
+
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
 SPAWN_R2_ENV_FILE=$WORK/r2.env
 SPAWN_BACKUP_KEY_FILE=$WORK/backup.key
@@ -681,7 +712,7 @@ if [ "$status" -ne 0 ]; then
     if [ -n "$MEASURE" ] && grep -q 'unknown command backup' "$WORK/err.txt"; then
         measured_fail "(1) \`spawn backup dump\` exited $status ($(err | tail -n 1)): no encrypted dump reached R2 and no backup.dumped record was written ($n0 events, max id $max0)"
         measure_today
-        echo "031: (measure) would fail: (2)-(6): there is no \`spawn backup\` (dump, bundle, verify): no hourly copy, no bundle of the mission sources and the transcripts, no restore drill, no budget"
+        echo "031: (measure) would fail: (2)-(6): there is no \`spawn backup\` (dump, bundle, verify): no hourly copy, no bundle of the mission sources and the transcripts, full or incremental, no restore drill, no limit and no alert"
         asserted=1
         exit 1
     fi
@@ -905,7 +936,10 @@ else
         if [ -z "$found" ]; then
             measured_fail "(3) no repos/*.bundle in the increment lists exactly spawn.git's branches now (bundles: $(cd "$WORK/unpacked2" && find . -name '*.bundle' | tr '\n' ' '))"
         else
-            [ "$(git bundle verify "$found" 2>&1 | grep -ci 'requires')" -ge 1 ] && [ -n "${full_spawn-}" ] ||
+            # A v2 bundle's header: its prerequisites are the lines that
+            # start with `-`, before the first blank line.
+            prerequisites=$(awk 'NR == 1 { next } /^$/ { exit } /^-/ { n++ } END { print n + 0 }' "$found" 2>/dev/null || echo 0)
+            [ "$prerequisites" -ge 1 ] ||
                 measured_fail "(3) spawn.git's bundle in the increment names no prerequisites: a whole copy, not an increment"
             if [ -n "${full_spawn-}" ]; then
                 git init -q --bare "$WORK/restore.git"
@@ -916,8 +950,8 @@ else
             fi
         fi
         [ "$(jq -r --arg s "$src_other" '[.repos[]? | select(.source == $s) | .unchanged][0] // empty' "$manifest" 2>/dev/null)" = true ] &&
-            [ "$(field "$inc" --arg s "$src_other" '[.repos[]? | select(.source == $s) | .unchanged][0] // empty' 2>/dev/null || true)" != false ] ||
-            measured_fail "(3) the increment does not mark other.git unchanged (no ref of it moved): $(jq -c '.repos' "$manifest" 2>/dev/null)"
+            [ "$(printf '%s' "$inc" | cut -d'|' -f2- | jq -r --arg s "$src_other" '[.repos[]? | select(.source == $s) | .unchanged][0] // empty' 2>/dev/null)" = true ] ||
+            measured_fail "(3) the increment and its record do not mark other.git unchanged (no ref of it moved): $(jq -c '.repos' "$manifest" 2>/dev/null)"
     fi
     echo "031: increment: $(field "$inc" '.stored_bytes') bytes stored for $(field "$inc" '.transcripts.bytes') bytes of transcripts, in $incr_ms ms"
 fi
@@ -1046,5 +1080,5 @@ if [ -n "$failed_any" ]; then
     asserted=1
     exit 1
 fi
-echo "031: hourly and daily dumps encrypted in R2 with their records, the sources and transcripts bundled, the drill restored the newest dump to its record's counts and failed a corrupted one, the budget held"
+echo "031: hourly and daily dumps encrypted in R2 with their records, the sources and transcripts bundled whole and then as an increment, the drill restored the newest dump to its record's counts and failed a corrupted one, the alert was recorded and nothing was written past the limit"
 exit 0
