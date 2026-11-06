@@ -34,7 +34,9 @@ struct Story {
 
 impl Story {
     fn rec(&mut self, at: i64, record: Value) -> &mut Self {
-        let mut object = record.as_object().expect("a record").clone();
+        let Value::Object(mut object) = record else {
+            panic!("a record is an object: {record}");
+        };
         object.insert("seq".into(), json!(self.control.len() + 1));
         object.insert("at".into(), json!(at));
         self.control
@@ -167,7 +169,7 @@ fn rfc3339_times_and_spans_read_as_epoch_milliseconds() {
     assert_eq!(parse_rfc3339("2026-10-02t00:00:00.5z"), Some(1_790_899_200_500));
     assert_eq!(parse_rfc3339("2026-10-01T19:00:00-05:00"), Some(t0()));
     assert_eq!(parse_rfc3339("2026-10-02"), Some(t0()));
-    assert_eq!(parse_rfc3339("2024-02-29T00:00:00Z").is_some(), true);
+    assert!(parse_rfc3339("2024-02-29T00:00:00Z").is_some());
     for bad in [
         "2026-02-29T00:00:00Z",
         "2026-13-01T00:00:00Z",
