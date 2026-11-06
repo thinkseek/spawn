@@ -284,6 +284,9 @@ pub(crate) enum Why {
     /// A mission's gate has had no room in TMPDIR for hours
     /// ([`crate::disk::gate_room_escalations`]).
     GateRoom,
+    /// A mission's gate failed twice in a row because the host did (the
+    /// test database), not the work ([`digest::host_fault_escalations`]).
+    GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
 }
@@ -476,6 +479,13 @@ pub(crate) fn step(
         store
             .gate_room_escalations()
             .map_err(|error| format!("gate room records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::host_fault_escalations(
+        store
+            .gate_host_fault_escalations()
+            .map_err(|error| format!("gate host fault records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
@@ -880,6 +890,96 @@ mod tests {
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, &plan.orders[0]);
         let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty(),
+            "told once"
+        );
+    }
+
+    /// Objective 20: the second host fault in a row reaches an idle
+    /// supervisor once, as an item of `host` tagged
+    /// `host gate-host-fault-<event id>`, naming the task, the mission, the
+    /// count, the evidence and when the task is judged again.
+    #[test]
+    fn two_host_faults_in_a_row_reach_an_idle_supervisor_once() {
+        let crash = "2026-11-06 01:46:58.017 UTC [1] LOG:  server process (PID 4242) was \
+                     terminated by signal 11: Segmentation fault";
+        let records = [
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 9,
+                "event_id": 41, "mission": 3, "host_faults": 2, "escalate": true,
+                "evidence": "server_log", "crash": [crash, "2026-11-06 01:46:58.018 UTC [1] \
+                LOG:  terminating any other active server processes"],
+                "failures": [{"test": "merges::tests::a", "message": "db error: ERROR: x",
+                              "class": "database"}],
+                "backoff_ms": 600_000, "due_ms": 1_793_930_000_000_i64}),
+            serde_json::json!({"type": "task.gated", "verdict": "host_fault", "id": 10,
+                "event_id": 52, "mission": 4, "host_faults": 2, "escalate": true,
+                "evidence": "failures",
+                "failures": [{"test": "api::tests::claims_in_order",
+                              "message": "error connecting to server: Connection refused",
+                              "class": "connection"},
+                             {"test": "control::tests::the_fold", "message": "SqlState(E57P02)",
+                              "class": "connection"}],
+                "backoff_ms": 600_000, "due_ms": 1_793_930_000_500_i64}),
+        ];
+        let host = super::digest::host_fault_escalations(&records);
+        let tags: Vec<String> = host.iter().map(Escalation::tag).collect();
+        assert_eq!(tags, ["host gate-host-fault-41", "host gate-host-fault-52"]);
+        assert!(host.iter().all(|item| item.why == Why::GateHostFault));
+        assert!(
+            host[0].line.starts_with(
+                "task #9 of mission 3: 2 gate failures in a row were the \
+                                      host's, not the work's: the test database's log shows a \
+                                      crash during the gate: "
+            ) && host[0].line.contains(crash)
+                && host[0]
+                    .line
+                    .contains("terminating any other active server processes")
+                && host[0].line.contains("judged again at 2026-11-06T")
+                && host[0].line.contains("nothing halts"),
+            "{}",
+            host[0].line
+        );
+        assert!(
+            host[1].line.contains(
+                "every check-tests.sh failure (2) was a connection error to the test database, \
+                 first api::tests::claims_in_order: error connecting to server: Connection \
+                 refused"
+            ),
+            "{}",
+            host[1].line
+        );
+        assert!(host.iter().all(|item| !item.line.contains('\n')));
+        assert!(
+            super::digest::host_fault_escalations(&[serde_json::json!({"id": 9})]).is_empty(),
+            "a record without its event is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &host[..1], true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(tags, &["host gate-host-fault-41"]);
+        let line = text
+            .lines()
+            .find(|line| line.contains("task #9"))
+            .expect("the item's line");
+        assert!(
+            line.starts_with("- host — host faults at the gate (the host's, not the work's): ")
+                && line.contains("was terminated by signal 11"),
+            "{line}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(
+            &[supervisor],
+            &Work::default(),
+            &host[..1],
+            true,
+            NOW,
+            "spawn",
+        );
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
