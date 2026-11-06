@@ -5656,4 +5656,236 @@ mod database_tests {
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// A `host_fault` record as the integrator writes it, by its failures.
+    fn host_fault_record(task: i64, revision: i32, faults: u32) -> Value {
+        json!({"type": "task.gated", "id": task, "revision": revision, "verdict": "host_fault",
+               "base": "b0", "scenarios": 0,
+               "reason": "host fault: every failure check-tests.sh printed (1) is a connection \
+                          error to the test database; not a verdict on the work, judged again \
+                          in 5 min",
+               "log": "| FAILED api::tests::one: Connection refused", "evidence": "failures",
+               "failures": [{"test": "api::tests::one", "message": "Connection refused",
+                             "class": "connection"}],
+               "host_faults": faults, "backoff_ms": 300_000, "escalate": faults == 2})
+    }
+
+    /// Objective 20: a host fault between two rejections leaves the
+    /// rejection run as it was (two in a row, not reset, not three), and
+    /// between two aborts the abort run; the task stays where it was.
+    #[test]
+    fn a_host_fault_between_two_rejections_leaves_the_rejection_run() {
+        let (base, source, scenarios, _) = world("host-fault-run", "exit 1\n");
+        let db = Db::new("host_fault_run");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let rejected = |revision: i32| {
+            json!({"type": "task.gated", "id": task, "revision": revision,
+                   "verdict": "rejected", "base": "b0", "note": "fails"})
+        };
+        db.record(&rejected(0));
+        db.store.task_delivered(task, 2).expect("delivered again");
+        assert!(db.store.task_reported(task, "again").expect("reported"));
+        db.record(&host_fault_record(task, 1, 1));
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_rejections, 1, "neither grown nor reset");
+        assert_eq!(after.gate_host_faults, 1);
+        assert_eq!(
+            (after.tasks[0].state, after.tasks[0].revisions),
+            (spawn_core::mission::TaskState::Reported, 1),
+            "nothing went back to the worker"
+        );
+        db.record(&rejected(1));
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_rejections, 2, "the run went on from where it was");
+        assert_eq!(after.gate_host_faults, 0, "a real verdict ends the host faults");
+        assert_eq!(super::halt_reason(&after, 0), None);
+
+        // The abort run, the same.
+        db.store.task_delivered(task, 3).expect("delivered again");
+        assert!(db.store.task_reported(task, "again").expect("reported"));
+        let aborted = json!({"type": "task.gated", "id": task, "revision": 2,
+                             "verdict": "aborted", "reason": "a gate that died"});
+        db.record(&aborted);
+        db.record(&host_fault_record(task, 2, 1));
+        db.record(&host_fault_record(task, 2, 2));
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_aborts, after.gate_rejections), (1, 2));
+        assert_eq!(after.gate_host_faults, 2);
+        db.record(&aborted);
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_aborts, after.gate_host_faults), (2, 0));
+        assert_eq!(super::halt_reason(&after, 0), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The task's latest `task.gated` record and its event's id and time.
+    fn last_verdict(db: &Db) -> (Value, i64, i64) {
+        let row = db
+            .admin()
+            .query_one(
+                "select kind -> 'detail' -> 'record', id, recorded_at_ms from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                  order by session_seq desc limit 1",
+                &[],
+            )
+            .expect("the verdict");
+        (row.get(0), row.get(1), row.get(2))
+    }
+
+    /// Objective 20, end to end: a gate that rejects for check-tests.sh
+    /// with connection errors only is recorded `host_fault` (by its
+    /// failures), the task stays reported and is not judged again before the
+    /// record's `due_ms`; the next, with database errors while the test
+    /// database's log gains a crash during the gate, is a host fault by the
+    /// log, the second in a row: escalated, its backoff doubled; the third
+    /// run accepts and the work lands, ending the run.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_host_fault_is_held_until_due_then_judged_again() {
+        let dir = std::env::temp_dir().join(format!("spawn-db-host-fault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runs = dir.join("runs");
+        let server_log = dir.join("postgres.log");
+        std::fs::write(
+            &server_log,
+            "2026-01-01 00:00:00.000 UTC [1] LOG:  server process (PID 1) was terminated by \
+             signal 9: Killed\n",
+        )
+        .expect("an old crash");
+        let (runs_path, log_path) = (runs.display(), server_log.display());
+        let gate = format!(
+            "n=$(cat '{runs_path}' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{runs_path}'\n\
+             reject() {{\n\
+               echo '| stage gate rejected 5ms regression: check-tests.sh must still pass'\n\
+               printf '{{\"verdict\":\"rejected\",\"reason\":\"regression: check-tests.sh fails on the candidate\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               exit 0\n\
+             }}\n\
+             echo '| == regression: check-tests.sh must still pass'\n\
+             if [ \"$n\" -eq 1 ]; then\n\
+               echo '| FAILED api::tests::claims_in_order: error connecting to server: Connection refused (os error 111)'\n\
+               echo '| FAILED stalls::tests::delivery: db error: FATAL: the database system is in recovery mode'\n\
+               reject\n\
+             elif [ \"$n\" -eq 2 ]; then\n\
+               printf '%s [1] LOG:  server process (PID 4242) was terminated by signal 11: Segmentation fault\\n' \"$(date -u '+%Y-%m-%d %H:%M:%S.%3N UTC')\" >>'{log_path}'\n\
+               echo '| FAILED merges::tests::a_conflict: db error: ERROR: cache lookup failed for relation 16388'\n\
+               reject\n\
+             fi\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n"
+        );
+        let (base, source, scenarios, mut integrator) = world("host-fault-pass", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: Some(server_log.clone()),
+            backoff: std::time::Duration::from_secs(2),
+        };
+        let db = Db::new("host_fault_pass");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let count = || {
+            std::fs::read_to_string(&runs)
+                .map(|text| text.trim().parse::<u32>().unwrap_or(0))
+                .unwrap_or(0)
+        };
+        let pass = || {
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+        };
+        let wait_until = |due: i64| {
+            let left = due - super::now_ms();
+            if left > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    u64::try_from(left).unwrap_or(0) + 50,
+                ));
+            }
+        };
+
+        pass();
+        assert_eq!(count(), 1);
+        let (record, event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], "failures");
+        assert_eq!(record["failures"].as_array().map(Vec::len), Some(2));
+        assert_eq!(record["failures"][1]["test"], "stalls::tests::delivery");
+        assert_eq!(record["failures"][1]["class"], "connection");
+        assert_eq!(record["host_faults"], 1);
+        assert_eq!(record["escalate"], false);
+        assert_eq!(record["backoff_ms"], 2000);
+        assert_eq!(record["due_ms"], at + 2000, "its own time plus the backoff");
+        assert!(record["candidate"].is_string() && record.get("crash").is_none());
+        assert!(
+            record["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("| FAILED api::tests::claims_in_order"))
+        );
+        let after = gated(&db, mission);
+        assert_eq!(
+            (after.gate_host_faults, after.gate_host_task, after.gate_host_due_ms),
+            (1, Some(task), Some(at + 2000))
+        );
+        assert_eq!((after.gate_rejections, after.gate_aborts), (0, 0));
+        assert_eq!(
+            (after.tasks[0].state, after.tasks[0].revisions),
+            (spawn_core::mission::TaskState::Reported, 0)
+        );
+        assert!(after.halted.is_none());
+
+        // Held until its due time.
+        pass();
+        assert_eq!(count(), 1, "not judged again before due_ms");
+        assert_eq!(last_verdict(&db).1, event);
+        wait_until(at + 2000);
+
+        pass();
+        assert_eq!(count(), 2);
+        let (record, event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], "server_log");
+        assert_eq!(record["failures"][0]["class"], "database");
+        let crash = record["crash"].as_array().expect("the crash lines");
+        assert_eq!(crash.len(), 1, "the old crash is outside the window: {record}");
+        assert!(
+            crash[0]
+                .as_str()
+                .is_some_and(|line| line.contains("(PID 4242) was terminated by signal 11"))
+        );
+        assert_eq!(record["host_faults"], 2);
+        assert_eq!(record["escalate"], true);
+        assert_eq!(record["backoff_ms"], 4000);
+        assert_eq!(record["due_ms"], at + 4000);
+        let escalations = db.store.gate_host_fault_escalations().expect("escalations");
+        assert_eq!(escalations.as_array().map(Vec::len), Some(1), "{escalations}");
+        assert_eq!(escalations[0]["event_id"], event);
+        assert_eq!(escalations[0]["mission"], mission);
+        assert!(escalations[0].get("log").is_none(), "the gate's log stays out");
+        assert_eq!(gated(&db, mission).gate_host_faults, 2);
+
+        pass();
+        assert_eq!(count(), 2, "held again, for the doubled backoff");
+        wait_until(at + 4000);
+        pass();
+        assert_eq!(count(), 3);
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let after = db.mission(mission);
+        assert!(after["halted"].is_null());
+        let missions: Vec<super::Mission> =
+            serde_json::from_value(db.store.gated_missions().expect("gated")).expect("missions");
+        let after = missions
+            .into_iter()
+            .find(|found| found.id == mission)
+            .expect("the mission");
+        assert_eq!(
+            (after.gate_host_faults, after.gate_host_task, after.gate_host_due_ms),
+            (0, None, None),
+            "the landing ends the run"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
