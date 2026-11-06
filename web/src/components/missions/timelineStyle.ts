@@ -32,6 +32,7 @@ export function verdictColor(verdict: string): string {
     case "aborted":
       return "var(--destructive)";
     case "conflict":
+    case "incompatible":
       return "var(--warning)";
     default:
       return "var(--muted-foreground)";
