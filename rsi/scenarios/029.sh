@@ -4,8 +4,9 @@
 # `<slice stem>-<execution id>.scope` (spawn-exec_12.scope in the default
 # spawn.slice), inside one slice of Spawn's (SPAWN_SLICE) whose MemoryHigh,
 # MemoryMax and CPUWeight are settings; the engine's children (builds, tests,
-# tools) inherit the scope. An execution's MemoryMax (SPAWN_EXECUTION_MEMORY_MAX)
-# and MemorySwapMax (SPAWN_EXECUTION_MEMORY_SWAP_MAX, default 0) bound it, so a
+# tools) inherit the scope. An execution's MemoryHigh, MemoryMax and
+# MemorySwapMax (SPAWN_EXECUTION_MEMORY_HIGH, _MAX, _SWAP_MAX: by the owner's
+# ruling of 2026-11-06 10G, 12G and 4G by default) bound it, so a
 # memory-limit kill ends that execution only: objective 028 records it
 # (`execution.interrupted`, cause `memory_limit`, path `resume`) and resumes it
 # with its work, while a sibling execution goes on untouched. An execution or
@@ -13,17 +14,25 @@
 # host's available memory; otherwise it waits, recorded with the measure and
 # the threshold (`admission.waiting`), and starts once it fits
 # (`admission.admitted`). A gate runs in a scope of its own,
-# `<slice stem>-gate-<task id>-<n>.scope`, with SPAWN_GATE_MEMORY_MAX.
+# `<slice stem>-gate-<task id>-<n>.scope`, with SPAWN_GATE_MEMORY_HIGH, _MAX
+# and _SWAP_MAX (10G, 12G, 4G by default), and a gate its envelope kills is a
+# host fault (objective 020's `host_fault`), judged again after 020's
+# backoff, never an abort and never toward a halt (the owner's ruling).
 #
 # A real loop (`spawn loop`: the Bridge, its pusher, the dispatcher, no
 # supervisor, no model judge) runs three residents of one gated mission on a
 # fake engine, each started by a task of the mission, in a slice of this run
 # alone (bb029_<run>.slice, SPAWN_SLICE_MEMORY_HIGH=128M,
-# SPAWN_SLICE_MEMORY_MAX=144M, CPUWeight left at its default),
-# SPAWN_EXECUTION_MEMORY_MAX=96M (swap left at its default) and
-# SPAWN_GATE_MEMORY_MAX=32M. Each engine notes, when it starts, its pid, its
-# cgroup, that cgroup's memory.max and memory.swap.max, a child's cgroup and
-# whether work.txt is in its workspace. `hog` writes work.txt (checkpointed),
+# SPAWN_SLICE_MEMORY_MAX=144M, CPUWeight left at its default), executions
+# in 92M/96M/16M (SPAWN_EXECUTION_MEMORY_HIGH, _MAX, _SWAP_MAX) and gates in
+# 30M/32M/8M (SPAWN_GATE_MEMORY_HIGH, _MAX, _SWAP_MAX): every envelope is set,
+# since the defaults do not fit under a 144M slice, and each MemoryHigh sits
+# close below its MemoryMax, because a process that grows page by page past
+# MemoryHigh is throttled, not killed (on this host 80M/96M/16M stalled at
+# 96 MiB for 60 s; 92M/96M/16M was killed in 2.7 s, 30M/32M/8M in 7.8 s).
+# SPAWN_GATE_HOST_FAULT_BACKOFF_SECS=3. Each engine notes, when it starts, its
+# pid, its cgroup, that cgroup's memory.max, memory.swap.max and memory.high,
+# a child's cgroup and whether work.txt is in its workspace. `hog` writes work.txt (checkpointed),
 # then, told to, runs a tool (python3) that allocates past its envelope in
 # 8 MiB steps up to 256 MiB, only when its own memory.max caps it at 256 MiB
 # or less (uncapped, the host is not put at risk: it says so and allocates
@@ -32,8 +41,10 @@
 # calm holds it. Checked:
 #   (1) hog's and calm's engines, and a child of each, run in
 #       bb029_<run>-<their execution id>.scope directly inside the run's
-#       slice, with memory.max 96 MiB and memory.swap.max 0; the slice is
-#       active with memory.high 128 MiB, memory.max 144 MiB and cpu.weight 50.
+#       slice, with memory.high 92 MiB, memory.max 96 MiB and memory.swap.max
+#       16 MiB; the slice is active with memory.high 128 MiB, memory.max 144
+#       MiB and cpu.weight 50; the loop's `host.envelope` record (state
+#       `systemd`) names the slice and each of these settings in bytes.
 #   (2) hog's allocation is killed by its envelope: its execution ends
 #       within 20 s (the engine's pid gone), the slice counts the OOM kill
 #       (memory.events oom_kill > 0), and calm runs on: the same execution,
@@ -54,13 +65,23 @@
 #       slice, after an `admission.admitted` record (waited_ms at least the
 #       hold it waited through).
 #   (5) a gate: calm's reported task is judged by `spawn integrate --once`
-#       (the run's first integrator pass) through a recording gate (SPAWN_GATE), which
-#       runs in bb029_<run>-gate-<task id>-<n>.scope inside the slice, with
-#       memory.max 32 MiB and memory.swap.max 0.
+#       passes through a recording gate (SPAWN_GATE), which runs in
+#       bb029_<run>-gate-<task id>-<n>.scope inside the slice, with
+#       memory.high 30 MiB, memory.max 32 MiB and memory.swap.max 8 MiB, and
+#       on its first run allocates past that envelope (hog's tool).
+#   (6) that gate, killed by its memory limit, is a host fault: within 20 s
+#       a `task.gated` with verdict `host_fault`, evidence `memory_limit`
+#       naming its scope, memory_max 33554432 and oom_kills > 0, backoff_ms
+#       3000 and due_ms its time + 3000; gate_aborts and gate_rejections
+#       unchanged, the task still `reported`, the mission not halted; no gate
+#       runs for it before due_ms; then it is judged again in a scope of a
+#       larger n, and accepted.
 #
 # It needs a systemd user manager that delegates the memory controller, and
 # the host's cgroup v2 tree: it is judged outside the gate's sandbox (whose
-# /run is empty, so no user manager is reachable). Without one it exits 1
+# /run is empty, so no user manager is reachable), by the owner (mission 7):
+# the gate gets no delegated cgroup (the owner's ruling, 2026-11-06), and 032's
+# real memory-limit kill is judged the same way. Without one it exits 1
 # with "029: cannot be judged here: ...", never 2: an objective scenario that
 # exits 2 on the base aborts every gate. The units it makes (the slice, the
 # scopes in it, set-property drop-ins under $XDG_RUNTIME_DIR) are named after
@@ -94,8 +115,11 @@
 # resumes it 384-396 ms after its end, its own session, work.txt intact,
 # again in a tmux scope; late starts 446-843 ms after its task's assignment
 # with no admission record; the gate runs in the cgroup of the process that
-# ran `spawn integrate`, with no limit. It fails at (1) in 2-17 s; a measure
-# run takes 31-92 s.
+# ran `spawn integrate`, with no limit; uncapped, its tool allocates nothing,
+# so the measure's gate kills itself (SIGKILL), which today is recorded
+# `aborted` (gate_aborts 0 -> 1, toward the halt) and judged again at the
+# next pass, with no due time. It fails at (1) in 2-17 s; a measure run takes
+# 31-92 s.
 set -eu
 
 asserted=""
@@ -184,8 +208,12 @@ finish() {
             tail -n 12 "$WORK/loop.log" >&2
         fi
         if [ -s "$WORK/engines.log" ]; then
-            echo "029: the engines (ms|name|execution|start|pid|cgroup|memory.max|memory.swap.max|child cgroup|work.txt):" >&2
+            echo "029: the engines (ms|name|execution|start|pid|cgroup|memory.max|memory.swap.max|child cgroup|work.txt|memory.high):" >&2
             cat "$WORK/engines.log" >&2
+        fi
+        if [ -s "$WORK/gate.log" ]; then
+            echo "029: the gate runs (ms|cgroup|memory.max|memory.swap.max|memory.high|run):" >&2
+            cat "$WORK/gate.log" >&2
         fi
         if [ -n "$database_made" ]; then
             echo "029: the executions and the envelope records:" >&2
@@ -194,7 +222,7 @@ finish() {
             psql -d "$SPAWN_DB_NAME" -tA -c "select left((e.kind -> 'detail' -> 'record')::text, 300)
                 from spawn_events e
                 where e.session_id = 'session_control'
-                  and e.kind -> 'detail' -> 'record' ->> 'type' similar to '(execution|admission|host)\.%'
+                  and e.kind -> 'detail' -> 'record' ->> 'type' similar to '(execution|admission|host|task\.gated)%'
                 order by e.session_seq" >&2 2>/dev/null || true
         fi
     fi
@@ -235,8 +263,13 @@ measured_fail() {
 }
 
 MIB=1048576
+EXEC_HIGH=$((92 * MIB))
 EXEC_MAX=$((96 * MIB))
+EXEC_SWAP=$((16 * MIB))
+GATE_HIGH=$((30 * MIB))
 GATE_MAX=$((32 * MIB))
+GATE_SWAP=$((8 * MIB))
+BACKOFF_SECS=3
 SLICE_HIGH=$((128 * MIB))
 SLICE_MAX=$((144 * MIB))
 SLICE_WEIGHT=50
@@ -271,14 +304,32 @@ gate=$WORK/gate
 mkdir -p "$gate"
 printf '#!/bin/sh\nexit 0\n' >"$gate/check-ok.sh"
 printf '# nothing protected\n' >"$gate/protected"
-# The recording gate: where it runs and under which limits, then accepted.
-# It runs with the gate's cleared environment, so its paths are written in.
+# The recording gate: where it runs and under which limits (run <n>), then
+# on its first run hog's tool, which allocates past a capped envelope (the
+# envelope's kill ends this gate: no verdict); later runs are accepted.
+# Uncapped (today), the tool allocates nothing: under BB_029_MEASURE=1 the
+# gate then kills itself, to show how a killed gate is recorded today;
+# otherwise it ends with no verdict. It runs with the gate's cleared
+# environment, so its paths and the measure flag are written in.
 cat >"$WORK/fake-gate.sh" <<EOF
 #!/bin/sh
+n=\$(( \$(cat '$WORK/gate-runs' 2>/dev/null || echo 0) + 1 ))
+echo "\$n" >'$WORK/gate-runs'
 cg=\$(sed -n 's/^0:://p' /proc/self/cgroup | head -n 1)
-printf '%s|%s|%s|%s\n' "\$(date +%s%3N)" "\$cg" \
+printf '%s|%s|%s|%s|%s|%s\n' "\$(date +%s%3N)" "\$cg" \
     "\$(cat "/sys/fs/cgroup\$cg/memory.max" 2>/dev/null || echo none)" \
-    "\$(cat "/sys/fs/cgroup\$cg/memory.swap.max" 2>/dev/null || echo none)" >>'$WORK/gate.log'
+    "\$(cat "/sys/fs/cgroup\$cg/memory.swap.max" 2>/dev/null || echo none)" \
+    "\$(cat "/sys/fs/cgroup\$cg/memory.high" 2>/dev/null || echo none)" "\$n" >>'$WORK/gate.log'
+if [ "\$n" = 1 ]; then
+    rc=0
+    out=\$(python3 -I '$WORK/alloc.py' '$WORK' gate 2>&1) || rc=\$?
+    printf '%s|gate|%s|%s\n' "\$(date +%s%3N)" "\$rc" "\$out" >>'$WORK/gate-alloc.log'
+    echo "gate: the tool ended with \$rc: \$out"
+    if [ "\$rc" = 3 ] && [ -n '$MEASURE' ]; then
+        kill -9 \$\$
+    fi
+    exit 3
+fi
 printf '{"verdict":"accepted"}\n' >"\$SPAWN_GATE_VERDICT"
 echo '{"verdict":"accepted"}'
 EOF
@@ -289,6 +340,7 @@ chmod 755 "$WORK/fake-gate.sh"
 cat >"$WORK/alloc.py" <<'EOF'
 import os, sys, time
 work = sys.argv[1]
+tag = sys.argv[2] if len(sys.argv) > 2 else "hog"
 cgroup = ""
 for line in open("/proc/self/cgroup"):
     if line.startswith("0::"):
@@ -301,7 +353,7 @@ cap = 256 << 20
 if not limit.isdigit() or int(limit) > cap:
     print("no cap: memory.max " + limit + ", nothing allocated")
     sys.exit(3)
-with open(work + "/alloc-start", "w") as out:
+with open(work + "/alloc-start-" + tag, "w") as out:
     out.write("%d\n" % int(time.time() * 1000))
 chunks = []
 while len(chunks) * (8 << 20) < cap:
@@ -326,7 +378,8 @@ EOF
 # second of quiet, the transcript's end of the turn first, then the prompt.
 # It writes its session transcript where Claude Code does. When it starts it
 # notes (engines.log) its pid, its cgroup, that cgroup's memory.max and
-# memory.swap.max, a child's cgroup and whether work.txt is in its workspace.
+# memory.swap.max, a child's cgroup, whether work.txt is in its workspace and
+# the cgroup's memory.high.
 # hog: its first turn writes work.txt (a tool call: checkpointed); once
 # go-hog exists it runs alloc.py once (hogged marks it). calm: once
 # hold-calm exists it runs hold.py in the background. A turn whose text
@@ -371,9 +424,10 @@ cgroup=$(sed -n 's/^0:://p' /proc/self/cgroup | head -n 1)
 child=$(sh -c "sed -n 's/^0:://p' /proc/self/cgroup | head -n 1")
 work=absent
 [ -f work.txt ] && work="found $(sha256sum <work.txt | cut -d' ' -f1)"
-printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(date +%s%3N)" "$name" "$SPAWN_EXECUTION_ID" "$start" "$$" \
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$(date +%s%3N)" "$name" "$SPAWN_EXECUTION_ID" "$start" "$$" \
   "$cgroup" "$(cat "/sys/fs/cgroup$cgroup/memory.max" 2>/dev/null || echo none)" \
   "$(cat "/sys/fs/cgroup$cgroup/memory.swap.max" 2>/dev/null || echo none)" "$child" "$work" \
+  "$(cat "/sys/fs/cgroup$cgroup/memory.high" 2>/dev/null || echo none)" \
   >>"$BB_WORK/engines.log"
 write_work() { printf "hog's work, written by %s\n" "$SPAWN_EXECUTION_ID" >work.txt; }
 allocate() {
@@ -438,8 +492,9 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_REVIEW_SECS \
     SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS \
     SPAWN_STALL_HALTED_SECS SPAWN_ENVELOPE SPAWN_SLICE SPAWN_SLICE_MEMORY_HIGH \
-    SPAWN_SLICE_MEMORY_MAX SPAWN_SLICE_CPU_WEIGHT SPAWN_EXECUTION_MEMORY_MAX \
-    SPAWN_EXECUTION_MEMORY_SWAP_MAX SPAWN_GATE_MEMORY_MAX SPAWN_GATE_MEMORY_SWAP_MAX \
+    SPAWN_SLICE_MEMORY_MAX SPAWN_SLICE_CPU_WEIGHT SPAWN_EXECUTION_MEMORY_HIGH \
+    SPAWN_EXECUTION_MEMORY_MAX SPAWN_EXECUTION_MEMORY_SWAP_MAX SPAWN_GATE_MEMORY_HIGH \
+    SPAWN_GATE_MEMORY_MAX SPAWN_GATE_MEMORY_SWAP_MAX SPAWN_GATE_HOST_FAULT_BACKOFF_SECS \
     SPAWN_RECOVER_BACKOFF_SECS SPAWN_GATE_MIN_FREE_GB SPAWN_GATE_MIN_FREE_MEMORY_MB; do
     unset "$name" 2>/dev/null || true
 done
@@ -457,13 +512,20 @@ SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
 # The envelopes under test: a slice of this run alone, small enough that
 # two idle executions fit and a third does not while calm holds 56 MiB.
-# CPUWeight and both swap limits are left at their defaults (50, 0, 0).
+# CPUWeight is left at its default (50). Every envelope is set: the defaults
+# (10G, 12G, 4G) do not fit under this slice, and a MemoryHigh well below
+# its MemoryMax throttles a page-by-page allocation instead of killing it
+# (the header's measures), so each MemoryHigh sits close below its MemoryMax.
 SPAWN_ENVELOPE=systemd
 SPAWN_SLICE=$slice
 SPAWN_SLICE_MEMORY_HIGH=128M
 SPAWN_SLICE_MEMORY_MAX=144M
+SPAWN_EXECUTION_MEMORY_HIGH=92M
 SPAWN_EXECUTION_MEMORY_MAX=96M
+SPAWN_EXECUTION_MEMORY_SWAP_MAX=16M
+SPAWN_GATE_MEMORY_HIGH=30M
 SPAWN_GATE_MEMORY_MAX=32M
+SPAWN_GATE_MEMORY_SWAP_MAX=8M
 # Objective 028's resume backoff, short: the time to resume is measured.
 SPAWN_RECOVER_BACKOFF_SECS=1
 # No stall is under test.
@@ -477,14 +539,16 @@ SPAWN_STALL_HALTED_SECS=1800
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
     SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
     SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_ENVELOPE \
-    SPAWN_SLICE SPAWN_SLICE_MEMORY_HIGH SPAWN_SLICE_MEMORY_MAX SPAWN_EXECUTION_MEMORY_MAX \
-    SPAWN_GATE_MEMORY_MAX SPAWN_RECOVER_BACKOFF_SECS SPAWN_STALL_ACTIVITY_SECS \
+    SPAWN_SLICE SPAWN_SLICE_MEMORY_HIGH SPAWN_SLICE_MEMORY_MAX SPAWN_EXECUTION_MEMORY_HIGH \
+    SPAWN_EXECUTION_MEMORY_MAX SPAWN_EXECUTION_MEMORY_SWAP_MAX SPAWN_GATE_MEMORY_HIGH \
+    SPAWN_GATE_MEMORY_MAX SPAWN_GATE_MEMORY_SWAP_MAX SPAWN_RECOVER_BACKOFF_SECS SPAWN_STALL_ACTIVITY_SECS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS \
     SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS
 mkdir -p "$SPAWN_WORKSPACE_ROOT" "$WORK/integrator"
 : >"$WORK/engines.log"
 : >"$WORK/alloc.log"
 : >"$WORK/gate.log"
+: >"$WORK/gate-alloc.log"
 
 tries=0
 while :; do
@@ -503,7 +567,7 @@ q() { scalar "$1"; }
 mib() { awk -v b="$1" 'BEGIN { if (b ~ /^[0-9]+$/) printf "%.1f MiB", b / 1048576; else print b }'; }
 
 # The latest engines.log line of a resident: ms|name|execution|start|pid|
-# cgroup|memory.max|memory.swap.max|child cgroup|work.txt
+# cgroup|memory.max|memory.swap.max|child cgroup|work.txt|memory.high
 engine_line() { awk -F'|' -v n="$1" '$2 == n' "$WORK/engines.log" | tail -n 1; }
 engines_of() { awk -F'|' -v n="$1" '$2 == n' "$WORK/engines.log" | wc -l | tr -d ' '; }
 field() { printf '%s' "$1" | cut -d'|' -f"$2"; }
@@ -545,6 +609,7 @@ within() {
 }
 integrate_once() {
     capture env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+        SPAWN_GATE_HOST_FAULT_BACKOFF_SECS="$BACKOFF_SECS" \
         "$SPAWN_BIN" integrate --once --root "$WORK/integrator"
     cat "$WORK/out.txt" "$WORK/err.txt" >>"$WORK/integrate.log"
     [ "$status" -eq 0 ] || harness "integrate exited $status: $(err | tail -n 3)"
@@ -552,8 +617,9 @@ integrate_once() {
 }
 slice_active() { [ "$(systemctl --user show -p ActiveState --value "$slice" 2>/dev/null)" = active ]; }
 slice_file() { cat "$slice_dir/$1" 2>/dev/null || echo none; }
-# The slice's memory that cannot be given back (no swap in an envelope):
-# anonymous and shared; page cache does not count.
+# The slice's memory that cannot be given back to the page cache: anonymous
+# and shared (what is in swap is zram, the host measure's to see); page
+# cache does not count.
 slice_held() {
     if [ -r "$slice_dir/memory.stat" ]; then
         awk '$1 == "anon" || $1 == "shmem" { sum += $2; found = 1 } END { if (found) print sum; else print "none" }' \
@@ -571,8 +637,8 @@ check_envelope() {
         measured_fail "(1) $1's engine (execution $exec_id, pid $(field "$2" 5)) runs in $cg (memory.max $(field "$2" 7), memory.swap.max $(field "$2" 8)), not in its own scope $stem-$exec_id.scope inside $slice: an execution has no envelope, and one allocation can take the host's memory"
     [ "$(field "$2" 9)" = "$cg" ] ||
         measured_fail "(1) a child of $1's engine runs in $(field "$2" 9), not in its engine's cgroup $cg: children do not inherit the envelope"
-    [ "$(field "$2" 7)" = "$EXEC_MAX" ] && [ "$(field "$2" 8)" = 0 ] ||
-        measured_fail "(1) $1's execution $exec_id runs with memory.max $(field "$2" 7) and memory.swap.max $(field "$2" 8), not $EXEC_MAX (SPAWN_EXECUTION_MEMORY_MAX=96M) and 0 (the swap default): this host's swap is zram, RAM itself, so an envelope with swap is no bound"
+    [ "$(field "$2" 11)" = "$EXEC_HIGH" ] && [ "$(field "$2" 7)" = "$EXEC_MAX" ] && [ "$(field "$2" 8)" = "$EXEC_SWAP" ] ||
+        measured_fail "(1) $1's execution $exec_id runs with memory.high $(field "$2" 11), memory.max $(field "$2" 7) and memory.swap.max $(field "$2" 8), not $EXEC_HIGH, $EXEC_MAX and $EXEC_SWAP (SPAWN_EXECUTION_MEMORY_HIGH=92M, _MAX=96M, _SWAP_MAX=16M): an envelope is its MemoryHigh, its MemoryMax and its swap cap (this host's swap is zram, RAM itself)"
 }
 
 # --- (1) every execution in its own scope, in the slice ---------------------------
@@ -622,6 +688,15 @@ if slice_active; then
         measured_fail "(1) $slice has memory.high $(slice_file memory.high), memory.max $(slice_file memory.max), cpu.weight $(slice_file cpu.weight); wanted $SLICE_HIGH (128M), $SLICE_MAX (144M) and $SLICE_WEIGHT (the default)"
 else
     measured_fail "(1) the slice $slice (SPAWN_SLICE) is not active ($(systemctl --user show -p ActiveState --value "$slice" 2>&1)): Spawn's executions have no slice to share and to yield from"
+fi
+envelope=$(record_of host.envelope state systemd)
+want_envelope="{\"slice\":\"$slice\",\"memory_high\":$SLICE_HIGH,\"memory_max\":$SLICE_MAX,\"cpu_weight\":$SLICE_WEIGHT,\"execution_memory_high\":$EXEC_HIGH,\"execution_memory_max\":$EXEC_MAX,\"execution_memory_swap_max\":$EXEC_SWAP,\"gate_memory_high\":$GATE_HIGH,\"gate_memory_max\":$GATE_MAX,\"gate_memory_swap_max\":$GATE_SWAP}"
+if [ -z "$envelope" ]; then
+    measured_fail "(1) the loop recorded no host.envelope with state systemd ($(records host.envelope type host.envelope | cut -d'|' -f2- | head -c 300)): the slice and the envelopes it runs under are in no record"
+else
+    got_envelope=$(printf '%s' "$envelope" | jq -c '{slice, memory_high, memory_max, cpu_weight, execution_memory_high, execution_memory_max, execution_memory_swap_max, gate_memory_high, gate_memory_max, gate_memory_swap_max}')
+    [ "$got_envelope" = "$want_envelope" ] ||
+        measured_fail "(1) the host.envelope record names $got_envelope, not the run's settings in bytes $want_envelope"
 fi
 
 # --- (2) a memory-limit kill ends that execution only -----------------------------
