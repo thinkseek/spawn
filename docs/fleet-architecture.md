@@ -284,14 +284,28 @@ it, on the same ladder.
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
   state as JSON), `spawn tail <session>` (screen and recent events) and
-  `spawn submit`. The dispatcher wakes it by typing a digest into its pane
-  while it is idle; digests coalesce while it works. Idle is its turn stopped
-  at its prompt, whatever Jev judged: a turn that ended on a question for the
-  human is judged BLOCKED, and digests still reach it. A digest has one line per
+  `spawn submit`. It never waits on a human (its charter,
+  `supervise::charter`; the owner, 2026-11-06: "no human but can input").
+  Whatever its grants allow it decides and does in the same turn (reviews,
+  accept or send back, assigning, routing and cancelling tasks, nudging a
+  stalled worker, a `continue` after a transient model API error, stopping a
+  worker, proposing or retiring a resident), reporting each as a line
+  "Decided (the owner may reverse): ...". What they do not allow (deploys,
+  owner-protected files, money, deleting data, a `discard` included,
+  changing grants or credentials: approving a resident, a mission's gate,
+  resuming a halted mission) is one line "For the owner: ..." that it does
+  not wait on; it moves on to other work. It never ends a turn on a question
+  or a list of decisions for the owner. The dispatcher wakes it by typing a
+  digest into its pane while it is idle; digests coalesce while it works.
+  Idle is its turn stopped at its prompt, whatever Jev judged: a turn that
+  ended on a question for the human (one of the old charter) is judged
+  BLOCKED, and digests still reach it. A digest has one line per
   session and reason: repeated items of one kind about one worker (a human's
   notes that could not be delivered, retried) are counted on one line, the
   latest quoted, so they cannot fill the digest. Its memory is its native
-  session (restored by resume) plus the log.
+  session (restored by resume) plus the log. The charter is given when a
+  native session starts (the first, or a handoff); a resume keeps the
+  session it had, and the charter it was given then.
 - **Human**: the attention queue in the UI ("Needs a human", top of the
   Fleet page) is computed by the dispatcher's own code, not by the UI:
   `GET /api/attention` runs the plan of the dispatcher's pass for this moment
@@ -305,8 +319,17 @@ it, on the same ladder.
   supervisor; then those its digests told it that still hold, with when they
   were told. A managed worker between tasks is not in it, since the
   dispatcher does not escalate it. Each item carries its digest heading, its
-  line, its agent and its age. Each human action is a command with
-  principal `human`; it is the event the whole system tries to make rarer.
+  line, its agent and its age. A "For the owner:" line is no question: a
+  latest reply that has one asks nothing, whatever Jev judged, unless a
+  `HUMAN:` question of an old-style turn is still open. Those lines are
+  listed apart, below the queue ("For the owner", `supervisor.for_owner`:
+  newest first, each once, at most 10, from the end of its transcript):
+  items to read, counted in no queue, cleared by no reply, since nothing
+  waits on them. The owner can type to the supervisor at any time (its pane,
+  or `spawn submit`); it reads that as an instruction, which may reverse a
+  decision of its, not as the answer to a question. Each human action is a
+  command with principal `human`; it is the event the whole system tries to
+  make rarer.
 - **Inputs to a busy session wait for its turn.** A person's or the
   supervisor's input (`spawn submit`, any principal but `spawn-dispatch`,
   `spawn-integrate` and `spawn-liveness`) that reaches a pane not ready is
@@ -362,7 +385,7 @@ input of a mission.
 | Layer | Who | Does | Never does |
 | --- | --- | --- | --- |
 | Intake | human (or a standing source) | puts a mission in the inbox: `spawn mission add`, typing to the supervisor, answering a worker | bypass the record: every human input is a stored command with principal `human` |
-| Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself |
+| Decision | supervisor | accepts a mission, splits it into tasks, routes each task to a resident or a fresh ephemeral worker, accepts or rejects reports, closes the mission | type into panes itself, but for a nudge or a `continue` after a transient model API error |
 | Delivery | dispatcher (rules) | delivers assigned tasks, one at a time per worker (a task typed into a live worker is preceded by a merge of `main` into its idle workspace, and its text says what the merge did: [storage.md](storage.md), "Main into a workspace"; a task is delivered when the command that carries it succeeds; a failed one, which typed nothing, is retried under `<key>-retry-<n>` with a doubling wait, 3 times, then escalated; a refusal because the pane was not ready yet (`does not accept input`, refused before typing) is no failed attempt and goes again after 5 s, counted only past 10 of them; one that may have typed the task is escalated at once; a delivery that never reached the worker is not its last delivery, so its retry is not held back by itself); resumes, nudges, collects reports, wakes the supervisor with digests | choose who does what |
 | Execution | workers | do one task, end with a report | take work from anywhere but their assignment |
 
@@ -555,7 +578,7 @@ Known edges, each with its rule:
 | --- | --- |
 | The UI's live terminal reads tmux | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
 | The supervisor's native transcript lives on the host (`~/.claude`, copied to the host's transcript archive) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
-| The attention queue reads the supervisor's question from its transcript | A compute peek at the transcript the log names (`session.native_started`), read by the Observer's own reply reader; where it cannot be read, the screen tail stored with the judgement stands in, labelled as such |
+| The attention queue reads the supervisor's question and its "For the owner:" lines from its transcript | A compute peek at the transcript the log names (`session.native_started`), read by the Observer's own reply reader; where it cannot be read, the screen tail stored with the judgement stands in for the question, labelled as such, and no line for the owner is listed |
 | Code lives in git | Artifact storage; every commit is referenced from an event |
 
 - The event log is the only state; every process is restartable.
