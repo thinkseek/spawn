@@ -95,6 +95,14 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />
           <LiveBadge live={agent.live} />
+          {agent.attention && (
+            <span
+              className="text-caption font-medium text-warning"
+              title={'In the dispatcher\'s "Needs a human" queue'}
+            >
+              needs a human
+            </span>
+          )}
           <span className="ml-auto" />
           <Button onClick={() => onOpenTimeline(sessionId)} title="Open the event timeline">
             <span className="hidden sm:inline">Session timeline</span>
@@ -248,6 +256,17 @@ function JevPanel({
             </span>
           )}
         </div>
+
+        {judgement.attention && (
+          <p
+            className="text-caption text-muted-foreground"
+            title={'The judge\'s opinion only. Who needs a human is the dispatcher\'s view: the "Needs a human" queue.'}
+          >
+            <span className="font-medium text-foreground">The judge asks for attention</span>
+            {judgement.attention_reason && <> · {reasonText(judgement.attention_reason)}</>}
+            <span className="text-faint-foreground"> · its opinion, not the dispatcher's queue</span>
+          </p>
+        )}
 
         {reason && (
           <div
