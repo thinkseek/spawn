@@ -125,3 +125,9 @@ export function formatBytes(bytes: number): string {
 export function pageHidden(doc: { visibilityState?: string } | undefined): boolean {
   return doc?.visibilityState === "hidden";
 }
+
+/** When data was last known current: the server's own time for it, or
+ * the moment a later answer said it had not changed, whichever is later. */
+export function freshAt(serverMs: number, checkedAt: number | null | undefined): number {
+  return Math.max(serverMs, checkedAt ?? 0);
+}
