@@ -2228,8 +2228,7 @@ mod tests {
     use super::{
         Freshness, Mission, NO_TEST_DATABASE, aborted, freshness, halt_reason, markers_note,
         merged_tree, needs_test_database, no_room, over_budget, pinned, report_freshness,
-        room_backoff, room_wait, short_of_room, task_scenario, waits_for_gate,
-        wall_clock_minutes,
+        room_backoff, room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
@@ -5026,7 +5025,20 @@ mod database_tests {
     /// One judging of a reported task with pushed work, on a host whose
     /// room `room` measures: the mission, the task, and the world's base.
     fn judged_on(tag: &str, room: crate::gate::Room) -> (Db, i64, i64, PathBuf) {
+        judged_on_with(tag, room, false)
+    }
+
+    /// [`judged_on`], the mission's scenarios marked
+    /// [`super::NO_TEST_DATABASE`] when `no_test_database`.
+    fn judged_on_with(
+        tag: &str,
+        room: crate::gate::Room,
+        no_test_database: bool,
+    ) -> (Db, i64, i64, PathBuf) {
         let (base, source, scenarios, mut integrator) = world(tag, NOTING_GATE);
+        if no_test_database {
+            std::fs::write(scenarios.join(super::NO_TEST_DATABASE), "").expect("the marker");
+        }
         integrator.judge.room = room;
         let db = Db::new(&tag.replace('-', "_"));
         let mission = db.gated_mission(&source, &scenarios);
@@ -5158,6 +5170,30 @@ mod database_tests {
             );
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    /// A mission whose gate needs no test database (`no-test-database`)
+    /// is not held back by a test server that fails its probe: its gate
+    /// never gets the URL, so the probe is not made and the gate runs.
+    #[test]
+    fn a_mission_without_a_test_database_is_not_held_back_by_its_probe() {
+        let room = measured_room(
+            &[(
+                "SPAWN_TEST_DATABASE_URL",
+                "postgres://t:pw@%2Frun%2Fpg/spawn_test",
+            )],
+            u64::MAX / 2,
+            u64::MAX / 2,
+            Err(spawn_postgres::ProbeFailure {
+                probe: "connect within 10 s".to_string(),
+                error: "connection refused".to_string(),
+            }),
+        );
+        let (db, mission, task, base) = judged_on_with("room-no-db", room, true);
+        assert_eq!(gate_runs(&base), 1, "the gate ran");
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Every check met: the gate runs exactly as before, the test database
