@@ -1117,7 +1117,9 @@ mod tests {
             .expect("git runs");
         say(
             PLAIN,
-            String::from_utf8_lossy(&plain.stderr).trim().replace('\n', " "),
+            String::from_utf8_lossy(&plain.stderr)
+                .trim()
+                .replace('\n', " "),
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1171,7 +1173,10 @@ mod tests {
         if plain_translated == plain_english {
             eprintln!("this host does not translate git ({plain_translated:?}): nothing to prove");
         }
-        assert_eq!(translated, english, "git's answer here: {plain_translated:?}");
+        assert_eq!(
+            translated, english,
+            "git's answer here: {plain_translated:?}"
+        );
     }
 
     #[test]
