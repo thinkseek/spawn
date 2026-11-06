@@ -133,7 +133,13 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
 fn one_line(text: &str, limit: usize) -> String {
     text.trim()
         .chars()
-        .map(|char| if char == '\n' || char == '\r' { ' ' } else { char })
+        .map(|char| {
+            if char == '\n' || char == '\r' {
+                ' '
+            } else {
+                char
+            }
+        })
         .take(limit)
         .collect()
 }
