@@ -233,10 +233,9 @@ impl MissionWorkspaces {
         store: Arc<PostgresStore>,
         factory: Factory,
     ) -> Self {
-        Self {
-            flush_on_drop: false,
-            ..Self::new(default, root, store, factory)
-        }
+        let mut one_shot = Self::new(default, root, store, factory);
+        one_shot.flush_on_drop = false;
+        one_shot
     }
 
     /// Queue a push of an agent's branch, to a source that receives them.
