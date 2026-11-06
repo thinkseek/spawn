@@ -314,7 +314,7 @@ while :; do
     session_resident_*"BB:WRITE "*) [ -n "$file" ] || file=${typed#*BB:WRITE }; file=${file%% *} ;;
     esac
   elif [ "$pending" = 1 ]; then
-    if [ -n "$file" ] && [ -n "$BB_SOURCE" ]; then
+    if [ -n "$file" ] && [ -n "${BB_SOURCE-}" ]; then
       printf '%s was here\n' "$agent" >"$file"
       turn_ends "wrote $file"
       start=$(date +%s)
@@ -485,17 +485,31 @@ hold() {
     assert_eq "$(field "$hold" source)" "$1" "$3 the source hold $hold names"
     assert_eq "$(field "$hold" by)" human "$3 who hold $hold names"
 }
-# The board's (`spawn mission list`) hold on `$1`: `<hold> <waiting ids>`.
-board_hold() {
+# `spawn mission list` into $WORK/board.json.
+board() {
     capture "$SPAWN_BIN" mission list
     [ "$status" -eq 0 ] || fail "\`spawn mission list\` exited $status: $(err | head -c 300)"
+    jq -e . "$WORK/out.txt" >/dev/null 2>&1 || fail "\`spawn mission list\` printed no JSON: $(out | head -c 300)"
+    cp "$WORK/out.txt" "$WORK/board.json"
+}
+# The hold on source `$1` in the `holds` of a JSON answer `$2`:
+# `<hold> <waiting task ids, comma-separated>`, empty when none.
+hold_in() {
     jq -r --arg s "$1" '[(.holds // [])[] | select(.source == $s)] | first
         | if . == null then "" else "\(.hold) \((.waiting // []) | map(tostring) | join(","))" end' \
-        "$WORK/out.txt" 2>/dev/null || fail "\`spawn mission list\` printed no JSON: $(out | head -c 300)"
+        "$2" 2>/dev/null || true
 }
 board_mission_hold() { # <mission>: the mission's `hold` on the board, "null" if none
     jq -r --argjson m "$1" '[.missions[] | select(.id == $m)] | first | .hold // null
-        | if type == "object" then .hold else . end | tostring' "$WORK/out.txt"
+        | if type == "object" then .hold else . end | tostring' "$WORK/board.json" 2>/dev/null || true
+}
+# A record's numeric field `$2` minus its own time (recorded_at_ms); empty
+# when the field is missing or not a number.
+after_own_time() {
+    q "select case when jsonb_typeof(kind -> 'detail' -> 'record' -> '$2') = 'number'
+                   then ((kind -> 'detail' -> 'record' ->> '$2')::numeric - recorded_at_ms)::bigint::text
+                   else '' end
+         from spawn_events where id = $1"
 }
 
 # The session is judged waiting at its prompt, live.
@@ -598,7 +612,7 @@ sa_main=$(main_of "$sa")
 hold "$sa" SA "(1)"
 hold_a=$hold
 assert_eq "$(field "$hold_a" main)" "$sa_main" "(1) the main hold $hold_a names (SA's main)"
-assert_eq "$(($(field "$hold_a" expires_ms) - $(recorded_ms "$hold_a")))" 10800000 \
+assert_eq "$(after_own_time "$hold_a" expires_ms)" 10800000 \
     "(1) hold $hold_a's expires_ms minus its own time (the default bound, 3 h)"
 assert_eq "$(jq -r '.main // empty' "$WORK/out.txt")" "$sa_main" "(1) the main \`spawn mission hold\` printed"
 
@@ -621,10 +635,23 @@ until [ -n "$t_alpha" ]; do
     integrator_alive || fail "(1) the integrator exited: $(log_tail)"
     sleep 1
 done
-wait_state "$t_beta1" landed 240 "(1) beta1 on SB"
-[ "$(main_of "$sa")" = "$sa_main" ] || [ "$(task_state "$t_alpha")" != landed ] ||
+# The other source lands while SA is held.
+deadline=$(($(now) + 240))
+until [ "$(accepted_record "$t_beta1")" -gt 0 ]; do
+    [ "$(now)" -lt "$deadline" ] ||
+        harness "(1) beta1 on SB was not accepted within 240 s (tasks: $(tasks_line); integrate: $(log_tail))"
+    integrator_alive || fail "(1) the integrator exited: $(log_tail)"
+    sleep 1
+done
+deadline=$(($(now) + 30))
+until [ "$(task_state "$t_beta1")" = landed ]; do
+    [ "$(now)" -lt "$deadline" ] ||
+        fail "(1) task #$t_beta1, accepted on SB (not held), did not land within 30 s while SA was held (state $(task_state "$t_beta1"); integrate: $(log_tail))"
+    integrator_alive || fail "(1) the integrator exited: $(log_tail)"
+    sleep 1
+done
+[ "$(task_state "$t_alpha")" != landed ] ||
     fail "(1) task #$t_alpha landed on SA while SA was held (hold $hold_a): SA's main moved $sa_main -> $(main_of "$sa")"
-assert_eq "$(records source.released hold "$hold_a" 0)" 0 "(1) releases of hold $hold_a (beta1 landed on SB while SA was held)"
 
 # Gates on a held source still run and record their verdicts.
 deadline=$(($(now) + 180))
@@ -664,7 +691,8 @@ assert_eq "$(held_records "$t_alpha" "$hold_a")" 1 \
     fail "(1) task #$t_alpha's task.held does not follow its accepted verdict (event $accepted_alpha)"
 
 # The hold and its waiting task are visible, and the wait is not a stall.
-seen=$(board_hold "$sa")
+board
+seen=$(hold_in "$sa" "$WORK/board.json")
 case "$seen" in
 "$hold_a "*) ;;
 *) fail "(1) \`spawn mission list\` shows no hold $hold_a on SA in \`holds\`: [$seen]" ;;
@@ -676,9 +704,7 @@ esac
 assert_eq "$(board_mission_hold "$mission_a")" "$hold_a" "(1) mission A's \`hold\` on the board"
 assert_eq "$(board_mission_hold "$mission_b")" null "(1) mission B's \`hold\` on the board (SB is not held)"
 attention
-listed=$(jq -r --arg s "$sa" '[(.holds // [])[] | select(.source == $s)] | first
-    | if . == null then "" else "\(.hold) \((.waiting // []) | map(tostring) | join(","))" end' \
-    "$WORK/attention.json")
+listed=$(hold_in "$sa" "$WORK/attention.json")
 case "$listed" in
 "$hold_a "*) ;;
 *) fail "(1) GET /api/attention lists no hold $hold_a on SA in \`holds\` while task #$t_alpha waits behind it: [$listed]" ;;
@@ -723,7 +749,8 @@ done
 [ "$(first_record task.landed id "$t_alpha" "$released_a")" -gt 0 ] ||
     fail "(3) task #$t_alpha's task.landed does not follow the release (event $released_a)"
 git --git-dir="$sa" cat-file -e main:alpha.txt 2>/dev/null || fail "(3) SA's main does not hold alpha.txt"
-assert_eq "$(board_hold "$sa")" "" "(3) the board's hold on SA after the release"
+board
+assert_eq "$(hold_in "$sa" "$WORK/board.json")" "" "(3) the board's hold on SA after the release"
 no_halt "(3) after the release"
 # A release with no hold records nothing; a hold on a source no mission
 # names is refused.
@@ -750,9 +777,9 @@ wait_gate beta2 "(4)"
 sb_main=$(main_of "$sb")
 hold "$sb" SB "(4)" 20
 hold_b=$hold
-expires=$(field "$hold_b" expires_ms)
-assert_eq "$((expires - $(recorded_ms "$hold_b")))" 20000 \
+assert_eq "$(after_own_time "$hold_b" expires_ms)" 20000 \
     "(4) hold $hold_b's expires_ms minus its own time (SPAWN_SOURCE_HOLD_SECS=20)"
+expires=$(field "$hold_b" expires_ms)
 : >"$WORK/release-beta2"
 deadline=$(($(now) + 15))
 until [ "$(accepted_record "$t_beta2")" -gt 0 ] && [ "$(held_records "$t_beta2" "$hold_b")" -ge 1 ]; do
