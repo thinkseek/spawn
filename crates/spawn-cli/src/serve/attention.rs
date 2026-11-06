@@ -95,9 +95,10 @@ pub(super) fn attention() -> Result<Value, String> {
     let store = super::open_store()?;
     let disk = store.host_disk().map_err(super::err)?;
     let (bounds, _) = dispatch::Bounds::from_env();
+    let (waits, _) = crate::deliver::Waits::from_env();
     let reading = dispatch::read_plan(
         &store,
-        dispatch::load(&store)?,
+        dispatch::load(&store, waits)?,
         |now| crate::disk::escalations(disk.as_array().map_or(&[][..], Vec::as_slice), now),
         &bounds,
         crate::config::supervised(),
