@@ -5555,7 +5555,11 @@ mod database_tests {
         // it as told and unresolved.
         let plan = gate_room_plan(&db, &tag);
         assert!(plan.pending.is_empty(), "told once: {:?}", plan.pending);
-        let told: Vec<String> = plan.told.iter().map(crate::dispatch::Escalation::tag).collect();
+        let told: Vec<String> = plan
+            .told
+            .iter()
+            .map(crate::dispatch::Escalation::tag)
+            .collect();
         assert_eq!(told, [tag.as_str()], "told, and the gate still has no room");
 
         // A no_room that names no free space or TMPDIR is refused.
