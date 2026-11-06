@@ -34,8 +34,11 @@ export interface ReadOptions {
 /** The last answer read at each URL, with its tag. */
 export class Validated {
   private readonly kept = new Map<string, Kept>();
+  private readonly fetcher: FetchLike;
 
-  constructor(private readonly fetcher: FetchLike = (url, init) => fetch(url, init)) {}
+  constructor(fetcher: FetchLike = (url, init) => fetch(url, init)) {
+    this.fetcher = fetcher;
+  }
 
   /** GET `url` and normalize it, or, answered 304, the value read last
    * time (the same object). A failure throws `fail`'s error, with the
