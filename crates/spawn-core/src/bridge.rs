@@ -2513,7 +2513,7 @@ impl Bridge {
             let pane =
                 match self
                     .terminals
-                    .capture_tail(active.terminal(), active.workspace, TAIL_LINES)
+                    .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
                 {
                     Ok(pane) => pane,
                     Err(error) => {
@@ -2543,7 +2543,7 @@ impl Bridge {
                 self.append(
                     &claimed.agent_id,
                     &claimed.session_id,
-                    Some(active.execution_id),
+                    Some(&active.execution_id),
                     Source::Bridge,
                     None,
                     EventKind::ScreenObserved {
