@@ -304,10 +304,10 @@ fn write_private(
 
 /// How many `new-session` calls one [`TerminalHost::start`] makes when
 /// each reaches a server that shuts down ([`server_left`]). The client sees
-/// the server's socket close only once that server is gone, so the next
-/// call starts a new server: one shutdown costs one call. The rest cover
-/// another server coming and going meanwhile, without looping on a tmux
-/// that always fails this way.
+/// its connection drop only once the old server's socket is closed for
+/// good, so the next call finds no server and starts one: one shutdown
+/// costs one call. The rest cover another server coming and going
+/// meanwhile, without looping on a tmux that always fails this way.
 const START_ATTEMPTS: usize = 3;
 
 impl TmuxHost {
