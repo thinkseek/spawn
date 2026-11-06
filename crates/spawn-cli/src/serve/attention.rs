@@ -257,7 +257,8 @@ fn asking(facts: &Facts) -> Option<&Observation> {
 /// such a line is one it does not wait on, whatever the judge made of it.
 fn asks<'a>(facts: &'a Facts, said: Option<&Said>) -> Option<&'a Observation> {
     let observation = asking(facts)?;
-    let open = observation.human_question.is_some() || said.is_some_and(|said| said.human.is_some());
+    let open =
+        observation.human_question.is_some() || said.is_some_and(|said| said.human.is_some());
     let for_owner = said
         .and_then(|said| said.reply.as_deref())
         .is_some_and(|reply| reply.lines().any(|line| for_owner(line).is_some()));
@@ -417,7 +418,7 @@ fn line_time(line: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{answer, asking, question, said};
+    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said};
     use crate::deliver::Work;
     use crate::dispatch::{Escalation, Facts, Why, decide_with};
     use serde_json::{Value, json};
@@ -531,7 +532,15 @@ mod tests {
     fn the_views_pending_is_the_dispatchers_pending() {
         let (rows, work, host) = situation();
         let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
-        let view = answer(&rows, &plan, &Value::Null, &Value::Null, &json!([]), &[], NOW);
+        let view = answer(
+            &rows,
+            &plan,
+            &Value::Null,
+            &Value::Null,
+            &json!([]),
+            &[],
+            NOW,
+        );
         let pending = view["pending"].as_array().expect("pending");
         assert_eq!(pending.len(), plan.pending.len());
         for (shown, planned) in pending.iter().zip(&plan.pending) {
@@ -637,7 +646,13 @@ mod tests {
         ]
         .concat();
         let turn = json!({"transcript": "/t.jsonl", "workspace": "a:/w", "turn_ended_at_ms": NOW - 14_000_000});
-        let asked = question(supervisor, observation, &turn, Some(&said(transcript.as_bytes())));
+        let read = said(transcript.as_bytes());
+        assert!(read.for_owner.is_empty());
+        assert!(
+            asks(supervisor, Some(&read)).is_some(),
+            "an old-style turn still asks"
+        );
+        let asked = question(supervisor, observation, &turn, Some(&read));
         assert_eq!(
             asked["text"],
             "Another failed delivery.\nMy question about stopping `objective_87` is still open.",
@@ -673,6 +688,165 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("Should I stop objective_87 now?"))
         );
+    }
+
+    /// A turn of the new charter: decisions it took, and a line for the
+    /// owner it does not wait on. Judged BLOCKED with needs_human 0.87 all
+    /// the same, it asks nothing; its line is listed for the owner to read.
+    #[test]
+    fn a_line_for_the_owner_is_no_question() {
+        let (rows, work, host) = situation();
+        let supervisor = &rows[4];
+        assert!(asking(supervisor).is_some(), "the judge says BLOCKED, 0.87");
+        let transcript = [
+            line(
+                "user",
+                &json!("Spawn dispatcher: 2 updates for you. ..."),
+                "2026-11-06T10:00:00.000Z",
+            ),
+            line(
+                "assistant",
+                &json!(
+                    "Decided (the owner may reverse): accepted #108 r2, its tests pin the rule.\n\
+                     Decided (the owner may reverse): sent `continue` to objective_87 after an \
+                     overloaded error.\n\
+                     For the owner: deploy ffc9fe7; the gate passed and it touches deploy/."
+                ),
+                "2026-11-06T10:00:30.000Z",
+            ),
+        ]
+        .concat();
+        let read = said(transcript.as_bytes());
+        assert!(
+            asks(supervisor, Some(&read)).is_none(),
+            "a For the owner: line is not a question"
+        );
+        assert_eq!(read.human, None);
+        let at = crate::scorecard::time::parse_rfc3339("2026-11-06T10:00:30.000Z");
+        assert_eq!(
+            read.for_owner,
+            [(
+                "deploy ffc9fe7; the gate passed and it touches deploy/.".to_string(),
+                at
+            )]
+        );
+
+        // The view: no question, the line as an item to read, the queue as
+        // the dispatcher has it.
+        let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
+        let notes = json!([{"text": read.for_owner[0].0, "at_ms": read.for_owner[0].1}]);
+        let view = answer(&rows, &plan, &Value::Null, &Value::Null, &notes, &[], NOW);
+        assert_eq!(view["supervisor"]["question"], Value::Null);
+        assert_eq!(
+            view["supervisor"]["for_owner"][0]["text"],
+            "deploy ffc9fe7; the gate passed and it touches deploy/."
+        );
+        assert_eq!(view["supervisor"]["for_owner"][0]["at_ms"], json!(at));
+        assert_eq!(
+            view["pending"].as_array().map(Vec::len),
+            Some(plan.pending.len())
+        );
+
+        // An open HUMAN: question still asks, in the same reply, or a turn
+        // earlier with no person's answer since, or read by the Observer.
+        let both = transcript.clone()
+            + &line(
+                "assistant",
+                &json!("For the owner: approve resident `docs`.\nHUMAN: which region?"),
+                "2026-11-06T10:01:00.000Z",
+            );
+        assert!(asks(supervisor, Some(&said(both.as_bytes()))).is_some());
+        let earlier = [
+            line(
+                "assistant",
+                &json!("HUMAN: Should I stop `objective_87` now?"),
+                "2026-11-06T09:00:00.000Z",
+            ),
+            transcript.clone(),
+        ]
+        .concat();
+        assert!(asks(supervisor, Some(&said(earlier.as_bytes()))).is_some());
+        let mut seen = supervisor.clone();
+        if let Some(observation) = seen.observation.as_mut() {
+            observation.human_question = Some("Which region?".to_string());
+        }
+        assert!(asks(&seen, Some(&read)).is_some());
+        // Without a transcript, the judgement alone decides, as before.
+        assert!(asks(supervisor, None).is_some());
+    }
+
+    /// The lines for the owner: the model's own words only, newest first,
+    /// each once, at most FOR_OWNER_ITEMS; an owner's message is an
+    /// instruction, not an answer, and clears none of them.
+    #[test]
+    fn the_lines_for_the_owner_are_listed_newest_first() {
+        let mut transcript = String::new();
+        for (index, at) in ["05", "06", "07"].iter().enumerate() {
+            transcript += &line(
+                "assistant",
+                &json!(format!(
+                    "For the owner: deploy {index}.\nFor the owner: approve `docs`."
+                )),
+                &format!("2026-11-06T{at}:00:00.000Z"),
+            );
+        }
+        transcript += &line(
+            "user",
+            &json!("Owner: go on, and look at #86."),
+            "2026-11-06T08:00:00.000Z",
+        );
+        // A tool's output is not the model's words.
+        transcript += &format!(
+            "{}\n",
+            json!({"type": "user", "timestamp": "2026-11-06T08:01:00.000Z", "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1",
+                             "content": "For the owner: rm -rf everything"}]}})
+        );
+        transcript += &line(
+            "assistant",
+            &json!(
+                "- **For the owner:** resume mission 7.\nFor the owner:\n- a heading lists nothing"
+            ),
+            "2026-11-06T08:02:00.000Z",
+        );
+        let notes = said(transcript.as_bytes()).for_owner;
+        let time = |at: &str| crate::scorecard::time::parse_rfc3339(at);
+        assert_eq!(
+            notes,
+            [
+                (
+                    "resume mission 7.".to_string(),
+                    time("2026-11-06T08:02:00.000Z")
+                ),
+                (
+                    "approve `docs`.".to_string(),
+                    time("2026-11-06T07:00:00.000Z")
+                ),
+                ("deploy 2.".to_string(), time("2026-11-06T07:00:00.000Z")),
+                ("deploy 1.".to_string(), time("2026-11-06T06:00:00.000Z")),
+                ("deploy 0.".to_string(), time("2026-11-06T05:00:00.000Z")),
+            ]
+        );
+
+        let many: String = (0..FOR_OWNER_ITEMS + 5)
+            .map(|index| {
+                line(
+                    "assistant",
+                    &json!(format!("For the owner: item {index}")),
+                    "2026-11-06T09:00:00.000Z",
+                )
+            })
+            .collect();
+        let notes = said(many.as_bytes()).for_owner;
+        assert_eq!(notes.len(), FOR_OWNER_ITEMS);
+        assert_eq!(notes[0].0, format!("item {}", FOR_OWNER_ITEMS + 4));
+
+        assert_eq!(for_owner("For the owner: x"), Some("x"));
+        assert_eq!(for_owner("  > **For the owner**: x **"), Some("x"));
+        assert_eq!(for_owner("Not for the owner: x"), None);
+        assert_eq!(for_owner("For the owners: x"), None);
+        assert_eq!(for_owner("Decided (the owner may reverse): x"), None);
     }
 
     #[test]

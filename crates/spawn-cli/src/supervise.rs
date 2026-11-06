@@ -361,10 +361,18 @@ work.",
         }
         // Nothing left of the old rule: no question to end a turn on, no
         // waiting, no HUMAN: line but the one it forbids.
-        for gone in ["Then wait", "tell them with HUMAN:", "starts with \"HUMAN:\""] {
+        for gone in [
+            "Then wait",
+            "tell them with HUMAN:",
+            "starts with \"HUMAN:\"",
+        ] {
             assert!(!text.contains(gone), "the charter no longer says: {gone}");
         }
-        assert_eq!(text.matches("HUMAN:").count(), 1, "only in `no \"HUMAN:\" line`");
+        assert_eq!(
+            text.matches("HUMAN:").count(),
+            1,
+            "only in `no \"HUMAN:\" line`"
+        );
         assert!(text.contains("no \"HUMAN:\" line, no \"Your decisions:\""));
     }
 
