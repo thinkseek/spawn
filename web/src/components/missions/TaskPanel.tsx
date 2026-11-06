@@ -148,7 +148,6 @@ export function TaskPanel({
               bytes={task.review_note_bytes}
               full={texts.texts?.review_note}
               read={texts}
-              onWant={() => undefined}
               className="mt-1"
             />
           </section>
@@ -234,7 +233,6 @@ export function TaskPanel({
               bytes={task.brief_bytes}
               full={texts.texts?.brief}
               read={texts}
-              onWant={() => undefined}
             />
           </Collapsible>
         )}
@@ -246,7 +244,6 @@ export function TaskPanel({
               bytes={task.report_bytes}
               full={texts.texts?.report}
               read={texts}
-              onWant={() => undefined}
             />
           </Collapsible>
         ) : (

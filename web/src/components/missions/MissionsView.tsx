@@ -625,9 +625,7 @@ function TaskRow({
   const title = taskTitle(task, { missionName });
   // The board sends the texts' first lines; the whole is read when asked
   // (the brief opened, a "show the whole" pressed), one GET for the three.
-  const [wanted, setWanted] = useState(false);
-  const texts = useTaskTexts(task, wanted);
-  const want = () => setWanted(true);
+  const texts = useTaskTexts(task, false);
   return (
     <li
       className={cx(
@@ -747,8 +745,7 @@ function TaskRow({
               bytes={task.review_note_bytes}
               full={texts.texts?.review_note}
               read={texts}
-              onWant={want}
-              className="mt-1"
+                className="mt-1"
             />
           ) : (
             <p className="mt-1 text-caption text-faint-foreground">
@@ -766,7 +763,6 @@ function TaskRow({
             bytes={task.review_note_bytes}
             full={texts.texts?.review_note}
             read={texts}
-            onWant={want}
             className="mt-1"
           />
         </div>
@@ -775,14 +771,13 @@ function TaskRow({
       <EarlierAttempts group={group} missionName={missionName} />
 
       {task.brief && (
-        <Collapsible label="Brief" onToggle={(open) => open && want()}>
+        <Collapsible label="Brief" onToggle={(open) => open && texts.want()}>
           <TaskText
             what="brief"
             excerpt={task.brief}
             bytes={task.brief_bytes}
             full={texts.texts?.brief}
             read={texts}
-            onWant={want}
           />
         </Collapsible>
       )}
@@ -795,7 +790,6 @@ function TaskRow({
             bytes={task.report_bytes}
             full={texts.texts?.report}
             read={texts}
-            onWant={want}
           />
         </Collapsible>
       ) : (
