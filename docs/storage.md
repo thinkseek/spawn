@@ -386,6 +386,14 @@ that took them landed them in `main` (Supply PA's `main` got
   nothing in `main` for it and does not conflict on it (the owner's
   removal against the engine's edits would be a modify/delete conflict).
   The engine's file stays in the workspace.
+- **Cost.** One more git call per checkpoint: a listing
+  (`ls-files --with-tree=<parent>`) that finds neither the parent nor the
+  index holding a runtime file, after which nothing else runs (the reset
+  and the rest run only when one is held, or a merge waits on markers);
+  and 16 exclude pathspecs on the staging and the size check. Measured on
+  this repository's tree (321 files, release build, the store's own
+  `commit`): 17–18 ms per checkpoint instead of 13–15 ms with nothing
+  changed, 21–22 ms instead of 17–18 ms with one file edited.
 
 ## The transcript archive
 
