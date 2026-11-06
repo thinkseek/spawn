@@ -265,7 +265,7 @@ verdict_over "$head"
 deploy
 check "succeeded (status $status)" [ "$status" -eq 0 ]
 check "released the owner's hold" [ -z "$(missions_hold)" ]
-check "says so" grep -q "released the owner's hold $held on $missions" "$out
+check "says so" grep -q "released the owner's hold $held on $missions" "$out"
 check "says the relay unit is not installed" grep -q "installed model-relay.py (unit spawn-model-relay is not installed" "$out"
 check "both relay scripts are installed" \
   bash -c 'cmp -s "$1/scripts/jev-relay.py" "$2/jev-relay.py" && cmp -s "$1/scripts/model-relay.py" "$2/model-relay.py"' _ "$checkout" "$live/bin"
@@ -290,7 +290,7 @@ verdict_over "$base"
 deploy DEPLOY_TEST_AFTER_PUSH=fail
 check "failed (status $status)" [ "$status" -ne 0 ]
 check "released the owner's hold on its failure" [ -z "$(missions_hold)" ]
-check "says so" grep -q "released the owner's hold $held on $missions" "$out
+check "says so" grep -q "released the owner's hold $held on $missions" "$out"
 check "main moved to HEAD" [ "$(main)" = "$head" ]
 check "completed the pending deploy on exit" grep -q "completed the pending deploy: main $base -> $head" "$out"
 check "deploy.pending is gone" [ ! -e "$live/deploy.pending" ]
