@@ -23,8 +23,7 @@ use std::path::Path;
 
 /// The reason scripts/rsi/gate.sh gives when check-tests.sh fails on the
 /// candidate: the only rejection whose failures are read.
-pub(crate) const CHECK_TESTS_REGRESSION: &str =
-    "regression: check-tests.sh fails on the candidate";
+pub(crate) const CHECK_TESTS_REGRESSION: &str = "regression: check-tests.sh fails on the candidate";
 
 /// The line that opens the check-tests section of the gate's output.
 const SECTION: &str = "| == regression: check-tests.sh must still pass";
@@ -275,7 +274,8 @@ pub(crate) fn log_time_ms(line: &str) -> Option<i64> {
 /// [`started_ms` - 1 s, `ended_ms` + 1 s], oldest first, at most
 /// [`CRASH_LINES`], each cut to [`CRASH_CHARS`].
 pub(crate) fn crash_lines(log: &str, started_ms: i64, ended_ms: i64) -> Vec<String> {
-    let window = started_ms.saturating_sub(WINDOW_SLACK_MS)..=ended_ms.saturating_add(WINDOW_SLACK_MS);
+    let window =
+        started_ms.saturating_sub(WINDOW_SLACK_MS)..=ended_ms.saturating_add(WINDOW_SLACK_MS);
     log.lines()
         .filter(|line| CRASH_MARKS.iter().any(|mark| line.contains(mark)))
         .filter(|line| log_time_ms(line).is_some_and(|at| window.contains(&at)))
@@ -339,7 +339,11 @@ impl HostFault {
 
 /// A message's first line, cut to [`MESSAGE_CHARS`].
 pub(crate) fn first_line(message: &str) -> String {
-    super::cut(message.lines().next().unwrap_or_default().trim(), MESSAGE_CHARS).to_string()
+    super::cut(
+        message.lines().next().unwrap_or_default().trim(),
+        MESSAGE_CHARS,
+    )
+    .to_string()
 }
 
 /// Whether the gate's rejection (`reason`, its output `log`) is the host's:
