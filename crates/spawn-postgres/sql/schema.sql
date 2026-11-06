@@ -384,6 +384,10 @@ create index if not exists spawn_commands_open
     on spawn_commands (session_id, id)
     where state <> 'finished';
 
+-- A session's latest commands, finished or not: the fleet board's task.
+create index if not exists spawn_commands_session
+    on spawn_commands (session_id, id);
+
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
 -- pattern such as `agent_worker_*`, so the supervisor can command every worker
