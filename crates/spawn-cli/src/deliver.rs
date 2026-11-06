@@ -1490,6 +1490,8 @@ mod tests {
             resident: Some("core".to_string()),
             gated: false,
             model: ModelProfile::Default,
+            reissue_of: None,
+            reissued_attempts: None,
         }
     }
 
