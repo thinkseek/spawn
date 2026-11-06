@@ -49,7 +49,14 @@ pub(crate) use config::{Flags, env_or, env_value, open_store};
 
 use commands::{engine, inspect, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|serve|scorecard|fleet|tail|run|version>";
+/// The commands, as the black-box contract (scripts/blackbox/scenarios/
+/// 010-cli-contract.sh) reads them verbatim.
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|serve|fleet|tail|run|version>";
+
+/// The commands the contract's line does not hold, each on a line of its own
+/// after it.
+const MORE_USAGE: &str =
+    "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
 
 fn main() {
     let code = match dispatch() {
@@ -65,7 +72,7 @@ fn main() {
 pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
-        return Err(USAGE.to_string());
+        return Err(format!("{USAGE}\n{MORE_USAGE}"));
     };
     let rest: Vec<String> = arguments.collect();
     match command.as_str() {
@@ -99,7 +106,13 @@ pub(crate) fn dispatch() -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::USAGE;
+    use super::{MORE_USAGE, USAGE};
+
+    #[test]
+    fn the_usage_names_the_scorecard_on_a_line_of_its_own() {
+        assert!(MORE_USAGE.trim_start().starts_with("spawn scorecard "));
+        assert!(!USAGE.contains("scorecard"), "the contract's line stays as it was");
+    }
 
     #[test]
     fn the_usage_names_each_command_once_and_no_removed_one() {
