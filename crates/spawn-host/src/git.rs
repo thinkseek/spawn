@@ -3050,4 +3050,134 @@ mod tests {
         assert_eq!(tree("agent_a"), tree(&start));
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// Every git this store runs, and every git built on [`super::git_command`]
+    /// (the controller's), is in the C locale whatever the host's; this
+    /// module starts no other git.
+    #[test]
+    fn every_git_runs_in_the_c_locale() {
+        use std::ffi::OsStr;
+        let store = GitWorkspace::new("/nonexistent.git", std::env::temp_dir());
+        for command in [
+            super::git_command("git"),
+            store.command(),
+            store.command_in(Path::new("/work"), Path::new("/index")),
+        ] {
+            let envs: Vec<_> = command.get_envs().collect();
+            assert!(
+                envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))),
+                "{envs:?}"
+            );
+            assert!(envs.contains(&(OsStr::new("LANGUAGE"), None)), "{envs:?}");
+        }
+        let own = include_str!("git.rs");
+        let code = own.split("#[cfg(test)]\nmod tests").next().unwrap_or(own);
+        assert_eq!(
+            code.matches("Command::new(").count(),
+            2,
+            "git_command's, and tar's"
+        );
+        assert_eq!(code.matches("Command::new(\"tar\")").count(), 1);
+    }
+
+    /// Marks a line of [`merge_decisions_in_this_locale`]'s output.
+    const DECISION: &str = "spawn-decision: ";
+
+    /// What this store makes of git in this process's locale, one line
+    /// each: a merge of `main` whose only conflict is in a file's lines
+    /// (markers written), one whose conflict markers cannot show
+    /// (modify/delete), and a git that fails. Run by
+    /// [`a_translated_locale_changes_no_merge_decision`] in one process per
+    /// locale; alone it only prints.
+    #[test]
+    #[ignore = "run by a_translated_locale_changes_no_merge_decision"]
+    fn merge_decisions_in_this_locale() {
+        let base = std::env::temp_dir().join(format!("spawn-git-locale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        std::fs::create_dir_all(&checkout).expect("create the repository");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write");
+        std::fs::write(checkout.join("gone.txt"), "kept\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let worked = |agent: &str, file: &str| {
+            let branch = BranchName::new(agent).expect("valid branch");
+            store.ensure_branch(&branch, None).expect("branch");
+            let workspace = store.mount(&branch).expect("mount");
+            std::fs::write(Path::new(workspace.path()).join(file), "mine\n").expect("write");
+            assert!(matches!(
+                store.commit(&workspace, "work").expect("commit"),
+                Commit::Created(_)
+            ));
+            workspace
+        };
+        let lines = worked("agent_a", "README.md");
+        let deleted = worked("agent_b", "gone.txt");
+        std::fs::write(checkout.join("README.md"), "theirs\n").expect("write on main");
+        git(&checkout, &["rm", "-q", "gone.txt"]);
+        git(&checkout, &["commit", "-qam", "landed"]);
+
+        let merged = store.merge_base(&lines);
+        assert!(
+            matches!(&merged, Ok(BaseMerge::Conflicted { marked: true, .. })),
+            "{merged:?}"
+        );
+        println!("{DECISION}{merged:?}");
+        let merged = store.merge_base(&deleted);
+        assert!(
+            matches!(&merged, Ok(BaseMerge::Conflicted { marked: false, .. })),
+            "{merged:?}"
+        );
+        println!("{DECISION}{merged:?}");
+        let failed = store.git_output(&["rev-parse", "--verify", "refs/heads/none"]);
+        assert!(failed.is_err(), "{failed:?}");
+        println!("{DECISION}{failed:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A merge of `main` comes to the same decision, the error a failed git
+    /// quotes included, in a process whose whole environment is Chinese
+    /// (`LC_ALL`, `LANG`, `LC_MESSAGES`, `LANGUAGE`) as in C: every git of
+    /// this store runs in the C locale ([`super::git_command`]). Without
+    /// it, the quoted error was git's Chinese. On a host without zh_CN or
+    /// git's Chinese messages nothing is translated, and the comparison
+    /// holds anyway.
+    #[test]
+    fn a_translated_locale_changes_no_merge_decision() {
+        let program = std::env::current_exe().expect("the test binary");
+        let run = |locale: &str, language: Option<&str>| {
+            let mut command = Command::new(&program);
+            command
+                .args([
+                    "--exact",
+                    "git::tests::merge_decisions_in_this_locale",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("LC_ALL", locale)
+                .env("LANG", locale)
+                .env("LC_MESSAGES", locale);
+            match language {
+                Some(language) => command.env("LANGUAGE", language),
+                None => command.env_remove("LANGUAGE"),
+            };
+            let output = command.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{locale}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix(DECISION))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let english = run("C", None);
+        assert_eq!(english.len(), 3, "{english:?}");
+        assert_eq!(run("zh_CN.UTF-8", Some("zh_CN:zh")), english);
+    }
 }
