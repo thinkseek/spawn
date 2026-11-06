@@ -425,19 +425,28 @@ begin
     return query select v_id;
 end $$;
 
+-- The first version returned no principal.
+drop function if exists spawn_claim(text, bigint);
 create or replace function spawn_claim(
     p_worker text,
     p_ttl_ms bigint
 ) returns table (
-    out_id      bigint,
-    out_attempt integer,
-    out_agent   text,
-    out_session text,
-    out_action  jsonb
+    out_id        bigint,
+    out_attempt   integer,
+    out_agent     text,
+    out_session   text,
+    out_action    jsonb,
+    out_principal text
 ) language sql as $$
     -- One command per session at a time: nothing earlier in the session
-    -- may be unfinished. "Earlier" is id order, which is commit order
-    -- because `spawn_submit` takes its id under the append lock.
+    -- may be unfinished, but an input that waits for its turn (the Bridge
+    -- recorded its `command.step` `waiting`, keyed `cmd_<id>:waiting`): it
+    -- holds nothing behind it. A stop, a discard or a resume behind it is
+    -- handled at once, and an input behind it is claimed and kept behind it
+    -- by the Bridge (typed after it, or refused while it waits). An
+    -- unfinished input that does not wait still holds everything. "Earlier"
+    -- is id order, which is commit order because `spawn_submit` takes its id
+    -- under the append lock.
     with candidate as (
         select c.id
         from spawn_commands c
@@ -448,6 +457,10 @@ create or replace function spawn_claim(
               where o.session_id = c.session_id
                 and o.state <> 'finished'
                 and o.id < c.id
+                and not exists (
+                    select 1 from spawn_events w
+                    where w.session_id = o.session_id and w.source = 'bridge'
+                      and w.source_event_id = 'cmd_' || o.id || ':waiting')
           )
         order by c.id
         for update skip locked
@@ -459,7 +472,21 @@ create or replace function spawn_claim(
         lease_until_ms = spawn_now_ms() + p_ttl_ms
     from candidate
     where c.id = candidate.id
-    returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action;
+    returning c.id, c.lease_attempt, c.agent_id, c.session_id, c.action, c.principal;
+$$;
+
+-- Leave a claimed command unfinished and claimable again in `p_ms`: an
+-- input that waits for its turn. A lease that is no longer this attempt's
+-- changes nothing. Returns whether it released.
+create or replace function spawn_release(
+    p_command bigint,
+    p_attempt integer,
+    p_ms      bigint
+) returns boolean language sql as $$
+    update spawn_commands c
+       set lease_until_ms = spawn_now_ms() + greatest(p_ms, 0)
+     where c.id = p_command and c.state <> 'finished' and c.lease_attempt = p_attempt
+    returning true;
 $$;
 
 create or replace function spawn_finish(
@@ -810,6 +837,7 @@ revoke execute on function spawn_append_trusted(text, text, text, text, text, js
 revoke execute on function spawn_session_fold(text) from public;
 revoke execute on function spawn_submit(text, text, text, text, jsonb) from public;
 revoke execute on function spawn_claim(text, bigint) from public;
+revoke execute on function spawn_release(bigint, integer, bigint) from public;
 revoke execute on function spawn_finish(bigint, integer, boolean, text) from public;
 
 -- A security definer function must not resolve names through the caller's
