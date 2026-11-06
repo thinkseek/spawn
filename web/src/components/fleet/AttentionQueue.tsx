@@ -3,6 +3,7 @@ import {
   ChevronRight,
   CircleCheck,
   MessageCircleQuestion,
+  NotebookPen,
   TriangleAlert,
 } from "lucide-react";
 
@@ -10,6 +11,7 @@ import type { PollResult } from "../../api";
 import type {
   Attention,
   AttentionItem,
+  OwnerNote,
   SupervisorQuestion,
   SupervisorView,
 } from "../../attention";
@@ -32,8 +34,10 @@ import { FleetStateBadge, JudgeBadge, RoleBadge } from "./bits";
  * "Needs a human", top of the Fleet page. It shows what the dispatcher's own
  * code holds (`/api/attention`): the supervisor's open question, then the
  * escalations not yet told to the supervisor, then those it was told that
- * still hold. An older server without that endpoint gets the list of agents
- * whose latest judgement asks for attention, labelled as the judges' only.
+ * still hold. Below it, the supervisor's lines "For the owner": read, not
+ * counted, since it does not wait on them. An older server without that
+ * endpoint gets the list of agents whose latest judgement asks for
+ * attention, labelled as the judges' only.
  */
 export function AttentionQueue({
   view,
@@ -81,8 +85,64 @@ function age(since: number | null): string | null {
   return since === null ? null : formatDuration(Math.max(0, Date.now() - since));
 }
 
-/** The dispatcher's view: question, then untold, then told. */
-function DispatcherQueue({
+/** The dispatcher's view: question, then untold, then told; then the
+ * supervisor's lines for the owner. */
+function DispatcherQueue(props: {
+  attention: Attention;
+  agents: FleetAgent[];
+  onSelect: (sessionId: string) => void;
+  stale: string | null;
+}) {
+  return (
+    <>
+      <Queue {...props} />
+      <OwnerNotes notes={attentionGroups(props.attention).forOwner} />
+    </>
+  );
+}
+
+/** The supervisor's lines for the owner: what its grants do not cover. It
+ * does not wait on them, so they ask nothing; they are there to be read. */
+function OwnerNotes({ notes }: { notes: OwnerNote[] }) {
+  if (notes.length === 0) return null;
+  return (
+    <section
+      aria-label="For the owner"
+      className="shrink-0 rounded-lg border border-border px-4 py-2"
+    >
+      <header className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <NotebookPen size={14} className="shrink-0 text-muted-foreground" />
+        <h2 className="text-label font-medium text-foreground">For the owner</h2>
+        <span className="tnum text-micro text-muted-foreground">
+          {notes.length}
+        </span>
+        <span className="text-micro text-faint-foreground">
+          the supervisor's lines; it does not wait on them
+        </span>
+      </header>
+      <ul className="mt-1 divide-y divide-border">
+        {notes.map((note) => (
+          <li key={note.text} className="flex items-baseline gap-3 py-1.5">
+            <p className="min-w-0 flex-1 break-words text-caption text-foreground">
+              {note.text}
+            </p>
+            {note.at_ms !== null && (
+              <span
+                className="tnum shrink-0 text-caption text-muted-foreground"
+                title={clockTime(note.at_ms)}
+              >
+                {age(note.at_ms)} ago
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** The queue itself: question, then untold, then told. */
+function Queue({
   attention,
   agents,
   onSelect,
