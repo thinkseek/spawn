@@ -356,18 +356,30 @@ impl GitWorkspace {
         arguments: &[S],
         specs: &[OsString],
     ) -> Result<Vec<u8>, WorkspaceError> {
+        let mut with_input: Vec<&OsStr> = arguments.iter().map(AsRef::as_ref).collect();
+        with_input.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(OsStr::new));
+        self.listing_in_with_input(directory, index, &with_input, nul_terminated(specs))
+    }
+
+    /// [`Self::listing_in`] for a command that reads `input` on standard
+    /// input.
+    fn listing_in_with_input<S: AsRef<OsStr>>(
+        &self,
+        directory: &Path,
+        index: &Path,
+        arguments: &[S],
+        input: Vec<u8>,
+    ) -> Result<Vec<u8>, WorkspaceError> {
         let word = shown_arguments(arguments);
         let mut child = self
             .command_in(directory, index)
             .args(arguments)
-            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
         let stdin = child.stdin.take();
-        let input = nul_terminated(specs);
         // Written beside the read: a long answer must not block the input.
         std::thread::scope(|scope| {
             scope.spawn(|| {
