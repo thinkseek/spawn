@@ -357,28 +357,27 @@ mod tests {
         json!({
             "session_id": session, "agent_id": agent, "live": true,
             "execution_id": format!("exec_{agent}"), "observation": observation,
-            "observation_event_id": at % 1000, "observation_at_ms": at,
+            "observation_event_id": observation["based_on_seq"].as_i64().map(|seq| seq * 10),
+            "observation_at_ms": at,
             "evidence_seq": observation["based_on_seq"], "turn_ended": true,
             "episode": 3, "open_command": false, "told": [],
         })
     }
 
-    /// The live situation of 2026-11-06 in miniature: worker 87 on a
-    /// delivered task asks for attention; worker 85 is judged BLOCKED with
-    /// attention too, but its task is reported (a managed worker between
-    /// tasks is not news); worker 82's engine was lost and its resume
-    /// failed, which the supervisor was told; the supervisor sits at its
-    /// prompt, BLOCKED, needs_human 0.87; a disk record waits.
+    /// The live situation of 2026-11-06 in miniature. Worker 82's engine
+    /// was lost and worker 85 is judged BLOCKED with attention, but both
+    /// tasks are reported or accepted (a managed worker between tasks is not
+    /// news). Worker 87, on a delivered task, asks for attention. Worker 90's
+    /// resume failed, and a digest told the supervisor so. The supervisor
+    /// sits at its prompt, BLOCKED, needs_human 0.87, and a disk record waits.
     fn situation() -> (Vec<Facts>, Work, Vec<Escalation>) {
-        let mut lost = row(
-            "session_worker_objective_82",
-            "agent_worker_objective_82",
-            &judged("UNKNOWN", 0.1, false, 4),
-            NOW - 5 * 3_600_000,
-        );
-        lost["live"] = json!(false);
-        lost["end_cause"] = json!("lost");
-        lost["resumed_young"] = json!(1);
+        let lost = |session: &str, agent: &str, at: i64| {
+            let mut lost = row(session, agent, &judged("UNKNOWN", 0.1, false, 4), at);
+            lost["live"] = json!(false);
+            lost["end_cause"] = json!("lost");
+            lost["resumed_young"] = json!(1);
+            lost
+        };
         let mut supervisor = row(
             "session_supervisor",
             "agent_supervisor",
@@ -386,11 +385,15 @@ mod tests {
             NOW - 4 * 3_600_000,
         );
         supervisor["told"] = json!([
-            "session_worker_objective_82 resume-exec_agent_worker_objective_82",
+            "session_worker_objective_90 resume-exec_agent_worker_objective_90",
             "session_worker_gone resume-exec_1",
         ]);
         let rows = vec![
-            facts(&lost),
+            facts(&lost(
+                "session_worker_objective_82",
+                "agent_worker_objective_82",
+                NOW - 5 * 3_600_000,
+            )),
             facts(&row(
                 "session_worker_objective_85",
                 "agent_worker_objective_85",
@@ -403,20 +406,26 @@ mod tests {
                 &judged("BLOCKED", 0.9, true, 30),
                 NOW - 120_000,
             )),
+            facts(&lost(
+                "session_worker_objective_90",
+                "agent_worker_objective_90",
+                NOW - 3 * 3_600_000,
+            )),
             facts(&supervisor),
         ];
-        let task = |id: i64, worker: &str, state: &str| {
+        let task = |id: i64, state: &str| {
             json!({
                 "id": id, "mission_id": 4, "kind": "ephemeral",
-                "agent_id": format!("agent_worker_{worker}"),
-                "session_id": format!("session_worker_{worker}"),
+                "agent_id": format!("agent_worker_objective_{id}"),
+                "session_id": format!("session_worker_objective_{id}"),
                 "brief": "b", "state": state, "revisions": 0, "mission_text": "m",
             })
         };
         let work = Work {
             tasks: serde_json::from_value(json!([
-                task(85, "objective_85", "reported"),
-                task(87, "objective_87", "delivered"),
+                task(82, "accepted"),
+                task(85, "reported"),
+                task(87, "delivered"),
             ]))
             .expect("task rows"),
             ..Work::default()
@@ -453,8 +462,8 @@ mod tests {
             .collect();
         assert_eq!(
             tags,
-            ["session_worker_objective_87 120", "host disk-7"],
-            "worker 85 between tasks is not news; worker 82 was told"
+            ["session_worker_objective_87 300", "host disk-7"],
+            "workers 82 and 85 between tasks are not news; worker 90 was told"
         );
         assert_eq!(pending[0]["agent_id"], "agent_worker_objective_87");
         assert_eq!(pending[0]["why"], "attention");
@@ -472,14 +481,15 @@ mod tests {
         assert_eq!(plan.told.len(), 1, "{:?}", plan.told);
         assert_eq!(plan.told[0].why, Why::ResumeFailed);
         let told_at = json!({
-            "session_worker_objective_82 resume-exec_agent_worker_objective_82": NOW - 4_000_000,
+            "session_worker_objective_90 resume-exec_agent_worker_objective_90": NOW - 4_000_000,
         });
         let view = answer(&rows, &plan, &told_at, Value::Null, &[], NOW);
         let told = view["told"].as_array().expect("told");
         assert_eq!(told.len(), 1, "a told tag no longer current is not shown");
         assert_eq!(told[0]["told"], true);
         assert_eq!(told[0]["why"], "resume failed");
-        assert_eq!(told[0]["agent_id"], "agent_worker_objective_82");
+        assert_eq!(told[0]["agent_id"], "agent_worker_objective_90");
+        assert_eq!(told[0]["since_ms"], NOW - 3 * 3_600_000);
         assert_eq!(told[0]["told_at_ms"], NOW - 4_000_000);
         assert!(
             view["pending"]
@@ -500,14 +510,14 @@ mod tests {
         };
         format!(
             "{}\n",
-            json!({"type": kind, "timestamp": at, "message": message})
+            json!({"type": kind, "uuid": at, "timestamp": at, "message": message})
         )
     }
 
     #[test]
     fn a_supervisor_blocked_at_its_prompt_shows_its_question() {
         let (rows, work, host) = situation();
-        let supervisor = &rows[3];
+        let supervisor = &rows[4];
         let observation = asking(supervisor).expect("BLOCKED at its prompt, needs_human 0.87");
         // The question was asked a turn ago; a digest came since and its
         // reply only refers to it.
@@ -578,10 +588,10 @@ mod tests {
     #[test]
     fn a_supervisor_at_work_or_sure_of_itself_asks_nothing() {
         let (rows, ..) = situation();
-        let mut supervisor = rows[3].clone();
+        let mut supervisor = rows[4].clone();
         supervisor.turn_ended = false;
         assert!(asking(&supervisor).is_none(), "a new turn started");
-        let mut sure = rows[3].clone();
+        let mut sure = rows[4].clone();
         if let Some(observation) = sure.observation.as_mut() {
             observation.needs_human = Some(0.3);
         }
@@ -590,7 +600,7 @@ mod tests {
             observation.human_question = Some("Which region?".to_string());
         }
         assert!(asking(&sure).is_some(), "a HUMAN: line asks whatever the odds");
-        let mut working = rows[3].clone();
+        let mut working = rows[4].clone();
         if let Some(observation) = working.observation.as_mut() {
             observation.ambiguity = None;
         }
