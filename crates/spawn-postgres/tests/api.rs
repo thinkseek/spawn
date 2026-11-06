@@ -2087,6 +2087,169 @@ fn the_attention_view_reads_the_supervisors_transcript_and_latest_turn() {
     );
 }
 
+/// Which charter the supervisor's running native session holds is read
+/// from records: the start of the execution that first named the native
+/// session (a resume names it again, a handoff names a new one) with the
+/// charter hash that start recorded, and the dispatcher's charter inputs
+/// since that start, with their outcomes. Other sessions carry none.
+#[test]
+fn dispatch_facts_name_the_charter_the_supervisors_native_session_holds() {
+    let (store, _schema) = store("facts_charter");
+    let supervisor = Worker {
+        store: &store,
+        agent: AgentId::new("agent_supervisor").expect("valid agent"),
+        session: SessionId::new("session_supervisor").expect("valid session"),
+    };
+    let worker = Worker {
+        store: &store,
+        agent: AgentId::new("agent_worker_a").expect("valid agent"),
+        session: SessionId::new("session_worker_a").expect("valid session"),
+    };
+    let start = |key: &str, charter: Option<&str>| {
+        supervisor.send(
+            "spawn-liveness",
+            key,
+            CommandAction::Start {
+                engine: ENGINE.to_string(),
+                prompt: "charter".to_string(),
+                parent_session_id: None,
+                from: None,
+                model: None,
+                charter: charter.map(str::to_string),
+            },
+            Some(Outcome::Succeeded),
+        )
+    };
+    let native = |execution: &str, key: &str, id: &str| {
+        supervisor.event(
+            execution,
+            key,
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: id.to_string(),
+                transcript_path: None,
+                engine_version: None,
+            },
+        );
+    };
+    let charter_input = |key: &str, hash: &str, outcome: Outcome| {
+        supervisor.send(
+            "spawn-dispatch",
+            key,
+            CommandAction::Input {
+                text: "Spawn dispatcher: your charter changed".to_string(),
+                tags: vec![format!("charter {hash}")],
+            },
+            Some(outcome),
+        )
+    };
+    let charter = || {
+        let facts = store.dispatch_facts().expect("facts");
+        let rows = facts.as_array().expect("rows");
+        let row = |session: &str| {
+            rows.iter()
+                .find(|row| row["session_id"] == session)
+                .cloned()
+                .expect("a row of the session")
+        };
+        assert!(row("session_worker_a")["charter"].is_null(), "a worker's");
+        row("session_supervisor")["charter"].clone()
+    };
+    worker.event("exec_w", "w:message", EventKind::MessageReceived);
+
+    // The first native session, given charter `aa`.
+    let first = start("supervisor-start-first", Some("aa"));
+    supervisor.started("exec_1", first);
+    native("exec_1", "exec_1:native", "native-1");
+    assert_eq!(
+        charter(),
+        serde_json::json!({"start": first, "given": "aa", "inputs": []})
+    );
+
+    // A digest (no charter tag), a person's input with a charter-like
+    // tag, a charter input refused before typing, then one typed.
+    supervisor.send(
+        "spawn-dispatch",
+        "dispatch-digest-1",
+        CommandAction::Input {
+            text: "Spawn dispatcher: 1 update".to_string(),
+            tags: vec!["session_worker_a 7".to_string()],
+        },
+        Some(Outcome::Succeeded),
+    );
+    supervisor.send(
+        "human",
+        "human-1",
+        CommandAction::Input {
+            text: "hello".to_string(),
+            tags: vec!["charter zz".to_string()],
+        },
+        Some(Outcome::Succeeded),
+    );
+    let refused = charter_input(
+        "dispatch-charter-bb-over-1",
+        "bb",
+        Outcome::Failed("the pane does not accept input".to_string()),
+    );
+    let typed = charter_input(
+        "dispatch-charter-bb-over-1-retry-1",
+        "bb",
+        Outcome::Succeeded,
+    );
+    // A resume of the same native session (its version record names it
+    // again): the same start began it.
+    let resume = supervisor.send(
+        "spawn-liveness",
+        "supervisor-resume-1",
+        CommandAction::Resume {
+            prompt: None,
+            model: None,
+        },
+        Some(Outcome::Succeeded),
+    );
+    supervisor.ended("exec_1");
+    supervisor.started("exec_2", resume);
+    native("exec_2", "exec_2:native-version", "native-1");
+    let read = charter();
+    assert_eq!(read["start"], first, "{read}");
+    assert_eq!(read["given"], "aa");
+    let inputs = read["inputs"].as_array().expect("inputs");
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (input["id"].as_i64(), input["hash"].as_str()))
+            .collect::<Vec<_>>(),
+        vec![(Some(refused), Some("bb")), (Some(typed), Some("bb"))],
+        "the dispatcher's charter inputs only: {read}"
+    );
+    assert_eq!(inputs[0]["succeeded"], false);
+    assert_eq!(inputs[0]["error"], "the pane does not accept input");
+    assert_eq!(inputs[0]["key"], "dispatch-charter-bb-over-1");
+    assert_eq!(inputs[1]["succeeded"], true);
+    assert!(inputs[1]["finished_at_ms"].is_i64());
+
+    // A handoff: a new native session, given `bb` by its start; the inputs
+    // typed into the one before are not its own.
+    supervisor.ended("exec_2");
+    let handoff = start("supervisor-start-handoff", Some("bb"));
+    supervisor.started("exec_3", handoff);
+    native("exec_3", "exec_3:native", "native-3");
+    assert_eq!(
+        charter(),
+        serde_json::json!({"start": handoff, "given": "bb", "inputs": []})
+    );
+
+    // A start that recorded no charter (a person's, or one from before).
+    supervisor.ended("exec_3");
+    let plain = start("human-start", None);
+    supervisor.started("exec_4", plain);
+    native("exec_4", "exec_4:native", "native-4");
+    assert_eq!(
+        charter(),
+        serde_json::json!({"start": plain, "given": null, "inputs": []})
+    );
+}
+
 #[test]
 fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
     let (store, _schema) = store("facts_model");
