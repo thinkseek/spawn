@@ -1662,10 +1662,48 @@ fn main_commits(
 /// Main's commits a note lists at most; the record lists them all.
 const NOTE_COMMITS: usize = 40;
 
-/// The note an `incompatible` verdict sends back, from the record alone:
-/// what happened, the rejected merge's gate output (its tail, as `rejected`
-/// quotes it), main's commits since the head's base by their 12-digit prefix
-/// and subject, and what to do.
+/// Main's commits the note's first line names at most.
+const HEADLINE_COMMITS: usize = 5;
+
+/// Characters of the gate output's failure lines the note's first line
+/// quotes at most.
+const HEADLINE_FAILURE_CHARS: usize = 600;
+
+/// The lines of a gate's output that say what failed, for the first line of
+/// a note (a reader that shows one line shows the failure): those that name
+/// an error or a failure, the verdict line left out, up to three, joined;
+/// without any, the last line before the verdict. Only quoted: no verdict is
+/// decided by it.
+fn failure_lines(log: &str) -> String {
+    let lines: Vec<&str> = log
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('{'))
+        .collect();
+    let failing: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("error") || lower.contains("fail") || lower.contains("panicked")
+        })
+        .take(3)
+        .collect();
+    let quoted = if failing.is_empty() {
+        lines.last().copied().unwrap_or_default().to_string()
+    } else {
+        failing.join(" / ")
+    };
+    cut(&quoted, HEADLINE_FAILURE_CHARS).to_string()
+}
+
+/// The note an `incompatible` verdict sends back, from the record alone.
+/// Its first line says it all for a reader that shows one line: the work
+/// passes on its own base and fails merged with main, main's commits since
+/// that base by their 12-digit prefix, the rejection's reason and the gate
+/// output's failure lines. Then main's commits with their subjects, what to
+/// do (main is merged into the workspace with this revision), and the
+/// merge's gate output (its tail, as `rejected` quotes it).
 fn incompatible_note(
     reason: &str,
     log: &str,
@@ -1674,13 +1712,34 @@ fn incompatible_note(
     commits: &[(String, String)],
 ) -> String {
     let short = |hash: &str| hash.chars().take(12).collect::<String>();
+    let mut named: Vec<String> = commits
+        .iter()
+        .take(HEADLINE_COMMITS)
+        .map(|(hash, _)| short(hash))
+        .collect();
+    if commits.len() > HEADLINE_COMMITS {
+        named.push(format!("{} more", commits.len() - HEADLINE_COMMITS));
+    }
+    let failure = failure_lines(log);
     let mut note = format!(
-        "Main moved under this work. It passes the gate on its own base ({}), but not merged \
-         with the source's main ({}): {reason}. The merge was clean as text; what main's \
-         commits changed breaks it.\n\nMain's commits since your work's base, oldest first \
-         (adapt the work to them):\n",
+        "Main moved under this work: it passes the gate on its own base {} but not merged with \
+         main {}, which took in {} since: {reason}{}",
         short(head_base),
         short(main),
+        if named.is_empty() {
+            "nothing".to_string()
+        } else {
+            named.join(", ")
+        },
+        if failure.is_empty() {
+            String::new()
+        } else {
+            format!(": {failure}")
+        },
+    );
+    note.push_str(
+        "\n\nThe merge was clean as text; what main's commits changed breaks it. Main's \
+         commits since your work's base, oldest first (adapt the work to them):\n",
     );
     for (hash, subject) in commits.iter().take(NOTE_COMMITS) {
         let _ = writeln!(note, "- {} {subject}", short(hash));
@@ -2923,6 +2982,11 @@ mod tests {
             "{record}"
         );
         let note = record["note"].as_str().expect("a note");
+        let first = note.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("missing field `c` in initializer of `Facts`") && first.contains(&m1[..12]),
+            "the first line says it all: {first}"
+        );
         for wanted in [
             "error[E0063]: missing field `c` in initializer of `Facts`",
             &m1[..12],
@@ -3018,6 +3082,10 @@ mod tests {
             &commits,
         );
         assert!(note.contains("landing 0\n"), "{note}");
+        let first = note.lines().next().unwrap_or_default();
+        assert!(first.contains(&format!("{:012x}", 4)), "{first}");
+        assert!(!first.contains(&format!("{:012x}", 5)), "{first}");
+        assert!(first.contains("38 more") && first.ends_with(": error: x"), "{first}");
         assert!(!note.contains(&format!("landing {}\n", super::NOTE_COMMITS)), "{note}");
         assert!(note.contains("and 3 more"), "{note}");
         assert!(note.ends_with("error: x\n"), "{note}");
