@@ -3843,9 +3843,20 @@ mod database_tests {
             base.join("host"),
             gate_path,
             test_gate_env(),
+            room_to_spare(),
             super::DEFAULT_GATES,
         );
         (base, source, scenarios, integrator)
+    }
+
+    /// The checks before a gate with their defaults, on a host with room to
+    /// spare: whatever this test host has, the stub gates run.
+    fn room_to_spare() -> crate::gate::Room {
+        crate::gate::Room::from_env(|_| None).measured_by(
+            |_| Some(u64::MAX),
+            || Some(u64::MAX),
+            |_| Ok(()),
+        )
     }
 
     /// Main moves on the source by one commit, pushed from a clone; the
