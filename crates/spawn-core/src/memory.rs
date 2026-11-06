@@ -373,13 +373,29 @@ impl CommandQueue for MemoryStore {
         let now = self.clock.now();
         let candidate = {
             let commands = &state.commands;
+            // An input that waits for its turn holds nothing behind it.
+            let waiting = |id: CommandId| {
+                state.events.iter().any(|record| {
+                    record.event.source == Source::Bridge
+                        && matches!(
+                            record.event.kind,
+                            EventKind::CommandStepped {
+                                command_id,
+                                step: crate::event::CommandStep::Waiting,
+                                ..
+                            } if command_id == id
+                        )
+                })
+            };
             commands
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| !row.finished)
                 .filter(|(index, row)| {
                     !commands[..*index].iter().any(|older| {
-                        older.submission.session_id == row.submission.session_id && !older.finished
+                        older.submission.session_id == row.submission.session_id
+                            && !older.finished
+                            && !waiting(older.id)
                     })
                 })
                 .filter(|(_, row)| row.lease.as_ref().is_none_or(|lease| lease.expires <= now))
@@ -394,6 +410,7 @@ impl CommandQueue for MemoryStore {
             .as_ref()
             .map_or(1, |lease| lease.attempt + 1);
         let submission = state.commands[index].submission.clone();
+        let principal = state.commands[index].principal.as_str().to_string();
         let id = state.commands[index].id;
         state.commands[index].lease = Some(Lease {
             attempt,
@@ -406,8 +423,24 @@ impl CommandQueue for MemoryStore {
             attempt,
             agent_id: submission.agent_id,
             session_id: submission.session_id,
+            principal,
             action,
         }))
+    }
+
+    fn release(&self, claimed: &Claimed, retry_in: Duration) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        let now = self.clock.now();
+        if let Some(lease) = state
+            .commands
+            .iter_mut()
+            .find(|row| row.id == claimed.command_id && !row.finished)
+            .and_then(|row| row.lease.as_mut())
+            .filter(|lease| lease.attempt == claimed.attempt)
+        {
+            lease.expires = now.plus(retry_in);
+        }
+        Ok(())
     }
 
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError> {
