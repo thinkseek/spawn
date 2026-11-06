@@ -101,7 +101,8 @@ Claude 以 `--ax-screen-reader` 运行，屏幕文本是唯一可靠的完成信
 | --- | --- |
 | `spawn_append(...)` | 追加事件，返回 id、seq、时间、是否插入 |
 | `spawn_submit(...)` | 幂等提交命令并写 `command.accepted` |
-| `spawn_claim(worker, ttl_ms)` | 领取命令，单会话串行，过期租约 attempt+1 |
+| `spawn_claim(worker, ttl_ms)` | 领取命令，单会话串行（记了 `waiting` 的输入不挡后面的命令），过期租约 attempt+1 |
+| `spawn_release(command, attempt, ms)` | 不结束命令，租约 `ms` 毫秒后到期（等轮次的输入用） |
 | `spawn_finish(...)` | 结束命令，返回 `done`、`already`、`stale`、`missing` |
 | `agent_state` | 每会话最新 observation |
 | `agent_timeline` | 会话事件时间线 |

@@ -268,8 +268,8 @@ it, on the same ladder.
   measured from (the control record's id; for `activity` the `session_seq`
   of the latest fact, or the delivery record's id when no fact came after
   it): `told` sends it once, and a step that moved and stalled anew has a
-  new record and a new tag. A failed retry, a stale verdict, a nudge or a
-  judgement moves no step. Every age is on the database's clock
+  new record and a new tag. A failed retry, a stale verdict, a nudge, an
+  input waiting for its turn or a judgement moves no step. Every age is on the database's clock
   (`spawn_now_ms()` against the records' times); nothing is inferred from
   another loop's timing or absence; a restarted loop computes the same
   stalls and tags. The stall layer acts on nothing: Spawn's own recoveries
@@ -290,6 +290,20 @@ it, on the same ladder.
 - **Human**: the attention queue in the UI lists only what the supervisor
   escalated or could not resolve. Each human action is a command with
   principal `human`; it is the event the whole system tries to make rarer.
+- **Inputs to a busy session wait for its turn.** A person's or the
+  supervisor's input (`spawn submit`, any principal but `spawn-dispatch`,
+  `spawn-integrate` and `spawn-liveness`) that reaches a pane not ready is
+  not refused: the Bridge records it `waiting` (`command.step`, once) and
+  types it on the next Ready reading, the session's waiting inputs oldest
+  first, each on a Ready reading of its own, at most once. It holds no stop,
+  discard or resume behind it; if the execution ends first it fails, as
+  stopped or with the end's cause, and a resume does not revive it. Spawn's
+  own loops keep their contract: their inputs are refused at once while the
+  pane is not ready (and behind a waiting input) and they retry on their
+  own, as the nudge and delivery retries above describe. The wait has no
+  timeout: a stall shows on the session's task like any other, and the
+  `waiting` record is no activity (it moves no stall step and does not make
+  a judgement look stale).
 - **Authority** comes from grants and DB roles. The dispatcher and the
   supervisor submit as their own principals and only for worker sessions.
   Neither can write observations or runtime events.
@@ -745,7 +759,7 @@ record of what was judged (§14 of design.md).
   --revision R`, which the supervisor's digest gives; without it, a human's
   review takes the report as it is now). The checked functions refuse a
   verdict on a revision the task has left, and the fold applies none: a
-  45-minute gate run on revision 0 never lands, or sends back, revision 1.
+  gate run on revision 0 never lands, or sends back, revision 1.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). A mission
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
@@ -782,6 +796,9 @@ record of what was judged (§14 of design.md).
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
+<<<<<<< 13668eb67b550a978e5eeed294e51646ef0c2557
+  3. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
+=======
   3. measures the host before the gate starts: **the host's room is
      checked before a gate, not discovered by its crash.** For this
      judging's task only (one that got a gate slot; a task that waits is
@@ -814,6 +831,7 @@ record of what was judged (§14 of design.md).
      any candidate runs. The decision rests on measures taken at the
      judging, recorded with their thresholds (design.md §14);
   4. runs the gate on C, with a 45-minute wall clock. When the gate
+>>>>>>> b6c4f24d2d4a341498012322571145be309dce56
      rejects C and C is a real merge (the pushed head does not contain
      `main`, so C's tree is not the head's), it then judges the head alone
      before recording anything: the same gate, scenarios and task scenario,

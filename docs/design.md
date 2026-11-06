@@ -124,7 +124,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 | 命令 | 行为 |
 | --- | --- |
 | `Start{engine,prompt,parent_session_id,from,model}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ 干净时把 `main` 合入分支（`merge_main_clean`，冲突时分支不动并记 `merge.conflicted`）→ mount，写 `command.step{mounted}` → 写 `execution.started`（新分支带 fork；这之前的追加失败时卸载并记 `mount_released`）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
-| `Input{text}` | 屏尾非 Ready 直接拒绝，Ready 才 `send-keys`；键入前写 `command.step{typing}`，成功后写 `{typed}` |
+| `Input{text}` | Ready 才 `send-keys`；键入前写 `command.step{typing}`，成功后写 `{typed}`。屏尾非 Ready（或终端还活着、抓屏一直失败）时：人和 supervisor 的输入等轮次——写一次 `command.step{waiting}`（键 `<command>:waiting`），命令不结束，等下一次 Ready 读数再键入；循环自己的输入（principal 为 `spawn-dispatch`、`spawn-integrate`、`spawn-liveness`）照旧立即拒绝（`pane state <state> does not accept input`），排在等待中的输入之后的也立即拒绝。会话没有执行时立即失败 |
 | `Stop` | 走结束流程，原因记为 `Stopped`；最后一次 checkpoint 失败时工作区不卸载 |
 | `Discard` | 同 `Stop`，但最后一次 checkpoint 失败也卸载工作区，未提交的内容丢失；只由人或 supervisor 在 `execution.end_stalled` 之后发出 |
 | `Resume{prompt,model}` | 复用最近的原生会话 id，新 Execution，逻辑 Session 不变 |
@@ -147,7 +147,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 之后、`unmount` 之前写 `execution.unmounting`；恢复出的结束若已有这条记录，就跳过 checkpoint，只再 terminate、unmount（工作区不在不算失败）并写 `execution.ended`。
 
-命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在则失败（下个 tick 按 `Lost` 结束），提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败（提示词可能已到引擎，所以不按 discard 结束：最后一次 checkpoint 失败时工作区不卸载，结束像 `Stop` 一样留待下个 tick 重试；键入失败时同理，只有日志表明从未开始键入的启动才按 discard 卸载）；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次）。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
+命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在则失败（下个 tick 按 `Lost` 结束），提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败（提示词可能已到引擎，所以不按 discard 结束：最后一次 checkpoint 失败时工作区不卸载，结束像 `Stop` 一样留待下个 tick 重试；键入失败时同理，只有日志表明从未开始键入的启动才按 discard 卸载）；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次，错误含 `MAY_HAVE_TYPED`）。等待中的输入也是这样：等待记在日志里（`waiting`），重启后的 Bridge 接着等；一次 Ready 读数只给一次键入用，下一条输入要等上一条 `typed` 之后的新 Ready 读数（或那次键入开始的轮次已结束）；同一会话的等待输入按 id 从旧到新键入，前面还有在等的就不键入后面的。等待的输入不挡 `Stop`、`Discard`、`Resume`：`spawn_claim` 跳过有 Bridge `waiting` 记录的未完成命令，把它后面的命令发出来（后面的输入也会发出来，以便记下自己的 `waiting`）；没有 `waiting` 记录的未完成命令仍挡住后面的一切。等待本身没有超时：Bridge 在本 tick 的领取循环结束前一直拿着它的租约，然后用 `spawn_release` 放开，`input_wait_retry`（1 秒）后可再领。执行结束时（同一 tick 或下一 tick），它的等待输入失败：`Stop`/`Discard` 结束的报 “the session was stopped before the input was typed”，其他结束报 “the session's execution ended (<cause>) before the input was typed”；`Resume` 不会让它们复活。`waiting` 不算活动：停滞层（`stall_facts` 的会话最新事实）和调度器的判定新鲜度（`dispatch_facts` 的 `evidence_seq`）都不计它，Observer 把它当普通命令步骤，之后的判定覆盖它。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
 
 结束的三个来源：
 
@@ -254,10 +254,11 @@ Observer 每次 tick：
 | `spawn_now_ms()` | `bigint` | 单一时间源 |
 | `spawn_append(...)` | `out_id`、`out_seq`、`out_at`、`out_inserted` | 事务内取序号并插入，`pg_advisory_xact_lock(1399957335)` 串行化；会话最近一次 `execution.started` 之后还没有 Bridge 写的同一执行的 `execution.ended` 时，再一条 `execution.started` 被拒（`23P01`，`StoreError::Rejected`），同键重放照旧返回既有记录 |
 | `spawn_submit(...)` | `out_id` | 幂等插入并写 `command.accepted` |
-| `spawn_claim(worker, ttl_ms)` | `out_id`、`out_attempt`、`out_agent`、`out_session`、`out_action` | `for update skip locked`，单会话串行，过期租约 attempt+1 |
+| `spawn_claim(worker, ttl_ms)` | `out_id`、`out_attempt`、`out_agent`、`out_session`、`out_principal`、`out_action` | `for update skip locked`，单会话串行（有 Bridge `waiting` 记录的未完成输入不挡后面的命令），过期租约 attempt+1 |
+| `spawn_release(command, attempt, ms)` | `boolean` | 不结束命令，把租约改为 `ms` 毫秒后到期；旧 attempt 或已结束的命令不动 |
 | `spawn_finish(command, attempt, succeeded, error)` | `done`、`already`、`stale`、`missing` | 旧 attempt 结束被拒 |
 
-权限：视图只归 owner，public 只有 `agent_commands` 的 insert（不能 select，连 `id` 列也不能，否则能列出所有命令 id；提交方从 `spawn_gateway_submit(agent, session, key, action)` 拿回自己那条命令的 id）；其他角色读 `security definer` 函数 `spawn_read_<视图>()`（state、status、tasks、freshness）与 `spawn_read_<视图>(session_id)`（timeline、judgements），按 `spawn_grants` 过滤 `session_user`，固定 `search_path`；`spawn_events`、`spawn_commands`、`spawn_grants`、`spawn_session_state` 撤销 public 全部权限；四个写函数撤销 public 执行权。`spawn_gateway_insert` 固定 `search_path = <schema>, pg_temp`，调用方无法用临时表替换 `spawn_grants`。
+权限：视图只归 owner，public 只有 `agent_commands` 的 insert（不能 select，连 `id` 列也不能，否则能列出所有命令 id；提交方从 `spawn_gateway_submit(agent, session, key, action)` 拿回自己那条命令的 id）；其他角色读 `security definer` 函数 `spawn_read_<视图>()`（state、status、tasks、freshness）与 `spawn_read_<视图>(session_id)`（timeline、judgements），按 `spawn_grants` 过滤 `session_user`，固定 `search_path`；`spawn_events`、`spawn_commands`、`spawn_grants`、`spawn_session_state` 撤销 public 全部权限；写函数（含 `spawn_release`）撤销 public 执行权。`spawn_gateway_insert` 固定 `search_path = <schema>, pg_temp`，调用方无法用临时表替换 `spawn_grants`。
 
 投影：`spawn_session_state` 每会话一行（最后序号、最后 id、事件数、最新 observation），由 `spawn_append` 在同一事务内更新，`session_seq` 守卫：行恰好落后一个事件时步进，否则从日志重折；迁移持 append 锁重折不一致的会话。会话归属取首个事件的 agent。
 

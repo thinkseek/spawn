@@ -264,3 +264,59 @@ fn a_gated_missions_verdicts_and_its_halt_are_read_from_their_records() {
     assert_eq!(halt["tasks"], json!([task_id]));
     assert_eq!(task(&facts, task_id)["halted"], true);
 }
+
+/// An input waiting for the session's turn records `command.step`
+/// `waiting`: no activity, so it is not the session's latest fact and does
+/// not move the delivered task's `activity` step.
+#[test]
+fn a_waiting_input_does_not_move_the_sessions_latest_fact() {
+    let (store, _schema) = store("stall_waiting");
+    let mission = store
+        .mission_add("Stalls", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let task_id = store
+        .task_assign(mission, "ephemeral", "w", "first", "default")
+        .expect("assign");
+    store.task_delivered(task_id, 1).expect("delivered");
+    let facts = store.stall_facts().expect("stall facts");
+    let session = task(&facts, task_id)["session_id"]
+        .as_str()
+        .expect("session")
+        .to_string();
+    append(
+        &store,
+        &session,
+        "tool-1",
+        Source::Claude,
+        EventKind::ToolStarted {
+            tool_name: "Bash".to_string(),
+            tool_use_id: "toolu_1".to_string(),
+        },
+    );
+    let latest = |facts: &Value| {
+        facts["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .find(|latest| latest["session_id"] == session.as_str())
+            .cloned()
+            .expect("the delivered task's session")
+    };
+    let before = latest(&store.stall_facts().expect("stall facts"));
+    assert_eq!(before["event_name"], "tool.started");
+    append(
+        &store,
+        &session,
+        "cmd_2:waiting",
+        Source::Bridge,
+        EventKind::CommandStepped {
+            command_id: spawn_core::id::CommandId(2),
+            step: spawn_core::event::CommandStep::Waiting,
+            workspace: None,
+        },
+    );
+    let after = latest(&store.stall_facts().expect("stall facts"));
+    assert_eq!(after["event_name"], "tool.started", "{after:#}");
+    assert_eq!(after["seq"], before["seq"], "the activity tag is unchanged");
+    assert_eq!(after["at_ms"], before["at_ms"]);
+}
