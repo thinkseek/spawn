@@ -517,6 +517,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 parent_session_id: None,
                 from: None,
                 model,
+                charter: None,
             },
         )),
     }

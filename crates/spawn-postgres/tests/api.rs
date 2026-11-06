@@ -62,6 +62,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     }
 }
