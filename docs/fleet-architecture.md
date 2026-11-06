@@ -302,10 +302,18 @@ it, on the same ladder.
   BLOCKED or WAITING with `needs_human` at least 0.5 (or with a `HUMAN:` line),
   in its own words from its transcript, with when it was asked and its last
   `HUMAN:` line not answered since; then the escalations not yet told to the
-  supervisor; then those its digests told it that still hold, with when they
-  were told. A managed worker between tasks is not in it, since the
-  dispatcher does not escalate it. Each item carries its digest heading, its
-  line, its agent and its age. Each human action is a command with
+  supervisor; then those its digests told it whose condition still holds
+  (a worker's state, a stall, a path still low on disk, a gate still without
+  room), with when they were told. News (a disk recovery, an approval, a
+  human's message, host faults at the gate) is resolved by being told, in
+  the plan itself (`Why::is_news`), so the digest and the queue agree. A
+  managed worker between tasks is not in it, since the dispatcher does not
+  escalate it. Each item carries its digest heading, its line, its agent and
+  its age. This queue is the UI's only definition of "needs a human": the
+  sidebar's count is its count, and an agent is marked when it has an item
+  in it (pending or told and unresolved) or is the supervisor asking a
+  question (`web/src/attention.ts`, `needsHuman`). A judge's `attention`
+  flag is its opinion, shown with the judgement in the agent detail. Each human action is a command with
   principal `human`; it is the event the whole system tries to make rarer.
 - **Inputs to a busy session wait for its turn.** A person's or the
   supervisor's input (`spawn submit`, any principal but `spawn-dispatch`,
@@ -524,9 +532,9 @@ decisions per agent-hour over the last 24 h) are computed from the log by
 | --- | --- |
 | Attention queue (top of the board) | The supervisor's open question in full; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved, each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code) |
 | Always-on agents (below the queue) | The supervisor, then the residents, pinned live or not: liveness, state and for how long, last activity, uptime, the task each holds |
-| Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor), judgements, the decision ladder and human decisions per agent-hour |
-| Fleet board | The rest of the fleet in groups: on a task (needs a human first, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
-| Agent detail | Live terminal; the Jev panel (distribution, needs_human, stuck, evidence, rules-vs-Jev); state timeline; event timeline |
+| Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor; memory available now against a 4 GiB warning line, of the total; each gated mission's waits for gate room: the run's task, how many `no_room` outcomes since when, whether it was escalated; a value the server could not read shows as unread, never guessed), judgements, the decision ladder and human decisions per agent-hour |
+| Fleet board | The rest of the fleet in groups: on a task (needs a human first, by the attention queue, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
+| Agent detail | Live terminal; the Jev panel (distribution, needs_human, stuck, the judge's attention flag and its reason, evidence, rules-vs-Jev); state timeline; event timeline |
 | Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
