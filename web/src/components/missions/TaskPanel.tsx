@@ -6,6 +6,7 @@ import { clockTime, formatDuration, relativeTime, stageDuration } from "../../fo
 import { PHASE_LABEL } from "../../missionTimeline";
 import type { Lane, TaskBar } from "../../missionTimeline";
 import { stageStep } from "../../missions";
+import { taskTitle } from "../../ordering";
 import { VerdictBadge } from "../rsi/Phase";
 import { cx } from "../ui";
 import { Markdown } from "./Markdown";
@@ -64,6 +65,11 @@ export function TaskPanel({
               </span>
             )}
           </h3>
+          {taskTitle(task, { missionName: lane.name }) && (
+            <p className="mt-1 line-clamp-2 text-label text-foreground">
+              {taskTitle(task, { missionName: lane.name })}
+            </p>
+          )}
           <div className="mt-1 flex min-w-0 items-center gap-2">
             <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
           </div>
