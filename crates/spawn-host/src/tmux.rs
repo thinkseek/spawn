@@ -484,17 +484,16 @@ impl TerminalHost for TmuxHost {
         terminal: &TerminalName,
         _workspace: &WorkspaceId,
     ) -> Result<Runner, TerminalError> {
-        let run = self.run_within(
-            &[
-                "list-panes".to_string(),
-                "-t".to_string(),
-                Self::pane(terminal),
-                "-F".to_string(),
-                "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}"
-                    .to_string(),
-            ],
-            CAPTURE_LIMIT,
-        )?;
+        // One tmux call, as `has-session` was: what the Bridge asks of every
+        // live execution each pass costs no more than before.
+        let run = self.run(&[
+            "list-panes".to_string(),
+            "-t".to_string(),
+            Self::pane(terminal),
+            "-F".to_string(),
+            "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}"
+                .to_string(),
+        ])?;
         match run.code {
             Some(0) => {}
             Some(1) if gone(&run.stderr) => return Ok(Runner::Gone),
