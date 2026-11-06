@@ -32,7 +32,12 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(directory)
-        .args(["-c", "user.name=spawn-test", "-c", "user.email=spawn@localhost"])
+        .args([
+            "-c",
+            "user.name=spawn-test",
+            "-c",
+            "user.email=spawn@localhost",
+        ])
         .args(arguments)
         .output()
         .expect("git is installed");

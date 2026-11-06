@@ -1150,7 +1150,10 @@ impl Judge {
             if !pushed_again && let Some(checkpoint) = checkpoint.as_deref() {
                 pushed_again = true;
                 if let Some(again) = sources::push_recorded(mirror, source, agent, checkpoint) {
-                    println!("integrate: task {}: {checkpoint} pushed again: {again:?}", task.id);
+                    println!(
+                        "integrate: task {}: {checkpoint} pushed again: {again:?}",
+                        task.id
+                    );
                 }
             }
             std::thread::sleep(PUSH_POLL);

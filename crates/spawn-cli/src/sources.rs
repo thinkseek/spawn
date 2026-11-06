@@ -42,9 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{
-    BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore,
-};
+use spawn_core::port::{BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
@@ -858,7 +856,14 @@ mod tests {
         // retried and not overwritten.
         let path = mirror.to_string_lossy().to_string();
         let main = git(&["--git-dir", &path, "rev-parse", "refs/heads/main"]).expect("main");
-        git(&["--git-dir", &path, "update-ref", "refs/heads/agent_x", &main]).expect("rewrite");
+        git(&[
+            "--git-dir",
+            &path,
+            "update-ref",
+            "refs/heads/agent_x",
+            &main,
+        ])
+        .expect("rewrite");
         checkpoint(&host, "agent_x", "three.txt");
         assert!(matches!(
             push_branch(&mirror, &source, "agent_x"),

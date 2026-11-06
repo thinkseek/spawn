@@ -97,7 +97,6 @@ pub(crate) fn push_branch(mirror: &Path, source: &str, branch: &str) -> Pushed {
     Pushed::Failed(stderr)
 }
 
-
 type PushFn = dyn Fn(&Path, &str, &str) -> Pushed + Send + Sync;
 
 /// A branch of one mirror.
