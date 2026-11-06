@@ -934,6 +934,9 @@ impl WorkspaceStore for GitWorkspace {
         }
         // A fresh export is the branch head: nothing stale is left.
         self.clear_stale(branch.as_str());
+        // `.spawn/` is never committed: main's copies for an open conflict
+        // markers cannot show come back from their record.
+        self.restore_main_copies(branch.as_str(), &directory);
 
         WorkspaceId::new(format!("{branch}:{}", directory.display()))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
@@ -1019,7 +1022,22 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
-        self.merge_main(workspace)
+        self.merge_main(workspace, &|| Ok(()))
+    }
+
+    fn merge_base_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BaseMerge, WorkspaceError> {
+        self.merge_main(workspace, ready)
+    }
+
+    /// The branch's lock, which every merge into the workspace takes.
+    fn hold(&self, workspace: &WorkspaceId) -> Option<Hold> {
+        self.lock_branch(workspace.sandbox())
+            .ok()
+            .map(|lock| Box::new(lock) as Hold)
     }
 
     fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
@@ -1127,8 +1145,19 @@ impl GitWorkspace {
     /// the second parent of the checkpoint that has them resolved (the way
     /// `git merge` leaves `MERGE_HEAD`). Until then no newer `main` is merged:
     /// markers never stack. A conflict markers cannot show (modify/delete,
-    /// renames, binary files) changes nothing.
-    fn merge_main(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+    /// renames, binary files) changes nothing but main's version of each
+    /// such file, copied to [`MAIN_COPIES`] and recorded beside the
+    /// workspace so every mount puts the copies back
+    /// ([`Self::restore_main_copies`]).
+    ///
+    /// Nothing is written unless `ready` agrees, asked under the lock right
+    /// before the first write ([`WorkspaceStore::merge_base_when`]); a
+    /// refusal is [`MERGE_WAITS`] with its reason, and changes nothing.
+    fn merge_main(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BaseMerge, WorkspaceError> {
         let branch = workspace.sandbox().to_string();
         let directory = self.checked_path(workspace)?;
         // The integrator commits this workspace too: no checkpoint reads the
@@ -1149,6 +1178,7 @@ impl GitWorkspace {
         let head = self.commit_id_of(&reference)?;
         let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
         if self.is_ancestor(&main, &head)? {
+            self.clear_main_copies(&branch);
             return Ok(BaseMerge::Current);
         }
         // No shared history (a default repository reseeded under an older
@@ -1174,6 +1204,14 @@ impl GitWorkspace {
             .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
         let (merged, files, kinds) = merge_tree_output(&output.stdout);
         let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
+        // The last moment before anything is written: an agent that is not
+        // idle keeps its workspace as it is, and the merge waits.
+        if matches!(output.status.code(), Some(0 | 1)) {
+            ready().map_err(|why| WorkspaceError::Refused {
+                code: MERGE_WAITS.to_string(),
+                message: why,
+            })?;
+        }
         match output.status.code() {
             Some(0) => {}
             Some(1) => {
@@ -1189,6 +1227,9 @@ impl GitWorkspace {
                         let _ = self.update_directory(&branch, &directory, &merged, &head_tree);
                         return Err(error);
                     }
+                    self.clear_main_copies(&branch);
+                } else {
+                    self.copy_mains_versions(&branch, &directory, &main, &files)?;
                 }
                 return Ok(BaseMerge::Conflicted {
                     files: shown_paths(&files),
@@ -1220,6 +1261,7 @@ impl GitWorkspace {
         if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
             return Err(self.follow_moved_branch(&branch, &directory, &merged, &error));
         }
+        self.clear_main_copies(&branch);
         Ok(BaseMerge::Merged {
             commit: CommitId::new(commit)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
