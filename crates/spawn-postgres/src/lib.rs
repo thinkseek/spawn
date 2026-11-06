@@ -535,7 +535,10 @@ pub fn parallel_query_probe(url: &str, limit: std::time::Duration) -> Result<(),
         error,
     };
     let mut config: postgres::Config = url.parse().map_err(|error: postgres::Error| {
-        failure("read SPAWN_TEST_DATABASE_URL as a postgres URL", probe_error(&error))
+        failure(
+            "read SPAWN_TEST_DATABASE_URL as a postgres URL",
+            probe_error(&error),
+        )
     })?;
     config.connect_timeout(limit);
     let (sender, receiver) = std::sync::mpsc::channel::<Result<bool, String>>();
