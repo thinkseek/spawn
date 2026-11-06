@@ -81,7 +81,9 @@ pub(crate) fn push_branch(mirror: &Path, source: &str, branch: &str) -> Pushed {
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     // `--porcelain` flags a ref that was not pushed with `!`, and its
-    // summary is never translated. `[rejected]` is git's own refusal:
+    // summary is never translated; git runs in the C locale besides
+    // (`controller_git`), so the stderr quoted with it is git's own English
+    // on any host. `[rejected]` is git's own refusal:
     // `spawn/<agent>` is not an ancestor of the head (a rewritten branch).
     // What the receiving side refused or never answered (`[remote
     // rejected]`, `[remote failure]`: a ref lock another push held, a hook)
@@ -343,14 +345,29 @@ impl Pusher {
         self.shared.lock().threads
     }
 
-    /// Whether `branch` of `mirror` waits for a push (a new one, or a
-    /// failed one's retry).
+    /// Whether `branch` of `mirror` is still owed a push: one waits (a new
+    /// one, or a failed one's retry) or one is under way. A retry the
+    /// background thread is making has left the queue but is not done: it
+    /// may fail and wait again.
     #[cfg(test)]
     pub(crate) fn waiting(&self, mirror: &Path, branch: &str) -> bool {
         self.shared
             .lock()
-            .dirty
-            .contains_key(&(mirror.to_path_buf(), branch.to_string()))
+            .owes(&(mirror.to_path_buf(), branch.to_string()))
+    }
+
+    /// Wait until `branch` of `mirror` is owed no push ([`Self::waiting`]):
+    /// its last push is done or refused. Woken by the end of every push,
+    /// never by a clock; `false` when that has not happened within `limit`.
+    #[cfg(test)]
+    pub(crate) fn settled(&self, mirror: &Path, branch: &str, limit: Duration) -> bool {
+        let key = (mirror.to_path_buf(), branch.to_string());
+        let (state, _) = self
+            .shared
+            .wake
+            .wait_timeout_while(self.shared.lock(), limit, |state| state.owes(&key))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.owes(&key)
     }
 
     /// Push `branch`'s head now, on this thread, after a push of it already
