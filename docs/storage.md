@@ -464,8 +464,12 @@ state and wedges nothing:
   floor_bytes}`, and once as `state: "recovered"` when it is back 1 GiB above
   the threshold (so a path at the threshold does not flap). The latest
   record per path is read back from the log on start, so a restart records
-  nothing twice. Each record of the last day reaches the supervisor's digest
-  once ("disk space on this host"); the fleet view's health carries `disk`:
+  nothing twice. A path's latest record reaches the supervisor's digest
+  once: a `low` one ("disk space on this host") is a condition, kept in the
+  dispatcher's plan (and the attention queue) as told and unresolved until
+  the path's `recovered` record replaces it, however long that takes; a
+  `recovered` one of the last day ("disk space back on this host") is news,
+  resolved by being told. The fleet view's health carries `disk`:
   per path its free space now (read by `spawn serve`), the thresholds and
   its latest record, and the health strip shows it. A failure to read or
   record is a line in the loop's log, never a failed pass.

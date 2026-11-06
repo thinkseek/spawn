@@ -13,6 +13,12 @@ import { StateDot, stateLabel } from "./StateDot";
 import { useStoredChoice } from "./ViewToggle";
 import { Ago, FOCUS_RING_INSET, GroupHeader, MiddleId, cx } from "./ui";
 
+export interface HumanCount {
+  count: number | null;
+  /** Why /api/attention could not be read, when it could not. */
+  error: string | null;
+}
+
 interface SidebarProps {
   sessions: OverviewSession[];
   /** The fleet's agents, grouped as the Fleet board groups them; null until
@@ -23,8 +29,9 @@ interface SidebarProps {
   view: View;
   rsi: RsiSummary | null;
   error: string | null;
-  /** Agents that need a human, from the fleet poll. */
-  attention: number;
+  /** What needs a human, by the dispatcher's view (attention.ts
+   * `needsHuman`): the queue's count, null while it is unknown, with why. */
+  attention: HumanCount;
   onShowFleet: () => void;
   onShowMissions: () => void;
   onShowRsi: () => void;
@@ -76,7 +83,7 @@ export function Sidebar({
           onClick={onShowFleet}
           icon={<LayoutGrid size={15} />}
           label="Fleet"
-          trailing={<AttentionCount count={attention} />}
+          trailing={<AttentionCount {...attention} />}
         />
         <NavItem
           active={view === "missions"}
@@ -359,11 +366,24 @@ function NavItem({
   );
 }
 
-function AttentionCount({ count }: { count: number }) {
+/** The "Needs a human" queue's count (the dispatcher's view); a muted "?"
+ * when it could not be read, never a count from elsewhere. */
+function AttentionCount({ count, error }: HumanCount) {
+  if (count === null) {
+    if (!error) return null;
+    return (
+      <span
+        title={`Who needs a human is unknown: /api/attention: ${error}`}
+        className="tnum rounded bg-muted px-1.5 py-px text-micro font-medium text-faint-foreground"
+      >
+        ?
+      </span>
+    );
+  }
   if (count <= 0) return null;
   return (
     <span
-      title={`${count} agent${count === 1 ? "" : "s"} need a human`}
+      title={`${count} thing${count === 1 ? "" : "s"} in "Needs a human" (the dispatcher's queue)`}
       className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning"
     >
       {count}
@@ -420,7 +440,7 @@ export function MobileNav({
           >
             {icon}
             {label}
-            {id === "fleet" && <AttentionCount count={attention} />}
+            {id === "fleet" && <AttentionCount {...attention} />}
           </button>
         ))}
       </div>

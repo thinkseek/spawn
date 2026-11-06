@@ -5446,10 +5446,45 @@ mod database_tests {
             .expect("the mission")
     }
 
+    /// The fleet view's gate room (`fleet_health`) shows `mission`'s run of
+    /// `no_room` as the mission row folds it.
+    fn assert_gate_room_shown(db: &Db, mission: i64) {
+        let health = db.store.fleet_health().expect("health");
+        assert!(
+            health.get("attention").is_none(),
+            "who needs a human is /api/attention's, not a count of judge flags"
+        );
+        let row = health["gate_room"]
+            .as_array()
+            .and_then(|missions| missions.iter().find(|row| row["mission"] == mission))
+            .expect("the mission's gate room");
+        let fold = gated(db, mission);
+        assert_eq!(row["task"].as_i64(), fold.gate_room_task);
+        assert_eq!(row["waits"].as_u64(), Some(u64::from(fold.gate_room_waits)));
+        assert_eq!(row["escalated"].as_bool(), Some(fold.gate_room_escalated));
+        assert_eq!(row["since_ms"].as_i64(), fold.gate_room_since_ms);
+        assert_eq!(row["last_ms"].as_i64(), fold.gate_room_last_ms);
+    }
+
+    /// The dispatcher's plan over the gate-room records the store gives now,
+    /// for a supervisor whose digests told it `tag`.
+    fn gate_room_plan(db: &Db, tag: &str) -> crate::dispatch::Plan {
+        let records = db.store.gate_room_escalations().expect("escalations");
+        let items =
+            crate::disk::gate_room_escalations(records.as_array().map_or(&[][..], Vec::as_slice));
+        let supervisor: crate::dispatch::Facts = serde_json::from_value(json!({
+            "session_id": "session_supervisor", "agent_id": "agent_supervisor", "told": [tag],
+        }))
+        .expect("facts");
+        let work = crate::deliver::Work::default();
+        crate::dispatch::decide_with(&[supervisor], &work, &items, false, 0, "spawn")
+    }
+
     /// Task 40: the fold. `no_room` keeps the task where it was, names the
     /// free space, moves neither the abort nor the rejection count, and
     /// folds the mission's run of them; a gate that judged ends the run, and
-    /// a real abort still counts.
+    /// a real abort still counts. The fleet view's health carries the run,
+    /// and a told escalation stays told and unresolved while the run goes on.
     #[test]
     fn no_room_counts_toward_no_halt_and_a_real_abort_still_does() {
         let (base, source, scenarios, _) = world("no-room-fold", "exit 1\n");
@@ -5479,6 +5514,7 @@ mod database_tests {
         );
         assert!(after.halted.is_none());
         assert_eq!(after.gate_room_task, Some(task));
+        assert_gate_room_shown(&db, mission);
         let escalations = db.store.gate_room_escalations().expect("escalations");
         assert_eq!(
             escalations.as_array().map(Vec::len),
@@ -5514,15 +5550,17 @@ mod database_tests {
             "a digest that failed told nothing"
         );
         digest("dispatch-digest-told", true);
-        assert_eq!(
-            db.store
-                .gate_room_escalations()
-                .expect("escalations")
-                .as_array()
-                .map(Vec::len),
-            Some(0),
-            "told once, by its record"
-        );
+        // Told once, by its record: the dispatcher's told set has its tag,
+        // so it is never pending again. Its run goes on, so the plan holds
+        // it as told and unresolved.
+        let plan = gate_room_plan(&db, &tag);
+        assert!(plan.pending.is_empty(), "told once: {:?}", plan.pending);
+        let told: Vec<String> = plan
+            .told
+            .iter()
+            .map(crate::dispatch::Escalation::tag)
+            .collect();
+        assert_eq!(told, [tag.as_str()], "told, and the gate still has no room");
 
         // A no_room that names no free space or TMPDIR is refused.
         assert!(
@@ -5541,6 +5579,12 @@ mod database_tests {
         assert_eq!(after.gate_aborts, 3);
         assert_eq!(after.gate_room_waits, 0, "a gate that ran ends the run");
         assert!(after.gate_room_since_ms.is_none() && !after.gate_room_escalated);
+        let plan = gate_room_plan(&db, &tag);
+        assert!(
+            plan.told.is_empty() && plan.pending.is_empty(),
+            "told, and its run is over: resolved"
+        );
+        assert_gate_room_shown(&db, mission);
         assert!(super::halt_reason(&after, 0).is_some_and(|reason| reason.contains("aborts")));
         let _ = std::fs::remove_dir_all(&base);
     }

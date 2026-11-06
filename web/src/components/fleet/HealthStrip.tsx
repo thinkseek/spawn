@@ -2,7 +2,9 @@ import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
-import { absoluteTitle, formatDuration } from "../../format";
+import { absoluteTitle, clockTime, formatDuration } from "../../format";
+import type { GateRoom, Memory } from "../../resources";
+import { memoryBar, waitingGates } from "../../resources";
 import { cx } from "../ui";
 
 const LADDER: Array<{
@@ -142,6 +144,114 @@ function DiskBar({ place }: { place: DiskPlace }) {
   );
 }
 
+/** Memory available now (MemAvailable), as a bar of the total against the
+ * warning line (4 GiB). A value the server could not read shows as unread,
+ * and an unknown total scales the bar to the warning instead. */
+function MemoryBar({ memory }: { memory: Memory | null }) {
+  if (!memory) {
+    return <p className="text-caption text-faint-foreground">This server reports no memory.</p>;
+  }
+  const available = memory.available_bytes;
+  const { tone, scale } = memoryBar(memory);
+  const at = (bytes: number) => `${Math.min(100, (bytes / scale) * 100)}%`;
+  const style =
+    tone === "unread"
+      ? { bar: "bg-faint-foreground", text: "text-faint-foreground", word: "unread" }
+      : tone === "short"
+        ? { bar: "bg-warning", text: "text-warning", word: "under the warning" }
+        : { bar: "bg-success", text: "text-foreground", word: "fine" };
+  return (
+    <div
+      className="min-w-0"
+      title={`Memory available (MemAvailable, read now): ${formatGib(available)} of ${
+        memory.total_bytes == null ? "an unread total" : formatGib(memory.total_bytes)
+      } (${style.word}); a warning under ${formatGib(memory.warn_bytes)}`}
+    >
+      <div className="flex items-baseline gap-2 text-caption">
+        <span className="text-muted-foreground">Memory</span>
+        <span className={cx("tnum ml-auto font-medium", style.text)}>{formatGib(available)}</span>
+        <span className="text-faint-foreground">available</span>
+      </div>
+      <div className="relative mt-1 h-1.5 rounded-full bg-muted">
+        {available != null && (
+          <div className={cx("h-full rounded-full", style.bar)} style={{ width: at(available) }} />
+        )}
+        <span
+          aria-hidden="true"
+          className="absolute -top-0.5 h-2.5 w-px bg-foreground/70"
+          style={{ left: at(memory.warn_bytes) }}
+        />
+      </div>
+      <div className="tnum mt-0.5 flex justify-between text-micro text-faint-foreground">
+        <span>warn {formatGib(memory.warn_bytes)}</span>
+        <span>{memory.total_bytes == null ? "total unread" : `of ${formatGib(memory.total_bytes)}`}</span>
+      </div>
+    </div>
+  );
+}
+
+function ago(ms: number | null): string {
+  return ms == null ? "—" : formatDuration(Math.max(0, Date.now() - ms));
+}
+
+/** Each gated mission's waits for gate room: the gates waiting now (the
+ * task, how many `no_room` since when, escalated or not), then the gated
+ * missions whose gate has room. */
+function GateRoomList({ rows }: { rows: GateRoom[] | null }) {
+  if (rows === null) {
+    return <p className="text-caption text-faint-foreground">This server reports no gate room.</p>;
+  }
+  const waiting = waitingGates(rows);
+  const free = rows.filter((row) => row.task === null);
+  return (
+    <div className="min-w-0 text-caption">
+      <div className="flex items-baseline gap-2">
+        <span className="text-muted-foreground">Gate room</span>
+        <span
+          className={cx(
+            "tnum ml-auto font-medium",
+            waiting.length > 0 ? "text-warning" : rows.length === 0 ? "text-faint-foreground" : "text-foreground",
+          )}
+        >
+          {rows.length === 0
+            ? "no gated mission"
+            : waiting.length === 0
+              ? "no gate waits"
+              : `${waiting.length} gate${waiting.length === 1 ? "" : "s"} waiting`}
+        </span>
+      </div>
+      {waiting.map((row) => (
+        <div
+          key={row.mission}
+          className="mt-0.5 flex min-w-0 items-baseline gap-1.5"
+          title={`Mission #${row.mission} ${row.name}: task #${row.task}'s gate found no room in TMPDIR ${row.waits} time${
+            row.waits === 1 ? "" : "s"
+          } in a row, since ${clockTime(row.since_ms)}, latest ${clockTime(row.last_ms)}; ${
+            row.escalated ? "escalated to the supervisor" : "not escalated yet (after two hours)"
+          }`}
+        >
+          <span className="min-w-0 truncate text-muted-foreground">
+            #{row.mission} {row.name}
+          </span>
+          <span className="shrink-0 font-mono text-micro text-faint-foreground">T{row.task}</span>
+          <span className="tnum ml-auto shrink-0 text-warning">
+            {row.waits}× for {ago(row.since_ms)}
+          </span>
+          {row.escalated && <span className="shrink-0 text-micro text-warning">escalated</span>}
+        </div>
+      ))}
+      {free.length > 0 && (
+        <div
+          className="mt-0.5 truncate text-micro text-faint-foreground"
+          title={free.map((row) => `#${row.mission} ${row.name}`).join("\n")}
+        >
+          room for {free.map((row) => `#${row.mission}`).join(", ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function formatRate(value: number | null): string {
   if (value == null) return "—";
   if (value === 0) return "0";
@@ -246,15 +356,17 @@ export function HealthStrip({
       </Cell>
 
       <Cell label="Resources">
-        {health.disk.length === 0 ? (
-          <p className="text-caption text-faint-foreground">This server reports no disk places.</p>
-        ) : (
-          <div className="space-y-2.5">
-            {health.disk.map((place) => (
+        <div className="space-y-2.5">
+          {health.disk.length === 0 ? (
+            <p className="text-caption text-faint-foreground">This server reports no disk places.</p>
+          ) : (
+            health.disk.map((place) => (
               <DiskBar key={`${place.label}:${place.path}`} place={place} />
-            ))}
-          </div>
-        )}
+            ))
+          )}
+          <MemoryBar memory={health.memory} />
+          <GateRoomList rows={health.gate_room} />
+        </div>
       </Cell>
 
       <Cell label="Judgements · last hour">
