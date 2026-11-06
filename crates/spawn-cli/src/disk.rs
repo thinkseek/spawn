@@ -229,10 +229,12 @@ no new executions start; free space (old workspaces, build output) or tell the o
 }
 
 /// The digest items for `records`, the integrator's `no_room` gate records
-/// that carry `escalate` and that no delivered digest told yet
-/// (`PostgresStore::gate_room_escalations`): a mission's gate has had no
-/// room in TMPDIR for more than two hours. No time window: a record stays
-/// an item until a digest carrying its tag reaches the supervisor, and the
+/// that carry `escalate` (`PostgresStore::gate_room_escalations`): a
+/// mission's gate has had no room in TMPDIR for more than two hours. No time
+/// window: a record stays an item until a digest carrying its tag reaches
+/// the supervisor, and after that while the run of `no_room` it escalated
+/// goes on (the mission's `gate_room_*`), so the plan holds it as told and
+/// unresolved until the gate gets room or the task leaves the gate. The
 /// integrator writes one per run, so the supervisor is told once.
 pub(crate) fn gate_room_escalations(records: &[Value]) -> Vec<Escalation> {
     records
