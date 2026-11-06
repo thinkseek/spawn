@@ -156,11 +156,17 @@ fn failed_line(line: &str) -> Option<Failure> {
     })
 }
 
-/// The test of a `thread '<test>' panicked at <location>:` line.
+/// The test of a `thread '<test>' panicked at <location>:` line, or of
+/// `thread '<test>' (<thread id>) panicked at <location>:` (Rust 1.88 on).
 fn panicked(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("thread '")?;
-    let (name, _) = rest.split_once("' panicked at")?;
-    Some(name)
+    let (name, after) = rest.split_once('\'')?;
+    let after = after.trim_start();
+    let after = match after.strip_prefix('(') {
+        Some(id) => id.split_once(')')?.1.trim_start(),
+        None => after,
+    };
+    (!name.is_empty() && after.starts_with("panicked at")).then_some(name)
 }
 
 /// The test of a `---- <test> stdout ----` line.
