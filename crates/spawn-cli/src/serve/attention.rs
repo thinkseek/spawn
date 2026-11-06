@@ -957,6 +957,7 @@ mod tests {
         }
         assert!(asking(&working).is_none());
     }
+
     /// Objective 34: the attention view lists the owner's holds only while a
     /// task waits behind them, beside `pending` and `told`, never among them.
     #[test]
