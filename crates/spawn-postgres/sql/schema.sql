@@ -1090,7 +1090,16 @@ create table if not exists mission_missions (
     gate_room_waits    integer not null default 0,
     gate_room_escalated boolean not null default false,
     -- An objective mission (§10.4): `{"backlog": <dir>, "resident": <name>}`.
-    objectives      jsonb
+    objectives      jsonb,
+    -- The gate's current run of `host_fault` outcomes (the gate failed
+    -- because the host did: the test database), in a row across the
+    -- mission: how many, the task the latest was about and when it is due to
+    -- be judged again (the record's `due_ms`). No verdict on the work, so it
+    -- counts toward no halt. `no_room` and `stale` leave the run; every
+    -- other verdict, a landing and a resume end it.
+    gate_host_faults integer not null default 0,
+    gate_host_task   bigint,
+    gate_host_due_ms bigint
 );
 
 create table if not exists mission_residents (
@@ -1153,6 +1162,9 @@ alter table mission_missions add column if not exists gate_room_last_ms bigint;
 alter table mission_missions add column if not exists gate_room_waits integer not null default 0;
 alter table mission_missions add column if not exists gate_room_escalated boolean not null default false;
 alter table mission_missions add column if not exists objectives jsonb;
+alter table mission_missions add column if not exists gate_host_faults integer not null default 0;
+alter table mission_missions add column if not exists gate_host_task bigint;
+alter table mission_missions add column if not exists gate_host_due_ms bigint;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
 alter table mission_tasks add column if not exists gate_log text;
@@ -1289,7 +1301,9 @@ begin
                                     gate_aborts = 0, scenario_floor = 0, gate_room_task = null,
                                     gate_room_since_ms = null,
                                     gate_room_last_ms = null, gate_room_waits = 0,
-                                    gate_room_escalated = false, updated_at_ms = p_at
+                                    gate_room_escalated = false, gate_host_faults = 0,
+                                    gate_host_task = null, gate_host_due_ms = null,
+                                    updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
         -- The owner moved a source's main on purpose (a deploy), forward from
@@ -1333,7 +1347,8 @@ begin
                          else state end,
                base = coalesce(p_record ->> 'base', base),
                candidate = case when v_verdict = 'accepted' then p_record ->> 'candidate'
-                                when v_verdict in ('aborted', 'no_room') then candidate end,
+                                when v_verdict in ('aborted', 'no_room', 'host_fault')
+                                     then candidate end,
                gate_log = coalesce(p_record ->> 'log', gate_log),
                metric = case when v_verdict = 'accepted' then p_record ->> 'metric' else metric end,
                review_note = case when v_verdict in ('rejected', 'conflict', 'incompatible') then p_record ->> 'note'
@@ -1347,10 +1362,27 @@ begin
                                                 when 'accepted' then 0 else gate_rejections end,
                -- `no_room`: the gate found no room in TMPDIR to judge, a
                -- fact about the host, not the work. It moves neither count.
+               -- `host_fault`: the gate failed because the host did (the
+               -- test database): neither count grows nor resets.
                gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
                                             when 'stale' then gate_aborts
                                             when 'no_room' then gate_aborts
+                                            when 'host_fault' then gate_aborts
                                             else 0 end,
+               -- The mission's host faults in a row: a landing or a real
+               -- verdict ends the run; `no_room` and `stale` leave it. The
+               -- task waits until the record's `due_ms`.
+               gate_host_faults = case v_verdict when 'host_fault' then gate_host_faults + 1
+                                                 when 'no_room' then gate_host_faults
+                                                 when 'stale' then gate_host_faults
+                                                 else 0 end,
+               gate_host_task = case v_verdict when 'host_fault' then v_id
+                                               when 'no_room' then gate_host_task
+                                               when 'stale' then gate_host_task end,
+               gate_host_due_ms = case v_verdict
+                                    when 'host_fault' then (p_record ->> 'due_ms')::bigint
+                                    when 'no_room' then gate_host_due_ms
+                                    when 'stale' then gate_host_due_ms end,
                -- The run is this task's: a `no_room` on another task starts
                -- a new one (no inherited backoff or age).
                gate_room_task = case v_verdict when 'no_room' then v_id
@@ -1377,6 +1409,10 @@ begin
          where id = v_mission;
     when 'task.landed' then
         update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
+        -- A landing ends its mission's run of host faults.
+        update mission_missions set gate_host_faults = 0, gate_host_task = null,
+                                    gate_host_due_ms = null
+         where id = (select mission_id from mission_tasks where id = v_id);
         -- Every mission on the same source sees the same main: the landing
         -- moves its own mission's baseline, and those of the other missions
         -- it names (spawn_integrator_record: the ones whose baseline was its
@@ -1460,7 +1496,8 @@ begin
             select * from jsonb_populate_record(null::mission_missions,
                 jsonb_build_object('accept', 'review', 'scenario_floor', 0,
                                    'gate_rejections', 0, 'gate_aborts', 0, 'gate_room_waits', 0,
-                                   'gate_room_escalated', false) || (p_record -> 'row'));
+                                   'gate_room_escalated', false, 'gate_host_faults', 0)
+                || (p_record -> 'row'));
         when 'mission_residents' then
             insert into mission_residents
             select * from jsonb_populate_record(null::mission_residents, p_record -> 'row');
@@ -1487,6 +1524,18 @@ begin
       from spawn_append_trusted('agent_control', 'session_control', null, 'control', null,
                                 jsonb_build_object('name', 'control.recorded',
                                                    'detail', jsonb_build_object('record', p_record))) a;
+    -- A host fault is judged again `backoff_ms` after its own record: its
+    -- `due_ms` is the record's time plus that, which only the append knows.
+    -- It is written into the record in the transaction that appends it, so
+    -- no reader ever sees the record without it.
+    if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
+       and jsonb_typeof(p_record -> 'backoff_ms') = 'number' then
+        p_record := p_record || jsonb_build_object(
+            'due_ms', v_at + (p_record ->> 'backoff_ms')::numeric::bigint);
+        update spawn_events
+           set kind = jsonb_set(kind, '{detail,record}', p_record)
+         where id = v_id;
+    end if;
     perform spawn_control_apply(p_record, v_at);
     return v_id;
 end $$;
@@ -2030,8 +2079,22 @@ begin
     end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
-                                          'aborted', 'stale', 'no_room') then
+                                          'aborted', 'stale', 'no_room', 'host_fault') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
+    end if;
+    -- A host fault names its evidence (§14): the failures the gate printed,
+    -- each the host's, and, when the test database's log decided it, the
+    -- crash lines stamped inside the gate's window; and its backoff.
+    if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
+       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log')
+            or case when jsonb_typeof(p_record -> 'failures') = 'array'
+                    then jsonb_array_length(p_record -> 'failures') else 0 end = 0
+            or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
+            or (p_record ->> 'evidence' = 'server_log'
+                and case when jsonb_typeof(p_record -> 'crash') = 'array'
+                         then jsonb_array_length(p_record -> 'crash') else 0 end = 0)) then
+        raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
+                        p_record;
     end if;
     -- No room to judge names what it saw: the free space and the directory.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'no_room'
@@ -2189,6 +2252,15 @@ create index if not exists spawn_events_gate_room
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
       and kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
+      and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
+
+-- The `host_fault` gate records that escalate (the second host fault in a
+-- row), found the same way.
+create index if not exists spawn_events_gate_host_fault
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+      and kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
       and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
 
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
