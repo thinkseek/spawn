@@ -1361,17 +1361,12 @@ begin
            set baseline = coalesce(baseline, p_record ->> 'base'),
                gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
                                                 when 'accepted' then 0 else gate_rejections end,
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
-               -- `no_room`: the gate found no room in TMPDIR to judge, a
-               -- fact about the host, not the work. It moves neither count.
-               -- `host_fault`: the gate failed because the host did (the
-               -- test database): neither count grows nor resets.
-=======
                -- `no_room`: no room to judge (TMPDIR's free space, the
                -- host's memory or the test database, measured before the
                -- gate or by the gate's own floor), a fact about the host,
                -- not the work. It moves neither count.
->>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
+               -- `host_fault`: the gate failed because the host did (the
+               -- test database): neither count grows nor resets.
                gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
                                             when 'stale' then gate_aborts
                                             when 'no_room' then gate_aborts
@@ -2090,7 +2085,6 @@ begin
                                           'aborted', 'stale', 'no_room', 'host_fault') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
     end if;
-<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
     -- crash lines stamped inside the gate's window; and its backoff.
@@ -2105,14 +2099,11 @@ begin
         raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
                         p_record;
     end if;
-    -- No room to judge names what it saw: the free space and the directory.
-=======
     -- No room to judge names what it measured: the check that fell short
     -- (`disk`, `memory` or `database`), its `measured` and its `threshold`
     -- (the integrator's checks before a gate, docs/fleet-architecture.md
     -- §10.3); a disk one, or one that names no check (the gate's own fact,
     -- and records from before the checks), the free space and the directory.
->>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'no_room'
        and ((p_record ? 'check'
              and (coalesce(p_record ->> 'check', '') not in ('disk', 'memory', 'database')
