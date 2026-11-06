@@ -118,7 +118,8 @@ from (
 /// - `tasks`: every open task (the rows [`DELIVERY_TASKS`] reads, but a
 ///   closed ephemeral task only while its worker runs) with `record`, the
 ///   latest control record that put it in its state (`task.assigned`; the
-///   review or verdict that sent it back; `task.delivered`; `task.reported`;
+///   review or verdict that sent it back (`rejected`, `conflict` or
+///   `incompatible`); `task.delivered`; `task.reported`;
 ///   the review that accepted it; the gate's `accepted`; the record that
 ///   closed it), and `stale`, the latest `stale` verdict on it, which moves
 ///   no step;
@@ -311,7 +312,8 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
  where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
 
 /// Gate verdicts on one objective's tasks, newest first, from the control
-/// stream: `[{task, verdict, reason, metric, at_ms}]`. `$1` mission,
+/// stream: `[{task, verdict, reason, metric, at_ms}]`, `incompatible` (sent
+/// back because main moved, not a rejection) among them. `$1` mission,
 /// `$2` objective, `$3` limit.
 pub(crate) const OBJECTIVE_HISTORY: &str = r"
 select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
