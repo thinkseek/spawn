@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { normalizeAttention, type Attention } from "./attention";
 import { chooseToken, type TokenChoice } from "./token";
 
 export type SessionState =
@@ -357,6 +358,12 @@ async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
 
 export async function fetchOverview(signal: AbortSignal): Promise<Overview> {
   return normalizeOverview(await getJson("/api/overview", signal));
+}
+
+/** The "Needs a human" queue as the dispatcher computes it. Throws on an
+ * older server without `/api/attention` (404): the queue falls back. */
+export async function fetchAttention(signal: AbortSignal): Promise<Attention> {
+  return normalizeAttention(await getJson("/api/attention", signal));
 }
 
 export async function fetchSession(
