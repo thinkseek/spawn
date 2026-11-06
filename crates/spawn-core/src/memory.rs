@@ -20,8 +20,8 @@ use crate::id::{
 };
 use crate::port::{
     ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Hold, Launch,
-    READ_LIMIT, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
-    WorkspaceStore,
+    READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive,
+    WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
