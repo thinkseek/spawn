@@ -1034,7 +1034,12 @@ record of what was judged (§14 of design.md).
   "unsolved" is cached, and a regression then lands) or flake another
   mission's candidate toward its halt. The integrator refuses N > 1 (up to
   8) unless `SPAWN_TEST_DATABASE_PER_GATE=1` states that the server is per
-  gate. Each judging records its own verdict and landing, which the next
+  gate. A mission whose scenarios directory holds the file
+  `no-test-database` (its owner's statement that its gate needs no test
+  database, as Supply PA's tests run on PGlite) gets no
+  SPAWN_TEST_DATABASE_URL, so its candidate code cannot reach the shared
+  server: its judgings do not count against N and run beside a Spawn gate,
+  still one per mission and per source. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
   missions. A judging that panics before any record of its own is
   recorded `aborted` with the reason, so the three-aborts halt bounds a

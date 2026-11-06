@@ -160,9 +160,13 @@ spawn fleet
 | `SPAWN_STALL_STOP_SECS` | `300` | 关闭的临时任务，工人多久还在跑就升级：退役 Stop 在下一趟就发，失败的 Stop 一分钟后重发 |
 | `SPAWN_STALL_HALTED_SECS` | `0` | 停摆的任务（mission halted）多久后升级：停摆从一开始就在等人 |
 | `SPAWN_GATE` | `scripts/rsi/gate.sh` | `spawn integrate` 的门禁脚本，输出一行 JSON 判定；线上指向控制器（部署的提交树）`~/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/gate.sh`，从不指向所有者的检出：所有者的改动部署后才生效 |
+<<<<<<< b950e25e38d827ef4dc53d420c8f6b4b11083840
+| `SPAWN_INTEGRATE_GATES` | `1` | `spawn integrate` 同时跑的门禁数（跨任务组；每个任务组至多一个；`--gates` 优先）。大于 1（至多 8）须设 `SPAWN_TEST_DATABASE_PER_GATE=1`：门禁目前共用一个测试数据库服务器。场景目录里有 `no-test-database` 文件的任务组（如 Supply PA，测试用 PGlite）拿不到测试库地址，其判定不占这个名额，可与 Spawn 的门禁并行 |
+=======
 | `SPAWN_INTEGRATE_GATES` | `1` | `spawn integrate` 同时跑的门禁数（跨任务组；每个任务组至多一个；`--gates` 优先）。大于 1（至多 8）须设 `SPAWN_TEST_DATABASE_PER_GATE=1`：门禁目前共用一个测试数据库服务器 |
 | `SPAWN_TEST_DATABASE_LOG` | 未设 | 测试数据库服务器的日志（`log_line_prefix` `%m [%p] `）；`spawn integrate` 读它找门禁期间的崩溃：有崩溃时数据库错误也让 check-tests.sh 的失败算主机故障（`host_fault`）而非拒绝。未设时只有连接错误算 |
 | `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | 连续第一次主机故障后，任务等多久再判；每多一次连续主机故障加倍，至多一小时 |
+>>>>>>> 9df7d22429ae9852a630197e219194dcc8f6831b
 
 ## 8. 验证
 

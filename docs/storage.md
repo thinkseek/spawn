@@ -366,8 +366,10 @@ state and wedges nothing:
   once (fleet-architecture.md §10.2, §10.3). The integrator passes the variable
   through. The gate's scratch is
   `$TMPDIR/spawn-gate.XXXXXX`, so cleanup can tell it from everyone else's.
-  The integrator runs one gate at a time (`--gates`, more only with a test
-  server per gate); each gate checks the floor at its own start. Measured
+  The integrator runs one gate at a time that uses the shared test server
+  (`--gates`, more only with a test server per gate), and beside it the
+  gates of missions marked `no-test-database`; each gate checks the floor
+  at its own start. Measured
   2026-11-06, a Spawn gate's scratch peaks near 1.7 GiB, two at once
   3.4 GiB, well inside the default floor. Routine cleanup removes only scratch untouched for a day, which no
   running gate (its wall clock, `SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 minutes by default, at most) is.
