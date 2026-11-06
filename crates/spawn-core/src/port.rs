@@ -68,11 +68,23 @@ pub trait CommandQueue: Send + Sync {
     ) -> Result<CommandId, StoreError>;
 
     /// Lease the oldest unfinished command of a session that has no live
-    /// lease, or `None`.
+    /// lease, or `None`. An unfinished input the Bridge recorded `waiting`
+    /// (it waits for the session's turn) does not hold the commands behind
+    /// it; any other unfinished command does.
     fn claim(&self, worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError>;
 
     /// Record the outcome and its `command.finished` event atomically.
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError>;
+
+    /// Leave a claimed command unfinished and make it claimable again after
+    /// `retry_in`: the Bridge's input that waits for its turn
+    /// (`CommandStep::Waiting`) is claimed again then, by this Bridge or a
+    /// restarted one. A lease that is no longer this claim's changes
+    /// nothing. Without it the lease runs out on its own.
+    fn release(&self, claimed: &Claimed, retry_in: Duration) -> Result<(), StoreError> {
+        let _ = (claimed, retry_in);
+        Ok(())
+    }
 }
 
 /// Workspace store refusal or failure.

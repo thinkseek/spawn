@@ -178,7 +178,8 @@ from (
     p.observation_at_ms,
     (select max(e.session_seq) from spawn_events e
       where e.session_id = s.session_id and e.source <> 'observer'
-        and e.event_name not in ('artifact.committed', 'merge.conflicted')) as evidence_seq,
+        and e.event_name not in ('artifact.committed', 'merge.conflicted')
+        and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting') as evidence_seq,
     coalesce((select e.event_name in ('turn.stopped', 'turn.failed') from spawn_events e
                where e.session_id = s.session_id and e.execution_id = s.execution_id
                  and e.event_name in ('message.received', 'turn.stopped', 'turn.failed')

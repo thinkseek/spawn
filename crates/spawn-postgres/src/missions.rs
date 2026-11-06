@@ -126,7 +126,8 @@ from (
 /// - `verdicts`: per gated mission with a task waiting for the gate, the
 ///   latest verdict on any of its tasks that is not `stale`;
 /// - `sessions`: per session with a delivered task, its latest fact (a
-///   record that is neither the Observer's nor storage's, as
+///   record that is neither the Observer's nor storage's, nor the Bridge's
+///   `waiting` step of an input, which says nothing the worker did, as
 ///   [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `evidence_seq`) and
 ///   the evidence of its latest screen reading;
 /// - `halted`: every halted mission with open tasks, its latest
@@ -205,6 +206,7 @@ select jsonb_build_object(
       select e.session_seq, e.event_name, e.recorded_at_ms from spawn_events e
        where e.session_id = s.session_id and e.source <> 'observer'
          and e.event_name not in ('artifact.committed', 'merge.conflicted')
+         and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
        order by e.session_seq desc limit 1) f on true
     left join lateral (
       select e.kind -> 'detail' ->> 'evidence' as evidence from spawn_events e
