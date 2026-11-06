@@ -545,7 +545,7 @@ decisions per agent-hour over the last 24 h) are computed from the log by
 
 | View | Answers |
 | --- | --- |
-| Attention queue (top of the board) | The supervisor's open question in full; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved, each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code) |
+| Attention queue (top of the board) | The supervisor's open question in full; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved, each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code); below it, the supervisor's "For the owner:" lines with their age, to read, not counted |
 | Always-on agents (below the queue) | The supervisor, then the residents, pinned live or not: liveness, state and for how long, last activity, uptime, the task each holds |
 | Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor), judgements, the decision ladder and human decisions per agent-hour |
 | Fleet board | The rest of the fleet in groups: on a task (needs a human first, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
