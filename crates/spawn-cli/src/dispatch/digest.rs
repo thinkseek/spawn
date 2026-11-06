@@ -63,6 +63,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::DeliveryFailed => "delivery failed",
         Why::StopFailed => "stop failed",
         Why::Disk => "disk space on this host",
+        Why::DiskRecovered => "disk space back on this host",
         Why::GateRoom => "no room for the gate on this host",
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
         Why::Stalled => "stalled",
