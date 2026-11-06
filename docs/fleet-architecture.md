@@ -924,8 +924,11 @@ record of what was judged (§14 of design.md).
   8) unless `SPAWN_TEST_DATABASE_PER_GATE=1` states that the server is per
   gate. Each judging records its own verdict and landing, which the next
   pass reads; finished judgings are reaped before a pass reads the
-  missions. A judging that errs or panics before any record of its own is
-  recorded `aborted` with the reason, so the three-aborts halt bounds it.
+  missions. A judging that panics before any record of its own is
+  recorded `aborted` with the reason, so the three-aborts halt bounds a
+  bug. One that returns an error records nothing: the error is shown to
+  the operator and a later pass judges again (a git that cannot run a
+  merge is the host's problem, not the work's: objective 008).
   A restart mid-gate kills the gate with the process (no record), and the
   next integrator judges the task again. One integrator per database: its
   advisory lock belongs to the connection, kept while any gate runs.
