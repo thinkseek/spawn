@@ -609,8 +609,10 @@ impl GitWorkspace {
             changed.extend(specs.iter().cloned());
             let changed = listed_paths(&self.git_listing(&changed)?);
             if !changed.is_empty() {
-                let literal: Vec<OsString> =
-                    changed.iter().map(|path| path.pathspec("literal")).collect();
+                let literal: Vec<OsString> = changed
+                    .iter()
+                    .map(|path| path.pathspec("literal"))
+                    .collect();
                 self.listing_in_with_pathspecs(
                     directory,
                     index,
@@ -623,10 +625,11 @@ impl GitWorkspace {
             .map(OsString::from)
             .into();
         listing.extend(specs);
-        let held: Vec<(TreePath, u64)> = listed_paths(&self.listing_in(directory, index, &listing)?)
-            .into_iter()
-            .map(|path| (path, 0))
-            .collect();
+        let held: Vec<(TreePath, u64)> =
+            listed_paths(&self.listing_in(directory, index, &listing)?)
+                .into_iter()
+                .map(|path| (path, 0))
+                .collect();
         if held.is_empty() {
             return Ok(());
         }
@@ -759,9 +762,17 @@ impl GitWorkspace {
             directory,
             index,
             &[
-                ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."]
-                    .map(OsString::from)
-                    .to_vec(),
+                [
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    ".",
+                ]
+                .map(OsString::from)
+                .to_vec(),
                 runtime_pathspecs("exclude"),
             ]
             .concat(),
