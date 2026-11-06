@@ -2150,7 +2150,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
 #[test]
 fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
     let (_store, schema) = store("logins");
-    for base in ["spawn_supervisor", "spawn_reader"] {
+    for base in ["spawn_supervisor", "spawn_reader", "spawn_human"] {
         let role = common::login(&schema, base);
         assert_ne!(role, base, "the login is this database's own");
         let fixed = format!(

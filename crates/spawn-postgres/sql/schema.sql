@@ -26,7 +26,7 @@ $$;
 -- each database gets its own, named after it (`spawn_supervisor_<db>`), so
 -- two installs on one cluster neither share privileges nor set each other's
 -- passwords. Schemas of one database (test cases) share them.
--- `p_base` is `spawn_supervisor` or `spawn_reader`; a name that would not
+-- `p_base` is `spawn_supervisor`, `spawn_reader` or `spawn_human`; a name that would not
 -- fit, or a database name outside [a-z0-9_], gets a hash instead.
 create or replace function spawn_login_role(p_base text) returns text
 language sql stable as $$
@@ -39,14 +39,17 @@ $$;
 
 -- The principal the session's login acts as: this database's restricted
 -- logins act as `spawn_supervisor` and `spawn_reader`, the names grants,
--- commands and records carry; the logins of the same names from before
--- logins were per database act as nobody (null); any other login as itself.
+-- commands and records carry, and `spawn_human` (the web page's typing,
+-- `spawn_human_input`) as `human`, the principal `spawn submit --principal
+-- human` names; the logins of the same names from before logins were per
+-- database act as nobody (null); any other login as itself.
 -- `session_user` survives SECURITY DEFINER, so this names the real caller.
 create or replace function spawn_principal() returns text
 language sql stable as $$
     select case
              when session_user::text = spawn_login_role('spawn_supervisor') then 'spawn_supervisor'
              when session_user::text = spawn_login_role('spawn_reader') then 'spawn_reader'
+             when session_user::text = spawn_login_role('spawn_human') then 'human'
              when session_user::text in ('spawn_supervisor', 'spawn_reader', 'spawn_terminal')
                  then null
              else session_user::text end
@@ -334,7 +337,7 @@ create or replace function spawn_append(
     out_inserted boolean
 ) language plpgsql security definer as $$
 begin
-    if coalesce(spawn_principal() in ('spawn_supervisor', 'spawn_reader'), true) then
+    if coalesce(spawn_principal() in ('spawn_supervisor', 'spawn_reader', 'human'), true) then
         raise exception '% may not write events', session_user using errcode = '42501';
     end if;
     return query
@@ -990,7 +993,7 @@ declare
     v_base text;
     v_role text;
 begin
-    foreach v_base in array array['spawn_supervisor', 'spawn_reader'] loop
+    foreach v_base in array array['spawn_supervisor', 'spawn_reader', 'spawn_human'] loop
         v_role := spawn_login_role(v_base);
         if not exists (select 1 from pg_roles where rolname = v_role) then
             execute format('create role %I nologin', v_role);
@@ -1021,12 +1024,14 @@ declare
     v_role text;
 begin
     foreach v_role in array array[spawn_login_role('spawn_supervisor'),
-                                  spawn_login_role('spawn_reader')] loop
+                                  spawn_login_role('spawn_reader'),
+                                  spawn_login_role('spawn_human')] loop
         execute format('alter role %I with nologin password null', v_role);
     end loop;
-    raise warning 'the database URL has no owner password: logins % and % are off (no login, '
+    raise warning 'the database URL has no owner password: logins %, % and % are off (no login, '
                   'no password) until a migration with the owner''s password',
-                  spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader');
+                  spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader'),
+                  spawn_login_role('spawn_human');
 end $$;
 revoke execute on function spawn_logins_off() from public;
 
@@ -1046,6 +1051,64 @@ insert into spawn_grants (principal, agent_id, scope) values
     ('spawn_supervisor', '*', 'read'),
     ('spawn_supervisor', 'agent_worker_*', 'all')
 on conflict (principal, agent_id) do nothing;
+
+-- A person's input from the web page (`spawn serve`, `POST
+-- /api/session/<id>/input`): the command `spawn submit --principal human
+-- --agent <the session's agent> --session <id> --key <key> --action
+-- '{"type":"input","text":<text>}'` makes, through the same `spawn_submit`
+-- with the same idempotency rule (a repeated key of `human` returns the
+-- first command and makes none). Like every input of a person it waits for
+-- the session's turn (crates/spawn-core/src/bridge.rs). The agent is the one
+-- the session belongs to (`spawn_agent_sessions`): the caller cannot pair a
+-- session with another agent. Returns the command, or null when no agent
+-- has used the session. Only the `spawn_human` login may call it, and it may
+-- call nothing else: it reads nothing (no grant), appends no event, and
+-- submits no other action and as no other principal. The text is what a
+-- person types: not blank, at most 8192 bytes (serve.rs `MAX_INPUT_TEXT`),
+-- and no control character but tab and line ends (an escape or a C1 control
+-- would reach the engine's terminal as keys, not as text).
+create or replace function spawn_human_input(p_session text, p_key text, p_text text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_agent text;
+begin
+    if spawn_principal() is distinct from 'human' then
+        raise exception '% may not type as a person (only the spawn_human login does)',
+            session_user using errcode = '42501';
+    end if;
+    if coalesce(p_key, '') = '' or octet_length(p_key) > 256 or p_key ~ '[[:cntrl:]]' then
+        raise exception 'an input needs an idempotency key of 1 to 256 bytes, no control character'
+            using errcode = '22023';
+    end if;
+    if coalesce(btrim(p_text, E' \t\r\n'), '') = '' then
+        raise exception 'an input needs text' using errcode = '22023';
+    end if;
+    if octet_length(p_text) > 8192 then
+        raise exception 'an input is at most 8192 bytes, not %', octet_length(p_text)
+            using errcode = '22023';
+    end if;
+    if p_text ~ '[\x01-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]' then
+        raise exception 'an input holds no control character but tab and line ends'
+            using errcode = '22023';
+    end if;
+    select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = p_session;
+    if v_agent is null then
+        return null;
+    end if;
+    return (select s.out_id
+              from spawn_submit('human', p_key, v_agent, p_session,
+                                jsonb_build_object('type', 'input', 'text', p_text)) s);
+end $$;
+
+do $$
+begin
+    execute format('alter function spawn_human_input(text, text, text) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_human_input(text, text, text) from public';
+    execute format('grant execute on function spawn_human_input(text, text, text) to %I',
+                   spawn_login_role('spawn_human'));
+end
+$$;
 
 -- Missions, tasks and residents (docs/fleet-architecture.md §3.2).
 --
@@ -1195,10 +1258,11 @@ create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
 
 
 -- Who may call the mission functions: the owner (humans' CLI, the
--- controller) and the supervisor's login.
+-- controller) and the supervisor's login; not the reader's, and not the web
+-- page's typing login (`human`, which may only call `spawn_human_input`).
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
-    select case when x.p is null or x.p = 'spawn_reader' then null
+    select case when x.p is null or x.p in ('spawn_reader', 'human') then null
                 when x.p = 'spawn_supervisor' then 'spawn_supervisor'
                 else 'owner' end
       from (select spawn_principal() as p) x

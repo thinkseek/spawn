@@ -29,7 +29,7 @@ interface SidebarProps {
   view: View;
   rsi: RsiSummary | null;
   error: string | null;
-  /** What needs a human, by the dispatcher's view (attention.ts
+  /** What is escalated, by the dispatcher's view (attention.ts
    * `needsHuman`): the queue's count, null while it is unknown, with why. */
   attention: HumanCount;
   onShowFleet: () => void;
@@ -176,7 +176,7 @@ export function Sidebar({
           )}
         />
         <span className="truncate font-mono">{window.location.host}</span>
-        <span className="ml-auto">{error ? "offline" : "read-only"}</span>
+        <span className="ml-auto">{error ? "offline" : "online"}</span>
       </div>
     </aside>
   );
@@ -310,9 +310,9 @@ function SessionRow({
           className="text-label font-medium text-foreground"
         />
         {attention && (
-          <span className="ml-auto flex shrink-0 text-warning" title="Needs a human">
+          <span className="ml-auto flex shrink-0 text-warning" title="Escalated">
             <BellRing size={11} aria-hidden="true" />
-            <span className="sr-only">needs a human</span>
+            <span className="sr-only">escalated</span>
           </span>
         )}
       </span>
@@ -366,14 +366,14 @@ function NavItem({
   );
 }
 
-/** The "Needs a human" queue's count (the dispatcher's view); a muted "?"
+/** The Escalations queue's count (the dispatcher's view); a muted "?"
  * when it could not be read, never a count from elsewhere. */
 function AttentionCount({ count, error }: HumanCount) {
   if (count === null) {
     if (!error) return null;
     return (
       <span
-        title={`Who needs a human is unknown: /api/attention: ${error}`}
+        title={`What is escalated is unknown: /api/attention: ${error}`}
         className="tnum rounded bg-muted px-1.5 py-px text-micro font-medium text-faint-foreground"
       >
         ?
@@ -383,7 +383,7 @@ function AttentionCount({ count, error }: HumanCount) {
   if (count <= 0) return null;
   return (
     <span
-      title={`${count} thing${count === 1 ? "" : "s"} in "Needs a human" (the dispatcher's queue)`}
+      title={`${count} thing${count === 1 ? "" : "s"} in Escalations (the dispatcher's queue)`}
       className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning"
     >
       {count}

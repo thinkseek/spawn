@@ -41,7 +41,7 @@ export interface Judgement {
   stuck: number | null;
   latency_ms: number | null;
   /** The judge's own opinion that someone should look, and why. Not who
-   * needs a human: that is the dispatcher's view (attention.ts). */
+   * is escalated: that is the dispatcher's view (attention.ts). */
   attention: boolean | null;
   attention_reason: string | null;
   evidence: Evidence | null;
@@ -69,7 +69,7 @@ export interface FleetAgent {
   ended_at_ms: number | null;
   state: FleetState;
   state_since_ms: number | null;
-  /** Needs a human, by the dispatcher's view (`/api/attention`, set by
+  /** Escalated, by the dispatcher's view (`/api/attention`, set by
    * attention.ts `markNeedsHuman`); false until that view is read. Never
    * the judge's flag, which is `judgement.attention`. */
   attention: boolean;
@@ -148,6 +148,9 @@ export interface CommandRecord {
   error: string | null;
   created_at_ms: number | null;
   finished_at_ms: number | null;
+  /** The Bridge holds it for the agent's turn (an input that waits); false
+   * from an older server, which does not say. */
+  waiting: boolean;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -305,7 +308,7 @@ function normalizeAgent(value: unknown): FleetAgent | null {
     ended_at_ms: optionalNumber(raw.ended_at_ms),
     state: fleetState(raw.state ?? judgement?.state),
     state_since_ms: optionalNumber(raw.state_since_ms),
-    // The server's `attention` is the judge's flag; who needs a human comes
+    // The server's `attention` is the judge's flag; what is escalated comes
     // from /api/attention (attention.ts `markNeedsHuman`).
     attention: false,
     judged_at_ms: optionalNumber(raw.judged_at_ms),
@@ -438,6 +441,7 @@ export function normalizeCommands(value: unknown): CommandRecord[] {
       error: optionalText(raw.error),
       created_at_ms: optionalNumber(raw.created_at_ms),
       finished_at_ms: optionalNumber(raw.finished_at_ms),
+      waiting: raw.waiting === true,
     };
   });
 }

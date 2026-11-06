@@ -30,8 +30,8 @@ Three ideas carry the design:
 
 ```text
  ┌──────────────────────────────────────────────────────────────────────┐
- │ 5 Interface   web UI (fleet board, attention queue, agent detail)    │
- │               read-only HTTP API · spawn CLI                          │
+ │ 5 Interface   web UI (fleet board, escalations, agent detail)        │
+ │               HTTP API: reads, one write (a person's input) · CLI     │
  ├──────────────────────────────────────────────────────────────────────┤
  │ 4 Control     Supervisor: one perpetual Claude Code session           │
  │                 reads fleet state, submits commands to workers        │
@@ -60,7 +60,7 @@ No layer calls another layer's process directly; they meet in the log.
 | 2 Event log | `spawn_events` (with the control stream), `spawn_commands`, grants, projections, views |
 | 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
-| 5 Interface | `spawn serve` (read-only API and web UI), the `spawn` CLI |
+| 5 Interface | `spawn serve` (API and web UI: reads, and one write, a person's input to a session), the `spawn` CLI |
 
 ## 2. Observation: rules first, Jev on ambiguity
 
@@ -306,42 +306,51 @@ it, on the same ladder.
   session (restored by resume) plus the log. The charter is given when a
   native session starts (the first, or a handoff); a resume keeps the
   session it had, and the charter it was given then.
-- **Human**: the attention queue in the UI ("Needs a human", top of the
-  Fleet page) is computed by the dispatcher's own code, not by the UI:
+- **Human**: the escalations queue in the UI ("Escalations", top of the
+  Fleet page: what the dispatcher raised, told to the supervisor or not) is
+  computed by the dispatcher's own code, not by the UI:
   `GET /api/attention` runs the plan of the dispatcher's pass for this moment
   (`dispatch::read_plan`, the function the pass itself calls: the same facts,
   mission rows, disk and gate-room records and stalls, then `decide_with`)
   and submits, marks and collects nothing. The queue shows, top to bottom:
-  the supervisor's open question, when its turn ended at its prompt judged
-  BLOCKED or WAITING with `needs_human` at least 0.5 (or with a `HUMAN:` line),
-  in its own words from its transcript, with when it was asked and its last
-  `HUMAN:` line not answered since; then the escalations not yet told to the
-  supervisor; then those its digests told it whose condition still holds
-  (a worker's state, a stall, a path still low on disk, a gate still without
-  room), with when they were told. News (a disk recovery, an approval, a
-  human's message, host faults at the gate) is resolved by being told, in
-  the plan itself (`Why::is_news`), so the digest and the queue agree. A
-  managed worker between tasks is not in it, since the dispatcher does not
-  escalate it. Each item carries its digest heading, its line, its agent and
-  its age. This queue is the UI's only definition of "needs a human": the
-  sidebar's count is its count, and an agent is marked when it has an item
-  in it (pending or told and unresolved) or is the supervisor asking a
-  question (`web/src/attention.ts`, `needsHuman`). A judge's `attention`
-  flag is its opinion, shown with the judgement in the agent detail.
+  what the supervisor asks ("The supervisor asks"), when its turn ended at
+  its prompt judged BLOCKED or WAITING with `needs_human` at least 0.5 (or
+  with a `HUMAN:` line), in its own words from its transcript: its last
+  `HUMAN:` line not answered since, or else its reply's last paragraph, in
+  at most three lines, the whole reply on request; right under it, always
+  there whether it asks or not, the box to type to the supervisor; then the
+  escalations not yet told to the supervisor; then those its digests told
+  it whose condition still holds (a worker's state, a stall, a path still
+  low on disk, a gate still without room), with when they were told, folded
+  to a one-line count while nothing is pending. News (a disk recovery, an
+  approval, a human's message, host faults at the gate) is resolved by
+  being told, in the plan itself (`Why::is_news`), so the digest and the
+  queue agree. A managed worker between tasks is not in it, since the
+  dispatcher does not escalate it. Each item carries its digest heading,
+  its line, its agent and its age. This queue is the UI's only definition
+  of what is escalated: the sidebar's count is its count, and an agent is
+  marked escalated when it has an item in it (pending or told and
+  unresolved) or is the supervisor asking a question
+  (`web/src/attention.ts`, `needsHuman`). A judge's `attention` flag is its
+  opinion, shown with the judgement in the agent detail.
   A "For the owner:" line is no question: a latest reply that has one
   asks nothing, whatever Jev judged, unless a `HUMAN:` question of an
   old-style turn is still open. Those lines are listed apart, below the
   queue ("For the owner", `supervisor.for_owner`: newest first, each once,
   at most 10, from the end of its transcript): items to read, counted in no
   queue; an owner's message clears none of them, since nothing waits on
-  them. The owner can type to the supervisor at any time (its pane, or
-  `spawn submit`); it reads that as an instruction, which may reverse one
+  them. Nothing waits on a person: a person reads the queue when they
+  choose. The owner can type to the supervisor at any time (the box at the
+  top of the Fleet page, its pane, or `spawn submit`), and to any agent (the
+  box in its detail drawer; both boxes are `POST /api/session/<id>/input`,
+  §5); the supervisor reads that as an instruction, which may reverse one
   of its decisions, not as the answer to a question. Each human action is a
   command with principal `human`; it is the event the whole system tries to
   make rarer.
 - **Inputs to a busy session wait for its turn.** A person's or the
-  supervisor's input (`spawn submit`, any principal but `spawn-dispatch`,
-  `spawn-integrate` and `spawn-liveness`) that reaches a pane not ready is
+  supervisor's input (`spawn submit` or the web page's input box, any
+  principal but `spawn-dispatch`, `spawn-integrate` and `spawn-liveness`)
+  that reaches a pane not ready is
   not refused: the Bridge records it `waiting` (`command.step`, once) and
   types it on the next Ready reading, the session's waiting inputs oldest
   first, each on a Ready reading of its own, at most once. It holds no stop,
@@ -554,22 +563,45 @@ decisions per agent-hour over the last 24 h) are computed from the log by
 
 | View | Answers |
 | --- | --- |
-| Attention queue (top of the board) | The supervisor's open question in full; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved, each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code); below it, the supervisor's "For the owner:" lines with their age, to read, not counted |
+| Escalations (top of the board) | What the supervisor asks, in at most three lines (its `HUMAN:` line or its reply's last paragraph; the whole reply on request), and under it the box to type to the supervisor, always there; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved (folded to a count while nothing is pending), each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code); below it, the supervisor's "For the owner:" lines with their age, to read, not counted |
 | Always-on agents (below the queue) | The supervisor, then the residents, pinned live or not: liveness, state and for how long, last activity, uptime, the task each holds |
 | Health strip | In this order: liveness (always-on agents up, shortest uptime, liveness restarts in 24 h), resources (free disk per place against its warning and floor; memory available now against a 4 GiB warning line, of the total; each gated mission's waits for gate room: the run's task, how many `no_room` outcomes since when, whether it was escalated; a value the server could not read shows as unread, never guessed), judgements, the decision ladder and human decisions per agent-hour |
-| Fleet board | The rest of the fleet in groups: on a task (needs a human first, by the attention queue, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
-| Agent detail | Live terminal; the Jev panel (distribution, needs_human, stuck, the judge's attention flag and its reason, evidence, rules-vs-Jev); state timeline; event timeline |
+| Fleet board | The rest of the fleet in groups: on a task (escalated first, by the escalations queue, then the quietest), idle, ended (folded, newest end first); each row its state, the mission and task it holds, what it does now, its last event; the sidebar's session list uses the same groups |
+| Agent detail | A box to type to its session, with what was sent there and whether it was typed or waits for the agent's turn; live terminal; the Jev panel (distribution, needs_human, stuck, the judge's attention flag and its reason, evidence, rules-vs-Jev); the commands into it (an input waiting for the turn says so); state timeline; event timeline |
 | Missions | Missions with open tasks first, then idle active ones, then closed ones (folded); each mission's tasks in flight (oldest first), landed or accepted, sent back, cancelled (folded), an objective's retries nested under its latest attempt; residents waiting for a human's approval |
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
-The API is read-only: `/api/overview`, `/api/fleet` (with
-`/api/fleet/<session>/judgements` and `/commands`), `/api/attention`,
+The API reads, as `spawn_reader`, with GET only (any other method on a
+read is 405): `/api/overview`, `/api/fleet` (with
+`/api/fleet/<session>/judgements` and `/commands`, each command with
+`waiting` once the Bridge holds it for the agent's turn), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
 `/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
 `/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
-Humans talk to the supervisor
-through its pane, or `spawn submit --session session_supervisor --action
+
+It writes one thing: a person's input to a session, `POST
+/api/session/<id>/input` with `{"text", "key"}` (the key, an idempotency
+key, may come as an `Idempotency-Key` header). That is the command `spawn
+submit --principal human --agent <the session's agent> --session <id> --key
+<key> --action '{"type":"input","text":...}'` makes, with the same
+idempotency rule (a retried POST types once), and like every person's input
+it waits for the session's turn (§3). It answers 202 with the command, which
+`/commands` then follows; `{"probe": true}` passes every guard and writes
+nothing, so the page knows before it offers the box. It runs as the
+`spawn_human` login, whose one right is `spawn_human_input`: an input, as
+principal `human`, to the agent the session belongs to; no other action, no
+read, no event. Its guards, in order: the read guard (the clients that may
+read may write: the token, `SPAWN_SERVE_LOCAL_OPEN`'s owner client,
+`SPAWN_SERVE_OPEN_NETWORKS`' clients naming the server by its address);
+POST only (405); without the token, an `Origin` naming the server as the
+`Host` does, so a page on another site cannot make the owner's browser type,
+and, with no token set at all, a client socket the owner's uid holds;
+`Content-Type: application/json` (415), which no form can send without a
+preflight; a body of at most 16 KiB (413); a key and a text a person types:
+not blank, at most 8 KiB, no control character but tab and line ends (400).
+Humans talk to the supervisor through that box (top of the Fleet page), its
+pane, or `spawn submit --session session_supervisor --action
 '{"type":"input",...}'`.
 
 ## 6. Invariants
@@ -593,7 +625,7 @@ Known edges, each with its rule:
 - The event log is the only state; every process is restartable.
 - `EventKind` stays closed; observation fields are additive.
 - Facts > rules > Jev; observation never acts; Jev alone triggers only reversible, bounded actions.
-- Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing; it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. Roles belong to the whole cluster, so each database has its own pair, named after it (`spawn_supervisor_<db>`, `spawn_reader_<db>`, SQL `spawn_login_role`); grants, commands and records still name the principals `spawn_supervisor` and `spawn_reader` (`spawn_principal`). Two installs on one cluster thus share no privileges and set none of each other's passwords. The cluster-wide `spawn_supervisor`, `spawn_reader` and `spawn_terminal` of earlier installs lose every privilege in the schema and act as nobody; a migration warns while one can still log in, for a human to drop it. A login's password is PBKDF2-HMAC-SHA256 of the owner's password (600,000 rounds), salted with a random salt kept in the login's role comment and its name (`spawn_postgres::role_url`), and set by every migration: nothing secret is stored, only a holder of the owner's password can form it, and a login that knows its own password and salt pays the rounds for every guess at the owner's. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration turns the logins off (no login, no password, with a warning) until a migration that has the owner's password.
+- Worker panes hold no database login. The Bridge reads what an engine does from files it writes anyway and from its screen: the Claude transcript (the Bridge names the session with `--session-id`, so it knows the path before the engine starts), the pane read every tick, and the exit file the runner writes. The supervisor's pane gets `spawn_supervisor`, which reads the fleet and submits commands through the gateway but appends no events of its own. The Bridge, the Observer and the controllers run as the owner. `spawn serve` reads as `spawn_reader`, which can write nothing, and types a person's input as `spawn_human`, which can call `spawn_human_input` and nothing else (an input, principal `human`, to the session's own agent); it binds loopback, and on any other address needs `SPAWN_SERVE_TOKEN`. Roles belong to the whole cluster, so each database has its own set, named after it (`spawn_supervisor_<db>`, `spawn_reader_<db>`, `spawn_human_<db>`, SQL `spawn_login_role`); grants, commands and records still name the principals `spawn_supervisor`, `spawn_reader` and `human` (`spawn_principal`). Two installs on one cluster thus share no privileges and set none of each other's passwords. The cluster-wide `spawn_supervisor`, `spawn_reader` and `spawn_terminal` of earlier installs lose every privilege in the schema and act as nobody; a migration warns while one can still log in, for a human to drop it. A login's password is PBKDF2-HMAC-SHA256 of the owner's password (600,000 rounds), salted with a random salt kept in the login's role comment and its name (`spawn_postgres::role_url`), and set by every migration: nothing secret is stored, only a holder of the owner's password can form it, and a login that knows its own password and salt pays the rounds for every guess at the owner's. The owner's password is percent-decoded first, so every spelling of it agrees. An owner URL without a password derives nothing: `role_url` refuses, and such a migration turns the logins off (no login, no password, with a warning) until a migration that has the owner's password.
 - No model key in Spawn: the DeepSeek key stays in the model relay's process, the gateway token in Claude Code's own settings (§3.3).
 - Every landing goes through the black-box gate, a host-side commit, a compare-and-swap move of the baseline, and the halt rules (§10).
 
@@ -611,7 +643,9 @@ sessions started for the supervisor's tasks. Observation runs rules first and
 Jev on ambiguity, with the full payload. The dispatcher's policy decides
 fixed cases by rules, allows one guarded Jev-gated nudge (`continue`), and
 escalates everything else to the supervisor, which may escalate to a human.
-A human acts from the attention queue with `spawn submit --principal human`.
+A human reads the escalations queue when they choose and types to any
+session from the web page (`POST /api/session/<id>/input`) or with `spawn
+submit --principal human`.
 Every decision is in the log with its evidence and what followed it.
 
 ### 7.1 The end-to-end check

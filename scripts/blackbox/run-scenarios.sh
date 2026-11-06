@@ -41,7 +41,7 @@ failed_names=""
 drop_database() {
     $SPAWN_PSQL -d postgres -tA -c "drop database if exists $1 with (force)" >/dev/null 2>&1
     $SPAWN_PSQL -d postgres -tA -c \
-        "drop role if exists spawn_supervisor_$1, spawn_reader_$1" >/dev/null 2>&1
+        "drop role if exists spawn_supervisor_$1, spawn_reader_$1, spawn_human_$1" >/dev/null 2>&1
     return 0
 }
 

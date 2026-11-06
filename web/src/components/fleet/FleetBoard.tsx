@@ -169,7 +169,7 @@ export function FleetBoard({
 function GroupHint({ id }: { id: AgentGroupId }) {
   const text =
     id === "on_task"
-      ? "needs a human first, then the quietest"
+      ? "escalated first, then the quietest"
       : id === "idle"
         ? "live, no open task"
         : id === "ended"
@@ -280,7 +280,7 @@ function AgentRow({
           <div className="mt-0.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-micro text-muted-foreground">
             <span>{stateLabelUpper(agent.state)}</span>
             {agent.attention && (
-              <span className="font-medium text-warning">· needs a human</span>
+              <span className="font-medium text-warning">· escalated</span>
             )}
             {lost && (
               <span className="font-medium text-warning" title="Its engine ended while it holds an open task">

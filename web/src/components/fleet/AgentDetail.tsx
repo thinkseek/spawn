@@ -41,6 +41,7 @@ import {
   SectionLabel,
 } from "./bits";
 import { doingNow } from "./FleetBoard";
+import { InputBox } from "./InputBox";
 
 interface AgentDetailProps {
   agent: FleetAgent;
@@ -98,9 +99,9 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
           {agent.attention && (
             <span
               className="text-caption font-medium text-warning"
-              title={'In the dispatcher\'s "Needs a human" queue'}
+              title="In the dispatcher's Escalations, at the top of the Fleet page"
             >
-              needs a human
+              escalated
             </span>
           )}
           <span className="ml-auto" />
@@ -114,6 +115,14 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
         <AgentSummary agent={agent} />
+        <div className="border-b border-surface-border bg-page-canvas px-4 py-2.5 sm:px-5">
+          <InputBox
+            sessionId={sessionId}
+            to={agent.agent_id || sessionId}
+            stopped={!agent.live}
+            commands={commands.data}
+          />
+        </div>
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
             <JevPanel
@@ -260,11 +269,11 @@ function JevPanel({
         {judgement.attention && (
           <p
             className="text-caption text-muted-foreground"
-            title={'The judge\'s opinion only. Who needs a human is the dispatcher\'s view: the "Needs a human" queue.'}
+            title="The judge's opinion only. What is escalated is the dispatcher's view: the Escalations at the top of the Fleet page."
           >
             <span className="font-medium text-foreground">The judge asks for attention</span>
             {judgement.attention_reason && <> · {reasonText(judgement.attention_reason)}</>}
-            <span className="text-faint-foreground"> · its opinion, not the dispatcher's queue</span>
+            <span className="text-faint-foreground"> · its opinion, not the dispatcher's escalations</span>
           </p>
         )}
 
@@ -659,6 +668,16 @@ function CommandOutcome({ record }: { record: CommandRecord }) {
   }
   if (record.succeeded === false) {
     return <span className="text-destructive">failed</span>;
+  }
+  if (record.waiting) {
+    return (
+      <span
+        className="text-warning"
+        title="The agent is in a turn: the Bridge types it when the turn ends"
+      >
+        waiting for its turn
+      </span>
+    );
   }
   return <span className="text-muted-foreground">{record.state ?? "pending"}</span>;
 }

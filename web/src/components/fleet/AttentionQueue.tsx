@@ -1,11 +1,15 @@
 import {
   BellRing,
+  ChevronDown,
   ChevronRight,
   CircleCheck,
+  MessageCircle,
   MessageCircleQuestion,
   NotebookPen,
   TriangleAlert,
 } from "lucide-react";
+import type { ReactNode } from "react";
+import { useState } from "react";
 
 import type { PollResult } from "../../api";
 import type {
@@ -15,7 +19,12 @@ import type {
   SupervisorQuestion,
   SupervisorView,
 } from "../../attention";
-import { attentionGroups, itemSince } from "../../attention";
+import {
+  attentionGroups,
+  itemSince,
+  questionSummary,
+  toldFolded,
+} from "../../attention";
 import type { FleetAgent, FleetState } from "../../fleet";
 import {
   ambiguityText,
@@ -31,23 +40,31 @@ import { cx } from "../ui";
 import { FleetStateBadge, JudgeBadge, RoleBadge } from "./bits";
 
 /**
- * "Needs a human", top of the Fleet page. It shows what the dispatcher's own
- * code holds (`/api/attention`): the supervisor's open question, then the
- * escalations not yet told to the supervisor, then those it was told that
- * still hold. Below it, the supervisor's lines "For the owner": read, not
- * counted, since it does not wait on them. An older server without that
- * endpoint gets the list of agents whose latest judgement asks for
- * attention, labelled as the judges' only.
+ * "Escalations", top of the Fleet page: what the dispatcher raised, told to
+ * the supervisor or not, as its own code computes it (`/api/attention`),
+ * and the box to type to the supervisor (`talk`), always there. What the
+ * supervisor asks, when it asks, comes first, in at most three lines, with
+ * the box right under it; then the escalations not yet told to the
+ * supervisor; then those it was told that still hold, folded to a count
+ * while nothing is pending. Below it, the supervisor's lines "For the
+ * owner": read, not counted, since it does not wait on them. Nothing here
+ * waits on a person: the supervisor decides and reports, and the owner may
+ * type to it whenever they choose. An older server without that endpoint
+ * gets the list of agents whose latest judgement asks for attention,
+ * labelled as the judges' only.
  */
 export function AttentionQueue({
   view,
   agents,
   onSelect,
+  talk,
 }: {
   /** `/api/attention`, polled by App; a failed poll keeps the last view. */
   view: PollResult<Attention>;
   agents: FleetAgent[];
   onSelect: (sessionId: string) => void;
+  /** The input box to the supervisor, shown in every state of the queue. */
+  talk: ReactNode;
 }) {
   if (view.data) {
     return (
@@ -56,6 +73,7 @@ export function AttentionQueue({
         agents={agents}
         onSelect={onSelect}
         stale={view.error}
+        talk={talk}
       />
     );
   }
@@ -65,18 +83,23 @@ export function AttentionQueue({
         agents={agents}
         onSelect={onSelect}
         unavailable={view.error}
+        talk={talk}
       />
     );
   }
   return (
     <section
-      aria-label="Attention queue"
-      className="flex h-9 shrink-0 items-center gap-2 rounded-lg border border-border px-4"
+      aria-label="Escalations"
+      className="shrink-0 overflow-hidden rounded-lg border border-surface-border bg-surface"
     >
-      <BellRing size={14} className="shrink-0 text-faint-foreground" />
-      <span className="text-caption text-muted-foreground">
-        Reading the dispatcher's view…
-      </span>
+      <header className="flex h-9 items-center gap-2 border-b border-surface-border px-4">
+        <BellRing size={14} className="shrink-0 text-faint-foreground" />
+        <h2 className="text-label font-medium text-foreground">Escalations</h2>
+        <span className="text-caption text-muted-foreground">
+          Reading the dispatcher's view…
+        </span>
+      </header>
+      <div className="px-4 py-2.5">{talk}</div>
     </section>
   );
 }
@@ -85,13 +108,14 @@ function age(since: number | null): string | null {
   return since === null ? null : formatDuration(Math.max(0, Date.now() - since));
 }
 
-/** The dispatcher's view: question, then untold, then told; then the
- * supervisor's lines for the owner. */
+/** The dispatcher's view: what the supervisor asks and the box to it, then
+ * untold, then told; then the supervisor's lines for the owner. */
 function DispatcherQueue(props: {
   attention: Attention;
   agents: FleetAgent[];
   onSelect: (sessionId: string) => void;
   stale: string | null;
+  talk: ReactNode;
 }) {
   return (
     <>
@@ -141,59 +165,56 @@ function OwnerNotes({ notes }: { notes: OwnerNote[] }) {
   );
 }
 
-/** The queue itself: question, then untold, then told. */
+/** The queue itself: what the supervisor asks and the box to it, then
+ * untold, then told. */
 function Queue({
   attention,
   agents,
   onSelect,
   stale,
+  talk,
 }: {
   attention: Attention;
   agents: FleetAgent[];
   onSelect: (sessionId: string) => void;
   /** Why the latest poll failed, while the last view stays on screen. */
   stale: string | null;
+  talk: ReactNode;
 }) {
   const groups = attentionGroups(attention);
+  // Null follows the default (toldFolded); a click decides from then on.
+  const [toldOpen, setToldOpen] = useState<boolean | null>(null);
+  const folded = toldOpen === null ? toldFolded(groups) : !toldOpen;
   const known = new Set(agents.map((agent) => agent.session_id));
   const select = (session: string) =>
     known.has(session) ? () => onSelect(session) : undefined;
   const supervisor = attention.supervisor;
-
-  if (groups.count === 0) {
-    return (
-      <section
-        aria-label="Attention queue"
-        className="flex shrink-0 items-center gap-3 rounded-lg border border-success/20 bg-success/[0.06] px-4 py-3"
-      >
-        <CircleCheck size={18} className="shrink-0 text-success" />
-        <div className="min-w-0 flex-1">
-          <div className="text-label font-medium text-foreground">
-            No one needs a human
-          </div>
-          <div className="text-caption text-muted-foreground">
-            The dispatcher holds no escalation and the supervisor asks nothing.
-          </div>
-        </div>
-        <Stale error={stale} />
-        <SupervisorStatus supervisor={supervisor} />
-      </section>
-    );
-  }
+  const none = groups.count === 0;
 
   return (
     <section
-      aria-label="Attention queue"
-      className="shrink-0 overflow-hidden rounded-lg border border-warning/30 bg-warning/[0.05]"
+      aria-label="Escalations"
+      className="shrink-0 overflow-hidden rounded-lg border border-surface-border bg-surface"
     >
-      <header className="flex min-h-9 flex-wrap items-center gap-x-2 gap-y-1 border-b border-warning/20 px-4 py-1.5">
-        <BellRing size={14} className="shrink-0 text-warning" />
-        <h2 className="text-label font-medium text-foreground">
-          Needs a human
-        </h2>
-        <span className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning">
-          {groups.count}
-        </span>
+      <header className="flex min-h-9 flex-wrap items-center gap-x-2 gap-y-1 border-b border-surface-border px-4 py-1.5">
+        {none ? (
+          <CircleCheck size={14} className="shrink-0 text-success" />
+        ) : (
+          <BellRing size={14} className="shrink-0 text-warning" />
+        )}
+        <h2 className="text-label font-medium text-foreground">Escalations</h2>
+        {none ? (
+          <span className="text-caption text-muted-foreground">
+            none: the dispatcher holds nothing and the supervisor asks nothing
+          </span>
+        ) : (
+          <span
+            className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning"
+            title="What the dispatcher raised, told to the supervisor or not, and what the supervisor asks"
+          >
+            {groups.count}
+          </span>
+        )}
         <span
           className="text-micro text-faint-foreground"
           title="Computed by the dispatcher's own code: what it would escalate this moment"
@@ -206,28 +227,49 @@ function Queue({
         </span>
       </header>
 
-      {groups.question && supervisor && (
-        <QuestionBlock
-          question={groups.question}
-          supervisor={supervisor}
-          onOpen={select(supervisor.session_id)}
-        />
-      )}
+      <div className="border-b border-surface-border px-4 py-2.5 last:border-b-0">
+        {groups.question && supervisor && (
+          <Asks question={groups.question} onOpen={select(supervisor.session_id)} />
+        )}
+        {talk}
+      </div>
 
       <ItemSection
         title="Not yet told to the supervisor"
         items={groups.untold}
         select={select}
       />
-      <ItemSection
-        title="Told to the supervisor, unresolved"
-        items={groups.told}
-        select={select}
-        muted
-      />
+      {groups.told.length > 0 &&
+        (folded ? (
+          <button
+            type="button"
+            aria-expanded={false}
+            onClick={() => setToldOpen(true)}
+            className="flex w-full items-center gap-1.5 border-b border-surface-border px-4 py-2 text-left text-caption text-muted-foreground transition-colors last:border-b-0 hover:bg-surface-hover"
+          >
+            <ChevronRight size={13} className="shrink-0" />
+            <span>
+              <span className="tnum font-medium text-foreground">
+                {groups.told.length}
+              </span>{" "}
+              told to the supervisor, unresolved
+            </span>
+            <span className="text-faint-foreground">
+              · each in a digest it received
+            </span>
+          </button>
+        ) : (
+          <ItemSection
+            title="Told to the supervisor, unresolved"
+            items={groups.told}
+            select={select}
+            muted
+            onFold={() => setToldOpen(false)}
+          />
+        ))}
 
       {attention.warnings.length > 0 && (
-        <p className="flex items-start gap-1.5 border-t border-warning/15 px-4 py-2 text-caption text-muted-foreground">
+        <p className="flex items-start gap-1.5 border-t border-surface-border px-4 py-2 text-caption text-muted-foreground">
           <TriangleAlert size={13} className="mt-px shrink-0 text-warning" />
           <span>
             Not everything could be read: {attention.warnings.join("; ")}
@@ -278,101 +320,91 @@ function SupervisorStatus({ supervisor }: { supervisor: SupervisorView | null })
   }
   const state: FleetState = fleetState(judgement.state);
   return (
-    <span className="inline-flex items-center gap-1.5 text-caption text-muted-foreground">
+    <span
+      className="inline-flex items-center gap-1.5 text-caption text-muted-foreground"
+      title={
+        judgement.needs_human !== null
+          ? `Its judge's needs_human: ${percent(judgement.needs_human)}`
+          : undefined
+      }
+    >
       supervisor
       <FleetStateBadge state={state} size="sm" />
-      {judgement.needs_human !== null && (
-        <span>
-          needs human{" "}
-          <span className="tnum font-medium text-foreground">
-            {percent(judgement.needs_human)}
-          </span>
-        </span>
-      )}
     </span>
   );
 }
 
-/** The supervisor's open question, in full. */
-function QuestionBlock({
+/** What the supervisor asks, in at most three lines (its `HUMAN:` line, or
+ * its reply's last paragraph), and its whole reply on request. */
+function Asks({
   question,
-  supervisor,
   onOpen,
 }: {
   question: SupervisorQuestion;
-  supervisor: SupervisorView;
   onOpen?: () => void;
 }) {
-  const asked = question.asked_at_ms;
-  const human = question.human;
-  const humanEarlier =
-    human?.at_ms != null && asked !== null && asked - human.at_ms > 60_000;
+  const [whole, setWhole] = useState(false);
+  const summary = questionSummary(question);
+  const asked = question.human?.at_ms ?? question.asked_at_ms;
   return (
-    <div className="border-b border-warning/20 px-4 py-3">
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <MessageCircleQuestion size={15} className="shrink-0 text-warning" />
-        <h3 className="text-label font-semibold text-foreground">
-          The supervisor is waiting for you
+    <div className="mb-2.5">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-muted-foreground">
+        <MessageCircle size={13} className="shrink-0" />
+        <h3 className="text-label font-medium text-foreground">
+          The supervisor asks
         </h3>
         {asked !== null && (
-          <span className="tnum text-caption text-muted-foreground">
-            asked{" "}
-            <span className="font-medium text-foreground">{age(asked)}</span>{" "}
-            ago, at {clockTime(asked)}
+          <span className="tnum">
+            {age(asked)} ago, at {clockTime(asked)}
           </span>
         )}
-        {supervisor.judgement && (
-          <span className="text-caption text-muted-foreground">
-            · {stateLabelUpper(fleetState(supervisor.judgement.state))}, needs
-            human {percent(supervisor.judgement.needs_human)}
-          </span>
-        )}
-      </div>
-
-      {human && (
-        <p className="mt-2 rounded-md border border-warning/30 bg-warning/[0.08] px-3 py-2 text-body font-medium text-foreground">
-          {human.text}
-          {humanEarlier && human.at_ms !== null && (
-            <span className="ml-2 text-caption font-normal text-muted-foreground">
-              asked {age(human.at_ms)} ago, at {clockTime(human.at_ms)}, and
-              not answered since
-            </span>
-          )}
-        </p>
-      )}
-
-      {question.text ? (
-        <div className="mt-2 max-h-80 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background/60 px-3 py-2 font-mono text-caption text-foreground">
-          {question.text}
-        </div>
-      ) : (
-        <p className="mt-2 text-caption text-muted-foreground">
-          Its words could not be read here; its pane shows them.
-        </p>
-      )}
-
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-muted-foreground">
-        <span>
-          Answer it in the supervisor's own pane (
-          <code className="font-mono text-micro">session_supervisor</code>
-          ); this page only reads.
-        </span>
         {question.source === "screen" && (
-          <span className="text-faint-foreground">
-            Shown from its last judged screen: the transcript could not be read.
+          <span
+            className="text-faint-foreground"
+            title="The transcript could not be read"
+          >
+            from its last judged screen
           </span>
         )}
         {onOpen && (
           <button
             type="button"
             onClick={onOpen}
-            className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-2 hover:underline"
+            className="ml-auto inline-flex items-center gap-0.5 font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
           >
             Open its pane
             <ChevronRight size={12} />
           </button>
         )}
       </div>
+      {summary.text ? (
+        <p
+          className="mt-1 line-clamp-3 whitespace-pre-wrap break-words text-label text-foreground"
+          title={summary.text}
+        >
+          {summary.text}
+        </p>
+      ) : (
+        <p className="mt-1 text-caption text-muted-foreground">
+          Its words could not be read here; its pane shows them.
+        </p>
+      )}
+      {summary.more && (
+        <button
+          type="button"
+          aria-expanded={whole}
+          onClick={() => setWhole((open) => !open)}
+          className="mt-0.5 inline-flex items-center gap-0.5 text-caption font-medium text-muted-foreground hover:text-foreground"
+        >
+          {whole ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          {whole ? "hide the whole reply" : "show the whole reply"}
+        </button>
+      )}
+      {whole && question.text && (
+        <div className="mt-1.5 max-h-80 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-surface-border bg-background/60 px-3 py-2 font-mono text-caption text-foreground">
+          {question.text}
+        </div>
+      )}
     </div>
   );
 }
@@ -382,20 +414,40 @@ function ItemSection({
   items,
   select,
   muted = false,
+  onFold,
 }: {
   title: string;
   items: AttentionItem[];
   select: (session: string) => (() => void) | undefined;
   muted?: boolean;
+  /** Fold the section to its count again. */
+  onFold?: () => void;
 }) {
   if (items.length === 0) return null;
+  const heading = (
+    <>
+      {onFold && <ChevronDown size={12} className="shrink-0" />}
+      {title}
+      <span className="tnum normal-case tracking-normal">{items.length}</span>
+    </>
+  );
+  const headingClass =
+    "flex items-center gap-2 px-4 pb-1 pt-2 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground";
   return (
-    <div className="border-b border-warning/15 last:border-b-0">
-      <div className="flex items-center gap-2 px-4 pb-1 pt-2 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
-        {title}
-        <span className="tnum normal-case tracking-normal">{items.length}</span>
-      </div>
-      <ul className="divide-y divide-warning/10">
+    <div className="border-b border-surface-border last:border-b-0">
+      {onFold ? (
+        <button
+          type="button"
+          aria-expanded
+          onClick={onFold}
+          className={cx(headingClass, "w-full text-left hover:text-foreground")}
+        >
+          {heading}
+        </button>
+      ) : (
+        <div className={headingClass}>{heading}</div>
+      )}
+      <ul className="divide-y divide-surface-border">
         {items.map((item) => (
           <li key={item.tag || `${item.session_id} ${item.line}`}>
             <ItemRow item={item} onSelect={select(item.session_id)} muted={muted} />
@@ -466,7 +518,7 @@ function ItemRow({
     <button
       type="button"
       onClick={onSelect}
-      className="group flex w-full items-start gap-3 px-4 py-2 text-left transition-colors hover:bg-warning/[0.06]"
+      className="group flex w-full items-start gap-3 px-4 py-2 text-left transition-colors hover:bg-surface-hover"
     >
       {body}
     </button>
@@ -514,57 +566,46 @@ function JudgementQueue({
   agents,
   onSelect,
   unavailable,
+  talk,
 }: {
   agents: FleetAgent[];
   onSelect: (sessionId: string) => void;
   unavailable: string;
+  talk: ReactNode;
 }) {
   const queue = agents.filter((agent) => agent.judgement?.attention === true).sort(rank);
 
-  if (queue.length === 0) {
-    return (
-      <section
-        aria-label="Attention queue"
-        className="flex shrink-0 items-center gap-3 rounded-lg border border-success/20 bg-success/[0.06] px-4 py-3"
-      >
-        <CircleCheck size={18} className="shrink-0 text-success" />
-        <div className="min-w-0 flex-1">
-          <div className="text-label font-medium text-foreground">
-            No judge asks for attention
-          </div>
-          <div className="text-caption text-muted-foreground">
-            Who needs a human is the dispatcher's to say, and its view could not be read.
-          </div>
-        </div>
-        <Unavailable error={unavailable} />
-      </section>
-    );
-  }
-
   return (
     <section
-      aria-label="Attention queue"
-      className="shrink-0 overflow-hidden rounded-lg border border-warning/30 bg-warning/[0.05]"
+      aria-label="Escalations"
+      className="shrink-0 overflow-hidden rounded-lg border border-surface-border bg-surface"
     >
-      <header className="flex h-9 items-center gap-2 border-b border-warning/20 px-4">
-        <BellRing size={14} className="shrink-0 text-warning" />
+      <header className="flex h-9 items-center gap-2 border-b border-surface-border px-4">
+        <BellRing size={14} className="shrink-0 text-faint-foreground" />
         <h2 className="text-label font-medium text-foreground">
-          Judges ask for attention
+          {queue.length > 0 ? "Judges ask for attention" : "No judge asks for attention"}
         </h2>
-        <span className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning">
-          {queue.length}
-        </span>
+        {queue.length > 0 && (
+          <span className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning">
+            {queue.length}
+          </span>
+        )}
         <span className="ml-auto">
           <Unavailable error={unavailable} />
         </span>
       </header>
-      <ul className="divide-y divide-warning/15">
-        {queue.map((agent) => (
-          <li key={agent.session_id}>
-            <AttentionRow agent={agent} onSelect={onSelect} />
-          </li>
-        ))}
-      </ul>
+      <div className="border-b border-surface-border px-4 py-2.5 last:border-b-0">
+        {talk}
+      </div>
+      {queue.length > 0 && (
+        <ul className="divide-y divide-surface-border">
+          {queue.map((agent) => (
+            <li key={agent.session_id}>
+              <AttentionRow agent={agent} onSelect={onSelect} />
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
@@ -587,7 +628,7 @@ function AttentionRow({
     <button
       type="button"
       onClick={() => onSelect(agent.session_id)}
-      className="group flex w-full items-start gap-3 px-4 py-2.5 text-left transition-colors hover:bg-warning/[0.06]"
+      className="group flex w-full items-start gap-3 px-4 py-2.5 text-left transition-colors hover:bg-surface-hover"
     >
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">

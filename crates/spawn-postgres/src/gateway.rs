@@ -1,9 +1,11 @@
 //! Access as a restricted login: reads through the grant-filtered
 //! `spawn_read_*` functions and submissions through the `agent_commands`
-//! gateway, so the caller sees and sends exactly what `spawn_grants` allows.
+//! gateway, so the caller sees and sends exactly what `spawn_grants` allows;
+//! and a person's input from the web page as the `spawn_human` login,
+//! through `spawn_human_input`, the one function that login may call.
 
 use spawn_core::command::Submission;
-use spawn_core::id::{CommandId, SessionId};
+use spawn_core::id::{CommandId, IdempotencyKey, SessionId};
 use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
@@ -60,6 +62,11 @@ pub(crate) const TAIL: &str = "select jsonb_build_object(
 /// `$1` agent, `$2` session, `$3` idempotency key, `$4` action.
 pub(crate) const SUBMIT: &str = "select spawn_gateway_submit($1, $2, $3, $4)";
 
+/// A person's input as the `spawn_human` login: the command made (or the one
+/// an earlier call with this key made), null when no agent has used the
+/// session. `$1` session, `$2` idempotency key, `$3` text.
+pub(crate) const HUMAN_INPUT: &str = "select spawn_human_input($1, $2, $3)";
+
 impl PostgresStore {
     /// The fleet as one JSON array, read through the grant-filtered
     /// `spawn_read_*` functions, so it shows exactly what the caller's login
@@ -96,5 +103,24 @@ impl PostgresStore {
             ],
         )?;
         Ok(CommandId(row.get::<_, i64>(0).unsigned_abs()))
+    }
+
+    /// Type `text` into `session` as a person, through `spawn_human_input`:
+    /// the input `spawn submit --principal human` would submit to the
+    /// session's agent, with the same idempotency rule (a repeated `key`
+    /// returns the first command). Only a store connected as the
+    /// `spawn_human` login may call it (`role_url(owner, "spawn_human")`);
+    /// that login can do nothing else. `None` when no agent has used the
+    /// session.
+    pub fn submit_human_input(
+        &self,
+        session: &SessionId,
+        key: &IdempotencyKey,
+        text: &str,
+    ) -> Result<Option<CommandId>, StoreError> {
+        let row = self.query_one(HUMAN_INPUT, &[&session.as_str(), &key.as_str(), &text])?;
+        Ok(row
+            .get::<_, Option<i64>>(0)
+            .map(|id| CommandId(id.unsigned_abs())))
     }
 }

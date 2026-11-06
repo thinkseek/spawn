@@ -1,8 +1,33 @@
-//! Read-only HTTP API and static files for the observer UI.
+//! HTTP API and static files for the observer UI: reads, and one write, a
+//! person's input to a session.
 //!
-//! The UI never writes. Every endpoint reads an existing view through the
-//! same store methods the CLI uses, so a defect in the UI cannot change
-//! state.
+//! Every read goes through the same store methods the CLI uses, as the
+//! read-only `spawn_reader` login, so a defect in a read cannot change
+//! state. An API path that reads answers 405 to any method but GET and HEAD.
+//!
+//! The one write is `POST /api/session/<id>/input` with `{"text": "...",
+//! "key": "<idempotency key>"}` (the key may come in an `Idempotency-Key`
+//! header instead): the input `spawn submit --principal human --agent <the
+//! session's agent> --session <id> --key <key> --action
+//! '{"type":"input","text":...}'` makes, with the same idempotency rule, so
+//! a retried POST types once; like every person's input it waits for the
+//! session's turn. It answers 202 with the command, which
+//! `/api/fleet/<id>/commands` then follows. It runs as the `spawn_human`
+//! login, whose one right is `spawn_human_input`
+//! (crates/spawn-postgres/sql/schema.sql): it submits no other action, reads
+//! nothing and appends no event. `{"probe": true}` in place of a text passes
+//! every guard and writes nothing: the page asks it before it offers its
+//! input box. The guards, in order: the read guard below (the clients that
+//! may read may write, and no other); POST only, 405 otherwise; unless the
+//! request carries the token, an `Origin` naming this server as the `Host`
+//! does (a page on another site cannot make the owner's browser type), and,
+//! when no token is set at all, a client socket the owner's uid holds (as
+//! `SPAWN_SERVE_LOCAL_OPEN` checks: anyone on a token-less loopback server
+//! reads, only the owner types); `Content-Type: application/json` (no form
+//! a page may post without asking first), 415 otherwise; a body of at most
+//! [`MAX_INPUT_BODY`] bytes, 413 otherwise; then a key and a text a person
+//! types (not blank, at most [`MAX_INPUT_TEXT`] bytes, no control character
+//! but tab and line ends), 400 otherwise.
 //!
 //! Reading is still worth guarding: `/api/pane/<id>` shows any live pane.
 //! `serve` binds 127.0.0.1 unless told otherwise, and on any other address
@@ -34,8 +59,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use spawn_core::event::{GlobalPosition, SessionSeq};
-use spawn_core::id::SessionId;
-use tiny_http::{Header, Request, Response, Server};
+use spawn_core::id::{IdempotencyKey, SessionId};
+use tiny_http::{Header, Method, Request, Response, Server};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::TerminalHost;
@@ -63,6 +88,13 @@ const DEFAULT_LIMIT: usize = 200;
 
 /// Largest page the timeline returns.
 const MAX_LIMIT: usize = 1000;
+
+/// Largest body `POST /api/session/<id>/input` takes, in bytes.
+const MAX_INPUT_BODY: usize = 16 * 1024;
+
+/// Longest text a person types from the page, in bytes. `spawn_human_input`
+/// (schema.sql) holds the same bound.
+const MAX_INPUT_TEXT: usize = 8 * 1024;
 
 /// Serve the API and the built UI until the process is killed.
 pub fn serve(flags: &Flags) -> Result<i32, String> {
@@ -105,6 +137,7 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         port,
         hosts,
         open,
+        owner_url: env_value("SPAWN_DATABASE_URL"),
     });
     serve_requests(&server, &shared, MAX_IN_FLIGHT);
     Ok(0)
@@ -127,6 +160,9 @@ struct Shared {
     /// Networks whose clients read without the token
     /// (`SPAWN_SERVE_OPEN_NETWORKS`, [`open_network_request`]).
     open: Vec<Network>,
+    /// The owner's database URL (`SPAWN_DATABASE_URL`), from which a
+    /// person's input derives the `spawn_human` login ([`writer`]).
+    owner_url: Option<String>,
 }
 
 /// Requests in flight, at most `limit`.
@@ -176,14 +212,7 @@ fn serve_requests(server: &Server, shared: &Arc<Shared>, limit: usize) {
             .name("serve-request".to_string())
             .spawn(move || {
                 let _slot = slot;
-                if let Err(error) = handle(
-                    request,
-                    &shared.web,
-                    shared.token.as_deref(),
-                    shared.port,
-                    &shared.hosts,
-                    &shared.open,
-                ) {
+                if let Err(error) = handle(request, &shared) {
                     eprintln!("serve: {error}");
                 }
             });
@@ -317,9 +346,13 @@ fn local_exemption(
 /// [`local_exemption`] for a request from `peer` to this server's `port`,
 /// with the uids read from `/proc`.
 fn owners_own_request(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
-    if !local_open() {
-        return false;
-    }
+    local_open() && owners_client(peer, port)
+}
+
+/// Whether the client end of a connection from `peer` to this server's
+/// `port` is a loopback socket the owner's uid holds, by `/proc` (none
+/// without it): [`local_exemption`] whatever `SPAWN_SERVE_LOCAL_OPEN` says.
+fn owners_client(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
     let tables: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
@@ -561,43 +594,63 @@ fn open_store() -> Result<spawn_postgres::PostgresStore, String> {
         .map_err(|error| error.to_string())
 }
 
-fn handle(
-    request: Request,
-    web: &Path,
-    token: Option<&str>,
-    port: Option<u16>,
-    hosts: &[String],
-    open: &[Network],
-) -> Result<(), String> {
+/// What the read guard decided for one API request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Access {
+    /// It may read (and so ask to write, [`input`]).
+    read: bool,
+    /// It carries the token.
+    token: bool,
+}
+
+/// The read guard. Without the token a read needs a Host that names this
+/// server and no foreign Origin (DNS rebinding, a local proxy); with it,
+/// any. With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
+/// needs no token: a client running as the owner's uid can read the token
+/// file anyway. Another user's loopback client still needs it. Off by
+/// default. A client of an open network (SPAWN_SERVE_OPEN_NETWORKS) that
+/// names this server by its address there needs none either.
+fn access(request: &Request, query: &str, shared: &Shared) -> Access {
+    let host = header(request, "Host");
+    let origin = header(request, "Origin");
+    let named = tokenless_request(host, origin, &shared.hosts);
+    let peer = request.remote_addr().copied();
+    let Some(token) = shared.token.as_deref() else {
+        return Access {
+            read: named,
+            token: false,
+        };
+    };
+    let carries = authorized(request, query, token);
+    Access {
+        read: carries
+            || (named && owners_own_request(peer, shared.port))
+            || open_network_request(peer, host, origin, shared.port, &shared.open),
+        token: carries,
+    }
+}
+
+fn handle(request: Request, shared: &Shared) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((path, query)) => (path, query),
         None => (url.as_str(), ""),
     };
     if path.starts_with("/api/") {
-        // Without the token a read needs a Host that names this server and
-        // no foreign Origin (DNS rebinding, a local proxy); with it, any.
-        // With SPAWN_SERVE_LOCAL_OPEN=1 the owner's browser on this machine
-        // needs no token: a client running as the owner's uid can read the
-        // token file anyway. Another user's loopback client still needs it.
-        // Off by default.
-        let named = tokenless_request(header(&request, "Host"), header(&request, "Origin"), hosts);
-        let open = match token {
-            None => named,
-            Some(token) => {
-                authorized(&request, query, token)
-                    || (named && owners_own_request(request.remote_addr().copied(), port))
-                    || open_network_request(
-                        request.remote_addr().copied(),
-                        header(&request, "Host"),
-                        header(&request, "Origin"),
-                        port,
-                        open,
-                    )
-            }
-        };
-        if !open {
-            return refuse(request, token.is_some());
+        let access = access(&request, query, shared);
+        if !access.read {
+            return refuse(request, shared.token.is_some());
+        }
+        if let Some(id) = path
+            .strip_prefix("/api/session/")
+            .and_then(|rest| rest.strip_suffix("/input"))
+        {
+            return input(request, id, access, shared);
+        }
+        if !matches!(request.method(), Method::Get | Method::Head) {
+            return request
+                .respond(not_allowed("GET"))
+                .map_err(|error| error.to_string());
         }
     }
     let answer = match path {
@@ -619,7 +672,7 @@ fn handle(
             } else if let Some(rest) = path.strip_prefix("/api/fleet/") {
                 fleet_session(rest, query)
             } else {
-                return static_file(request, web, path);
+                return static_file(request, &shared.web, path);
             }
         }
     };
@@ -649,6 +702,229 @@ fn refuse(request: Request, token_set: bool) -> Result<(), String> {
         )
     };
     request.respond(response).map_err(|error| error.to_string())
+}
+
+/// 405, naming the one method (`allow`) the path takes.
+fn not_allowed(allow: &'static str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let header = Header::from_bytes("Allow", allow).expect("static header is valid");
+    json_response(
+        405,
+        &json!({ "error": format!("method not allowed: this path takes {allow} only") }),
+    )
+    .with_header(header)
+}
+
+/// `POST /api/session/<id>/input`, past the read guard (`access`): a
+/// person's input to session `id`, or a probe of whether one would be taken
+/// (module doc).
+fn input(mut request: Request, id: &str, access: Access, shared: &Shared) -> Result<(), String> {
+    if *request.method() != Method::Post {
+        return request
+            .respond(not_allowed("POST"))
+            .map_err(|error| error.to_string());
+    }
+    let (status, body) = match typed(&mut request, id, access, shared) {
+        Ok(answer) => answer,
+        Err((status, error)) => (status, json!({ "error": error })),
+    };
+    request
+        .respond(json_response(status, &body))
+        .map_err(|error| error.to_string())
+}
+
+/// The body of `POST /api/session/<id>/input`: a person's text and its
+/// idempotency key, or `{"probe": true}` alone. Nothing else: no action
+/// type, no agent, no principal.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputBody {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    probe: bool,
+}
+
+/// The checks of a person's input after its method, then the probe's answer
+/// or the submission: `(status, answer)`, or `(status, why)` when refused.
+fn typed(
+    request: &mut Request,
+    id: &str,
+    access: Access,
+    shared: &Shared,
+) -> Result<(u16, Value), (u16, String)> {
+    if !access.token {
+        if !same_origin(header(request, "Host"), header(request, "Origin")) {
+            return Err((
+                403,
+                "forbidden: an input without the token needs this page's own Origin".to_string(),
+            ));
+        }
+        if shared.token.is_none() && !owners_client(request.remote_addr().copied(), shared.port) {
+            return Err((
+                403,
+                "forbidden: with no SPAWN_SERVE_TOKEN set, only the owner's own client on this \
+                 machine types"
+                    .to_string(),
+            ));
+        }
+    }
+    if !is_json(header(request, "Content-Type")) {
+        return Err((
+            415,
+            "an input is a JSON body (Content-Type: application/json)".to_string(),
+        ));
+    }
+    let header_key = header(request, "Idempotency-Key").map(str::to_string);
+    let body = read_body(request)?;
+    let body: InputBody = serde_json::from_slice(&body).map_err(|error| {
+        (
+            400,
+            format!("{BAD_REQUEST}the body is not an input: {error}"),
+        )
+    })?;
+    let session = session_id(id).map_err(|error| (400, error))?;
+    if body.probe {
+        if body.text.is_some() || body.key.is_some() || header_key.is_some() {
+            return Err((
+                400,
+                format!("{BAD_REQUEST}a probe carries no text and no key"),
+            ));
+        }
+        writer(shared).map_err(|error| (500, error))?;
+        return Ok((
+            200,
+            json!({ "writable": true, "session_id": session.as_str(),
+                    "max_text_bytes": MAX_INPUT_TEXT }),
+        ));
+    }
+    let key = match (body.key, header_key) {
+        (Some(body), Some(header)) if body != header => {
+            return Err((
+                400,
+                format!("{BAD_REQUEST}the key and the Idempotency-Key header differ"),
+            ));
+        }
+        (Some(key), _) | (None, Some(key)) => IdempotencyKey::new(key)
+            .map_err(|error| (400, format!("{BAD_REQUEST}the key: {error}")))?,
+        (None, None) => {
+            return Err((
+                400,
+                format!(
+                    "{BAD_REQUEST}an input needs an idempotency key (\"key\", or an \
+                     Idempotency-Key header), so that a retried POST types once"
+                ),
+            ));
+        }
+    };
+    let text = typed_text(body.text).map_err(|error| (400, format!("{BAD_REQUEST}{error}")))?;
+    let store = writer(shared).map_err(|error| (500, error))?;
+    match store.submit_human_input(&session, &key, &text) {
+        Ok(Some(command)) => Ok((
+            202,
+            json!({ "command_id": command.0, "session_id": session.as_str(),
+                    "principal": "human" }),
+        )),
+        Ok(None) => Err((
+            404,
+            format!(
+                "no agent has used {}: there is nothing to type into",
+                session.as_str()
+            ),
+        )),
+        Err(error) => Err((500, error.to_string())),
+    }
+}
+
+/// Whether `origin` is this page's own: present, and the same host over
+/// http as the request's `Host`.
+fn same_origin(host: Option<&str>, origin: Option<&str>) -> bool {
+    let (Some(host), Some(origin)) = (host, origin) else {
+        return false;
+    };
+    origin
+        .trim()
+        .strip_prefix("http://")
+        .is_some_and(|rest| authority(rest) == authority(host))
+}
+
+/// Whether a `Content-Type` value is JSON's (`application/json`, with any
+/// parameters).
+fn is_json(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// A request's body, at most [`MAX_INPUT_BODY`] bytes (413 past it: a
+/// declared length is refused unread).
+fn read_body(request: &mut Request) -> Result<Vec<u8>, (u16, String)> {
+    use std::io::Read;
+    let too_big = || {
+        (
+            413,
+            format!("the body is over {MAX_INPUT_BODY} bytes, the most an input takes"),
+        )
+    };
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_INPUT_BODY)
+    {
+        return Err(too_big());
+    }
+    let mut body = Vec::new();
+    let limit = u64::try_from(MAX_INPUT_BODY).unwrap_or(u64::MAX) + 1;
+    Read::take(request.as_reader(), limit)
+        .read_to_end(&mut body)
+        .map_err(|error| {
+            (
+                400,
+                format!("{BAD_REQUEST}the body could not be read: {error}"),
+            )
+        })?;
+    if body.len() > MAX_INPUT_BODY {
+        return Err(too_big());
+    }
+    Ok(body)
+}
+
+/// `text` as a person types it, or why it is not: present, not blank, at
+/// most [`MAX_INPUT_TEXT`] bytes, and no control character but tab and line
+/// ends (an escape would reach the engine's terminal as keys).
+fn typed_text(text: Option<String>) -> Result<String, String> {
+    let text = text.ok_or("an input needs a text")?;
+    if text.trim().is_empty() {
+        return Err("the text is empty".to_string());
+    }
+    if text.len() > MAX_INPUT_TEXT {
+        return Err(format!(
+            "the text is {} bytes; an input is at most {MAX_INPUT_TEXT}",
+            text.len()
+        ));
+    }
+    if text
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
+    {
+        return Err(
+            "the text holds a control character; only tab and line ends are typed".to_string(),
+        );
+    }
+    Ok(text)
+}
+
+/// A connection as the `spawn_human` login, derived from the owner's URL:
+/// the one login a write uses, which may call `spawn_human_input` and
+/// nothing else.
+fn writer(shared: &Shared) -> Result<spawn_postgres::PostgresStore, String> {
+    let owner = shared
+        .owner_url
+        .as_deref()
+        .ok_or_else(|| "SPAWN_DATABASE_URL is not set".to_string())?;
+    let url = spawn_postgres::role_url(owner, "spawn_human")?;
+    spawn_postgres::PostgresStore::connect_with_statement_timeout(&url, STATEMENT_TIMEOUT)
+        .map_err(|error| error.to_string())
 }
 
 fn json_response(status: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -1340,10 +1616,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_LIMIT, ProcSocket, Shared, access_token,
-        handle, is_loopback, local_exemption, log_window, objective_json, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_summary, same_secret, serve_requests,
-        server_hosts, tokenless_request, with_last_gates,
+        Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
+        ProcSocket, Shared, access_token, handle, is_json, is_loopback, local_exemption,
+        log_window, objective_json, open_network_request, open_networks, owner_uid, peer_uid,
+        proc_sockets, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
+        tokenless_request, typed_text, with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1586,6 +1863,442 @@ mod tests {
             401,
             "a client outside the open network: the token"
         );
+    }
+
+    /// The body of an input every guard but the one tested lets through.
+    const BODY: &str = r#"{"text":"stop objective_87","key":"k-1"}"#;
+
+    /// `answer` refuses with `status`, before the database: these tests set
+    /// no SPAWN_DATABASE_URL, so a request past every guard would answer 500
+    /// "SPAWN_DATABASE_URL is not set" instead.
+    fn refused(answer: &Answer, status: u16, why: &str) {
+        assert_eq!(answer.status, status, "{why}: {answer:?}");
+        assert!(
+            !answer.body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SPAWN_DATABASE_URL"),
+            "{why}: refused before the database"
+        );
+    }
+
+    /// The read guard refuses an input as it refuses a read: the clients
+    /// that may read may write, and no other.
+    #[test]
+    fn the_read_guard_refuses_an_input_as_it_refuses_a_read() {
+        let json = "Content-Type: application/json\r\n";
+        for (token, open, headers, status, why) in [
+            (
+                Some("secret"),
+                "",
+                "Host: 127.0.0.1:PORT\r\n",
+                401,
+                "a token set and none carried",
+            ),
+            (
+                Some("secret"),
+                "",
+                "Host: attacker.example:PORT\r\nOrigin: http://attacker.example:PORT\r\n",
+                401,
+                "a rebound name",
+            ),
+            (
+                None,
+                "",
+                "Host: attacker.example:PORT\r\n",
+                403,
+                "no token set, a Host that does not name this server",
+            ),
+            (
+                None,
+                "",
+                "Host: 127.0.0.1:PORT\r\nOrigin: http://attacker.example\r\n",
+                403,
+                "a page on another site",
+            ),
+            (
+                Some("secret"),
+                "127.0.0.0/8",
+                "Host: 127.0.0.1:PORT\r\nOrigin: http://evil.example\r\n",
+                401,
+                "an open network's client from another site's page",
+            ),
+        ] {
+            let headers = format!("{headers}{json}");
+            refused(&post(token, open, None, INPUT, &headers, BODY), status, why);
+        }
+    }
+
+    /// Past the read guard, an input without the token needs its page's own
+    /// `Origin`, which a browser sends with every POST: a script with no
+    /// Origin needs the token.
+    #[test]
+    fn an_input_without_the_token_needs_its_pages_origin() {
+        let named = "Host: 127.0.0.1:PORT\r\nContent-Type: application/json\r\n";
+        for (token, open, why) in [
+            (None, "", "no token set"),
+            (Some("secret"), "127.0.0.0/8", "an open network's client"),
+        ] {
+            let answer = post(token, open, None, INPUT, named, BODY);
+            refused(&answer, 403, why);
+            assert!(
+                answer.body["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Origin")),
+                "{why}: {answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_input_path_takes_post_only() {
+        for method in ["GET", "PUT", "DELETE", "PATCH"] {
+            let answer = exchange(
+                Some("secret"),
+                "",
+                None,
+                &format!(
+                    "{method} {INPUT} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Authorization: Bearer secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            refused(&answer, 405, method);
+            assert!(answer.head.contains("Allow: POST"), "{method}: {answer:?}");
+        }
+    }
+
+    /// Only JSON (a form or a text post is one a page may send without
+    /// asking first), and at most 16 KiB of it, declared or chunked.
+    #[test]
+    fn an_input_is_a_json_body_of_at_most_16_kib() {
+        for content in [
+            "",
+            "Content-Type: text/plain\r\n",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+            "Content-Type: multipart/form-data; boundary=x\r\n",
+        ] {
+            let headers =
+                format!("Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n{content}");
+            refused(
+                &post(Some("secret"), "", None, INPUT, &headers, BODY),
+                415,
+                content,
+            );
+        }
+        let big = format!(r#"{{"text":"{}","key":"k-1"}}"#, "a".repeat(MAX_INPUT_BODY));
+        refused(
+            &post(Some("secret"), "", None, INPUT, SCRIPT, &big),
+            413,
+            "a body over 16 KiB",
+        );
+        let chunked = exchange(
+            Some("secret"),
+            "",
+            None,
+            &format!(
+                "POST {INPUT} HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
+                 Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\
+                 Connection: close\r\n\r\n{:x}\r\n{big}\r\n0\r\n\r\n",
+                big.len()
+            ),
+        );
+        refused(&chunked, 413, "a chunked body over 16 KiB");
+    }
+
+    /// The body names a text and its key, nothing else: no action type, no
+    /// agent; the text is one a person types.
+    #[test]
+    fn an_inputs_body_is_a_text_and_a_key_and_nothing_else() {
+        let long = format!(
+            r#"{{"text":"{}","key":"k-1"}}"#,
+            "a".repeat(MAX_INPUT_TEXT + 1)
+        );
+        for (body, why) in [
+            ("not json", "not JSON"),
+            (r#"{"text":"x","key":"k","type":"stop"}"#, "an action type"),
+            (
+                r#"{"text":"x","key":"k","agent":"agent_worker_a"}"#,
+                "an agent",
+            ),
+            (r#"{"text":"x"}"#, "no key"),
+            (r#"{"key":"k"}"#, "no text"),
+            (r#"{"text":"  \n ","key":"k"}"#, "a blank text"),
+            (long.as_str(), "a text over 8 KiB"),
+            (r#"{"text":"a\u001b[201~b","key":"k"}"#, "an escape"),
+            (r#"{"text":"x","key":""}"#, "an empty key"),
+            (r#"{"probe":true,"text":"x"}"#, "a probe with a text"),
+        ] {
+            refused(
+                &post(Some("secret"), "", None, INPUT, SCRIPT, body),
+                400,
+                why,
+            );
+        }
+        let other_key = format!("{SCRIPT}Idempotency-Key: other\r\n");
+        refused(
+            &post(Some("secret"), "", None, INPUT, &other_key, BODY),
+            400,
+            "a key in the body and another in the header",
+        );
+        let malformed = "/api/session/not%20a%20session/input";
+        refused(
+            &post(Some("secret"), "", None, malformed, SCRIPT, BODY),
+            400,
+            "a malformed session id",
+        );
+    }
+
+    /// Who may write past the guards: the token's holder from anywhere, the
+    /// page itself on an open network, and, with no token set, the owner's
+    /// own client. Each reaches the database (here none: 500).
+    #[test]
+    fn the_clients_that_read_may_write_from_their_own_page() {
+        let body = r#"{"text":"hello","key":"k-1"}"#;
+        let reached = |answer: Answer, why: &str| {
+            assert_eq!(answer.status, 500, "{why}: {answer:?}");
+            assert_eq!(
+                answer.body["error"], "SPAWN_DATABASE_URL is not set",
+                "{why}: every guard passed"
+            );
+        };
+        reached(
+            post(Some("secret"), "", None, INPUT, SCRIPT, body),
+            "the token, no Origin",
+        );
+        reached(
+            post(
+                Some("secret"),
+                "",
+                None,
+                INPUT,
+                &format!("{SCRIPT}Origin: http://elsewhere.example\r\n"),
+                body,
+            ),
+            "the token from another page: it holds the token",
+        );
+        reached(
+            post(Some("secret"), "127.0.0.0/8", None, INPUT, PAGE, body),
+            "an open network's page, naming this server by its address",
+        );
+        reached(
+            post(
+                Some("secret"),
+                "",
+                None,
+                &format!("{INPUT}?token=secret"),
+                PAGE,
+                body,
+            ),
+            "the token as a parameter",
+        );
+        reached(
+            post(
+                Some("secret"),
+                "",
+                None,
+                INPUT,
+                "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
+                 Content-Type: Application/JSON; charset=utf-8\r\n",
+                body,
+            ),
+            "JSON with a charset",
+        );
+        let local = post(None, "", None, INPUT, PAGE, body);
+        if owner_known() {
+            reached(local, "no token set: the owner's own client (this test)");
+        } else {
+            assert_eq!(local.status, 403, "no /proc: no client is the owner's");
+        }
+        let probe = post(None, "", None, INPUT, PAGE, r#"{"probe":true}"#);
+        if owner_known() {
+            reached(probe, "a probe passes the same guards");
+        }
+    }
+
+    #[test]
+    fn a_read_path_takes_get_and_head_only() {
+        for method in ["POST", "PUT", "DELETE"] {
+            let answer = exchange(
+                None,
+                "",
+                None,
+                &format!(
+                    "{method} /api/overview HTTP/1.1\r\nHost: 127.0.0.1:PORT\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert_eq!(answer.status, 405, "{method}");
+            assert!(answer.head.contains("Allow: GET"), "{answer:?}");
+        }
+        // A GET still reads (no database here: anything but 405).
+        assert_eq!(
+            status_with(
+                None,
+                "",
+                "/api/session/not%20a%20session",
+                "Host: 127.0.0.1:PORT\r\n"
+            ),
+            400
+        );
+    }
+
+    #[test]
+    fn a_persons_text_and_its_page_are_checked_as_typed() {
+        assert_eq!(
+            typed_text(Some("hi\tthere\r\nok".into())),
+            Ok("hi\tthere\r\nok".into())
+        );
+        assert_eq!(
+            typed_text(Some("字".repeat(MAX_INPUT_TEXT / 3))).map(|text| text.len()),
+            Ok(MAX_INPUT_TEXT / 3 * 3)
+        );
+        for bad in [
+            None,
+            Some(String::new()),
+            Some(" \n\t".to_string()),
+            Some("a".repeat(MAX_INPUT_TEXT + 1)),
+            Some("\u{1b}[A".to_string()),
+            Some("\u{9b}A".to_string()),
+            Some("a\u{0}b".to_string()),
+        ] {
+            assert!(typed_text(bad.clone()).is_err(), "{bad:?}");
+        }
+        assert!(is_json(Some("application/json")));
+        assert!(is_json(Some(" application/JSON ; charset=utf-8")));
+        assert!(!is_json(Some("text/plain")));
+        assert!(!is_json(Some("application/json-seq")));
+        assert!(!is_json(None));
+        assert!(same_origin(
+            Some("127.0.0.1:8787"),
+            Some("http://127.0.0.1:8787")
+        ));
+        assert!(same_origin(
+            Some("LOCALHOST:8787"),
+            Some("http://localhost:8787")
+        ));
+        assert!(!same_origin(Some("127.0.0.1:8787"), None), "no Origin");
+        assert!(!same_origin(None, Some("http://127.0.0.1:8787")));
+        assert!(!same_origin(
+            Some("127.0.0.1:8787"),
+            Some("https://127.0.0.1:8787")
+        ));
+        assert!(!same_origin(
+            Some("127.0.0.1:8787"),
+            Some("http://127.0.0.1:9999")
+        ));
+        assert!(!same_origin(Some("127.0.0.1:8787"), Some("null")));
+    }
+
+    /// Run `case` on a schema of its own in the test database
+    /// (`SPAWN_TEST_DATABASE_URL`, never the live one), migrated, its session
+    /// `session_supervisor` used by `agent_supervisor`, with its owner's URL
+    /// (the schema on its search path, as an install's URL names it) and
+    /// store. The schema is dropped afterwards.
+    fn in_test_schema(case: impl FnOnce(&str, &spawn_postgres::PostgresStore)) {
+        use spawn_core::event::{EventKind, NewEvent, Source};
+        use spawn_core::id::AgentId;
+        use spawn_core::port::EventLog;
+        let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+            "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+        );
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let schema = format!("spawn_test_{}_{nanos:x}_serve_input", std::process::id());
+        let store = spawn_postgres::PostgresStore::connect_in_schema(&url, &schema)
+            .expect("a schema of its own, migrated");
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let owner = format!("{url}{separator}options=-csearch_path%3D{schema}");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store
+                .append(NewEvent {
+                    agent_id: AgentId::new("agent_supervisor").expect("valid agent"),
+                    session_id: spawn_core::id::SessionId::new("session_supervisor")
+                        .expect("valid session"),
+                    execution_id: None,
+                    source: Source::Claude,
+                    source_event_id: Some("message-1".to_string()),
+                    kind: EventKind::MessageReceived,
+                })
+                .expect("the session's first event");
+            case(&owner, &store);
+        }));
+        let _ = postgres::Client::connect(&url, postgres::NoTls)
+            .and_then(|mut client| client.batch_execute(&format!("drop schema {schema} cascade")));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The accepted case, end to end through the handler into the test
+    /// database: the probe writes nothing, an input is the command `spawn
+    /// submit --principal human` makes, and a retried POST types once.
+    #[test]
+    fn a_persons_input_reaches_the_test_database_once() {
+        in_test_schema(|owner, store| {
+            let commands = || {
+                store
+                    .commands_json("session_supervisor", 50)
+                    .expect("commands")
+            };
+            let to = |token, open, headers: &str, path: &str, body: &str| {
+                post(token, open, Some(owner.to_string()), path, headers, body)
+            };
+            let probe = to(Some("secret"), "", SCRIPT, INPUT, r#"{"probe":true}"#);
+            assert_eq!(probe.status, 200, "{probe:?}");
+            assert_eq!(probe.body["writable"], true);
+            assert_eq!(probe.body["max_text_bytes"], MAX_INPUT_TEXT);
+            assert_eq!(commands(), json!([]), "a probe writes nothing");
+
+            let body = r#"{"text":"Stop objective_87 and report.\nThanks","key":"page-1"}"#;
+            let first = to(Some("secret"), "", SCRIPT, INPUT, body);
+            assert_eq!(first.status, 202, "{first:?}");
+            assert_eq!(first.body["principal"], "human");
+            assert_eq!(first.body["session_id"], "session_supervisor");
+            let id = first.body["command_id"].as_u64().expect("a command");
+            let again = to(Some("secret"), "", SCRIPT, INPUT, body);
+            assert_eq!(again.status, 202);
+            assert_eq!(again.body["command_id"], id, "a retried POST types once");
+            let listed = commands();
+            assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+            assert_eq!(listed[0]["command_id"], id);
+            assert_eq!(listed[0]["principal"], "human");
+            assert_eq!(listed[0]["action"], "input");
+            assert_eq!(listed[0]["text"], "Stop objective_87 and report.\nThanks");
+            assert_eq!(listed[0]["state"], "pending");
+            assert_eq!(listed[0]["waiting"], false);
+
+            // The key in a header, from the page of an open network.
+            let page_with_key = format!("{PAGE}Idempotency-Key: page-2\r\n");
+            let header = to(
+                Some("secret"),
+                "127.0.0.0/8",
+                &page_with_key,
+                INPUT,
+                r#"{"text":"second"}"#,
+            );
+            assert_eq!(header.status, 202, "{header:?}");
+            assert_ne!(header.body["command_id"], id);
+            if owner_known() {
+                let local = to(None, "", PAGE, INPUT, r#"{"text":"third","key":"page-3"}"#);
+                assert_eq!(
+                    local.status, 202,
+                    "no token set, the owner's client: {local:?}"
+                );
+            }
+            let unknown = to(
+                Some("secret"),
+                "",
+                SCRIPT,
+                "/api/session/session_never_seen/input",
+                r#"{"text":"hello","key":"page-4"}"#,
+            );
+            assert_eq!(unknown.status, 404, "{unknown:?}");
+            let listed = commands();
+            let listed = listed.as_array().expect("a list");
+            assert!(listed.iter().all(|command| command["principal"] == "human"));
+            assert_eq!(listed.len(), if owner_known() { 3 } else { 2 });
+        });
     }
 
     #[test]
@@ -1862,31 +2575,104 @@ mod tests {
     /// `token` set (or none) and `open` as `SPAWN_SERVE_OPEN_NETWORKS`,
     /// sending `headers` as [`tokenless_status`] does.
     fn status_with(token: Option<&'static str>, open: &str, path: &str, headers: &str) -> u16 {
+        exchange(
+            token,
+            open,
+            None,
+            &format!("GET {path} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n"),
+        )
+        .status
+    }
+
+    /// One answer of `serve`'s request handler.
+    #[derive(Debug)]
+    struct Answer {
+        status: u16,
+        /// The status line and headers.
+        head: String,
+        body: serde_json::Value,
+    }
+
+    /// One raw exchange with `serve`'s request handler, `token` set (or
+    /// none), `open` as `SPAWN_SERVE_OPEN_NETWORKS` and `owner` as
+    /// `SPAWN_DATABASE_URL`: `raw` is sent as it is, `PORT` replaced by the
+    /// server's port.
+    fn exchange(
+        token: Option<&'static str>,
+        open: &str,
+        owner: Option<String>,
+        raw: &str,
+    ) -> Answer {
         use std::io::{Read, Write};
         let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
         let port = server.server_addr().to_ip().expect("ip").port();
-        let hosts = server_hosts("127.0.0.1:0", port);
-        let web = std::env::temp_dir();
-        let open = open_networks(Some(open)).expect("networks");
+        let shared = Shared {
+            web: std::env::temp_dir(),
+            token: token.map(str::to_string),
+            port: Some(port),
+            hosts: server_hosts("127.0.0.1:0", port),
+            open: open_networks(Some(open)).expect("networks"),
+            owner_url: owner,
+        };
         let worker = std::thread::spawn(move || {
             let request = server.recv().expect("request");
-            handle(request, &web, token, Some(port), &hosts, &open).expect("answered");
+            handle(request, &shared).expect("answered");
         });
-        let headers = headers.replace("PORT", &port.to_string());
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        write!(
-            client,
-            "GET {path} HTTP/1.1\r\n{headers}Connection: close\r\n\r\n"
-        )
-        .expect("send");
+        client
+            .write_all(raw.replace("PORT", &port.to_string()).as_bytes())
+            .expect("send");
         let mut answer = String::new();
         client.read_to_string(&mut answer).expect("read");
         worker.join().expect("handler");
-        answer
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .expect("status line")
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap_or((&answer, ""));
+        Answer {
+            status: head
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .expect("status line"),
+            head: head.to_string(),
+            body: serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    /// A POST of `body` to `path`, sending `headers` (each ending in CRLF,
+    /// `PORT` replaced) and its length, to a server set up as [`exchange`]
+    /// says.
+    fn post(
+        token: Option<&'static str>,
+        open: &str,
+        owner: Option<String>,
+        path: &str,
+        headers: &str,
+        body: &str,
+    ) -> Answer {
+        exchange(
+            token,
+            open,
+            owner,
+            &format!(
+                "POST {path} HTTP/1.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    /// The headers of the page's own POST: its Host, its Origin, JSON.
+    const PAGE: &str = "Host: 127.0.0.1:PORT\r\nOrigin: http://127.0.0.1:PORT\r\n\
+                        Content-Type: application/json\r\n";
+
+    /// The headers of a script with the token: no Origin.
+    const SCRIPT: &str = "Host: 127.0.0.1:PORT\r\nAuthorization: Bearer secret\r\n\
+                          Content-Type: application/json\r\n";
+
+    const INPUT: &str = "/api/session/session_supervisor/input";
+
+    /// Whether this host can tell the owner's sockets (`/proc`): with no
+    /// token set, only the owner's client types.
+    fn owner_known() -> bool {
+        owner_uid().is_some()
     }
 
     /// A server running `serve`'s own loop ([`serve_requests`]) with at most
@@ -1904,6 +2690,7 @@ mod tests {
             port: Some(port),
             hosts: server_hosts("127.0.0.1:0", port),
             open: Vec::new(),
+            owner_url: None,
         });
         std::thread::spawn(move || serve_requests(&server, &shared, limit));
         (port, web)
