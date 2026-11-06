@@ -2241,6 +2241,14 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
+-- The `source.moved` records (deploys), found without reading the rest of
+-- the stream: the dispatcher reads the latest on every step
+-- (`LATEST_SOURCE_MOVED`).
+create index if not exists spawn_events_source_moved
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'source.moved';
+
 -- The `no_room` gate records that escalate, found without reading the rest
 -- of the stream (the dispatcher reads them on every step).
 create index if not exists spawn_events_gate_room
