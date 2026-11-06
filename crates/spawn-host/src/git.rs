@@ -488,8 +488,8 @@ impl GitWorkspace {
     /// Build output and files over the cap leave the index after `add -A`,
     /// so a `.gitignore` inside the tree cannot re-include them; a file over
     /// the cap is excluded before it is hashed. The engine's runtime files
-    /// are never added, and the ones the branch already tracks are taken as
-    /// any tracked file is ([`Self::track_runtime_files`]).
+    /// are never added, and the ones the project tracks are taken as any
+    /// tracked file is ([`Self::track_runtime_files`]).
     ///
     /// A file over the cap that git already holds as a blob in `main` or a
     /// pending merge's `main` ([`Self::source_commits`]) stays a blob: it
@@ -758,25 +758,19 @@ impl GitWorkspace {
     /// something other than a regular file, a symlink or a directory (a
     /// FIFO, a socket, a device), which git cannot add.
     fn left_out_files(&self, directory: &Path, index: &Path) -> Result<LeftOut, WorkspaceError> {
-        let listed = self.listing_in(
-            directory,
-            index,
-            &[
-                [
-                    "ls-files",
-                    "-z",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                    "--",
-                    ".",
-                ]
-                .map(OsString::from)
-                .to_vec(),
-                runtime_pathspecs("exclude"),
-            ]
-            .concat(),
-        )?;
+        let mut arguments: Vec<OsString> = [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+        ]
+        .map(OsString::from)
+        .into();
+        arguments.extend(runtime_pathspecs("exclude"));
+        let listed = self.listing_in(directory, index, &arguments)?;
         let mut oversized = Vec::new();
         let mut special = Vec::new();
         for path in listed_paths(&listed) {
