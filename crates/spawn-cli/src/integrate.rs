@@ -4909,8 +4909,7 @@ mod database_tests {
             })
             .expect("recorded, never pushed");
         assert_eq!(
-            super::Judge::pushed_candidate(&db.store, &mirror, &source, &task)
-                .expect("judged"),
+            super::Judge::pushed_candidate(&db.store, &mirror, &source, &task).expect("judged"),
             super::Freshness::Fresh(commit.as_str().to_string())
         );
         host.unmount(&workspace).expect("unmount");

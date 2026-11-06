@@ -1047,7 +1047,10 @@ mod tests {
         };
         let held = crate::dispatch::merge_main_before(&db.store, &root, &mut order)
             .expect_err("the delivery is held");
-        assert!(held.contains("waits") && held.contains("in flight"), "{held}");
+        assert!(
+            held.contains("waits") && held.contains("in flight"),
+            "{held}"
+        );
         assert_eq!(head(&mirror, &agent), before, "nothing merged");
         assert!(!root.join(&agent).join("added.txt").exists());
         let _ = std::fs::remove_dir_all(&base);
