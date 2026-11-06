@@ -921,8 +921,7 @@ function SegmentMark({
           fontSize={10}
           fontWeight={500}
           className="tnum"
-          fill="#fff"
-          opacity={0.92}
+          fill="var(--bar-label)"
         >
           {label}
         </text>
