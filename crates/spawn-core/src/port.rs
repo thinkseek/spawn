@@ -73,6 +73,16 @@ pub trait CommandQueue: Send + Sync {
 
     /// Record the outcome and its `command.finished` event atomically.
     fn finish(&self, claimed: &Claimed, outcome: &Outcome) -> Result<(), StoreError>;
+
+    /// Leave a claimed command unfinished and make it claimable again after
+    /// `retry_in`: the Bridge's input that waits for its turn
+    /// (`CommandStep::Waiting`) is claimed again then, by this Bridge or a
+    /// restarted one. A lease that is no longer this claim's changes
+    /// nothing. Without it the lease runs out on its own.
+    fn release(&self, claimed: &Claimed, retry_in: Duration) -> Result<(), StoreError> {
+        let _ = (claimed, retry_in);
+        Ok(())
+    }
 }
 
 /// Workspace store refusal or failure.

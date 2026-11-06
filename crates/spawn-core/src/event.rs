@@ -115,6 +115,15 @@ pub enum CommandStep {
     Typing,
     /// The typing succeeded.
     Typed,
+    /// An input that waits for its turn: the pane did not take text when
+    /// the Bridge read it (a turn runs, a dialog shows, the capture keeps
+    /// failing), or an earlier input of the session still waits, or the
+    /// session's last typed input has not been answered yet. Nothing was
+    /// typed and the command stays unfinished; the Bridge types it once the
+    /// pane reads ready, or fails it when the session's execution ends
+    /// first. Only an input from outside Spawn's own loops waits
+    /// (`crate::bridge::waits`). Recorded once per command.
+    Waiting,
 }
 
 /// Why a checkpoint commit was taken.
