@@ -111,8 +111,9 @@
 //!    gate's run as this process measured it, give or take a second
 //!    ([`host::crash_lines`]). At least one failure read, and every one the
 //!    host's: `host_fault`, not `rejected`, and C's head is not judged
-//!    alone. Only a gate that got SPAWN_TEST_DATABASE_URL has host faults (a
-//!    mission marked [`NO_TEST_DATABASE`] has none). The task stays where it was, its revisions and note do not
+//!    alone. A mission whose gate needs no test database
+//!    ([`NO_TEST_DATABASE`]) has no host faults: its rejections stay
+//!    rejections. The task stays where it was, its revisions and note do not
 //!    move, nothing goes back to the worker, and neither `gate_rejections`
 //!    nor `gate_aborts` grows or resets. The record names `candidate`,
 //!    `reason` (`host fault: ...`, saying which evidence), `log`,
@@ -1494,12 +1495,10 @@ impl Judge {
                 gate_wall_clock(),
             )
         };
-        // Only a gate that got the test database can fail because it did: a
-        // mission whose gate needs none (or whose URL was withheld) has no
+        // Only a gate that runs on the test database can fail because it
+        // did: a mission whose gate needs none ([`NO_TEST_DATABASE`]) has no
         // host faults, and the test server's log says nothing about it.
-        let test_database = gate_env
-            .iter()
-            .any(|(name, _)| name == "SPAWN_TEST_DATABASE_URL");
+        let test_database = needs_test_database(scenarios);
         // The candidate's gate run, measured: a crash in the test
         // database's log counts only inside this window.
         let started = now_ms();
