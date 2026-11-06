@@ -65,9 +65,9 @@ pub(crate) struct MissionWorkspaces {
     mirrors: Mutex<HashMap<String, Routed>>,
     /// When each mirror's `main` was last fetched.
     refreshed: Mutex<HashMap<PathBuf, Instant>>,
-    /// Whether dropping the store pushes what waits on the process's
-    /// pushers: the store a process runs on, not a one-shot one.
-    flush_on_drop: bool,
+    /// A store for one change ([`Self::one_shot`]): it queues no push and
+    /// flushes nothing when dropped; its caller publishes what it changed.
+    one_shot: bool,
 }
 
 /// One agent's store and, for a mission with a source, where its mirror
@@ -219,14 +219,15 @@ impl MissionWorkspaces {
             factory,
             mirrors: Mutex::new(HashMap::new()),
             refreshed: Mutex::new(HashMap::new()),
-            flush_on_drop: true,
+            one_shot: false,
         }
     }
 
     /// A store for one change inside a process that goes on (a merge of
-    /// main, a set-aside): its pushes go to the process's pushers like any
-    /// store's, its caller publishes what it changed ([`publish`]), and
-    /// dropping it pushes nothing else.
+    /// main, a set-aside): it queues no push of its own, so nothing is
+    /// published before its caller recorded the change; the caller then
+    /// publishes it ([`publish`], through the process's pusher for the
+    /// source), and dropping the store pushes nothing.
     pub(crate) fn one_shot(
         default: GitWorkspace,
         root: &Path,
@@ -234,13 +235,14 @@ impl MissionWorkspaces {
         factory: Factory,
     ) -> Self {
         let mut one_shot = Self::new(default, root, store, factory);
-        one_shot.flush_on_drop = false;
+        one_shot.one_shot = true;
         one_shot
     }
 
-    /// Queue a push of an agent's branch, to a source that receives them.
+    /// Queue a push of an agent's branch, to a source that receives them
+    /// (a one-shot store's caller publishes instead).
     fn mark(&self, mirror: &Path, source: &str, agent: &str) {
-        if receives_branches(source) {
+        if !self.one_shot && receives_branches(source) {
             crate::push::shared(source).mark(mirror, source, agent);
         }
     }
@@ -627,7 +629,7 @@ impl Drop for MissionWorkspaces {
     /// A process that ends (`spawn tick`, `spawn loop` after SIGTERM) pushes
     /// what is still waiting, its one-shot stores' failed pushes included.
     fn drop(&mut self) {
-        if self.flush_on_drop {
+        if !self.one_shot {
             crate::push::flush_shared();
         }
     }
