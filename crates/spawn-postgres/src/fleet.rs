@@ -141,8 +141,8 @@ select jsonb_build_object(
     'failures', (select count(*) from events where event_name in ('tool.failed', 'turn.failed'))
   ),
   'ladder_24h', jsonb_build_object(
-    'rules', (select count(*) from judged where observation ->> 'judge' = 'rules'),
-    'model', (select count(*) from judged where observation ->> 'judge' <> 'rules'),
+    'rules', (select count(*) from judged where judge = 'rules'),
+    'model', (select count(*) from judged where judge <> 'rules'),
     'dispatcher', (select count(*) from commands where principal = 'spawn-dispatch'),
     'supervisor', (select count(*) from commands where principal = 'spawn_supervisor'),
     'liveness', (select count(*) from commands where principal = 'spawn-liveness'),
