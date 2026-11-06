@@ -622,7 +622,8 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///       "review_note", "created_by", "created_at_ms", "delivered_at_ms",
 ///       "updated_at_ms",
 ///       "gates": [{                       // task.gated records, oldest first
-///         "verdict": "accepted" | "rejected" | "aborted" | "conflict" | "stale",
+///         "verdict": "accepted" | "rejected" | "aborted" | "conflict" | "incompatible"
+///                    | "stale" | "no_room",
 ///         "reason": "..." | null, "metric": "METRIC ..." | null,
 ///         "candidate": "<commit>" | null, "at_ms": 1793724858000
 ///       }]
