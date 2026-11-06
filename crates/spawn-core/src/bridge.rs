@@ -648,6 +648,23 @@ impl Bridge {
             }
         }
         for (agent_id, session, command, workspace) in orphans {
+            // A mount the log's open execution uses is no orphan, whatever
+            // this view missed: unmounting it would take the directory from
+            // under its engine. The execution is followed again instead.
+            if let Some(active) = self
+                .log
+                .open_execution(&session)?
+                .and_then(|record| self.track_from_log(&session, &record))
+                && (active.execution_id == ExecutionId::for_command(command)
+                    || active.workspace == self.workspaces.canonical(&workspace))
+            {
+                eprintln!(
+                    "spawn: {session}: the log holds execution {} open in {}, which this \
+                     Bridge's view had not read; it is followed again, its mount kept",
+                    active.execution_id, active.workspace
+                );
+                continue;
+            }
             if self.workspaces.unmount(&workspace).is_err() {
                 continue;
             }
@@ -1696,34 +1713,42 @@ impl Bridge {
         if let Some(active) = self.running(&claimed.session_id) {
             return Ok(Some(active));
         }
-        let Some(record) = self.log.open_execution(&claimed.session_id)? else {
-            return Ok(None);
-        };
-        let (
-            EventKind::ExecutionStarted {
-                workspace,
-                transcript_from,
-                ..
-            },
-            Some(execution),
-        ) = (&record.event.kind, record.event.execution_id.clone())
+        let Some(active) = self
+            .log
+            .open_execution(&claimed.session_id)?
+            .and_then(|record| self.track_from_log(&claimed.session_id, &record))
         else {
             return Ok(None);
         };
-        let active = Active::started(
-            execution,
-            self.workspaces.canonical(workspace),
-            *transcript_from,
-        );
         report.warnings.push(format!(
             "{}: the log holds execution {} open and this Bridge's view had none; it is \
              followed again",
             claimed.session_id, active.execution_id
         ));
-        if let Some(view) = self.sessions.get_mut(&claimed.session_id) {
+        Ok(Some(active))
+    }
+
+    /// The open execution the log answered with (`record`, an
+    /// `execution.started`), put into the session's view as the fold would
+    /// have: the view follows the log again.
+    fn track_from_log(&mut self, session: &SessionId, record: &EventRecord) -> Option<Active> {
+        let EventKind::ExecutionStarted {
+            workspace,
+            transcript_from,
+            ..
+        } = &record.event.kind
+        else {
+            return None;
+        };
+        let active = Active::started(
+            record.event.execution_id.clone()?,
+            self.workspaces.canonical(workspace),
+            *transcript_from,
+        );
+        if let Some(view) = self.sessions.get_mut(session) {
             view.active = Some(active.clone());
         }
-        Ok(Some(active))
+        Some(active)
     }
 
     /// Before a start, a resume or an input acts on its session: the
