@@ -207,8 +207,7 @@ mod tests {
         let real = std::fs::canonicalize(base.join("real/ws")).expect("resolve");
         let configured = base.join("link/ws").display().to_string();
         assert_eq!(super::canonical_workspace_root(&configured), real.display().to_string());
-        let mut flags = Flags::default();
-        flags.insert("root", &configured);
+        let flags = Flags::parse(&["--root".to_string(), configured.clone()]).expect("flags");
         assert_eq!(
             workspace_root(&flags).as_deref(),
             Some(real.display().to_string().as_str())
