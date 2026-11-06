@@ -461,7 +461,8 @@ pub(crate) fn decide_with(
         }
     }
     plan.pending.extend(deliver::news_items(work, rows));
-    plan.pending.extend(supervisor.and_then(charter::escalation));
+    plan.pending
+        .extend(supervisor.and_then(charter::escalation));
     plan.pending.extend_from_slice(host);
     (plan.told, plan.pending) = std::mem::take(&mut plan.pending)
         .into_iter()

@@ -233,8 +233,8 @@ pub(super) fn escalation(supervisor: &Facts) -> Option<Escalation> {
 #[cfg(test)]
 mod tests {
     use super::{ATTEMPTS, Input, Records, escalation, give, order, series, text};
-    use crate::dispatch::{Escalation, Facts, Plan, Why, decide_with};
     use crate::deliver::Work;
+    use crate::dispatch::{Escalation, Facts, Plan, Why, decide_with};
     use crate::supervise::Charter;
     use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
     use spawn_core::command::CommandAction;
@@ -323,7 +323,11 @@ mod tests {
         let order = order(&facts, &new).expect("the new charter is due");
         assert_eq!(order.session_id, "session_supervisor");
         assert_eq!(order.agent_id, "agent_supervisor");
-        assert_eq!(order.key, key(&new, 40), "keyed by hash and the start it replaces");
+        assert_eq!(
+            order.key,
+            key(&new, 40),
+            "keyed by hash and the start it replaces"
+        );
         let CommandAction::Input { text: typed, tags } = &order.action else {
             panic!("the charter is typed input: {:?}", order.action);
         };
@@ -370,7 +374,11 @@ mod tests {
         assert_eq!(order(&busy, &new), None);
         let mut stale = supervisor(Some(&earlier()), Vec::new());
         stale.evidence_seq = Some(12);
-        assert_eq!(order(&stale, &new), None, "a judgement older than its latest fact");
+        assert_eq!(
+            order(&stale, &new),
+            None,
+            "a judgement older than its latest fact"
+        );
         let mut down = supervisor(Some(&earlier()), Vec::new());
         down.live = false;
         assert_eq!(order(&down, &new), None);
@@ -399,7 +407,10 @@ mod tests {
         assert_eq!(escalation(&one), None);
         let two = supervisor(
             Some(&earlier()),
-            vec![refused(41, &first), refused(42, &format!("{first}-retry-1"))],
+            vec![
+                refused(41, &first),
+                refused(42, &format!("{first}-retry-1")),
+            ],
         );
         assert_eq!(
             order(&two, &new).map(|order| order.key),
@@ -425,7 +436,8 @@ mod tests {
         assert!(item.line.contains("3 attempts"), "{}", item.line);
         assert!(item.line.contains(PANE_NOT_READY), "{}", item.line);
         assert!(
-            item.line.contains(&format!("still holds charter {}", earlier().hash)),
+            item.line
+                .contains(&format!("still holds charter {}", earlier().hash)),
             "{}",
             item.line
         );
@@ -566,7 +578,10 @@ mod tests {
 
     #[test]
     fn retries_share_the_key_of_their_first_attempt() {
-        assert_eq!(series("dispatch-charter-ab-over-4"), "dispatch-charter-ab-over-4");
+        assert_eq!(
+            series("dispatch-charter-ab-over-4"),
+            "dispatch-charter-ab-over-4"
+        );
         assert_eq!(
             series("dispatch-charter-ab-over-4-retry-2"),
             "dispatch-charter-ab-over-4"
