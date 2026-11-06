@@ -1134,7 +1134,12 @@ create table if not exists mission_tasks (
     delivered_at_ms bigint,
     -- The models the task's worker runs on (docs/fleet-architecture.md,
     -- "Engine models"): `default`, or `cheap` for simple, well-specified work.
-    model           text   not null default 'default' check (model in ('default', 'cheap'))
+    model           text   not null default 'default' check (model in ('default', 'cheap')),
+    -- The task this one re-issues (its `task.assigned` names it): a first
+    -- delivery spent without typing is cancelled and assigned again once,
+    -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
+    -- re-issued again.
+    reissue_of      bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1162,6 +1167,7 @@ alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
+alter table mission_tasks add column if not exists reissue_of bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1265,12 +1271,13 @@ begin
                    (select r.state from mission_residents r where r.agent_id = k.agent_id));
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
-                                   created_by, objective, scenario, model,
+                                   created_by, objective, scenario, model, reissue_of,
                                    created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
-                p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'), p_at, p_at);
+                p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
+                (p_record ->> 'reissue_of')::bigint, p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -1779,6 +1786,75 @@ begin
     perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
 end $$;
 
+-- The dispatcher's re-issue, owner only (docs/fleet-architecture.md §3,
+-- "Deliveries"): a task waiting for its first delivery, whose retries are
+-- spent and none of whose attempts may have typed, is cancelled and
+-- assigned again, in this one transaction, so its objective (if any) has a
+-- task in flight throughout. `p_attempts` is every attempt of the spent
+-- delivery, in order (`command`, `key`, `error`), as the dispatcher read
+-- them from the queue: the `task.cancelled` record keeps them, names `by`
+-- `spawn-dispatch` and `reissued_as` the new task, whose `task.assigned`
+-- names `reissue_of` and copies the old task's mission, kind, worker (a
+-- resident's; an ephemeral task gets a new worker with the same label, as
+-- `spawn_task_assign` names it), brief, model, objective, scenario and
+-- `created_by`. Refused for a task that is not `assigned` at revision 0,
+-- one that is itself a re-issue, or one the closure rule holds. Returns the
+-- new task's id.
+create or replace function spawn_task_reissue(p_task bigint, p_attempts jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_old mission_tasks%rowtype;
+    v_id bigint;
+    v_agent text;
+    v_session text;
+    v_label text;
+begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not re-issue tasks', session_user using errcode = '42501';
+    end if;
+    select * into v_old from mission_tasks where id = p_task;
+    if v_old.id is null then
+        raise exception 'task % does not exist', p_task;
+    end if;
+    if v_old.state <> 'assigned' or v_old.revisions <> 0 then
+        raise exception 'task % is %, not waiting for its first delivery: it is not re-issued',
+            p_task, v_old.state;
+    end if;
+    if v_old.reissue_of is not null then
+        raise exception 'task % re-issues task % already: it is not re-issued again',
+            p_task, v_old.reissue_of;
+    end if;
+    if jsonb_typeof(p_attempts) is distinct from 'array' or jsonb_array_length(p_attempts) = 0 then
+        raise exception 'the re-issue of task % names no attempts of its delivery', p_task;
+    end if;
+    if not exists (select 1 from mission_missions
+                    where id = v_old.mission_id and state in ('open', 'active'))
+       or not spawn_task_may_move(p_task, 'cancelled') then
+        raise exception 'task % may not be assigned again (its mission or worker is closed)',
+            p_task;
+    end if;
+    v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
+    if v_old.kind = 'ephemeral' then
+        v_label := coalesce(substring(v_old.agent_id from '^agent_worker_(.+)_[0-9]+$'), 'task');
+        v_agent := format('agent_worker_%s_%s', v_label, v_id);
+        v_session := format('session_worker_%s_%s', v_label, v_id);
+    else
+        v_agent := v_old.agent_id;
+        v_session := v_old.session_id;
+    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'task.cancelled', 'id', p_task, 'by', 'spawn-dispatch', 'reissued_as', v_id,
+        'attempts', p_attempts));
+    perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
+        'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
+        'kind', v_old.kind, 'agent_id', v_agent, 'session_id', v_session,
+        'brief', v_old.brief, 'model', v_old.model, 'created_by', v_old.created_by,
+        'objective', v_old.objective, 'scenario', v_old.scenario, 'reissue_of', p_task)));
+    return v_id;
+end $$;
+
 -- A resident starts only after a human approves it.
 create or replace function spawn_resident_propose(p_name text, p_charter text)
 returns void language plpgsql security definer as $$
@@ -1969,7 +2045,11 @@ end $$;
 -- The owner moved a source's main forward outside the gate (a deploy): the
 -- missions whose baseline is `p_from` take `p_to` instead of halting. The
 -- caller checks that `p_to` descends from `p_from`; returns how many missions
--- moved. A mission without a baseline yet, or halted, is left alone.
+-- moved. A mission without a baseline yet, or halted, is left alone. The
+-- move is recorded for every deploy, also when it moves no mission
+-- (`missions` empty: the fold moves nothing then): a deploy is when a host
+-- fault may have gone, and the dispatcher tries every spent delivery once
+-- more after each `source.moved` record.
 create or replace function spawn_source_moved(p_source text, p_from text, p_to text)
 returns integer language plpgsql security definer as $$
 declare
@@ -1985,11 +2065,9 @@ begin
     select count(*), coalesce(jsonb_agg(id order by id), '[]'::jsonb) into v_count, v_missions
       from mission_missions
      where sources ->> 0 = p_source and baseline = p_from and halted is null;
-    if v_count > 0 then
-        perform spawn_control_record(jsonb_build_object(
-            'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
-            'missions', v_missions));
-    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
+        'missions', v_missions));
     return v_count;
 end $$;
 
@@ -2309,7 +2387,8 @@ begin
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
-        'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
+        'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
+        'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
