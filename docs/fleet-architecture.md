@@ -292,8 +292,8 @@ it, on the same ladder.
   worker, proposing or retiring a resident), reporting each as a line
   "Decided (the owner may reverse): ...". What they do not allow (deploys,
   owner-protected files, money, deleting data, a `discard` included,
-  changing grants or credentials: approving a resident, a mission's gate,
-  resuming a halted mission) is one line "For the owner: ..." that it does
+  changing grants or credentials: approving a resident, setting a
+  mission's gate, resuming a halted mission) is one line "For the owner: ..." that it does
   not wait on; it moves on to other work. It never ends a turn on a question
   or a list of decisions for the owner. The dispatcher wakes it by typing a
   digest into its pane while it is idle; digests coalesce while it works.
@@ -324,10 +324,10 @@ it, on the same ladder.
   `HUMAN:` question of an old-style turn is still open. Those lines are
   listed apart, below the queue ("For the owner", `supervisor.for_owner`:
   newest first, each once, at most 10, from the end of its transcript):
-  items to read, counted in no queue, cleared by no reply, since nothing
-  waits on them. The owner can type to the supervisor at any time (its pane,
-  or `spawn submit`); it reads that as an instruction, which may reverse a
-  decision of its, not as the answer to a question. Each human action is a
+  items to read, counted in no queue; an owner's message clears none of
+  them, since nothing waits on them. The owner can type to the supervisor at any time (its pane,
+  or `spawn submit`); it reads that as an instruction, which may reverse one
+  of its decisions, not as the answer to a question. Each human action is a
   command with principal `human`; it is the event the whole system tries to
   make rarer.
 - **Inputs to a busy session wait for its turn.** A person's or the
