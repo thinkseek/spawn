@@ -72,7 +72,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行） | error |
 | `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main` 或启动的 `from`，跨主机删除之前的旧记录里还可能是 `spawn/<agent>`；commit：分支起点） |
-| `execution.ended` | Bridge | cause、exit_code |
+| `execution.ended` | Bridge | cause、exit_code；Bridge 结束一个已无自己的 runner 在跑的执行时另带 evidence（主机看到了什么、哪条命令发现的） |
 | `execution.unmounting` | Bridge（结束流程过了最后一次 checkpoint 与 terminate、卸载之前；键 `<exec>:unmounting`） | — |
 | `command.step` | Bridge（命令处理的一步，键 `cmd_<id>:<step>`） | command_id、step（`mounted`、`mount_released`、`typing`、`typed`）、workspace（`mounted`/`mount_released` 带） |
 | `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
@@ -103,7 +103,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进已挂载、处于两轮之间空闲的工作区的分支（Bridge 不调用；集成器判 `conflict` 时、调度器给活着的 worker 键入任务前调用，见 spawn-cli 的 `main_merge`）：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
-| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`capture_tail`、`read_from`、`write_new`、`terminate` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
+| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`runner`、`capture_tail`、`read_from`、`write_new`、`terminate` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 | `TranscriptArchive` | `copies`、`read`、`append(copy, at, bytes)` | 原生会话记录的存档（见 [storage.md](./storage.md#the-transcript-archive)）：每个 agent 的每个原生会话有编号的副本，副本只增长，`at` 不等于副本当前长度的追加被拒，已存的字节从不改写；本地实现在 `<root>/.transcripts` |
 
 错误类型：
@@ -160,6 +160,8 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行。其他来源的同名事件只是退出报告（`agent_executions.exit_reported`），现在已无人写：runner 把退出码写进 `SPAWN_EXIT_FILE`，所以只有那之前的旧执行可能为真。
 
 每会话一个活跃执行由日志保证，不只靠 Bridge 的内存：`Start`/`Resume` 先追上日志再查内存，日志的追加再查一次（`spawn_append_trusted`，内存实现同样）：会话最近一次执行还没有 Bridge 写的结束时拒绝 `execution.started`。被拒的启动以日志给的原因失败，卸载自己刚挂的工作区（那正是另一个执行的工作区时不卸载），不启动终端。runner 的退出报告不算结束；丢失的执行由下一个 tick 写 `execution.ended`（cause `lost`）后，会话即可再启动或恢复。
+
+“丢失”指没有 Bridge 自己启动的 runner 在跑它（issue #15）：`TerminalHost::runner` 回答 `Running`（窗格活着，且由本主机的启动拉起：tmux 的 `pane_start_command` 带有本次启动的环境文件名 `spawn-launch-<终端>-`）、`Gone`（终端不在）或 `Untracked`（终端在，但不托管那个 runner：窗格已死，或重启后终端管理器恢复出、停在 shell 提示符的同名会话）。只有 `Running` 算在运行；其余先再读一次退出文件，没有就按 `lost` 结束，`evidence` 记下主机所见。`Start`、`Resume`、`Input` 动手前先处理会话里这样的执行（`Bridge::settle`，走正常的结束流程），而不是因为它失败、等以后的 tick：start/resume 接着做，input 失败一次（需要运行中的引擎），之后照常 resume；`Stop` 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 的视图只随折叠日志改变（它写的结束被读回后，执行才离开视图）；视图里会话没有执行时，命令向日志查询（`EventLog::open_execution`，与守卫同一规则：最近一次 `execution.started` 之后没有 Bridge 写的结束），查到就重新跟踪并警告。重启时，视图没读到其启动、但日志仍认为未结束的执行所用的挂载不算孤儿，不卸载。不受跟踪的引擎从不被静默收编：它被结束，终端被杀。
 
 恢复：每次 `spawn tick` 是新进程，从位置 0 折叠全部事件得到活跃执行、原生会话 id 与待提交的 checkpoint。`Resume` 复用最新原生会话 id，新开 Execution 与 mount，优先 `--resume`；逻辑 Session 不变。
 
