@@ -90,10 +90,11 @@
 # private tmux socket and a loopback port, no network. Every wait is bounded
 # in time.
 #
-# Today (three runs on 2026-11-06, the deployed binary): the setup takes
-# about 3 s, and `spawn mission hold --source <SA>` exits 1 with the usage
-# of `spawn mission` at once; the scenario fails at (1) 4-5 s after it
-# starts.
+# Today (2026-11-06, the deployed binary): `spawn mission hold --source
+# <SA>` exits 1 with the usage of `spawn mission` ("spawn: usage: ...");
+# the scenario fails at (1) 0.8-1.0 s after it starts. A pass takes 1-4
+# minutes (most of it the loop's setup, two reports, and the 20 s bound
+# of (4)).
 set -eu
 
 asserted=""
@@ -653,20 +654,25 @@ done
 [ "$(task_state "$t_alpha")" != landed ] ||
     fail "(1) task #$t_alpha landed on SA while SA was held (hold $hold_a): SA's main moved $sa_main -> $(main_of "$sa")"
 
-# Gates on a held source still run and record their verdicts.
+# Gates on a held source still run and record their verdicts: alpha's
+# task is reported (the world works), then gated.
 deadline=$(($(now) + 180))
 until [ "$(accepted_record "$t_alpha")" -gt 0 ]; do
     case "$(task_state "$t_alpha")" in
-    assigned | delivered | revise)
-        [ "$(now)" -lt "$deadline" ] ||
-            harness "(1) alpha's task #$t_alpha was not reported within 180 s (tasks: $(tasks_line))"
-        ;;
     landed) fail "(1) task #$t_alpha landed on SA while SA was held (hold $hold_a)" ;;
-    *)
-        [ "$(now)" -lt "$deadline" ] ||
-            fail "(1) alpha's reported task #$t_alpha on held SA was not gated within 180 s: gates on a held source still run (tasks: $(tasks_line); integrate: $(log_tail))"
-        ;;
+    reported | accepted | landing) break ;;
     esac
+    [ "$(now)" -lt "$deadline" ] ||
+        harness "(1) alpha's task #$t_alpha was not reported within 180 s (tasks: $(tasks_line))"
+    integrator_alive || fail "(1) the integrator exited: $(log_tail)"
+    sleep 1
+done
+deadline=$(($(now) + 60))
+until [ "$(accepted_record "$t_alpha")" -gt 0 ]; do
+    [ "$(task_state "$t_alpha")" != landed ] ||
+        fail "(1) task #$t_alpha landed on SA while SA was held (hold $hold_a)"
+    [ "$(now)" -lt "$deadline" ] ||
+        fail "(1) alpha's reported task #$t_alpha on held SA was not gated within 60 s: gates on a held source still run (tasks: $(tasks_line); integrate: $(log_tail))"
     integrator_alive || fail "(1) the integrator exited: $(log_tail)"
     sleep 1
 done
