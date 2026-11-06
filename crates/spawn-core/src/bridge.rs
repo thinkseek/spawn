@@ -8,7 +8,7 @@
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -126,8 +126,13 @@ pub struct BridgeConfig {
     pub ready_interval: Duration,
     /// Attempts of an input whose terminal call failed (a capture, or the
     /// staging of its text) while the terminal is still there. A pane that
-    /// reads as not ready is refused at once ([`PANE_NOT_READY`]).
+    /// reads as not ready refuses an input of Spawn's own loops at once
+    /// ([`PANE_NOT_READY`]); any other input waits ([`waits`]).
     pub input_attempts: usize,
+    /// How soon an input that waits for its turn is claimed again: its lease
+    /// is released for this long ([`CommandQueue::release`]), so a busy pane
+    /// is read about this often until it takes the input.
+    pub input_wait_retry: Duration,
     /// Where Claude Code writes session transcripts (its `projects`
     /// directory), as the terminal host sees it.
     pub claude_projects: String,
@@ -152,6 +157,7 @@ impl BridgeConfig {
             ready_attempts: 40,
             ready_interval: Duration::from_millis(250),
             input_attempts: 4,
+            input_wait_retry: Duration::from_secs(1),
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
             model_relay: None,
@@ -251,6 +257,32 @@ struct SessionView {
     /// The latest prompt the engine's transcript recorded: its execution and
     /// where it is in the log.
     last_message: Option<(ExecutionId, GlobalPosition)>,
+    /// What the log says about the session's inputs ([`Inputs`]).
+    inputs: Inputs,
+}
+
+/// What the log says about a session's inputs: which wait for their turn,
+/// and whether the input typed last has been answered, so the next goes on
+/// a ready screen of its own. All of it is folded from the log, so a
+/// restarted Bridge carries on with it.
+#[derive(Debug, Clone, Default)]
+struct Inputs {
+    /// Unfinished inputs with a `waiting` step, each with the execution it
+    /// waited on.
+    waiting: BTreeMap<CommandId, Option<ExecutionId>>,
+    /// How each ended execution of the session ended.
+    ended: HashMap<ExecutionId, EndCause>,
+    /// The latest `typed` step (a prompt's or an input's).
+    typed: Option<(ExecutionId, GlobalPosition)>,
+    /// The latest screen the Bridge recorded as ready.
+    ready: Option<(ExecutionId, GlobalPosition)>,
+    /// The latest end of a turn in the engine's transcript.
+    turn_end: Option<(ExecutionId, GlobalPosition)>,
+}
+
+/// `at` is later than `than` in the same execution.
+fn after(at: Option<&(ExecutionId, GlobalPosition)>, execution: &ExecutionId, than: GlobalPosition) -> bool {
+    at.is_some_and(|(seen, position)| seen == execution && *position > than)
 }
 
 /// The recorded steps of one command ([`CommandStep`]).
@@ -296,7 +328,38 @@ impl SessionView {
                     CommandStep::Mounted => steps.mounted.clone_from(workspace),
                     CommandStep::MountReleased => steps.released = true,
                     CommandStep::Typing => steps.typing_at = Some(record.position),
-                    CommandStep::Typed => steps.typed = true,
+                    CommandStep::Typed => {
+                        steps.typed = true;
+                        if let Some(execution) = event.execution_id.clone() {
+                            self.inputs.typed = Some((execution, record.position));
+                        }
+                    }
+                    CommandStep::Waiting => {
+                        self.inputs
+                            .waiting
+                            .insert(*command_id, event.execution_id.clone());
+                    }
+                }
+            }
+            EventKind::CommandFinished { command_id, .. } => {
+                self.inputs.waiting.remove(command_id);
+            }
+            EventKind::ScreenObserved {
+                state: ScreenState::Ready,
+                ..
+            } if event.source == Source::Bridge => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.inputs.ready = Some((execution, record.position));
+                }
+            }
+            EventKind::TurnStopped { .. } | EventKind::TurnFailed { .. } => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.inputs.turn_end = Some((execution, record.position));
+                }
+            }
+            EventKind::ExecutionEnded { cause, .. } if event.source == Source::Bridge => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.inputs.ended.insert(execution, *cause);
                 }
             }
             EventKind::ExecutionStarted { command_id, .. } => {
@@ -332,6 +395,28 @@ impl SessionView {
                 }
             }
         }
+    }
+
+    /// Whether the input typed last into `execution` has been answered, so
+    /// another may be typed: nothing was typed into it yet, or since the
+    /// last `typed` the Bridge recorded a ready screen, or the engine
+    /// received a prompt and ended its turn. A ready screen read before a
+    /// typing is consumed by it (the rule the Observer's snapshot applies),
+    /// so two inputs never land in one prompt.
+    fn answered(&self, execution: &ExecutionId) -> bool {
+        let Some((typed_in, typed_at)) = &self.inputs.typed else {
+            return true;
+        };
+        if typed_in != execution {
+            return true;
+        }
+        if after(self.inputs.ready.as_ref(), execution, *typed_at) {
+            return true;
+        }
+        self.last_message
+            .as_ref()
+            .filter(|(seen, position)| seen == execution && *position > *typed_at)
+            .is_some_and(|(_, message)| after(self.inputs.turn_end.as_ref(), execution, *message))
     }
 
     /// Fold what recovery needs to compare the agent's branch with the log:
@@ -391,6 +476,20 @@ pub struct Bridge {
     warned: std::sync::Mutex<HashMap<SessionId, HashSet<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
+    /// The latest claim of each input this Bridge left waiting, so that an
+    /// execution's end fails them in the same tick. Only a shortcut: a
+    /// restarted Bridge, which has none, fails them when it claims them
+    /// next (the log says which wait and how the execution ended).
+    held: HashMap<CommandId, Claimed>,
+}
+
+/// What handling a claimed command came to.
+enum Handled {
+    /// It finished, with this outcome.
+    Finished(Outcome),
+    /// An input that waits for its turn: left unfinished, claimed again
+    /// after [`BridgeConfig::input_wait_retry`].
+    Waiting,
 }
 
 impl Bridge {
@@ -414,6 +513,7 @@ impl Bridge {
             unrecorded_commits: std::sync::Mutex::default(),
             warned: std::sync::Mutex::default(),
             transcripts: None,
+            held: HashMap::new(),
         }
     }
 
@@ -588,6 +688,9 @@ impl Bridge {
     pub fn tick(&mut self) -> Result<TickReport, StoreError> {
         self.catch_up()?;
         let mut report = TickReport::default();
+        // Inputs left waiting in this tick: one claimed again in the same
+        // tick (a retry interval of zero) waits for the next.
+        let mut waited: HashSet<CommandId> = HashSet::new();
         while report.commands < self.config.max_commands_per_tick {
             let Some(claimed) = self
                 .queue
@@ -595,8 +698,24 @@ impl Bridge {
             else {
                 break;
             };
-            let outcome = self.handle(&claimed, &mut report)?;
-            self.queue.finish(&claimed, &outcome)?;
+            if waited.contains(&claimed.command_id) {
+                self.queue
+                    .release(&claimed, self.config.input_wait_retry)?;
+                self.held.insert(claimed.command_id, claimed);
+                break;
+            }
+            match self.handle(&claimed, &mut report)? {
+                Handled::Finished(outcome) => {
+                    self.held.remove(&claimed.command_id);
+                    self.queue.finish(&claimed, &outcome)?;
+                }
+                Handled::Waiting => {
+                    self.queue
+                        .release(&claimed, self.config.input_wait_retry)?;
+                    waited.insert(claimed.command_id);
+                    self.held.insert(claimed.command_id, claimed);
+                }
+            }
             report.commands += 1;
             self.catch_up()?;
         }
@@ -643,6 +762,7 @@ impl Bridge {
                 latest: None,
                 steps: HashMap::new(),
                 last_message: None,
+                inputs: Inputs::default(),
             });
         view.fold_branch(record);
         view.fold_steps(record);
@@ -1387,15 +1507,20 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         report: &mut TickReport,
-    ) -> Result<Outcome, StoreError> {
+    ) -> Result<Handled, StoreError> {
         let Ok(action) = claimed.action() else {
-            return Ok(Outcome::Failed("stored action is not valid".to_string()));
+            return Ok(Handled::Finished(Outcome::Failed(
+                "stored action is not valid".to_string(),
+            )));
         };
         // What a command appends comes after the session's waiting commit
         // records. While the log refuses them the command is not handled
         // (the error ends the tick; the lease brings the command back).
         self.record_unrecorded_commit(&claimed.session_id)?;
-        match action {
+        if let CommandAction::Input { text, .. } = &action {
+            return self.input(claimed, text);
+        }
+        let outcome = match action {
             CommandAction::Start {
                 engine: _,
                 prompt,
@@ -1413,13 +1538,14 @@ impl Bridge {
                 },
                 report,
             ),
-            CommandAction::Input { text, .. } => self.input(claimed, &text),
+            CommandAction::Input { .. } => unreachable!("handled above"),
             CommandAction::Stop => self.stop(claimed, false, report),
             CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt, model } => {
                 self.resume(claimed, prompt.as_deref(), model, report)
             }
-        }
+        }?;
+        Ok(Handled::Finished(outcome))
     }
 
     fn running(&self, session: &SessionId) -> Option<Active> {
