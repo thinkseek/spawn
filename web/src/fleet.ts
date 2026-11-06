@@ -3,7 +3,7 @@
 // so a server that omits one renders an empty value instead of crashing.
 
 import type { SessionState } from "./api";
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
 import type { GateRoom, Memory } from "./resources";
 import { normalizeGateRoom, normalizeMemory } from "./resources";
 import type { RsiPane } from "./rsi";

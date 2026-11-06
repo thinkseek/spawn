@@ -4,7 +4,7 @@
 // field is normalized, so a server that omits one renders an empty value
 // instead of crashing the page.
 
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
 
 export type Direction = "lower" | "higher";
 
