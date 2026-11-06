@@ -93,7 +93,7 @@
 #
 # Today (2026-11-06, the deployed binary): `spawn mission hold --source
 # <SA>` exits 1 with the usage of `spawn mission` ("spawn: usage: ...");
-# the scenario fails at (1) 0.8-1.0 s after it starts.
+# the scenario fails at (1) 0.8-1.2 s after it starts.
 set -eu
 
 asserted=""
