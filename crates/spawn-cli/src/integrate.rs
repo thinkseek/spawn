@@ -4865,4 +4865,55 @@ mod database_tests {
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// Issue #8: a reported task whose agent's latest recorded checkpoint
+    /// the source never got (its push was lost with the process that queued
+    /// it) is not judged `stale` on every pass forever: the stale check
+    /// pushes that checkpoint again from this host's mirror, and the same
+    /// check finds it fresh.
+    #[test]
+    fn a_recorded_checkpoint_whose_push_was_lost_is_pushed_again_and_fresh() {
+        use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
+        use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
+        use spawn_core::port::{Commit, EventLog, WorkspaceStore};
+        let db = Db::new("lost_push");
+        let (base, source, scenarios, _integrator) = world("lost-push", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = ready_task(&db, db.reported_task(mission, "lost"));
+        let root = base.join("host");
+        let mirror = crate::sources::ensure_mirror(&root, Some(&source)).expect("mirror");
+        let host = spawn_host::GitWorkspace::new(&mirror, &root);
+        let branch = BranchName::new(task.agent_id.as_str()).expect("branch");
+        host.ensure_branch(&branch, None).expect("branch");
+        let workspace = host.mount(&branch).expect("mount");
+        std::fs::write(Path::new(workspace.path()).join("work.txt"), "work\n").expect("write");
+        let Commit::Created(commit) = host.commit(&workspace, "work").expect("commit") else {
+            panic!("a checkpoint");
+        };
+        db.store
+            .append(NewEvent {
+                agent_id: AgentId::new(task.agent_id.as_str()).expect("agent"),
+                session_id: SessionId::new(task.session_id.as_str()).expect("session"),
+                execution_id: None,
+                source: Source::Bridge,
+                source_event_id: Some(format!("commit:{commit}")),
+                kind: EventKind::ArtifactCommitted {
+                    reason: CheckpointReason::BaseMerged,
+                    artifact: ArtifactRef {
+                        project: "missions".to_string(),
+                        branch: branch.clone(),
+                        commit: CommitId::new(commit.as_str()).expect("commit"),
+                    },
+                    files: vec!["work.txt".to_string()],
+                },
+            })
+            .expect("recorded, never pushed");
+        assert_eq!(
+            super::Judge::pushed_candidate(&db.store, &mirror, &source, &task)
+                .expect("judged"),
+            super::Freshness::Fresh(commit.as_str().to_string())
+        );
+        host.unmount(&workspace).expect("unmount");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
