@@ -164,16 +164,30 @@ expect "a candidate that names no commit is no verdict" \
     "exit=$(sh "$gate" "$repo" "$base" no-such-ref "$scenarios" >/dev/null 2>&1 || echo $?)" 'exit=3'
 expect "no task scenario: regression only" "$(judge "$good")" 'exit=0 {"verdict":"accepted"}'
 
-# No room in TMPDIR: an abort (exit 3, no verdict) before any scratch is made.
+# No room in TMPDIR: exit 5 and a no-room fact in the verdict file (no
+# verdict), before any scratch is made. The integrator records it as
+# `no_room`, which does not count toward a halt.
 roomless=$work/roomless-tmp
 mkdir "$roomless"
-expect "a TMPDIR without room aborts the gate" \
-    "$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000; judge "$good")" 'exit=3 '
-refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'verdict'
+expect "a TMPDIR without room stops the gate with its own status" \
+    "$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000; judge "$good")" \
+    'exit=5 {"no_room":true,"free_kb":'
+expect "the reason names the floor and TMPDIR" "$(cat "$integrator/verdict")" \
+    "\"min_gb\":1000000000,\"tmpdir\":\"$roomless\"}"
+expect "and the free space, in KiB" \
+    "$(grep -Ec '^\{"no_room":true,"free_kb":[0-9]+,"min_gb"' "$integrator/verdict")" 1
+refuse "with no verdict" "$(cat "$integrator/verdict")" '"verdict"'
+expect "a verdict file that cannot be written still exits 5" \
+    "exit=$(export TMPDIR="$roomless" SPAWN_GATE_MIN_FREE_GB=1000000000
+            SPAWN_GATE_VERDICT=$work/no-such-dir/verdict sh "$gate" "$repo" "$base" "$good" "$scenarios" \
+                >/dev/null 2>&1 || echo $?)" 'exit=5'
 expect "and says why" "$(cat "$work/gate.out")" 'under SPAWN_GATE_MIN_FREE_GB=1000000000: not starting'
 refuse "and leaves no scratch" "$(ls -A "$roomless")" 'spawn-gate'
-expect "a floor that is not whole GiB aborts too" \
+expect "a floor that is not whole GiB is an abort (exit 3), not short room" \
     "$(export SPAWN_GATE_MIN_FREE_GB=lots; judge "$good")" 'exit=3 '
+refuse "and writes no no-room fact" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'no_room'
+expect "a TMPDIR whose free space cannot be read is an abort too" \
+    "$(export TMPDIR="$work/no-such-tmp" SPAWN_GATE_MIN_FREE_GB=1; judge "$good")" 'exit=3 '
 expect "the gate's scratch is named for cleanup" \
     "$(export TMPDIR="$roomless"; . "$(dirname "$gate")/../disk.sh"; basename "$(gate_scratch)")" 'spawn-gate.'
 rm -rf "$roomless"
@@ -830,20 +844,224 @@ expect "the base cache is unchanged" \
 [ ! -e "$cache/planted" ] || { echo "FAIL the sandbox planted a base cache entry"; exit 1; }
 echo "ok   nothing planted in the base cache"
 
-# A helper the scenarios source from the controller is in the key: the
-# controller is two levels above the scenarios directory.
-controller=$work/controller
+# 9b. The base cache's key is everything that decides a base result, and
+# nothing else. The scenarios run from a controller checkout (two levels
+# above them) whose helper 011.sh sources; a controller file no scenario
+# names is not in the key. The controller lies under $HOME, as the owner's
+# does: the sandbox binds its scripts back from there.
+controller=$HOME/controller
 mkdir -p "$controller/rsi" "$controller/scripts/blackbox"
 cp -r "$objectives" "$controller/rsi/scenarios"
 printf '# helper\n' >"$controller/scripts/blackbox/lib.sh"
-judge "$good" "" "$controller/rsi/scenarios" >/dev/null
-expect "with the controller's helpers, a second run is cached" \
-    "$(judge "$good" "" "$controller/rsi/scenarios")" 'exit=0 {"verdict":"accepted"}'
-expect "from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+printf '# the runner of other suites\n' >"$controller/scripts/blackbox/runner.sh"
+printf '. "$(dirname "$0")/../../scripts/blackbox/lib.sh"\n' >>"$controller/rsi/scenarios/011.sh"
+printf '# like scripts/blackbox/runner.sh, which it does not run\n' >>"$controller/rsi/scenarios/011.sh"
+keyed=$controller/rsi/scenarios
+# from_cache: the base results the last run took from the cache.
+from_cache() { sed -n 's/^| base results from the cache: \(.*\); run on the base:.*/\1/p' "$work/gate.out"; }
+judge "$good" "" "$keyed" >/dev/null
+expect "the key is not the scenario's path: 007.sh is a hit from another directory" \
+    "$(cat "$work/gate.out")" '| base results from the cache: 007.sh; run on the base: 011.sh'
+expect "a cache hit: the same key again" "$(judge "$good" "" "$keyed")" 'exit=0 {"verdict":"accepted"}'
+expect "both results from the cache" "$(from_cache)" '007.sh 011.sh'
+expect "each named so in the log" "$(cat "$work/gate.out")" '| == base: 007.sh: unsolved (cached)'
+refuse "and nothing built on the base" "$(cat "$work/gate.out")" '== base: build'
+expect "the log says where the time went" "$(cat "$work/gate.out")" \
+    '| gate time: base 0 s (0 scenario runs, 2 results from the cache), candidate '
+expect "the log names the toolchain" "$(cat "$work/gate.out")" '| base cache: toolchain rustc '
+
+printf '# changed\n' >>"$controller/scripts/blackbox/runner.sh"
+judge "$good" "" "$keyed" >/dev/null
+expect "a controller file no scenario names, or names in a comment only, changes no key" \
+    "$(from_cache)" '007.sh 011.sh'
+
 printf '# changed\n' >>"$controller/scripts/blackbox/lib.sh"
-expect "a changed helper is judged again" "$(judge "$good" "" "$controller/rsi/scenarios")" \
+judge "$good" "" "$keyed" >/dev/null
+expect "a miss: a helper the scenario sources changed" "$(cat "$work/gate.out")" \
+    'from the cache: 007.sh; run on the base: 011.sh'
+
+printf '# changed\n' >>"$keyed/007.sh"
+judge "$good" "" "$keyed" >/dev/null
+expect "a miss: the scenario's blob changed" "$(cat "$work/gate.out")" \
+    'from the cache: 011.sh; run on the base: 007.sh'
+
+printf '# changed\n' >>"$keyed/build"
+judge "$good" "" "$keyed" >/dev/null
+expect "a miss: the build hook changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+
+git -C "$seed" checkout -q -B other-base "$base"
+printf 'unrelated\n' >"$seed/unrelated"
+other_base=$(commit other-base)
+saved_base=$base
+base=$other_base
+judge "$good" "" "$keyed" >/dev/null
+base=$saved_base
+expect "a miss: another base commit" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+
+gate_copy=$work/gate-copy/scripts
+mkdir -p "$gate_copy/rsi"
+cp "$(dirname "$gate")"/../*.sh "$gate_copy/"
+cp "$gate" "$gate_copy/rsi/gate.sh"
+printf '# changed\n' >>"$gate_copy/rsi/gate.sh"
+saved_gate=$gate
+gate=$gate_copy/rsi/gate.sh
+judge "$good" "" "$keyed" >/dev/null
+gate=$saved_gate
+expect "a miss: gate.sh's blob changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+
+# Another toolchain: a rustc that says another version, first on PATH.
+mkdir -p "$work/other-rust"
+printf '#!/bin/sh\necho "rustc 0.0.1-other (test)"\necho "release: 0.0.1-other"\n' >"$work/other-rust/rustc"
+chmod +x "$work/other-rust/rustc"
+saved_path=$PATH
+PATH=$work/other-rust:$PATH
+other_toolchain=$(judge "$good" "" "$keyed")
+PATH=$saved_path
+expect "a miss: another toolchain" "$other_toolchain" 'exit=0 {"verdict":"accepted"}'
+expect "run on the base" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+expect "and the log names it" "$(cat "$work/gate.out")" 'toolchain rustc 0.0.1-other'
+judge "$good" "" "$keyed" >/dev/null
+expect "the toolchain back: cached again" "$(from_cache)" '007.sh 011.sh'
+
+# The test server's version and the other tools the scenarios run are in
+# the key: a psql first on PATH that answers `-V` and the server's
+# `server_version_num` (asked through libpq's variables, never a URL on its
+# command line) from a file beside it.
+mkdir -p "$work/fake-pg"
+cat >"$work/fake-pg/psql" <<'EOF'
+#!/bin/sh
+here=$(dirname "$0")
+case "$*" in
+-V) cat "$here/client" ;;
+*"server_version_num"*)
+    [ -n "${PGHOST-}" ] && [ -n "${PGDATABASE-}" ] || { echo "no libpq variables" >&2; exit 2; }
+    case "$*" in *postgres:*) echo "a URL on the command line" >&2; exit 2 ;; esac
+    cat "$here/server" ;;
+*) exit 2 ;;
+esac
+EOF
+chmod +x "$work/fake-pg/psql"
+echo 'psql (PostgreSQL) 17.0' >"$work/fake-pg/client"
+echo 170000 >"$work/fake-pg/server"
+with_fake_pg() {
+    saved_path=$PATH
+    PATH=$work/fake-pg:$PATH
+    fake_pg_out=$(judge "$good" "" "${1:-$keyed}")
+    PATH=$saved_path
+}
+with_fake_pg
+expect "the log names the test server's version" "$(cat "$work/gate.out")" 'psql 17.0 server 170000'
+with_fake_pg
+expect "the same server: a hit" "$(from_cache)" '007.sh 011.sh'
+echo 170004 >"$work/fake-pg/server"
+with_fake_pg
+expect "a miss: the test server's version changed" "$fake_pg_out" 'exit=0 {"verdict":"accepted"}'
+expect "both run on the base" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+echo 'psql (PostgreSQL) 17.1' >"$work/fake-pg/client"
+with_fake_pg
+expect "a miss: another psql" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+
+# A hit touches its entry, so routine cleanup keeps the entries in use.
+for entry in "$cache"/*; do touch -d '20 days ago' "$entry"; done
+judge "$good" "" "$keyed" >/dev/null
+expect "a hit" "$(from_cache)" '007.sh 011.sh'
+expect "touches the two entries it used" "$(find "$cache" -type f -newermt '-1 hour' | grep -c .)" '2'
+
+# A helper reached indirectly (a variable after scripts/, or a cd into
+# scripts/ and a relative path) cannot be read off the text: all of the
+# controller's scripts/ is in the key.
+indirect=$HOME/indirect
+mkdir -p "$indirect/rsi/scenarios" "$indirect/scripts/blackbox"
+printf '# helper v1\n' >"$indirect/scripts/blackbox/lib.sh"
+cp "$scenarios/protected" "$scenarios/build" "$indirect/rsi/scenarios/"
+cat >"$indirect/rsi/scenarios/021.sh" <<'EOF'
+#!/bin/sh
+h=blackbox/lib.sh
+. "$(dirname "$0")/../../scripts/$h"
+[ "$(cat value)" != three ]
+EOF
+cat >"$indirect/rsi/scenarios/022.sh" <<'EOF'
+#!/bin/sh
+(cd "$(dirname "$0")/../../scripts" && . ./blackbox/lib.sh) || exit 2
+[ "$(cat value)" != three ]
+EOF
+judge "$good" "" "$indirect/rsi/scenarios" >/dev/null
+judge "$good" "" "$indirect/rsi/scenarios" >/dev/null
+expect "indirect helpers: a hit while nothing changed" "$(from_cache)" '021.sh 022.sh'
+printf '# helper v2\n' >"$indirect/scripts/blackbox/lib.sh"
+judge "$good" "" "$indirect/rsi/scenarios" >/dev/null
+expect "a miss: the helper reached through scripts/\$h or a cd changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 021.sh 022.sh'
+
+# What is installed in a directory the `bind` list names decides base
+# results (a project's node_modules), so it is in the key: a listing of the
+# directory, or pnpm's install record when it has one.
+bound=$HOME/bound-inputs
+mkdir -p "$bound/lib" "$HOME/bound-ctl/rsi/scenarios"
+echo v1 >"$bound/lib/answer"
+cp "$scenarios/protected" "$scenarios/build" "$HOME/bound-ctl/rsi/scenarios/"
+printf '%s\n' "$bound" >"$HOME/bound-ctl/rsi/scenarios/bind"
+cat >"$HOME/bound-ctl/rsi/scenarios/031.sh" <<EOF
+#!/bin/sh
+[ -f '$bound/lib/answer' ] || exit 2
+[ "\$(cat value)" != three ]
+EOF
+bound_scenarios=$HOME/bound-ctl/rsi/scenarios
+judge "$good" "" "$bound_scenarios" >/dev/null
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a bound directory unchanged: a hit" "$(from_cache)" '031.sh'
+echo v2-longer >"$bound/lib/answer"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: a file in a bound directory changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+mkdir -p "$bound/.pnpm"
+printf 'lockfileVersion: 9\n' >"$bound/.pnpm/lock.yaml"
+printf 'prunedAt: one\n' >"$bound/.modules.yaml"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: the directory now has pnpm's install record" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "with the record: a hit" "$(from_cache)" '031.sh'
+echo v3 >"$bound/lib/answer"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "an edit without an install is not keyed (the record stands for it)" "$(from_cache)" '031.sh'
+printf 'prunedAt: two\n' >"$bound/.modules.yaml"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: an install rewrote the record" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+printf 'lockfileVersion: 9\npackages: {}\n' >"$bound/.pnpm/lock.yaml"
+judge "$good" "" "$bound_scenarios" >/dev/null
+expect "a miss: the installed lockfile changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 031.sh'
+
+# A corrupt entry is a miss: whatever an entry holds but "solved" or
+# "unsolved", an entry that cannot be read, or one that is a directory, is
+# judged again, and rewritten.
+for entry in "$cache"/*; do printf 'solved, trust me\n' >"$entry"; done
+expect "corrupt entries: the verdict is the base's own" "$(judge "$good" "" "$keyed")" \
     'exit=0 {"verdict":"accepted"}'
-refuse "not from the cache" "$(cat "$work/gate.out")" '011.sh: solved (cached)'
+expect "each judged again" "$(cat "$work/gate.out")" '| == base: 007.sh: its cache entry cannot be read; judged again'
+expect "on the base" "$(cat "$work/gate.out")" 'from the cache: none; run on the base: 007.sh 011.sh'
+judge "$good" "" "$keyed" >/dev/null
+expect "and rewritten" "$(from_cache)" '007.sh 011.sh'
+for entry in "$cache"/*; do chmod 000 "$entry"; done
+judge "$good" "" "$keyed" >/dev/null
+expect "unreadable entries are misses" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+for entry in "$cache"/*; do
+    chmod 600 "$entry" 2>/dev/null || true
+    rm -rf "$entry"
+    mkdir "$entry"
+done
+judge "$good" "" "$keyed" >/dev/null
+expect "an entry that is a directory is a miss" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+judge "$good" "" "$keyed" >/dev/null
+expect "and is replaced" "$(from_cache)" '007.sh 011.sh'
+chmod -R u+rwx "$cache"
 
 # A base cache the sandbox would show again (under a directory it binds) is
 # refused before anything runs.

@@ -56,6 +56,14 @@
 //! the dispatcher, delivery keeps no state: idempotency keys and the task
 //! rows say what was already done.
 //!
+//! A waiting task that does not move is not left to wait silently: the
+//! task whose turn it is ([`next_up`]) is at its `delivery` step from the
+//! record that put it there, and the dispatcher's stall layer
+//! (`dispatch::stall`) escalates it once its bound
+//! (`SPAWN_STALL_DELIVERY_SECS`) has passed, naming every attempt and its
+//! outcome and the retry still due or held ([`delivery_status`]). One whose
+//! retries are spent was escalated as delivery failed, and gets no stall.
+//!
 //! [`orders`] is pure; [`collect_reports`] is the one step with side effects
 //! (the report file and the task row).
 
@@ -67,6 +75,7 @@ use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
 use spawn_core::command::CommandAction;
 use spawn_core::event::{ENGINE, ModelProfile};
 use spawn_core::mission::TaskState;
+use spawn_core::observation::Ambiguity;
 use spawn_host::tree_path::TreePath;
 use spawn_postgres::PostgresStore;
 
@@ -539,8 +548,9 @@ enum Attempts {
     /// goes at `due_ms`.
     Retry { number: usize, due_ms: i64 },
     /// The latest attempt failed and is not tried again: why, for the
-    /// supervisor.
-    Failed(&'static str),
+    /// supervisor, and whether its retries are spent (`false`: it may have
+    /// typed the task, so it is not tried again).
+    Failed { why: &'static str, spent: bool },
 }
 
 /// Where `task`'s current delivery into `facts`' session stands. A failure
@@ -572,10 +582,11 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
         Some(false) => {
             let error = last.error.as_deref().unwrap_or_default();
             if error.contains(MAY_HAVE_TYPED) {
-                return Attempts::Failed(
-                    "may or may not have reached its worker; ask the worker before assigning it \
-                     again",
-                );
+                return Attempts::Failed {
+                    why: "may or may not have reached its worker; ask the worker before assigning \
+                          it again",
+                    spent: false,
+                };
             }
             let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
             if not_ready(last) && refusals <= NOT_READY_FREE {
@@ -585,13 +596,138 @@ fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
                 };
             }
             if failures > DELIVERY_RETRIES {
-                return Attempts::Failed("never reached its worker; cancel it and assign it again");
+                return Attempts::Failed {
+                    why: "never reached its worker; cancel it and assign it again",
+                    spent: true,
+                };
             }
             Attempts::Retry {
                 number: sent.len(),
                 due_ms: finished.saturating_add(retry_wait_ms(failures)),
             }
         }
+    }
+}
+
+/// Why a delivery due now is not sent, if it is held: what [`delivery`]
+/// waits for on the worker. `settled`: as there.
+fn held(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<String> {
+    let facts = found?;
+    if facts.open_command {
+        return Some("a command is in flight in its session".to_string());
+    }
+    if facts.stopping() {
+        return Some("its worker's stop is under way".to_string());
+    }
+    if !facts.live {
+        // Started or resumed with the task: nothing to wait for.
+        return None;
+    }
+    let ready = if task.is_revision() {
+        facts.turn_stopped_idle()
+    } else {
+        facts.idle_at_prompt() || (settled && facts.turn_stopped_idle())
+    };
+    if ready {
+        return None;
+    }
+    Some(
+        match (facts.current_observation(), facts.observation.as_ref()) {
+            (None, Some(latest)) => format!(
+                "its worker has no judgement covering its latest fact (the latest, {}, is older)",
+                latest.state.key()
+            ),
+            (None, None) => "its worker has no judgement yet".to_string(),
+            (Some(current), _) if current.ambiguity != Some(Ambiguity::TurnStoppedIdle) => format!(
+                "its worker is not idle at its prompt (judged {})",
+                current.state.key()
+            ),
+            (Some(current), _) => format!(
+                "its worker stopped at its prompt judged {} and the task it last got is still open",
+                current.state.key()
+            ),
+        },
+    )
+}
+
+/// What delivery did and does about one waiting task, for its stall
+/// ([`crate::dispatch`]'s `stall`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeliveryStatus {
+    /// Its retries are spent: [`Why::DeliveryFailed`] was its escalation.
+    pub(crate) given_up: bool,
+    /// Every attempt with its key and outcome (a failed one with its
+    /// error), then what comes next: a retry due, or due and held and why,
+    /// or none.
+    pub(crate) line: String,
+}
+
+/// Where `task`'s delivery stands, at `now_ms` (the database's clock).
+pub(crate) fn delivery_status(
+    work: &Work,
+    task: &TaskRow,
+    found: Option<&Facts>,
+    now_ms: i64,
+) -> DeliveryStatus {
+    let sent = found
+        .map(|facts| delivery_attempts(task, facts))
+        .unwrap_or_default();
+    let mut parts = Vec::new();
+    let mut last_error: Option<&str> = None;
+    for attempt in &sent {
+        parts.push(match attempt.succeeded {
+            None => format!("`{}` in flight", attempt.key),
+            Some(true) => format!("`{}` succeeded", attempt.key),
+            Some(false) => {
+                let error = attempt.error.as_deref().unwrap_or("no error recorded");
+                let said = if last_error == Some(error) {
+                    "the same error".to_string()
+                } else {
+                    one_line(error, 200)
+                };
+                last_error = Some(error);
+                format!("`{}` failed ({said})", attempt.key)
+            }
+        });
+    }
+    let tried = if parts.is_empty() {
+        "nothing sent yet".to_string()
+    } else {
+        format!("attempts: {}", parts.join("; "))
+    };
+    let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
+    let mut given_up = false;
+    let next = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
+        Attempts::None => held(task, found, settled).map_or_else(
+            || "its first attempt goes on the next pass".to_string(),
+            |why| format!("its first attempt is held: {why}"),
+        ),
+        Attempts::Open => "an attempt is in flight".to_string(),
+        Attempts::Delivered(_) => {
+            "the last attempt succeeded; the task is marked delivered on the next pass".to_string()
+        }
+        Attempts::Retry { number, due_ms } => {
+            let key = format!("{}-retry-{number}", task.delivery_key());
+            if now_ms < due_ms {
+                format!(
+                    "retry `{key}` due in {}s",
+                    (due_ms - now_ms).saturating_add(999) / 1000
+                )
+            } else {
+                held(task, found, settled).map_or_else(
+                    || format!("retry `{key}` due now"),
+                    |why| format!("retry `{key}` due and held: {why}"),
+                )
+            }
+        }
+        Attempts::Failed { why, spent } => {
+            given_up = spent;
+            format!("not tried again: it {why} (escalated as delivery failed)")
+        }
+    };
+    DeliveryStatus {
+        given_up,
+        line: format!("{tried}; {next}"),
     }
 }
 
@@ -621,6 +757,21 @@ pub(crate) fn delivered(work: &Work, rows: &[Facts]) -> Vec<(i64, i64)> {
         .collect()
 }
 
+/// The waiting tasks (assigned, or sent back) that are their session's
+/// turn ([`Turns`]: a revision first, then the oldest new task) with no
+/// open task of the session holding it ([`Work::blocked`]): the ones
+/// delivery tries now. Every other waiting task is queued behind one.
+pub(crate) fn next_up(work: &Work) -> BTreeSet<i64> {
+    let blocked = work.blocked();
+    let mut turns = Turns::new(work);
+    work.tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Assigned | TaskState::Revise))
+        .filter(|task| turns.take(task) && !blocked.contains(task.session_id.as_str()))
+        .map(|task| task.id)
+        .collect()
+}
+
 /// Delivery orders for the current facts: a task's delivery, or its retry
 /// once due ([`attempts`]).
 pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
@@ -628,16 +779,14 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
         .iter()
         .map(|facts| (facts.session_id.as_str(), facts))
         .collect();
-    let blocked = work.blocked();
-    let mut turns = Turns::new(work);
+    let next = next_up(work);
     let mut orders = Vec::new();
     for task in &work.tasks {
         let session = task.session_id.as_str();
         let found = facts.get(session).copied();
         match task.state {
             TaskState::Assigned | TaskState::Revise => {
-                let turn = turns.take(task);
-                if !turn || blocked.contains(session) {
+                if !next.contains(&task.id) {
                     continue;
                 }
                 let key = match found.map_or(Attempts::None, |facts| attempts(task, facts)) {
@@ -648,7 +797,7 @@ pub(crate) fn orders(work: &Work, rows: &[Facts], now_ms: i64) -> Vec<Order> {
                     Attempts::Retry { .. }
                     | Attempts::Open
                     | Attempts::Delivered(_)
-                    | Attempts::Failed(_) => continue,
+                    | Attempts::Failed { .. } => continue,
                 };
                 let settled = found.is_some_and(|facts| last_delivery_closed(work, facts));
                 orders.extend(delivery(task, found, settled, key));
@@ -884,7 +1033,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         });
     }
     for (task, attempts) in waiting_attempts(work, rows) {
-        if let Attempts::Failed(why) = attempts {
+        if let Attempts::Failed { why, .. } = attempts {
             items.push(Escalation {
                 session_id: task.session_id.clone(),
                 id: task.delivery_key(),

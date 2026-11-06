@@ -110,6 +110,123 @@ from (
    where first.id is not null
 ) t";
 
+/// What the dispatcher measures stalls from (`dispatch/stall.rs`,
+/// docs/fleet-architecture.md §3), all from the log and on the database's
+/// clock: `now_ms` is `spawn_now_ms()`, and every `age_ms` is it minus the
+/// record's `recorded_at_ms`.
+///
+/// - `tasks`: every open task (the rows [`DELIVERY_TASKS`] reads, but a
+///   closed ephemeral task only while its worker runs) with `record`, the
+///   latest control record that put it in its state (`task.assigned`; the
+///   review or verdict that sent it back; `task.delivered`; `task.reported`;
+///   the review that accepted it; the gate's `accepted`; the record that
+///   closed it), and `stale`, the latest `stale` verdict on it, which moves
+///   no step;
+/// - `verdicts`: per gated mission with a task waiting for the gate, the
+///   latest verdict on any of its tasks that is not `stale`;
+/// - `sessions`: per session with a delivered task, its latest fact (a
+///   record that is neither the Observer's nor storage's, as
+///   [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `evidence_seq`) and
+///   the evidence of its latest screen reading;
+/// - `halted`: every halted mission with open tasks, its latest
+///   `mission.halted` record and those tasks.
+pub(crate) const STALL_FACTS: &str = r"
+with now as (select spawn_now_ms() as ms),
+open as (
+  select k.id, k.mission_id, k.kind, k.session_id, k.state, k.revisions,
+         m.gate is not null as gated, coalesce(m.accept, 'review') as accept,
+         m.halted is not null as halted
+    from mission_tasks k
+    join mission_missions m on m.id = k.mission_id
+   where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
+      or (k.state = 'accepted' and m.gate is not null)
+      or (k.state in ('accepted', 'cancelled', 'landed') and k.kind = 'ephemeral'
+          and exists (select 1 from agent_status s where s.session_id = k.session_id and s.live))
+)
+select jsonb_build_object(
+  'now_ms', (select ms from now),
+  'tasks', coalesce((select jsonb_agg(jsonb_build_object(
+      'id', o.id, 'mission_id', o.mission_id, 'kind', o.kind, 'session_id', o.session_id,
+      'state', o.state, 'revisions', o.revisions, 'gated', o.gated, 'accept', o.accept,
+      'halted', o.halted, 'record', rec.record, 'stale', st.stale) order by o.id)
+    from open o
+    left join lateral (
+      select jsonb_build_object('id', e.id, 'type', x.r ->> 'type', 'at_ms', e.recorded_at_ms,
+                                'age_ms', (select ms from now) - e.recorded_at_ms) as record
+        from spawn_events e
+       cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'id' = o.id::text
+         and case o.state
+               when 'assigned' then x.r ->> 'type' = 'task.assigned'
+               when 'revise' then (x.r ->> 'type' = 'task.reviewed' and x.r ->> 'accepted' = 'false')
+                               or (x.r ->> 'type' = 'task.gated'
+                                   and x.r ->> 'verdict' in ('rejected', 'conflict'))
+               when 'delivered' then x.r ->> 'type' = 'task.delivered'
+               when 'reported' then x.r ->> 'type' = 'task.reported'
+               when 'accepted' then x.r ->> 'type' = 'task.reviewed' and x.r ->> 'accepted' = 'true'
+               when 'landing' then x.r ->> 'type' = 'task.gated' and x.r ->> 'verdict' = 'accepted'
+               when 'landed' then x.r ->> 'type' = 'task.landed'
+               when 'cancelled' then x.r ->> 'type' in ('task.cancelled', 'task.aborted')
+               else false
+             end
+       order by e.session_seq desc limit 1) rec on true
+    left join lateral (
+      select jsonb_build_object('id', e.id, 'reason', e.kind -> 'detail' -> 'record' ->> 'reason',
+                                'at_ms', e.recorded_at_ms,
+                                'age_ms', (select ms from now) - e.recorded_at_ms) as stale
+        from spawn_events e
+       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'id' = o.id::text
+         and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+         and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'stale'
+       order by e.session_seq desc limit 1) st on true), '[]'::jsonb),
+  'verdicts', coalesce((select jsonb_agg(v order by v.mission_id) from (
+      select distinct on (k.mission_id) k.mission_id, e.id,
+             e.kind -> 'detail' -> 'record' ->> 'verdict' as verdict,
+             e.kind -> 'detail' -> 'record' ->> 'id' as task,
+             e.recorded_at_ms as at_ms, (select ms from now) - e.recorded_at_ms as age_ms
+        from mission_tasks k
+        join spawn_events e
+          on e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+       where k.mission_id in (select mission_id from open
+                               where gated and state in ('reported', 'accepted'))
+         and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+         and e.kind -> 'detail' -> 'record' ->> 'verdict' <> 'stale'
+       order by k.mission_id, e.session_seq desc) v), '[]'::jsonb),
+  'sessions', coalesce((select jsonb_agg(jsonb_build_object(
+      'session_id', s.session_id, 'seq', f.session_seq, 'event_name', f.event_name,
+      'at_ms', f.recorded_at_ms, 'age_ms', (select ms from now) - f.recorded_at_ms,
+      'screen', sc.evidence) order by s.session_id)
+    from (select distinct session_id from open where state = 'delivered') s
+    left join lateral (
+      select e.session_seq, e.event_name, e.recorded_at_ms from spawn_events e
+       where e.session_id = s.session_id and e.source <> 'observer'
+         and e.event_name not in ('artifact.committed', 'merge.conflicted')
+       order by e.session_seq desc limit 1) f on true
+    left join lateral (
+      select e.kind -> 'detail' ->> 'evidence' as evidence from spawn_events e
+       where e.session_id = s.session_id and e.event_name = 'screen.observed'
+       order by e.id desc limit 1) sc on true), '[]'::jsonb),
+  'halted', coalesce((select jsonb_agg(jsonb_build_object(
+      'mission_id', m.id, 'reason', m.halted, 'record', h.record, 'tasks', t.ids) order by m.id)
+    from mission_missions m
+    join lateral (
+      select jsonb_agg(o.id order by o.id) as ids from open o
+       where o.mission_id = m.id and o.state not in ('cancelled', 'landed')
+         and not (o.state = 'accepted' and not o.gated)) t on t.ids is not null
+    left join lateral (
+      select jsonb_build_object('id', e.id, 'type', 'mission.halted', 'at_ms', e.recorded_at_ms,
+                                'age_ms', (select ms from now) - e.recorded_at_ms) as record
+        from spawn_events e
+       where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text
+         and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.halted'
+       order by e.session_seq desc limit 1) h on true
+   where m.halted is not null), '[]'::jsonb)
+)";
+
 /// What the supervisor should hear about, beyond worker states: open
 /// missions, reports it reviews (not those of a mission its gate alone
 /// accepts: the gate judges them, and `spawn_task_review` refuses them; a
@@ -213,12 +330,15 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
 
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
-/// the integrator may judge, land, or hold to its budget.
+/// the integrator may judge, land, or hold to its budget, with the brief and
+/// the report a landing's message is written from.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
-         m.gate_rejections, m.gate_aborts, m.objectives, m.sources ->> 0 as source,
+         m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
+         m.gate_room_last_ms,
+         m.gate_room_waits, m.gate_room_escalated, m.objectives, m.sources ->> 0 as source,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -227,7 +347,8 @@ from (
                'session_id', k.session_id, 'state', k.state, 'base', k.base,
                'candidate', k.candidate, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
-               'revisions', k.revisions)
+               'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
+               'updated_at_ms', k.updated_at_ms)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -237,6 +358,34 @@ from (
    where m.gate is not null
      and (m.state in ('open', 'active') or t.tasks is not null)
 ) x";
+
+/// The `no_room` gate records that carry `escalate` (the mission's gate
+/// went without room past the integrator's limit) and that the supervisor
+/// was not told of yet, oldest first, each with its `event_id`, `at_ms` and
+/// `mission`. Told is a record, not a window: a digest that reached the
+/// supervisor carrying the tag `host gate-room-<event_id>` (as
+/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was away
+/// for days is still told once.
+pub(crate) const GATE_ROOM_ESCALATIONS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.recorded_at_ms,
+                                                  'mission', k.mission_id)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join mission_tasks k on k.id = (r ->> 'id')::bigint
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
+   and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
+   and not exists (select 1 from told where tag = 'host gate-room-' || e.id)";
 
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
@@ -358,15 +507,26 @@ pub(crate) const RETIRED_RESIDENTS: &str =
     "select agent_id, session_id from mission_residents where state = 'retired'";
 
 /// First source of the mission behind an agent's first task. `$1` agent.
+///
+/// An agent whose first execution started before its first task was
+/// mounted from the default repository (`SPAWN_GIT_REPO`), where its branch
+/// lives (a resident started before it had work): it stays there, read from
+/// the records (`execution.started` against the task's creation, one clock),
+/// so its checkpoints find the branch it was mounted on. No row then.
 pub(crate) const AGENT_SOURCE: &str = "select m.sources ->> 0
                    from mission_tasks k join mission_missions m on m.id = k.mission_id
                   where k.agent_id = $1
+                    and not exists (select 1 from spawn_events e
+                                     where e.agent_id = $1 and e.event_name = 'execution.started'
+                                       and e.recorded_at_ms < k.created_at_ms)
                   order by k.id limit 1";
 
 /// Agents with a task still open (not cancelled, not landed) and the
 /// source their workspace comes from, by [`AGENT_SOURCE`]'s rule (the
-/// agent's first task decides): the branches a restarted Bridge publishes
-/// again, since its pusher's queue lived in memory.
+/// agent's first task decides, and an agent that ran before it stays on
+/// the default repository, published by no mission): the branches a
+/// restarted Bridge publishes again, since its pusher's queue lived in
+/// memory.
 pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
                         (select m.sources ->> 0
                            from mission_tasks k join mission_missions m on m.id = k.mission_id
@@ -374,6 +534,11 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
                           order by k.id limit 1)
                    from (select distinct agent_id from mission_tasks
                           where state not in ('cancelled', 'landed')) a
+                  where not exists (
+                          select 1 from spawn_events e
+                           where e.agent_id = a.agent_id and e.event_name = 'execution.started'
+                             and e.recorded_at_ms < (select min(k.created_at_ms) from mission_tasks k
+                                                      where k.agent_id = a.agent_id))
                   order by a.agent_id";
 
 // Delivery bookkeeping, run by the dispatcher as the owner.
@@ -526,6 +691,12 @@ impl PostgresStore {
         self.query_json(GATED, &[])
     }
 
+    /// The `no_room` gate records that escalate and were not told to the
+    /// supervisor yet ([`GATE_ROOM_ESCALATIONS`]).
+    pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
+        self.query_json(GATE_ROOM_ESCALATIONS, &[])
+    }
+
     /// Tool calls `session` started after `since_ms`: a task's budget.
     pub fn tool_calls_since(&self, session: &str, since_ms: i64) -> Result<i64, StoreError> {
         Ok(self
@@ -642,6 +813,11 @@ impl PostgresStore {
         self.query_json(CANCELLED_DELIVERIES, &[])
     }
 
+    /// What the dispatcher measures stalls from ([`STALL_FACTS`]).
+    pub fn stall_facts(&self) -> Result<Value, StoreError> {
+        self.query_json(STALL_FACTS, &[])
+    }
+
     /// Missions, reports, approvals and human messages for the digest.
     pub fn mission_news(&self) -> Result<Value, StoreError> {
         self.query_json(MISSION_NEWS, &[])
@@ -666,7 +842,9 @@ impl PostgresStore {
     /// Where an agent's workspace comes from: `None` when no mission owns
     /// the agent, `Some(None)` for a mission without sources (a scratch
     /// workspace), `Some(Some(source))` otherwise. The agent's first task
-    /// decides, so a resident's workspace never jumps between sources.
+    /// decides, so a resident's workspace never jumps between sources; an
+    /// agent that ran before its first task keeps the default repository it
+    /// was mounted from (`None`).
     pub fn agent_source(&self, agent: &str) -> Result<Option<Option<String>>, StoreError> {
         let rows = self.query(AGENT_SOURCE, &[&agent])?;
         Ok(rows.first().map(|row| row.get::<_, Option<String>>(0)))

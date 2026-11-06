@@ -6,7 +6,20 @@
 //! it counts only when the gate exits 0. Stdout is the record, not the
 //! verdict: candidate code once wrote an accepted line to the gate's stdout
 //! through /proc and killed the gate. A gate that exits non-zero, or dies
-//! of a signal, is an abort whatever it printed.
+//! of a signal, is an abort whatever it printed, with one exception: exit
+//! [`NO_ROOM_EXIT`] *and* a no-room fact in the verdict file
+//! (`{"no_room":true,"free_kb":n,"min_gb":n,"tmpdir":"…"}`) means TMPDIR had
+//! no room to judge ([`GateFailure::NoRoom`]). The gate writes that file
+//! before any candidate code runs (scripts/disk.sh `gate_room`).
+//!
+//! A TMPDIR with no room at all may leave no fact: the gate cannot write
+//! its verdict file, or this process cannot create its private directory.
+//! Then this process measures the free space itself ([`judge`]'s `free_kb`,
+//! `df` in production): of the directory it could not create in, or of the
+//! gate's TMPDIR after an exit [`NO_ROOM_EXIT`] with no readable fact. It
+//! records [`GateFailure::NoRoom`] with its own measurement only when that is
+//! under the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is
+//! an abort, as is a fact with any other exit status.
 //!
 //! The gate runs with a cleared environment: [`GATE_ENV`] and nothing else.
 //! The integrator's own database URL never reaches candidate code.
@@ -32,6 +45,19 @@ pub(crate) const GATE_ENV: &[&str] = &[
     "SPAWN_GATE_MIN_FREE_GB",
 ];
 
+/// The gate's exit status when TMPDIR has no room to judge now
+/// (scripts/rsi/gate.sh). It counts only with the no-room fact in the
+/// verdict file.
+pub(crate) const NO_ROOM_EXIT: i32 = 5;
+
+/// The gate's floor when SPAWN_GATE_MIN_FREE_GB is unset (scripts/disk.sh).
+const DEFAULT_MIN_FREE_GB: u64 = 10;
+
+/// Free KiB of the filesystem holding a path, as this host reports it now.
+fn measured_free_kb(path: &Path) -> Option<u64> {
+    crate::disk::free_bytes(path).ok().map(|bytes| bytes / 1024)
+}
+
 /// One gate verdict.
 #[derive(Debug, Clone)]
 pub(crate) struct Verdict {
@@ -53,6 +79,15 @@ pub(crate) enum GateFailure {
     /// The gate ran but gave no verdict to believe: a non-zero or signalled
     /// exit, or no verdict file. `log` is what it printed.
     Aborted { reason: String, log: String },
+    /// TMPDIR had less than SPAWN_GATE_MIN_FREE_GB free, so the gate did not
+    /// start. A fact about the host, not the work. It names what the gate
+    /// saw: free KiB, the floor in GiB, and the directory.
+    NoRoom {
+        free_kb: u64,
+        min_gb: u64,
+        tmpdir: String,
+        log: String,
+    },
 }
 
 /// The gate's environment, read through `lookup`: the [`GATE_ENV`]
@@ -170,7 +205,64 @@ pub(crate) fn judge(
     env: &[(String, String)],
     limit: Duration,
 ) -> Result<Verdict, GateFailure> {
-    let directory = PrivateDirectory::create().map_err(|error| failed(&error))?;
+    judge_in(
+        &std::env::temp_dir(),
+        &measured_free_kb,
+        gate,
+        repo,
+        base,
+        candidate,
+        scenarios,
+        scenario,
+        env,
+        limit,
+    )
+}
+
+/// [`judge`], with the private directory made under `parent` and free space
+/// measured by `free_kb` (a seam for tests: a disk with no room at all).
+#[allow(clippy::too_many_arguments)]
+fn judge_in(
+    parent: &Path,
+    free_kb: &dyn Fn(&Path) -> Option<u64>,
+    gate: &Path,
+    repo: &Path,
+    base: &str,
+    candidate: &str,
+    scenarios: &Path,
+    scenario: Option<&Path>,
+    env: &[(String, String)],
+    limit: Duration,
+) -> Result<Verdict, GateFailure> {
+    let floor = env_value(env, "SPAWN_GATE_MIN_FREE_GB")
+        .map_or(Some(DEFAULT_MIN_FREE_GB), |text| text.parse::<u64>().ok());
+    // The gate's own TMPDIR, as gate.sh reads it.
+    let tmpdir = PathBuf::from(env_value(env, "TMPDIR").unwrap_or("/tmp"));
+    let short = |path: &Path, log: &str, why: &str| -> Option<GateFailure> {
+        let min_gb = floor?;
+        let free = free_kb(path)?;
+        (free < min_gb.saturating_mul(1_048_576)).then(|| GateFailure::NoRoom {
+            free_kb: free,
+            min_gb,
+            tmpdir: path.display().to_string(),
+            log: format!(
+                "{log}! integrate: {why}; measured {free} KiB free in {}, under \
+                 SPAWN_GATE_MIN_FREE_GB={min_gb}\n",
+                path.display()
+            ),
+        })
+    };
+    let directory = match PrivateDirectory::create_in(parent) {
+        Ok(directory) => directory,
+        Err(error) => {
+            return Err(short(
+                parent,
+                "",
+                &format!("cannot create the gate's private directory: {error}"),
+            )
+            .unwrap_or_else(|| failed(&error)));
+        }
+    };
     let verdict_path = directory.path().join("verdict");
     let mut command = Command::new("sh");
     command
@@ -186,9 +278,39 @@ pub(crate) fn judge(
         .env_clear()
         .envs(env.iter().map(|(name, value)| (name, value)))
         .env("SPAWN_GATE_VERDICT", &verdict_path);
-    let run = run_bounded(command, limit, directory.path())?;
+    let run = match run_bounded(command, limit, directory.path()) {
+        Ok(run) => run,
+        Err(GateFailure::Failed(error)) => {
+            return Err(short(
+                parent,
+                "",
+                &format!("cannot run the gate in its private directory: {error}"),
+            )
+            .unwrap_or(GateFailure::Failed(error)));
+        }
+        Err(other) => return Err(other),
+    };
     let verdict = std::fs::read_to_string(&verdict_path).ok();
-    decide(&run, verdict.as_deref())
+    match decide(&run, verdict.as_deref()) {
+        // Exit 5 with no readable fact: the gate said "no room" but could
+        // not write it down. Measure; believe it only under the floor.
+        Err(GateFailure::Aborted { reason, log }) if run.status.code() == Some(NO_ROOM_EXIT) => {
+            Err(short(
+                &tmpdir,
+                &log,
+                "the gate exited 5 with no readable no-room fact",
+            )
+            .unwrap_or(GateFailure::Aborted { reason, log }))
+        }
+        other => other,
+    }
+}
+
+/// The value of `name` in the gate's environment, when set.
+fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
 }
 
 /// The verdict of a finished gate run: the verdict file's, only after a
@@ -207,6 +329,16 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         reason,
         log: record(&run.stdout),
     };
+    if run.status.code() == Some(NO_ROOM_EXIT)
+        && let Some((free_kb, min_gb, tmpdir)) = verdict.and_then(no_room)
+    {
+        return Err(GateFailure::NoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log: record(&run.stdout),
+        });
+    }
     if !run.status.success() {
         return Err(aborted(format!("the gate ended with {}", run.status)));
     }
@@ -241,6 +373,23 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
     })
 }
 
+/// The no-room fact of a verdict file, `(free_kb, min_gb, tmpdir)`: one
+/// JSON line with `no_room` true, whole numbers and a directory.
+fn no_room(file: &str) -> Option<(u64, u64, String)> {
+    let line = file.trim();
+    if line.contains('\n') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("no_room")?.as_bool() != Some(true) || value.get("verdict").is_some() {
+        return None;
+    }
+    let free_kb = value.get("free_kb")?.as_u64()?;
+    let min_gb = value.get("min_gb")?.as_u64()?;
+    let tmpdir = value.get("tmpdir")?.as_str()?;
+    (!tmpdir.is_empty()).then(|| (free_kb, min_gb, tmpdir.to_string()))
+}
+
 fn failed(error: &std::io::Error) -> GateFailure {
     GateFailure::Failed(error.to_string())
 }
@@ -250,13 +399,17 @@ fn failed(error: &std::io::Error) -> GateFailure {
 struct PrivateDirectory(PathBuf);
 
 impl PrivateDirectory {
+    #[cfg(test)]
     fn create() -> std::io::Result<Self> {
+        Self::create_in(&std::env::temp_dir())
+    }
+
+    fn create_in(parent: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt as _;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let path =
-            std::env::temp_dir().join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
+        let path = parent.join(format!("spawn-gate-{}-{nonce:x}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
     }
@@ -360,7 +513,8 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GateFailure, PrivateDirectory, gate_env, judge, run_bounded, withhold_owners_cluster,
+        GateFailure, PrivateDirectory, gate_env, judge, judge_in, run_bounded,
+        withhold_owners_cluster,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -437,6 +591,31 @@ mod tests {
         }
     }
 
+    impl FakeGate {
+        /// [`FakeGate::judge`] with the private directory under `parent` and
+        /// free space measured as `free_kb` says, wherever.
+        fn judge_room(
+            &self,
+            env: &[(String, String)],
+            parent: &Path,
+            free_kb: Option<u64>,
+        ) -> Result<super::Verdict, GateFailure> {
+            let path = |name: &str| -> PathBuf { self.directory.path().join(name) };
+            judge_in(
+                parent,
+                &|_| free_kb,
+                &path("gate.sh"),
+                Path::new("/nonexistent/repo.git"),
+                "base",
+                "candidate",
+                &path("scenarios"),
+                None,
+                env,
+                Duration::from_secs(20),
+            )
+        }
+    }
+
     fn path_only() -> Vec<(String, String)> {
         vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]
     }
@@ -493,6 +672,144 @@ mod tests {
             gate.judge(&path_only()),
             Err(GateFailure::Aborted { reason, .. }) if reason.contains("exit status: 1")
         ));
+    }
+
+    const NO_ROOM_FACT: &str =
+        r#"{"no_room":true,"free_kb":2097152,"min_gb":10,"tmpdir":"/data/tmp"}"#;
+
+    #[test]
+    fn exit_5_with_the_no_room_fact_is_no_room() {
+        let gate = FakeGate::new(&format!(
+            "echo 'gate: 2.0 GiB free' >&2\necho '{NO_ROOM_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"
+        ));
+        let Err(GateFailure::NoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log,
+        }) = gate.judge(&path_only())
+        else {
+            panic!("no room is its own outcome");
+        };
+        assert_eq!(
+            (free_kb, min_gb, tmpdir.as_str()),
+            (2_097_152, 10, "/data/tmp")
+        );
+        assert!(log.contains("! gate: 2.0 GiB free"), "{log}");
+    }
+
+    #[test]
+    fn exit_5_without_the_fact_is_an_abort() {
+        // A bare status, a status with a verdict instead, or a fact that
+        // names no directory: nothing recorded says "no room".
+        for body in [
+            "exit 5\n".to_string(),
+            "echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n".to_string(),
+            "echo '{\"no_room\":true,\"free_kb\":1,\"min_gb\":10}' >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"
+                .to_string(),
+            "echo '{\"no_room\":true,\"free_kb\":\"lots\",\"min_gb\":10,\"tmpdir\":\"/t\"}' \
+             >\"$SPAWN_GATE_VERDICT\"\nexit 5\n"
+                .to_string(),
+        ] {
+            let gate = FakeGate::new(&body);
+            assert!(
+                matches!(
+                    // Room to spare, whatever this host has.
+                    gate.judge_room(&path_only(), &std::env::temp_dir(), Some(u64::MAX)),
+                    Err(GateFailure::Aborted { ref reason, .. }) if reason.contains("exit status: 5")
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    /// A TMPDIR at 0 bytes free: this process cannot even make its private
+    /// directory. It measures the directory itself, and records no room only
+    /// when the measure is under the floor.
+    #[test]
+    fn no_private_directory_on_a_full_disk_is_no_room_by_measure() {
+        let gate = FakeGate::new("exit 0\n");
+        let full = Path::new("/nonexistent/full-tmp");
+        let Err(GateFailure::NoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log,
+        }) = gate.judge_room(&path_only(), full, Some(0))
+        else {
+            panic!("a full disk is no room");
+        };
+        assert_eq!((free_kb, min_gb), (0, 10), "the default floor");
+        assert_eq!(tmpdir, "/nonexistent/full-tmp");
+        assert!(
+            log.contains("cannot create the gate's private directory"),
+            "{log}"
+        );
+        // The same failure with room to spare, or unmeasurable: an abort.
+        for measured in [Some(11 * 1_048_576), None] {
+            assert!(
+                matches!(
+                    gate.judge_room(&path_only(), full, measured),
+                    Err(GateFailure::Failed(_))
+                ),
+                "{measured:?}"
+            );
+        }
+    }
+
+    /// The gate exits 5 but could not write its fact (a full disk): the
+    /// integrator measures the gate's TMPDIR against the gate's floor.
+    #[test]
+    fn exit_5_without_a_fact_is_no_room_only_by_measure() {
+        let gate = FakeGate::new("exit 5\n");
+        let parent = std::env::temp_dir();
+        let env = |floor: &str| {
+            let mut env = path_only();
+            env.push(("TMPDIR".to_string(), "/data/full".to_string()));
+            env.push(("SPAWN_GATE_MIN_FREE_GB".to_string(), floor.to_string()));
+            env
+        };
+        let Err(GateFailure::NoRoom {
+            free_kb,
+            min_gb,
+            tmpdir,
+            log,
+        }) = gate.judge_room(&env("4"), &parent, Some(0))
+        else {
+            panic!("exit 5 on a full TMPDIR is no room");
+        };
+        assert_eq!((free_kb, min_gb, tmpdir.as_str()), (0, 4, "/data/full"));
+        assert!(log.contains("no readable no-room fact"), "{log}");
+        for (floor, measured) in [("4", Some(4 * 1_048_576)), ("4", None), ("lots", Some(0))] {
+            assert!(
+                matches!(
+                    gate.judge_room(&env(floor), &parent, measured),
+                    Err(GateFailure::Aborted { .. })
+                ),
+                "floor {floor}, measured {measured:?}: an abort"
+            );
+        }
+        // Any other exit, on the same full disk, still counts.
+        let other = FakeGate::new("exit 3\n");
+        assert!(matches!(
+            other.judge_room(&env("4"), &parent, Some(0)),
+            Err(GateFailure::Aborted { .. })
+        ));
+    }
+
+    #[test]
+    fn the_no_room_fact_with_another_status_is_an_abort() {
+        // Exit 3 is every other refusal to start (a missing bind directory,
+        // a bad floor): it counts, whatever the file says.
+        for status in [0, 3] {
+            let gate = FakeGate::new(&format!(
+                "echo '{NO_ROOM_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit {status}\n"
+            ));
+            assert!(
+                matches!(gate.judge(&path_only()), Err(GateFailure::Aborted { .. })),
+                "exit {status}"
+            );
+        }
     }
 
     #[test]

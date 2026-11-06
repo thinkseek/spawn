@@ -88,6 +88,10 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let mut store: Option<std::sync::Arc<PostgresStore>> = None;
     let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
     let mut disk = disk::Monitor::new(workspace_root.as_deref());
+    let (bounds, warnings) = dispatch::Bounds::from_env();
+    for warning in &warnings {
+        eprintln!("spawn loop warning: {warning}");
+    }
     let mut failures: u32 = 0;
     loop {
         let mut failed = false;
@@ -129,7 +133,14 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
             if dispatching {
                 step(
                     "dispatch",
-                    dispatch::step(open, supervised, &spawn, workspace_root.as_deref(), &disk),
+                    dispatch::step(
+                        open,
+                        supervised,
+                        &spawn,
+                        workspace_root.as_deref(),
+                        &disk,
+                        &bounds,
+                    ),
                 );
             }
             // Under the disk floor no resident is revived (a new execution);

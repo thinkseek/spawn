@@ -67,6 +67,7 @@ const PHASE: Record<string, PhaseStyle> = {
   aborted: MUTED,
   conflict: { ...WARNING, pulse: false },
   stale: MUTED,
+  no_room: MUTED,
 };
 
 const FALLBACK: PhaseStyle = {

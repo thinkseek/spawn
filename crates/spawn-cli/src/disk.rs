@@ -219,6 +219,37 @@ no new executions start; free space (old workspaces, build output) or tell the o
         .collect()
 }
 
+/// The digest items for `records`, the integrator's `no_room` gate records
+/// that carry `escalate` and that no delivered digest told yet
+/// (`PostgresStore::gate_room_escalations`): a mission's gate has had no
+/// room in TMPDIR for more than two hours. No time window: a record stays
+/// an item until a digest carrying its tag reaches the supervisor, and the
+/// integrator writes one per run, so the supervisor is told once.
+pub(crate) fn gate_room_escalations(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let free = gib(record["free_kb"].as_u64()?.saturating_mul(1024));
+            let tmpdir = record["tmpdir"].as_str()?;
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "a mission".to_string(), |id| format!("mission {id}"));
+            Some(Escalation {
+                session_id: "host".to_string(),
+                id: format!("gate-room-{id}"),
+                why: Why::GateRoom,
+                line: format!(
+                    "the gate of {mission} has had no room to judge for over two hours: {free} \
+free in TMPDIR {tmpdir}, under SPAWN_GATE_MIN_FREE_GB={}. Its work waits (no halt counts); free \
+space there (old gate scratch, build output) or tell the owner.",
+                    record["min_gb"].as_u64().unwrap_or_default()
+                ),
+            })
+        })
+        .collect()
+}
+
 /// The size report the fleet view shows: per place (the workspace root of
 /// `SPAWN_WORKSPACE_ROOT`, and `TMPDIR`) its free space now (`null` when it
 /// cannot be read), the thresholds, and the state of its latest `host.disk`
@@ -361,7 +392,7 @@ impl Monitor {
 mod tests {
     use super::{
         GIB, Monitor, Place, RECOVERY_MARGIN, Reading, Thresholds, escalations,
-        hold_new_executions, parse_df, places,
+        gate_room_escalations, hold_new_executions, parse_df, places,
     };
     use crate::dispatch::{Order, Why};
     use serde_json::json;
@@ -550,5 +581,32 @@ mod tests {
                 .contains("Under 2.0 GiB no new executions start")
         );
         assert_eq!(items[1].line, "workspace /ws has 30.0 GiB free again");
+    }
+
+    #[test]
+    fn a_gate_without_room_for_hours_is_told_with_the_free_space_and_tmpdir() {
+        let day: i64 = 86_400_000;
+        let records = [
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 4,
+                   "free_kb": 3 * 1_048_576, "min_gb": 10, "tmpdir": "/data/tmp",
+                   "event_id": 12, "at_ms": 10 * day, "mission": 7}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 5,
+                   "free_kb": 1, "min_gb": 10, "tmpdir": "/old", "event_id": 2,
+                   "at_ms": 8 * day, "mission": 3}),
+        ];
+        // The store returns only the untold ones; their age does not matter.
+        let items = gate_room_escalations(&records);
+        assert_eq!(items.len(), 2, "a record older than a day is still told");
+        assert_eq!(items[1].tag(), "host gate-room-2");
+        assert_eq!(items[0].why, Why::GateRoom);
+        assert_eq!(items[0].tag(), "host gate-room-12");
+        assert!(
+            items[0].line.contains(
+                "the gate of mission 7 has had no room to judge for over two hours: 3.0 GiB \
+free in TMPDIR /data/tmp, under SPAWN_GATE_MIN_FREE_GB=10"
+            ),
+            "{}",
+            items[0].line
+        );
     }
 }
