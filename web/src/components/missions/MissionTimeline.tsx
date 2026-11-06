@@ -45,7 +45,7 @@ import {
   useWheelZoom,
   useWidth,
 } from "../timeaxis/useTimeWindow";
-import { cx } from "../ui";
+import { EmptyState, cx } from "../ui";
 import { useStoredChoice } from "../ViewToggle";
 import { TaskPanel } from "./TaskPanel";
 import { PHASE_COLOR, PHASE_LEGEND, verdictColor } from "./timelineStyle";
