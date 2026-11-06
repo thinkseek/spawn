@@ -5,7 +5,9 @@
 //! rule (`spawn_task_may_continue`) lets its work go on, one pass:
 //!
 //! 1. a halt rule that fired stops the mission's landings until a human
-//!    resumes it: three gate rejections in a row, three aborts in a row, the
+//!    resumes it: three gate rejections in a row, three aborts in a row
+//!    (neither a `no_room` nor a `host_fault` counts toward either, and no
+//!    rule counts host faults: a halt needs a human), the
 //!    scenario count below its floor, a remote source (agents' branches
 //!    never reach it), or the source's main not where the last landing left
 //!    it. That last one is read only from a fetch that succeeded this pass,
@@ -95,6 +97,40 @@
 //!    the supervisor once ([`crate::disk::gate_room_escalations`]). Every
 //!    other gate failure, the gate's own exit 3 included (a missing bind
 //!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
+//!
+//!    **A host fault is not a verdict.** When the gate rejects C with
+//!    [`host::CHECK_TESTS_REGRESSION`], the integrator reads the failures
+//!    check-tests.sh printed in the gate's recorded output
+//!    ([`host::check_tests_failures`]: its `FAILED <test>: <message>` lines
+//!    when the section holds one, else the panics and `Error:` lines of its
+//!    excerpt). A failure is the host's when its message is a connection
+//!    error to the test database ([`host::CONNECTION_ERRORS`]), or a
+//!    database error of any kind (`db error`, `Error { kind: Db`) while the
+//!    test database's log (`SPAWN_TEST_DATABASE_LOG`, optional; unset or
+//!    unreadable is no evidence, said once) shows a crash stamped within the
+//!    gate's run as this process measured it, give or take a second
+//!    ([`host::crash_lines`]). At least one failure read, and every one the
+//!    host's: `host_fault`, not `rejected`, and C's head is not judged
+//!    alone. The task stays where it was, its revisions and note do not
+//!    move, nothing goes back to the worker, and neither `gate_rejections`
+//!    nor `gate_aborts` grows or resets. The record names `candidate`,
+//!    `reason` (`host fault: ...`, saying which evidence), `log`,
+//!    `evidence` (`failures` when every failure is a connection error, else
+//!    `server_log`), `failures` (each `test`, first message line, `class`),
+//!    `crash` (the log lines, when used), `host_faults` (the mission's count
+//!    in a row, this one included, folded by the store as
+//!    `gate_host_faults`), `backoff_ms` ([`host_fault_backoff`]:
+//!    `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS`, 300 by default, doubled per host
+//!    fault in a row, at most an hour), `due_ms` (the record's own time plus
+//!    the backoff, written by the store) and `escalate` (the second in a
+//!    row only; the dispatcher's digest takes it to the supervisor once,
+//!    [`crate::dispatch::digest::host_fault_escalations`]). No pass gates
+//!    the task before `due_ms` ([`host_wait`], read from the store, never
+//!    from memory; its mission's other tasks wait behind it). A real failure
+//!    among them, or none read, keeps it `rejected`; any other rejection is
+//!    judged as before. The decision rests on the failures and the crash
+//!    lines named in the record, never on the reason's text alone; the wait
+//!    rests on the recorded `due_ms`;
 //!
 //!    **A report is judged against the checkpoint of the turn that produced
 //!    it.** The dispatcher collects a report only after the turn that wrote
