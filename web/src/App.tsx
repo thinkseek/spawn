@@ -1,5 +1,5 @@
 import { PanelRight } from "lucide-react";
-import { Suspense, lazy, useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 
 import { fetchOverview, fetchSession, usePoll } from "./api";
 import type { SessionDetail } from "./api";
@@ -14,6 +14,9 @@ import { ScorecardView } from "./components/scorecard/ScorecardView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
+import type { Missions } from "./missions";
+import { fetchMissions } from "./missions";
+import { fleetContext } from "./ordering";
 
 // Its own chunk: Motion and d3 load only when the Show view opens.
 const ShowView = lazy(() =>
@@ -82,6 +85,14 @@ export default function App() {
   // open agent) across reloads.
   const [route, setRoute] = useState<Route>(routeFromHash);
   const view = route.view;
+  // Polled in every view too: the sidebar and the fleet board group agents
+  // by the tasks they hold. Faster while the missions page shows them.
+  const missions = usePoll<Missions>(
+    "missions",
+    fetchMissions,
+    view === "missions" ? 5_000 : 15_000,
+  );
+  const context = useMemo(() => fleetContext(missions.data), [missions.data]);
   const setView = (next: View) => setRoute({ view: next, agent: null });
 
   useEffect(() => {
@@ -162,6 +173,8 @@ export default function App() {
       />
       <Sidebar
         sessions={overview.data?.sessions ?? []}
+        agents={fleet.data?.agents ?? null}
+        context={context}
         selectedId={view === "sessions" ? selectedId : null}
         view={view}
         rsi={rsi}
@@ -182,16 +195,17 @@ export default function App() {
       {view === "fleet" ? (
         <FleetView
           fleet={fleet}
+          context={context}
           selectedId={route.agent}
           onSelect={(agent) => setRoute({ view: "fleet", agent })}
           onOpenTimeline={openTimeline}
         />
       ) : view === "missions" ? (
-        <MissionsView />
+        <MissionsView missions={missions} />
       ) : view === "rsi" ? (
         <RsiView onOpenSession={openTimeline} />
       ) : view === "scorecard" ? (
-        <ScorecardView />
+        <ScorecardView missions={missions.data} />
       ) : view === "show" ? (
         <Suspense fallback={<div className="flex-1 bg-page-canvas" />}>
           <ShowView fleet={fleet} present={false} />
