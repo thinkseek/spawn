@@ -70,6 +70,9 @@ const PHASE: Record<string, PhaseStyle> = {
   incompatible: { ...WARNING, pulse: false },
   stale: MUTED,
   no_room: MUTED,
+  // The gate failed because the host did (the test database): the host's
+  // verdict, not the work's. Not counted; judged again after a backoff.
+  host_fault: { ...INFO, pulse: false },
 };
 
 const FALLBACK: PhaseStyle = {
