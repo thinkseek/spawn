@@ -1161,3 +1161,37 @@ fn a_restarted_observer_covers_a_lagging_session_once() {
     let mut again = rules_only(&fixture);
     assert_eq!(again.tick().expect("tick"), 0, "covered: nothing to write");
 }
+
+/// An input that waits for a busy session's turn records `waiting`. The
+/// Observer takes it as it takes any command step: it changes no verdict,
+/// and the judgement written once the facts settle covers it, so the
+/// verdict never looks stale behind it.
+#[test]
+fn a_waiting_input_is_covered_like_any_command_step_and_changes_no_verdict() {
+    let fixture = fixture(Scripted::new(Ok(blocked_answer())));
+    let mut observer = rules_only(&fixture);
+    started(&fixture.store);
+    tool_started(&fixture.store, "t1");
+    busy(&fixture.store);
+    assert_eq!(observer.tick().expect("tick"), 1);
+    fixture.clock.advance(Duration::from_secs(3));
+    observer.tick().expect("settled");
+
+    append(
+        &fixture.store,
+        Source::Bridge,
+        EventKind::CommandStepped {
+            command_id: CommandId(2),
+            step: spawn_core::event::CommandStep::Waiting,
+            workspace: None,
+        },
+    );
+    let waiting = latest_fact(&fixture.store);
+    fixture.clock.advance(Duration::from_secs(3));
+    assert_eq!(observer.tick().expect("settled"), 1);
+    let last = observations(&fixture.store).pop().expect("an observation");
+    assert_eq!(last.state, SemanticState::Working);
+    assert_eq!(last.based_on_seq.0, waiting, "covers the waiting step");
+    fixture.clock.advance(Duration::from_secs(31));
+    assert_eq!(observer.tick().expect("recheck"), 0);
+}
