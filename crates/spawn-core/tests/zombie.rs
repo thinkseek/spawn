@@ -428,7 +428,8 @@ fn an_engine_its_runner_still_runs_is_never_ended_by_a_start() {
     assert!(error.contains("already runs"), "{error}");
     assert!(ends(&store).is_empty());
     assert!(store.is_alive(&first(), &any_workspace()).expect("alive"));
-    // And an input reaches it.
+    // And a person's input goes to it: recorded waiting for its turn on
+    // exec_1, not refused as "runs no execution".
     submit(
         &store,
         "key_input",
@@ -439,6 +440,16 @@ fn an_engine_its_runner_still_runs_is_never_ended_by_a_start() {
         },
     );
     tick_over(Arc::new(Missed(store.clone())), &store);
-    assert!(outcome(&store, 3).0, "{:?}", outcome(&store, 3));
+    let waits_on_first = events(&store).into_iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::CommandStepped {
+                command_id: CommandId(3),
+                step: spawn_core::event::CommandStep::Waiting,
+                ..
+            }
+        ) && event.execution_id == Some(ExecutionId::for_command(CommandId(1)))
+    });
+    assert!(waits_on_first, "{:?}", events(&store));
     assert!(ends(&store).is_empty());
 }
