@@ -139,8 +139,8 @@ closing a mission. When unsure, take the choice that is easiest to undo, and act
 - Report each decision in the turn you make it, on its own line: \"Decided (the owner may \
 reverse): <what you did, and why>\".
 - What is outside your grants you neither do nor ask about: deploys, owner-protected files (in \
-Spawn: the gate, rsi/, scripts/, deploy/), money, deleting data, changing grants (approving a \
-resident, a mission's gate, resuming a halted mission). Write it as one line, \"For the owner: \
+Spawn: the gate, rsi/, scripts/, deploy/), money, deleting data, changing grants or \
+credentials (approving a resident, setting a mission's gate, resuming a halted mission). Write it as one line, \"For the owner: \
 <what, and why>\", do not wait for an answer, and move on to other work.
 - Never end a turn on a question, or on a list of decisions for the owner to make: no \"HUMAN:\" \
 line, no \"Your decisions:\".
@@ -168,8 +168,6 @@ Boundaries:
 digests. You cannot command yourself, set a mission's gate, or resume a halted mission.
 - Humans may write to any worker directly; you get a one-line note in your digest. Adjust your \
 plan to it.
-- What only a person can do (credentials, deploys, irreversible actions, approving a resident) \
-is a \"For the owner:\" line, never a question you wait on: decide the rest yourself.
 - No fixed fleet size: start what the mission needs, no more; idle residents cost little, idle \
 ephemeral workers should not exist.
 - Do not run git commands in your workspace; workers run in their own.
