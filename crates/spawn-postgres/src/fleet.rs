@@ -106,8 +106,9 @@ select jsonb_build_object(
   'by_state', (select coalesce(jsonb_object_agg(state, n), '{}'::jsonb)
                  from (select coalesce(state, 'UNKNOWN') as state, count(*) as n
                          from agent_status group by 1) t),
-  -- Each gated mission's run of `no_room` gate outcomes (one task's, the
-  -- integrator's fold): open or active missions, and any whose run goes on.
+  -- The run of `no_room` gate outcomes of each gated mission (one task at
+  -- a time, as the store folds them): open or active missions, and any
+  -- whose run goes on.
   'gate_room', (select coalesce(jsonb_agg(jsonb_build_object(
                    'mission', m.id, 'text', left(m.text, 200), 'task', m.gate_room_task,
                    'since_ms', m.gate_room_since_ms, 'last_ms', m.gate_room_last_ms,
