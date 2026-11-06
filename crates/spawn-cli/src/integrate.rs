@@ -2559,6 +2559,40 @@ mod tests {
         std::fs::remove_dir_all(&base).expect("clean");
     }
 
+    /// A request names its commit by its full hash only (SHA-1 or SHA-256),
+    /// never by an option or a revision expression.
+    #[test]
+    fn an_owner_request_names_its_commit_by_full_hash() {
+        use super::owner::{full_hash, owner_ref};
+        assert!(full_hash(&"a1".repeat(20)));
+        assert!(full_hash(&"0f".repeat(32)));
+        for bad in ["HEAD", "--all", "main", &"A1".repeat(20), &"a1".repeat(19), "", &"g".repeat(40)]
+        {
+            assert!(!full_hash(bad), "{bad}");
+        }
+        assert_eq!(owner_ref("abc"), "refs/spawn-owner/abc");
+    }
+
+    /// The merge that lands the owner's commit says it is the owner's
+    /// landing, names the request and the commit's subject (bounded), and
+    /// carries the request and the commit as trailers.
+    #[test]
+    fn an_owner_landing_merge_names_its_request_and_the_commits_subject() {
+        let message = super::owner::owner_message(42, "c0ffee", "ba5e", "owner: the contract\n");
+        assert!(
+            message.starts_with("Owner landing (request 42): owner: the contract\n\n"),
+            "{message}"
+        );
+        assert!(message.contains("c0ffee") && message.contains("ba5e"), "{message}");
+        assert!(
+            message.ends_with("\n\nSpawn-Owner-Request: 42\nSpawn-Owner-Commit: c0ffee\n"),
+            "{message}"
+        );
+        let long = super::owner::owner_message(1, "c", "m", &"x".repeat(500));
+        let first = long.lines().next().expect("a first line");
+        assert!(first.chars().count() < 140, "{first}");
+    }
+
     /// Commit everything in the checkout `directory`.
     pub(super) fn commit_in(directory: &str, message: &str) {
         let git = crate::sources::git;
