@@ -349,6 +349,14 @@ phase() {
     event=$1
     task=$2
     verdict=$3
+    # One gate slot: one judging per pass, so one record. The checks belong
+    # to the judging that would run a gate, not to every ready task.
+    records=$(q "select count(*) from spawn_events
+                  where session_id = 'session_control' and id > $from
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                    and kind -> 'detail' -> 'record' ->> 'verdict' <> 'stale'")
+    [ "$records" -eq 1 ] ||
+        fail "($what) one pass with one gate slot recorded $records gate outcomes; the checks run for the judging that would run the gate, one task"
 }
 
 # The common checks of a phase whose check fell short.
