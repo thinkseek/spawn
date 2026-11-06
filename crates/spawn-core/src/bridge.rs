@@ -521,6 +521,15 @@ pub struct Bridge {
     held: HashMap<CommandId, Claimed>,
 }
 
+/// What [`Bridge::settle`] did with an open execution no runner runs.
+enum Settled {
+    /// It ended now: what it was, for the command's report.
+    Ended(String),
+    /// Its end could not finish this tick (its final checkpoint failed): it
+    /// stays due, and the command fails with why.
+    Ending(String),
+}
+
 /// What handling a claimed command came to.
 enum Handled {
     /// It finished, with this outcome.
@@ -932,14 +941,16 @@ impl Bridge {
                 ended_now.push((session.clone(), active.execution_id.clone()));
                 continue;
             }
-            if let Some(view) = self.sessions.get_mut(&session) {
-                if let Some(held) = view.active.as_mut() {
-                    // Cleared by `advance` only once committed: a failed
-                    // checkpoint stays due and is tried again next tick.
-                    held.checkpoint = active.checkpoint;
-                    held.reported_end = active.reported_end;
-                    held.follow = active.follow;
-                }
+            if let Some(held) = self
+                .sessions
+                .get_mut(&session)
+                .and_then(|view| view.active.as_mut())
+            {
+                // Cleared by `advance` only once committed: a failed
+                // checkpoint stays due and is tried again next tick.
+                held.checkpoint = active.checkpoint;
+                held.reported_end = active.reported_end;
+                held.follow = active.follow;
             }
         }
         if !ended_now.is_empty() {
@@ -1607,6 +1618,27 @@ impl Bridge {
         // records. While the log refuses them the command is not handled
         // (the error ends the tick; the lease brings the command back).
         self.record_unrecorded_commit(&claimed.session_id)?;
+        // An execution the log holds open that nothing runs any more is
+        // ended first, so the command meets the session as it is.
+        let settled = match &action {
+            CommandAction::Start { .. }
+            | CommandAction::Resume { .. }
+            | CommandAction::Input { .. } => self.settle(claimed, report)?,
+            CommandAction::Stop | CommandAction::Discard => None,
+        };
+        match (&action, settled) {
+            (_, None) => {}
+            (_, Some(Settled::Ending(why))) => {
+                return Ok(Handled::Finished(Outcome::Failed(why)));
+            }
+            (CommandAction::Input { .. }, Some(Settled::Ended(what))) => {
+                return Ok(Handled::Finished(Outcome::Failed(format!(
+                    "{what}; an input needs a running engine: resume the session"
+                ))));
+            }
+            // A start or resume goes on, on a session that runs nothing.
+            (_, Some(Settled::Ended(what))) => report.warnings.push(what),
+        }
         let outcome = match action {
             CommandAction::Start {
                 engine: _,
@@ -1637,6 +1669,93 @@ impl Bridge {
 
     fn running(&self, session: &SessionId) -> Option<Active> {
         self.sessions.get(session)?.active.clone()
+    }
+
+    /// Before a start, a resume or an input acts on its session: the
+    /// session's open execution (the log's, which the Bridge's view
+    /// follows) is checked against what runs. One that no runner of the
+    /// Bridge's own runs any more (its terminal gone, or there and hosting
+    /// no runner: a dead pane, a shell restored after a restart) is ended
+    /// now, through the end every execution takes (final checkpoint,
+    /// terminal killed, unmount, `execution.ended`), as `exited` when its
+    /// runner left an exit status and as `lost` with what the host saw
+    /// otherwise. Without this the command would fail on an execution that
+    /// will never answer: a start or resume refused because the session
+    /// "already runs" one, an input refused at a pane that hosts no engine,
+    /// until a later tick ended it, or forever while the terminal stays.
+    ///
+    /// Nothing to settle (`None`): no open execution, a running one, an end
+    /// already under way (the normal path finishes it), the command's own
+    /// execution (a retried start goes on from it), or a host that cannot
+    /// tell. The engine in an untracked terminal is never adopted: it is
+    /// ended, and the terminal killed.
+    fn settle(
+        &mut self,
+        claimed: &Claimed,
+        tick: &mut TickReport,
+    ) -> Result<Option<Settled>, StoreError> {
+        let Some(mut active) = self.running(&claimed.session_id) else {
+            return Ok(None);
+        };
+        if active.execution_id == ExecutionId::for_command(claimed.command_id)
+            || active.reported_end.is_some()
+            || active.unmounting
+        {
+            return Ok(None);
+        }
+        let mut report = TickReport::default();
+        let Ok(Some((cause, exit_code))) =
+            self.not_running(&claimed.session_id, &mut active, &mut report)
+        else {
+            return Ok(None);
+        };
+        let seen = active
+            .follow
+            .evidence
+            .clone()
+            .unwrap_or_else(|| format!("its runner exited ({exit_code:?})"));
+        if let Some(evidence) = active.follow.evidence.as_mut() {
+            evidence.push_str(&format!("; found by {}", claimed.command_id));
+        }
+        let ended = self.end(
+            &claimed.agent_id,
+            &claimed.session_id,
+            &mut active,
+            cause,
+            exit_code,
+            false,
+            &mut report,
+        )?;
+        self.catch_up()?;
+        if ended {
+            self.fail_waiting(&claimed.session_id, Some(cause))?;
+            tick.warnings.append(&mut report.warnings);
+            return Ok(Some(Settled::Ended(format!(
+                "{}'s execution {} was not running ({seen}); it ended as {}",
+                claimed.session_id,
+                active.execution_id,
+                cause_name(cause)
+            ))));
+        }
+        // Its end stays due: each tick tries it again, as a stop's.
+        if let Some(held) = self
+            .sessions
+            .get_mut(&claimed.session_id)
+            .and_then(|view| view.active.as_mut())
+        {
+            held.reported_end = active.reported_end;
+            held.follow.end_failures = active.follow.end_failures;
+            held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.evidence = active.follow.evidence;
+        }
+        report.warnings.insert(
+            0,
+            format!(
+                "{}'s execution {} is not running ({seen}) and its end is not done yet",
+                claimed.session_id, active.execution_id
+            ),
+        );
+        Ok(Some(Settled::Ending(report.warnings.join("; "))))
     }
 
     fn start(
@@ -1763,20 +1882,27 @@ impl Bridge {
         prompt: &str,
         fresh: bool,
     ) -> Result<Outcome, StoreError> {
+        // Nothing is typed into a terminal that does not host the runner.
         match self
             .terminals
-            .is_alive(&active.terminal(), &active.workspace)
+            .runner(&active.terminal(), &active.workspace)
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(Runner::Running) => {}
+            Ok(Runner::Gone) => {
                 return Ok(Outcome::Failed(format!(
                     "{}: the engine's terminal is gone; the execution ends as lost",
                     claimed.session_id
                 )));
             }
+            Ok(Runner::Untracked(seen)) => {
+                return Ok(Outcome::Failed(format!(
+                    "{}: {seen}; the execution ends as lost",
+                    claimed.session_id
+                )));
+            }
             Err(error) => {
                 return Ok(Outcome::Failed(format!(
-                    "is_alive {}: {error}",
+                    "runner {}: {error}",
                     active.terminal()
                 )));
             }
@@ -2242,6 +2368,7 @@ impl Bridge {
     ) -> Result<Outcome, StoreError> {
         let mut report = TickReport::default();
         let mut ending = active.clone();
+        ending.follow.evidence = Some(format!("its start failed: {why}"));
         let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
@@ -2706,12 +2833,36 @@ impl Bridge {
         discard: bool,
         tick: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
+        // The Bridge's view follows the log: no execution here is none the
+        // log holds open, so there is no end to wait for.
         let Some(mut active) = self.running(&claimed.session_id) else {
             return Ok(Outcome::Succeeded);
         };
         let mut report = TickReport::default();
         // A stop of an end already under way keeps its cause.
         let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Stopped, None));
+        // A stop that finds no runner of its own there (the terminal gone,
+        // or hosting no runner) still writes the end the log waits for, and
+        // says what it found.
+        if active.reported_end.is_none()
+            && !active.unmounting
+            && active.follow.evidence.is_none()
+        {
+            let seen = match self
+                .terminals
+                .runner(&active.terminal(), &active.workspace)
+            {
+                Ok(Runner::Gone) => Some(format!("its terminal {} is gone", active.terminal())),
+                Ok(Runner::Untracked(seen)) => Some(seen),
+                Ok(Runner::Running) | Err(_) => None,
+            };
+            active.follow.evidence = seen.map(|seen| {
+                format!(
+                    "{seen}: no runner was running when {} came",
+                    claimed.command_id
+                )
+            });
+        }
         let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
@@ -2808,6 +2959,15 @@ pub const LOOP_PRINCIPALS: [&str; 3] = ["spawn-dispatch", "spawn-integrate", "sp
 /// refused while the pane cannot take it.
 pub fn waits(principal: &str) -> bool {
     !LOOP_PRINCIPALS.contains(&principal)
+}
+
+/// The wire name of an end's cause.
+fn cause_name(cause: EndCause) -> &'static str {
+    match cause {
+        EndCause::Exited => "exited",
+        EndCause::Stopped => "stopped",
+        EndCause::Lost => "lost",
+    }
 }
 
 /// The failure of an input that waited and was never typed, the session's
