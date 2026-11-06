@@ -17,6 +17,15 @@
 //! it from the tree. The branch head alone is the whole workspace
 //! (docs/storage.md).
 //!
+//! The files the engine writes for itself in its working directory
+//! ([`ENGINE_RUNTIME_FILES`]: Claude Code's scheduler lock, worktrees and
+//! the rest of its own list) never enter a checkpoint, whatever the
+//! project's `.gitignore` says: they are excluded by pathspec at every
+//! staging, so a workspace mounted before this rule is covered at its next
+//! checkpoint. The rest of `.claude/` is the project's and is committed. A
+//! runtime file the project tracks (both the branch and `main` hold it) is
+//! committed like any tracked file; Spawn never removes it from `main`.
+//!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
 //! part before the colon, so every call rebuilds the mapping from the
 //! identifier alone.
@@ -44,6 +53,60 @@ const BASE: &str = "main";
 
 /// Paths that never enter a commit.
 const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
+
+/// Files the engine writes for itself in its working directory, at any
+/// depth: its runtime state (a session's scheduler lock, its worktrees, its
+/// checkpoints, its mailbox), never the project's. No checkpoint adds one,
+/// whatever the project's `.gitignore` says; the rest of `.claude/` (the
+/// settings, agents and commands a project commits) is committed as usual
+/// ([`GitWorkspace::track_runtime_files`], docs/storage.md).
+///
+/// An entry that ends in `/` is a directory; any other is a file, or a
+/// directory, and everything under it. Claude Code is the only engine
+/// (`spawn_core::event::ENGINE`), and the list is its own: the paths it
+/// writes to a checkout's `.git/info/exclude` under `# claude-code-runtime`
+/// (Claude Code 2.1.318). An exported workspace has no `.git`, so Claude
+/// Code writes none there.
+pub const ENGINE_RUNTIME_FILES: [&str; 10] = [
+    ".claude/scheduled_tasks.lock",
+    ".claude/scheduled_tasks.json",
+    ".claude/routines/.state/",
+    ".claude/worktrees/",
+    ".claude/checkpoints/",
+    ".claude/mailbox/",
+    ".claude/agent-registry.json",
+    ".claude/agent-memory-local",
+    ".claude/first-run",
+    ".claude/assistant-daemon-state.json",
+];
+
+/// Pathspecs that match the engine's runtime files
+/// ([`ENGINE_RUNTIME_FILES`]) at any depth, each with `glob` magic and
+/// `magic` before it (`exclude`, or nothing). A glob pathspec never matches
+/// what is under a directory it names, so a directory gets `<path>/**`.
+fn runtime_pathspecs(magic: &str) -> Vec<OsString> {
+    let magic = if magic.is_empty() {
+        "glob".to_string()
+    } else {
+        format!("{magic},glob")
+    };
+    ENGINE_RUNTIME_FILES
+        .iter()
+        .flat_map(|entry| {
+            let (path, directory) = match entry.strip_suffix('/') {
+                Some(path) => (path, true),
+                None => (*entry, false),
+            };
+            let under = format!(":({magic})**/{path}/**");
+            if directory {
+                vec![under]
+            } else {
+                vec![format!(":({magic})**/{path}"), under]
+            }
+        })
+        .map(OsString::from)
+        .collect()
+}
 
 /// Where main's version of each file that conflicts with the branch in a
 /// way markers cannot show is copied, relative to the workspace (under
@@ -313,23 +376,35 @@ impl GitWorkspace {
         arguments: &[S],
         specs: &[OsString],
     ) -> Result<Vec<u8>, WorkspaceError> {
+        let mut with_input: Vec<&OsStr> = arguments.iter().map(AsRef::as_ref).collect();
+        with_input.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(OsStr::new));
+        self.listing_in_with_input(directory, index, &with_input, &nul_terminated(specs))
+    }
+
+    /// [`Self::listing_in`] for a command that reads `input` on standard
+    /// input.
+    fn listing_in_with_input<S: AsRef<OsStr>>(
+        &self,
+        directory: &Path,
+        index: &Path,
+        arguments: &[S],
+        input: &[u8],
+    ) -> Result<Vec<u8>, WorkspaceError> {
         let word = shown_arguments(arguments);
         let mut child = self
             .command_in(directory, index)
             .args(arguments)
-            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
         let stdin = child.stdin.take();
-        let input = nul_terminated(specs);
         // Written beside the read: a long answer must not block the input.
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 use std::io::Write;
-                stdin.map(|mut stdin| stdin.write_all(&input))
+                stdin.map(|mut stdin| stdin.write_all(input))
             });
             report_listing(child.wait_with_output(), &word)
         })
@@ -417,27 +492,33 @@ impl GitWorkspace {
         self.root.join(".index").join(branch)
     }
 
-    /// Tree of the work tree in `directory`, built against `index`, and the
-    /// files over the size cap ([`max_file_bytes`]) left out of it, with
-    /// their sizes.
+    /// Tree of the work tree in `directory` for a checkpoint of `branch`
+    /// whose parent is `head`, built against `index`, and the files over
+    /// the size cap ([`max_file_bytes`]) left out of it, with their sizes.
     ///
     /// Build output and files over the cap leave the index after `add -A`,
     /// so a `.gitignore` inside the tree cannot re-include them; a file over
-    /// the cap is excluded before it is hashed.
+    /// the cap is excluded before it is hashed. The engine's runtime files
+    /// are never added, and the ones the project tracks are taken as any
+    /// tracked file is ([`Self::track_runtime_files`]).
     ///
-    /// A file over the cap that git already holds as a blob in one of
-    /// `kept_in` (`main`, a pending merge's `main`) stays a blob: it came
-    /// from the source (main may get one from outside Spawn), and leaving it
-    /// out of the tree would delete it from `main` when the branch lands.
+    /// A file over the cap that git already holds as a blob in `main` or a
+    /// pending merge's `main` ([`Self::source_commits`]) stays a blob: it
+    /// came from the source (main may get one from outside Spawn), and
+    /// leaving it out of the tree would delete it from `main` when the
+    /// branch lands.
     fn tree_of(
         &self,
         directory: &Path,
         index: &Path,
-        kept_in: &[String],
+        branch: &str,
+        head: &str,
     ) -> Result<(String, Vec<(TreePath, u64)>), WorkspaceError> {
         clear_dead_lock(index);
+        let pending_main = self.pending_merge(branch).map(|pending| pending.main);
+        let kept_in = self.source_commits(pending_main.as_deref());
         let (mut oversized, special) = self.left_out_files(directory, index)?;
-        let blobs = self.blobs_in(kept_in, &oversized)?;
+        let blobs = self.blobs_in(&kept_in, &oversized)?;
         oversized.retain(|(path, _)| !blobs.contains(path));
         // A special file (a FIFO, a socket, a device) is never committed:
         // `git add` refuses one at a tracked path, which would fail every
@@ -445,12 +526,13 @@ impl GitWorkspace {
         let mut left_out = oversized.clone();
         left_out.extend(special);
         self.stage_all_but(directory, index, &left_out)?;
+        self.track_runtime_files(directory, index, head, pending_main.as_deref())?;
         self.unstage(directory, index, &left_out)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the cap between the size check and `add`
         // was hashed anyway; it is left out all the same.
         let mut grown = self.oversized_blobs(&tree)?;
-        let blobs = self.blobs_in(kept_in, &grown)?;
+        let blobs = self.blobs_in(&kept_in, &grown)?;
         grown.retain(|(path, _)| !blobs.contains(path));
         if grown.is_empty() {
             return Ok((tree, oversized));
@@ -463,9 +545,11 @@ impl GitWorkspace {
         Ok((tree, oversized))
     }
 
-    /// `git add -A` of the work tree in `directory` except `left_out`, which
-    /// is never hashed. The paths go to git on standard input, so any number
-    /// of them fits.
+    /// `git add -A` of the work tree in `directory` except `left_out` and
+    /// the engine's runtime files ([`ENGINE_RUNTIME_FILES`]), which are
+    /// never hashed: an exclude pathspec, so no ignore rule of the project
+    /// (a `.gitignore` that re-includes one) brings one in. The paths go to
+    /// git on standard input, so any number of them fits.
     fn stage_all_but(
         &self,
         directory: &Path,
@@ -478,8 +562,129 @@ impl GitWorkspace {
                 .iter()
                 .map(|(path, _)| path.pathspec("exclude,literal")),
         );
+        add.extend(runtime_pathspecs("exclude"));
         self.listing_in_with_pathspecs(directory, index, &["add", "-A"], &add)
             .map(|_| ())
+    }
+
+    /// Make the index's entries for the engine's runtime files
+    /// ([`ENGINE_RUNTIME_FILES`]) exactly the ones the project tracks, each
+    /// as the work tree in `directory` holds it now.
+    ///
+    /// A runtime file is tracked when the branch holds it and so does
+    /// `main`: the project's own, committed on purpose or by mistake. The
+    /// branch is `head` (the checkpoint's parent), and, while a merge of
+    /// `main` waits on its markers (`pending_main`), `head` with what that
+    /// `main` changed since the merge base: the merge wrote those changes
+    /// into the directory. A tracked one is committed like any tracked
+    /// file, git's rule for a tracked file an ignore rule names: the
+    /// engine's edits to it, and its deletion. Spawn never takes one out
+    /// of `main` (the owner removes it). One only the branch holds (a
+    /// checkpoint from before this rule committed it), or one `main` no
+    /// longer holds (the owner removed it), leaves the branch: either way
+    /// the landing changes nothing in `main` for it, and does not conflict
+    /// on it. One the branch does not hold never enters the index
+    /// ([`Self::stage_all_but`]).
+    ///
+    /// The kept index is only a stat cache (a fresh one after a failure,
+    /// one that saw no merge of main, one written before this rule), so
+    /// its runtime entries are first reset from `head`, never trusted.
+    /// When neither `head` nor the index holds a runtime file and no merge
+    /// waits (nearly every checkpoint), one listing says so and nothing
+    /// else runs.
+    fn track_runtime_files(
+        &self,
+        directory: &Path,
+        index: &Path,
+        head: &str,
+        pending_main: Option<&str>,
+    ) -> Result<(), WorkspaceError> {
+        let specs = runtime_pathspecs("");
+        if pending_main.is_none() {
+            // `--with-tree`: the index's entries and `head`'s together.
+            let mut probe: Vec<OsString> =
+                ["ls-files", "-z", "--cached"].map(OsString::from).into();
+            probe.push(OsString::from(format!("--with-tree={head}")));
+            probe.push(OsString::from("--"));
+            probe.extend(specs.iter().cloned());
+            if self.listing_in(directory, index, &probe)?.is_empty() {
+                return Ok(());
+            }
+        }
+        let mut reset: Vec<OsString> = ["reset", "-q", "--no-refresh", head, "--"]
+            .map(OsString::from)
+            .into();
+        reset.extend(specs.iter().cloned());
+        self.listing_in(directory, index, &reset)?;
+        if let Some(main) = pending_main
+            && let Ok(base) = self.git_output(&["merge-base", head, main])
+        {
+            let mut changed: Vec<OsString> = [
+                "diff-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                base.as_str(),
+                main,
+                "--",
+            ]
+            .map(OsString::from)
+            .into();
+            changed.extend(specs.iter().cloned());
+            let changed = listed_paths(&self.git_listing(&changed)?);
+            if !changed.is_empty() {
+                let literal: Vec<OsString> = changed
+                    .iter()
+                    .map(|path| path.pathspec("literal"))
+                    .collect();
+                self.listing_in_with_pathspecs(
+                    directory,
+                    index,
+                    &["reset", "-q", "--no-refresh", main],
+                    &literal,
+                )?;
+            }
+        }
+        let mut listing: Vec<OsString> = ["ls-files", "-z", "--cached", "--"]
+            .map(OsString::from)
+            .into();
+        listing.extend(specs);
+        let entries: Vec<(TreePath, u64)> =
+            listed_paths(&self.listing_in(directory, index, &listing)?)
+                .into_iter()
+                .map(|path| (path, 0))
+                .collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let in_main = match self.commit_id_of(&format!("refs/heads/{BASE}")) {
+            Ok(main) => self.blobs_in(&[main], &entries)?,
+            Err(_) => entries.iter().map(|(path, _)| path.clone()).collect(),
+        };
+        // git adds nothing beyond a symbolic link and refuses a directory or
+        // a special file: what is not a file there now is gone from the
+        // index, as `add -A` would have it.
+        let (present, gone): (Vec<TreePath>, Vec<TreePath>) = entries
+            .into_iter()
+            .map(|(path, _)| path)
+            .partition(|path| in_main.contains(path) && is_file_in(directory, path));
+        for (flag, paths) in [("--add", present), ("--force-remove", gone)] {
+            if paths.is_empty() {
+                continue;
+            }
+            let names: Vec<OsString> = paths
+                .iter()
+                .map(|path| path.as_path().as_os_str().to_os_string())
+                .collect();
+            self.listing_in_with_input(
+                directory,
+                index,
+                &["update-index", flag, "-z", "--stdin"],
+                &nul_terminated(&names),
+            )?;
+        }
+        Ok(())
     }
 
     /// Take build output and `paths` out of the index. Paths go to git as
@@ -540,17 +745,17 @@ impl GitWorkspace {
         Ok(found)
     }
 
-    /// The commits whose blobs over the cap a checkpoint of `branch` keeps
-    /// as blobs ([`Self::tree_of`]): `main`, and the `main` of a pending
-    /// merge. Not the branch head: a file the agent committed under the cap
-    /// and grew past it is left out like any other.
-    fn source_commits(&self, branch: &str) -> Vec<String> {
+    /// The commits whose blobs over the cap a checkpoint keeps as blobs
+    /// ([`Self::tree_of`]): `main`, and `pending_main`, the `main` of the
+    /// branch's pending merge. Not the branch head: a file the agent
+    /// committed under the cap and grew past it is left out like any other.
+    fn source_commits(&self, pending_main: Option<&str>) -> Vec<String> {
         let mut commits = Vec::new();
         if let Ok(main) = self.commit_id_of(&format!("refs/heads/{BASE}")) {
             commits.push(main);
         }
-        if let Some(pending) = self.pending_merge(branch) {
-            commits.push(pending.main);
+        if let Some(pending_main) = pending_main {
+            commits.push(pending_main.to_string());
         }
         commits.sort();
         commits.dedup();
@@ -572,23 +777,25 @@ impl GitWorkspace {
             .collect())
     }
 
-    /// Paths git would commit (tracked or untracked, ignore rules applied)
-    /// that a checkpoint leaves out: the files over the size cap, with their
-    /// sizes; then the paths that hold something other than a regular file,
-    /// a symlink or a directory (a FIFO, a socket, a device), which git
-    /// cannot add.
+    /// Paths git would commit (tracked or untracked, ignore rules applied,
+    /// the engine's runtime files aside) that a checkpoint leaves out: the
+    /// files over the size cap, with their sizes; then the paths that hold
+    /// something other than a regular file, a symlink or a directory (a
+    /// FIFO, a socket, a device), which git cannot add.
     fn left_out_files(&self, directory: &Path, index: &Path) -> Result<LeftOut, WorkspaceError> {
-        let listed = self.listing_in(
-            directory,
-            index,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-        )?;
+        let mut arguments: Vec<OsString> = [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+        ]
+        .map(OsString::from)
+        .into();
+        arguments.extend(runtime_pathspecs("exclude"));
+        let listed = self.listing_in(directory, index, &arguments)?;
         let mut oversized = Vec::new();
         let mut special = Vec::new();
         for path in listed_paths(&listed) {
@@ -1002,7 +1209,7 @@ impl WorkspaceStore for GitWorkspace {
         }
         let reference = format!("refs/heads/{branch}");
         let parent = self.git_output(&["rev-parse", &reference])?;
-        let tree = self.tree_of(&directory, &index, &self.source_commits(&branch));
+        let tree = self.tree_of(&directory, &index, &branch, &parent);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
@@ -1347,7 +1554,7 @@ impl GitWorkspace {
                 })?;
             }
             let _ = std::fs::remove_file(&index);
-            let tree = self.tree_of(&directory, &index, &self.source_commits(branch));
+            let tree = self.tree_of(&directory, &index, branch, &head);
             let _ = std::fs::remove_file(&index);
             let (tree, _) = tree?;
             if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
@@ -1566,7 +1773,7 @@ impl GitWorkspace {
         let head = self.commit_id_of(&format!("refs/heads/{branch}"))?;
         let reference = stale_ref(branch);
         let previous = self.commit_id_of(&reference).ok();
-        let tree = self.tree_of(directory, &index, &self.source_commits(branch));
+        let tree = self.tree_of(directory, &index, branch, &head);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
@@ -2092,6 +2299,24 @@ fn unresolved(directory: &Path, files: &[(TreePath, usize)]) -> bool {
 /// Files over the cap with their sizes, then special files
 /// ([`GitWorkspace::left_out_files`]).
 type LeftOut = (Vec<(TreePath, u64)>, Vec<(TreePath, u64)>);
+
+/// Whether `path` is a regular file or a symlink in `directory`, reached
+/// through directories only: git adds nothing beyond a symbolic link.
+fn is_file_in(directory: &Path, path: &TreePath) -> bool {
+    for prefix in path.prefixes() {
+        let Ok(metadata) = std::fs::symlink_metadata(directory.join(prefix.as_path())) else {
+            return false;
+        };
+        let kind = metadata.file_type();
+        if prefix == *path {
+            return kind.is_file() || kind.is_symlink();
+        }
+        if !kind.is_dir() {
+            return false;
+        }
+    }
+    false
+}
 
 /// Remove git's own lock beside `index` (`<index>.lock`), left by a git
 /// that died mid-command (killed, out of memory, a SIGBUS on a file the
