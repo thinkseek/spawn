@@ -56,7 +56,7 @@ use crate::id::{
 use crate::ingest::{claude_line, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, Runner, StoreError,
     TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
@@ -256,6 +256,10 @@ struct Follow {
     /// The engine's version, once read from this execution's transcript
     /// and recorded.
     version: Option<String>,
+    /// What the Bridge saw when it found no runner of its own running the
+    /// execution (the terminal gone, or there and hosting no runner): the
+    /// end record's `evidence`.
+    evidence: Option<String>,
 }
 
 /// What the Bridge knows about one session.
@@ -846,7 +850,9 @@ impl Bridge {
             }
             // An exit report of an old runner (engine-sourced; runners now
             // write SPAWN_EXIT_FILE): only old logs hold one.
-            EventKind::ExecutionEnded { cause, exit_code } if current => {
+            EventKind::ExecutionEnded {
+                cause, exit_code, ..
+            } if current => {
                 if let Some(active) = view.active.as_mut() {
                     active.reported_end = Some((*cause, *exit_code));
                 }
@@ -918,12 +924,16 @@ impl Bridge {
             let ended =
                 self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
             if ended {
+                // The Bridge's view of what runs changes only by folding the
+                // log (the end just recorded, read back below): it never
+                // drops an execution the log still holds open, which the
+                // log's guard would refuse every start for while the Bridge
+                // saw nothing to end.
                 ended_now.push((session.clone(), active.execution_id.clone()));
+                continue;
             }
             if let Some(view) = self.sessions.get_mut(&session) {
-                if ended {
-                    view.active = None;
-                } else if let Some(held) = view.active.as_mut() {
+                if let Some(held) = view.active.as_mut() {
                     // Cleared by `advance` only once committed: a failed
                     // checkpoint stays due and is tried again next tick.
                     held.checkpoint = active.checkpoint;
@@ -972,25 +982,20 @@ impl Bridge {
             .or_else(|| self.exit_status(session, active, report))
         {
             Some(end) => Some(end),
-            None => match self
-                .terminals
-                .is_alive(&active.terminal(), &active.workspace)
-            {
-                Ok(true) => {
+            // Running means a runner of the Bridge's own in the terminal, not
+            // a terminal of that name: one that outlived its runner (a dead
+            // pane, a shell restored after a restart) runs no engine of
+            // Spawn's, and would otherwise hold the execution open forever.
+            None => match self.not_running(session, active, report) {
+                Ok(None) => {
                     self.follow_screen(agent_id, session, active)?;
                     None
                 }
-                // The engine may have written its exit status and closed the
-                // pane between the read above and this check: read it again
-                // before calling the execution lost.
-                Ok(false) => Some(
-                    self.exit_status(session, active, report)
-                        .unwrap_or((EndCause::Lost, None)),
-                ),
+                Ok(Some(end)) => Some(end),
                 Err(error) => {
                     report
                         .warnings
-                        .push(format!("is_alive {}: {error}", active.terminal()));
+                        .push(format!("runner {}: {error}", active.terminal()));
                     None
                 }
             },
@@ -1049,6 +1054,34 @@ impl Bridge {
         };
         let text = String::from_utf8_lossy(&bytes);
         Some((EndCause::Exited, text.trim().parse().ok()))
+    }
+
+    /// How the execution ended when no runner of the Bridge's own runs it
+    /// any more ([`TerminalHost::runner`]), `None` while one does. The
+    /// engine may have written its exit status and closed the pane between
+    /// the read before this check and it, so the exit file is read again
+    /// first: an exit is an exit. Otherwise it is lost, and what the host
+    /// saw is kept for its end record (`follow.evidence`). An error says
+    /// nothing about the terminal: the execution is left as it is.
+    fn not_running(
+        &self,
+        session: &SessionId,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) -> Result<Option<(EndCause, Option<i32>)>, TerminalError> {
+        let seen = match self
+            .terminals
+            .runner(&active.terminal(), &active.workspace)?
+        {
+            Runner::Running => return Ok(None),
+            Runner::Gone => format!("its terminal {} is gone", active.terminal()),
+            Runner::Untracked(seen) => seen,
+        };
+        if let Some(end) = self.exit_status(session, active, report) {
+            return Ok(Some(end));
+        }
+        active.follow.evidence = Some(format!("{seen}; its runner wrote no exit status"));
+        Ok(Some((EndCause::Lost, None)))
     }
 
     /// Append the events in what the engine wrote to its transcript since
@@ -1358,7 +1391,11 @@ impl Bridge {
             Some(&active.execution_id),
             Source::Bridge,
             Some(format!("{}:ended", active.execution_id)),
-            EventKind::ExecutionEnded { cause, exit_code },
+            EventKind::ExecutionEnded {
+                cause,
+                exit_code,
+                evidence: active.follow.evidence.clone(),
+            },
         )?;
         Ok(true)
     }
