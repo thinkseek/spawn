@@ -228,8 +228,22 @@ pub trait WorkspaceStore: Send + Sync {
         from: Option<&str>,
     ) -> Result<Branch, WorkspaceError>;
 
-    /// Materialize `branch` where the engine can run.
+    /// Materialize `branch` where the engine can run. The id names the
+    /// directory as the engine's process sees it (every symlink on the way
+    /// resolved): the pane starts there, and the engine files its transcript
+    /// under that path.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError>;
+
+    /// `workspace` as this store names it now ([`Self::mount`]). An id
+    /// recorded under another spelling of the store's root (the root as it
+    /// was configured, before a version that resolves it through its
+    /// symlinks) names the same directory, and comes back under the resolved
+    /// root; any other id comes back as it is. The Bridge reads the
+    /// workspace of every execution in the log through it, so an execution
+    /// started before the upgrade is followed where its engine writes.
+    fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
+        workspace.clone()
+    }
 
     /// Commit the workspace. No changes is [`Commit::Unchanged`].
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError>;
