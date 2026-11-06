@@ -470,10 +470,10 @@ function JudgementQueue({
         <CircleCheck size={18} className="shrink-0 text-success" />
         <div className="min-w-0 flex-1">
           <div className="text-label font-medium text-foreground">
-            No one needs a human
+            No judge asks for attention
           </div>
           <div className="text-caption text-muted-foreground">
-            Every agent is either working or settled without you.
+            Who needs a human is the dispatcher's to say, and its view could not be read.
           </div>
         </div>
         <Unavailable error={unavailable} />
@@ -489,7 +489,7 @@ function JudgementQueue({
       <header className="flex h-9 items-center gap-2 border-b border-warning/20 px-4">
         <BellRing size={14} className="shrink-0 text-warning" />
         <h2 className="text-label font-medium text-foreground">
-          Needs a human
+          Judges ask for attention
         </h2>
         <span className="tnum rounded bg-warning/15 px-1.5 py-px text-micro font-medium text-warning">
           {queue.length}
