@@ -20,7 +20,7 @@ use crate::PostgresStore;
 /// `legacy.imported` row (from before the control stream) lends its own
 /// fields, plus its `state` and times. Records of no measure (reports,
 /// residents, halts, host facts) are left out.
-const CONTROL: &str = r"
+const FACTS: &str = r"
 select jsonb_build_object(
   'control', (
     select coalesce(jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
@@ -76,14 +76,12 @@ select jsonb_build_object(
              order by c.id), '[]'::jsonb)
       from spawn_commands c
      cross join lateral (
-       select (select jsonb_agg(tag order by n)
-                 from jsonb_array_elements_text(c.action -> 'tags') with ordinality as g(tag, n)
-                where tag ~ '(^| )stall-[0-9]+-[a-z_]+-[0-9]+$') as stalls
-        where c.principal = 'spawn-dispatch' and c.action ->> 'type' = 'input'
-          and jsonb_typeof(c.action -> 'tags') = 'array'
-       union all
-       select null where not (c.principal = 'spawn-dispatch' and c.action ->> 'type' = 'input'
-                              and jsonb_typeof(c.action -> 'tags') = 'array')) t
+       select case when c.principal = 'spawn-dispatch' and c.action ->> 'type' = 'input'
+                        and jsonb_typeof(c.action -> 'tags') = 'array'
+                   then (select jsonb_agg(g.tag order by g.n)
+                           from jsonb_array_elements_text(c.action -> 'tags')
+                                with ordinality as g(tag, n)
+                          where g.tag ~ '(^| )stall-[0-9]+-[a-z_]+-[0-9]+$') end as stalls) t
      where c.created_at_ms < $1
        and (c.principal in ('human', 'spawn')
             or c.succeeded is false
@@ -98,12 +96,12 @@ impl PostgresStore {
     }
 
     /// The scorecard's facts recorded before `until_ms`, in one snapshot:
-    /// `{control: [...], commands: [...]}` ([`CONTROL`]). `commands` holds the
+    /// `{control: [...], commands: [...]}` ([`FACTS`]). `commands` holds the
     /// rows a measure reads: the owner's (`human`, `spawn`), every failed
     /// one, the dispatcher's deliveries (`deliver-<task>-<revision>` and their
     /// retries; `error` only on a failed one) and its digests that carry a
     /// stall tag (`stalls`: those tags, `<session> stall-<task>-<step>-<n>`).
     pub fn scorecard_facts(&self, until_ms: i64) -> Result<Value, StoreError> {
-        self.query_json(CONTROL, &[&until_ms])
+        self.query_json(FACTS, &[&until_ms])
     }
 }
