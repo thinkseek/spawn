@@ -1317,8 +1317,10 @@ begin
            set baseline = coalesce(baseline, p_record ->> 'base'),
                gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
                                                 when 'accepted' then 0 else gate_rejections end,
-               -- `no_room`: the gate found no room in TMPDIR to judge, a
-               -- fact about the host, not the work. It moves neither count.
+               -- `no_room`: no room to judge (TMPDIR's free space, the
+               -- host's memory or the test database, measured before the
+               -- gate or by the gate's own floor), a fact about the host,
+               -- not the work. It moves neither count.
                gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
                                             when 'stale' then gate_aborts
                                             when 'no_room' then gate_aborts
