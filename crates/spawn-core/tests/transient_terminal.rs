@@ -1,11 +1,11 @@
-//! Inputs here come from the dispatcher, one of Spawn's own loops (see
-//! `Rig::submit`).
-//!
 //! A transient terminal error is not a terminal outcome (design §14): one
 //! refused or timed-out capture, or a staging refused before any key went,
 //! spends an attempt and is tried again; only a terminal that `has-session`
 //! says is gone fails a command at once. A refusal before typing is
 //! recorded as nothing typed, never as "may have typed".
+//!
+//! Inputs here come from the dispatcher, one of Spawn's own loops (see
+//! `Rig::submit`).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
