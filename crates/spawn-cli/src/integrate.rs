@@ -4512,6 +4512,7 @@ mod database_tests {
             base.join("host"),
             base.join("gate.sh"),
             Vec::new(),
+            room_to_spare(),
             super::DEFAULT_GATES,
         );
         integrator.pass_on(&db.store).expect("a pass");
