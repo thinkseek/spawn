@@ -55,7 +55,8 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 
 /// The commands the contract's line does not hold, each on a line of its own
 /// after it.
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
+const MORE_USAGE: &str =
+    "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
 
 fn main() {
     let code = match dispatch() {
@@ -110,10 +111,7 @@ mod tests {
     #[test]
     fn the_usage_names_the_scorecard_on_a_line_of_its_own() {
         assert!(MORE_USAGE.trim_start().starts_with("spawn scorecard "));
-        assert!(
-            !USAGE.contains("scorecard"),
-            "the contract's line stays as it was"
-        );
+        assert!(!USAGE.contains("scorecard"), "the contract's line stays as it was");
     }
 
     #[test]
