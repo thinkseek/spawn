@@ -55,7 +55,14 @@ impl Story {
         self
     }
 
-    fn assign(&mut self, when: i64, id: i64, mission: i64, objective: Option<i64>, by: &str) -> &mut Self {
+    fn assign(
+        &mut self,
+        when: i64,
+        id: i64,
+        mission: i64,
+        objective: Option<i64>,
+        by: &str,
+    ) -> &mut Self {
         self.rec(
             when,
             json!({"type": "task.assigned", "id": id, "mission_id": mission,
@@ -77,7 +84,10 @@ impl Story {
     }
 
     fn reviewed(&mut self, when: i64, id: i64, accepted: bool) -> &mut Self {
-        self.rec(when, json!({"type": "task.reviewed", "id": id, "accepted": accepted}))
+        self.rec(
+            when,
+            json!({"type": "task.reviewed", "id": id, "accepted": accepted}),
+        )
     }
 
     fn cancelled(&mut self, when: i64, id: i64, by: Option<&str>) -> &mut Self {
@@ -161,12 +171,18 @@ fn three_landings(story: &mut Story, first: i64) {
 #[test]
 fn rfc3339_times_and_spans_read_as_epoch_milliseconds() {
     assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
-    assert_eq!(parse_rfc3339("2026-10-02T00:00:00Z"), Some(1_790_899_200_000));
+    assert_eq!(
+        parse_rfc3339("2026-10-02T00:00:00Z"),
+        Some(1_790_899_200_000)
+    );
     assert_eq!(
         parse_rfc3339("2026-10-02T02:00:00.123+02:00"),
         Some(1_790_899_200_123)
     );
-    assert_eq!(parse_rfc3339("2026-10-02t00:00:00.5z"), Some(1_790_899_200_500));
+    assert_eq!(
+        parse_rfc3339("2026-10-02t00:00:00.5z"),
+        Some(1_790_899_200_500)
+    );
     assert_eq!(parse_rfc3339("2026-10-01T19:00:00-05:00"), Some(t0()));
     assert_eq!(parse_rfc3339("2026-10-02"), Some(t0()));
     assert!(parse_rfc3339("2024-02-29T00:00:00Z").is_some());
@@ -211,7 +227,10 @@ fn days_are_the_utc_dates_the_window_covers_clipped_to_it() {
             ("2026-10-03".to_string(), at(24), at(30)),
         ]
     );
-    assert_eq!(days(at(1), at(2)), vec![("2026-10-02".to_string(), at(1), at(2))]);
+    assert_eq!(
+        days(at(1), at(2)),
+        vec![("2026-10-02".to_string(), at(1), at(2))]
+    );
 }
 
 #[test]
@@ -228,7 +247,11 @@ fn the_window_defaults_to_seven_days_and_a_given_until_fixes_it() {
     // given the answer does not depend on when it was asked.
     for asked_at in [at(100), at(5000)] {
         assert_eq!(
-            window(Some(When::Ago(36 * HOUR_MS)), Some(When::At(at(48))), asked_at),
+            window(
+                Some(When::Ago(36 * HOUR_MS)),
+                Some(When::At(at(48))),
+                asked_at
+            ),
             Ok(window_hours(12, 48))
         );
     }
@@ -257,9 +280,17 @@ fn ratios_round_to_three_decimals_half_away_from_zero() {
     assert_eq!(ratio_milli(7, 6), Some(1167));
     assert_eq!(ratio_milli(1, 3), Some(333));
     assert_eq!(ratio_milli(2, 3), Some(667));
-    assert_eq!(ratio_milli(1, 2000), Some(1), "0.0005 rounds away from zero");
+    assert_eq!(
+        ratio_milli(1, 2000),
+        Some(1),
+        "0.0005 rounds away from zero"
+    );
     assert_eq!(ratio_milli(-1, 2000), Some(-1));
-    assert_eq!(ratio_milli(999, 2_000_000), Some(0), "0.0004995 rounds down");
+    assert_eq!(
+        ratio_milli(999, 2_000_000),
+        Some(0),
+        "0.0004995 rounds down"
+    );
     assert_eq!(ratio_milli(16020, 6), Some(2_670_000));
     assert_eq!(ratio_milli(5, 0), None);
     assert_eq!(Number::Milli(171).json(), json!(0.171));
@@ -298,7 +329,11 @@ fn open_hours_are_the_union_of_the_intervals_clipped_to_the_window() {
     ];
     assert_eq!(union_ms(&intervals, window), 11 * HOUR_MS + 7 * HOUR_MS);
     // Clipped at both ends; an open interval runs to the window's end.
-    let intervals = [(at(-30), Some(at(2))), (at(40), None), (at(-5), Some(at(-1)))];
+    let intervals = [
+        (at(-30), Some(at(2))),
+        (at(40), None),
+        (at(-5), Some(at(-1))),
+    ];
     assert_eq!(union_ms(&intervals, window), 2 * HOUR_MS + 8 * HOUR_MS);
     assert_eq!(union_ms(&[], window), 0);
     assert_eq!(union_ms(&[(at(50), None)], window), 0);
@@ -382,7 +417,11 @@ fn throughput_is_landings_per_open_hour() {
     // Open 0-2, 3-5, 6-8 and an open task from 10: 6 + 14 = 20 hours.
     story.assign(at(10), 9, 1, None, "spawn_supervisor");
     let history = story.history();
-    let throughput = dimension(&counts(&history, Scope::Fleet, window_hours(0, 24)), None, "throughput");
+    let throughput = dimension(
+        &counts(&history, Scope::Fleet, window_hours(0, 24)),
+        None,
+        "throughput",
+    );
     assert_eq!(throughput["landed"], json!(3));
     assert_eq!(throughput["open_hours"], json!(20.0));
     assert_eq!(throughput["value"], json!(0.15));
@@ -425,7 +464,11 @@ fn lead_time_runs_from_the_objectives_first_try() {
         .map(|landing| (landing.task, landing.lead_ms / HOUR_MS))
         .collect();
     assert_eq!(leads, vec![(2, 5), (4, 3), (6, 2), (7, 7)]);
-    let lead = dimension(&counts(&history, Scope::Mission(1), window_hours(0, 24)), None, "lead_time");
+    let lead = dimension(
+        &counts(&history, Scope::Mission(1), window_hours(0, 24)),
+        None,
+        "lead_time",
+    );
     // 2 3 5 7: median rank 2, p90 rank 4.
     assert_eq!(lead["value"], json!(3 * HOUR_MS));
     assert_eq!(lead["p90"], json!(7 * HOUR_MS));
@@ -529,18 +572,62 @@ fn autonomy_counts_the_owners_interventions() {
     story.rec(at(8), json!({"type": "mission.resumed", "id": 1}));
     // Commands: a person's and the CLI's count; Spawn's loops' do not.
     story
-        .command("human", "board-1", "session_1", "input", at(9), Some(true), None, &[])
-        .command("spawn", "cli-1", "elsewhere", "stop", at(9), Some(true), None, &[])
-        .command("spawn-dispatch", "deliver-1-0", "session_1", "start", at(9), Some(true), None, &[])
-        .command("spawn_supervisor", "s-1", "session_1", "input", at(9), Some(true), None, &[]);
+        .command(
+            "human",
+            "board-1",
+            "session_1",
+            "input",
+            at(9),
+            Some(true),
+            None,
+            &[],
+        )
+        .command(
+            "spawn",
+            "cli-1",
+            "elsewhere",
+            "stop",
+            at(9),
+            Some(true),
+            None,
+            &[],
+        )
+        .command(
+            "spawn-dispatch",
+            "deliver-1-0",
+            "session_1",
+            "start",
+            at(9),
+            Some(true),
+            None,
+            &[],
+        )
+        .command(
+            "spawn_supervisor",
+            "s-1",
+            "session_1",
+            "input",
+            at(9),
+            Some(true),
+            None,
+            &[],
+        );
     let history = story.history();
-    let autonomy = dimension(&counts(&history, Scope::Fleet, window_hours(0, 24)), None, "autonomy");
+    let autonomy = dimension(
+        &counts(&history, Scope::Fleet, window_hours(0, 24)),
+        None,
+        "autonomy",
+    );
     assert_eq!(
         autonomy["by_kind"],
         json!({"command": 2, "resume": 1, "owner_task": 1, "cancel_reassign": 2})
     );
     assert_eq!(autonomy["interventions"], json!(6));
-    let mission_1 = dimension(&counts(&history, Scope::Mission(1), window_hours(0, 24)), None, "autonomy");
+    let mission_1 = dimension(
+        &counts(&history, Scope::Mission(1), window_hours(0, 24)),
+        None,
+        "autonomy",
+    );
     // The board's input went to task 1's session (mission 2); the CLI's to
     // no task's: the fleet's only.
     assert_eq!(
@@ -553,7 +640,11 @@ fn autonomy_counts_the_owners_interventions() {
         .filter(|mark| mark.kind == Kind::CancelReassign)
         .map(|mark| mark.at)
         .collect();
-    assert_eq!(cancel_reassign, vec![at(4), at(7)], "counted at the reassignment");
+    assert_eq!(
+        cancel_reassign,
+        vec![at(4), at(7)],
+        "counted at the reassignment"
+    );
 }
 
 #[test]
@@ -570,29 +661,89 @@ fn reliability_counts_failures_of_the_machinery() {
         .gated(at(6), 8, "rejected", None);
     let host = "start terminal: new-session failed";
     // Task 6: four failed attempts, nothing typed: spent, at the last finish.
-    for (index, key) in ["deliver-6-0", "deliver-6-0-retry-1", "deliver-6-0-retry-2", "deliver-6-0-retry-3"]
-        .into_iter()
-        .enumerate()
+    for (index, key) in [
+        "deliver-6-0",
+        "deliver-6-0-retry-1",
+        "deliver-6-0-retry-2",
+        "deliver-6-0-retry-3",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let minutes = i64::try_from(index).expect("few") * 600_000;
-        story.command("spawn-dispatch", key, "session_6", "start", at(2) + minutes, Some(false), Some(host), &[]);
+        story.command(
+            "spawn-dispatch",
+            key,
+            "session_6",
+            "start",
+            at(2) + minutes,
+            Some(false),
+            Some(host),
+            &[],
+        );
     }
     // Task 8: a refusal for a pane not ready, then delivered: not spent.
     story
-        .command("spawn-dispatch", "deliver-8-0", "session_8", "input", at(2), Some(false),
-                 Some("pane state Busy does not accept input"), &[])
-        .command("spawn-dispatch", "deliver-8-0-retry-1", "session_8", "input", at(2) + 5000, Some(true), None, &[]);
+        .command(
+            "spawn-dispatch",
+            "deliver-8-0",
+            "session_8",
+            "input",
+            at(2),
+            Some(false),
+            Some("pane state Busy does not accept input"),
+            &[],
+        )
+        .command(
+            "spawn-dispatch",
+            "deliver-8-0-retry-1",
+            "session_8",
+            "input",
+            at(2) + 5000,
+            Some(true),
+            None,
+            &[],
+        );
     // A stall tag sent twice counts once, at the first digest; another
     // principal's tags count nothing.
     let tag = "session_9 stall-9-activity-1";
     story
-        .command("spawn-dispatch", "digest-a", "session_supervisor", "input", at(7), Some(true), None, &[tag])
-        .command("spawn-dispatch", "digest-b", "session_supervisor", "input", at(8), Some(true), None,
-                 &[tag, "session_9 stall-9-judgement-4"])
-        .command("human", "board", "session_supervisor", "input", at(9), Some(true), None,
-                 &["session_9 stall-9-delivery-5"]);
+        .command(
+            "spawn-dispatch",
+            "digest-a",
+            "session_supervisor",
+            "input",
+            at(7),
+            Some(true),
+            None,
+            &[tag],
+        )
+        .command(
+            "spawn-dispatch",
+            "digest-b",
+            "session_supervisor",
+            "input",
+            at(8),
+            Some(true),
+            None,
+            &[tag, "session_9 stall-9-judgement-4"],
+        )
+        .command(
+            "human",
+            "board",
+            "session_supervisor",
+            "input",
+            at(9),
+            Some(true),
+            None,
+            &["session_9 stall-9-delivery-5"],
+        );
     let history = story.history();
-    let reliability = dimension(&counts(&history, Scope::Mission(1), window_hours(0, 24)), None, "reliability");
+    let reliability = dimension(
+        &counts(&history, Scope::Mission(1), window_hours(0, 24)),
+        None,
+        "reliability",
+    );
     assert_eq!(
         reliability["by_kind"],
         json!({"failed_command": 5, "spent_delivery": 1, "stall": 2, "gate_infrastructure": 3})
@@ -622,7 +773,16 @@ fn a_delivery_is_spent_only_as_attempts_judges_it() {
                 format!("deliver-4-0-retry-{index}")
             };
             let created = at(1) + i64::try_from(index).expect("few") * 60_000;
-            story.command("spawn-dispatch", &key, "session_4", "input", created, *succeeded, *error, &[]);
+            story.command(
+                "spawn-dispatch",
+                &key,
+                "session_4",
+                "input",
+                created,
+                *succeeded,
+                *error,
+                &[],
+            );
         }
         story
             .history()
@@ -638,9 +798,18 @@ fn a_delivery_is_spent_only_as_attempts_judges_it() {
     );
     assert!(spent(&[failed; 4]), "four failures: retries spent");
     assert!(!spent(&[failed; 3]), "three failures: a retry is due");
-    assert!(!spent(&[failed, failed, failed, typed]), "may have typed: not spent");
-    assert!(!spent(&[failed, failed, failed, (None, None)]), "an attempt still open");
-    assert!(!spent(&[failed, failed, failed, (Some(true), None)]), "delivered");
+    assert!(
+        !spent(&[failed, failed, failed, typed]),
+        "may have typed: not spent"
+    );
+    assert!(
+        !spent(&[failed, failed, failed, (None, None)]),
+        "an attempt still open"
+    );
+    assert!(
+        !spent(&[failed, failed, failed, (Some(true), None)]),
+        "delivered"
+    );
     // Refusals for a pane not ready are free, up to ten.
     let mut free = vec![refused; 10];
     free.extend([failed; 3]);
@@ -681,13 +850,26 @@ fn tokens_count_once_per_message_across_lines_and_copies() {
     .concat();
     std::fs::write(agent.join(format!("{native}.jsonl")), copy0).expect("copy 0");
     let copy1 = [
-        line("2026-10-03T07:00:00.000Z", "msg_e", "sonnet", [10, 0, 2000, 90]),
-        line("2026-10-03T17:00:00.000Z", "msg_f", "opus", [50, 0, 1000, 50]),
+        line(
+            "2026-10-03T07:00:00.000Z",
+            "msg_e",
+            "sonnet",
+            [10, 0, 2000, 90],
+        ),
+        line(
+            "2026-10-03T17:00:00.000Z",
+            "msg_f",
+            "opus",
+            [50, 0, 1000, 50],
+        ),
     ]
     .concat();
     std::fs::write(agent.join(format!("{native}.1.jsonl")), copy1).expect("copy 1");
-    std::fs::write(agent.join("notes.txt"), line("2026-10-03T17:00:00.000Z", "msg_x", "opus", [1, 1, 1, 1]))
-        .expect("not a copy file");
+    std::fs::write(
+        agent.join("notes.txt"),
+        line("2026-10-03T17:00:00.000Z", "msg_x", "opus", [1, 1, 1, 1]),
+    )
+    .expect("not a copy file");
     let other = root.join("agent_supervisor");
     std::fs::create_dir_all(&other).expect("archive");
     // The same message id under another agent is another message.
@@ -787,13 +969,33 @@ fn a_command_belongs_to_the_task_its_key_names_else_the_task_open_on_its_session
         };
         history.command_mission(&command, &by_session)
     };
-    assert_eq!(mission("deliver-3-0-retry-2", "session_r", at(1)), Some(3), "the key's task");
+    assert_eq!(
+        mission("deliver-3-0-retry-2", "session_r", at(1)),
+        Some(3),
+        "the key's task"
+    );
     assert_eq!(mission("board-1", "session_r", at(1)), Some(1));
-    assert_eq!(mission("board-2", "session_r", at(6)), Some(1), "the oldest open task");
-    assert_eq!(mission("board-3", "session_r", at(10)), Some(2), "task 1 closed at 10");
-    assert_eq!(mission("board-4", "session_r", at(25)), None, "no task open: the fleet's");
+    assert_eq!(
+        mission("board-2", "session_r", at(6)),
+        Some(1),
+        "the oldest open task"
+    );
+    assert_eq!(
+        mission("board-3", "session_r", at(10)),
+        Some(2),
+        "task 1 closed at 10"
+    );
+    assert_eq!(
+        mission("board-4", "session_r", at(25)),
+        None,
+        "no task open: the fleet's"
+    );
     assert_eq!(mission("board-5", "session_supervisor", at(1)), None);
-    assert_eq!(mission("deliver-99-0", "session_r", at(31)), Some(3), "an unknown task: the session's");
+    assert_eq!(
+        mission("deliver-99-0", "session_r", at(31)),
+        Some(3),
+        "an unknown task: the session's"
+    );
 }
 
 #[test]
@@ -828,7 +1030,10 @@ fn keys_and_tags_name_their_task() {
         stall_of("session_resident_r1 stall-9-activity-1"),
         Some(("stall-9-activity-1", 9))
     );
-    assert_eq!(stall_of("stall-12-delivery-40"), Some(("stall-12-delivery-40", 12)));
+    assert_eq!(
+        stall_of("stall-12-delivery-40"),
+        Some(("stall-12-delivery-40", 12))
+    );
     assert_eq!(stall_of("missions stall-mission-1-halted-5"), None);
     assert_eq!(stall_of("session_x report-12-0"), None);
 }
@@ -877,7 +1082,10 @@ fn the_card_holds_the_fleet_then_each_active_mission_with_previous_and_days() {
     // Previous: two landings, not enough; so no trend.
     assert_eq!(fleet["dimensions"]["throughput"]["previous"], Value::Null);
     assert_eq!(fleet["dimensions"]["throughput"]["trend"], Value::Null);
-    assert_eq!(fleet["dimensions"]["lead_time"]["value"], json!(2 * HOUR_MS));
+    assert_eq!(
+        fleet["dimensions"]["lead_time"]["value"],
+        json!(2 * HOUR_MS)
+    );
     let days: Vec<&str> = fleet["days"]
         .as_array()
         .expect("days")
@@ -908,7 +1116,10 @@ fn the_card_holds_the_fleet_then_each_active_mission_with_previous_and_days() {
         }
     }
     // The same record gives the same answer.
-    assert_eq!(card, super::card(&history, window_hours(0, 48), None).expect("again"));
+    assert_eq!(
+        card,
+        super::card(&history, window_hours(0, 48), None).expect("again")
+    );
 }
 
 #[test]
@@ -948,13 +1159,19 @@ fn the_text_form_says_not_enough_data_with_n_and_the_minimum() {
     let history = small_card_story().history();
     let card = card(&history, window_hours(0, 48), None).expect("a card");
     let shown = text(&card);
-    assert!(shown.contains("2026-10-02T00:00:00Z to 2026-10-04T00:00:00Z"), "{shown}");
+    assert!(
+        shown.contains("2026-10-02T00:00:00Z to 2026-10-04T00:00:00Z"),
+        "{shown}"
+    );
     assert!(shown.contains("mission 3"), "{shown}");
     assert!(
         shown.contains("not enough data (n 0, minimum 3)"),
         "{shown}"
     );
-    assert!(shown.contains("throughput   0.5 landings per open hour"), "{shown}");
+    assert!(
+        shown.contains("throughput   0.5 landings per open hour"),
+        "{shown}"
+    );
     assert!(shown.contains("higher is better"), "{shown}");
     assert!(shown.contains("lower is better"), "{shown}");
     // Below the minimum, no lead time is shown as a number.
@@ -966,7 +1183,10 @@ fn the_text_form_says_not_enough_data_with_n_and_the_minimum() {
     assert!(lead.contains("not enough data"), "{lead}");
     assert!(!shows_a_duration(lead), "{lead}");
     let fleet = shown.split("mission 1").next().expect("the fleet's part");
-    let lead = fleet.lines().find(|line| line.contains("lead")).expect("a lead time line");
+    let lead = fleet
+        .lines()
+        .find(|line| line.contains("lead"))
+        .expect("a lead time line");
     assert!(shows_a_duration(lead), "{lead}");
 }
 
@@ -996,7 +1216,16 @@ fn clipping_the_history_to_both_windows_changes_no_number() {
         .task(72, "task.landed", at(31))
         .message("agent_72", at(30), "opus", 7)
         .message("agent_supervisor", at(-300), "opus", 9)
-        .command("human", "board-9", "session_72", "input", at(-250), Some(false), None, &[]);
+        .command(
+            "human",
+            "board-9",
+            "session_72",
+            "input",
+            at(-250),
+            Some(false),
+            None,
+            &[],
+        );
     let whole = story.history();
     let mut clipped = story.history();
     clipped.clip(at(-48), at(48));

@@ -112,9 +112,7 @@ pub(crate) fn parse_rfc3339(text: &str) -> Option<i64> {
     };
     // A leap second is read as the last second of its minute.
     let second = second.min(59);
-    Some(
-        date_ms + ((hour * 60 + minute - offset_minutes) * 60 + second) * 1000 + millis,
-    )
+    Some(date_ms + ((hour * 60 + minute - offset_minutes) * 60 + second) * 1000 + millis)
 }
 
 /// A span back in time (`90m`, `36h`, `7d`, `2w`, `30s`), in milliseconds.
