@@ -9,7 +9,7 @@
 | 对象 | 位置 | 用途 |
 | --- | --- | --- |
 | 事件表与命令表 | [schema.sql](../crates/spawn-postgres/sql/schema.sql) 的 `spawn_events`、`spawn_commands` | 唯一事实源 |
-| 写入函数 | 同上，`spawn_append`、`spawn_submit`、`spawn_claim`、`spawn_finish` | 生产事件与命令状态 |
+| 写入函数 | 同上，`spawn_append`、`spawn_submit`、`spawn_claim`、`spawn_release`、`spawn_finish` | 生产事件与命令状态 |
 | 授权表 | 同上，`spawn_grants` 与触发器 `spawn_gateway_insert` | 写入门禁 |
 | 投影与视图 | 同上，`spawn_session_state`、`agent_*`、`spawn_read_*` | 读模型 |
 | 端口定义 | [port.rs](../crates/spawn-core/src/port.rs) | `EventLog`、`CommandQueue`、`WorkspaceStore`、`TerminalHost` |

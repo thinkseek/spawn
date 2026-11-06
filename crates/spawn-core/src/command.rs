@@ -103,6 +103,9 @@ pub struct Claimed {
     pub agent_id: AgentId,
     /// Target session.
     pub session_id: SessionId,
+    /// Who submitted the command: an input from outside Spawn's own loops
+    /// waits for its turn instead of being refused (`crate::bridge`).
+    pub principal: String,
     /// Raw action as stored. Parse with [`Claimed::action`].
     pub action: serde_json::Value,
 }
