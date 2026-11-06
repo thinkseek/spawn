@@ -379,3 +379,107 @@ done
         "the stop killed the engine's terminal"
     );
 }
+
+/// The upgrade of a host whose root is reached through a symlink: an
+/// execution started by a version that recorded the root as configured is
+/// read, after the restart, through the store's name for its workspace, so
+/// the Bridge finds the transcript its engine wrote under the resolved
+/// directory (before, it watched the literal one, which never got a line).
+#[test]
+fn an_execution_recorded_before_the_upgrade_is_followed_where_its_engine_writes() {
+    let _exclusive = exclusive();
+    let world = World::new("upgrade");
+    let store = world.store();
+    store.ensure_branch(&branch(), None).expect("branch");
+    let mounted = store.mount(&branch()).expect("mount");
+    let old = WorkspaceId::new(format!(
+        "agent_one:{}",
+        world.configured().join("agent_one").display()
+    ))
+    .expect("valid workspace");
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let memory = Arc::new(MemoryStore::new("shop", clock.clone()));
+    let execution = spawn_core::id::ExecutionId::for_command(spawn_core::id::CommandId(1));
+    let terminal = spawn_core::id::TerminalName::for_execution(&execution);
+    let agent = AgentId::new("agent_one").expect("valid agent");
+    let session = SessionId::new("session_one").expect("valid session");
+    let append = |key: &str, kind: EventKind| {
+        memory
+            .append(NewEvent {
+                agent_id: agent.clone(),
+                session_id: session.clone(),
+                execution_id: Some(execution.clone()),
+                source: spawn_core::event::Source::Bridge,
+                source_event_id: Some(key.to_string()),
+                kind,
+            })
+            .expect("append");
+    };
+    append(
+        "exec_1:started",
+        EventKind::ExecutionStarted {
+            engine: ENGINE.to_string(),
+            workspace: old.clone(),
+            command_id: spawn_core::id::CommandId(1),
+            fork: None,
+            model: spawn_core::event::ModelProfile::Default,
+            transcript_from: None,
+        },
+    );
+    append(
+        "exec_1:native",
+        EventKind::NativeSessionStarted {
+            engine: ENGINE.to_string(),
+            native_session_id: "native-1".to_string(),
+            transcript_path: None,
+            engine_version: None,
+        },
+    );
+    // The engine runs (its terminal is there) and wrote one turn where
+    // Claude Code writes it.
+    memory
+        .start(&spawn_core::port::Launch {
+            terminal: terminal.clone(),
+            workspace: old.clone(),
+            cwd: old.path().to_string(),
+            program: "spawn".to_string(),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+        })
+        .expect("terminal");
+    let projects = "/projects";
+    let written = format!(
+        "{projects}/{}/native-1.jsonl",
+        claude_directory(&seen_from(old.path()))
+    );
+    memory.append_file(
+        &written,
+        concat!(
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-11-06T10:00:00.000Z","message":{"role":"user","content":"prompt"}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"turn_duration","uuid":"s1","timestamp":"2026-11-06T10:00:01.000Z","durationMs":1}"#,
+            "\n"
+        ),
+    );
+    let mut config = BridgeConfig::new("tester");
+    config.claude_projects = projects.to_string();
+    let mut bridge = Bridge::new(
+        memory.clone(),
+        memory.clone(),
+        Arc::new(world.store()),
+        memory.clone(),
+        config,
+    )
+    .with_clock(clock);
+    bridge.recover().expect("recover");
+    bridge.tick().expect("tick");
+    assert!(
+        events(&memory)
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::TurnStopped { .. })),
+        "the turn written under {} was read: {:?}",
+        mounted.path(),
+        events(&memory)
+    );
+    store.unmount(&mounted).expect("unmount");
+}
