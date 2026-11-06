@@ -38,11 +38,19 @@
 #     writes at start, checked against its command line; never by name);
 #   - memory-limit kill: with a systemd user manager, objective 029's
 #     envelope (SPAWN_ENVELOPE=systemd, SPAWN_SLICE a slice of the
-#     scenario's own, SPAWN_EXECUTION_MEMORY_MAX=128M,
-#     SPAWN_EXECUTION_MEMORY_SWAP_MAX=0) and a tool that allocates 256 MiB;
-#     where there is none (the gate's sandbox has no /run and no bus), a
+#     scenario's own, SPAWN_EXECUTION_MEMORY_HIGH=124M, _MAX=128M and
+#     _SWAP_MAX=16M, and gate envelopes that fit under the slice: every
+#     envelope is set, since the owner's defaults of 2026-11-06, 10G, 12G
+#     and 4G, do not fit under its 2G slice, and MemoryHigh sits close
+#     below MemoryMax because a process that grows page by page past
+#     MemoryHigh is throttled, not killed: on this host 124M/128M/16M killed
+#     the tool in 0.74 s, 120M/128M/16M in 13.1 s) and a tool that allocates
+#     256 MiB; where there is none (the gate's sandbox has no /run and no
+#     bus, and the gate gets no delegated cgroup: the owner's ruling), a
 #     stand-in: the execution's runner and engine SIGKILLed at once, as the
-#     kernel's group OOM kill does; the output says which;
+#     kernel's group OOM kill does; the output says which. The real
+#     memory-limit kill is judged by the owner's run outside the sandbox
+#     (mission 7), as objective 029 is;
 #   - database restart: the loop's database socket gone and every
 #     connection through it cut, until the outage ends;
 #   - model relay outage: the relay answers 529 overloaded_error; the
@@ -616,8 +624,9 @@ for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SP
     SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_LOOP_INTERVAL_MS \
     SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS SPAWN_STALL_REVIEW_SECS \
     SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS SPAWN_STALL_STOP_SECS \
-    SPAWN_STALL_HALTED_SECS SPAWN_ENVELOPE SPAWN_SLICE SPAWN_EXECUTION_MEMORY_MAX \
-    SPAWN_EXECUTION_MEMORY_SWAP_MAX SPAWN_SLICE_MEMORY_HIGH SPAWN_SLICE_MEMORY_MAX \
+    SPAWN_STALL_HALTED_SECS SPAWN_ENVELOPE SPAWN_SLICE SPAWN_EXECUTION_MEMORY_HIGH \
+    SPAWN_EXECUTION_MEMORY_MAX SPAWN_EXECUTION_MEMORY_SWAP_MAX SPAWN_GATE_MEMORY_HIGH \
+    SPAWN_GATE_MEMORY_MAX SPAWN_GATE_MEMORY_SWAP_MAX SPAWN_SLICE_MEMORY_HIGH SPAWN_SLICE_MEMORY_MAX \
     SPAWN_SLICE_CPU_WEIGHT; do
     unset "$name" 2>/dev/null || true
 done
@@ -667,9 +676,11 @@ mkdir -p "$SPAWN_WORKSPACE_ROOT" "$SPAWN_CLAUDE_PROJECTS"
 : >"$WORK/loop-runs"
 
 # The memory-limit fault needs objective 029's envelope, which needs a
-# systemd user manager; the gate's sandbox has none (no /run, no bus). There
-# the fault is stood in for by what the kernel's group OOM kill does to an
-# execution: its processes (the runner and the engine) killed at once.
+# systemd user manager; the gate's sandbox has none (no /run, no bus) and
+# gets no delegated cgroup (the owner's ruling, 2026-11-06). There the fault
+# is stood in for by what the kernel's group OOM kill does to an execution:
+# its processes (the runner and the engine) killed at once; the real kill is
+# judged by the owner's run outside the sandbox.
 if [ "$ENVELOPE" = auto ]; then
     ENVELOPE=stand-in
     if command -v systemd-run >/dev/null 2>&1 &&
@@ -679,17 +690,26 @@ if [ "$ENVELOPE" = auto ]; then
     fi
 fi
 if [ "$ENVELOPE" = systemd ]; then
-    slice="bb032-$run.slice"
+    # Digits and `_` only: a `-` in a slice's name nests it in another slice.
+    slice="bb032_$run.slice"
     SPAWN_ENVELOPE=systemd
     SPAWN_SLICE=$slice
     SPAWN_SLICE_MEMORY_HIGH=1536M
     SPAWN_SLICE_MEMORY_MAX=2G
     SPAWN_SLICE_CPU_WEIGHT=50
+    # Every envelope set: the defaults (10G, 12G, 4G) do not fit under this
+    # slice; MemoryHigh close below MemoryMax, so the tool reaches the kill.
+    SPAWN_EXECUTION_MEMORY_HIGH=124M
     SPAWN_EXECUTION_MEMORY_MAX=128M
-    SPAWN_EXECUTION_MEMORY_SWAP_MAX=0
+    SPAWN_EXECUTION_MEMORY_SWAP_MAX=16M
+    SPAWN_GATE_MEMORY_HIGH=960M
+    SPAWN_GATE_MEMORY_MAX=1G
+    SPAWN_GATE_MEMORY_SWAP_MAX=64M
     export SPAWN_ENVELOPE SPAWN_SLICE SPAWN_SLICE_MEMORY_HIGH SPAWN_SLICE_MEMORY_MAX \
-        SPAWN_SLICE_CPU_WEIGHT SPAWN_EXECUTION_MEMORY_MAX SPAWN_EXECUTION_MEMORY_SWAP_MAX
-    echo "032: memory-limit fault: an execution envelope (systemd user manager, slice $slice, SPAWN_EXECUTION_MEMORY_MAX=128M) and a tool allocating 256 MiB"
+        SPAWN_SLICE_CPU_WEIGHT SPAWN_EXECUTION_MEMORY_HIGH SPAWN_EXECUTION_MEMORY_MAX \
+        SPAWN_EXECUTION_MEMORY_SWAP_MAX SPAWN_GATE_MEMORY_HIGH SPAWN_GATE_MEMORY_MAX \
+        SPAWN_GATE_MEMORY_SWAP_MAX
+    echo "032: memory-limit fault: an execution envelope (systemd user manager, slice $slice, SPAWN_EXECUTION_MEMORY_HIGH=124M, _MAX=128M, _SWAP_MAX=16M) and a tool allocating 256 MiB"
 else
     echo "032: memory-limit fault: stood in for (no systemd user manager here: objective 029's envelope cannot run): the execution's runner and engine killed at once, as a group OOM kill does"
 fi
