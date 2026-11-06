@@ -87,7 +87,7 @@ pub(crate) fn set_aside(
         let root = root.to_path_buf();
         Arc::new(move |repo: &Path| GitWorkspace::new(repo, &root))
     };
-    let workspaces = sources::MissionWorkspaces::new(
+    let workspaces = sources::MissionWorkspaces::one_shot(
         GitWorkspace::new(&mirror, root),
         root,
         Arc::clone(store),
@@ -124,8 +124,15 @@ pub(crate) fn set_aside(
             }
         }
     };
-    // Dropping the store pushes the commit it marked.
-    drop(workspaces);
+    // Pushed now, through the process's pusher for the source; a push that
+    // fails stays queued there and is retried.
+    if matches!(done, Done::SetAside { .. })
+        && let Some(source) = source.as_deref()
+        && let Some(crate::push::Pushed::Failed(why) | crate::push::Pushed::Rejected(why)) =
+            sources::publish(&mirror, source, agent)
+    {
+        eprintln!("set aside the work of task #{}: push: {why}", cancelled.id);
+    }
     Ok(done)
 }
 

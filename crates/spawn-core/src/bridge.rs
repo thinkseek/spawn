@@ -1852,31 +1852,40 @@ impl Bridge {
         } else {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
-        if let Err(error) = self
-            .terminals
-            .stage_text(&active.terminal(), &active.workspace, &text)
-        {
-            return Ok(Err(Untyped::Refused(error)));
-        }
-        self.step(
-            claimed,
-            Some(&active.execution_id),
-            CommandStep::Typing,
-            None,
-        )?;
-        let typed = self
-            .terminals
-            .submit_staged(&active.terminal(), &active.workspace);
-        if typed.is_ok() {
+        let typed = {
+            // A merge of main into the workspace waits while this types,
+            // and once it gets the workspace it finds the `typed` step
+            // recorded: no merge writes the workspace under the turn this
+            // starts ([`WorkspaceStore::merge_base_when`]).
+            let _held = self.workspaces.hold(&active.workspace);
+            if let Err(error) =
+                self.terminals
+                    .stage_text(&active.terminal(), &active.workspace, &text)
+            {
+                return Ok(Err(Untyped::Refused(error)));
+            }
             self.step(
                 claimed,
                 Some(&active.execution_id),
-                CommandStep::Typed,
+                CommandStep::Typing,
                 None,
             )?;
-            if !notices.is_empty() {
-                self.workspaces.notices_told(&active.workspace, &notices);
+            let typed = self
+                .terminals
+                .submit_staged(&active.terminal(), &active.workspace);
+            if typed.is_ok() {
+                self.step(
+                    claimed,
+                    Some(&active.execution_id),
+                    CommandStep::Typed,
+                    None,
+                )?;
             }
+            typed
+        };
+        // After the hold: telling the store takes the branch's lock too.
+        if typed.is_ok() && !notices.is_empty() {
+            self.workspaces.notices_told(&active.workspace, &notices);
         }
         Ok(typed.map_err(Untyped::Unknown))
     }
