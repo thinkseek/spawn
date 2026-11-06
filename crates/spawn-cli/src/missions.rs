@@ -69,6 +69,23 @@ fn hold_bound(text: Option<&str>) -> Result<i32, String> {
         })
 }
 
+/// `spawn mission hold --source <source> [--reason <text>]`, its bound from
+/// `SPAWN_SOURCE_HOLD_SECS` ([`hold_bound`]): the hold as printed.
+fn hold(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let source = text(flags, "source")?;
+    let bound = hold_bound(crate::config::env_value("SPAWN_SOURCE_HOLD_SECS").as_deref())?;
+    let reason = flags.get("reason");
+    if let Some(reason) = &reason
+        && reason.chars().count() > HOLD_REASON_CHARS
+    {
+        return Err(format!(
+            "--reason is at most {HOLD_REASON_CHARS} characters, not {}",
+            reason.chars().count()
+        ));
+    }
+    hold_source(store, &source, bound, reason.as_deref())
+}
+
 /// Hold landings on `source` for `bound` seconds (`spawn mission hold`):
 /// under the integrator's landing lock, so a landing whose push has begun
 /// records its outcome first, the main read here is the one it left, and no
@@ -292,20 +309,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let missions = store.source_moved(&source, &from, &to).map_err(err)?;
             print(&json!({ "source": source, "to": to, "missions": missions }));
         }
-        "hold" => {
-            let source = text(&flags, "source")?;
-            let bound = hold_bound(crate::config::env_value("SPAWN_SOURCE_HOLD_SECS").as_deref())?;
-            let reason = flags.get("reason");
-            if let Some(reason) = &reason
-                && reason.chars().count() > HOLD_REASON_CHARS
-            {
-                return Err(format!(
-                    "--reason is at most {HOLD_REASON_CHARS} characters, not {}",
-                    reason.chars().count()
-                ));
-            }
-            print(&hold_source(&store, &source, bound, reason.as_deref())?);
-        }
+        "hold" => print(&hold(&store, &flags)?),
         "release" => {
             let source = text(&flags, "source")?;
             print(&store.source_release(&source).map_err(err)?);
