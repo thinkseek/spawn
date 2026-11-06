@@ -2348,3 +2348,248 @@ fn a_report_names_the_checkpoint_of_its_turn() {
         "the latest report names no checkpoint"
     );
 }
+
+/// Objective 20: `host_fault` (the gate failed because the host did) is no
+/// verdict on the work. The store accepts it only with its evidence, stamps
+/// its `due_ms` from the record's own time, leaves the task where it was
+/// (revisions, note) and both halt counts as they were, and folds the
+/// mission's host faults in a row: + 1 on each, kept by `no_room` and
+/// `stale`, ended by a real verdict, a landing and a resume. The second in
+/// a row is an escalation until a digest tells it.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_host_fault_moves_no_count_and_its_run_is_folded() {
+    let (store, schema) = store("control_host_fault");
+    let mission = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "review",
+            None,
+            None,
+        )
+        .expect("configure");
+    let accepted_task = |brief: &str| {
+        let task = store
+            .task_assign(mission, "ephemeral", "w", brief, "default")
+            .expect("assign");
+        store.task_delivered(task, 1).expect("delivered");
+        assert!(store.task_reported(task, "done").expect("reported"));
+        store.task_review(task, true, "", None).expect("accept");
+        task
+    };
+    let task = accepted_task("first");
+    let mut client = admin(&schema);
+    let host_fault = |task: i64, revision: i32, faults: i64, backoff_ms: i64| {
+        json!({"type": "task.gated", "id": task, "revision": revision, "verdict": "host_fault",
+               "base": "b1", "scenarios": 7, "candidate": "c-host",
+               "reason": "host fault: every failure check-tests.sh printed (1) is a connection \
+                          error to the test database",
+               "log": "| FAILED api::tests::one: Connection refused", "evidence": "failures",
+               "failures": [{"test": "api::tests::one", "message": "Connection refused",
+                             "class": "connection"}],
+               "host_faults": faults, "backoff_ms": backoff_ms, "escalate": faults == 2})
+    };
+    let verdict = |task: i64, revision: i32, verdict: &str| {
+        store
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "revision": revision,
+                                       "verdict": verdict, "base": "b1", "note": "real",
+                                       "candidate": "c1", "reason": "r", "free_kb": 1,
+                                       "min_gb": 10, "tmpdir": "/t"}),
+            )
+            .expect("record a verdict");
+    };
+    let mission_row = |client: &mut Client| tables(client)["missions"][0].clone();
+    let task_row = |client: &mut Client, id: i64| {
+        tables(client)["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == id)
+            .cloned()
+            .expect("the task")
+    };
+    let recorded = |client: &mut Client, event: i64| -> (serde_json::Value, i64) {
+        let row = client
+            .query_one(
+                "select kind -> 'detail' -> 'record', recorded_at_ms from spawn_events
+                  where id = $1",
+                &[&event],
+            )
+            .expect("the record");
+        (row.get(0), row.get(1))
+    };
+
+    // Only with its evidence: the failures, the crash lines when the log
+    // decided it, and its backoff.
+    let refused = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut record = host_fault(task, 0, 1, 300_000);
+        change(&mut record);
+        store.integrator_record(&record).is_err()
+    };
+    assert!(refused(&|record| {
+        record.as_object_mut().expect("object").remove("evidence");
+    }));
+    assert!(refused(&|record| record["evidence"] = json!("a hunch")));
+    assert!(refused(&|record| record["failures"] = json!([])));
+    assert!(refused(
+        &|record| record["failures"] = json!("Connection refused")
+    ));
+    assert!(refused(&|record| record["backoff_ms"] = json!("5 min")));
+    assert!(refused(&|record| record["evidence"] = json!("server_log")));
+    assert!(refused(&|record| {
+        record["evidence"] = json!("server_log");
+        record["crash"] = json!([]);
+    }));
+
+    // A rejection and an abort first: the runs a host fault must leave.
+    verdict(task, 0, "rejected");
+    store.task_delivered(task, 2).expect("delivered again");
+    assert!(store.task_reported(task, "again").expect("reported"));
+    store
+        .task_review(task, true, "", Some(1))
+        .expect("accept again");
+    verdict(task, 1, "aborted");
+    let before = task_row(&mut client, task);
+    assert_eq!(
+        (before["state"].clone(), before["revisions"].clone()),
+        (json!("accepted"), json!(1))
+    );
+
+    let event = store
+        .integrator_record(&host_fault(task, 1, 1, 300_000))
+        .expect("the store accepts host_fault");
+    let (record, at) = recorded(&mut client, event);
+    assert_eq!(
+        record["due_ms"],
+        at + 300_000,
+        "its own time plus the backoff"
+    );
+    let after = task_row(&mut client, task);
+    assert_eq!(after["state"], "accepted", "the task stays where it was");
+    assert_eq!(after["revisions"], 1);
+    assert_eq!(after["review_note"], before["review_note"]);
+    assert_eq!(after["review_note"], "real");
+    assert_eq!(after["candidate"], before["candidate"]);
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (row["gate_rejections"].clone(), row["gate_aborts"].clone()),
+        (json!(1), json!(1))
+    );
+    assert_eq!(row["gate_host_faults"], 1);
+    assert_eq!(row["gate_host_task"], task);
+    assert_eq!(row["gate_host_due_ms"], at + 300_000);
+    assert!(row["halted"].is_null());
+    assert_eq!(
+        store
+            .gate_host_fault_escalations()
+            .expect("escalations")
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "the first in a row is not escalated"
+    );
+
+    // `no_room` and `stale` keep the run; the next host fault grows it.
+    verdict(task, 1, "no_room");
+    verdict(task, 1, "stale");
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_host_faults"], 1);
+    assert_eq!(row["gate_host_due_ms"], at + 300_000);
+    assert_eq!(task_row(&mut client, task)["state"], "accepted");
+    let second = store
+        .integrator_record(&host_fault(task, 1, 2, 600_000))
+        .expect("a second host fault");
+    let (record, at) = recorded(&mut client, second);
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_host_faults"], 2);
+    assert_eq!(row["gate_host_due_ms"], at + 600_000);
+    assert_eq!(record["due_ms"], at + 600_000);
+    assert_eq!(
+        (row["gate_rejections"].clone(), row["gate_aborts"].clone()),
+        (json!(1), json!(1))
+    );
+
+    // The second in a row is an escalation, until a digest tells it.
+    let escalations = store.gate_host_fault_escalations().expect("escalations");
+    assert_eq!(
+        escalations.as_array().map(Vec::len),
+        Some(1),
+        "{escalations}"
+    );
+    assert_eq!(escalations[0]["event_id"], second);
+    assert_eq!(escalations[0]["mission"], mission);
+    assert_eq!(escalations[0]["due_ms"], at + 600_000);
+    assert!(escalations[0].get("log").is_none());
+    client
+        .execute(
+            "insert into spawn_commands (principal, idempotency_key, agent_id, session_id,
+                                         action, state, succeeded, created_at_ms)
+             values ('spawn-dispatch', 'dispatch-digest-host', 'agent_supervisor',
+                     'session_supervisor',
+                     jsonb_build_object('type', 'input', 'text', 'digest',
+                                        'tags', jsonb_build_array($1::text)),
+                     'finished', true, 0)",
+            &[&format!("host gate-host-fault-{second}")],
+        )
+        .expect("a delivered digest");
+    assert_eq!(
+        store
+            .gate_host_fault_escalations()
+            .expect("escalations")
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "told once"
+    );
+
+    // A real verdict ends the run.
+    verdict(task, 1, "rejected");
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_host_faults"], 0);
+    assert!(row["gate_host_task"].is_null() && row["gate_host_due_ms"].is_null());
+    assert_eq!(row["gate_rejections"], 2);
+
+    // A landing ends it: another task's host fault, then a landing.
+    let landing = accepted_task("second");
+    verdict(landing, 0, "accepted");
+    let third = accepted_task("third");
+    store
+        .integrator_record(&host_fault(third, 0, 1, 300_000))
+        .expect("a host fault on another task");
+    assert_eq!(mission_row(&mut client)["gate_host_faults"], 1);
+    assert_eq!(mission_row(&mut client)["gate_host_task"], third);
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": landing, "from": "b1",
+                                   "to": "c1"}))
+        .expect("landed");
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_host_faults"], 0, "a landing ends the run");
+    assert!(row["gate_host_task"].is_null());
+
+    // A resume ends it.
+    store
+        .integrator_record(&host_fault(third, 0, 1, 300_000))
+        .expect("a host fault");
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": mission, "reason": "x"}))
+        .expect("halt");
+    assert_eq!(mission_row(&mut client)["gate_host_faults"], 1);
+    store.mission_resume(mission).expect("resume");
+    let row = mission_row(&mut client);
+    assert_eq!(row["gate_host_faults"], 0, "a resume ends the run");
+    assert!(row["gate_host_due_ms"].is_null());
+    assert_eq!(task_row(&mut client, third)["state"], "accepted");
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}

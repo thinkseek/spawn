@@ -342,7 +342,8 @@ from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
-         m.gate_room_waits, m.gate_room_escalated, m.objectives, m.sources ->> 0 as source,
+         m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
+         m.gate_host_due_ms, m.objectives, m.sources ->> 0 as source,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -390,6 +391,34 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
    and not exists (select 1 from told where tag = 'host gate-room-' || e.id)";
+
+/// The `host_fault` gate records that carry `escalate` (the mission's second
+/// host fault in a row) and that the supervisor was not told of yet, oldest
+/// first, each with its `event_id`, `at_ms` and `mission`, without the
+/// gate's `log`. Told is a record, as for [`GATE_ROOM_ESCALATIONS`]: a digest
+/// that reached the supervisor carrying the tag
+/// `host gate-host-fault-<event_id>`, however long ago.
+pub(crate) const GATE_HOST_FAULT_ESCALATIONS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg((r - 'log') || jsonb_build_object('event_id', e.id,
+                                                           'at_ms', e.recorded_at_ms,
+                                                           'mission', k.mission_id)
+                          order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join mission_tasks k on k.id = (r ->> 'id')::bigint
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
+   and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
+   and not exists (select 1 from told where tag = 'host gate-host-fault-' || e.id)";
 
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
@@ -699,6 +728,12 @@ impl PostgresStore {
     /// supervisor yet ([`GATE_ROOM_ESCALATIONS`]).
     pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_ROOM_ESCALATIONS, &[])
+    }
+
+    /// The `host_fault` gate records that escalate and were not told to the
+    /// supervisor yet ([`GATE_HOST_FAULT_ESCALATIONS`]).
+    pub fn gate_host_fault_escalations(&self) -> Result<Value, StoreError> {
+        self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.
