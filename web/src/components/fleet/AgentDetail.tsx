@@ -30,7 +30,7 @@ import {
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
 import { LiveBadge, TerminalBlock, TerminalPanel } from "../Terminal";
-import { Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
+import { Ago, Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
 import {
   Fact,
   FleetStateBadge,
@@ -157,8 +157,8 @@ function AgentSummary({ agent }: { agent: FleetAgent }) {
             {now.label}
           </span>
         </Fact>
-        <Fact label="Last event">{relativeTime(activity.last_event_at_ms)}</Fact>
-        <Fact label="In state since">{relativeTime(agent.state_since_ms)}</Fact>
+        <Fact label="Last event"><Ago ms={activity.last_event_at_ms} /></Fact>
+        <Fact label="In state since"><Ago ms={agent.state_since_ms} /></Fact>
         <Fact label="Engine · execution" mono>
           {[agent.engine, agent.execution_id].filter(Boolean).join(" · ") || "—"}
         </Fact>
@@ -229,9 +229,7 @@ function JevPanel({
                 Back to latest
               </button>
             )}
-            <span className="tnum" title={at ? new Date(at).toLocaleString() : undefined}>
-              {relativeTime(at)}
-            </span>
+            <Ago ms={at} />
           </>
         }
       />
