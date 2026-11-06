@@ -141,8 +141,13 @@ fail() {
 pass() { stage_mark e2e ok "$*"; }
 
 # wait_for <seconds> <description> <command...>
+# Every bound is an upper bound on a wait for something that must happen; a
+# passing run never reaches one. They are scaled (E2E_WAIT_SCALE, default 3)
+# because a gate runs this beside other gates and workers' suites on a shared
+# host, where a 60 s bound failed on load alone (owner gate b973097,
+# 2026-11-07: "a rules WORKING judgement", then "the breaking report").
 wait_for() {
-  local limit=$1 what=$2
+  local limit=$(( $1 * ${E2E_WAIT_SCALE:-3} )) what=$2
   shift 2
   local deadline=$((SECONDS + limit))
   until "$@" >/dev/null 2>&1; do
@@ -362,7 +367,9 @@ wait_for 30 "the supervisor's native session" grep -q '^session_supervisor' "$wo
 pass "supervisor started by the liveness rule"
 
 # --- 1+2. rules decide WORKING; Jev decides the idle prompt; digest ---------
-export E2E_TOOL_SECONDS=3
+# Long enough for the transcript's tool.started to be ingested and judged
+# while the tool still runs, on a loaded host too.
+export E2E_TOOL_SECONDS=15
 start_worker session_worker_a "E2E:WORK build the thing"
 judged_working_by_rules() {
   tail_of session_worker_a | jq -e '
