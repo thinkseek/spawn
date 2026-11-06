@@ -2093,6 +2093,7 @@ fn the_attention_view_reads_the_supervisors_transcript_and_latest_turn() {
 /// charter hash that start recorded, and the dispatcher's charter inputs
 /// since that start, with their outcomes. Other sessions carry none.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn dispatch_facts_name_the_charter_the_supervisors_native_session_holds() {
     let (store, _schema) = store("facts_charter");
     let supervisor = Worker {
