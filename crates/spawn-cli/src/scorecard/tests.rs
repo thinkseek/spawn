@@ -962,5 +962,22 @@ fn the_text_form_says_not_enough_data_with_n_and_the_minimum() {
         .find(|line| line.contains("lead"))
         .expect("a lead time line");
     assert!(lead.contains("not enough data"), "{lead}");
-    assert!(!lead.contains(" ms") && !lead.contains('h'.to_string().as_str()) || lead.contains("not enough"), "{lead}");
+    assert!(!shows_a_duration(lead), "{lead}");
+    let fleet = shown.split("mission 1").next().expect("the fleet's part");
+    let lead = fleet.lines().find(|line| line.contains("lead")).expect("a lead time line");
+    assert!(shows_a_duration(lead), "{lead}");
+}
+
+/// Whether `line` holds a number followed by a unit of time (`5h`, `3 ms`,
+/// `2.5 min`).
+fn shows_a_duration(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    (0..bytes.len()).any(|end| {
+        if !bytes[end].is_ascii_digit() || bytes.get(end + 1).is_some_and(u8::is_ascii_digit) {
+            return false;
+        }
+        let rest = line[end + 1..].trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        rest.starts_with('h') || rest.starts_with("ms") || rest.starts_with("min")
+    })
 }
