@@ -1837,9 +1837,7 @@ mod room_tests {
         );
         assert_eq!(memory.check(), "memory", "disk and memory still count");
         // The same room with the database: the probe decides.
-        let (database, _) = short(
-            room_with_url_failing(&taken()).check(&gate_env(&[])),
-        );
+        let (database, _) = short(room_with_url_failing(&taken()).check(&gate_env(&[])));
         assert_eq!(database.check(), "database");
     }
 
