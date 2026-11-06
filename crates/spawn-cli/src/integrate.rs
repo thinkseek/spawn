@@ -4070,7 +4070,15 @@ mod host_fault_tests {
         );
         lines.push("error: test failed, to rerun pass `-p spawn-cli --bin spawn`".to_string());
         lines.push("--".to_string());
-        lines.extend(panic_lines("a_gate_verdict_lands_only_on_its_revision", &[CRASHED]));
+        // Rust 1.88 on names the thread's id too.
+        lines.extend([
+            "---- a_gate_verdict_lands_only_on_its_revision stdout ----".to_string(),
+            "thread 'a_gate_verdict_lands_only_on_its_revision' (2794460) panicked at \
+             tests/control.rs:9:9:"
+                .to_string(),
+            CRASHED.to_string(),
+            NOTE.to_string(),
+        ]);
         lines.extend(panic_lines("objective_tasks_keep_their_history", &[RECOVERING]));
         lines.push("test result: FAILED. 20 passed; 2 failed; 0 ignored".to_string());
         lines.push("error: 2 targets failed:".to_string());
@@ -4280,12 +4288,12 @@ mod host_fault_tests {
         assert!(host::host_fault(reason, &output_of(&today), || crash.clone()).is_some());
 
         // A second of slack on either side of the measured window, no more.
-        let started = at("2026-11-06T01:46:59.017Z");
+        let started = at("2026-11-06T01:46:59.020Z");
         assert_eq!(host::crash_lines(&log, started, started + 5000).len(), 1);
         assert!(host::crash_lines(&log, started + 1, started + 5000).is_empty());
-        let ended = at("2026-11-06T01:46:57.020Z");
-        assert_eq!(host::crash_lines(&log, ended - 5000, ended).len(), 3);
-        assert_eq!(host::crash_lines(&log, ended - 5000, ended - 1).len(), 2);
+        let ended = at("2026-11-06T01:46:57.017Z");
+        assert_eq!(host::crash_lines(&log, ended - 5000, ended).len(), 1);
+        assert!(host::crash_lines(&log, ended - 5000, ended - 1).is_empty());
     }
 
     /// The log's times: `UTC` (or `GMT`), or a numeric offset, with or
