@@ -7,8 +7,38 @@
 //! The Bridge is the only writer of a Bridge-sourced `execution.ended`, and
 //! it writes that event only after the final checkpoint, the terminal kill
 //! and the unmount. A refold of the log therefore never repeats cleanup.
+//!
+//! An input to a busy session waits for its turn (docs/design.md §5). An
+//! `Input` from a person or the supervisor (any principal but the loops in
+//! [`LOOP_PRINCIPALS`]) that finds the pane not ready, or a capture that
+//! keeps failing on a live terminal, records `command.step` `waiting` once
+//! (key `<command>:waiting`) and stays unfinished. It is typed on a Ready
+//! reading, and a Ready reading is spent by the typing: the next input needs
+//! one taken after the previous `typed` (or that typing's turn to have
+//! ended). The session's waiting inputs go oldest first: none is typed
+//! before an earlier one still waiting. At most once holds as for any
+//! input: `typed` succeeds, `typing` without `typed` fails with
+//! [`MAY_HAVE_TYPED`]. The loops' own inputs keep their contract: refused at
+//! once while the pane is not ready (they retry on their own), and refused
+//! behind a waiting input too. A waiting input holds nothing else: the
+//! queue hands out what comes behind it (a stop, a discard, a resume, a
+//! later input to be recorded waiting). When the execution ends, its
+//! waiting inputs fail in the same tick or the next: as stopped if a stop or
+//! a discard ended it, otherwise with the end's cause; a resume does not
+//! revive them. An input to a session with no execution still fails at
+//! once.
+//!
+//! The wait has no timeout of its own. Its lease approach: a waiting input
+//! keeps no lease between ticks. The Bridge holds the claim for the rest of
+//! the tick (so a command behind it can be claimed), then releases it
+//! ([`CommandQueue::release`]) to be claimable again after
+//! [`BridgeConfig::input_wait_retry`]; the waiting itself is read from the
+//! log, so another or a restarted Bridge carries on where this one stopped.
+//! The `waiting` record is not activity: the stall layer and the
+//! dispatcher's staleness ignore it, and the Observer covers it like any
+//! command step.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -126,8 +156,13 @@ pub struct BridgeConfig {
     pub ready_interval: Duration,
     /// Attempts of an input whose terminal call failed (a capture, or the
     /// staging of its text) while the terminal is still there. A pane that
-    /// reads as not ready is refused at once ([`PANE_NOT_READY`]).
+    /// reads as not ready refuses an input of Spawn's own loops at once
+    /// ([`PANE_NOT_READY`]); any other input waits ([`waits`]).
     pub input_attempts: usize,
+    /// How soon an input that waits for its turn is claimed again: its lease
+    /// is released for this long ([`CommandQueue::release`]), so a busy pane
+    /// is read about this often until it takes the input.
+    pub input_wait_retry: Duration,
     /// Where Claude Code writes session transcripts (its `projects`
     /// directory), as the terminal host sees it.
     pub claude_projects: String,
@@ -152,6 +187,7 @@ impl BridgeConfig {
             ready_attempts: 40,
             ready_interval: Duration::from_millis(250),
             input_attempts: 4,
+            input_wait_retry: Duration::from_secs(1),
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
             model_relay: None,
@@ -251,6 +287,36 @@ struct SessionView {
     /// The latest prompt the engine's transcript recorded: its execution and
     /// where it is in the log.
     last_message: Option<(ExecutionId, GlobalPosition)>,
+    /// What the log says about the session's inputs ([`Inputs`]).
+    inputs: Inputs,
+}
+
+/// What the log says about a session's inputs: which wait for their turn,
+/// and whether the input typed last has been answered, so the next goes on
+/// a ready screen of its own. All of it is folded from the log, so a
+/// restarted Bridge carries on with it.
+#[derive(Debug, Clone, Default)]
+struct Inputs {
+    /// Unfinished inputs with a `waiting` step, each with the execution it
+    /// waited on.
+    waiting: BTreeMap<CommandId, Option<ExecutionId>>,
+    /// How each ended execution of the session ended.
+    ended: HashMap<ExecutionId, EndCause>,
+    /// The latest `typed` step (a prompt's or an input's).
+    typed: Option<(ExecutionId, GlobalPosition)>,
+    /// The latest screen the Bridge recorded as ready.
+    ready: Option<(ExecutionId, GlobalPosition)>,
+    /// The latest end of a turn in the engine's transcript.
+    turn_end: Option<(ExecutionId, GlobalPosition)>,
+}
+
+/// `at` is later than `than` in the same execution.
+fn after(
+    at: Option<&(ExecutionId, GlobalPosition)>,
+    execution: &ExecutionId,
+    than: GlobalPosition,
+) -> bool {
+    at.is_some_and(|(seen, position)| seen == execution && *position > than)
 }
 
 /// The recorded steps of one command ([`CommandStep`]).
@@ -296,7 +362,38 @@ impl SessionView {
                     CommandStep::Mounted => steps.mounted.clone_from(workspace),
                     CommandStep::MountReleased => steps.released = true,
                     CommandStep::Typing => steps.typing_at = Some(record.position),
-                    CommandStep::Typed => steps.typed = true,
+                    CommandStep::Typed => {
+                        steps.typed = true;
+                        if let Some(execution) = event.execution_id.clone() {
+                            self.inputs.typed = Some((execution, record.position));
+                        }
+                    }
+                    CommandStep::Waiting => {
+                        self.inputs
+                            .waiting
+                            .insert(*command_id, event.execution_id.clone());
+                    }
+                }
+            }
+            EventKind::CommandFinished { command_id, .. } => {
+                self.inputs.waiting.remove(command_id);
+            }
+            EventKind::ScreenObserved {
+                state: ScreenState::Ready,
+                ..
+            } if event.source == Source::Bridge => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.inputs.ready = Some((execution, record.position));
+                }
+            }
+            EventKind::TurnStopped { .. } | EventKind::TurnFailed { .. } => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.inputs.turn_end = Some((execution, record.position));
+                }
+            }
+            EventKind::ExecutionEnded { cause, .. } if event.source == Source::Bridge => {
+                if let Some(execution) = event.execution_id.clone() {
+                    self.inputs.ended.insert(execution, *cause);
                 }
             }
             EventKind::ExecutionStarted { command_id, .. } => {
@@ -332,6 +429,28 @@ impl SessionView {
                 }
             }
         }
+    }
+
+    /// Whether the input typed last into `execution` has been answered, so
+    /// another may be typed: nothing was typed into it yet, or since the
+    /// last `typed` the Bridge recorded a ready screen, or the engine
+    /// received a prompt and ended its turn. A ready screen read before a
+    /// typing is consumed by it (the rule the Observer's snapshot applies),
+    /// so two inputs never land in one prompt.
+    fn answered(&self, execution: &ExecutionId) -> bool {
+        let Some((typed_in, typed_at)) = &self.inputs.typed else {
+            return true;
+        };
+        if typed_in != execution {
+            return true;
+        }
+        if after(self.inputs.ready.as_ref(), execution, *typed_at) {
+            return true;
+        }
+        self.last_message
+            .as_ref()
+            .filter(|(seen, position)| seen == execution && *position > *typed_at)
+            .is_some_and(|(_, message)| after(self.inputs.turn_end.as_ref(), execution, *message))
     }
 
     /// Fold what recovery needs to compare the agent's branch with the log:
@@ -391,6 +510,20 @@ pub struct Bridge {
     warned: std::sync::Mutex<HashMap<SessionId, HashSet<String>>>,
     /// Where the engines' transcripts are copied ([`crate::transcripts`]).
     transcripts: Option<Arc<dyn TranscriptArchive>>,
+    /// The latest claim of each input this Bridge left waiting, so that an
+    /// execution's end fails them in the same tick. Only a shortcut: a
+    /// restarted Bridge, which has none, fails them when it claims them
+    /// next (the log says which wait and how the execution ended).
+    held: HashMap<CommandId, Claimed>,
+}
+
+/// What handling a claimed command came to.
+enum Handled {
+    /// It finished, with this outcome.
+    Finished(Outcome),
+    /// An input that waits for its turn: left unfinished, claimed again
+    /// after [`BridgeConfig::input_wait_retry`].
+    Waiting,
 }
 
 impl Bridge {
@@ -414,6 +547,7 @@ impl Bridge {
             unrecorded_commits: std::sync::Mutex::default(),
             warned: std::sync::Mutex::default(),
             transcripts: None,
+            held: HashMap::new(),
         }
     }
 
@@ -588,6 +722,10 @@ impl Bridge {
     pub fn tick(&mut self) -> Result<TickReport, StoreError> {
         self.catch_up()?;
         let mut report = TickReport::default();
+        // Inputs left waiting keep their lease until the claims of this tick
+        // are done, so the commands behind them are claimed now; then they
+        // are released, to be claimed again after `input_wait_retry`.
+        let mut waited: Vec<Claimed> = Vec::new();
         while report.commands < self.config.max_commands_per_tick {
             let Some(claimed) = self
                 .queue
@@ -595,10 +733,24 @@ impl Bridge {
             else {
                 break;
             };
-            let outcome = self.handle(&claimed, &mut report)?;
-            self.queue.finish(&claimed, &outcome)?;
+            match self.handle(&claimed, &mut report)? {
+                Handled::Finished(outcome) => {
+                    self.held.remove(&claimed.command_id);
+                    self.queue.finish(&claimed, &outcome)?;
+                }
+                Handled::Waiting => {
+                    self.held.insert(claimed.command_id, claimed.clone());
+                    waited.push(claimed);
+                }
+            }
             report.commands += 1;
             self.catch_up()?;
+        }
+        for claimed in &waited {
+            // One its execution's end failed meanwhile is not released.
+            if self.held.contains_key(&claimed.command_id) {
+                self.queue.release(claimed, self.config.input_wait_retry)?;
+            }
         }
         self.act(&mut report)?;
         self.catch_up()?;
@@ -643,6 +795,7 @@ impl Bridge {
                 latest: None,
                 steps: HashMap::new(),
                 last_message: None,
+                inputs: Inputs::default(),
             });
         view.fold_branch(record);
         view.fold_steps(record);
@@ -756,9 +909,13 @@ impl Bridge {
                 ))
             })
             .collect();
+        let mut ended_now = Vec::new();
         for (session, agent_id, native, mut active) in running {
             let ended =
                 self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
+            if ended {
+                ended_now.push((session.clone(), active.execution_id.clone()));
+            }
             if let Some(view) = self.sessions.get_mut(&session) {
                 if ended {
                     view.active = None;
@@ -769,6 +926,18 @@ impl Bridge {
                     held.reported_end = active.reported_end;
                     held.follow = active.follow;
                 }
+            }
+        }
+        if !ended_now.is_empty() {
+            // What waited for a turn of an execution that ended is never
+            // typed: failed now, with how the execution ended.
+            self.catch_up()?;
+            for (session, execution) in ended_now {
+                let cause = self
+                    .sessions
+                    .get(&session)
+                    .and_then(|view| view.inputs.ended.get(&execution).copied());
+                self.fail_waiting(&session, cause)?;
             }
         }
         Ok(())
@@ -1387,15 +1556,17 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         report: &mut TickReport,
-    ) -> Result<Outcome, StoreError> {
+    ) -> Result<Handled, StoreError> {
         let Ok(action) = claimed.action() else {
-            return Ok(Outcome::Failed("stored action is not valid".to_string()));
+            return Ok(Handled::Finished(Outcome::Failed(
+                "stored action is not valid".to_string(),
+            )));
         };
         // What a command appends comes after the session's waiting commit
         // records. While the log refuses them the command is not handled
         // (the error ends the tick; the lease brings the command back).
         self.record_unrecorded_commit(&claimed.session_id)?;
-        match action {
+        let outcome = match action {
             CommandAction::Start {
                 engine: _,
                 prompt,
@@ -1413,13 +1584,14 @@ impl Bridge {
                 },
                 report,
             ),
-            CommandAction::Input { text, .. } => self.input(claimed, &text),
+            CommandAction::Input { text, .. } => return self.input(claimed, &text),
             CommandAction::Stop => self.stop(claimed, false, report),
             CommandAction::Discard => self.stop(claimed, true, report),
             CommandAction::Resume { prompt, model } => {
                 self.resume(claimed, prompt.as_deref(), model, report)
             }
-        }
+        }?;
+        Ok(Handled::Finished(outcome))
     }
 
     fn running(&self, session: &SessionId) -> Option<Active> {
@@ -1642,6 +1814,7 @@ impl Bridge {
             CommandStep::MountReleased => "mount_released",
             CommandStep::Typing => "typing",
             CommandStep::Typed => "typed",
+            CommandStep::Waiting => "waiting",
         };
         self.append(
             &claimed.agent_id,
@@ -2256,24 +2429,80 @@ impl Bridge {
         )))
     }
 
-    fn input(&mut self, claimed: &Claimed, text: &str) -> Result<Outcome, StoreError> {
+    /// An input typed into the running engine, at most once ([`Self::type_once`]),
+    /// on a ready pane, after every earlier input of the session that waits,
+    /// and only once the input typed last was answered
+    /// ([`SessionView::answered`]). When it cannot be typed yet, an input of
+    /// Spawn's own loops is refused at once ([`PANE_NOT_READY`]: they retry
+    /// on their own schedule) and any other waits for its turn
+    /// ([`Self::not_yet`]).
+    fn input(&mut self, claimed: &Claimed, text: &str) -> Result<Handled, StoreError> {
+        let finished = |outcome| Ok(Handled::Finished(outcome));
+        let waited = self
+            .sessions
+            .get(&claimed.session_id)
+            .and_then(|view| view.inputs.waiting.get(&claimed.command_id).cloned());
         let Some(active) = self.running(&claimed.session_id) else {
-            return Ok(Outcome::Failed(format!(
+            // One that waited outlived its execution: it is never typed.
+            if let Some(waited_on) = waited {
+                return finished(Outcome::Failed(
+                    self.ended_untyped(&claimed.session_id, waited_on.as_ref()),
+                ));
+            }
+            return finished(Outcome::Failed(format!(
                 "{} runs no execution",
                 claimed.session_id
             )));
         };
+        // Nor in a later execution: a resume does not revive it.
+        if let Some(Some(waited_on)) = &waited
+            && *waited_on != active.execution_id
+        {
+            return finished(Outcome::Failed(
+                self.ended_untyped(&claimed.session_id, Some(waited_on)),
+            ));
+        }
         // A retried input is never typed twice.
         match self.typing_of(claimed, &active.execution_id) {
             Typing::Due => {}
-            Typing::Done => return Ok(Outcome::Succeeded),
+            Typing::Done => return finished(Outcome::Succeeded),
             Typing::Unknown => {
-                return Ok(Outcome::Failed(format!("the text {MAY_HAVE_TYPED}")));
+                return finished(Outcome::Failed(format!("the text {MAY_HAVE_TYPED}")));
             }
         }
+        let shown = active
+            .follow
+            .screen
+            .map_or(ScreenState::Unknown, |(state, _)| state);
+        // Behind an earlier input that waits, or a typing not answered yet.
+        let held = self.sessions.get(&claimed.session_id).and_then(|view| {
+            if let Some(earlier) = view.inputs.waiting.range(..claimed.command_id).next() {
+                return Some(format!("{}, sent before it, waits for its turn", earlier.0));
+            }
+            (!view.answered(&active.execution_id))
+                .then(|| "the input typed last has not been answered yet".to_string())
+        });
+        if let Some(why) = held {
+            return self.not_yet(claimed, &active, shown, Some(&why));
+        }
+        self.type_when_ready(claimed, &active, text, waited.is_some(), shown)
+    }
+
+    /// Read the pane and type `text` if it is ready, else leave the input to
+    /// [`Self::not_yet`]. `waited`: the input was recorded waiting before.
+    fn type_when_ready(
+        &mut self,
+        claimed: &Claimed,
+        active: &Active,
+        text: &str,
+        waited: bool,
+        shown: ScreenState,
+    ) -> Result<Handled, StoreError> {
+        let finished = |outcome| Ok(Handled::Finished(outcome));
         // A failed capture or a staging refused, on a terminal still there,
-        // spends one attempt; out of attempts, the input is refused as not
-        // ready, which typed nothing. Only a terminal that is gone fails it.
+        // spends one attempt; out of attempts, the input is not ready, which
+        // typed nothing. Only a terminal that is gone fails one that cannot
+        // wait; one that waits is failed by the execution's end, with why.
         let mut attempt = 0;
         loop {
             if attempt > 0 {
@@ -2288,55 +2517,135 @@ impl Bridge {
                 {
                     Ok(pane) => pane,
                     Err(error) => {
-                        if self.terminal_gone(&active) {
-                            return Ok(Outcome::Failed(format!("terminal disappeared: {error}")));
+                        if self.terminal_gone(active) {
+                            if waits(&claimed.principal) {
+                                return self.not_yet(claimed, active, shown, None);
+                            }
+                            return finished(Outcome::Failed(format!(
+                                "terminal disappeared: {error}"
+                            )));
                         }
                         if last {
-                            return Ok(Outcome::Failed(format!(
-                                "pane unread ({error}): taken as one that {PANE_NOT_READY}"
-                            )));
+                            return self.not_yet(
+                                claimed,
+                                active,
+                                ScreenState::Unknown,
+                                Some(&format!("pane unread ({error})")),
+                            );
                         }
                         continue;
                     }
                 };
             let reading = read_claude_screen(&pane);
-            self.append(
-                &claimed.agent_id,
-                &claimed.session_id,
-                Some(&active.execution_id),
-                Source::Bridge,
-                None,
-                EventKind::ScreenObserved {
-                    state: reading.state,
-                    evidence: reading.evidence,
-                },
-            )?;
-            if !reading.state.accepts_input() {
-                return Ok(Outcome::Failed(format!(
-                    "pane state {:?} {PANE_NOT_READY}",
-                    reading.state
-                )));
+            // A waiting input's busy readings are not recorded again each
+            // time it is tried: they are no new fact.
+            if reading.state.accepts_input() || !waited {
+                self.append(
+                    &claimed.agent_id,
+                    &claimed.session_id,
+                    Some(&active.execution_id),
+                    Source::Bridge,
+                    None,
+                    EventKind::ScreenObserved {
+                        state: reading.state,
+                        evidence: reading.evidence,
+                    },
+                )?;
             }
-            match self.type_once(claimed, &active, text)? {
-                Ok(()) => return Ok(Outcome::Succeeded),
+            if !reading.state.accepts_input() {
+                return self.not_yet(claimed, active, reading.state, None);
+            }
+            match self.type_once(claimed, active, text)? {
+                Ok(()) => return finished(Outcome::Succeeded),
                 Err(Untyped::Refused(error)) => {
-                    if self.terminal_gone(&active) {
-                        return Ok(Outcome::Failed(format!("terminal disappeared: {error}")));
+                    if self.terminal_gone(active) {
+                        if waits(&claimed.principal) {
+                            return self.not_yet(claimed, active, shown, None);
+                        }
+                        return finished(Outcome::Failed(format!("terminal disappeared: {error}")));
                     }
                     if last {
-                        return Ok(Outcome::Failed(format!(
-                            "submit text refused before typing ({error}): taken as a pane that \
-                             {PANE_NOT_READY}"
-                        )));
+                        return self.not_yet(
+                            claimed,
+                            active,
+                            reading.state,
+                            Some(&format!("submit text refused before typing ({error})")),
+                        );
                     }
                 }
                 Err(Untyped::Unknown(error)) => {
-                    return Ok(Outcome::Failed(format!(
+                    return finished(Outcome::Failed(format!(
                         "submit text: {error}; the text {MAY_HAVE_TYPED}"
                     )));
                 }
             }
         }
+    }
+
+    /// An input that cannot be typed yet (the pane shows `state`, or `why`):
+    /// one of Spawn's own loops is refused at once, `pane state <state> does
+    /// not accept input`, having typed nothing; any other is recorded as
+    /// waiting (`command.step` `waiting`, once) and left unfinished.
+    fn not_yet(
+        &self,
+        claimed: &Claimed,
+        active: &Active,
+        state: ScreenState,
+        why: Option<&str>,
+    ) -> Result<Handled, StoreError> {
+        if !waits(&claimed.principal) {
+            let why = why.map_or_else(String::new, |why| format!(": {why}"));
+            return Ok(Handled::Finished(Outcome::Failed(format!(
+                "pane state {state:?} {PANE_NOT_READY}{why}"
+            ))));
+        }
+        self.step(
+            claimed,
+            Some(&active.execution_id),
+            CommandStep::Waiting,
+            None,
+        )?;
+        Ok(Handled::Waiting)
+    }
+
+    /// Why an input that waited on `execution` was never typed: the
+    /// session was stopped, or its execution ended otherwise, first.
+    fn ended_untyped(&self, session: &SessionId, execution: Option<&ExecutionId>) -> String {
+        let cause = execution.and_then(|execution| {
+            self.sessions
+                .get(session)
+                .and_then(|view| view.inputs.ended.get(execution).copied())
+        });
+        untyped_because(cause)
+    }
+
+    /// Fail every input of `session` this Bridge left waiting, now that its
+    /// execution has ended (`cause`): none of them was typed. One claimed by
+    /// someone else since is failed when it is claimed next.
+    fn fail_waiting(
+        &mut self,
+        session: &SessionId,
+        cause: Option<EndCause>,
+    ) -> Result<(), StoreError> {
+        let mine: Vec<CommandId> = self
+            .held
+            .iter()
+            .filter(|(_, claimed)| &claimed.session_id == session)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in mine {
+            let Some(claimed) = self.held.remove(&id) else {
+                continue;
+            };
+            match self
+                .queue
+                .finish(&claimed, &Outcome::Failed(untyped_because(cause)))
+            {
+                Ok(()) | Err(StoreError::LeaseLost { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// `Stop`, or with `discard` the `Discard` that unmounts even when the
@@ -2364,6 +2673,8 @@ impl Bridge {
         )?;
         self.catch_up()?;
         if ended {
+            // What waited for a turn of this execution is never typed.
+            self.fail_waiting(&claimed.session_id, Some(cause))?;
             // A discard that lost work says so in the tick's report too.
             tick.warnings.append(&mut report.warnings);
             return Ok(Outcome::Succeeded);
@@ -2435,6 +2746,34 @@ impl Bridge {
 /// moment from ready: a turn's end reaches the transcript before the screen
 /// settles at the prompt.
 pub const PANE_NOT_READY: &str = "does not accept input";
+
+/// Principals of Spawn's own loops. Their inputs are refused at once when
+/// the pane cannot take them ([`PANE_NOT_READY`]) and retried on their own
+/// schedule (the dispatcher's delivery retries, which its stall evidence
+/// reads); every other principal's input (a person's, the supervisor's)
+/// waits for its turn ([`CommandStep::Waiting`]).
+pub const LOOP_PRINCIPALS: [&str; 3] = ["spawn-dispatch", "spawn-integrate", "spawn-liveness"];
+
+/// Whether an input from `principal` waits for its turn instead of being
+/// refused while the pane cannot take it.
+pub fn waits(principal: &str) -> bool {
+    !LOOP_PRINCIPALS.contains(&principal)
+}
+
+/// The failure of an input that waited and was never typed, the session's
+/// execution having ended first (`cause`, when the log says).
+fn untyped_because(cause: Option<EndCause>) -> String {
+    match cause {
+        Some(EndCause::Stopped) => "the session was stopped before the input was typed".to_string(),
+        Some(EndCause::Exited) => {
+            "the session's execution ended (exited) before the input was typed".to_string()
+        }
+        Some(EndCause::Lost) => {
+            "the session's execution ended (lost) before the input was typed".to_string()
+        }
+        None => "the session's execution ended before the input was typed".to_string(),
+    }
+}
 
 /// Why text sent into a terminal did not arrive.
 enum Untyped {
