@@ -1012,7 +1012,10 @@ mod tests {
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
         );
-        assert_eq!(plan.told, host, "told, and the path is still low: unresolved");
+        assert_eq!(
+            plan.told, host,
+            "told, and the path is still low: unresolved"
+        );
     }
 
     /// The live page of 2026-11-06 20:30: two disk recoveries told 8 h
@@ -1037,18 +1040,27 @@ mod tests {
         let rows = [idle_supervisor()];
         let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
         let pending: Vec<String> = plan.pending.iter().map(Escalation::tag).collect();
-        assert_eq!(pending, ["host disk-7", "host disk-8"], "both news until told");
+        assert_eq!(
+            pending,
+            ["host disk-7", "host disk-8"],
+            "both news until told"
+        );
         let CommandAction::Input { text, .. } = &plan.orders[0].action else {
             panic!("a digest is typed input");
         };
         assert!(
-            text.contains("- host — disk space back on this host: tmpdir /data/tmp has 43.0 GiB free again\n"),
+            text.contains(
+                "- host — disk space back on this host: tmpdir /data/tmp has 43.0 GiB free again\n"
+            ),
             "{text}"
         );
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, &plan.orders[0]);
         let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
-        assert!(plan.orders.is_empty() && plan.pending.is_empty(), "told once");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty(),
+            "told once"
+        );
         let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
         assert_eq!(told, ["host disk-8"], "the recovery is not unresolved");
     }

@@ -5534,7 +5534,8 @@ mod database_tests {
         // read, and the plan holds it as told and unresolved.
         let held = db.store.gate_room_escalations().expect("escalations");
         assert_eq!(held.as_array().map(Vec::len), Some(1), "{held}");
-        let items = crate::disk::gate_room_escalations(held.as_array().map_or(&[][..], Vec::as_slice));
+        let items =
+            crate::disk::gate_room_escalations(held.as_array().map_or(&[][..], Vec::as_slice));
         let supervisor: crate::dispatch::Facts = serde_json::from_value(json!({
             "session_id": "session_supervisor", "agent_id": "agent_supervisor", "told": [tag],
         }))
@@ -5549,7 +5550,10 @@ mod database_tests {
         );
         assert!(plan.pending.is_empty(), "told once: {:?}", plan.pending);
         assert_eq!(
-            plan.told.iter().map(crate::dispatch::Escalation::tag).collect::<Vec<_>>(),
+            plan.told
+                .iter()
+                .map(crate::dispatch::Escalation::tag)
+                .collect::<Vec<_>>(),
             [tag.clone()],
             "told, and the gate still has no room"
         );

@@ -69,7 +69,11 @@ mod tests {
     fn the_report_reads_this_host_or_says_null() {
         let here = report_of(Path::new("/proc/meminfo"));
         if Path::new("/proc/meminfo").exists() {
-            assert!(here["available_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+            assert!(
+                here["available_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes > 0)
+            );
             assert!(here["total_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
         }
         assert_eq!(

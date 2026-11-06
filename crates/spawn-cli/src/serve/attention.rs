@@ -536,7 +536,10 @@ mod tests {
                 .collect()
         };
         assert_eq!(shown("told"), ["host disk-13"]);
-        assert!(shown("pending").is_empty(), "told once: never pending again");
+        assert!(
+            shown("pending").is_empty(),
+            "told once: never pending again"
+        );
     }
 
     /// A transcript line of Claude Code.
