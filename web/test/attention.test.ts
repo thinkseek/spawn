@@ -216,3 +216,38 @@ test("nothing held and nothing asked is an empty queue", () => {
   assert.equal(groups.question, null);
   assert.equal(groups.count, 0);
 });
+
+test("the supervisor's lines for the owner are read, not counted", () => {
+  const raw = answer() as {
+    pending: unknown[];
+    told: unknown[];
+    supervisor: { question: unknown; for_owner?: unknown };
+  };
+  raw.supervisor.for_owner = [
+    { text: "deploy ffc9fe7; it touches deploy/", at_ms: NOW - 60_000 },
+    { text: "approve resident `docs`", at_ms: "soon" },
+    { text: "" },
+    null,
+  ];
+  const view = normalizeAttention(raw);
+  assert.deepEqual(view.supervisor?.for_owner, [
+    { text: "deploy ffc9fe7; it touches deploy/", at_ms: NOW - 60_000 },
+    { text: "approve resident `docs`", at_ms: null },
+  ]);
+  assert.equal(attentionGroups(view).count, 6, "no more than without them");
+
+  // A turn of the new charter asks nothing: the queue is empty, the lines
+  // are still there to read.
+  raw.pending = [];
+  raw.told = [];
+  raw.supervisor.question = null;
+  const groups = attentionGroups(normalizeAttention(raw));
+  assert.equal(groups.count, 0);
+  assert.equal(groups.question, null);
+  assert.equal(groups.forOwner.length, 2);
+  assert.equal(groups.forOwner[0].text, "deploy ffc9fe7; it touches deploy/");
+
+  // An older server sends none.
+  delete raw.supervisor.for_owner;
+  assert.deepEqual(normalizeAttention(raw).supervisor?.for_owner, []);
+});
