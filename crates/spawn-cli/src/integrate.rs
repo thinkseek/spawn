@@ -4870,6 +4870,12 @@ mod database_tests {
         assert_eq!(record["free_kb"], 2048);
         assert_eq!(record["tmpdir"], "/data/tmp");
         assert_eq!(record["escalate"], false);
+        // The gate's own floor is the disk check, named as the
+        // integrator's checks name theirs.
+        assert_eq!(
+            (&record["check"], &record["measured"], &record["threshold"]),
+            (&json!("disk"), &json!(2048), &json!(10 * 1_048_576))
+        );
         assert!(
             record["reason"]
                 .as_str()
@@ -4881,6 +4887,214 @@ mod database_tests {
                 .as_str()
                 .is_some_and(|log| log.contains("! gate: 0.0 GiB free"))
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The stub gate that notes each run beside itself and accepts.
+    const NOTING_GATE: &str = "echo ran >>\"$(dirname \"$0\")/runs\"\n\
+                               printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+
+    /// How many times the stub gate in `base` ran.
+    fn gate_runs(base: &Path) -> usize {
+        std::fs::read_to_string(base.join("runs")).map_or(0, |runs| runs.lines().count())
+    }
+
+    /// The latest `task.gated` record.
+    fn last_gated(db: &Db) -> Value {
+        db.admin()
+            .query_one(
+                "select kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                  order by session_seq desc limit 1",
+                &[],
+            )
+            .expect("the verdict")
+            .get(0)
+    }
+
+    /// One judging of a reported task with pushed work, on a host whose
+    /// room `room` measures: the mission, the task, and the world's base.
+    fn judged_on(tag: &str, room: crate::gate::Room) -> (Db, i64, i64, PathBuf) {
+        let (base, source, scenarios, mut integrator) = world(tag, NOTING_GATE);
+        integrator.judge.room = room;
+        let db = Db::new(&tag.replace('-', "_"));
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        push_work(&base, &source, &agent_of(&db, mission, task), "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        (db, mission, task, base)
+    }
+
+    /// A room with these integrator variables, measuring `free_kb`,
+    /// `available_mb` and `probe`.
+    fn measured_room(
+        integrator: &[(&'static str, &'static str)],
+        free_kb: u64,
+        available_mb: u64,
+        probe: Result<(), spawn_postgres::ProbeFailure>,
+    ) -> crate::gate::Room {
+        let integrator = integrator.to_vec();
+        crate::gate::Room::from_env(move |name| {
+            integrator
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+        .measured_by(
+            move |_| Some(free_kb),
+            move || Some(available_mb),
+            move |_| probe.clone(),
+        )
+    }
+
+    /// Objective 018: the host's room is measured before the gate starts.
+    /// A check that falls short (disk, memory, the test database whose
+    /// parallel query cannot get its shared memory) runs no gate and is
+    /// recorded `no_room` with its check, measure and threshold: the task
+    /// stays reported, neither count moves, and the mission's run of
+    /// no-room names the task, so it is judged again after the backoff. No
+    /// password reaches the record.
+    #[test]
+    fn a_check_short_before_the_gate_records_no_room_and_runs_no_gate() {
+        const URL: &str = "postgres://gate:hunter2@%2Fvar%2Frun%2Ftest-pg:5433/spawn_test";
+        let shared_memory = spawn_postgres::ProbeFailure {
+            probe: "a parallel query within 10 s".to_string(),
+            error: "ERROR: could not resize shared memory segment \"/PostgreSQL.2\" to 8388608 \
+                    bytes: No space left on device (53100) for gate:hunter2"
+                .to_string(),
+        };
+        let plenty = u64::MAX / 2;
+        let cases = [
+            (
+                "room-short-disk",
+                measured_room(&[], 1024, plenty, Ok(())),
+                "disk",
+                json!(1024),
+                json!(10 * 1_048_576),
+                "SPAWN_GATE_MIN_FREE_GB=10",
+            ),
+            (
+                "room-short-memory",
+                measured_room(&[], plenty, 512, Ok(())),
+                "memory",
+                json!(512),
+                json!(2048),
+                "512 MiB available",
+            ),
+            (
+                "room-short-database",
+                measured_room(
+                    &[("SPAWN_TEST_DATABASE_URL", URL)],
+                    plenty,
+                    plenty,
+                    Err(shared_memory),
+                ),
+                "database",
+                json!(
+                    "ERROR: could not resize shared memory segment \"/PostgreSQL.2\" to 8388608 \
+                     bytes: No space left on device (53100) for gate:***"
+                ),
+                json!("a parallel query within 10 s"),
+                "the test database (/var/run/test-pg:5433/spawn_test)",
+            ),
+        ];
+        for (tag, room, check, measured, threshold, named) in cases {
+            let (db, mission, task, base) = judged_on(tag, room);
+            assert_eq!(gate_runs(&base), 0, "{check}: the gate never ran");
+            let record = last_gated(&db);
+            assert_eq!(
+                (&record["id"], &record["verdict"], &record["check"]),
+                (&json!(task), &json!("no_room"), &json!(check)),
+                "{record}"
+            );
+            assert_eq!(
+                (&record["measured"], &record["threshold"]),
+                (&measured, &threshold),
+                "{record}"
+            );
+            let reason = record["reason"].as_str().expect("a reason");
+            assert!(
+                reason.contains(named) && reason.ends_with("not a verdict, judged again later"),
+                "{reason}"
+            );
+            assert!(
+                record["log"]
+                    .as_str()
+                    .is_some_and(|log| log.contains("the gate did not run")),
+                "{record}"
+            );
+            assert!(!record.to_string().contains("hunter2"), "{record}");
+            if check == "disk" {
+                assert_eq!(
+                    (&record["free_kb"], &record["min_gb"], &record["tmpdir"]),
+                    (&json!(1024), &json!(10), &json!("/tmp"))
+                );
+            }
+            let after = gated(&db, mission);
+            assert_eq!(
+                after.tasks[0].state,
+                spawn_core::mission::TaskState::Reported
+            );
+            assert_eq!((after.gate_aborts, after.gate_rejections), (0, 0));
+            assert_eq!((after.gate_room_task, after.gate_room_waits), (Some(task), 1));
+            assert!(
+                super::room_wait(&after, task, super::now_ms()).is_some(),
+                "judged again after the backoff"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// Every check met: the gate runs exactly as before, the test database
+    /// probed by the integrator's URL; a threshold that does not parse is an
+    /// abort, and runs no gate either.
+    #[test]
+    fn with_room_the_gate_runs_and_a_bad_threshold_is_an_abort() {
+        let probed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&probed);
+        let room = measured_room(
+            &[("SPAWN_TEST_DATABASE_URL", "postgres://t:pw@%2Frun%2Fpg/spawn_test")],
+            u64::MAX / 2,
+            u64::MAX / 2,
+            Ok(()),
+        )
+        .measured_by(
+            |_| Some(u64::MAX / 2),
+            || Some(u64::MAX / 2),
+            move |url| {
+                noted.lock().expect("probed").push(url.to_string());
+                Ok(())
+            },
+        );
+        let (db, mission, task, base) = judged_on("room-met", room);
+        assert_eq!(gate_runs(&base), 1, "the gate ran once");
+        assert_eq!(
+            *probed.lock().expect("probed"),
+            ["postgres://t:pw@%2Frun%2Fpg/spawn_test"]
+        );
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let room = measured_room(
+            &[("SPAWN_GATE_MIN_FREE_MEMORY_MB", "lots")],
+            0,
+            0,
+            Ok(()),
+        );
+        let (db, mission, task, base) = judged_on("room-bad", room);
+        assert_eq!(gate_runs(&base), 0);
+        let record = last_gated(&db);
+        assert_eq!((&record["id"], &record["verdict"]), (&json!(task), &json!("aborted")));
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("SPAWN_GATE_MIN_FREE_MEMORY_MB")),
+            "{record}"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 1, "an abort counts");
         let _ = std::fs::remove_dir_all(&base);
     }
 
