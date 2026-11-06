@@ -2075,22 +2075,121 @@ begin
     return v_count;
 end $$;
 
+-- The owner asks for `p_commit` on a mission source's main (`spawn mission
+-- push`, owner only): the commit already waits in the source at `p_ref`
+-- (`refs/spawn-owner/<commit>`), and the integrator applies the request
+-- between its own steps, under the landing hold, and records its outcome
+-- (`source.moved` naming it, or `source.push_refused`). Nothing else moves:
+-- no branch, no baseline, no gate. Returns the request's event id. The
+-- source is one a gate lands on: a directory on this host with a mission.
+create or replace function spawn_source_push_request(p_source text, p_commit text, p_ref text)
+returns bigint language plpgsql security definer as $$
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner lands on a source' using errcode = '42501';
+    end if;
+    if not spawn_source_allowed(p_source) then
+        raise exception 'not a mission source: %', p_source;
+    end if;
+    if left(p_source, 1) <> '/' then
+        raise exception 'the source % is remote: agents'' branches reach only a directory on '
+                        'this host, so nothing lands on it', p_source;
+    end if;
+    if not exists (select 1 from mission_missions where sources ->> 0 = p_source) then
+        raise exception 'no mission is on the source %', p_source;
+    end if;
+    if p_commit is null or p_commit !~ '^[0-9a-f]{40}([0-9a-f]{24})?$' then
+        raise exception 'a commit is named by its full hash, not %', p_commit;
+    end if;
+    if p_ref is distinct from 'refs/spawn-owner/' || p_commit then
+        raise exception 'the owner''s commit waits at refs/spawn-owner/%, not %', p_commit, p_ref;
+    end if;
+    return spawn_control_record(jsonb_build_object(
+        'type', 'source.push_requested', 'source', p_source, 'commit', p_commit,
+        'ref', p_ref, 'by', 'human'));
+end $$;
+
+-- The integrator's hold on an owner's landing (owner only): the landing
+-- hold's lock (spawn_landing_hold), so no task landing's push and its
+-- record are ever split by an owner landing, and dropping a mission waits
+-- for it. Released by spawn_landing_release.
+create or replace function spawn_source_push_hold()
+returns void language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not land work', session_user using errcode = '42501';
+    end if;
+    perform pg_advisory_lock(1399957337);
+end $$;
+
 -- The integrator's records (`spawn integrate`, owner only): gate verdicts,
--- landings, aborts over budget, and halts.
+-- landings, aborts over budget, halts, and the outcomes of the owner's
+-- landing requests.
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
     v_mission bigint;
     v_stale bigint;
     v_recorded bigint;
+    v_request jsonb;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted') then
+    if p_record ->> 'type' is null
+       or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
+                                      'source.moved', 'source.push_refused') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- The outcome of an owner's landing names its request: a
+    -- `source.push_requested` that has no outcome yet, so every request has
+    -- at most one. A move names the request's source, where main went from
+    -- and to, and is the owner's (`by`); the missions it moves are those on
+    -- the source whose baseline was its `from` and that are not halted, as
+    -- spawn_source_moved names them.
+    if p_record ->> 'type' in ('source.moved', 'source.push_refused') then
+        if coalesce(p_record ->> 'request', '') !~ '^[0-9]{1,18}$' then
+            raise exception 'an owner landing''s outcome names its request: %', p_record;
+        end if;
+        select e.kind -> 'detail' -> 'record' into v_request
+          from spawn_events e
+         where e.id = (p_record ->> 'request')::bigint
+           and e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.push_requested';
+        if v_request is null then
+            raise exception 'no owner landing request %', p_record ->> 'request';
+        end if;
+        if exists (
+            select 1 from spawn_events o
+             where o.session_id = 'session_control' and o.event_name = 'control.recorded'
+               and o.kind -> 'detail' -> 'record' ->> 'type'
+                   in ('source.push_requested', 'source.push_refused', 'source.moved')
+               and o.kind -> 'detail' -> 'record' ->> 'request' = p_record ->> 'request') then
+            raise exception 'the owner landing request % has its outcome already',
+                            p_record ->> 'request';
+        end if;
+        if p_record ->> 'type' = 'source.moved' then
+            if p_record ->> 'source' is distinct from v_request ->> 'source'
+               or p_record ->> 'from' is null or p_record ->> 'to' is null then
+                raise exception 'a source.moved names the request''s source %, from and to: %',
+                                v_request ->> 'source', p_record;
+            end if;
+            p_record := p_record || jsonb_build_object('by', 'human', 'missions', (
+                select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
+                  from mission_missions m
+                 where m.sources ->> 0 = p_record ->> 'source'
+                   and m.baseline = p_record ->> 'from' and m.halted is null));
+        else
+            if coalesce(p_record ->> 'reason', '') = '' then
+                raise exception 'a source.push_refused names its reason: %', p_record;
+            end if;
+            p_record := p_record || jsonb_build_object('source', v_request ->> 'source',
+                                                       'commit', v_request ->> 'commit');
+        end if;
+        return spawn_control_record(p_record);
     end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
