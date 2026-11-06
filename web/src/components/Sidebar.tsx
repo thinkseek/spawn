@@ -234,7 +234,8 @@ function GroupedSessions({
                         sessionId={agent.session_id}
                         agentId={agent.agent_id}
                         state={state}
-                        label={agent.live || group.id === "always_on" ? label : `${label}, ended`}
+                        // Ended outside the Ended group is news: say it.
+                        label={agent.live || group.id === "ended" ? label : `${label}, ended`}
                         at={at}
                         attention={agent.attention}
                         task={held ? `T${held.task_id ?? "?"} ${held.label}${held.title ? ` · ${held.title}` : ""}` : null}
