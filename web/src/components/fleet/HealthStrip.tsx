@@ -2,10 +2,8 @@ import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { DiskPlace, FleetHealth, LadderStep } from "../../fleet";
-import { FLEET_STATES, stateLabelUpper } from "../../fleet";
 import { formatDuration } from "../../format";
 import { cx } from "../ui";
-import { FleetStateDot } from "./bits";
 
 const LADDER: Array<{
   step: LadderStep | "liveness";
@@ -16,7 +14,7 @@ const LADDER: Array<{
   {
     step: "rules",
     label: "Rules",
-    bar: "bg-muted-foreground/70",
+    bar: "bg-muted-foreground",
     hint: "Settled by deterministic rules",
   },
   {
@@ -95,27 +93,51 @@ function formatGib(bytes: number | null): string {
   return bytes == null ? "—" : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 }
 
-function DiskLine({ disk }: { disk: DiskPlace[] }) {
-  if (disk.length === 0) return null;
+/** Free disk at one place, as a bar against its warning and its floor:
+ * the scale runs to twice the warning (or a little past the free space,
+ * whichever is more), so the two marks always show. */
+function DiskBar({ place }: { place: DiskPlace }) {
+  const free = place.free_bytes;
+  const scale = Math.max(place.warn_bytes * 2, (free ?? 0) * 1.15, 1);
+  const at = (bytes: number) => `${Math.min(100, (bytes / scale) * 100)}%`;
+  const tone =
+    free == null
+      ? { bar: "bg-faint-foreground", text: "text-faint-foreground", word: "unread" }
+      : free < place.floor_bytes
+        ? { bar: "bg-destructive", text: "text-destructive", word: "under the floor: no new executions" }
+        : free < place.warn_bytes
+          ? { bar: "bg-warning", text: "text-warning", word: "under the warning" }
+          : { bar: "bg-success", text: "text-foreground", word: "fine" };
   return (
-    <div className="mt-1.5 flex flex-wrap gap-x-2.5 gap-y-1 text-caption">
-      {disk.map((place) => (
-        <Stat
-          key={`${place.label}:${place.path}`}
-          label={`free · ${place.label}`}
-          value={formatGib(place.free_bytes)}
-          tone={
-            place.free_bytes == null
-              ? "text-faint-foreground"
-              : place.free_bytes < place.floor_bytes
-                ? "text-destructive"
-                : place.free_bytes < place.warn_bytes
-                  ? "text-warning"
-                  : undefined
-          }
-          title={`${place.path}: a warning under ${formatGib(place.warn_bytes)}, no new executions under ${formatGib(place.floor_bytes)}`}
-        />
-      ))}
+    <div
+      className="min-w-0"
+      title={`${place.path}: ${formatGib(free)} free (${tone.word}); a warning under ${formatGib(place.warn_bytes)}, no new executions under ${formatGib(place.floor_bytes)}`}
+    >
+      <div className="flex items-baseline gap-2 text-caption">
+        <span className="text-muted-foreground">Disk · {place.label}</span>
+        <span className={cx("tnum ml-auto font-medium", tone.text)}>{formatGib(free)}</span>
+        <span className="text-faint-foreground">free</span>
+      </div>
+      <div className="relative mt-1 h-1.5 rounded-full bg-muted">
+        {free != null && (
+          <div className={cx("h-full rounded-full", tone.bar)} style={{ width: at(free) }} />
+        )}
+        {[
+          ["floor", place.floor_bytes],
+          ["warn", place.warn_bytes],
+        ].map(([name, bytes]) => (
+          <span
+            key={name}
+            aria-hidden="true"
+            className="absolute -top-0.5 h-2.5 w-px bg-foreground/70"
+            style={{ left: at(bytes as number) }}
+          />
+        ))}
+      </div>
+      <div className="tnum mt-0.5 flex justify-between text-micro text-faint-foreground">
+        <span>floor {formatGib(place.floor_bytes)}</span>
+        <span>warn {formatGib(place.warn_bytes)}</span>
+      </div>
     </div>
   );
 }
@@ -128,7 +150,25 @@ function formatRate(value: number | null): string {
   return value.toFixed(1);
 }
 
-export function HealthStrip({ health }: { health: FleetHealth }) {
+/** Liveness of the always-on agents, as the strip's first cell reads it. */
+export interface Liveness {
+  /** Always-on agents (the supervisor and the residents) and how many run. */
+  total: number;
+  up: number;
+  /** The live always-on agent whose execution started last, and how long ago. */
+  shortest: { name: string; ms: number; since: number } | null;
+}
+
+const HUMAN_RATE_HINT =
+  "Human per agent-hour: decisions that needed a person (the ladder's human step) in the last 24 h, divided by the hours agents ran in that time. Lower is better; 0 means the fleet ran without anyone.";
+
+export function HealthStrip({
+  health,
+  liveness,
+}: {
+  health: FleetHealth;
+  liveness: Liveness;
+}) {
   const lastHour = health.last_hour;
   const jev = lastHour.by_judge.jev ?? 0;
   const rules = lastHour.by_judge.rules ?? 0;
@@ -143,69 +183,83 @@ export function HealthStrip({ health }: { health: FleetHealth }) {
     LADDER.reduce((sum, entry) => sum + health.ladder_24h[entry.step], 0) +
     health.ladder_24h.liveness;
   const humanRate = health.human_per_agent_hour;
+  const restarts = health.ladder_24h.liveness;
+  const down = liveness.total - liveness.up;
 
   return (
     <section
       aria-label="Fleet health"
-      className="grid shrink-0 grid-cols-2 gap-px overflow-hidden rounded-lg border border-surface-border bg-surface-border md:grid-cols-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)_minmax(0,1.5fr)_minmax(0,2.1fr)]"
+      className="grid shrink-0 grid-cols-1 gap-px overflow-hidden rounded-lg border border-surface-border bg-surface-border sm:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)_minmax(0,1.2fr)_minmax(0,1.75fr)]"
     >
-      <Cell label="Human per agent-hour · 24h">
-        <div
-          className={cx(
-            "tnum text-display-sm leading-none font-semibold tracking-tight",
-            humanRate == null
-              ? "text-faint-foreground"
-              : humanRate === 0
-                ? "text-success"
-                : "text-warning",
-          )}
-          title="Human decisions divided by agent-hours over the last 24 h. Lower is better."
-        >
-          {formatRate(humanRate)}
-        </div>
-        <div className="mt-1.5 text-caption text-muted-foreground">
-          <span className="tnum">{health.ladder_24h.human}</span> human ·{" "}
-          <span className="tnum">
-            {health.agent_hours_24h == null
-              ? "—"
-              : health.agent_hours_24h.toFixed(1)}
-          </span>{" "}
-          agent-h
-        </div>
-      </Cell>
-
-      <Cell label="Agents">
-        <div className="flex items-baseline gap-3 text-caption">
-          <span className="tnum text-title-sm font-semibold text-foreground">
-            {health.agents_total}
+      <Cell label="Liveness">
+        <div className="flex items-baseline gap-2">
+          <span
+            className={cx(
+              "tnum text-display-sm leading-none font-semibold tracking-tight",
+              liveness.total === 0
+                ? "text-faint-foreground"
+                : down > 0
+                  ? "text-warning"
+                  : "text-success",
+            )}
+          >
+            {liveness.up}/{liveness.total}
           </span>
-          <Stat label="live" value={health.live} />
-          <Stat
-            label="attention"
-            value={health.attention}
-            tone={health.attention > 0 ? "text-warning" : undefined}
-          />
+          <span className="text-caption text-muted-foreground">always-on agents up</span>
         </div>
-        <div className="mt-1.5 flex flex-wrap gap-x-2.5 gap-y-1 text-caption text-muted-foreground">
-          {FLEET_STATES.filter((state) => health.by_state[state] > 0).map(
-            (state) => (
-              <span key={state} className="inline-flex items-center gap-1">
-                <FleetStateDot state={state} size="sm" />
-                <span className="tnum text-foreground">
-                  {health.by_state[state]}
-                </span>
-                {stateLabelUpper(state).toLowerCase()}
-              </span>
-            ),
+        <div className="mt-2 space-y-0.5 text-caption text-muted-foreground">
+          <div
+            className="flex min-w-0 items-baseline gap-1"
+            title={
+              liveness.shortest
+                ? `${liveness.shortest.name}'s current execution started ${new Date(liveness.shortest.since).toLocaleString()}`
+                : undefined
+            }
+          >
+            <span className="shrink-0">Shortest uptime</span>
+            <span className="tnum ml-auto shrink-0 font-medium text-foreground">
+              {liveness.shortest ? formatDuration(liveness.shortest.ms) : "—"}
+            </span>
+          </div>
+          {liveness.shortest && (
+            <div className="truncate text-right text-micro text-faint-foreground">
+              {liveness.shortest.name}
+            </div>
           )}
-          {health.agents_total === 0 && (
-            <span className="text-faint-foreground">no agents yet</span>
-          )}
+          <div className="flex items-baseline gap-1" title={LIVENESS.hint}>
+            <span>Liveness restarts · 24h</span>
+            <span
+              className={cx(
+                "tnum ml-auto font-medium",
+                restarts > 0 ? "text-warning" : "text-foreground",
+              )}
+            >
+              {restarts}
+            </span>
+          </div>
+          <div className="flex items-baseline gap-1">
+            <span>Agents live</span>
+            <span className="tnum ml-auto font-medium text-foreground">
+              {health.live}
+              <span className="font-normal text-faint-foreground"> of {health.agents_total}</span>
+            </span>
+          </div>
         </div>
-        <DiskLine disk={health.disk} />
       </Cell>
 
-      <Cell label="Judgements · last hour" className="col-span-2 md:col-span-1">
+      <Cell label="Resources">
+        {health.disk.length === 0 ? (
+          <p className="text-caption text-faint-foreground">This server reports no disk places.</p>
+        ) : (
+          <div className="space-y-2.5">
+            {health.disk.map((place) => (
+              <DiskBar key={`${place.label}:${place.path}`} place={place} />
+            ))}
+          </div>
+        )}
+      </Cell>
+
+      <Cell label="Judgements · last hour">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-caption">
           <span className="tnum text-title-sm font-semibold text-foreground">
             {judged}
@@ -276,9 +330,30 @@ export function HealthStrip({ health }: { health: FleetHealth }) {
             </span>
           </span>
         }
-        className="col-span-2 md:col-span-3 xl:col-span-1"
+        className="sm:col-span-2 xl:col-span-1"
       >
-        <div className="flex h-1.5 gap-px overflow-hidden rounded-full bg-muted">
+        <div className="flex items-baseline gap-2" title={HUMAN_RATE_HINT}>
+          <span
+            className={cx(
+              "tnum text-title-sm leading-none font-semibold",
+              humanRate == null
+                ? "text-faint-foreground"
+                : humanRate === 0
+                  ? "text-success"
+                  : "text-warning",
+            )}
+          >
+            {formatRate(humanRate)}
+          </span>
+          <span className="cursor-help text-caption text-muted-foreground underline decoration-dotted underline-offset-2">
+            human per agent-hour
+          </span>
+          <span className="tnum ml-auto text-caption text-muted-foreground">
+            {health.ladder_24h.human} human ·{" "}
+            {health.agent_hours_24h == null ? "—" : health.agent_hours_24h.toFixed(1)} agent-h
+          </span>
+        </div>
+        <div className="mt-2 flex h-1.5 gap-px overflow-hidden rounded-full bg-muted">
           {ladderTotal > 0 &&
             [...LADDER, { ...LIVENESS, step: "liveness" as const }].map(
               (entry) => {
@@ -308,6 +383,7 @@ export function HealthStrip({ health }: { health: FleetHealth }) {
                 {index > 0 && (
                   <ChevronRight
                     size={12}
+                    aria-hidden="true"
                     className="shrink-0 text-faint-foreground"
                   />
                 )}
@@ -338,21 +414,15 @@ export function HealthStrip({ health }: { health: FleetHealth }) {
             );
           })}
         </ol>
-        <div className="mt-1 flex flex-wrap gap-x-3 text-micro text-faint-foreground">
-          <span title={LIVENESS.hint} className="inline-flex items-center gap-1">
-            <span className={cx("size-1.5 rounded-full", LIVENESS.bar)} />
-            <span className="tnum text-muted-foreground">
-              {health.ladder_24h.liveness}
-            </span>{" "}
-            liveness restarts
-          </span>
-          {health.ladder_extra.map(([name, count]) => (
-            <span key={name}>
-              <span className="tnum text-muted-foreground">{count}</span>{" "}
-              {name}
-            </span>
-          ))}
-        </div>
+        {health.ladder_extra.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-x-3 text-micro text-faint-foreground">
+            {health.ladder_extra.map(([name, count]) => (
+              <span key={name}>
+                <span className="tnum text-muted-foreground">{count}</span> {name}
+              </span>
+            ))}
+          </div>
+        )}
       </Cell>
     </section>
   );
