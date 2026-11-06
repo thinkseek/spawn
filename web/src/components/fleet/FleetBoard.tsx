@@ -126,9 +126,11 @@ export function FleetBoard({
                 />
                 {open &&
                   (group.agents.length === 0 ? (
-                    <p className="border-t border-surface-border px-4 py-2 text-caption text-faint-foreground">
-                      {group.id === "on_task" ? "No worker holds an open task." : "None."}
-                    </p>
+                    group.id === "on_task" && (
+                      <p className="border-t border-surface-border px-4 py-2 text-caption text-faint-foreground">
+                        No worker holds an open task.
+                      </p>
+                    )
                   ) : (
                     <ul className="divide-y divide-surface-border border-t border-surface-border">
                       {group.agents.map((agent) => (
