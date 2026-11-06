@@ -627,7 +627,7 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///       "updated_at_ms",
 ///       "gates": [{                       // task.gated records, oldest first
 ///         "verdict": "accepted" | "rejected" | "aborted" | "conflict" | "incompatible"
-///                    | "stale" | "no_room",
+///                    | "stale" | "no_room" | "host_fault",
 ///         "reason": "..." | null, "metric": "METRIC ..." | null,
 ///         "candidate": "<commit>" | null, "at_ms": 1793724858000
 ///       }]
