@@ -304,31 +304,41 @@ export function MissionTimeline({
     <div ref={rootRef} className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-5">
         {header}
-        <Legend />
-        <div className="ml-auto flex items-center gap-1">
-          {fold !== LINEAR || folding === "off" ? (
-            <button
-              type="button"
-              aria-pressed={folding === "on"}
-              onClick={() => setFolding(folding === "on" ? "off" : "on")}
-              title={
-                folding === "on"
-                  ? "Idle stretches of 30 min or more are folded into marked breaks; click for a linear axis"
-                  : "A linear axis; click to fold idle stretches into breaks"
-              }
-              className={cx(
-                "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption transition-colors hover:bg-surface-hover",
-                folding === "on" ? "text-foreground" : "text-muted-foreground",
-              )}
-            >
-              <FoldHorizontal size={13} />
-              {folding === "on" ? "Idle folded" : "Linear"}
-            </button>
-          ) : null}
-          <ZoomControls view={view} fitLabel="Fit every task" />
-        </div>
+        {!empty && <Legend />}
+        {!empty && (
+          <div className="ml-auto flex items-center gap-1">
+            {fold !== LINEAR || folding === "off" ? (
+              <button
+                type="button"
+                aria-pressed={folding === "on"}
+                onClick={() => setFolding(folding === "on" ? "off" : "on")}
+                title={
+                  folding === "on"
+                    ? "Idle stretches of 30 min or more are folded into marked breaks; click for a linear axis"
+                    : "A linear axis; click to fold idle stretches into breaks"
+                }
+                className={cx(
+                  "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption transition-colors hover:bg-surface-hover",
+                  folding === "on" ? "text-foreground" : "text-muted-foreground",
+                )}
+              >
+                <FoldHorizontal size={13} />
+                {folding === "on" ? "Idle folded" : "Linear"}
+              </button>
+            ) : null}
+            <ZoomControls view={view} fitLabel="Fit every task" />
+          </div>
+        )}
       </div>
 
+      {empty ? (
+        <EmptyState
+          className="flex-1"
+          title="No tasks yet"
+          hint="Tasks appear here once the integrator assigns one."
+        />
+      ) : (
+        <>
       {!compact && (
         <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 pb-2 sm:px-5">
           {timeline.lanes.length > 1 && (
