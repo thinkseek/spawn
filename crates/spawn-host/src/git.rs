@@ -692,17 +692,17 @@ impl GitWorkspace {
         Ok(found)
     }
 
-    /// The commits whose blobs over the cap a checkpoint of `branch` keeps
-    /// as blobs ([`Self::tree_of`]): `main`, and the `main` of a pending
-    /// merge. Not the branch head: a file the agent committed under the cap
-    /// and grew past it is left out like any other.
-    fn source_commits(&self, branch: &str) -> Vec<String> {
+    /// The commits whose blobs over the cap a checkpoint keeps as blobs
+    /// ([`Self::tree_of`]): `main`, and `pending_main`, the `main` of the
+    /// branch's pending merge. Not the branch head: a file the agent
+    /// committed under the cap and grew past it is left out like any other.
+    fn source_commits(&self, pending_main: Option<&str>) -> Vec<String> {
         let mut commits = Vec::new();
         if let Ok(main) = self.commit_id_of(&format!("refs/heads/{BASE}")) {
             commits.push(main);
         }
-        if let Some(pending) = self.pending_merge(branch) {
-            commits.push(pending.main);
+        if let Some(pending_main) = pending_main {
+            commits.push(pending_main.to_string());
         }
         commits.sort();
         commits.dedup();
@@ -734,12 +734,12 @@ impl GitWorkspace {
             directory,
             index,
             &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
+                ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."]
+                    .map(OsString::from)
+                    .to_vec(),
+                runtime_pathspecs("exclude"),
+            ]
+            .concat(),
         )?;
         let mut oversized = Vec::new();
         let mut special = Vec::new();
@@ -1140,7 +1140,7 @@ impl WorkspaceStore for GitWorkspace {
         }
         let reference = format!("refs/heads/{branch}");
         let parent = self.git_output(&["rev-parse", &reference])?;
-        let tree = self.tree_of(&directory, &index, &self.source_commits(&branch));
+        let tree = self.tree_of(&directory, &index, &branch, &parent);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
@@ -1485,7 +1485,7 @@ impl GitWorkspace {
                 })?;
             }
             let _ = std::fs::remove_file(&index);
-            let tree = self.tree_of(&directory, &index, &self.source_commits(branch));
+            let tree = self.tree_of(&directory, &index, branch, &head);
             let _ = std::fs::remove_file(&index);
             let (tree, _) = tree?;
             if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
@@ -1704,7 +1704,7 @@ impl GitWorkspace {
         let head = self.commit_id_of(&format!("refs/heads/{branch}"))?;
         let reference = stale_ref(branch);
         let previous = self.commit_id_of(&reference).ok();
-        let tree = self.tree_of(directory, &index, &self.source_commits(branch));
+        let tree = self.tree_of(directory, &index, branch, &head);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
