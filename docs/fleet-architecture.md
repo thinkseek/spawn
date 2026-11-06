@@ -742,7 +742,7 @@ record of what was judged (§14 of design.md).
   --revision R`, which the supervisor's digest gives; without it, a human's
   review takes the report as it is now). The checked functions refuse a
   verdict on a revision the task has left, and the fold applies none: a
-  45-minute gate run on revision 0 never lands, or sends back, revision 1.
+  gate run on revision 0 never lands, or sends back, revision 1.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). A mission
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
@@ -779,7 +779,7 @@ record of what was judged (§14 of design.md).
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate on C, with a 45-minute wall clock. When the gate
+  3. runs the gate on C, with a wall clock (`SPAWN_GATE_WALL_CLOCK_MINUTES`, 120 by default). When the gate
      rejects C and C is a real merge (the pushed head does not contain
      `main`, so C's tree is not the head's), it then judges the head alone
      before recording anything: the same gate, scenarios and task scenario,
