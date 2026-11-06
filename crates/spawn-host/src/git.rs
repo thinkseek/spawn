@@ -2231,6 +2231,24 @@ fn unresolved(directory: &Path, files: &[(TreePath, usize)]) -> bool {
 /// ([`GitWorkspace::left_out_files`]).
 type LeftOut = (Vec<(TreePath, u64)>, Vec<(TreePath, u64)>);
 
+/// Whether `path` is a regular file or a symlink in `directory`, reached
+/// through directories only: git adds nothing beyond a symbolic link.
+fn is_file_in(directory: &Path, path: &TreePath) -> bool {
+    for prefix in path.prefixes() {
+        let Ok(metadata) = std::fs::symlink_metadata(directory.join(prefix.as_path())) else {
+            return false;
+        };
+        let kind = metadata.file_type();
+        if prefix == *path {
+            return kind.is_file() || kind.is_symlink();
+        }
+        if !kind.is_dir() {
+            return false;
+        }
+    }
+    false
+}
+
 /// Remove git's own lock beside `index` (`<index>.lock`), left by a git
 /// that died mid-command (killed, out of memory, a SIGBUS on a file the
 /// agent truncated while git mapped it): while it is there every git on
