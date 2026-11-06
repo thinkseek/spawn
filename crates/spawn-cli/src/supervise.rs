@@ -337,6 +337,38 @@ mod tests {
         assert!(text.contains("security"));
     }
 
+    /// The owner, 2026-11-06: "no human but can input". The supervisor
+    /// decides what its grants allow and says so; what they do not allow is
+    /// a line for the owner it does not wait on; the owner's words are
+    /// instructions, never answers.
+    #[test]
+    fn the_charter_never_waits_on_a_person() {
+        let text = charter("spawn", "mission.md");
+        for sentence in [
+            "you never wait on a person.",
+            "Decide everything within your grants yourself, and act on it in the same turn",
+            "a `continue` to a worker whose turn ended on a transient model API error",
+            "\"Decided (the owner may reverse): <what you did, and why>\"",
+            "\"For the owner: <what, and why>\", do not wait for an answer, and move on to other \
+work.",
+            "deploys, owner-protected files",
+            "money, deleting data, changing grants",
+            "Never end a turn on a question, or on a list of decisions for the owner to make",
+            "Read an owner's message as an instruction",
+            "never as the answer to a pending question",
+            "'{\"type\":\"input\",\"text\":\"continue\"}'",
+        ] {
+            assert!(text.contains(sentence), "the charter says: {sentence}");
+        }
+        // Nothing left of the old rule: no question to end a turn on, no
+        // waiting, no HUMAN: line but the one it forbids.
+        for gone in ["Then wait", "Then \\\nwait", "tell them with HUMAN:", "starts with \"HUMAN:\""] {
+            assert!(!text.contains(gone), "the charter no longer says: {gone}");
+        }
+        assert_eq!(text.matches("HUMAN:").count(), 1, "only in `no \"HUMAN:\" line`");
+        assert!(text.contains("no \"HUMAN:\" line, no \"Your decisions:\""));
+    }
+
     fn facts() -> LivenessFacts {
         LivenessFacts {
             open_command: false,
