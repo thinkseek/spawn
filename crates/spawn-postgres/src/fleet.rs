@@ -174,6 +174,14 @@ select jsonb_build_object(
 /// anything was typed (a pane not ready, no execution, a source that did not
 /// answer) told the worker nothing: the worker's last delivery is still the
 /// one before it, and its own retry is not judged against itself.
+///
+/// `charter`, for the supervisor only (null for every other session), is
+/// what decides which charter its running native session holds: `start`,
+/// the command of the execution that first named its current native session
+/// (the latest `session.native_started`'s id); `given`, that start's
+/// `charter` (null for a start that recorded none); `inputs`, every input
+/// the dispatcher sent into the session after that start that files a
+/// `charter <hash>` tag, oldest first, with its outcome, however long ago.
 pub(crate) const DISPATCH_FACTS: &str = concat!(
     r"
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
