@@ -204,11 +204,11 @@ fn the_store_writes_expires_ms_and_a_second_hold_renews_the_first() {
     assert_eq!(first["main"], MAIN);
     assert!(first["renews"].is_null());
     let first_hold = first["hold"].as_i64().expect("an id");
+    let waited = store.task_held(task, first_hold, source).expect("held");
     assert_eq!(
-        store.task_held(task, first_hold, source).expect("held"),
-        Some(records(&mut client, "control.recorded").len() as i64).filter(|_| false).or(
-            records(&mut client, "task.held").first().and_then(|r| r["id"].as_i64())
-        )
+        waited,
+        records(&mut client, "task.held")[0]["id"].as_i64(),
+        "the task waits behind the first"
     );
 
     // A second hold renews it: its own main, bound and expiry, `renews` the
