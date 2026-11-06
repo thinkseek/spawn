@@ -8,7 +8,9 @@ Type=oneshot
 # is protected: no candidate changes it; an owner edit runs once deployed).
 # It sources scripts/disk.sh beside it.
 WorkingDirectory=%h/.local/share/spawn-rsi
-ExecStart=%h/.local/share/spawn-rsi/controllers/spawn/scripts/maintenance.sh
+# Through sh: the controller is a git export, so a file mode never decides
+# whether the cleanup runs.
+ExecStart=/bin/sh %h/.local/share/spawn-rsi/controllers/spawn/scripts/maintenance.sh
 # TMPDIR (the integrator's, so the gate's scratch is found), SPAWN_BACKUP_DIR
 # and any SPAWN_MAINTENANCE_*.
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env

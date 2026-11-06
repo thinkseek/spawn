@@ -122,3 +122,54 @@ fn agents_with_an_open_task_are_published_again_from_their_first_source() {
     expected.sort();
     assert_eq!(store.publishing_agents().expect("agents"), expected);
 }
+
+/// A resident started before it had any task was mounted from the default
+/// repository, where its branch lives: its first task's mission does not
+/// move it (its checkpoints, and so its turns' ends, would find no branch),
+/// and no mission publishes it. One whose first execution came after its
+/// first task is the mission's, as before. Read from the records.
+#[test]
+fn an_agent_that_ran_before_its_first_task_stays_on_the_default_repository() {
+    let (store, schema) = store("source_first_mount");
+    let mission = store
+        .mission_add("scratch", &json!([]), "human")
+        .expect("add");
+    let mut client = admin(&schema);
+    let started = |client: &mut postgres::Client, agent: &str, at: &str| {
+        client
+            .batch_execute(&format!(
+                "select spawn_append_trusted('{agent}', '{}', 'exec_{agent}', 'bridge', null,
+                    '{{\"name\": \"execution.started\", \"detail\": {{\"engine\": \"claude\"}}}}'::jsonb);
+                 update spawn_events set recorded_at_ms = {at}
+                  where agent_id = '{agent}' and event_name = 'execution.started'",
+                agent.replace("agent_", "session_")
+            ))
+            .expect("record an execution");
+    };
+    for name in ["early", "late"] {
+        store.resident_propose(name, "a concern").expect("propose");
+        store.resident_approve(name).expect("approve");
+    }
+    // `early` ran before its task; `late` only after.
+    started(&mut client, "agent_resident_early", "1");
+    store
+        .task_assign(mission, "resident", "early", "brief", "default")
+        .expect("assign");
+    store
+        .task_assign(mission, "resident", "late", "brief", "default")
+        .expect("assign");
+    started(&mut client, "agent_resident_late", "spawn_now_ms() + 1000");
+    assert_eq!(
+        store.agent_source("agent_resident_early").expect("source"),
+        None
+    );
+    assert_eq!(
+        store.agent_source("agent_resident_late").expect("source"),
+        Some(None),
+        "a scratch mission's agent"
+    );
+    assert_eq!(
+        store.publishing_agents().expect("agents"),
+        vec![("agent_resident_late".to_string(), None)]
+    );
+}

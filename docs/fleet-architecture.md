@@ -224,6 +224,62 @@ it, on the same ladder.
   told. An approval or a human command (once finished, with its outcome: one
   that failed is reported as failed) is news until it was told, however
   long that takes.
+
+  **Stalls: no task waits silently.** A stall is the absence of an event,
+  so the dispatcher also measures, for every open task, the step it waits
+  on and since which record, from the log alone (`dispatch/stall.rs`, the
+  query `stall_facts`), and escalates a step that has not moved within its
+  bound, once per stall:
+
+  | Step | The task | Measured from | Bound (default) |
+  | --- | --- | --- | --- |
+  | `delivery` | assigned or sent back, and its session's turn (a revision first, then the oldest new task; no earlier open task of the session holding it) | `task.assigned`, or the review or gate verdict that sent it back | `SPAWN_STALL_DELIVERY_SECS` (600) |
+  | `activity` | delivered, waiting for its worker (a worker idle at its prompt with no report collected included) | the later of `task.delivered` and the session's latest fact (a record of the session that is not the Observer's nor storage's) | `SPAWN_STALL_ACTIVITY_SECS` (900) |
+  | `judgement` | reported, under review | `task.reported` | `SPAWN_STALL_REVIEW_SECS` (1800) |
+  | `judgement` | in a gated mission, the task the integrator judges next (`Mission::ready`'s order) | the later of the record that made it ready and the mission's latest verdict that is not `stale` | `SPAWN_STALL_GATE_SECS` (3600) |
+  | `landing` | landing | its `task.gated` accepted | `SPAWN_STALL_LANDING_SECS` (600) |
+  | `stop` | an ephemeral task closed (accepted without a gate, landed, cancelled) whose worker still runs | the record that closed it | `SPAWN_STALL_STOP_SECS` (300) |
+  | `halted` | a halted mission with open tasks | its `mission.halted` | `SPAWN_STALL_HALTED_SECS` (0) |
+
+  A task queued behind another of its session, or behind the task its
+  mission's gate judges next, is not escalated: the one ahead of it is. The
+  tasks of a halted mission that wait for the gate or a landing are the
+  halt's, escalated once per halt about session `missions`
+  (`stall-mission-<mission>-halted-<record>`), with the reason and the open
+  tasks. A failed command (a delivery attempt, a model switch's or a
+  retirement's Stop, a resume) is the evidence of the step it blocks, not a
+  step of its own. A delivery whose retries are spent was escalated as
+  `delivery failed`, which is its stall's escalation; one that may have
+  typed the task is not retried, and its stall is escalated at its bound.
+  A worker at its prompt whose screen says background shells still run
+  (Claude Code's `· done … N shells still running`, read from the line the
+  engine draws right above its prompt) is treated as active: its `activity`
+  step is not escalated while that is its latest screen reading, since the
+  engine resumes the agent when the shells finish.
+
+  The item, heading `stalled`, is one line naming `task #<id>`, the step,
+  how long it stood still, the evidence (the record it is measured from and
+  its age, the latest judgement's state and whether it covers the latest
+  fact, every failed attempt with its key and error, the latest stale
+  verdict's reason) and what Spawn already tried and still will (each
+  delivery attempt and its outcome, a retry due, or due and held and why;
+  a nudge, a resume, the idle or report item already sent). Its tag is
+  `<session> stall-<task>-<step>-<n>`, `n` naming the record the step is
+  measured from (the control record's id; for `activity` the `session_seq`
+  of the latest fact, or the delivery record's id when no fact came after
+  it): `told` sends it once, and a step that moved and stalled anew has a
+  new record and a new tag. A failed retry, a stale verdict, a nudge or a
+  judgement moves no step. Every age is on the database's clock
+  (`spawn_now_ms()` against the records' times); nothing is inferred from
+  another loop's timing or absence; a restarted loop computes the same
+  stalls and tags. The stall layer acts on nothing: Spawn's own recoveries
+  (delivery retries, the resume of a lost ephemeral worker and the liveness
+  rule for residents, the integrator judging a `stale` report again, the
+  retire Stop) run on their own schedules, and every default bound is longer
+  than their first attempt. Typing into a worker, delivering again after an
+  attempt that may have typed, cancelling, reassigning, resuming a halted
+  mission, stopping a resident or extending a budget each need a decision:
+  the supervisor's.
 - **Supervisor**: one perpetual Claude Code session (`agent_supervisor`).
   It plans missions into worker tasks and handles what the dispatcher
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
@@ -607,10 +663,46 @@ the tree's own:
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
-- objective results on the base are cached outside the sandbox, keyed by
-  the base commit and the scenario, build hook, controller helpers and gate
-  hashes; candidate code cannot see or write the cache, but any process of
-  the same uid outside the sandbox can (the same-uid limit).
+- objective results on the base (solved, or unsolved after two runs that
+  agree) are cached outside the sandbox, keyed by everything that decides
+  them: the base commit, the blobs of the scenario and of the gate, the
+  tools the scenarios run (`rustc -vV`, `cargo -V`, `node --version`,
+  `psql -V`, `git --version`, `tmux -V`, `python3 -V`, `jq --version`, in
+  the sandbox inside the base tree) and the test server's
+  `server_version_num`, the scenarios directory's build hook and helpers
+  (and the `bind` list's text), a fingerprint of each directory the `bind`
+  list names (the blobs of pnpm's `.modules.yaml` and `.pnpm/lock.yaml`
+  when present, else a listing of the directory: path, type, size, mtime,
+  link target), and the files the scenario names on its code lines
+  (`scripts/...` of the controller, transitively; a scenario that reaches
+  into `scripts/` through a variable or a `cd` keys all of it). A
+  controller file no scenario names (the black-box runner) changes no key.
+  Not keyed: an edit inside a bound directory that has pnpm's install
+  record but was not installed, and the state candidate code leaves on the
+  shared test server (a disposable server per gate is GitHub issue #6;
+  until then one gate runs at a time). Only the gate
+  writes an entry, after a completed base run; an entry it cannot read is
+  a miss; candidate runs are never cached; the log lists which base
+  results came from the cache, and the time spent on the base, the
+  candidate and the setup. A hit touches its entry; spawn-maintenance
+  removes entries no gate used for 14 days.
+  Candidate code cannot see or write the cache, but any process of the
+  same uid outside the sandbox can (the same-uid limit).
+- **Exit status.** The gate exits 0 with a verdict. It exits 5 when it has
+  no room to judge now: `TMPDIR` has less than `SPAWN_GATE_MIN_FREE_GB`
+  free (`scripts/disk.sh` `gate_room`). In that case it first writes the
+  fact `{"no_room":true,"free_kb","min_gb","tmpdir"}` to the verdict file,
+  before any scratch is made or any candidate code runs. On a disk with no
+  room at all, that write may fail, and the gate still exits 5. The
+  integrator reads `no_room` from exit 5 together with the fact (`gate.rs`).
+  Without a readable fact, it measures the free space itself (`df`), and it
+  records `no_room` with its own measurement only when that is under the
+  floor. It does this in two cases: the gate exited 5 (it measures the
+  gate's `TMPDIR`), or the integrator could not create or use its private
+  directory for the gate (it measures that directory's parent). Any other
+  status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
+  `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
+  a timeout or a signal.
 
 `scripts/rsi/test-gate.sh` tests the gate itself.
 
@@ -655,27 +747,65 @@ record of what was judged (§14 of design.md).
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
   another mission's task in `landing` waits for it (the push may have moved
-  `main` before its `task.landed`). For each task that is ready, it:
+  `main` before its `task.landed`). Every pass visits every mission (its
+  halts, budget, landing and objective assignment never wait for another
+  mission's gate); only a landing makes the rest of its source wait for the
+  next pass. A free gate goes to the ready task that has waited longest,
+  across missions, counted from its report or from the end of its
+  mission's previous judging, whichever is later; the mission id decides
+  nothing. For a mission's lowest ready task (one per mission at a time:
+  §10.4, "One gate at a time, for now"), on a thread of its own, it:
   1. fetches the agent's pushed branch, the source's `spawn/<agent>`, into
      its mirror's `refs/spawn-integrate/<agent>` (it never commits a
      workspace and never moves `refs/heads/<agent>`). A push that lags the
      agent's latest checkpoint is gated `stale` after a short wait: no gate
      run, no rejection, the task stays ready and is judged again later
      ([storage.md](storage.md), "Landing");
-  2. builds the candidate: the pushed branch itself, or a merge of it with `main`
-     when `main` has moved. A conflict first merges `main` into the agent's
+  2. builds the candidate, the landing commit C: one merge commit whose
+     first parent is `main` (the base) and second the pushed head, with the
+     head's tree when `main` is in it and the merge by `main`'s merge rules
+     when `main` has moved, never a fast-forward to a worker's commit. Its
+     message says what landed: the objective's title, the objective and the
+     task on the first line (for a task without an objective, the brief's
+     first line and the task), then the report's `## What changed` (the
+     whole report without one, bounded, a line that could read as a
+     `Spawn-` trailer indented), then `Spawn-Task`, `Spawn-Objective` and
+     `Spawn-Head` trailers. So `git log --first-parent main` is one line
+     per landed task, `git bisect start --first-parent` visits only gated
+     landings, `git revert -m 1 <C>` undoes one task, and every checkpoint
+     stays reachable through the second parents ([storage.md](storage.md),
+     "Landing"). A conflict first merges `main` into the agent's
      idle workspace, with conflict markers, then sends the task back with a
      note that names the marked files ([storage.md](storage.md), "Main into
      a workspace"). A branch with a pending merge of `main` or with conflict
      markers is sent back as `conflict` before it is judged.
-  3. runs the gate, with a 45-minute wall clock;
-  4. records `task.gated` (verdict, log, metric) before git moves;
+  3. runs the gate on C, with a 45-minute wall clock;
+  4. records `task.gated` (verdict, log, metric, C as `candidate`) before
+     git moves. A gate
+     that had no room (exit 5 with its fact, §10.2) is gated `no_room`. This
+     is no verdict on the work. The task stays where it was, and the record
+     names the reason, `free_kb`, `min_gb` and `tmpdir`. It moves neither
+     `gate_aborts` nor `gate_rejections`, so a disk that another project
+     filled halts no mission. The fold keeps the mission's current run of
+     them, which belongs to one task (`gate_room_task`, `gate_room_since_ms`,
+     `gate_room_last_ms`, `gate_room_waits`, `gate_room_escalated`). These
+     end the run: a gate that judges, conflicts or aborts, the task leaving
+     the gate (`task.cancelled`, `task.aborted`), or `mission.resumed`. A
+     `stale` leaves it. A `no_room` on another task starts a new run, with
+     no inherited age, backoff or escalation. The integrator tries that task
+     again only after a backoff from the latest `no_room`: 5 minutes,
+     doubled each time, at most 40. The first `no_room` more than 2 hours
+     into a run carries `escalate`. The dispatcher's digest takes that
+     record to the supervisor, with the free space and `TMPDIR` ("no room
+     for the gate on this host"). It stays pending until a delivered digest
+     carries its tag (`host gate-room-<event>`), however long that takes, so
+     it is told once.
   5. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
      record was lost), which is a landing;
-  6. records `task.landed` (`from`, `to`).
+  6. records `task.landed` (`from`, `to` = C).
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note.
 - **Closure is one rule** (`spawn_task_may_continue` in `schema.sql`). Once a
@@ -706,7 +836,7 @@ record of what was judged (§14 of design.md).
   task closes").
 - **Halt rules,** per mission and read from the log:
   - three gate rejections in a row;
-  - three gate aborts in a row;
+  - three gate aborts in a row (`no_room` is not an abort);
   - the scenario count below its floor (the most scenarios a gate run of
     the mission has counted since it was configured or last resumed);
   - the source's `main` not where the last landing left it.
@@ -754,8 +884,10 @@ record of what was judged (§14 of design.md).
     dispatcher once its task lands or is cancelled (`retire-task-<id>`). Its
     report reaches the supervisor's digest like any report. With N = 1 this
     is one task at a time on the resident, as before.
-  - Landing stays one at a time: one candidate judged per pass, the lowest
-    ready task first, main moved by compare-and-swap. A task whose base is
+  - Landing stays one at a time per mission: one candidate judged at a
+    time, the lowest ready task first, main moved by compare-and-swap.
+    Across missions the gate goes to the longest wait (§10.3), so a
+    mission that is always ready does not starve another's. A task whose base is
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
   - Budgets apply per task, from its delivery; the halt rules stay per
@@ -775,5 +907,28 @@ record of what was judged (§14 of design.md).
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
   `/api/rsi/task/<id>` answers one task; `/api/rsi/pane` shows the
   resident's terminal.
-- **One gate at a time.** Integrator passes hold an advisory lock, so two
-  gates never run at once.
+- **One gate at a time, for now.** A judging (fetch, gate, landing) runs
+  on a thread of its own. A mission has at most one in flight, and so does
+  a source (missions on one source share its mirror and its main); while
+  it runs, the integrator's passes leave that source's mirror alone (no
+  landing, fetch or judging on it), but every mission still gets its
+  halts, budget and objective assignments. At
+  most `--gates N` (`SPAWN_INTEGRATE_GATES`) run at once across missions,
+  and **N is 1**: more than one gate is unsafe until each gate has a test
+  database server of its own (GitHub issue #6, which also covers the
+  server state candidate code leaves behind). Today every gate reaches the
+  same test PostgreSQL server, and its gate login is a superuser, so one
+  gate's candidate code can disturb another gate's base runs (an
+  "unsolved" is cached, and a regression then lands) or flake another
+  mission's candidate toward its halt. The integrator refuses N > 1 (up to
+  8) unless `SPAWN_TEST_DATABASE_PER_GATE=1` states that the server is per
+  gate. Each judging records its own verdict and landing, which the next
+  pass reads; finished judgings are reaped before a pass reads the
+  missions. A judging that panics before any record of its own is
+  recorded `aborted` with the reason, so the three-aborts halt bounds a
+  bug. One that returns an error records nothing: the error is shown to
+  the operator and a later pass judges again (a git that cannot run a
+  merge is the host's problem, not the work's: objective 008).
+  A restart mid-gate kills the gate with the process (no record), and the
+  next integrator judges the task again. One integrator per database: its
+  advisory lock belongs to the connection, kept while any gate runs.

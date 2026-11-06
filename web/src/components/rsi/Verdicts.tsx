@@ -25,6 +25,8 @@ function defaultNote(verdict: TaskVerdict): string {
       return "Conflicts with main; sent back";
     case "stale":
       return "Main moved; judged again";
+    case "no_room":
+      return "No disk room for the gate; judged again later";
     default:
       return "";
   }

@@ -21,9 +21,27 @@
 //!    own `refs/spawn-integrate/<agent>`. The integrator never commits a
 //!    mounted workspace and never moves the agent's `refs/heads/<agent>`,
 //!    so it works the same on a host that never ran the agent, and a file
-//!    written after the last checkpoint never lands. The candidate is
-//!    merged with the source's main when main moved, and judged by
-//!    `scripts/rsi/gate.sh` with the mission's scenarios. Every verdict
+//!    written after the last checkpoint never lands.
+//!
+//!    **A landing is one commit per task on main's first-parent line.**
+//!    The candidate is a new merge commit C ([`landing_candidate`]), never
+//!    the worker's commit and never a fast-forward to one: first parent the
+//!    source's main (the task's base), second parent the pushed head
+//!    judged fresh; its tree is the head's when main is in it, and the merge
+//!    by main's merge rules when main moved (a conflict is `conflict`). Its
+//!    message ([`landing_message`]) says what landed, from the record alone:
+//!    the objective's title with the objective and the task on the first
+//!    line (a task without one: its brief's first line and the task), the
+//!    report's `## What changed` (or the whole report, bounded) after a
+//!    blank line, with no line of it able to pass for a `Spawn-` trailer,
+//!    and the integrator's `Spawn-Task`, `Spawn-Objective` and `Spawn-Head`
+//!    trailers. C is judged by `scripts/rsi/gate.sh` with the mission's
+//!    scenarios, named in the accepted `task.gated` (`candidate`), pushed
+//!    as it is, and named in `task.landed` (`to`). So `git log
+//!    --first-parent` is one line per landed task, `git bisect start
+//!    --first-parent` visits only gated landings, `git revert -m 1 <C>`
+//!    undoes one task, and every checkpoint stays reachable from main
+//!    through the second parents. Every verdict
 //!    names the revision of the report it judged (the task's `revisions`),
 //!    and the store refuses it once the task has moved on. A pass records
 //!    the verdict before git moves, then moves the source's main with a
@@ -39,7 +57,19 @@
 //!    the task goes back to `reported` (`accepted` under review), no
 //!    rejection is counted, nothing reaches the worker, and a later pass
 //!    judges again. An agent with neither a checkpoint nor a pushed branch
-//!    has no branch to land.
+//!    has no branch to land;
+//!
+//!    **No room is not a verdict.** A gate that finds TMPDIR short of room
+//!    (exit [`gate::NO_ROOM_EXIT`] with its no-room fact,
+//!    [`GateFailure::NoRoom`]) is gated `no_room`: the task stays where it
+//!    was, the verdict names the free space and TMPDIR, and neither the
+//!    abort nor the rejection count moves. The store folds the mission's
+//!    run of them (`gate_room_*`); the next try waits [`room_backoff`] after
+//!    the latest, and the first `no_room` more than [`ROOM_ESCALATE_AFTER`]
+//!    into a run carries `escalate`, which the dispatcher's digest takes to
+//!    the supervisor once ([`crate::disk::gate_room_escalations`]). Every
+//!    other gate failure, the gate's own exit 3 included (a missing bind
+//!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
 //!
 //!    **A report is judged against the checkpoint of the turn that produced
 //!    it.** The dispatcher collects a report only after the turn that wrote
@@ -54,15 +84,56 @@
 //! 5. an objective mission's free slots are filled ([`objectives`]): it keeps
 //!    up to its worker limit N (`--workers`, default 1) of its tasks in
 //!    flight, each on its own agent (its resident, then per-task workers),
-//!    and never two for one objective. Filling happens on every pass that
-//!    gets this far, before the judging of step 4, which stays one
-//!    candidate per pass, the lowest ready task first. A halted mission gets
-//!    no new task.
+//!    and never two for one objective. Filling happens on every pass, for
+//!    every mission that is not halted, whatever its gate or any other
+//!    mission's gate is doing. A halted mission gets no new task.
 //!
-//! Like the dispatcher, it keeps no state of its own: the control stream
-//! says what was judged and landed. An advisory lock allows one integrator
-//! per database, so two gates never run at once.
+//! **Every mission gets its step in every pass.** A pass visits every
+//! mission: halts, budgets, landings and assignments never wait for another
+//! mission. Only a landing ends anything early: it moves its source's main
+//! and the baselines of the missions on it, so the rest of that source
+//! waits for the next pass, which reads everything again; other sources go
+//! on. The ready tasks the pass found are given gates after every mission
+//! had its step ([`Integrator::start_ready`]): the one that has waited
+//! longest first, from when it was reported or from when its mission's
+//! previous judging ended, whichever is later. The mission id decides
+//! nothing, so two missions that are always ready take turns.
+//!
+//! **Gates run per mission, on threads.** A judging (step 4, from the
+//! fetch of the pushed branch to the landing) runs on a thread of its own:
+//! - a mission has at most one judging in flight, its lowest ready task:
+//!   its tasks stay serial, each landing on the main the next is judged
+//!   against. While it runs, the pass leaves the mirror of that source
+//!   alone (no landing, fetch or judging for the mission or any other on
+//!   its source: they share the mirror and the main it judges against);
+//!   halts, budgets and assignments go on;
+//! - at most `--gates N` (`SPAWN_INTEGRATE_GATES`) judgings run at once
+//!   across missions, and N is [`DEFAULT_GATES`], one: the gates share one
+//!   test database server whose gate login is a superuser, so a second
+//!   gate's candidate could disturb the first's base runs. N up to
+//!   [`MAX_GATES`] is allowed only with [`PER_GATE_SERVER`]`=1`, once each
+//!   gate has a server of its own. A ready task over the cap waits for a
+//!   later pass (said once).
+//!
+//! Every judging records its own outcome (`task.gated`, `task.landed`), as
+//! before; the pass reads those records, never the thread's result. A
+//! finished thread is reaped only at the start of a pass, before the
+//! missions are read, so no pass acts on a snapshot older than a judging's
+//! records. A judging that panics before any record of its own is recorded
+//! `aborted` ([`judged_or_aborted`]), so the three-aborts halt bounds a bug.
+//! One that returns an error records nothing, as before threads: the error
+//! is the operator's to read (a git that cannot run a merge is the host's,
+//! not the work's; objective 008), and a later pass judges the task again. A restart mid-gate behaves as before: the process (and the
+//! gate under it) dies before any record, so the next integrator judges the
+//! task again.
+//!
+//! Like the dispatcher, it keeps no state of its own beyond the gates it is
+//! running: the control stream says what was judged and landed. An advisory
+//! lock allows one integrator per database; it belongs to the connection,
+//! which the integrator keeps while any of its gates runs.
 
+use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +154,17 @@ use crate::{main_merge, objectives, sources};
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
+
+/// The wait before the first retry of a gate that had no room; it doubles
+/// with each `no_room` in a row, up to [`ROOM_BACKOFF_MAX`].
+const ROOM_BACKOFF: Duration = Duration::from_mins(5);
+
+/// The longest wait between two tries of a gate that had no room.
+const ROOM_BACKOFF_MAX: Duration = Duration::from_mins(40);
+
+/// How long a mission's gate may go without room before the supervisor is
+/// told, once per run.
+const ROOM_ESCALATE_AFTER: Duration = Duration::from_hours(2);
 
 /// Wall clock of one gate run: two builds, clippy, the tests, the e2e and
 /// the black-box scenarios fit well inside it.
@@ -105,7 +187,55 @@ const PUSH_POLL: Duration = Duration::from_millis(500);
 /// Who the integrator's commands come from.
 const PRINCIPAL: &str = "spawn-integrate";
 
-const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>]";
+const USAGE: &str = "usage: spawn integrate [--once] [--root <dir>] [--gates <n>]";
+
+/// Gates that run at once, across missions, unless `--gates` or
+/// `SPAWN_INTEGRATE_GATES` says otherwise. One: concurrent gates share one
+/// test PostgreSQL server whose gate login is a superuser, so one gate's
+/// candidate code could disturb another gate's base runs (and an
+/// "unsolved" would be cached) or its candidate's checks.
+pub(crate) const DEFAULT_GATES: usize = 1;
+
+/// The opt-in that allows more than one gate: set to `1` only when each
+/// gate gets a test database server of its own.
+pub(crate) const PER_GATE_SERVER: &str = "SPAWN_TEST_DATABASE_PER_GATE";
+
+/// The most gates `--gates` allows: each holds two trees, their builds and
+/// a share of the test database.
+pub(crate) const MAX_GATES: usize = 8;
+
+/// How many gates may run at once: `--gates`, else `SPAWN_INTEGRATE_GATES`,
+/// else [`DEFAULT_GATES`]; a whole number from 1 to [`MAX_GATES`], and more
+/// than one only with [`PER_GATE_SERVER`]`=1` (`per_gate`).
+pub(crate) fn gate_slots(
+    flag: Option<String>,
+    env: Option<String>,
+    per_gate: Option<&str>,
+) -> Result<usize, String> {
+    let Some((name, text)) = flag
+        .map(|text| ("--gates", text))
+        .or_else(|| env.map(|text| ("SPAWN_INTEGRATE_GATES", text)))
+    else {
+        return Ok(DEFAULT_GATES);
+    };
+    match text.trim().parse::<usize>() {
+        Ok(1) => Ok(1),
+        Ok(slots) if (2..=MAX_GATES).contains(&slots) => {
+            if per_gate.map(str::trim) == Some("1") {
+                Ok(slots)
+            } else {
+                Err(format!(
+                    "{name}={slots}: more than one gate at once is unsafe while the gates share \
+                     one test database server (its gate login is a superuser); set \
+                     {PER_GATE_SERVER}=1 only once each gate has a server of its own"
+                ))
+            }
+        }
+        _ => Err(format!(
+            "{name} is a whole number from 1 to {MAX_GATES}, not '{text}'"
+        )),
+    }
+}
 
 /// One mission with a gate the integrator visits, from `gated_missions`.
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +259,20 @@ pub(crate) struct Mission {
     pub(crate) gate_rejections: u32,
     #[serde(default)]
     pub(crate) gate_aborts: u32,
+    /// The mission's current run of `no_room` gate outcomes, folded by the
+    /// store: the task it is about (a run is one task's; it ends when that
+    /// task leaves the gate), when it began, when the latest was recorded,
+    /// how many, and whether one carried `escalate`.
+    #[serde(default)]
+    pub(crate) gate_room_task: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_since_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_last_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) gate_room_waits: u32,
+    #[serde(default)]
+    pub(crate) gate_room_escalated: bool,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
@@ -162,6 +306,18 @@ pub(crate) struct Task {
     /// task has moved on to another.
     #[serde(default)]
     pub(crate) revisions: i32,
+    /// Its brief (`mission_tasks.brief`): an objective task's first line is
+    /// `Objective <id>: <title>`.
+    #[serde(default)]
+    pub(crate) brief: String,
+    /// The report the gate's verdict is for (`mission_tasks.report`), as the
+    /// record holds it: the landing's message summarises it.
+    #[serde(default)]
+    pub(crate) report: Option<String>,
+    /// When it last changed state (reported, accepted, or a verdict that
+    /// left it ready): how long it has waited for a gate.
+    #[serde(default)]
+    pub(crate) updated_at_ms: i64,
 }
 
 impl Mission {
@@ -202,6 +358,66 @@ pub(crate) fn halt_reason(mission: &Mission, scenarios: u32) -> Option<String> {
         ));
     }
     None
+}
+
+/// The wait after the `waits`-th `no_room` in a row: [`ROOM_BACKOFF`],
+/// doubled each time, at most [`ROOM_BACKOFF_MAX`]. None before the first.
+pub(crate) fn room_backoff(waits: u32) -> Duration {
+    if waits == 0 {
+        return Duration::ZERO;
+    }
+    ROOM_BACKOFF
+        .saturating_mul(2u32.saturating_pow(waits - 1))
+        .min(ROOM_BACKOFF_MAX)
+}
+
+/// How long `task`'s gate still waits for room at `now_ms`, read from the
+/// store's record of its latest `no_room` (never from memory). None when the
+/// gate may run: also when the mission's run is another task's, which never
+/// lends its backoff.
+pub(crate) fn room_wait(mission: &Mission, task: i64, now_ms: i64) -> Option<Duration> {
+    if mission.gate_room_task != Some(task) {
+        return None;
+    }
+    let last = mission.gate_room_last_ms?;
+    let backoff = i64::try_from(room_backoff(mission.gate_room_waits).as_millis()).ok()?;
+    let left = last.saturating_add(backoff).saturating_sub(now_ms);
+    (left > 0).then(|| Duration::from_millis(left.unsigned_abs()))
+}
+
+/// The record of a gate that had no room to judge `task`, at `now_ms`: the
+/// reason with the free space and TMPDIR, the facts themselves, and
+/// `escalate` when the run of them on this task began more than
+/// [`ROOM_ESCALATE_AFTER`] ago and none escalated yet. Another task's run
+/// gives it no age.
+pub(crate) fn no_room(
+    mission: &Mission,
+    task: i64,
+    free_kb: u64,
+    min_gb: u64,
+    tmpdir: &str,
+    log: &str,
+    now_ms: i64,
+) -> Value {
+    let after = i64::try_from(ROOM_ESCALATE_AFTER.as_millis()).unwrap_or(i64::MAX);
+    let escalate = mission.gate_room_task == Some(task)
+        && !mission.gate_room_escalated
+        && mission
+            .gate_room_since_ms
+            .is_some_and(|since| now_ms.saturating_sub(since) > after);
+    #[allow(clippy::cast_precision_loss)]
+    let free_gib = free_kb as f64 / 1_048_576.0;
+    json!({
+        "reason": format!(
+            "no room to judge now: {free_gib:.1} GiB free in {tmpdir} (TMPDIR), under \
+             SPAWN_GATE_MIN_FREE_GB={min_gb}; not a verdict, judged again later"
+        ),
+        "free_kb": free_kb,
+        "min_gb": min_gb,
+        "tmpdir": tmpdir,
+        "log": log,
+        "escalate": escalate,
+    })
 }
 
 /// Whether a delivered task ran past its mission's budget
@@ -376,13 +592,20 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
              the gate does not get it"
         );
     }
-    let integrator = Integrator {
-        root,
-        gate,
-        gate_env,
-    };
+    let gates = gate_slots(
+        flags.get("gates"),
+        crate::config::env_value("SPAWN_INTEGRATE_GATES"),
+        crate::config::env_value(PER_GATE_SERVER).as_deref(),
+    )
+    .map_err(|error| format!("{error}\n{USAGE}"))?;
+    let integrator = Integrator::new(root, gate, gate_env, gates);
     loop {
-        if let Err(error) = integrator.pass() {
+        let pass = integrator.pass();
+        if once {
+            // One pass, and the gates it started run to their records.
+            integrator.settle();
+        }
+        if let Err(error) = pass {
             eprintln!("integrate: {error}");
             if once {
                 return Err(error);
@@ -396,24 +619,139 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
 }
 
 struct Integrator {
+    judge: Judge,
+    /// Gates that may run at once ([`gate_slots`]).
+    gates: usize,
+    /// The judgings in flight, one per mission at most.
+    running: RefCell<Vec<Running>>,
+    /// The store whose connection holds the integrator's lock, kept while
+    /// a judging runs: its thread records through it.
+    held: RefCell<Option<Arc<PostgresStore>>>,
+    /// Tasks already said to wait for a gate: said again only once they
+    /// have had one.
+    waiting: RefCell<std::collections::HashSet<i64>>,
+    /// When each mission's last judging ended (this process's reading):
+    /// its next task waits for a gate from then.
+    last_judged: RefCell<std::collections::HashMap<i64, i64>>,
+}
+
+/// What a judging needs, owned, so it runs on a thread of its own.
+#[derive(Clone)]
+struct Judge {
     root: PathBuf,
     gate: PathBuf,
     /// The gate's whole environment ([`gate::gate_env`]).
     gate_env: Vec<(String, String)>,
 }
 
+/// A task a mission may judge now, waiting for a gate.
+struct Ready {
+    mission: i64,
+    source: String,
+    mirror: PathBuf,
+    main: String,
+    /// The mission as read this pass, its gate the scenarios directory
+    /// pinned once ([`pinned`]): the judging reads its no-room run too.
+    gated: Mission,
+    count: u32,
+    task: Task,
+}
+
+/// One judging in flight.
+struct Running {
+    mission: i64,
+    source: String,
+    task: i64,
+    handle: std::thread::JoinHandle<()>,
+}
+
 impl Integrator {
-    fn pass(&self) -> Result<(), String> {
-        // A store per pass: the advisory lock belongs to the connection, and
-        // is released with it.
-        let store = Arc::new(open_store()?);
-        if !store
-            .integrator_try_lock()
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(());
+    fn new(root: PathBuf, gate: PathBuf, gate_env: Vec<(String, String)>, gates: usize) -> Self {
+        Self {
+            judge: Judge {
+                root,
+                gate,
+                gate_env,
+            },
+            gates,
+            running: RefCell::new(Vec::new()),
+            held: RefCell::new(None),
+            waiting: RefCell::new(std::collections::HashSet::new()),
+            last_judged: RefCell::new(std::collections::HashMap::new()),
         }
-        self.pass_on(&store)
+    }
+
+    fn pass(&self) -> Result<(), String> {
+        self.reap();
+        // A store per pass while no gate runs: the advisory lock belongs to
+        // the connection, and is released with it. While one runs, its
+        // thread holds the store, so the lock stays this integrator's.
+        if self.running.borrow().is_empty() {
+            self.held.borrow_mut().take();
+        }
+        let held = self.held.borrow().clone();
+        let store = if let Some(store) = held {
+            store
+        } else {
+            let store = Arc::new(open_store()?);
+            if !store
+                .integrator_try_lock()
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(());
+            }
+            store
+        };
+        let pass = self.pass_on(&store);
+        // A pass that failed may have lost the connection: the next pass
+        // asks for the lock again (refused while the old connection lives).
+        *self.held.borrow_mut() =
+            (pass.is_ok() && !self.running.borrow().is_empty()).then_some(store);
+        pass
+    }
+
+    /// Join the judgings that ended. Their records are in the log already;
+    /// a thread that panicked recorded nothing, so its task is judged again.
+    fn reap(&self) {
+        let finished: Vec<Running> = {
+            let mut running = self.running.borrow_mut();
+            let (finished, still) = running
+                .drain(..)
+                .partition(|gate: &Running| gate.handle.is_finished());
+            *running = still;
+            finished
+        };
+        for gate in finished {
+            self.join(gate);
+        }
+    }
+
+    /// Wait for every judging in flight (`--once`, and tests).
+    fn settle(&self) {
+        let running: Vec<Running> = self.running.borrow_mut().drain(..).collect();
+        for gate in running {
+            self.join(gate);
+        }
+    }
+
+    fn join(&self, gate: Running) {
+        // The mission's next task waits for a gate from now.
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        self.last_judged.borrow_mut().insert(gate.mission, now);
+        if gate.handle.join().is_err() {
+            eprintln!(
+                "integrate: mission {}: the judging of task {} panicked; it is judged again",
+                gate.mission, gate.task
+            );
+        }
+    }
+
+    /// Whether a judging in flight keeps `mission` from the mirror this
+    /// pass: its own, or one on its source.
+    fn busy(&self, mission: &Mission) -> bool {
+        self.running.borrow().iter().any(|gate| {
+            gate.mission == mission.id || mission.source.as_deref() == Some(gate.source.as_str())
+        })
     }
 
     /// One pass over every gated mission, holding the integrator's lock.
@@ -421,25 +759,45 @@ impl Integrator {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
+        // Every mission gets its step in every pass: halts, budgets,
+        // landings and objective assignments never wait for another
+        // mission's gate. A landing moves its source's main and the
+        // baselines of the missions on it, so the rest of that source waits
+        // for the next pass, which reads everything again; other sources go
+        // on.
+        let mut moved = std::collections::HashSet::new();
+        let mut ready = Vec::new();
         for mission in &missions {
-            match self.mission(store, &missions, mission) {
-                // Whatever one mission did may move another's view (a shared
-                // source's main): the next pass reads everything again.
-                Ok(true) => return Ok(()),
+            let source = mission.source.clone();
+            if source.as_ref().is_some_and(|source| moved.contains(source)) {
+                continue;
+            }
+            match self.mission(store, &missions, mission, &mut ready) {
+                Ok(true) => {
+                    if let Some(source) = source {
+                        moved.insert(source);
+                    }
+                }
                 Ok(false) => {}
                 Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
             }
         }
+        ready.retain(|candidate: &Ready| !moved.contains(&candidate.source));
+        self.start_ready(store, ready);
         Ok(())
     }
 
-    /// One mission's step. True when it recorded anything. `missions` is
-    /// every mission of the pass, for the landings on a shared source.
+    /// One mission's step. True when it landed a task (its source's main
+    /// moved). A ready task it may judge goes to `ready`; the gates are
+    /// given out after every mission had its step ([`Self::start_ready`]).
+    /// `missions` is every mission of the pass, for the landings on a
+    /// shared source.
     fn mission(
         &self,
         store: &Arc<PostgresStore>,
         missions: &[Mission],
         mission: &Mission,
+        ready: &mut Vec<Ready>,
     ) -> Result<bool, String> {
         if mission.halted.is_some() {
             return Ok(false);
@@ -447,72 +805,184 @@ impl Integrator {
         let scenarios = pinned(Path::new(&mission.gate));
         let count = gate::count_scenarios(&scenarios)?;
         if let Some(reason) = halt_reason(mission, count) {
-            return halt(store, mission, &reason).map(|()| true);
+            return halt(store, mission, &reason).map(|()| false);
         }
-        if Self::enforce_budget(store, mission)? {
-            return Ok(true);
-        }
+        Self::enforce_budget(store, mission)?;
         let Some(source) = mission.source.as_deref() else {
             return Ok(false);
         };
         if let Some(reason) = unlandable(source) {
-            return halt(store, mission, &reason).map(|()| true);
+            return halt(store, mission, &reason).map(|()| false);
         }
-        let mirror =
-            sources::ensure_mirror(&self.root, Some(source)).map_err(|error| error.to_string())?;
-        if let Some(task) = mission.landing() {
-            return land(store, &mirror, source, task).map(|()| true);
-        }
-        // Another mission's landing on this source may have moved main
-        // without its record yet (a crash between the push and
-        // `task.landed`): main says nothing about this mission until that
-        // landing is resolved, by its own mission's next step.
-        if let Some((other, task)) = landing_elsewhere(missions, mission) {
-            println!(
-                "integrate: mission {}: waits for task {task} of mission {other} to land on                  its source",
-                mission.id
-            );
-            return Ok(false);
-        }
-        // A fetch that failed leaves the mirror's last copy of main, which
-        // is no reading of the source's main: no halt, no verdict by it.
-        sources::refresh(&mirror, source)?;
-        let main = git(&[
-            "--git-dir",
-            &mirror.to_string_lossy(),
-            "rev-parse",
-            "refs/heads/main",
-        ])?;
-        if let Some(baseline) = &mission.baseline
-            && *baseline != main
-        {
-            return halt(
-                store,
-                mission,
-                &format!("the source's main is {main}, but the last landing left {baseline}"),
-            )
-            .map(|()| true);
-        }
-        // An objective mission's free slots get their objectives; a closed
-        // mission gets none. An assignment that fails does not keep a ready
-        // task from its judging.
-        let assigned = if mission.state == "done" {
-            false
-        } else {
-            match objectives::assign_next(store, mission) {
-                Ok(assigned) => !assigned.is_empty(),
-                Err(error) if mission.ready().is_none() => return Err(error),
-                Err(error) => {
-                    eprintln!("integrate: mission {}: {error}", mission.id);
-                    false
+        // The mirror and main, when this mission may judge now: not while a
+        // gate of its own, or of another mission on its source, runs (they
+        // share the mirror and the main it judges against).
+        let mut judgeable = None;
+        if !self.busy(mission) {
+            let mirror = sources::ensure_mirror(&self.judge.root, Some(source))
+                .map_err(|error| error.to_string())?;
+            if let Some(task) = mission.landing() {
+                return land(store, &mirror, source, task).map(|()| true);
+            }
+            // Another mission's landing on this source may have moved main
+            // without its record yet (a crash between the push and
+            // `task.landed`): main says nothing about this mission until
+            // that landing is resolved, by its own mission's next step.
+            if let Some((other, task)) = landing_elsewhere(missions, mission) {
+                println!(
+                    "integrate: mission {}: waits for task {task} of mission {other} to land on \
+                     its source",
+                    mission.id
+                );
+            } else {
+                // A fetch that failed leaves the mirror's last copy of main,
+                // which is no reading of the source's main: no halt, no
+                // verdict by it.
+                match sources::refresh(&mirror, source).and_then(|()| {
+                    git(&[
+                        "--git-dir",
+                        &mirror.to_string_lossy(),
+                        "rev-parse",
+                        "refs/heads/main",
+                    ])
+                }) {
+                    Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
+                    Ok(main) => {
+                        if let Some(baseline) = &mission.baseline
+                            && *baseline != main
+                        {
+                            return halt(
+                                store,
+                                mission,
+                                &format!(
+                                    "the source's main is {main}, but the last landing left \
+                                     {baseline}"
+                                ),
+                            )
+                            .map(|()| false);
+                        }
+                        judgeable = Some((mirror, main));
+                    }
                 }
             }
+        }
+        // An objective mission's free slots get their objectives, whatever
+        // its gate is doing; a closed mission gets none.
+        if mission.state != "done"
+            && let Err(error) = objectives::assign_next(store, mission)
+        {
+            eprintln!("integrate: mission {}: {error}", mission.id);
+        }
+        if let (Some((mirror, main)), Some(task)) = (judgeable, mission.ready()) {
+            // The gate had no room last time: wait out the backoff, then try.
+            if let Some(wait) = room_wait(mission, task.id, now_ms()) {
+                println!(
+                    "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
+                    mission.id,
+                    task.id,
+                    wait.as_secs()
+                );
+                return Ok(false);
+            }
+            let mut gated = mission.clone();
+            gated.gate = scenarios.to_string_lossy().into_owned();
+            ready.push(Ready {
+                mission: mission.id,
+                source: source.to_string(),
+                mirror,
+                main,
+                gated,
+                count,
+                task: task.clone(),
+            });
+        }
+        Ok(false)
+    }
+
+    /// Give the free gates to the ready tasks that have waited longest:
+    /// since they were reported (`updated_at_ms`, which every verdict also
+    /// moves), or since their mission's last judging ended, whichever is
+    /// later (a task cannot have a gate while its mission's previous one
+    /// runs). Two missions that are always ready thus take turns, and the
+    /// mission id decides nothing. At most one judging per mission and per
+    /// source.
+    fn start_ready(&self, store: &Arc<PostgresStore>, mut ready: Vec<Ready>) {
+        let since = |candidate: &Ready| {
+            let ended = self
+                .last_judged
+                .borrow()
+                .get(&candidate.mission)
+                .copied()
+                .unwrap_or(0);
+            candidate.task.updated_at_ms.max(ended)
         };
-        let Some(task) = mission.ready() else {
-            return Ok(assigned);
-        };
-        let judged = self.judge(store, &mirror, source, &main, &scenarios, count, task)?;
-        Ok(judged || assigned)
+        ready.sort_by_key(|candidate| (since(candidate), candidate.task.id));
+        for candidate in ready {
+            let taken =
+                self.running.borrow().iter().any(|gate| {
+                    gate.mission == candidate.mission || gate.source == candidate.source
+                });
+            if taken {
+                continue;
+            }
+            let running = self.running.borrow().len();
+            if running >= self.gates {
+                if self.waiting.borrow_mut().insert(candidate.task.id) {
+                    println!(
+                        "integrate: mission {}: task {} waits for a gate ({running} of {} \
+                         running)",
+                        candidate.mission, candidate.task.id, self.gates
+                    );
+                }
+                continue;
+            }
+            self.waiting.borrow_mut().remove(&candidate.task.id);
+            let mission = candidate.mission;
+            if let Err(error) = self.start_judging(store, candidate, running) {
+                eprintln!("integrate: mission {mission}: {error}");
+            }
+        }
+    }
+
+    /// Judge a ready task on a thread of its own.
+    fn start_judging(
+        &self,
+        store: &Arc<PostgresStore>,
+        candidate: Ready,
+        running: usize,
+    ) -> Result<(), String> {
+        let Ready {
+            mission: mission_id,
+            source,
+            mirror,
+            main,
+            gated,
+            count,
+            task,
+        } = candidate;
+        let judge = self.judge.clone();
+        let task_id = task.id;
+        let (store, source_owned) = (Arc::clone(store), source.clone());
+        let handle = std::thread::Builder::new()
+            .name(format!("gate-{task_id}"))
+            .spawn(move || {
+                judged_or_aborted(&store, &task, &main, mission_id, || {
+                    judge.judge(&store, &mirror, &source_owned, &main, &gated, count, &task)
+                });
+            })
+            .map_err(|error| format!("start the judging of task {task_id}: {error}"))?;
+        println!(
+            "integrate: mission {mission_id}: judging task {task_id} ({} of {} gates)",
+            running + 1,
+            self.gates
+        );
+        self.running.borrow_mut().push(Running {
+            mission: mission_id,
+            source,
+            task: task_id,
+            handle,
+        });
+        Ok(())
     }
 
     /// Abort delivered tasks over budget. True when it aborted one.
@@ -544,7 +1014,9 @@ impl Integrator {
         }
         Ok(aborted)
     }
+}
 
+impl Judge {
     /// The agent's pushed branch, fetched into the mirror, checked against
     /// the checkpoint the task's report names and the agent's latest
     /// checkpoint ([`report_freshness`]). A lagging push is fetched again for
@@ -591,9 +1063,8 @@ impl Integrator {
         }
     }
 
-    /// Judge one task from its pushed branch. True when what it recorded may
-    /// move another mission's view; a stale push moves nothing, so the other
-    /// missions still get their turn in this pass.
+    /// Judge one task from its pushed branch, on its own thread. True when
+    /// the gate ran; a stale push runs none.
     #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
@@ -601,7 +1072,7 @@ impl Integrator {
         mirror: &Path,
         source: &str,
         main: &str,
-        scenarios: &Path,
+        mission: &Mission,
         count: u32,
         task: &Task,
     ) -> Result<bool, String> {
@@ -624,7 +1095,7 @@ impl Integrator {
             mirror,
             source,
             main,
-            scenarios,
+            mission,
             count,
             task,
             branch.as_deref(),
@@ -641,11 +1112,12 @@ impl Integrator {
         mirror: &Path,
         source: &str,
         main: &str,
-        scenarios: &Path,
+        mission: &Mission,
         count: u32,
         task: &Task,
         branch: Option<&str>,
     ) -> Result<(), String> {
+        let scenarios = Path::new(&mission.gate);
         // Read only: the integrator never commits a workspace.
         let repo = GitWorkspace::new(mirror, &self.root);
         let gated = |verdict: &str, extra: Value| -> Result<(), String> {
@@ -681,7 +1153,8 @@ impl Integrator {
         if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
             return gated("conflict", json!({ "note": note }));
         }
-        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, task.id)? else {
+        let message = landing_message(task, &branch);
+        let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
             // The worker cannot merge main itself: merge it into the
             // workspace now, while the worker waits for this verdict, so
             // the note names what it has to resolve.
@@ -750,21 +1223,104 @@ impl Integrator {
                 land(store, mirror, source, &landing)
             }
             Ok(verdict) => rejected(&verdict.reason, &verdict.output),
+            // No room in TMPDIR: a fact about the host, never a count.
+            Err(GateFailure::NoRoom {
+                free_kb,
+                min_gb,
+                tmpdir,
+                log,
+            }) => gated(
+                "no_room",
+                no_room(mission, task.id, free_kb, min_gb, &tmpdir, &log, now_ms()),
+            ),
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
 }
 
-/// The commit that would land `branch` (the agent's pushed head, in the
-/// mirror) on `main`, or `None` when the two conflict. Only objects are
-/// written, never a ref: the agent's `refs/heads/<agent>` stays the Bridge's,
-/// and `spawn/<agent>` catches up with a landing through the Bridge's next
-/// merge of main, which its pusher pushes like any checkpoint.
+/// Run a judging. When it panics, record its abort unless it recorded
+/// something already: a panic that ends a judging without a record of its
+/// own would recur on every pass, forever, and an abort counts toward the
+/// mission's three-aborts halt. An error is shown and records nothing: no
+/// verdict on the work (objective 008), and a later pass judges again.
+fn judged_or_aborted(
+    store: &PostgresStore,
+    task: &Task,
+    main: &str,
+    mission: i64,
+    judging: impl FnOnce() -> Result<bool, String>,
+) {
+    let reason = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(judging)) {
+        Ok(Ok(_)) => return,
+        // An error is no verdict: shown, not recorded, judged again later.
+        Ok(Err(error)) => {
+            eprintln!("integrate: mission {mission}: task {}: {error}", task.id);
+            return;
+        }
+        Err(panic) => format!(
+            "the judging panicked: {}",
+            panic
+                .downcast_ref::<&str>()
+                .map(ToString::to_string)
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default()
+        ),
+    };
+    eprintln!("integrate: mission {mission}: task {}: {reason}", task.id);
+    match abort_unrecorded(store, task, main, &reason) {
+        Ok(true) => println!("integrate: task {} gated: aborted", task.id),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "integrate: mission {mission}: task {}: record the abort: {error}",
+            task.id
+        ),
+    }
+}
+
+/// Record `task.gated aborted` for a judging that ended in an error, when
+/// the log shows it recorded nothing: the task is still in the state and at
+/// the revision it was judged from. True when it recorded the abort.
+fn abort_unrecorded(
+    store: &PostgresStore,
+    task: &Task,
+    main: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    let missions: Vec<Mission> =
+        serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
+            .map_err(|error| format!("gated missions: {error}"))?;
+    let unrecorded = missions
+        .iter()
+        .flat_map(|mission| &mission.tasks)
+        .any(|now| now.id == task.id && now.state == task.state && now.revisions == task.revisions);
+    if !unrecorded {
+        return Ok(false);
+    }
+    record(
+        store,
+        &json!({"type": "task.gated", "id": task.id, "verdict": "aborted",
+                "revision": task.revisions, "base": main, "reason": reason}),
+    )?;
+    Ok(true)
+}
+
+/// The commit that lands `branch` (the agent's pushed head, in the mirror)
+/// on `main`, with `message` ([`landing_message`]), or `None` when the two
+/// conflict. Always one new merge commit: first parent `main` (the base the
+/// gate judges against), second parent `branch`, so main's first-parent line
+/// is one commit per landing and every checkpoint stays reachable through
+/// the second parents. Its tree is the branch's when main is in it, and the
+/// merge of both by main's merge rules otherwise. Never the branch head
+/// itself, so a head that names a large-file manifest lands without it.
+/// Only objects are written, never a ref: the agent's `refs/heads/<agent>`
+/// stays the Bridge's, and `spawn/<agent>` catches up with a landing through
+/// the Bridge's next merge of main, which its pusher pushes like any
+/// checkpoint.
 fn landing_candidate(
     mirror_path: &str,
     main: &str,
     branch: &str,
-    task: i64,
+    message: &str,
 ) -> Result<Option<String>, String> {
     let main_is_in = git(&[
         "--git-dir",
@@ -775,69 +1331,142 @@ fn landing_candidate(
         branch,
     ])
     .is_ok();
-    if main_is_in {
-        // Large files are workspace state, never source: a branch head
-        // that names a large-file manifest lands as a commit of the same
-        // tree without it, so nothing forked from main inherits them.
-        let message = git(&[
-            "--git-dir",
-            mirror_path,
-            "show",
-            "-s",
-            "--format=%B",
-            branch,
-        ])?;
-        if !spawn_host::names_files_outside_git(&message) {
-            return Ok(Some(branch.to_string()));
-        }
-        let tree = git(&[
+    let tree = if main_is_in {
+        git(&[
             "--git-dir",
             mirror_path,
             "rev-parse",
             &format!("{branch}^{{tree}}"),
-        ])?;
-        return commit_landing(
-            mirror_path,
-            &[&tree, "-p", branch, "-m", &format!("Land task {task}")],
-        )
-        .map(Some);
-    }
-    // Main moved since the worker started: land the merge of both, by
-    // main's merge rules (a bare repository reads no in-tree
-    // .gitattributes otherwise), as main is merged into agents' branches.
-    let output = sources::controller_git()
-        .args([
-            "--git-dir",
-            mirror_path,
-            &format!("--attr-source={main}"),
-            "merge-tree",
-            "--write-tree",
-            main,
-            branch,
-        ])
-        .output()
-        .map_err(|error| format!("run git merge-tree: {error}"))?;
-    let Some(tree) = merged_tree(
-        output.status.code(),
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    )?
-    else {
-        return Ok(None);
+        ])?
+    } else {
+        // Main moved since the worker started: land the merge of both, by
+        // main's merge rules (a bare repository reads no in-tree
+        // .gitattributes otherwise), as main is merged into agents' branches.
+        let output = sources::controller_git()
+            .args([
+                "--git-dir",
+                mirror_path,
+                &format!("--attr-source={main}"),
+                "merge-tree",
+                "--write-tree",
+                main,
+                branch,
+            ])
+            .output()
+            .map_err(|error| format!("run git merge-tree: {error}"))?;
+        let Some(tree) = merged_tree(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )?
+        else {
+            return Ok(None);
+        };
+        tree
     };
     commit_landing(
         mirror_path,
-        &[
-            &tree,
-            "-p",
-            main,
-            "-p",
-            branch,
-            "-m",
-            &format!("Land task {task} (merged with main)"),
-        ],
+        &[&tree, "-p", main, "-p", branch, "-m", message],
     )
     .map(Some)
+}
+
+/// Characters of a report's summary a landing's message holds at most.
+const SUMMARY_CHARS: usize = 3000;
+
+/// Characters of a brief's first line a landing's first line holds at most.
+const TITLE_CHARS: usize = 100;
+
+/// The message of `task`'s landing of `head`: what landed, from the record
+/// alone (never a workspace). The first line holds the objective's title
+/// (the brief's first line, `Objective <id>: <title>`) and names the
+/// objective and the task, or, for a task without an objective, the brief's
+/// first non-empty line and the task. After a blank line, the report's
+/// `## What changed` section (the whole report when it has none), bounded,
+/// with every line that could read as a `Spawn-` trailer indented. Last, the
+/// integrator's own trailers.
+pub(crate) fn landing_message(task: &Task, head: &str) -> String {
+    let first = task
+        .brief
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let mut subject = match task.objective {
+        Some(objective) => {
+            let title = first
+                .strip_prefix(&format!("Objective {objective}:"))
+                .map_or(first, str::trim);
+            let title = cut(title, TITLE_CHARS);
+            if title.is_empty() {
+                format!("Land objective {objective}, task {}", task.id)
+            } else {
+                format!("{title} (objective {objective}, task {})", task.id)
+            }
+        }
+        None if first.is_empty() => format!("Land task {}", task.id),
+        None => format!("{} (task {})", cut(first, TITLE_CHARS), task.id),
+    };
+    if subject.to_ascii_lowercase().starts_with("spawn checkpoint") {
+        subject = format!("Land {subject}");
+    }
+    let mut message = subject;
+    message.push_str("\n\n");
+    let summary = report_summary(task.report.as_deref().unwrap_or_default());
+    if summary.is_empty() {
+        message.push_str("The task's report is empty.");
+    } else {
+        for line in summary.lines() {
+            if line.trim_start().to_ascii_lowercase().starts_with("spawn-") {
+                message.push_str("    ");
+            }
+            message.push_str(line);
+            message.push('\n');
+        }
+    }
+    let message = message.trim_end().to_string();
+    let mut trailers = format!("Spawn-Task: {}\n", task.id);
+    if let Some(objective) = task.objective {
+        let _ = writeln!(trailers, "Spawn-Objective: {objective}");
+    }
+    let _ = writeln!(trailers, "Spawn-Head: {head}");
+    format!("{message}\n\n{trailers}")
+}
+
+/// What a landing's message quotes of `report`: its `## What changed`
+/// section, or the whole report when it has none (or an empty one),
+/// trimmed and cut to [`SUMMARY_CHARS`].
+fn report_summary(report: &str) -> String {
+    fn heading(line: &str) -> Option<&str> {
+        let level = line.bytes().take_while(|&byte| byte == b'#').count();
+        (1..=2)
+            .contains(&level)
+            .then(|| line[level..].trim().trim_end_matches(':').trim())
+    }
+    let mut lines = report.lines();
+    let mut section = None;
+    if lines.any(|line| heading(line).is_some_and(|text| text.eq_ignore_ascii_case("what changed")))
+    {
+        let body: Vec<&str> = lines.take_while(|line| heading(line).is_none()).collect();
+        let body = body.join("\n");
+        if !body.trim().is_empty() {
+            section = Some(body);
+        }
+    }
+    let text = section.as_deref().unwrap_or(report).trim();
+    let summary = cut(text, SUMMARY_CHARS);
+    if summary.len() < text.len() {
+        format!("{summary}\n[the report continues]")
+    } else {
+        summary.to_string()
+    }
+}
+
+/// `text` cut to at most `limit` characters, on a character boundary.
+fn cut(text: &str, limit: usize) -> &str {
+    text.char_indices()
+        .nth(limit)
+        .map_or(text, |(at, _)| text[..at].trim_end())
 }
 
 /// What `git merge-tree --write-tree` said, from its exit code (`None`: no
@@ -926,7 +1555,16 @@ fn aborted(failure: &GateFailure) -> Value {
         GateFailure::Aborted { reason, log } => {
             json!({"reason": format!("the gate failed: {reason}"), "log": log})
         }
+        // Recorded as `no_room` by the caller; counted here only if a
+        // caller forgets that.
+        GateFailure::NoRoom { tmpdir, log, .. } => {
+            json!({"reason": format!("the gate had no room in {tmpdir}"), "log": log})
+        }
     }
+}
+
+fn now_ms() -> i64 {
+    spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
 /// Move the source's default branch from the task's base to its candidate,
@@ -1097,11 +1735,45 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree,
-        over_budget, pinned, report_freshness, task_scenario,
+        Freshness, Mission, aborted, freshness, halt_reason, markers_note, merged_tree, no_room,
+        over_budget, pinned, report_freshness, room_backoff, room_wait, task_scenario,
     };
     use crate::gate::GateFailure;
     use serde_json::json;
+
+    /// One gate at a time unless the test server is per gate: more is
+    /// refused without the opt-in, whatever asks for it.
+    #[test]
+    fn the_gate_cap_is_one_and_more_needs_a_server_per_gate() {
+        use super::{DEFAULT_GATES, MAX_GATES, gate_slots};
+        let per_gate = || Some("1");
+        assert_eq!(gate_slots(None, None, None), Ok(1));
+        assert_eq!(DEFAULT_GATES, 1);
+        assert_eq!(gate_slots(Some("1".into()), None, None), Ok(1));
+        for (flag, env) in [(Some("2"), None), (None, Some("3")), (Some("8"), Some("1"))] {
+            let refused = gate_slots(flag.map(Into::into), env.map(Into::into), None);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.contains("SPAWN_TEST_DATABASE_PER_GATE=1")),
+                "{flag:?} {env:?}: {refused:?}"
+            );
+            assert!(gate_slots(flag.map(Into::into), env.map(Into::into), Some("yes")).is_err());
+        }
+        assert_eq!(gate_slots(None, Some("3".into()), per_gate()), Ok(3));
+        assert_eq!(
+            gate_slots(Some("1".into()), Some("3".into()), per_gate()),
+            Ok(1),
+            "the flag first"
+        );
+        for wrong in ["0", "-1", "two", ""] {
+            assert!(
+                gate_slots(Some(wrong.into()), None, per_gate()).is_err(),
+                "{wrong}"
+            );
+        }
+        assert!(gate_slots(None, Some((MAX_GATES + 1).to_string()), per_gate()).is_err());
+    }
 
     /// Only exit 1 is a conflict: a merge-tree git cannot run (an unknown
     /// option, a crash, a signal) is an error carrying git's message.
@@ -1195,7 +1867,8 @@ mod tests {
             .expect("fetch")
             .expect("pushed");
         let main = git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"]).expect("main");
-        let candidate = super::landing_candidate(&mirror_path, &main, &pushed, task)
+        let message = format!("Work (task {task})\n\nThe work.\n");
+        let candidate = super::landing_candidate(&mirror_path, &main, &pushed, &message)
             .expect("candidate")
             .expect("no conflict");
         assert_ne!(candidate, pushed, "a landing of its own");
@@ -1429,7 +2102,8 @@ mod tests {
         let main =
             crate::sources::git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
                 .expect("main");
-        super::landing_candidate(&mirror_path, &main, &pushed, 1).expect("candidate")
+        super::landing_candidate(&mirror_path, &main, &pushed, "Work (task 1)\n\nThe work.\n")
+            .expect("candidate")
     }
 
     /// The whole loop of a conflict: the verdict merges main into the idle
@@ -1538,9 +2212,23 @@ mod tests {
         );
         assert_eq!(super::markers_note(false, &[]), None);
 
-        // Judged again: it contains main, so it lands as it is.
+        // Judged again: it contains main, so it lands as a commit of its
+        // tree on top of main, with the resolution as its second parent.
         let candidate = judged(&mirror, &source, agent).expect("no conflict now");
-        assert_eq!(candidate, resolved.as_str());
+        assert_ne!(candidate, resolved.as_str(), "never the worker's commit");
+        let rev = |reference: String| {
+            git(&["--git-dir", &mirror_path, "rev-parse", &reference]).expect("rev-parse")
+        };
+        assert_eq!(
+            rev(format!("{candidate}^1")),
+            main,
+            "main is the first parent"
+        );
+        assert_eq!(rev(format!("{candidate}^2")), resolved.as_str());
+        assert_eq!(
+            rev(format!("{candidate}^{{tree}}")),
+            rev(format!("{resolved}^{{tree}}"))
+        );
         git(&[
             "--git-dir",
             &mirror_path,
@@ -1549,7 +2237,7 @@ mod tests {
             &source,
             &format!("{candidate}:refs/heads/main"),
         ])
-        .expect("lands with a fast-forward of main");
+        .expect("lands with one commit on top of main");
         assert_eq!(
             git(&["--git-dir", &source, "show", "main:README.md"]).expect("main's README"),
             "one\nTWO by the agent, on main\nthree"
@@ -1906,6 +2594,84 @@ mod tests {
         assert_eq!(halt_reason(&mission(0, 0, 0), 0), None, "no floor yet");
     }
 
+    const MINUTE: i64 = 60_000;
+
+    #[test]
+    fn no_room_backs_off_doubling_to_a_cap() {
+        let minutes: Vec<u64> = (0..=6)
+            .map(|waits| room_backoff(waits).as_secs() / 60)
+            .collect();
+        assert_eq!(minutes, [0, 5, 10, 20, 40, 40, 40]);
+        assert_eq!(room_backoff(u32::MAX).as_secs(), 40 * 60, "no overflow");
+    }
+
+    #[test]
+    fn the_gate_waits_out_its_backoff_from_the_recorded_no_room() {
+        let mut waiting = mission(0, 0, 0);
+        assert_eq!(
+            room_wait(&waiting, 4, 0),
+            None,
+            "no run of no_room: judge now"
+        );
+        waiting.gate_room_task = Some(4);
+        waiting.gate_room_since_ms = Some(100 * MINUTE);
+        waiting.gate_room_last_ms = Some(110 * MINUTE);
+        waiting.gate_room_waits = 2;
+        assert_eq!(
+            room_wait(&waiting, 4, 112 * MINUTE).map(|wait| wait.as_secs()),
+            Some(8 * 60)
+        );
+        assert_eq!(room_wait(&waiting, 4, 120 * MINUTE), None, "backoff over");
+        assert_eq!(
+            room_wait(&waiting, 5, 112 * MINUTE),
+            None,
+            "another task does not inherit the backoff"
+        );
+    }
+
+    #[test]
+    fn no_room_names_the_reason_and_the_free_space_and_escalates_once_after_two_hours() {
+        let mut waiting = mission(0, 2, 0);
+        let first = no_room(
+            &waiting,
+            4,
+            3 * 1_048_576 + 104_858,
+            10,
+            "/data/tmp",
+            "log",
+            0,
+        );
+        assert_eq!(
+            first["reason"],
+            "no room to judge now: 3.1 GiB free in /data/tmp (TMPDIR), under \
+             SPAWN_GATE_MIN_FREE_GB=10; not a verdict, judged again later"
+        );
+        assert_eq!(first["free_kb"], 3 * 1_048_576 + 104_858);
+        assert_eq!(first["tmpdir"], "/data/tmp");
+        assert_eq!(first["min_gb"], 10);
+        assert_eq!(first["escalate"], false, "the first of a run");
+        waiting.gate_room_task = Some(4);
+        waiting.gate_room_since_ms = Some(0);
+        let at = |mission: &Mission, minutes: i64| {
+            no_room(mission, 4, 1, 10, "/t", "", minutes * MINUTE)["escalate"].clone()
+        };
+        assert_eq!(
+            no_room(&waiting, 5, 1, 10, "/t", "", 500 * MINUTE)["escalate"],
+            false,
+            "a later task's first no_room starts its own run"
+        );
+        assert_eq!(
+            at(&waiting, 120),
+            false,
+            "two hours exactly is not more than two"
+        );
+        assert_eq!(at(&waiting, 121), true);
+        waiting.gate_room_escalated = true;
+        assert_eq!(at(&waiting, 500), false, "told once per run");
+        // And it never counts toward the halt the mission already nears.
+        assert_eq!(halt_reason(&waiting, 0), None);
+    }
+
     #[test]
     fn a_budget_bounds_minutes_and_tool_calls() {
         let budget = json!({"minutes": 45, "tool_calls": 60});
@@ -1930,6 +2696,247 @@ mod tests {
         // accepted forever.
         gated.tasks.remove(0);
         assert_eq!(gated.ready().map(|task| task.id), Some(2));
+    }
+
+    /// A task as `GATED` reads it, with a brief and a report.
+    fn task_of(id: i64, objective: Option<u32>, brief: &str, report: Option<&str>) -> super::Task {
+        serde_json::from_value(json!({
+            "id": id, "agent_id": "agent_a", "session_id": "session_a", "state": "landing",
+            "objective": objective, "brief": brief, "report": report,
+        }))
+        .expect("a task")
+    }
+
+    const REPORT: &str = "## Outcome\ndone\n\n## What changed\nsummary: HARBOUR.txt now holds \
+                          kestrel\n\n### Details\nOne file.\n\n## Open issues\nnone\n";
+
+    #[test]
+    fn an_objective_landing_names_its_title_objective_and_task_and_summarises_the_report() {
+        let task = task_of(
+            42,
+            Some(931),
+            "Objective 931: Greet the harbour with a kestrel\n\nWrite the file.\n\
+             Earlier gate verdicts on this objective, newest first:\n- task 41: rejected\n",
+            Some(REPORT),
+        );
+        let message = super::landing_message(&task, "abc123");
+        let mut lines = message.lines();
+        assert_eq!(
+            lines.next(),
+            Some("Greet the harbour with a kestrel (objective 931, task 42)")
+        );
+        assert_eq!(lines.next(), Some(""));
+        let body: String = lines.collect::<Vec<_>>().join("\n");
+        assert!(
+            body.starts_with("summary: HARBOUR.txt now holds kestrel\n\n### Details\nOne file."),
+            "{body}"
+        );
+        assert!(
+            !body.contains("## Outcome") && !body.contains("Open issues"),
+            "{body}"
+        );
+        assert!(!message.contains("task 41"), "no other task: {message}");
+        assert!(
+            message.ends_with("\n\nSpawn-Task: 42\nSpawn-Objective: 931\nSpawn-Head: abc123\n"),
+            "{message}"
+        );
+        assert!(!spawn_host::names_files_outside_git(&message));
+    }
+
+    #[test]
+    fn a_landing_without_an_objective_names_its_brief_and_task() {
+        let task = task_of(
+            5,
+            None,
+            "\n\n  Fix the parser's error messages  \nMore.\n",
+            Some(REPORT),
+        );
+        let message = super::landing_message(&task, "abc123");
+        assert_eq!(
+            message.lines().next(),
+            Some("Fix the parser's error messages (task 5)")
+        );
+        assert!(!message.contains("Spawn-Objective"), "{message}");
+        assert!(message.contains("\nsummary: HARBOUR.txt now holds kestrel\n"));
+        // A long first line is cut; an empty brief still names the task;
+        // nothing reads like a checkpoint.
+        let long = task_of(6, None, &"word ".repeat(100), None);
+        let first = super::landing_message(&long, "h")
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(first.len() < 120 && first.ends_with(" (task 6)"), "{first}");
+        assert!(
+            super::landing_message(&task_of(7, None, "", None), "h").starts_with("Land task 7\n\n")
+        );
+        let checkpoint = task_of(8, None, "spawn checkpoint exec_3", None);
+        assert!(super::landing_message(&checkpoint, "h").starts_with("Land spawn checkpoint"));
+    }
+
+    #[test]
+    fn a_report_without_what_changed_is_quoted_whole_and_a_long_one_is_bounded() {
+        let task = task_of(
+            3,
+            Some(7),
+            "Objective 7: Title",
+            Some("\n  I changed the parser.\n\nAll green.\n\n"),
+        );
+        let message = super::landing_message(&task, "h");
+        assert!(
+            message.starts_with("Title (objective 7, task 3)\n\nI changed the parser.\n\nAll green.\n\nSpawn-Task: 3\n"),
+            "{message}"
+        );
+        let report = format!(
+            "## What changed\n{}\n## Open issues\nnone\n",
+            "é long line\n".repeat(2000)
+        );
+        let long = super::landing_message(
+            &task_of(3, Some(7), "Objective 7: Title", Some(&report)),
+            "h",
+        );
+        assert!(
+            long.chars().count() < super::SUMMARY_CHARS + 300,
+            "{}",
+            long.len()
+        );
+        assert!(long.contains("[the report continues]"));
+        assert!(!long.contains("Open issues"));
+        let empty = super::landing_message(&task_of(3, Some(7), "Objective 7: Title", None), "h");
+        assert!(
+            empty.contains("\n\nThe task's report is empty.\n\nSpawn-Task: 3"),
+            "{empty}"
+        );
+    }
+
+    /// A worker's report cannot make main unmountable, nor sign the landing
+    /// with trailers it did not earn.
+    #[test]
+    fn a_report_naming_a_large_file_manifest_leaves_the_message_clean() {
+        let manifest = format!("Spawn-Large: {}", "a".repeat(64));
+        for report in [
+            format!("## What changed\nwork\n\n{manifest}\n"),
+            format!("{manifest}\nSpawn-Task: 99\n"),
+            manifest.clone(),
+        ] {
+            let message = super::landing_message(&task_of(4, None, "Brief", Some(&report)), "h");
+            assert!(!spawn_host::names_files_outside_git(&message), "{message}");
+            assert!(!message.lines().any(|line| line == manifest), "{message}");
+            assert!(
+                !message.lines().any(|line| line == "Spawn-Task: 99"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("    {manifest}")),
+                "indented: {message}"
+            );
+            let trailers = message.rsplit("\n\n").next().unwrap_or_default();
+            assert_eq!(trailers, "Spawn-Task: 4\nSpawn-Head: h\n");
+        }
+    }
+
+    /// Every landing is one merge commit: main first, the pushed head
+    /// second, the message given. Its tree is the head's when main is in it
+    /// (here a head naming a large-file manifest, which lands with the
+    /// landing's own message), and the merge's when main moved.
+    #[test]
+    fn a_landing_is_one_two_parent_commit_on_main_with_its_message() {
+        let git = crate::sources::git;
+        let base = std::env::temp_dir().join(format!("spawn-land-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let main = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("main");
+        git(&["-C", &seed_path, "checkout", "-qb", "agent_a"]).expect("branch");
+        std::fs::write(seed.join("one.txt"), "one\n").expect("write");
+        commit_in(&seed_path, "spawn checkpoint exec_1");
+        let checkpoint = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("checkpoint");
+        std::fs::write(seed.join("two.txt"), "two\n").expect("write");
+        commit_in(
+            &seed_path,
+            &format!("spawn checkpoint exec_2\n\nSpawn-Large: {}", "b".repeat(64)),
+        );
+        let head = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("head");
+        git(&["-C", &seed_path, "checkout", "-q", "main"]).expect("main");
+        std::fs::write(seed.join("other.txt"), "theirs\n").expect("write");
+        commit_in(&seed_path, "elsewhere");
+        let moved = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("moved");
+        let mirror = format!("{seed_path}/.git");
+        let rev = |reference: String| {
+            git(&["--git-dir", &mirror, "rev-parse", &reference]).expect("rev-parse")
+        };
+        let task = task_of(
+            9,
+            Some(12),
+            "Objective 12: Count the gulls",
+            Some("## What changed\ngulls\n"),
+        );
+        let message = super::landing_message(&task, &head);
+
+        for (main, merged) in [(main.as_str(), false), (moved.as_str(), true)] {
+            let landing = super::landing_candidate(&mirror, main, &head, &message)
+                .expect("a landing")
+                .expect("no conflict");
+            assert_eq!(rev(format!("{landing}^1")), main, "first parent: the base");
+            assert_eq!(rev(format!("{landing}^2")), head, "second parent: the head");
+            assert!(
+                git(&[
+                    "--git-dir",
+                    &mirror,
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("{landing}^3")
+                ])
+                .is_err(),
+                "two parents"
+            );
+            let said = git(&["--git-dir", &mirror, "show", "-s", "--format=%B", &landing])
+                .expect("message");
+            assert_eq!(said, message.trim_end());
+            assert!(
+                said.starts_with("Count the gulls (objective 12, task 9)\n\ngulls\n"),
+                "{said}"
+            );
+            assert!(
+                !spawn_host::names_files_outside_git(&said),
+                "the manifest stays off main"
+            );
+            let files =
+                git(&["--git-dir", &mirror, "ls-tree", "--name-only", &landing]).expect("tree");
+            if merged {
+                assert_eq!(files, "README.md\none.txt\nother.txt\ntwo.txt", "the merge");
+            } else {
+                assert_eq!(
+                    rev(format!("{landing}^{{tree}}")),
+                    rev(format!("{head}^{{tree}}"))
+                );
+            }
+            // One commit on the first-parent line; the checkpoints off it.
+            let line = git(&[
+                "--git-dir",
+                &mirror,
+                "rev-list",
+                "--first-parent",
+                &format!("{main}..{landing}"),
+            ])
+            .expect("first parents");
+            assert_eq!(line, landing);
+            git(&[
+                "--git-dir",
+                &mirror,
+                "merge-base",
+                "--is-ancestor",
+                &checkpoint,
+                &landing,
+            ])
+            .expect("the checkpoints stay reachable");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Both landing commits [`super::landing_candidate`] writes (a branch
@@ -1973,10 +2980,15 @@ mod tests {
         let mirror = format!("{seed_path}/.git");
 
         for (main, branch) in [(main.as_str(), large.as_str()), (&moved, &late)] {
-            let landing = super::landing_candidate(&mirror, main, branch, 7)
+            let message = "Work (task 7)\n\nThe work.\n\nSpawn-Task: 7\n";
+            let landing = super::landing_candidate(&mirror, main, branch, message)
                 .expect("a landing")
                 .expect("no conflict");
             assert_ne!(landing, branch, "a commit of the integrator's own");
+            let said = git(&["--git-dir", &mirror, "show", "-s", "--format=%B", &landing])
+                .expect("message");
+            assert_eq!(said, message.trim_end(), "the integrator's message");
+            assert!(!spawn_host::names_files_outside_git(&said));
             let who = git(&[
                 "--git-dir",
                 &mirror,
@@ -2164,11 +3176,12 @@ mod database_tests {
         std::fs::create_dir_all(&scenarios).expect("scenarios");
         let gate_path = base.join("gate.sh");
         std::fs::write(&gate_path, gate).expect("gate");
-        let integrator = Integrator {
-            root: base.join("host"),
-            gate: gate_path,
-            gate_env: Vec::new(),
-        };
+        let integrator = Integrator::new(
+            base.join("host"),
+            gate_path,
+            test_gate_env(),
+            super::DEFAULT_GATES,
+        );
         (base, source, scenarios, integrator)
     }
 
@@ -2186,6 +3199,518 @@ mod database_tests {
 
     fn source_main(source: &str) -> String {
         git(&["--git-dir", source, "rev-parse", "refs/heads/main"]).expect("main")
+    }
+
+    /// The stub gates' environment: PATH only, for `sleep` and `cat`.
+    fn test_gate_env() -> Vec<(String, String)> {
+        std::env::var("PATH")
+            .map(|path| vec![("PATH".to_string(), path)])
+            .unwrap_or_default()
+    }
+
+    /// `agent`'s work on `source`'s main, pushed as `spawn/<agent>`: one new
+    /// file. The pushed commit.
+    fn push_work(base: &Path, source: &str, agent: &str, file: &str) -> String {
+        let clone = base.join(format!("agent-{file}"));
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", source, &clone_path]).expect("clone");
+        std::fs::write(clone.join(file), "work\n").expect("write");
+        super::tests::commit_in(&clone_path, "work");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/spawn/{agent}"),
+        ])
+        .expect("push the agent's branch");
+        git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work")
+    }
+
+    /// A gate that notes the candidate it judges in `<marks>/started`, then
+    /// holds until `<marks>/release` exists, and accepts.
+    fn holding_gate(marks: &Path) -> String {
+        let marks = marks.to_string_lossy();
+        format!(
+            "echo \"$3\" >>'{marks}/started'\n\
+             while [ ! -e '{marks}/release' ]; do sleep 0.05; done\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n"
+        )
+    }
+
+    /// Releases the holding gates when a test ends, a failed one too, so no
+    /// stub gate outlives it.
+    struct Release(PathBuf);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), "");
+        }
+    }
+
+    fn started(marks: &Path) -> Vec<String> {
+        std::fs::read_to_string(marks.join("started"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Wait until `count` gates started (a gate starts on its own thread).
+    fn wait_started(marks: &Path, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let started = started(marks);
+            if started.len() >= count || std::time::Instant::now() > deadline {
+                return started;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn agent_of(db: &Db, mission: i64, task: i64) -> String {
+        db.mission(mission)["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == task)
+            .and_then(|row| row["agent_id"].as_str())
+            .expect("the task's agent")
+            .to_string()
+    }
+
+    /// An empty directory for a holding gate's marks.
+    fn fresh_marks(name: &str) -> PathBuf {
+        let marks = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&marks);
+        std::fs::create_dir_all(&marks).expect("marks");
+        marks
+    }
+
+    /// The integrator's mirror of `source`.
+    fn mirror_of(integrator: &Integrator, source: &str) -> String {
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(source))
+            .expect("mirror")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// A landing commit's parent `n` (1: the main it lands on, 2: the agent's
+    /// head), read from the first of `repos` that has the commit: a gate is
+    /// given the landing commit, one new merge per landing.
+    fn parent(repos: &[&str], commit: &str, n: u8) -> String {
+        repos
+            .iter()
+            .find_map(|repo| git(&["--git-dir", repo, "rev-parse", &format!("{commit}^{n}")]).ok())
+            .unwrap_or_else(|| panic!("no parent {n} of {commit} in {repos:?}"))
+    }
+
+    /// Gates run per mission, concurrently: mission A has two ready tasks,
+    /// B one on a source of its own, and D one on A's source; three gates
+    /// may run. The first pass starts A's first task and B's, and nothing
+    /// else through any number of passes although a gate is free: A's second
+    /// waits for A's first (a mission's tasks stay serial, each judged
+    /// against the main the one before left), and D for A's (they share the
+    /// mirror and main). Then D's runs, judged against the main A's first
+    /// left: it has waited since it was reported, A's second only since A's
+    /// first ended (the longest wait gets the gate). Then A's second.
+    #[test]
+    fn gates_run_per_mission_concurrently() {
+        let marks = fresh_marks("spawn-db-gate-marks");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("concurrent-a", &holding_gate(&marks));
+        integrator.gates = 3;
+        let (base_b, source_b, _, _) = world("concurrent-b", "exit 1\n");
+        let db = Db::new("concurrent_gates");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let d = db.gated_mission(&source_a, &scenarios);
+        let a_one = db.reported_task(a, "a1");
+        let a_two = db.reported_task(a, "a2");
+        let b_task = db.reported_task(b, "b1");
+        let d_task = db.reported_task(d, "d1");
+        let pushed_a_one = push_work(&base_a, &source_a, &agent_of(&db, a, a_one), "a1.txt");
+        let pushed_a_two = push_work(&base_a, &source_a, &agent_of(&db, a, a_two), "a2.txt");
+        let pushed_b = push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
+        let pushed_d = push_work(&base_a, &source_a, &agent_of(&db, d, d_task), "d1.txt");
+        let hold = |count: usize| {
+            for _ in 0..3 {
+                integrator
+                    .pass_on(&db.store)
+                    .expect("a pass while gates run");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let now = started(&marks);
+            assert_eq!(now.len(), count, "nothing else starts: {now:?}");
+            now
+        };
+        let release = || {
+            std::fs::write(marks.join("release"), "").expect("release");
+            integrator.settle();
+            std::fs::remove_file(marks.join("release")).expect("hold again");
+        };
+
+        integrator.pass_on(&db.store).expect("the first pass");
+        let (mirror_a, mirror_b) = (
+            mirror_of(&integrator, &source_a),
+            mirror_of(&integrator, &source_b),
+        );
+        let repos = [mirror_a.as_str(), mirror_b.as_str()];
+        let mut first: Vec<String> = wait_started(&marks, 2)
+            .iter()
+            .map(|commit| parent(&repos, commit, 2))
+            .collect();
+        first.sort();
+        let mut expected = vec![pushed_a_one.clone(), pushed_b.clone()];
+        expected.sort();
+        assert_eq!(first, expected, "A's first and B's, at once");
+        hold(2);
+        assert_eq!(db.mission(d)["tasks"][0]["state"], "reported");
+        release();
+        assert_eq!(
+            parent(&[&source_b], &source_main(&source_b), 2),
+            pushed_b,
+            "B's landed"
+        );
+        let a_first_main = source_main(&source_a);
+        assert_eq!(
+            parent(&[&source_a], &a_first_main, 2),
+            pushed_a_one,
+            "A's first landed"
+        );
+
+        integrator.pass_on(&db.store).expect("the next pass");
+        let second = wait_started(&marks, 3);
+        assert_eq!(
+            parent(&repos, &second[2], 2),
+            pushed_d,
+            "D's, the longest wait"
+        );
+        assert_eq!(
+            parent(&repos, &second[2], 1),
+            a_first_main,
+            "judged against the main A's first left"
+        );
+        hold(3);
+        release();
+        assert_eq!(db.mission(d)["tasks"][0]["state"], "landed");
+        let d_main = source_main(&source_a);
+
+        integrator.pass_on(&db.store).expect("the pass after");
+        let third = wait_started(&marks, 4);
+        assert_eq!(parent(&repos, &third[3], 2), pushed_a_two, "A's second");
+        assert_eq!(
+            parent(&repos, &third[3], 1),
+            d_main,
+            "judged against the main D's left"
+        );
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert!(
+            db.mission(a)["tasks"]
+                .as_array()
+                .expect("tasks")
+                .iter()
+                .all(|row| row["state"] == "landed"),
+            "{}",
+            db.mission(a)
+        );
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// The gate goes to the ready task that has waited longest, across
+    /// missions, not to the lowest mission id: A and B are always ready
+    /// (two tasks each, reported A1, A2, B1, B2) and there is one gate. A2
+    /// waits from the end of A1's judging, after B1 was reported, so the
+    /// missions take turns: A1, B1, A2, B2. Neither waits more than one
+    /// gate behind the other.
+    #[test]
+    fn two_missions_always_ready_take_turns_at_one_gate() {
+        let marks = fresh_marks("spawn-db-gate-turns");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) = world("turns-a", &holding_gate(&marks));
+        integrator.gates = 1;
+        let (base_b, source_b, _, _) = world("turns-b", "exit 1\n");
+        let db = Db::new("turns");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let mut pushed = Vec::new();
+        for (mission, base, source, worker) in [
+            (a, &base_a, &source_a, "a1"),
+            (a, &base_a, &source_a, "a2"),
+            (b, &base_b, &source_b, "b1"),
+            (b, &base_b, &source_b, "b2"),
+        ] {
+            let task = db.reported_task(mission, worker);
+            pushed.push(push_work(
+                base,
+                source,
+                &agent_of(&db, mission, task),
+                &format!("{worker}.txt"),
+            ));
+            // Reported at distinct times.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for turn in 1..=4 {
+            integrator.pass_on(&db.store).expect("a pass");
+            assert_eq!(
+                wait_started(&marks, turn).len(),
+                turn,
+                "gate {turn} started"
+            );
+            integrator.pass_on(&db.store).expect("a pass while it runs");
+            std::fs::write(marks.join("release"), "").expect("release");
+            integrator.settle();
+            std::fs::remove_file(marks.join("release")).expect("hold again");
+        }
+        let (mirror_a, mirror_b) = (
+            mirror_of(&integrator, &source_a),
+            mirror_of(&integrator, &source_b),
+        );
+        let repos = [mirror_a.as_str(), mirror_b.as_str()];
+        let judged: Vec<String> = started(&marks)
+            .iter()
+            .map(|commit| parent(&repos, commit, 2))
+            .collect();
+        let order =
+            |heads: &[&String]| heads.iter().map(|head| (*head).clone()).collect::<Vec<_>>();
+        assert_eq!(
+            judged,
+            order(&[&pushed[0], &pushed[2], &pushed[1], &pushed[3]]),
+            "A1, B1, A2, B2"
+        );
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// An objective mission with a ready backlog, its resident, and up to
+    /// `workers` tasks in flight.
+    fn objective_mission(
+        db: &Db,
+        base: &Path,
+        source: &str,
+        scenarios: &Path,
+        name: &str,
+        workers: u32,
+    ) -> i64 {
+        let backlog = base.join(format!("backlog-{name}"));
+        std::fs::create_dir_all(&backlog).expect("backlog");
+        std::fs::write(
+            backlog.join("001.json"),
+            r#"{"id": 1, "title": "One", "prompt": "Do one."}"#,
+        )
+        .expect("objective");
+        db.store
+            .resident_propose(name, "Pursues objectives")
+            .expect("propose");
+        db.store.resident_approve(name).expect("approve");
+        let mission = db
+            .store
+            .mission_add(name, &json!([source]), "human")
+            .expect("add");
+        db.store
+            .mission_configure(
+                mission,
+                Some(&scenarios.to_string_lossy()),
+                "gate",
+                None,
+                Some(
+                    &json!({"backlog": backlog.to_string_lossy(), "resident": name,
+                             "workers": workers}),
+                ),
+            )
+            .expect("configure");
+        mission
+    }
+
+    /// A mission with a ready task does not delay another mission's
+    /// objective assignment: A (the lower id) assigns an objective and has a
+    /// task to judge, whose gate holds; B, on another source, gets its
+    /// objective in the same pass, and again while A's gate runs.
+    #[test]
+    fn a_ready_mission_does_not_delay_another_missions_assignment() {
+        let marks = fresh_marks("spawn-db-gate-assign");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("assign-a", &holding_gate(&marks));
+        integrator.gates = 1;
+        let (base_b, source_b, _, _) = world("assign-b", "exit 1\n");
+        let db = Db::new("assign_not_delayed");
+        let a = objective_mission(&db, &base_a, &source_a, &scenarios, "ra", 2);
+        let ready = db.reported_task(a, "w");
+        let pushed = push_work(&base_a, &source_a, &agent_of(&db, a, ready), "w.txt");
+        let b = objective_mission(&db, &base_b, &source_b, &scenarios, "rb", 1);
+        let tasks = |mission: i64| db.mission(mission)["tasks"].as_array().map_or(0, Vec::len);
+        assert_eq!((tasks(a), tasks(b)), (1, 0));
+
+        integrator.pass_on(&db.store).expect("one pass");
+        assert_eq!(tasks(a), 2, "A assigned its objective");
+        assert_eq!(tasks(b), 1, "B assigned its objective in the same pass");
+        let mirror = crate::sources::ensure_mirror(&integrator.judge.root, Some(&source_a))
+            .expect("mirror")
+            .to_string_lossy()
+            .to_string();
+        let started = wait_started(&marks, 1);
+        assert_eq!(parent(&[&mirror], &started[0], 2), pushed, "A's gate runs");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass while A's gate holds");
+        assert_eq!(tasks(b), 1, "B's one slot stays filled, nothing doubled");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// A cap of one is one gate at a time across missions, as before.
+    #[test]
+    fn a_cap_of_one_gates_one_mission_at_a_time() {
+        let marks = fresh_marks("spawn-db-gate-cap");
+        let _release = Release(marks.clone());
+        let (base_a, source_a, scenarios, mut integrator) =
+            world("cap-one-a", &holding_gate(&marks));
+        integrator.gates = 1;
+        let (base_b, source_b, _, _) = world("cap-one-b", "exit 1\n");
+        let db = Db::new("cap_one");
+        let a = db.gated_mission(&source_a, &scenarios);
+        let b = db.gated_mission(&source_b, &scenarios);
+        let a_one = db.reported_task(a, "a1");
+        let b_task = db.reported_task(b, "b1");
+        let pushed_a_one = push_work(&base_a, &source_a, &agent_of(&db, a, a_one), "a1.txt");
+        let pushed_b = push_work(&base_b, &source_b, &agent_of(&db, b, b_task), "b1.txt");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        let (mirror_a, mirror_b) = (
+            mirror_of(&integrator, &source_a),
+            mirror_of(&integrator, &source_b),
+        );
+        let repos = [mirror_a.as_str(), mirror_b.as_str()];
+        let heads = || -> Vec<String> {
+            started(&marks)
+                .iter()
+                .map(|commit| parent(&repos, commit, 2))
+                .collect()
+        };
+        integrator.pass_on(&db.store).expect("another pass");
+        wait_started(&marks, 1);
+        assert_eq!(heads(), vec![pushed_a_one.clone()]);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(heads(), vec![pushed_a_one], "B waits for the one gate");
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        integrator.pass_on(&db.store).expect("the pass after");
+        integrator.settle();
+        assert_eq!(heads().last(), Some(&pushed_b));
+        assert_eq!(db.mission(b)["tasks"][0]["state"], "landed");
+        for base in [base_a, base_b, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// The task as the integrator reads it.
+    fn ready_task(db: &Db, task: i64) -> super::Task {
+        let missions: Vec<super::Mission> =
+            serde_json::from_value(db.store.gated_missions().expect("gated")).expect("missions");
+        missions
+            .into_iter()
+            .flat_map(|mission| mission.tasks)
+            .find(|row| row.id == task)
+            .expect("the task")
+    }
+
+    fn verdicts(db: &Db, task: i64) -> Vec<String> {
+        db.admin()
+            .query(
+                "select kind -> 'detail' -> 'record' ->> 'verdict' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                    and kind -> 'detail' -> 'record' ->> 'id' = $1
+                  order by session_seq",
+                &[&task.to_string()],
+            )
+            .expect("verdicts")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// A judging that panics before any record of its own records an
+    /// abort, so the three-aborts halt bounds a bug; one that returns an
+    /// error records nothing (objective 008: an environment error is shown,
+    /// not judged); one that recorded something gets no abort on top of it.
+    #[test]
+    fn a_judging_that_panics_before_its_verdict_is_recorded_aborted() {
+        let (base, source, scenarios, integrator) = world("judging-fails", "exit 1\n");
+        let db = Db::new("judging_fails");
+        let main = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+
+        super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
+            Err("fetch the pushed branch: no such repository".to_string())
+        });
+        assert!(verdicts(&db, task).is_empty(), "an error is no verdict");
+        super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
+            panic!("a bug in the judging")
+        });
+        super::judged_or_aborted(&db.store, &ready_task(&db, task), &main, mission, || {
+            panic!("another bug, {}", "formatted")
+        });
+        assert_eq!(verdicts(&db, task), vec!["aborted", "aborted"]);
+        let reasons: Vec<String> = db
+            .admin()
+            .query(
+                "select kind -> 'detail' -> 'record' ->> 'reason' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'verdict' = 'aborted'
+                  order by session_seq",
+                &[],
+            )
+            .expect("reasons")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert!(reasons[0].contains("a bug in the judging"), "{reasons:?}");
+        assert!(reasons[1].contains("another bug, formatted"), "{reasons:?}");
+
+        // One that recorded its verdict, then failed: no abort on top.
+        let judged = ready_task(&db, task);
+        super::judged_or_aborted(&db.store, &judged, &main, mission, || {
+            db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                              "verdict": "stale", "reason": "behind"}));
+            db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                              "verdict": "rejected", "base": main, "note": "no"}));
+            Err("then the landing failed".to_string())
+        });
+        assert_eq!(
+            verdicts(&db, task),
+            vec!["aborted", "aborted", "stale", "rejected"]
+        );
+
+        // The rejection reset the count: three aborts in a row from here
+        // halt the mission.
+        let other = db.reported_task(mission, "x");
+        for _ in 0..3 {
+            super::judged_or_aborted(&db.store, &ready_task(&db, other), &main, mission, || {
+                panic!("again")
+            });
+        }
+        assert_eq!(verdicts(&db, other), vec!["aborted"; 3]);
+        integrator.pass_on(&db.store).expect("a pass");
+        let halted = db.mission(mission)["halted"].clone();
+        assert!(
+            halted
+                .as_str()
+                .is_some_and(|reason| reason.contains("gate aborts in a row")),
+            "halted: {halted}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Audit #17: a landing's push moved main, and the integrator stopped
@@ -2213,7 +3738,7 @@ mod database_tests {
                           "verdict": "accepted", "base": b0, "candidate": c1}),
         );
         // The mirror exists, as it did when the push went out.
-        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror");
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
 
         integrator.pass_on(&db.store).expect("a pass");
         let waited = db.mission(waiting);
@@ -2249,7 +3774,7 @@ mod database_tests {
         let c2 = main_moves(&base, &source, "on-top.txt");
         db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
                           "verdict": "accepted", "base": b0, "candidate": c1}));
-        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror");
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
 
         integrator.pass_on(&db.store).expect("a pass");
         let after = db.mission(mission);
@@ -2268,7 +3793,7 @@ mod database_tests {
         use std::os::unix::fs::PermissionsExt;
         let (base, source, scenarios, integrator) = world("failed-fetch", "exit 1\n");
         let db = Db::new("failed_fetch");
-        crate::sources::ensure_mirror(&integrator.root, Some(&source)).expect("mirror at F");
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror at F");
         let mission = db.gated_mission(&source, &scenarios);
         let task = db.reported_task(mission, "w");
         let t = main_moves(&base, &source, "deploy.txt");
@@ -2309,11 +3834,12 @@ mod database_tests {
             .expect("a gate configured before the check");
         db.reported_task(mission, "w");
         let base = std::env::temp_dir().join(format!("spawn-db-remote-{}", std::process::id()));
-        let integrator = Integrator {
-            root: base.join("host"),
-            gate: base.join("gate.sh"),
-            gate_env: Vec::new(),
-        };
+        let integrator = Integrator::new(
+            base.join("host"),
+            base.join("gate.sh"),
+            Vec::new(),
+            super::DEFAULT_GATES,
+        );
         integrator.pass_on(&db.store).expect("a pass");
         let halted = db.mission(mission)["halted"].clone();
         assert!(
@@ -2321,6 +3847,257 @@ mod database_tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("never lands")),
             "halted: {halted}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn gated(db: &Db, mission: i64) -> super::Mission {
+        let missions: Vec<super::Mission> =
+            serde_json::from_value(db.store.gated_missions().expect("gated")).expect("missions");
+        missions
+            .into_iter()
+            .find(|found| found.id == mission)
+            .expect("the mission")
+    }
+
+    /// Task 40: the fold. `no_room` keeps the task where it was, names the
+    /// free space, moves neither the abort nor the rejection count, and
+    /// folds the mission's run of them; a gate that judged ends the run, and
+    /// a real abort still counts.
+    #[test]
+    fn no_room_counts_toward_no_halt_and_a_real_abort_still_does() {
+        let (base, source, scenarios, _) = world("no-room-fold", "exit 1\n");
+        let db = Db::new("no_room_fold");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let no_room = |escalate: bool| {
+            json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "no_room",
+                   "reason": "no room to judge now", "free_kb": 1024, "min_gb": 10,
+                   "tmpdir": "/data/tmp", "log": "! gate: short", "escalate": escalate})
+        };
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "aborted", "reason": "a gate that died"}));
+        for _ in 0..4 {
+            db.record(&no_room(false));
+        }
+        db.record(&no_room(true));
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_aborts, 1, "no_room moves no abort count");
+        assert_eq!(after.gate_rejections, 0);
+        assert_eq!(after.gate_room_waits, 5);
+        assert!(after.gate_room_escalated);
+        assert!(after.gate_room_since_ms.is_some() && after.gate_room_last_ms.is_some());
+        assert_eq!(
+            after.tasks[0].state,
+            spawn_core::mission::TaskState::Reported
+        );
+        assert!(after.halted.is_none());
+        assert_eq!(after.gate_room_task, Some(task));
+        let escalations = db.store.gate_room_escalations().expect("escalations");
+        assert_eq!(
+            escalations.as_array().map(Vec::len),
+            Some(1),
+            "{escalations}"
+        );
+        assert_eq!(escalations[0]["mission"], mission);
+        assert_eq!(escalations[0]["free_kb"], 1024);
+        // Told is a record: a digest that reached the supervisor with the
+        // item's tag, however long ago. Until then it stays, whatever its age.
+        let tag = format!("host gate-room-{}", escalations[0]["event_id"]);
+        let digest = |key: &str, succeeded: bool| {
+            db.admin()
+                .execute(
+                    "insert into spawn_commands (principal, idempotency_key, agent_id, session_id,
+                                                 action, state, succeeded, created_at_ms)
+                     values ('spawn-dispatch', $1, 'agent_supervisor', 'session_supervisor',
+                             jsonb_build_object('type', 'input', 'text', 'digest',
+                                                'tags', jsonb_build_array($2::text)),
+                             'finished', $3, 0)",
+                    &[&key, &tag, &succeeded],
+                )
+                .expect("a digest");
+        };
+        digest("dispatch-digest-failed", false);
+        assert_eq!(
+            db.store
+                .gate_room_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "a digest that failed told nothing"
+        );
+        digest("dispatch-digest-told", true);
+        assert_eq!(
+            db.store
+                .gate_room_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "told once, by its record"
+        );
+
+        // A no_room that names no free space or TMPDIR is refused.
+        assert!(
+            db.store
+                .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                           "verdict": "no_room", "reason": "?"}))
+                .is_err()
+        );
+
+        // Two more real aborts make three in a row: the halt still fires.
+        for _ in 0..2 {
+            db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                              "verdict": "aborted", "reason": "bind dir missing"}));
+        }
+        let after = gated(&db, mission);
+        assert_eq!(after.gate_aborts, 3);
+        assert_eq!(after.gate_room_waits, 0, "a gate that ran ends the run");
+        assert!(after.gate_room_since_ms.is_none() && !after.gate_room_escalated);
+        assert!(super::halt_reason(&after, 0).is_some_and(|reason| reason.contains("aborts")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Task 40 review: a run of `no_room` is one task's. The task leaving
+    /// the gate (cancelled, aborted over budget) ends it, and a later task's
+    /// first `no_room` starts a new run: no inherited age, backoff or
+    /// escalation.
+    #[test]
+    fn a_task_leaving_the_gate_ends_its_run_of_no_room() {
+        let (base, source, scenarios, _) = world("no-room-leaves", "exit 1\n");
+        let db = Db::new("no_room_leaves");
+        let mission = db.gated_mission(&source, &scenarios);
+        let no_room = |task: i64, escalate: bool| {
+            json!({"type": "task.gated", "id": task, "revision": 0, "verdict": "no_room",
+                   "reason": "no room", "free_kb": 0, "min_gb": 10, "tmpdir": "/t",
+                   "escalate": escalate})
+        };
+        let first = db.reported_task(mission, "a");
+        for escalate in [false, false, true] {
+            db.record(&no_room(first, escalate));
+        }
+        let before = gated(&db, mission);
+        assert_eq!(
+            (
+                before.gate_room_task,
+                before.gate_room_waits,
+                before.gate_room_escalated
+            ),
+            (Some(first), 3, true)
+        );
+        db.store.task_cancel(first).expect("cancel");
+        let after = gated(&db, mission);
+        assert_eq!(
+            (
+                after.gate_room_task,
+                after.gate_room_waits,
+                after.gate_room_escalated
+            ),
+            (None, 0, false),
+            "cancelled: the run ends"
+        );
+        assert!(after.gate_room_since_ms.is_none() && after.gate_room_last_ms.is_none());
+
+        // A no_room on another task, while the run's task still waits (or
+        // left without a record), starts a new run too.
+        let second = db.reported_task(mission, "b");
+        db.record(&no_room(second, true));
+        let third = db.reported_task(mission, "c");
+        db.record(&no_room(third, false));
+        let after = gated(&db, mission);
+        assert_eq!(
+            (
+                after.gate_room_task,
+                after.gate_room_waits,
+                after.gate_room_escalated
+            ),
+            (Some(third), 1, false),
+            "another task's no_room starts a new run"
+        );
+        assert_eq!(after.gate_room_since_ms, after.gate_room_last_ms);
+        assert_eq!(super::room_wait(&after, second, i64::MAX), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Task 40, end to end: a gate that exits 5 with its no-room fact is
+    /// recorded `no_room` with the free space, the task stays reported, and
+    /// the next pass waits out the backoff instead of running the gate.
+    #[test]
+    fn a_gate_without_room_is_recorded_no_room_and_retried_later() {
+        let gate = "echo 'gate: 0.0 GiB free' >&2\n\
+                    printf '{\"no_room\":true,\"free_kb\":2048,\"min_gb\":10,\"tmpdir\":\"/data/tmp\"}\\n' \
+                    >\"$SPAWN_GATE_VERDICT\"\n\
+                    echo ran >>\"$(dirname \"$0\")/runs\"\n\
+                    exit 5\n";
+        let (base, source, scenarios, integrator) = world("no-room-pass", gate);
+        let db = Db::new("no_room_pass");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent_id = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        let clone = base.join("agent");
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &clone_path]).expect("clone");
+        std::fs::write(clone.join("work.txt"), "work\n").expect("write");
+        super::tests::commit_in(&clone_path, "work");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("HEAD:refs/heads/spawn/{agent_id}"),
+        ])
+        .expect("push the agent's branch");
+
+        // Judgings run on threads: settle each pass's before the next, as
+        // `--once` does.
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        integrator.pass_on(&db.store).expect("a second pass");
+        integrator.settle();
+        let runs = std::fs::read_to_string(base.join("runs")).expect("the gate ran");
+        assert_eq!(
+            runs.lines().count(),
+            1,
+            "the second pass waits out the backoff"
+        );
+        let after = gated(&db, mission);
+        assert_eq!(
+            after.tasks[0].state,
+            spawn_core::mission::TaskState::Reported
+        );
+        assert_eq!((after.gate_aborts, after.gate_rejections), (0, 0));
+        assert_eq!(after.gate_room_waits, 1);
+        let record: Value = db
+            .admin()
+            .query_one(
+                "select kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                  order by session_seq desc limit 1",
+                &[],
+            )
+            .expect("the verdict")
+            .get(0);
+        assert_eq!(record["id"], task);
+        assert_eq!(record["verdict"], "no_room");
+        assert_eq!(record["free_kb"], 2048);
+        assert_eq!(record["tmpdir"], "/data/tmp");
+        assert_eq!(record["escalate"], false);
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("0.0 GiB free in /data/tmp")),
+            "{record}"
+        );
+        assert!(
+            record["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("! gate: 0.0 GiB free"))
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -2368,9 +4145,26 @@ mod database_tests {
         let work = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("work");
 
         integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
         let after = db.mission(mission);
         assert_eq!(after["tasks"][0]["state"], "landed", "{after}");
-        assert_eq!(source_main(&source), work);
+        // One landing commit on top of the base, the work its second parent,
+        // its message from the record (the brief and the report).
+        let main = source_main(&source);
+        let rev = |reference: String| {
+            git(&["--git-dir", &source, "rev-parse", &reference]).expect("rev-parse")
+        };
+        assert_eq!(rev(format!("{main}^1")), b0);
+        assert_eq!(rev(format!("{main}^2")), work);
+        let message =
+            git(&["--git-dir", &source, "show", "-s", "--format=%B", &main]).expect("message");
+        assert!(
+            message.starts_with(&format!(
+                "brief (task {task})\n\nagain\n\nSpawn-Task: {task}\n"
+            )),
+            "{message}"
+        );
+        assert_eq!(after["baseline"], main.as_str());
         let revisions: Vec<Option<String>> = db
             .admin()
             .query(

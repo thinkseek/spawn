@@ -236,7 +236,37 @@ head alone is the whole workspace, so everything below is a git operation.
   caught by the marker check wherever the integrator runs. The gate judges
   the candidate; the integrator moves `main` by a compare-and-swap push. A
   branch head an earlier version wrote with a `Spawn-Large` trailer lands
-  as a commit of the same tree without it.
+  without it: the landing commit's message is the integrator's.
+
+  **A landing is one commit per task on `main`'s first-parent line.** Every
+  landing, also of a branch that already contains `main`, moves `main` by
+  exactly one new merge commit C, never by a fast-forward to a worker's
+  commit: first parent the `main` the gate judged against (the task's base),
+  second parent the pushed head that was judged. C's tree is the head's when
+  `main` is its ancestor, and the merge by `main`'s merge rules otherwise.
+  C is built before the gate runs: the gate judges it, `task.gated` names it
+  in `candidate`, the push moves `main` to exactly it, and `task.landed`
+  names it in `to`. Its message is the integrator's, written from the record
+  alone (never from a workspace), and says what landed: the first line is
+  the objective's title (the brief's first line) with the objective and the
+  task, `Greet the harbour (objective 7, task 42)`, or, for a task without
+  an objective, the brief's first non-empty line and `(task <id>)`; after a
+  blank line, the report's `## What changed` section (the whole report when
+  it has none), at most 3000 characters, with any line of it that could
+  read as a `Spawn-` trailer indented; last, the trailers `Spawn-Task`,
+  `Spawn-Objective` and `Spawn-Head` (the judged head). Author and committer
+  are `spawn-integrate`, unsigned. So `git log --first-parent main` reads one
+  line per landed task, `git bisect start --first-parent` (git 2.29+) visits
+  only landings, each one gated (a plain bisect may stop on an ungated
+  checkpoint: the price of keeping the history), and `git revert -m 1 <C>`
+  undoes exactly one task. The worker's checkpoints stay reachable from
+  `main` through the second parents, off that line, so a reverted objective
+  comes back as a new task from the current `main` (or by reverting the
+  revert), never by merging the same branch again. It is a merge and not a
+  squash so that no other ref has to keep the history, and so that the
+  worker's head is in `main`: the next merge of `main` into its branch is
+  clean, where after a squash every later merge would see the same change
+  from both sides.
 
 ## Files over the cap
 
@@ -319,10 +349,19 @@ state and wedges nothing:
 
 - **The gate refuses to start without room.** With less than
   `SPAWN_GATE_MIN_FREE_GB` (default 10) GiB free in `TMPDIR`, `gate.sh`
-  exits 3 before it makes any scratch (`scripts/disk.sh`): an abort, which
-  the integrator records and retries, never a verdict on the candidate. The
-  integrator passes the variable through. The gate's scratch is
+  exits 5 with a no-room fact before it makes any scratch
+  (`scripts/disk.sh`). The integrator records it as `no_room`, which is
+  never a verdict on the candidate and never counts toward a halt. If no
+  room is left even for the fact, the integrator measures `TMPDIR` itself.
+  It tries again with a backoff, and after 2 hours it tells the supervisor
+  once (fleet-architecture.md §10.2, §10.3). The integrator passes the variable
+  through. The gate's scratch is
   `$TMPDIR/spawn-gate.XXXXXX`, so cleanup can tell it from everyone else's.
+  The integrator runs one gate at a time (`--gates`, more only with a test
+  server per gate); each gate checks the floor at its own start. Measured
+  2026-11-06, a Spawn gate's scratch peaks near 1.7 GiB, two at once
+  3.4 GiB, well inside the default floor. Routine cleanup removes only scratch untouched for a day, which no
+  running gate (45 minutes at most) is.
 - **The loop watches free space.** Once a minute `spawn loop` reads the free
   space of the workspace root and `TMPDIR` (`df`). A path that falls under
   `SPAWN_DISK_WARN_GB` (default 20) GiB is recorded once as a control record
