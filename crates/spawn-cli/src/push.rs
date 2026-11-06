@@ -79,12 +79,22 @@ pub(crate) fn push_branch(mirror: &Path, source: &str, branch: &str) -> Pushed {
     if output.status.success() {
         return Pushed::Done;
     }
-    // `--porcelain` flags a refused ref with `!`, whatever the language.
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    // `--porcelain` flags a ref that was not pushed with `!`, and its
+    // summary is never translated. `[rejected]` is git's own refusal:
+    // `spawn/<agent>` is not an ancestor of the head (a rewritten branch).
+    // What the receiving side refused or never answered (`[remote
+    // rejected]`, `[remote failure]`: a ref lock another push held, a hook)
+    // may pass on a retry: a failure, retried (issue #8).
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Some(line) = stdout.lines().find(|line| line.starts_with('!')) {
-        return Pushed::Rejected(line.replace('\t', " ").trim().to_string());
+        let line = line.replace('\t', " ").trim().to_string();
+        if line.contains("[rejected]") {
+            return Pushed::Rejected(line);
+        }
+        return Pushed::Failed(format!("{line}: {stderr}"));
     }
-    Pushed::Failed(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    Pushed::Failed(stderr)
 }
 
 
