@@ -186,6 +186,7 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
             Runner::Running
         );
         assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
+        server.wait_running("cat");
         host.terminate(&terminal(), &workspace()).expect("kill");
         assert_eq!(
             host.runner(&terminal(), &workspace()).expect("runner"),
@@ -240,7 +241,84 @@ fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
             host.runner(&terminal(), &workspace()).expect("runner"),
             Runner::Running
         );
+        server.wait_running("cat");
         // The server's only session: it shuts down next.
         host.terminate(&terminal(), &workspace()).expect("kill");
     }
+}
+
+/// The environment files of this process's launches that are still there.
+fn environment_files() -> Vec<String> {
+    let directory = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let prefix = format!("spawn-launch-spawn-exec_1-{}-", std::process::id());
+    fs::read_dir(&directory)
+        .expect("read the directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect()
+}
+
+/// A launch is asked for again only when tmux said the server left
+/// ("server exited unexpectedly", as tmux reports a server that shut down
+/// before it read the call), each time with a new environment file, and a
+/// few times at most.
+#[test]
+fn a_launch_is_asked_again_only_of_a_server_that_left() {
+    let _exclusive = exclusive();
+    let server = Server::new("left");
+    let calls = server.directory.join("calls");
+    let left = server.directory.join("left");
+    let logged = || {
+        let calls = fs::read_to_string(&calls).unwrap_or_default();
+        fs::remove_file(server.directory.join("calls")).ok();
+        calls.lines().map(str::to_string).collect::<Vec<_>>()
+    };
+    // `new-session` meets a server that left while the marker `left` is
+    // there (`once`: the first time only); every call is logged.
+    let tmux = |once: bool| {
+        server.host_through(&format!(
+            "printf '%s\\n' \"$1\" >>'{calls}'\n\
+             if [ \"$1\" = new-session ] && [ -e '{left}' ]; then\n\
+             {forget}  echo 'server exited unexpectedly' >&2\n  exit 1\nfi\nexec {tmux}",
+            calls = calls.display(),
+            left = left.display(),
+            forget = if once {
+                format!("  rm -f '{}'\n", left.display())
+            } else {
+                String::new()
+            },
+            tmux = server.command(),
+        ))
+    };
+    let before = environment_files();
+
+    fs::write(&left, "").expect("marker");
+    let host = tmux(true);
+    host.start(&launch("/bin/cat", &[], &[("A", "1")]))
+        .expect("the second call starts it");
+    assert_eq!(logged(), ["new-session", "new-session"]);
+    assert_eq!(
+        host.runner(&terminal(), &workspace()).expect("runner"),
+        Runner::Running
+    );
+    server.wait_running("cat");
+    host.terminate(&terminal(), &workspace()).expect("kill");
+    let _ = logged();
+
+    fs::write(&left, "").expect("marker");
+    let host = tmux(false);
+    let error = host
+        .start(&launch("/bin/cat", &[], &[("A", "1")]))
+        .expect_err("a server that always leaves");
+    assert!(error.0.contains("server exited unexpectedly"), "{error:?}");
+    let asked = logged();
+    assert!(
+        asked.len() > 1 && asked.len() <= 5 && asked.iter().all(|call| call == "new-session"),
+        "{asked:?}"
+    );
+    assert_eq!(environment_files(), before, "an environment file was left");
 }
