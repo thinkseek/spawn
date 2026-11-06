@@ -226,7 +226,8 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
 }
 
 /// A launch right after the server's last terminal ended (the only
-/// execution stopped, the next one starts) starts: its `new-session` may
+/// execution was killed just after it started, as one whose prompt could
+/// not be typed is, and the next one starts) starts: its `new-session` may
 /// reach the server while it shuts down, which drops it unread ("server
 /// exited unexpectedly"), and that says nothing about the launch.
 #[test]
@@ -234,6 +235,7 @@ fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
     let _exclusive = exclusive();
     let server = Server::new("restart");
     let host = server.host();
+    let before = environment_files();
     for round in 0..20 {
         host.start(&launch("/bin/cat", &[], &[]))
             .unwrap_or_else(|error| panic!("start {round}: {error:?}"));
@@ -241,20 +243,31 @@ fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
             host.runner(&terminal(), &workspace()).expect("runner"),
             Runner::Running
         );
-        server.wait_running("cat");
-        // The server's only session: it shuts down next.
+        // At once, while the pane may still be forking with the server's
+        // socket open: the server's only session, so it shuts down next.
         host.terminate(&terminal(), &workspace()).expect("kill");
     }
+    // A pane killed before its shell ran leaves its environment file.
+    let directory = environment_directory();
+    for name in environment_files() {
+        if !before.contains(&name) {
+            let _ = fs::remove_file(directory.join(name));
+        }
+    }
+}
+
+/// Where a launch's environment file is written.
+fn environment_directory() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// The environment files of this process's launches that are still there.
 fn environment_files() -> Vec<String> {
-    let directory = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
     let prefix = format!("spawn-launch-spawn-exec_1-{}-", std::process::id());
-    fs::read_dir(&directory)
+    fs::read_dir(environment_directory())
         .expect("read the directory")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
