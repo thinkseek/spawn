@@ -117,12 +117,21 @@ export function MissionTimeline({
     [all, missions, now, reasons],
   );
 
-  const [missionFilter, setMissionFilter] = useState<number | null>(null);
-  const [stateFilter, setStateFilter] = useState<StateFilter>("all");
+  const [missionFilter, pickMission] = useState<number | null>(null);
+  const [stateFilter, pickState] = useState<StateFilter>("all");
   // Folds the reader flipped: a closed mission's lane and the cancelled
   // section start folded, the rest open (see `folded`).
   const [toggled, setToggled] = useState<Set<string>>(() => new Set());
   const [moreMissions, setMoreMissions] = useState(false);
+  // A new filter starts from its own defaults (nothing folded under one).
+  const setMissionFilter = (next: number | null) => {
+    pickMission(next);
+    setToggled(new Set());
+  };
+  const setStateFilter = (next: StateFilter) => {
+    pickState(next);
+    setToggled(new Set());
+  };
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
 
