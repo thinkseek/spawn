@@ -2395,10 +2395,12 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
     };
     let verdict = |task: i64, revision: i32, verdict: &str| {
         store
-            .integrator_record(&json!({"type": "task.gated", "id": task, "revision": revision,
+            .integrator_record(
+                &json!({"type": "task.gated", "id": task, "revision": revision,
                                        "verdict": verdict, "base": "b1", "note": "real",
                                        "candidate": "c1", "reason": "r", "free_kb": 1,
-                                       "min_gb": 10, "tmpdir": "/t"}))
+                                       "min_gb": 10, "tmpdir": "/t"}),
+            )
             .expect("record a verdict");
     };
     let mission_row = |client: &mut Client| tables(client)["missions"][0].clone();
@@ -2434,7 +2436,9 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
     }));
     assert!(refused(&|record| record["evidence"] = json!("a hunch")));
     assert!(refused(&|record| record["failures"] = json!([])));
-    assert!(refused(&|record| record["failures"] = json!("Connection refused")));
+    assert!(refused(
+        &|record| record["failures"] = json!("Connection refused")
+    ));
     assert!(refused(&|record| record["backoff_ms"] = json!("5 min")));
     assert!(refused(&|record| record["evidence"] = json!("server_log")));
     assert!(refused(&|record| {
@@ -2446,7 +2450,9 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
     verdict(task, 0, "rejected");
     store.task_delivered(task, 2).expect("delivered again");
     assert!(store.task_reported(task, "again").expect("reported"));
-    store.task_review(task, true, "", Some(1)).expect("accept again");
+    store
+        .task_review(task, true, "", Some(1))
+        .expect("accept again");
     verdict(task, 1, "aborted");
     let before = task_row(&mut client, task);
     assert_eq!(
@@ -2458,7 +2464,11 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
         .integrator_record(&host_fault(task, 1, 1, 300_000))
         .expect("the store accepts host_fault");
     let (record, at) = recorded(&mut client, event);
-    assert_eq!(record["due_ms"], at + 300_000, "its own time plus the backoff");
+    assert_eq!(
+        record["due_ms"],
+        at + 300_000,
+        "its own time plus the backoff"
+    );
     let after = task_row(&mut client, task);
     assert_eq!(after["state"], "accepted", "the task stays where it was");
     assert_eq!(after["revisions"], 1);
@@ -2466,7 +2476,10 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
     assert_eq!(after["review_note"], "real");
     assert_eq!(after["candidate"], before["candidate"]);
     let row = mission_row(&mut client);
-    assert_eq!((row["gate_rejections"].clone(), row["gate_aborts"].clone()), (json!(1), json!(1)));
+    assert_eq!(
+        (row["gate_rejections"].clone(), row["gate_aborts"].clone()),
+        (json!(1), json!(1))
+    );
     assert_eq!(row["gate_host_faults"], 1);
     assert_eq!(row["gate_host_task"], task);
     assert_eq!(row["gate_host_due_ms"], at + 300_000);
@@ -2496,11 +2509,18 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
     assert_eq!(row["gate_host_faults"], 2);
     assert_eq!(row["gate_host_due_ms"], at + 600_000);
     assert_eq!(record["due_ms"], at + 600_000);
-    assert_eq!((row["gate_rejections"].clone(), row["gate_aborts"].clone()), (json!(1), json!(1)));
+    assert_eq!(
+        (row["gate_rejections"].clone(), row["gate_aborts"].clone()),
+        (json!(1), json!(1))
+    );
 
     // The second in a row is an escalation, until a digest tells it.
     let escalations = store.gate_host_fault_escalations().expect("escalations");
-    assert_eq!(escalations.as_array().map(Vec::len), Some(1), "{escalations}");
+    assert_eq!(
+        escalations.as_array().map(Vec::len),
+        Some(1),
+        "{escalations}"
+    );
     assert_eq!(escalations[0]["event_id"], second);
     assert_eq!(escalations[0]["mission"], mission);
     assert_eq!(escalations[0]["due_ms"], at + 600_000);
