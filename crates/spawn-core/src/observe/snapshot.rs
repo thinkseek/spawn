@@ -89,7 +89,9 @@ impl Snapshot {
                 if record.event.execution_id.is_some()
                     && self.execution.is_some()
                     && record.event.execution_id != self.execution => {}
-            EventKind::ExecutionEnded { cause, exit_code } => {
+            EventKind::ExecutionEnded {
+                cause, exit_code, ..
+            } => {
                 self.execution_active = false;
                 self.stalled_end = None;
                 self.last_end = Some(*cause);

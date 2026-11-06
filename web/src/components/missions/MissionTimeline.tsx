@@ -9,6 +9,8 @@ import {
   STATE_FILTERS,
   deriveMissionTimeline,
   filterLanes,
+  hasBars,
+  isLive,
   phaseAt,
 } from "../../missionTimeline";
 import type {
@@ -20,6 +22,8 @@ import type {
   VerdictReasons,
 } from "../../missionTimeline";
 import type { Mission } from "../../missions";
+import type { TaskSection } from "../../ordering";
+import { SECTION_LABEL, groupTasks, missionClass, taskTitle } from "../../ordering";
 import { LINEAR, foldIdle } from "../../timeFold";
 import { fitDomain } from "../../timeWindow";
 import { Overview } from "../timeaxis/Overview";
@@ -43,21 +47,47 @@ import {
   useWheelZoom,
   useWidth,
 } from "../timeaxis/useTimeWindow";
-import { cx } from "../ui";
+import { EmptyState, FOCUS_RING, FOCUS_RING_INSET, cx } from "../ui";
 import { useStoredChoice } from "../ViewToggle";
 import { TaskPanel } from "./TaskPanel";
 import { PHASE_COLOR, PHASE_LEGEND, verdictColor } from "./timelineStyle";
 
 const LANE_H = 40;
+const SECTION_H = 24;
 const ROW_H = 34;
+const ATTEMPT_H = 28;
 const BAR_H = 14;
 const RADIUS = 4;
 /** Gap between a bar's segments, in the surface colour. */
 const GAP = 2;
 
 type Row =
-  | { kind: "lane"; key: string; lane: Lane; y: number; h: number }
-  | { kind: "task"; key: string; lane: Lane; bar: TaskBar; y: number; h: number };
+  | { kind: "lane"; key: string; lane: Lane; y: number; h: number; folded: boolean }
+  | {
+      kind: "section";
+      key: string;
+      lane: Lane;
+      section: TaskSection;
+      count: number;
+      y: number;
+      h: number;
+      folded: boolean;
+    }
+  | {
+      kind: "task";
+      key: string;
+      lane: Lane;
+      bar: TaskBar;
+      y: number;
+      h: number;
+      /** 0: a row of the list; 1: an earlier attempt nested under it. */
+      depth: 0 | 1;
+      title: string | null;
+      /** How a nested attempt ended. */
+      outcome: string | null;
+      /** Attempts at the row's objective, this one included. */
+      retries: number;
+    };
 
 interface Hover {
   key: string;
@@ -89,8 +119,10 @@ export function MissionTimeline({
 }) {
   const reduceMotion = useReducedMotion() ?? false;
   const ids = useId();
-  const all = useMemo(() => deriveMissionTimeline(missions, 0, reasons), [missions, reasons]);
-  const live = all.lanes.some((lane) => lane.bars.some((bar) => bar.end === null && !bar.stalled));
+  // Seeded at the wall clock so a board with no bars at all (a mission
+  // before its first task) has today's fallback extent, not epoch 0.
+  const all = useMemo(() => deriveMissionTimeline(missions, Date.now(), reasons), [missions, reasons]);
+  const live = isLive(all);
   const now = useNowWhile(live);
   // Ordering and extent depend on now only through open bars.
   const timeline = useMemo(
@@ -98,9 +130,21 @@ export function MissionTimeline({
     [all, missions, now, reasons],
   );
 
-  const [missionFilter, setMissionFilter] = useState<number | null>(null);
-  const [stateFilter, setStateFilter] = useState<StateFilter>("all");
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [missionFilter, pickMission] = useState<number | null>(null);
+  const [stateFilter, pickState] = useState<StateFilter>("all");
+  // Folds the reader set, by lane or section key; the rest follow their
+  // default (see `folded`).
+  const [folds, setFolds] = useState<ReadonlyMap<string, boolean>>(() => new Map());
+  const [moreMissions, setMoreMissions] = useState(false);
+  // A new filter starts from its own defaults (nothing folded under one).
+  const setMissionFilter = (next: number | null) => {
+    pickMission(next);
+    setFolds(new Map());
+  };
+  const setStateFilter = (next: StateFilter) => {
+    pickState(next);
+    setFolds(new Map());
+  };
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
 
@@ -108,22 +152,82 @@ export function MissionTimeline({
     () => filterLanes(timeline.lanes, missionFilter, stateFilter),
     [timeline, missionFilter, stateFilter],
   );
+  // A closed mission's lane and the cancelled section start folded, unless
+  // a filter is on (it shows what it picked) or they hold the selected task
+  // (its row and panel stay in view); a fold the reader set wins.
+  const holdsSelection = useCallback(
+    (bars: readonly TaskBar[]) =>
+      bars.some((bar) => (onSelectTask ? bar.task.id === selectedTask : bar.key === selectedKey)),
+    [onSelectTask, selectedTask, selectedKey],
+  );
+  const folded = useCallback(
+    (key: string, byDefault: boolean, bars: readonly TaskBar[]) =>
+      folds.get(key) ??
+      (byDefault && missionFilter === null && stateFilter === "all" && !holdsSelection(bars)),
+    [folds, missionFilter, stateFilter, holdsSelection],
+  );
   const rows = useMemo(() => {
     const list: Row[] = [];
     let y = 0;
     for (const lane of lanes) {
+      const laneFolded = !compact && folded(lane.key, missionClass(lane.mission) === "closed", lane.bars);
       if (!compact) {
-        list.push({ kind: "lane", key: lane.key, lane, y, h: LANE_H });
+        list.push({ kind: "lane", key: lane.key, lane, y, h: LANE_H, folded: laneFolded });
         y += LANE_H;
       }
-      if (collapsed.has(lane.key)) continue;
-      for (const bar of lane.bars) {
-        list.push({ kind: "task", key: bar.key, lane, bar, y, h: ROW_H });
-        y += ROW_H;
+      if (laneFolded) continue;
+      // The one task order (ordering.ts): in flight, landed or accepted,
+      // sent back, cancelled; an objective's retries nest under its latest.
+      for (const { section, groups } of groupTasks(lane.bars, (bar) => bar.task, lane.mission)) {
+        const sectionKey = `${lane.key}:${section}`;
+        const sectionBars = groups.flatMap((group) => [group.item, ...group.earlier.map((attempt) => attempt.item)]);
+        const sectionFolded = folded(sectionKey, section === "cancelled", sectionBars);
+        list.push({
+          kind: "section",
+          key: sectionKey,
+          lane,
+          section,
+          count: groups.length,
+          y,
+          h: SECTION_H,
+          folded: sectionFolded,
+        });
+        y += SECTION_H;
+        if (sectionFolded) continue;
+        for (const group of groups) {
+          list.push({
+            kind: "task",
+            key: group.item.key,
+            lane,
+            bar: group.item,
+            y,
+            h: ROW_H,
+            depth: 0,
+            title: taskTitle(group.task, { missionName: lane.name }),
+            outcome: null,
+            retries: group.earlier.length + 1,
+          });
+          y += ROW_H;
+          for (const attempt of group.earlier) {
+            list.push({
+              kind: "task",
+              key: attempt.item.key,
+              lane,
+              bar: attempt.item,
+              y,
+              h: ATTEMPT_H,
+              depth: 1,
+              title: null,
+              outcome: attempt.outcome,
+              retries: 1,
+            });
+            y += ATTEMPT_H;
+          }
+        }
       }
     }
     return { list, height: y };
-  }, [lanes, collapsed, compact]);
+  }, [lanes, folded, compact]);
 
   // The axis spans what the filters show, so one mission fills the width.
   const shown = useMemo(() => {
@@ -152,7 +256,8 @@ export function MissionTimeline({
   const scrollRef = useRef<HTMLDivElement>(null);
   const rowsRef = useRef<HTMLDivElement>(null);
   const width = useWidth(scrollRef);
-  const labelW = width < 640 ? 132 : compact ? 150 : 236;
+  // Rows carry a title beside the id, so the label column grows on wide screens.
+  const labelW = width < 640 ? 132 : compact ? (width >= 900 ? 250 : 150) : width >= 1200 ? 330 : 236;
   const plotW = Math.max(0, width - labelW - 20);
   const view = useTimeWindow(extent, plotW, reduceMotion);
   const { domain } = view;
@@ -186,21 +291,16 @@ export function MissionTimeline({
   const zoomToBar = (bar: TaskBar) =>
     view.zoomTo(fold.fold(bar.start), fold.fold(bar.end ?? now));
   const choose = (row: Row) => {
-    if (row.kind === "lane") {
-      toggleLane(row.lane.key);
+    if (row.kind !== "task") {
+      toggleFold(row.key, row.folded);
       return;
     }
     if (onSelectTask) {
       if (row.bar.task.id !== null) onSelectTask(row.bar.task.id);
     } else setSelectedKey((current) => (current === row.key ? null : row.key));
   };
-  const toggleLane = (key: string) =>
-    setCollapsed((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  const toggleFold = (key: string, wasFolded: boolean) =>
+    setFolds((current) => new Map(current).set(key, !wasFolded));
 
   const locate = (event: PointerEvent | MouseEvent) => {
     const rect = rowsRef.current!.getBoundingClientRect();
@@ -290,214 +390,238 @@ export function MissionTimeline({
   };
 
   const hoveredRow = hover ? rows.list.find((row) => row.key === hover.key) : undefined;
-  const nowX = timeline.openCount > 0 ? px(now) : null;
+  // The marker follows the clock: it shows only while a task is live, never
+  // frozen at page load for a halted mission's stalled task.
+  const nowX = live ? px(now) : null;
   const totalTasks = timeline.lanes.reduce((sum, lane) => sum + lane.bars.length, 0);
+  const empty = !hasBars(timeline);
 
   return (
     <div ref={rootRef} className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-5">
         {header}
-        <Legend />
-        <div className="ml-auto flex items-center gap-1">
-          {fold !== LINEAR || folding === "off" ? (
-            <button
-              type="button"
-              aria-pressed={folding === "on"}
-              onClick={() => setFolding(folding === "on" ? "off" : "on")}
-              title={
-                folding === "on"
-                  ? "Idle stretches of 30 min or more are folded into marked breaks; click for a linear axis"
-                  : "A linear axis; click to fold idle stretches into breaks"
-              }
-              className={cx(
-                "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption transition-colors hover:bg-surface-hover",
-                folding === "on" ? "text-foreground" : "text-muted-foreground",
-              )}
-            >
-              <FoldHorizontal size={13} />
-              {folding === "on" ? "Idle folded" : "Linear"}
-            </button>
-          ) : null}
-          <ZoomControls view={view} fitLabel="Fit every task" />
-        </div>
+        {!empty && <Legend />}
+        {!empty && (
+          <div className="ml-auto flex items-center gap-1">
+            {fold !== LINEAR || folding === "off" ? (
+              <button
+                type="button"
+                aria-pressed={folding === "on"}
+                onClick={() => setFolding(folding === "on" ? "off" : "on")}
+                title={
+                  folding === "on"
+                    ? "Idle stretches of 30 min or more are folded into marked breaks; click for a linear axis"
+                    : "A linear axis; click to fold idle stretches into breaks"
+                }
+                className={cx(
+                  "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-caption transition-colors hover:bg-surface-hover",
+                  folding === "on" ? "text-foreground" : "text-muted-foreground",
+                )}
+              >
+                <FoldHorizontal size={13} />
+                {folding === "on" ? "Idle folded" : "Linear"}
+              </button>
+            ) : null}
+            <ZoomControls view={view} fitLabel="Fit every task" />
+          </div>
+        )}
       </div>
 
-      {!compact && (
-        <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 pb-2 sm:px-5">
-          {timeline.lanes.length > 1 && (
-            <Chips
-              label="Mission"
-              value={missionFilter}
-              onChange={setMissionFilter}
-              options={[
-                { id: null, label: "All missions" },
-                ...timeline.lanes.map((lane) => ({ id: lane.mission.id, label: lane.name })),
-              ]}
-            />
+      {empty ? (
+        <EmptyState
+          className="flex-1"
+          title="No tasks yet"
+          hint="Tasks appear here once the integrator assigns one."
+        />
+      ) : (
+        <>
+          {!compact && (
+            <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 px-4 pb-2 sm:px-5">
+              {timeline.lanes.length > 1 && (
+                <MissionChips
+                  lanes={timeline.lanes}
+                  value={missionFilter}
+                  onChange={setMissionFilter}
+                  more={moreMissions}
+                  onMore={() => setMoreMissions(!moreMissions)}
+                />
+              )}
+              <Chips
+                label="Task state"
+                value={stateFilter}
+                onChange={setStateFilter}
+                options={STATE_FILTERS.map((entry) => ({ id: entry.id, label: entry.label }))}
+              />
+            </div>
           )}
-          <Chips
-            label="Task state"
-            value={stateFilter}
-            onChange={setStateFilter}
-            options={STATE_FILTERS.map((entry) => ({ id: entry.id, label: entry.label }))}
-          />
-        </div>
-      )}
 
-      {!compact && (
-        <div className="flex shrink-0 items-stretch px-4 sm:px-5">
-          <div
-            className="flex shrink-0 flex-col justify-center pr-3 text-caption"
-            style={{ width: labelW - 16 }}
-          >
-            <span className="tnum text-muted-foreground">
-              {formatDuration(timeline.end - timeline.start)}
-            </span>
-            <span className="tnum truncate text-faint-foreground">
-              {totalTasks} task{totalTasks === 1 ? "" : "s"}
-              {timeline.openCount > 0 && ` · ${timeline.openCount} open`}
-            </span>
-          </div>
-          <Overview
-            lines={overviewLines}
-            extent={extent}
-            domain={domain}
-            width={plotW}
-            onDomain={view.setDomain}
-            onGlide={view.glideTo}
-          />
-        </div>
-      )}
-
-      <div className="relative flex min-h-0 flex-1">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <AxisRow
-            ticks={ticks}
-            breaks={breaks}
-            labelW={labelW}
-            plotW={plotW}
-            caption={compact ? "Task" : "Mission · task"}
-          />
-          <div ref={scrollRef} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-6">
-            {rows.list.length === 0 ? (
-              <p className="px-5 py-10 text-center text-caption text-faint-foreground">
-                No task matches these filters.
-              </p>
-            ) : (
+          {!compact && (
+            <div className="flex shrink-0 items-stretch px-4 sm:px-5">
               <div
-                ref={rowsRef}
-                role="tree"
-                aria-label="Missions timeline"
-                tabIndex={0}
-                onKeyDown={onKeyDown}
-                onPointerDown={onPointerDown}
-                onPointerMove={onPointerMove}
-                onPointerUp={onPointerUp}
-                onPointerCancel={() => pan.cancel()}
-                onPointerLeave={() => setHover(null)}
-                onDoubleClick={(event) => {
-                  const { row, x } = locate(event);
-                  if (row?.kind === "task" && x >= 0) zoomToBar(row.bar);
-                }}
-                className={cx(
-                  "relative select-none outline-none",
-                  pan.dragging ? "cursor-grabbing" : "cursor-default",
-                )}
-                style={{ height: rows.height }}
+                className="flex shrink-0 flex-col justify-center pr-3 text-caption"
+                style={{ width: labelW - 16 }}
               >
-                {rows.list.map((row) =>
-                  row.kind === "lane" ? null : (
-                    <TaskLabel
-                      key={row.key}
-                      row={row}
-                      labelW={labelW}
-                      hovered={hover?.key === row.key}
-                      selected={selected?.key === row.key}
-                      onSelect={() => choose(row)}
-                    />
-                  ),
-                )}
+                <span className="tnum text-muted-foreground">
+                  {formatDuration(timeline.end - timeline.start)}
+                </span>
+                <span className="tnum truncate text-faint-foreground">
+                  {totalTasks} task{totalTasks === 1 ? "" : "s"}
+                  {timeline.openCount > 0 && ` · ${timeline.openCount} open`}
+                </span>
+              </div>
+              <Overview
+                lines={overviewLines}
+                extent={extent}
+                domain={domain}
+                width={plotW}
+                onDomain={view.setDomain}
+                onGlide={view.glideTo}
+              />
+            </div>
+          )}
 
-                <svg
-                  aria-hidden="true"
-                  width={plotW}
-                  height={rows.height}
-                  className="pointer-events-none absolute top-0 overflow-hidden"
-                  style={{ left: labelW }}
-                >
-                  <defs>
-                    {(Object.keys(PHASE_COLOR) as Array<keyof typeof PHASE_COLOR>).map((phase) => (
-                      <TailGradient key={phase} id={`${ids}-tail-${phase}`} color={PHASE_COLOR[phase]} />
-                    ))}
-                    <pattern
-                      id={`${ids}-hatch`}
-                      width={5}
-                      height={5}
-                      patternUnits="userSpaceOnUse"
-                      patternTransform="rotate(45)"
-                    >
-                      <rect width={5} height={5} fill="var(--warning)" opacity={0.14} />
-                      <line x1={0} y1={0} x2={0} y2={5} stroke="var(--warning)" strokeWidth={2} opacity={0.75} />
-                    </pattern>
-                    <clipPath id={`${ids}-plot`}>
-                      <rect x={0} y={0} width={plotW} height={rows.height} />
-                    </clipPath>
-                  </defs>
-                  <g clipPath={`url(#${ids}-plot)`}>
-                    <BreakBands breaks={breaks} height={rows.height} />
-                    <Gridlines ticks={ticks} height={rows.height} />
-                    <NowLine x={nowX} height={rows.height} plotW={plotW} />
+          <div className="relative flex min-h-0 flex-1">
+            <div className="flex min-w-0 flex-1 flex-col">
+              <AxisRow
+                ticks={ticks}
+                breaks={breaks}
+                labelW={labelW}
+                plotW={plotW}
+                caption={compact ? "Task" : "Mission · task"}
+              />
+              <div ref={scrollRef} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto pb-6">
+                {rows.list.length === 0 ? (
+                  <p className="px-5 py-10 text-center text-caption text-faint-foreground">
+                    No task matches these filters.
+                  </p>
+                ) : (
+                  <div
+                    ref={rowsRef}
+                    role="tree"
+                    aria-label="Missions timeline"
+                    tabIndex={0}
+                    onKeyDown={onKeyDown}
+                    onPointerDown={onPointerDown}
+                    onPointerMove={onPointerMove}
+                    onPointerUp={onPointerUp}
+                    onPointerCancel={() => pan.cancel()}
+                    onPointerLeave={() => setHover(null)}
+                    onDoubleClick={(event) => {
+                      const { row, x } = locate(event);
+                      if (row?.kind === "task" && x >= 0) zoomToBar(row.bar);
+                    }}
+                    className={cx(
+                      "relative select-none",
+                      FOCUS_RING_INSET,
+                      pan.dragging ? "cursor-grabbing" : "cursor-default",
+                    )}
+                    style={{ height: rows.height }}
+                  >
                     {rows.list.map((row) =>
-                      row.kind === "lane" ? (
-                        <LaneBand key={row.key} row={row} px={px} now={now} />
-                      ) : (
-                        <Bar
+                      row.kind === "lane" ? null : row.kind === "section" ? (
+                        <SectionRowLabel
                           key={row.key}
-                          bar={row.bar}
-                          cy={row.y + row.h / 2 + 3}
-                          px={px}
-                          plotW={plotW}
-                          now={now}
-                          ids={ids}
-                          hovered={hover?.key === row.key ? hover.verdict : null}
+                          row={row}
+                          short={labelW < 200}
+                          onSurface={compact}
+                          folded={row.folded}
+                          onToggle={() => toggleFold(row.key, row.folded)}
+                        />
+                      ) : (
+                        <TaskLabel
+                          key={row.key}
+                          row={row}
+                          labelW={labelW}
+                          titled={labelW >= 200}
+                          hovered={hover?.key === row.key}
+                          selected={selected?.key === row.key}
+                          onSelect={() => choose(row)}
                         />
                       ),
                     )}
-                  </g>
-                </svg>
-                {/* Lane headers sit above the plot, on the canvas colour, so
-                    their text never runs over a gridline. */}
-                {rows.list.map((row) =>
-                  row.kind === "lane" ? (
-                    <LaneLabel
-                      key={row.key}
-                      row={row}
-                      collapsed={collapsed.has(row.lane.key)}
-                      onToggle={() => toggleLane(row.lane.key)}
-                    />
-                  ) : null,
+
+                    <svg
+                      aria-hidden="true"
+                      width={plotW}
+                      height={rows.height}
+                      className="pointer-events-none absolute top-0 overflow-hidden"
+                      style={{ left: labelW }}
+                    >
+                      <defs>
+                        {(Object.keys(PHASE_COLOR) as Array<keyof typeof PHASE_COLOR>).map((phase) => (
+                          <TailGradient key={phase} id={`${ids}-tail-${phase}`} color={PHASE_COLOR[phase]} />
+                        ))}
+                        <pattern
+                          id={`${ids}-hatch`}
+                          width={5}
+                          height={5}
+                          patternUnits="userSpaceOnUse"
+                          patternTransform="rotate(45)"
+                        >
+                          <rect width={5} height={5} fill="var(--warning)" opacity={0.14} />
+                          <line x1={0} y1={0} x2={0} y2={5} stroke="var(--warning)" strokeWidth={2} opacity={0.75} />
+                        </pattern>
+                        <clipPath id={`${ids}-plot`}>
+                          <rect x={0} y={0} width={plotW} height={rows.height} />
+                        </clipPath>
+                      </defs>
+                      <g clipPath={`url(#${ids}-plot)`}>
+                        <BreakBands breaks={breaks} height={rows.height} />
+                        <Gridlines ticks={ticks} height={rows.height} />
+                        <NowLine x={nowX} height={rows.height} plotW={plotW} />
+                        {rows.list.map((row) =>
+                          row.kind === "lane" ? (
+                            <LaneBand key={row.key} row={row} px={px} now={now} />
+                          ) : row.kind === "section" ? null : (
+                            <Bar
+                              key={row.key}
+                              bar={row.bar}
+                              cy={row.y + row.h / 2 + (row.depth === 0 ? 3 : 1)}
+                              px={px}
+                              plotW={plotW}
+                              now={now}
+                              ids={ids}
+                              hovered={hover?.key === row.key ? hover.verdict : null}
+                            />
+                          ),
+                        )}
+                      </g>
+                    </svg>
+                    {/* Lane headers sit above the plot, on the canvas colour, so
+                        their text never runs over a gridline. */}
+                    {rows.list.map((row) =>
+                      row.kind === "lane" ? (
+                        <LaneLabel
+                          key={row.key}
+                          row={row}
+                          collapsed={row.folded}
+                          onToggle={() => toggleFold(row.key, row.folded)}
+                        />
+                      ) : null,
+                    )}
+                  </div>
                 )}
               </div>
+            </div>
+
+            {!onSelectTask && (
+              <AnimatePresence>
+                {selectedRow && (
+                  <TaskPanel
+                    key="task"
+                    bar={selectedRow.bar}
+                    lane={selectedRow.lane}
+                    now={now}
+                    reduceMotion={reduceMotion}
+                    onClose={() => setSelectedKey(null)}
+                    onZoom={() => zoomToBar(selectedRow.bar)}
+                  />
+                )}
+              </AnimatePresence>
             )}
           </div>
-        </div>
-
-        {!onSelectTask && (
-          <AnimatePresence>
-            {selectedRow && (
-              <TaskPanel
-                key="task"
-                bar={selectedRow.bar}
-                lane={selectedRow.lane}
-                now={now}
-                reduceMotion={reduceMotion}
-                onClose={() => setSelectedKey(null)}
-                onZoom={() => zoomToBar(selectedRow.bar)}
-              />
-            )}
-          </AnimatePresence>
-        )}
-      </div>
+        </>
+      )}
 
       {hover && hover.x >= 0 && !pan.dragging && hoveredRow?.kind === "task" && (
         <FloatingTip
@@ -505,7 +629,13 @@ export function MissionTimeline({
           y={hover.y}
           flip={hover.x > (rootRef.current?.clientWidth ?? 0) - 320}
         >
-          <TaskTip bar={hoveredRow.bar} verdict={hover.verdict} time={hover.time} now={now} />
+          <TaskTip
+            bar={hoveredRow.bar}
+            title={hoveredRow.title ?? taskTitle(hoveredRow.bar.task, { missionName: hoveredRow.lane.name })}
+            verdict={hover.verdict}
+            time={hover.time}
+            now={now}
+          />
         </FloatingTip>
       )}
     </div>
@@ -581,6 +711,7 @@ function Chips<T extends string | number | null>({
           onClick={() => onChange(option.id)}
           className={cx(
             "h-6 max-w-56 truncate rounded-md px-2 text-caption transition-colors",
+            FOCUS_RING,
             value === option.id
               ? "bg-surface-selected font-medium text-foreground"
               : "text-muted-foreground hover:bg-surface-hover hover:text-foreground",
@@ -589,6 +720,112 @@ function Chips<T extends string | number | null>({
           {option.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+/** The mission filter, in the lanes' order. Closed missions sit behind a
+ * "More" button, unless one of them is the one picked. */
+function MissionChips({
+  lanes,
+  value,
+  onChange,
+  more,
+  onMore,
+}: {
+  lanes: readonly Lane[];
+  value: number | null;
+  onChange: (next: number | null) => void;
+  more: boolean;
+  onMore: () => void;
+}) {
+  const closed = lanes.filter((lane) => missionClass(lane.mission) === "closed");
+  const shown = lanes.filter((lane) => missionClass(lane.mission) !== "closed");
+  const picked = closed.find((lane) => lane.mission.id === value);
+  const extra = more ? closed : picked ? [picked] : [];
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-1">
+      <Chips
+        label="Mission"
+        value={value}
+        onChange={onChange}
+        options={[
+          { id: null, label: "All missions" },
+          ...[...shown, ...extra].map((lane) => ({ id: lane.mission.id, label: lane.name })),
+        ]}
+      />
+      {closed.length > 0 && (
+        <button
+          type="button"
+          aria-expanded={more}
+          onClick={onMore}
+          title={more ? "Hide the closed missions" : "Show the closed missions"}
+          className={cx(
+            "inline-flex h-6 items-center gap-1 rounded-md px-2 text-caption text-muted-foreground transition-colors hover:bg-surface-hover hover:text-foreground",
+            FOCUS_RING,
+          )}
+        >
+          {more ? "Fewer" : `More · ${closed.length} closed`}
+          <ChevronRight
+            size={12}
+            aria-hidden="true"
+            className={cx("transition-transform motion-reduce:transition-none", more && "rotate-180")}
+          />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** A section's header inside a lane: its name and count; it folds. */
+/** Section names for a narrow label column. */
+const SECTION_SHORT: Record<TaskSection, string> = {
+  in_flight: "In flight",
+  landed: "Landed",
+  sent_back: "Sent back",
+  cancelled: "Cancelled",
+};
+
+function SectionRowLabel({
+  row,
+  short,
+  onSurface,
+  folded,
+  onToggle,
+}: {
+  row: Extract<Row, { kind: "section" }>;
+  short: boolean;
+  /** Drawn inside a card (the RSI page), not on the page canvas. */
+  onSurface: boolean;
+  folded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div
+      role="treeitem"
+      aria-level={2}
+      className="pointer-events-none absolute inset-x-0 flex items-end pl-7"
+      style={{ top: row.y, height: row.h }}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <button
+        type="button"
+        aria-expanded={!folded}
+        onClick={onToggle}
+        className={cx(
+          "pointer-events-auto mb-0.5 inline-flex items-center gap-1.5 rounded px-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground hover:text-foreground",
+          onSurface ? "bg-surface" : "bg-page-canvas",
+          FOCUS_RING,
+        )}
+      >
+        <ChevronRight
+          size={11}
+          aria-hidden="true"
+          className={cx("transition-transform duration-150 motion-reduce:transition-none", !folded && "rotate-90")}
+        />
+        {(short ? SECTION_SHORT : SECTION_LABEL)[row.section]}
+        <span className="tnum font-normal tracking-normal text-muted-foreground">{row.count}</span>
+      </button>
     </div>
   );
 }
@@ -616,16 +853,18 @@ function LaneLabel({
     <div
       role="treeitem"
       aria-level={1}
-      aria-expanded={!collapsed}
       className="pointer-events-none absolute inset-x-0 flex items-end px-3 pb-1.5"
       style={{ top: row.y, height: row.h }}
       onPointerDown={(event) => event.stopPropagation()}
     >
       <button
         type="button"
-        tabIndex={-1}
+        aria-expanded={!collapsed}
         onClick={onToggle}
-        className="pointer-events-auto flex min-w-0 items-center gap-2 rounded-md bg-page-canvas py-0.5 pr-2 text-left outline-none"
+        className={cx(
+          "pointer-events-auto flex min-w-0 items-center gap-2 rounded-md bg-page-canvas py-0.5 pr-2 text-left",
+          FOCUS_RING,
+        )}
       >
         <ChevronRight
           size={13}
@@ -674,22 +913,25 @@ const OUTCOME_ICON: Record<TaskBar["outcome"], ReactNode> = {
 function TaskLabel({
   row,
   labelW,
+  titled,
   hovered,
   selected,
   onSelect,
 }: {
   row: Extract<Row, { kind: "task" }>;
   labelW: number;
+  /** Room for the title (and a nested attempt's outcome) beside the id. */
+  titled: boolean;
   hovered: boolean;
   selected: boolean;
   onSelect: () => void;
 }) {
   const { bar } = row;
-  const task = bar.task;
+  const nested = row.depth === 1;
   return (
     <div
       role="treeitem"
-      aria-level={2}
+      aria-level={nested ? 4 : 3}
       aria-selected={selected}
       className={cx(
         "absolute inset-x-0 flex items-center transition-colors duration-150 motion-reduce:transition-none",
@@ -702,23 +944,63 @@ function TaskLabel({
         tabIndex={-1}
         onClick={onSelect}
         onPointerDown={(event) => event.stopPropagation()}
-        className="flex h-full shrink-0 items-center gap-2 pr-3 pl-9 text-left outline-none"
+        title={row.title ? `${bar.label} · ${row.title}` : row.outcome ? `${bar.label} · ${row.outcome}` : undefined}
+        className={cx(
+          "flex h-full shrink-0 items-center gap-2 pr-3 text-left outline-none",
+          nested ? "pl-12" : "pl-9",
+        )}
         style={{ width: labelW }}
       >
-        <span className="tnum shrink-0 font-mono text-caption text-foreground/90">{bar.label}</span>
-        {task.objective !== null && (
-          <span className="tnum shrink-0 text-caption text-faint-foreground">obj {task.objective}</span>
+        {nested ? (
+          <>
+            <span aria-hidden="true" className="h-3 w-2 shrink-0 border-b border-l border-border-strong" />
+            <span className="tnum shrink-0 font-mono text-micro text-muted-foreground">{bar.label}</span>
+            {titled && (
+              <span
+                className={cx(
+                  "min-w-0 truncate text-micro",
+                  row.outcome?.startsWith("aborted") ? "text-destructive" : "text-muted-foreground",
+                )}
+              >
+                {row.outcome}
+              </span>
+            )}
+          </>
+        ) : (
+          <>
+            <span
+              className={cx(
+                "tnum shrink-0 font-mono",
+                titled ? "text-micro text-faint-foreground" : "text-caption text-foreground/90",
+              )}
+            >
+              {bar.label}
+            </span>
+            {titled && (
+              <span className="min-w-0 flex-1 truncate text-caption text-foreground">
+                {row.title ?? (bar.task.objective !== null ? `objective ${bar.task.objective}` : "")}
+              </span>
+            )}
+          </>
+        )}
+        {!nested && row.retries > 1 && (
+          <span
+            className="tnum flex shrink-0 items-center gap-0.5 text-micro text-muted-foreground"
+            title={`Attempt ${row.retries} at objective ${bar.task.objective ?? "?"}; the earlier ones are nested below`}
+          >
+            ×{row.retries}
+          </span>
         )}
         {bar.attempts > 1 && (
           <span
             className="flex shrink-0 items-center gap-0.5 text-caption text-warning"
-            title={`${bar.attempts} attempts`}
+            title={`${bar.attempts} rounds: sent back ${bar.attempts - 1} time${bar.attempts === 2 ? "" : "s"}`}
           >
             <RotateCcw size={10} />
             {bar.attempts}
           </span>
         )}
-        <span className="ml-auto flex shrink-0 items-center">{OUTCOME_ICON[bar.outcome]}</span>
+        <span className={cx("flex shrink-0 items-center", nested ? "" : "ml-auto")}>{OUTCOME_ICON[bar.outcome]}</span>
       </button>
     </div>
   );
@@ -925,8 +1207,7 @@ function SegmentMark({
           fontSize={10}
           fontWeight={500}
           className="tnum"
-          fill="#fff"
-          opacity={0.92}
+          fill="var(--bar-label)"
         >
           {label}
         </text>
@@ -965,11 +1246,13 @@ function EndCap({ bar, x, cy }: { bar: TaskBar; x: number; cy: number }) {
 
 function TaskTip({
   bar,
+  title,
   verdict,
   time,
   now,
 }: {
   bar: TaskBar;
+  title: string | null;
   verdict: VerdictMark | null;
   time: number;
   now: number;
@@ -1006,6 +1289,7 @@ function TaskTip({
           {bar.outcome === "open" ? (bar.stalled ? "stalled" : "in flight") : bar.outcome}
         </span>
       </div>
+      {title && <div className="mt-0.5 line-clamp-2 text-white/85">{title}</div>}
       {segment && (
         <div className="mt-0.5 flex items-center gap-1.5">
           <span className="h-1.5 w-2.5 rounded-full" style={{ background: PHASE_COLOR[segment.phase] }} />

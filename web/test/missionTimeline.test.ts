@@ -5,6 +5,8 @@ import type { Mission, MissionTask, TaskStage } from "../src/missions.ts";
 import {
   deriveMissionTimeline,
   filterLanes,
+  hasBars,
+  isLive,
   laneState,
   missionName,
   phaseAt,
@@ -224,6 +226,39 @@ test("stale and aborted verdicts keep the task at the gate", () => {
   assert.equal(bar!.end, null);
 });
 
+test("the clock and the now line run only while a task is live", () => {
+  const working = task(20, "delivered", [
+    ["assigned", 0],
+    ["delivered", 2],
+  ]);
+  const now = T0 + 30 * MIN;
+  const running = deriveMissionTimeline([mission(1, [working])], now);
+  assert.equal(running.openCount, 1);
+  assert.equal(isLive(running), true);
+
+  // A halted mission counts its open task for the axis, but nothing moves:
+  // the marker would otherwise stay where the page loaded.
+  const halted = deriveMissionTimeline(
+    [mission(1, [working], { halted: "3 gate rejections in a row" })],
+    now,
+  );
+  assert.equal(halted.openCount, 1);
+  assert.equal(halted.lanes[0].bars[0].stalled, true);
+  assert.equal(isLive(halted), false);
+});
+
+test("a mission without tasks has no bar to draw", () => {
+  const taskless = deriveMissionTimeline([mission(1, [])], T0);
+  assert.equal(hasBars(taskless), false);
+  assert.equal(taskless.openCount, 0);
+
+  const working = deriveMissionTimeline(
+    [mission(1, [task(20, "delivered", [["assigned", 0], ["delivered", 2]])])],
+    T0 + 10 * MIN,
+  );
+  assert.equal(hasBars(working), true);
+});
+
 test("an open task runs to now; a halted mission's open task is stalled", () => {
   const working = task(20, "delivered", [
     ["assigned", 0],
@@ -294,7 +329,80 @@ test("a task from before the control stream is one segment by its state", () => 
   assert.equal(taskBar(task(13, "assigned", [], { created_at_ms: null }), mission(1, [])), null);
 });
 
-test("lanes: newest activity first, counts, state, and the halted mission", () => {
+test("a legacy reported task is gated only when the gate judges it", () => {
+  const reported = task(19, "reported", [], { created_at_ms: T0, updated_at_ms: T0 + MIN });
+  const phaseOf = (extra: Partial<Mission>) =>
+    taskBar(reported, mission(1, [], extra))!.segments.map((segment) => segment.phase);
+  assert.deepEqual(phaseOf({ gate: null, accept: null }), ["review"]);
+  assert.deepEqual(phaseOf({ accept: "review" }), ["review"]);
+  assert.deepEqual(phaseOf({ accept: "gate" }), ["gate"]);
+});
+
+test("a conflict verdict's review note shows as its reason", () => {
+  const bar = taskBar(
+    task(
+      21,
+      "revise",
+      [["assigned", 0], ["delivered", 1], ["reported", 10], ["gated", 12, "conflict"]],
+      { review_note: "carries conflict markers in fenced.txt" },
+    ),
+    mission(4, []),
+  );
+  const mark = bar!.verdicts.at(-1)!;
+  assert.equal(mark.verdict, "conflict");
+  assert.equal(mark.sentBack, true);
+  assert.equal(mark.reason, "carries conflict markers in fenced.txt");
+});
+
+test("the review note belongs to the latest send-back only", () => {
+  const bar = taskBar(
+    task(
+      22,
+      "landed",
+      [
+        ["assigned", 0],
+        ["delivered", 1],
+        ["reported", 5],
+        ["gated", 6, "conflict"],
+        ["delivered", 7],
+        ["reported", 12],
+        ["gated", 13, "rejected"],
+        ["delivered", 14],
+        ["reported", 20],
+        ["gated", 21, "accepted"],
+        ["landed", 22],
+      ],
+      { review_note: "the gate rejected this work: check-e2e fails" },
+    ),
+    mission(4, []),
+  );
+  // The earlier conflict and the acceptance do not take the latest note.
+  assert.deepEqual(
+    bar!.verdicts.map((verdict) => verdict.reason),
+    [null, "the gate rejected this work: check-e2e fails", null],
+  );
+});
+
+test("a cancellation's note is not a send-back's reason", () => {
+  const bar = taskBar(
+    task(
+      23,
+      "cancelled",
+      [
+        ["assigned", 0],
+        ["delivered", 1],
+        ["reported", 5],
+        ["gated", 6, "rejected"],
+        ["cancelled", 9],
+      ],
+      { review_note: "the worker exceeded its budget" },
+    ),
+    mission(4, []),
+  );
+  assert.equal(bar!.verdicts.at(-1)!.reason, null);
+});
+
+test("lanes: in the missions' order (open, idle, closed), counts, state, and the halted mission", () => {
   const supply = mission(6, [
     task(16, "landed", [["assigned", 0], ["delivered", 1], ["reported", 5], ["gated", 6, "accepted"], ["landed", 7]]),
     task(17, "landed", [["assigned", 10], ["delivered", 11], ["reported", 15], ["gated", 16, "rejected"], ["delivered", 17], ["reported", 19], ["gated", 20, "accepted"], ["landed", 21]]),

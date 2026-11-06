@@ -134,6 +134,37 @@
 //!    lines named in the record, never on the reason's text alone; the wait
 //!    rests on the recorded `due_ms`;
 //!
+//!    **The host's room is measured before the gate, never learned from
+//!    its crash** ([`gate::Room`]). At the start of each judging, after the
+//!    candidate is built and before the gate starts (only for a task that
+//!    got a gate slot: a task that waits is neither checked nor recorded),
+//!    the integrator checks, in this order, stopping at the first that falls
+//!    short: the free KiB (`df`) of the gate's TMPDIR against
+//!    SPAWN_GATE_MIN_FREE_GB (default 10, the floor `scripts/disk.sh` reads:
+//!    one floor, one meaning); `MemAvailable` in MiB against
+//!    SPAWN_GATE_MIN_FREE_MEMORY_MB (default 2048, the integrator's only);
+//!    and, when SPAWN_TEST_DATABASE_URL is set in the integrator's
+//!    environment (whatever [`gate::withhold_owners_cluster`] then decides
+//!    for the gate), a connection to the test database within 10 s and a
+//!    forced parallel query (a Gather with a worker, so its dynamic shared
+//!    memory is exercised) within 10 s; not for a mission marked
+//!    [`NO_TEST_DATABASE`], whose gate never gets the URL, so a test server
+//!    that is down never holds back its work. A check that falls short runs no
+//!    gate: the task is gated `no_room`, the path above, unchanged in its
+//!    meaning (no verdict, no count, the same `gate_room_*` run, backoff and
+//!    escalation), and the record names `check` (`disk`, `memory`,
+//!    `database`), `measured` and `threshold` (free KiB and the floor in
+//!    KiB, with `free_kb`, `min_gb` and `tmpdir`; available MiB and the
+//!    floor in MiB; the error and the probe, with the server named
+//!    host:port/database, never the URL's password), and a reason that names
+//!    the three ([`short_of_room`]). A threshold of 0 disables its check; one
+//!    that does not parse is an abort. Every check met: the gate runs as
+//!    before, its own floor and exit 5 included. The decision rests on
+//!    measures taken at the judging, recorded with their thresholds (design
+//!    §14): a host whose test database cannot run a parallel query is found
+//!    in seconds, not by a gate whose every database test fails 25 minutes
+//!    in and reads as a regression;
+//!
 //!    **A report is judged against the checkpoint of the turn that produced
 //!    it.** The dispatcher collects a report only after the turn that wrote
 //!    it ended in the log, and the Bridge records a turn's checkpoint before
@@ -214,7 +245,7 @@ use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
 use crate::config::{loop_interval, workspace_root};
-use crate::gate::{self, GateFailure};
+use crate::gate::{self, GateFailure, RoomFailure, Shortfall};
 use crate::{Flags, env_or, open_store};
 use crate::{main_merge, objectives, sources};
 
@@ -595,25 +626,84 @@ pub(crate) fn no_room(
     log: &str,
     now_ms: i64,
 ) -> Value {
+    let disk = Shortfall::Disk {
+        free_kb,
+        min_gb,
+        tmpdir: tmpdir.to_string(),
+    };
+    short_of_room(mission, task, &disk, log, now_ms)
+}
+
+/// The record of a judging of `task` that found the host short of room at
+/// `now_ms`, by the gate's own floor or by the integrator's checks before
+/// it ([`gate::Room`]): `check`, `measured` and `threshold`; for disk also
+/// `free_kb`, `min_gb` and `tmpdir`, for the database its `server` (never
+/// the URL, so never its password); a reason that names the check, the
+/// measure and the threshold; `log`; and `escalate` as [`no_room`] says.
+pub(crate) fn short_of_room(
+    mission: &Mission,
+    task: i64,
+    short: &Shortfall,
+    log: &str,
+    now_ms: i64,
+) -> Value {
     let after = i64::try_from(ROOM_ESCALATE_AFTER.as_millis()).unwrap_or(i64::MAX);
     let escalate = mission.gate_room_task == Some(task)
         && !mission.gate_room_escalated
         && mission
             .gate_room_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) > after);
-    #[allow(clippy::cast_precision_loss)]
-    let free_gib = free_kb as f64 / 1_048_576.0;
-    json!({
-        "reason": format!(
-            "no room to judge now: {free_gib:.1} GiB free in {tmpdir} (TMPDIR), under \
-             SPAWN_GATE_MIN_FREE_GB={min_gb}; not a verdict, judged again later"
+    let reason = match short {
+        Shortfall::Disk {
+            free_kb,
+            min_gb,
+            tmpdir,
+        } => {
+            #[allow(clippy::cast_precision_loss)]
+            let free_gib = *free_kb as f64 / 1_048_576.0;
+            format!(
+                "no room to judge now: {free_gib:.1} GiB free in {tmpdir} (TMPDIR), under \
+                 SPAWN_GATE_MIN_FREE_GB={min_gb}; not a verdict, judged again later"
+            )
+        }
+        Shortfall::Memory {
+            available_mb,
+            min_mb,
+        } => format!(
+            "no room to judge now: the host's memory has {available_mb} MiB available \
+             (MemAvailable), under SPAWN_GATE_MIN_FREE_MEMORY_MB={min_mb}; not a verdict, judged \
+             again later"
         ),
-        "free_kb": free_kb,
-        "min_gb": min_gb,
-        "tmpdir": tmpdir,
+        Shortfall::Database {
+            server,
+            probe,
+            error,
+        } => format!(
+            "no room to judge now: the test database ({server}) failed the probe \"{probe}\": \
+             {error}; not a verdict, judged again later"
+        ),
+    };
+    let mut record = json!({
+        "reason": reason,
+        "check": short.check(),
+        "measured": short.measured(),
+        "threshold": short.threshold(),
         "log": log,
         "escalate": escalate,
-    })
+    });
+    let extra = match short {
+        Shortfall::Disk {
+            free_kb,
+            min_gb,
+            tmpdir,
+        } => json!({"free_kb": free_kb, "min_gb": min_gb, "tmpdir": tmpdir}),
+        Shortfall::Memory { .. } => json!({}),
+        Shortfall::Database { server, .. } => json!({ "server": server }),
+    };
+    if let (Some(target), Some(extra)) = (record.as_object_mut(), extra.as_object()) {
+        target.extend(extra.clone());
+    }
+    record
 }
 
 /// Whether a delivered task ran past its mission's budget
@@ -794,7 +884,10 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
         crate::config::env_value(PER_GATE_SERVER).as_deref(),
     )
     .map_err(|error| format!("{error}\n{USAGE}"))?;
-    let integrator = Integrator::new(root, gate, gate_env, gates);
+    // What the host must have before a gate starts, read once like the
+    // gate's environment (gate::Room).
+    let host_room = gate::Room::from_env(|name| std::env::var(name).ok());
+    let integrator = Integrator::new(root, gate, gate_env, host_room, gates);
     if integrator.judge.host.server_log.is_none() {
         no_server_log(&format!("{TEST_DATABASE_LOG} is unset"));
     }
@@ -843,6 +936,8 @@ struct Judge {
     gate_env: Vec<(String, String)>,
     /// How a rejection is told from a host fault.
     host: HostSettings,
+    /// The host's room, checked before each gate starts ([`gate::Room`]).
+    room: gate::Room,
 }
 
 /// The settings of host faults: the test database's log
@@ -924,13 +1019,20 @@ fn waits_for_gate(shares_server: bool, shared_running: usize, cap: usize) -> boo
 }
 
 impl Integrator {
-    fn new(root: PathBuf, gate: PathBuf, gate_env: Vec<(String, String)>, gates: usize) -> Self {
+    fn new(
+        root: PathBuf,
+        gate: PathBuf,
+        gate_env: Vec<(String, String)>,
+        host_room: gate::Room,
+        gates: usize,
+    ) -> Self {
         Self {
             judge: Judge {
                 root,
                 gate,
                 gate_env,
                 host: HostSettings::from_env(),
+                room: host_room,
             },
             gates,
             running: RefCell::new(Vec::new()),
@@ -1336,6 +1438,7 @@ impl Judge {
             .is_ok()
         };
         let deadline = std::time::Instant::now() + PUSH_WAIT;
+        let mut pushed_again = false;
         loop {
             let pushed = sources::fetch_pushed_into(mirror, source, agent, &integrator_ref(agent))
                 .map_err(|error| error.to_string())?;
@@ -1347,6 +1450,17 @@ impl Judge {
             );
             if !matches!(verdict, Freshness::Stale(_)) || std::time::Instant::now() >= deadline {
                 return Ok(verdict);
+            }
+            // A recorded checkpoint whose push was lost (issue #8) is pushed
+            // again from this host's mirror, once a pass.
+            if !pushed_again && let Some(checkpoint) = checkpoint.as_deref() {
+                pushed_again = true;
+                if let Some(again) = sources::push_recorded(mirror, source, agent, checkpoint) {
+                    println!(
+                        "integrate: task {}: {checkpoint} pushed again: {again:?}",
+                        task.id
+                    );
+                }
             }
             std::thread::sleep(PUSH_POLL);
         }
@@ -1469,6 +1583,35 @@ impl Judge {
         }
 
         let scenario = task_scenario(scenarios, task.scenario.as_deref());
+        // The host's room, measured now, before any gate starts: a gate
+        // must never be how the integrator learns the host had none. A gate
+        // that gets no test database has none to probe.
+        let room = if needs_test_database(scenarios) {
+            self.room.clone()
+        } else {
+            self.room.without_test_database()
+        };
+        match room.check(&self.gate_env) {
+            Ok(checks) => println!(
+                "integrate: task {}: room to judge: {}",
+                task.id,
+                checks.lines().collect::<Vec<_>>().join("; ")
+            ),
+            Err(RoomFailure::Short { short, log }) => {
+                println!(
+                    "integrate: task {}: no room to judge now ({}); the gate does not run",
+                    task.id,
+                    short.check()
+                );
+                return gated(
+                    "no_room",
+                    short_of_room(mission, task.id, &short, &log, now_ms()),
+                );
+            }
+            Err(RoomFailure::Bad(reason)) => {
+                return gated("aborted", json!({ "reason": reason }));
+            }
+        }
         // The test server must not be the owner's, by identity, asked now:
         // a socket mount or a DNS name can change between gate runs.
         let owner = std::env::var("SPAWN_DATABASE_URL").ok();
@@ -2355,9 +2498,9 @@ mod tests {
     use super::{
         Freshness, Mission, NO_TEST_DATABASE, aborted, freshness, halt_reason, markers_note,
         merged_tree, needs_test_database, no_room, over_budget, pinned, report_freshness,
-        room_backoff, room_wait, task_scenario, waits_for_gate, wall_clock_minutes,
+        room_backoff, room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
     };
-    use crate::gate::GateFailure;
+    use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
 
     /// One gate at a time unless the test server is per gate: more is
@@ -3561,6 +3704,87 @@ mod tests {
         assert_eq!(halt_reason(&waiting, 0), None);
     }
 
+    /// Objective 018: every `no_room` names its check, what it measured and
+    /// the threshold, in its fields and in its reason; a disk one keeps the
+    /// fields and wording it had; the database's names the server, never
+    /// the URL; and escalation is the run's, whatever the check.
+    #[test]
+    fn a_no_room_names_its_check_measure_and_threshold() {
+        let waiting = mission(0, 0, 0);
+        let disk = no_room(&waiting, 4, 3 * 1_048_576, 10, "/data/tmp", "log", 0);
+        assert_eq!(
+            (&disk["check"], &disk["measured"], &disk["threshold"]),
+            (
+                &json!("disk"),
+                &json!(3 * 1_048_576),
+                &json!(10 * 1_048_576)
+            )
+        );
+        assert_eq!(
+            (&disk["free_kb"], &disk["min_gb"], &disk["tmpdir"]),
+            (&json!(3 * 1_048_576), &json!(10), &json!("/data/tmp"))
+        );
+
+        let memory = short_of_room(
+            &waiting,
+            4,
+            &Shortfall::Memory {
+                available_mb: 1500,
+                min_mb: 2048,
+            },
+            "memory: 1500 MiB available\n",
+            0,
+        );
+        assert_eq!(
+            memory["reason"],
+            "no room to judge now: the host's memory has 1500 MiB available (MemAvailable), \
+             under SPAWN_GATE_MIN_FREE_MEMORY_MB=2048; not a verdict, judged again later"
+        );
+        assert_eq!(
+            (&memory["check"], &memory["measured"], &memory["threshold"]),
+            (&json!("memory"), &json!(1500), &json!(2048))
+        );
+        assert_eq!(memory["log"], "memory: 1500 MiB available\n");
+        assert_eq!(memory["escalate"], false);
+        assert!(memory.get("free_kb").is_none() && memory.get("tmpdir").is_none());
+
+        let error = "ERROR: could not resize shared memory segment \"/PostgreSQL.2\" to 8388608 \
+                     bytes: No space left on device (53100)";
+        let database = Shortfall::Database {
+            server: "/var/run/test-pg:5433/spawn_test".to_string(),
+            probe: "a parallel query within 10 s".to_string(),
+            error: error.to_string(),
+        };
+        let record = short_of_room(&waiting, 4, &database, "", 0);
+        assert_eq!(
+            (&record["check"], &record["measured"], &record["threshold"]),
+            (
+                &json!("database"),
+                &json!(error),
+                &json!("a parallel query within 10 s")
+            )
+        );
+        assert_eq!(record["server"], "/var/run/test-pg:5433/spawn_test");
+        let reason = record["reason"].as_str().expect("a reason");
+        assert!(
+            reason.starts_with(
+                "no room to judge now: the test database (/var/run/test-pg:5433/spawn_test) \
+                 failed the probe \"a parallel query within 10 s\": ERROR: could not resize"
+            ) && reason.ends_with("not a verdict, judged again later"),
+            "{reason}"
+        );
+
+        // Two hours into the task's run: the first record escalates,
+        // whichever check fell short.
+        let mut long = mission(0, 0, 0);
+        long.gate_room_task = Some(4);
+        long.gate_room_since_ms = Some(0);
+        assert_eq!(
+            short_of_room(&long, 4, &database, "", 121 * MINUTE)["escalate"],
+            true
+        );
+    }
+
     #[test]
     fn a_gate_without_the_test_database_does_not_wait_for_one_that_has_it() {
         // One shared-server gate allowed: a second one waits, a gate that gets
@@ -4754,9 +4978,20 @@ mod database_tests {
             base.join("host"),
             gate_path,
             test_gate_env(),
+            room_to_spare(),
             super::DEFAULT_GATES,
         );
         (base, source, scenarios, integrator)
+    }
+
+    /// The checks before a gate with their defaults, on a host with room to
+    /// spare: whatever this test host has, the stub gates run.
+    fn room_to_spare() -> crate::gate::Room {
+        crate::gate::Room::from_env(|_| None).measured_by(
+            |_| Some(u64::MAX),
+            || Some(u64::MAX),
+            |_| Ok(()),
+        )
     }
 
     /// Main moves on the source by one commit, pushed from a clone; the
@@ -5412,6 +5647,7 @@ mod database_tests {
             base.join("host"),
             base.join("gate.sh"),
             Vec::new(),
+            room_to_spare(),
             super::DEFAULT_GATES,
         );
         integrator.pass_on(&db.store).expect("a pass");
@@ -5434,10 +5670,45 @@ mod database_tests {
             .expect("the mission")
     }
 
+    /// The fleet view's gate room (`fleet_health`) shows `mission`'s run of
+    /// `no_room` as the mission row folds it.
+    fn assert_gate_room_shown(db: &Db, mission: i64) {
+        let health = db.store.fleet_health().expect("health");
+        assert!(
+            health.get("attention").is_none(),
+            "who needs a human is /api/attention's, not a count of judge flags"
+        );
+        let row = health["gate_room"]
+            .as_array()
+            .and_then(|missions| missions.iter().find(|row| row["mission"] == mission))
+            .expect("the mission's gate room");
+        let fold = gated(db, mission);
+        assert_eq!(row["task"].as_i64(), fold.gate_room_task);
+        assert_eq!(row["waits"].as_u64(), Some(u64::from(fold.gate_room_waits)));
+        assert_eq!(row["escalated"].as_bool(), Some(fold.gate_room_escalated));
+        assert_eq!(row["since_ms"].as_i64(), fold.gate_room_since_ms);
+        assert_eq!(row["last_ms"].as_i64(), fold.gate_room_last_ms);
+    }
+
+    /// The dispatcher's plan over the gate-room records the store gives now,
+    /// for a supervisor whose digests told it `tag`.
+    fn gate_room_plan(db: &Db, tag: &str) -> crate::dispatch::Plan {
+        let records = db.store.gate_room_escalations().expect("escalations");
+        let items =
+            crate::disk::gate_room_escalations(records.as_array().map_or(&[][..], Vec::as_slice));
+        let supervisor: crate::dispatch::Facts = serde_json::from_value(json!({
+            "session_id": "session_supervisor", "agent_id": "agent_supervisor", "told": [tag],
+        }))
+        .expect("facts");
+        let work = crate::deliver::Work::default();
+        crate::dispatch::decide_with(&[supervisor], &work, &items, false, 0, "spawn")
+    }
+
     /// Task 40: the fold. `no_room` keeps the task where it was, names the
     /// free space, moves neither the abort nor the rejection count, and
     /// folds the mission's run of them; a gate that judged ends the run, and
-    /// a real abort still counts.
+    /// a real abort still counts. The fleet view's health carries the run,
+    /// and a told escalation stays told and unresolved while the run goes on.
     #[test]
     fn no_room_counts_toward_no_halt_and_a_real_abort_still_does() {
         let (base, source, scenarios, _) = world("no-room-fold", "exit 1\n");
@@ -5467,6 +5738,7 @@ mod database_tests {
         );
         assert!(after.halted.is_none());
         assert_eq!(after.gate_room_task, Some(task));
+        assert_gate_room_shown(&db, mission);
         let escalations = db.store.gate_room_escalations().expect("escalations");
         assert_eq!(
             escalations.as_array().map(Vec::len),
@@ -5502,15 +5774,17 @@ mod database_tests {
             "a digest that failed told nothing"
         );
         digest("dispatch-digest-told", true);
-        assert_eq!(
-            db.store
-                .gate_room_escalations()
-                .expect("escalations")
-                .as_array()
-                .map(Vec::len),
-            Some(0),
-            "told once, by its record"
-        );
+        // Told once, by its record: the dispatcher's told set has its tag,
+        // so it is never pending again. Its run goes on, so the plan holds
+        // it as told and unresolved.
+        let plan = gate_room_plan(&db, &tag);
+        assert!(plan.pending.is_empty(), "told once: {:?}", plan.pending);
+        let told: Vec<String> = plan
+            .told
+            .iter()
+            .map(crate::dispatch::Escalation::tag)
+            .collect();
+        assert_eq!(told, [tag.as_str()], "told, and the gate still has no room");
 
         // A no_room that names no free space or TMPDIR is refused.
         assert!(
@@ -5529,6 +5803,12 @@ mod database_tests {
         assert_eq!(after.gate_aborts, 3);
         assert_eq!(after.gate_room_waits, 0, "a gate that ran ends the run");
         assert!(after.gate_room_since_ms.is_none() && !after.gate_room_escalated);
+        let plan = gate_room_plan(&db, &tag);
+        assert!(
+            plan.told.is_empty() && plan.pending.is_empty(),
+            "told, and its run is over: resolved"
+        );
+        assert_gate_room_shown(&db, mission);
         assert!(super::halt_reason(&after, 0).is_some_and(|reason| reason.contains("aborts")));
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -5662,6 +5942,12 @@ mod database_tests {
         assert_eq!(record["free_kb"], 2048);
         assert_eq!(record["tmpdir"], "/data/tmp");
         assert_eq!(record["escalate"], false);
+        // The gate's own floor is the disk check, named as the
+        // integrator's checks name theirs.
+        assert_eq!(
+            (&record["check"], &record["measured"], &record["threshold"]),
+            (&json!("disk"), &json!(2048), &json!(10 * 1_048_576))
+        );
         assert!(
             record["reason"]
                 .as_str()
@@ -5673,6 +5959,255 @@ mod database_tests {
                 .as_str()
                 .is_some_and(|log| log.contains("! gate: 0.0 GiB free"))
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The stub gate that notes each run beside itself and accepts.
+    const NOTING_GATE: &str = "echo ran >>\"$(dirname \"$0\")/runs\"\n\
+                               printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+
+    /// How many times the stub gate in `base` ran.
+    fn gate_runs(base: &Path) -> usize {
+        std::fs::read_to_string(base.join("runs")).map_or(0, |runs| runs.lines().count())
+    }
+
+    /// The latest `task.gated` record.
+    fn last_gated(db: &Db) -> Value {
+        db.admin()
+            .query_one(
+                "select kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+                  order by session_seq desc limit 1",
+                &[],
+            )
+            .expect("the verdict")
+            .get(0)
+    }
+
+    /// One judging of a reported task with pushed work, on a host whose
+    /// room `room` measures: the mission, the task, and the world's base.
+    fn judged_on(tag: &str, room: crate::gate::Room) -> (Db, i64, i64, PathBuf) {
+        judged_on_with(tag, room, false)
+    }
+
+    /// [`judged_on`], the mission's scenarios marked
+    /// [`super::NO_TEST_DATABASE`] when `no_test_database`.
+    fn judged_on_with(
+        tag: &str,
+        room: crate::gate::Room,
+        no_test_database: bool,
+    ) -> (Db, i64, i64, PathBuf) {
+        let (base, source, scenarios, mut integrator) = world(tag, NOTING_GATE);
+        if no_test_database {
+            std::fs::write(scenarios.join(super::NO_TEST_DATABASE), "").expect("the marker");
+        }
+        integrator.judge.room = room;
+        let db = Db::new(&tag.replace('-', "_"));
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        push_work(&base, &source, &agent_of(&db, mission, task), "work.txt");
+        integrator.pass_on(&db.store).expect("a pass");
+        integrator.settle();
+        (db, mission, task, base)
+    }
+
+    /// A room with these integrator variables, measuring `free_kb`,
+    /// `available_mb` and `probe`.
+    fn measured_room(
+        integrator: &[(&'static str, &'static str)],
+        free_kb: u64,
+        available_mb: u64,
+        probe: Result<(), spawn_postgres::ProbeFailure>,
+    ) -> crate::gate::Room {
+        let integrator = integrator.to_vec();
+        crate::gate::Room::from_env(move |name| {
+            integrator
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+        .measured_by(
+            move |_| Some(free_kb),
+            move || Some(available_mb),
+            move |_| probe.clone(),
+        )
+    }
+
+    /// Objective 018: the host's room is measured before the gate starts.
+    /// A check that falls short (disk, memory, the test database whose
+    /// parallel query cannot get its shared memory) runs no gate and is
+    /// recorded `no_room` with its check, measure and threshold: the task
+    /// stays reported, neither count moves, and the mission's run of
+    /// no-room names the task, so it is judged again after the backoff. No
+    /// password reaches the record.
+    #[test]
+    fn a_check_short_before_the_gate_records_no_room_and_runs_no_gate() {
+        const URL: &str = "postgres://gate:hunter2@%2Fvar%2Frun%2Ftest-pg:5433/spawn_test";
+        let shared_memory = spawn_postgres::ProbeFailure {
+            probe: "a parallel query within 10 s".to_string(),
+            error: "ERROR: could not resize shared memory segment \"/PostgreSQL.2\" to 8388608 \
+                    bytes: No space left on device (53100) for gate:hunter2"
+                .to_string(),
+        };
+        let plenty = u64::MAX / 2;
+        let cases = [
+            (
+                "room-short-disk",
+                measured_room(&[], 1024, plenty, Ok(())),
+                "disk",
+                json!(1024),
+                json!(10 * 1_048_576),
+                "SPAWN_GATE_MIN_FREE_GB=10",
+            ),
+            (
+                "room-short-memory",
+                measured_room(&[], plenty, 512, Ok(())),
+                "memory",
+                json!(512),
+                json!(2048),
+                "512 MiB available",
+            ),
+            (
+                "room-short-database",
+                measured_room(
+                    &[("SPAWN_TEST_DATABASE_URL", URL)],
+                    plenty,
+                    plenty,
+                    Err(shared_memory),
+                ),
+                "database",
+                json!(
+                    "ERROR: could not resize shared memory segment \"/PostgreSQL.2\" to 8388608 \
+                     bytes: No space left on device (53100) for gate:***"
+                ),
+                json!("a parallel query within 10 s"),
+                "the test database (/var/run/test-pg:5433/spawn_test)",
+            ),
+        ];
+        for (tag, room, check, measured, threshold, named) in cases {
+            let (db, mission, task, base) = judged_on(tag, room);
+            assert_eq!(gate_runs(&base), 0, "{check}: the gate never ran");
+            let record = last_gated(&db);
+            assert_eq!(
+                (&record["id"], &record["verdict"], &record["check"]),
+                (&json!(task), &json!("no_room"), &json!(check)),
+                "{record}"
+            );
+            assert_eq!(
+                (&record["measured"], &record["threshold"]),
+                (&measured, &threshold),
+                "{record}"
+            );
+            let reason = record["reason"].as_str().expect("a reason");
+            assert!(
+                reason.contains(named) && reason.ends_with("not a verdict, judged again later"),
+                "{reason}"
+            );
+            assert!(
+                record["log"]
+                    .as_str()
+                    .is_some_and(|log| log.contains("the gate did not run")),
+                "{record}"
+            );
+            assert!(!record.to_string().contains("hunter2"), "{record}");
+            if check == "disk" {
+                assert_eq!(
+                    (&record["free_kb"], &record["min_gb"], &record["tmpdir"]),
+                    (&json!(1024), &json!(10), &json!("/tmp"))
+                );
+            }
+            let after = gated(&db, mission);
+            assert_eq!(
+                after.tasks[0].state,
+                spawn_core::mission::TaskState::Reported
+            );
+            assert_eq!((after.gate_aborts, after.gate_rejections), (0, 0));
+            assert_eq!(
+                (after.gate_room_task, after.gate_room_waits),
+                (Some(task), 1)
+            );
+            assert!(
+                super::room_wait(&after, task, super::now_ms()).is_some(),
+                "judged again after the backoff"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// A mission whose gate needs no test database (`no-test-database`)
+    /// is not held back by a test server that fails its probe: its gate
+    /// never gets the URL, so the probe is not made and the gate runs.
+    #[test]
+    fn a_mission_without_a_test_database_is_not_held_back_by_its_probe() {
+        let room = measured_room(
+            &[(
+                "SPAWN_TEST_DATABASE_URL",
+                "postgres://t:pw@%2Frun%2Fpg/spawn_test",
+            )],
+            u64::MAX / 2,
+            u64::MAX / 2,
+            Err(spawn_postgres::ProbeFailure {
+                probe: "connect within 10 s".to_string(),
+                error: "connection refused".to_string(),
+            }),
+        );
+        let (db, mission, task, base) = judged_on_with("room-no-db", room, true);
+        assert_eq!(gate_runs(&base), 1, "the gate ran");
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every check met: the gate runs exactly as before, the test database
+    /// probed by the integrator's URL; a threshold that does not parse is an
+    /// abort, and runs no gate either.
+    #[test]
+    fn with_room_the_gate_runs_and_a_bad_threshold_is_an_abort() {
+        let probed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&probed);
+        let room = measured_room(
+            &[(
+                "SPAWN_TEST_DATABASE_URL",
+                "postgres://t:pw@%2Frun%2Fpg/spawn_test",
+            )],
+            u64::MAX / 2,
+            u64::MAX / 2,
+            Ok(()),
+        )
+        .measured_by(
+            |_| Some(u64::MAX / 2),
+            || Some(u64::MAX / 2),
+            move |url| {
+                noted.lock().expect("probed").push(url.to_string());
+                Ok(())
+            },
+        );
+        let (db, mission, task, base) = judged_on("room-met", room);
+        assert_eq!(gate_runs(&base), 1, "the gate ran once");
+        assert_eq!(
+            *probed.lock().expect("probed"),
+            ["postgres://t:pw@%2Frun%2Fpg/spawn_test"]
+        );
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        assert_eq!(verdicts(&db, task), vec!["accepted"]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let room = measured_room(&[("SPAWN_GATE_MIN_FREE_MEMORY_MB", "lots")], 0, 0, Ok(()));
+        let (db, mission, task, base) = judged_on("room-bad", room);
+        assert_eq!(gate_runs(&base), 0);
+        let record = last_gated(&db);
+        assert_eq!(
+            (&record["id"], &record["verdict"]),
+            (&json!(task), &json!("aborted"))
+        );
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("SPAWN_GATE_MIN_FREE_MEMORY_MB")),
+            "{record}"
+        );
+        assert_eq!(gated(&db, mission).gate_aborts, 1, "an abort counts");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -5756,6 +6291,56 @@ mod database_tests {
             revisions,
             vec![Some("0".to_string()), Some("1".to_string())]
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #8: a reported task whose agent's latest recorded checkpoint
+    /// the source never got (its push was lost with the process that queued
+    /// it) is not judged `stale` on every pass forever: the stale check
+    /// pushes that checkpoint again from this host's mirror, and the same
+    /// check finds it fresh.
+    #[test]
+    fn a_recorded_checkpoint_whose_push_was_lost_is_pushed_again_and_fresh() {
+        use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
+        use spawn_core::id::{AgentId, BranchName, CommitId, SessionId};
+        use spawn_core::port::{Commit, EventLog, WorkspaceStore};
+        let db = Db::new("lost_push");
+        let (base, source, scenarios, _integrator) = world("lost-push", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = ready_task(&db, db.reported_task(mission, "lost"));
+        let root = base.join("host");
+        let mirror = crate::sources::ensure_mirror(&root, Some(&source)).expect("mirror");
+        let host = spawn_host::GitWorkspace::new(&mirror, &root);
+        let branch = BranchName::new(task.agent_id.as_str()).expect("branch");
+        host.ensure_branch(&branch, None).expect("branch");
+        let workspace = host.mount(&branch).expect("mount");
+        std::fs::write(Path::new(workspace.path()).join("work.txt"), "work\n").expect("write");
+        let Commit::Created(commit) = host.commit(&workspace, "work").expect("commit") else {
+            panic!("a checkpoint");
+        };
+        db.store
+            .append(NewEvent {
+                agent_id: AgentId::new(task.agent_id.as_str()).expect("agent"),
+                session_id: SessionId::new(task.session_id.as_str()).expect("session"),
+                execution_id: None,
+                source: Source::Bridge,
+                source_event_id: Some(format!("commit:{commit}")),
+                kind: EventKind::ArtifactCommitted {
+                    reason: CheckpointReason::BaseMerged,
+                    artifact: ArtifactRef {
+                        project: "missions".to_string(),
+                        branch: branch.clone(),
+                        commit: CommitId::new(commit.as_str()).expect("commit"),
+                    },
+                    files: vec!["work.txt".to_string()],
+                },
+            })
+            .expect("recorded, never pushed");
+        assert_eq!(
+            super::Judge::pushed_candidate(&db.store, &mirror, &source, &task).expect("judged"),
+            super::Freshness::Fresh(commit.as_str().to_string())
+        );
+        host.unmount(&workspace).expect("unmount");
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -41,13 +41,16 @@
 //! escalations) and the step; [`worker`] is the per-worker ladder and
 //! [`digest`] the supervisor digest. Task delivery (the mission layer's
 //! rules) lives in [`crate::deliver`]; this module combines both into one
-//! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
+//! [`Plan`] ([`decide_with`]), reads it from the store ([`read_plan`], which
+//! the UI's attention queue calls too: `GET /api/attention`) and submits it
+//! ([`step`]).
 
 mod digest;
 mod stall;
 mod stops;
 mod worker;
 
+pub(crate) use digest::{OPENING as DIGEST_OPENING, heading};
 pub(crate) use stall::Bounds;
 
 use std::collections::BTreeSet;
@@ -279,16 +282,36 @@ pub(crate) enum Why {
     DeliveryFailed,
     /// A Stop of a live execution kept failing.
     StopFailed,
-    /// Free disk on this host crossed the warning threshold (crate::disk).
+    /// Free disk on this host fell under the warning threshold, and is not
+    /// back yet (crate::disk).
     Disk,
-    /// A mission's gate has had no room in TMPDIR for hours
-    /// ([`crate::disk::gate_room_escalations`]).
+    /// Free disk on this host is back above the warning threshold
+    /// (crate::disk): news, see [`Why::is_news`].
+    DiskRecovered,
+    /// A mission's gate has had no room in TMPDIR for hours, and its run of
+    /// `no_room` goes on ([`crate::disk::gate_room_escalations`]).
     GateRoom,
     /// A mission's gate failed twice in a row because the host did (the
     /// test database), not the work ([`digest::host_fault_escalations`]).
     GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
+}
+
+impl Why {
+    /// Whether an item of this kind is news rather than a condition: told
+    /// once, it leaves nothing to resolve. A disk recovery, an approval, a
+    /// human's message and a pair of host faults at the gate (the
+    /// integrator judges again on its own) are news. Every other item is a
+    /// condition that holds while its facts do (a worker's state, a stall,
+    /// a path still low on disk, a gate still without room): told, it stays
+    /// in [`Plan::told`] until its facts change.
+    pub(crate) fn is_news(self) -> bool {
+        matches!(
+            self,
+            Self::DiskRecovered | Self::Approved | Self::Human | Self::GateHostFault
+        )
+    }
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -298,16 +321,24 @@ pub(crate) struct Escalation {
     pub(crate) id: String,
     pub(crate) why: Why,
     pub(crate) line: String,
+    /// When the record it rests on was written (the judgement of a
+    /// worker's state, the record a stall is measured from, a disk or gate
+    /// record), on the database's clock; `None` when the rows carry no
+    /// time. Only for showing its age (`GET /api/attention`): never in its
+    /// tag or a digest's text.
+    pub(crate) since_ms: Option<i64>,
 }
 
 impl Escalation {
-    /// An escalation about the session `facts` describe.
+    /// An escalation about the session `facts` describe, as of its latest
+    /// judgement.
     pub(crate) fn about(facts: &Facts, id: String, why: Why, line: String) -> Self {
         Self {
             session_id: facts.session_id.clone(),
             id,
             why,
             line,
+            since_ms: facts.observation_at_ms,
         }
     }
 
@@ -356,6 +387,11 @@ pub(crate) struct Plan {
     pub(crate) orders: Vec<Order>,
     /// Escalations not delivered yet, whether or not a digest goes out now.
     pub(crate) pending: Vec<Escalation>,
+    /// Escalations already delivered to the supervisor (their tag is in its
+    /// told set) whose condition still holds: left out of `pending`, so
+    /// never sent again. News ([`Why::is_news`]) is not among them: told,
+    /// it is resolved. The attention view shows these as unresolved.
+    pub(crate) told: Vec<Escalation>,
 }
 
 /// Principal the dispatcher submits as.
@@ -392,7 +428,7 @@ pub(crate) fn decide_with(
         delivered: deliver::delivered(work, rows),
         reissues: deliver::reissues(work, rows, now_ms),
         orders: deliver::orders(work, rows, now_ms),
-        pending: Vec::new(),
+        ..Plan::default()
     };
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
@@ -415,7 +451,12 @@ pub(crate) fn decide_with(
     }
     plan.pending.extend(deliver::news_items(work, rows));
     plan.pending.extend_from_slice(host);
-    plan.pending.retain(|item| !told.contains(&item.tag()));
+    (plan.told, plan.pending) = std::mem::take(&mut plan.pending)
+        .into_iter()
+        .partition(|item| told.contains(&item.tag()));
+    // Every item here holds now (each source gives only what its facts
+    // still say); told news was resolved by the telling.
+    plan.told.retain(|item| !item.why.is_news());
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
             .extend(digest::order(supervisor, &plan.pending, spawn));
@@ -424,7 +465,7 @@ pub(crate) fn decide_with(
 }
 
 /// Facts and mission rows, read once.
-fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
+pub(crate) fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     let rows: Vec<Facts> =
         serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
             .map_err(|error| format!("dispatch facts: {error}"))?;
@@ -457,6 +498,35 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
     Ok(())
 }
 
+<<<<<<< 4bd4c19bb866659500033efdfca36db64186d47e
+/// One pass's plan, read from the store before anything is submitted.
+pub(crate) struct Reading {
+    /// The facts the plan was made from.
+    pub(crate) rows: Vec<Facts>,
+    /// The mission rows the plan was made from.
+    pub(crate) work: Work,
+    pub(crate) plan: Plan,
+    /// Log lines: what could not be read (a stall read that failed).
+    pub(crate) lines: Vec<String>,
+}
+
+/// The plan for this moment, reading only: the host's news (the disk items
+/// `disk` gives for the moment's clock, the gate-room and gate host-fault
+/// records, the stalls past their `bounds`, [`stall`]) added to the facts and mission rows
+/// `loaded` ([`load`]), then [`decide_with`]. [`step`] submits what it
+/// returns; `GET /api/attention` (crate::serve) shows it. One function for
+/// both, so the queue a person reads is the dispatcher's own.
+pub(crate) fn read_plan(
+    store: &PostgresStore,
+    loaded: (Vec<Facts>, Work),
+    disk: impl FnOnce(i64) -> Vec<Escalation>,
+    bounds: &Bounds,
+    supervised: bool,
+    spawn: &str,
+) -> Result<Reading, String> {
+    let (rows, work) = loaded;
+    let mut lines = Vec::new();
+=======
 /// Run one dispatcher step against the store: collect reports from idle
 /// workers under `root`, then submit the plan, with the stalls past their
 /// `bounds` among its escalations ([`stall`]), without its new executions
@@ -481,8 +551,9 @@ pub(crate) fn step(
         (rows, work) = load(store)?;
         work.waits = waits;
     }
+>>>>>>> 3507ae04337ca0bb051e24d94e36024394f9065e
     let now = now_ms();
-    let mut host = disk.escalations(now);
+    let mut host = disk(now);
     host.extend(crate::disk::gate_room_escalations(
         store
             .gate_room_escalations()
@@ -503,7 +574,50 @@ pub(crate) fn step(
         Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
         Err(error) => lines.push(format!("dispatch: stalls: {error}")),
     }
-    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    let plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    Ok(Reading {
+        rows,
+        work,
+        plan,
+        lines,
+    })
+}
+
+/// Run one dispatcher step against the store: collect reports from idle
+/// workers under `root`, then submit the plan ([`read_plan`]), with the
+/// stalls past their `bounds` among its escalations ([`stall`]), without
+/// its new executions while the disk is under its floor ([`crate::disk`]).
+/// Returns log lines.
+pub(crate) fn step(
+    store: &std::sync::Arc<PostgresStore>,
+    supervised: bool,
+    spawn: &str,
+    root: Option<&Path>,
+    disk: &crate::disk::Monitor,
+    bounds: &Bounds,
+) -> Result<Vec<String>, String> {
+    let (mut rows, mut work) = load(store)?;
+    let mut lines = root.map_or_else(Vec::new, |root| {
+        deliver::collect_reports(store, &work, &rows, root)
+    });
+    if !lines.is_empty() {
+        // Collecting a report changed a task's state.
+        (rows, work) = load(store)?;
+    }
+    let Reading {
+        work,
+        mut plan,
+        lines: read,
+        ..
+    } = read_plan(
+        store,
+        (rows, work),
+        |now| disk.escalations(now),
+        bounds,
+        supervised,
+        spawn,
+    )?;
+    lines.extend(read);
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
         if held > 0 {
@@ -551,9 +665,17 @@ pub(crate) fn step(
         }
         // A task typed into a live worker starts from the source's main:
         // merged into its idle workspace first, and the brief says what the
-        // merge did ([`crate::main_merge`]).
+        // merge did ([`crate::main_merge`]). A worker found busy at the
+        // merge gets nothing this pass: the delivery is tried again on the
+        // next, by the same rules.
         if let Some(root) = root {
-            lines.extend(merge_main_before(store, root, &mut order));
+            match merge_main_before(store, root, &mut order) {
+                Ok(line) => lines.extend(line),
+                Err(held) => {
+                    lines.push(held);
+                    continue;
+                }
+            }
         }
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
         // Before the command exists, so the worker's report for it comes
@@ -611,17 +733,27 @@ fn set_aside_before(
 /// Merge main into the workspace of the live worker `order` types a task
 /// into, and add what the merge did to the typed text. A start or resume
 /// mounts its workspace later; the Bridge merges main then, when it merges
-/// cleanly. Returns a log line when the merge did something.
-fn merge_main_before(
+/// cleanly. Returns a log line when the merge did something, and an error
+/// (the log line) when the order must not be sent this pass: the worker was
+/// not idle when the merge looked again ([`crate::main_merge::Merge::Busy`]).
+pub(crate) fn merge_main_before(
     store: &std::sync::Arc<PostgresStore>,
     root: &Path,
     order: &mut Order,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let CommandAction::Input { text, .. } = &mut order.action else {
-        return None;
+        return Ok(None);
     };
-    let task = order.task?;
+    let Some(task) = order.task else {
+        return Ok(None);
+    };
     let merge = crate::main_merge::merge_main(store, root, &order.agent_id, &order.session_id);
+    if let crate::main_merge::Merge::Busy(why) = &merge {
+        return Err(format!(
+            "deliver: task #{task} waits: main is not merged into its workspace while {why}; \
+             tried again next pass"
+        ));
+    }
     // What earlier merges changed and no typed delivery told yet, from
     // their records: this attempt's merge may find main already in.
     let untold = store
@@ -632,12 +764,12 @@ fn merge_main_before(
         text.push_str("\n\n");
         text.push_str(&note);
     }
-    match merge {
+    Ok(match merge {
         crate::main_merge::Merge::Current | crate::main_merge::Merge::NotMounted => None,
         other => Some(format!(
             "deliver: task #{task}: main into its workspace: {other:?}"
         )),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -887,13 +1019,21 @@ mod tests {
         assert_eq!(tags, &["session_worker_a 100"]);
         assert!(text.contains("needs_human 90%"));
 
-        // Once delivered, the same escalation is not sent again.
+        // Once delivered, the same escalation is not sent again; while it
+        // holds, the plan keeps it as told (the attention view shows it).
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, digest);
         let rows = [rows[0].clone(), supervisor];
         let plan = decide(&rows, true, NOW, "spawn");
         assert!(plan.orders.is_empty());
         assert!(plan.pending.is_empty());
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["session_worker_a 100"]);
+        assert_eq!(
+            plan.told[0].since_ms,
+            Some(NOW - 1_000),
+            "as of its judgement"
+        );
     }
 
     #[test]
@@ -903,6 +1043,7 @@ mod tests {
             id: "disk-7".to_string(),
             why: Why::Disk,
             line: "tmpdir /tmp has 5.0 GiB free".to_string(),
+            since_ms: None,
         }];
         let rows = [idle_supervisor()];
         let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
@@ -916,6 +1057,175 @@ mod tests {
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
+        );
+        assert_eq!(
+            plan.told, host,
+            "told, and the path is still low: unresolved"
+        );
+    }
+
+    /// The live page of 2026-11-06 20:30: two disk recoveries told 8 h
+    /// earlier were listed as told and unresolved. A recovery is news: told
+    /// once, then resolved, while a low path stays unresolved until its
+    /// recovery replaces it (crate::disk::escalations).
+    #[test]
+    fn a_told_recovery_is_resolved_and_a_told_low_path_is_not() {
+        let record = |id: i64, path: &str, state: &str, free: u64| {
+            serde_json::json!({"type": "host.disk", "label": "tmpdir", "path": path,
+                               "state": state, "free_bytes": free << 30, "warn_bytes": 20_u64 << 30,
+                               "floor_bytes": 2_u64 << 30, "event_id": id,
+                               "at_ms": NOW - 8 * 3_600_000})
+        };
+        let host = crate::disk::escalations(
+            &[
+                record(7, "/data/tmp", "recovered", 43),
+                record(8, "/ws", "low", 5),
+            ],
+            NOW,
+        );
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
+        let pending: Vec<String> = plan.pending.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            pending,
+            ["host disk-7", "host disk-8"],
+            "both news until told"
+        );
+        let CommandAction::Input { text, .. } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert!(
+            text.contains(
+                "- host — disk space back on this host: tmpdir /data/tmp has 43.0 GiB free again\n"
+            ),
+            "{text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty(),
+            "told once"
+        );
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host disk-8"], "the recovery is not unresolved");
+    }
+
+    /// News of every kind is resolved by being told: a told approval, human
+    /// message or pair of host faults is never kept as unresolved, even if
+    /// its source still gives it.
+    #[test]
+    fn told_news_is_never_unresolved() {
+        let item = |why: Why, id: &str| Escalation {
+            session_id: "host".to_string(),
+            id: id.to_string(),
+            why,
+            line: String::new(),
+            since_ms: None,
+        };
+        let host = [
+            item(Why::Approved, "approved-core"),
+            item(Why::Human, "human-4"),
+            item(Why::GateHostFault, "gate-host-fault-9"),
+            item(Why::GateRoom, "gate-room-12"),
+        ];
+        let mut supervisor = idle_supervisor();
+        supervisor.told = host.iter().map(Escalation::tag).collect();
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(plan.pending.is_empty());
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host gate-room-12"], "only the condition holds");
+    }
+
+    /// The live sequence of 2026-11-06: 100 human notes to one worker could
+    /// not be delivered, each its own line, and they filled 16 digests in a
+    /// row while a report waited behind them. One session's items of one
+    /// kind are one line, every tag filed.
+    #[test]
+    fn repeated_items_about_one_session_are_one_digest_line() {
+        let human = |n: usize| Escalation {
+            session_id: "session_worker_b".to_string(),
+            id: format!("human-{n}"),
+            why: Why::Human,
+            line: format!("note {n} could not be delivered"),
+            since_ms: None,
+        };
+        let mut host: Vec<Escalation> = (1..=20).map(human).collect();
+        host.push(Escalation {
+            session_id: "session_worker_c".to_string(),
+            id: "report-9-0".to_string(),
+            why: Why::Report,
+            line: "task #9 reported".to_string(),
+            since_ms: None,
+        });
+        // Items about the host are each about something else.
+        for place in ["workspace", "tmpdir"] {
+            host.push(Escalation {
+                session_id: "host".to_string(),
+                id: format!("disk-{place}"),
+                why: Why::Disk,
+                line: format!("{place} is low"),
+                since_ms: None,
+            });
+        }
+        let plan = decide_with(
+            &[idle_supervisor()],
+            &Work::default(),
+            &host,
+            true,
+            NOW,
+            "spawn",
+        );
+        let [digest] = plan.orders.as_slice() else {
+            panic!("one digest: {:?}", plan.orders);
+        };
+        let CommandAction::Input { text, tags } = &digest.action else {
+            panic!("a typed digest");
+        };
+        assert!(text.starts_with("Spawn dispatcher: 4 updates"), "{text}");
+        assert!(
+            text.contains("workspace is low") && text.contains("tmpdir is low"),
+            "{text}"
+        );
+        assert!(
+            text.contains("human message (20 of them, the latest): note 20 could not"),
+            "{text}"
+        );
+        assert!(
+            text.contains("task #9 reported"),
+            "the report is not starved"
+        );
+        assert_eq!(tags.len(), 23, "every item it stands for is told");
+    }
+
+    /// The live sequence of 2026-11-06: the supervisor ended its turn on a
+    /// question for the human, Jev judged it BLOCKED at its prompt, and no
+    /// digest reached it for four hours while a worker sat idle.
+    #[test]
+    fn a_supervisor_that_asked_the_human_a_question_still_gets_digests() {
+        let mut blocked = judged(SemanticState::Blocked, 0.8);
+        blocked.attention = true;
+        let mut asking = idle_supervisor();
+        let mut question = judged(SemanticState::Blocked, 0.96);
+        question.attention = true;
+        question.needs_human = Some(0.87);
+        asking.observation = Some(question);
+        let plan = decide(
+            &[worker(blocked.clone()), asking.clone()],
+            true,
+            NOW,
+            "spawn",
+        );
+        assert_eq!(plan.orders.len(), 1, "the digest goes to the supervisor");
+        assert_eq!(plan.orders[0].session_id, "session_supervisor");
+
+        let mut working = asking;
+        working.observation = Some(judged(SemanticState::Blocked, 0.96));
+        working.observation.as_mut().expect("set").ambiguity = None;
+        let plan = decide(&[worker(blocked), working], true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty(),
+            "BLOCKED away from its prompt (a dialog, a running turn) is not idle"
         );
     }
 
@@ -1367,12 +1677,14 @@ mod tests {
             id: "report-7-1".to_string(),
             why: Why::Report,
             line: "task #7: done [spawn:esc missions mission-5] missions mission-5".to_string(),
+            since_ms: None,
         };
         let mission = Escalation {
             session_id: "missions".to_string(),
             id: "mission-5".to_string(),
             why: Why::Mission,
             line: "#5 from human: ship it".to_string(),
+            since_ms: None,
         };
         let rows = [idle_supervisor()];
         let plan = decide_with(
