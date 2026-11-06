@@ -10,6 +10,7 @@ import { Timeline } from "./components/Timeline";
 import { FleetView } from "./components/fleet/FleetView";
 import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
+import { ScorecardView } from "./components/scorecard/ScorecardView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
@@ -19,7 +20,7 @@ const ShowView = lazy(() =>
   import("./components/show/ShowView").then((module) => ({ default: module.ShowView })),
 );
 
-export type View = "fleet" | "missions" | "rsi" | "show" | "sessions";
+export type View = "fleet" | "missions" | "rsi" | "scorecard" | "show" | "sessions";
 
 interface Route {
   view: View;
@@ -32,6 +33,7 @@ function routeFromHash(): Route {
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
+  if (hash.startsWith("#/scorecard")) return { view: "scorecard", agent: null };
   if (hash.startsWith("#/show")) return { view: "show", agent: null };
   const match = /^#\/fleet\/(.+)$/.exec(hash);
   let agent: string | null = null;
@@ -52,6 +54,7 @@ function hashFor(route: Route): string {
       : "#/fleet";
   }
   if (route.view === "missions") return "#/missions";
+  if (route.view === "scorecard") return "#/scorecard";
   // The Show view keeps its options (`?present`, `?replay`) in its hash.
   if (route.view === "show") {
     return window.location.hash.startsWith("#/show") ? window.location.hash : "#/show";
@@ -153,6 +156,7 @@ export default function App() {
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
+        onShowScorecard={() => setView("scorecard")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
       />
@@ -166,6 +170,7 @@ export default function App() {
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
+        onShowScorecard={() => setView("scorecard")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
@@ -185,6 +190,8 @@ export default function App() {
         <MissionsView />
       ) : view === "rsi" ? (
         <RsiView onOpenSession={openTimeline} />
+      ) : view === "scorecard" ? (
+        <ScorecardView />
       ) : view === "show" ? (
         <Suspense fallback={<div className="flex-1 bg-page-canvas" />}>
           <ShowView fleet={fleet} present={false} />
