@@ -88,7 +88,7 @@ pub(crate) fn parse_rfc3339(text: &str) -> Option<i64> {
             return None;
         }
         let mut scale = 100;
-        for byte in fraction.bytes().take(3) {
+        for byte in fraction.bytes().take(length.min(3)) {
             millis += i64::from(byte - b'0') * scale;
             scale /= 10;
         }
