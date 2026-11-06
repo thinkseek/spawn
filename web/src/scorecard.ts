@@ -4,7 +4,7 @@
 // requests. The helpers below the fetch are pure (no React), so the view
 // stays a thin layer over them.
 
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
 
 // ---------------------------------------------------------------------------
 // Types: exactly the JSON the server answers.

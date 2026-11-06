@@ -1,6 +1,6 @@
 // Reads of `/api/events`: the whole event log in log order, a page at a
 // time, after a position or from a time.
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
 import type { LogEvent } from "./show";
 
 export interface EventPage {
