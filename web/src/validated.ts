@@ -16,7 +16,8 @@ const KEPT_URLS = 128;
 
 interface Kept {
   etag: string;
-  value: unknown;
+  raw: unknown;
+  normalized: unknown;
   normalize: (raw: unknown) => unknown;
 }
 
@@ -54,11 +55,9 @@ export class Validated {
     if (response.status === 304 && kept) {
       // Read again by another caller with another reading of the same
       // answer: normalize it its own way.
-      if (kept.normalize !== normalize) {
-        return normalize((kept.value as { raw: unknown }).raw);
-      }
+      if (kept.normalize !== normalize) return normalize(kept.raw);
       this.touch(url, kept);
-      return (kept.value as { normalized: T }).normalized;
+      return kept.normalized as T;
     }
     if (!response.ok) {
       let detail = "";
@@ -76,11 +75,7 @@ export class Validated {
     const normalized = normalize(raw);
     const etag = response.headers.get("ETag");
     if (etag) {
-      this.touch(url, {
-        etag,
-        value: { raw, normalized },
-        normalize: normalize as (raw: unknown) => unknown,
-      });
+      this.touch(url, { etag, raw, normalized, normalize });
     } else {
       this.kept.delete(url);
     }
