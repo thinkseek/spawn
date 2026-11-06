@@ -319,111 +319,108 @@ fn kinds(table: &[(Kind, &str); 4]) -> Vec<Kind> {
     table.iter().map(|(kind, _)| *kind).collect()
 }
 
-/// The eight dimensions of `counts`, by name, in [`NAMES`] order.
-fn dimensions_of(counts: &Counts) -> Vec<Dimension> {
-    let landed = counts.landed;
-    let enough = landed >= MIN_N;
-    let landed_i = i128::try_from(landed).unwrap_or(i128::MAX);
-    let mut out = Vec::with_capacity(NAMES.len());
-
+fn throughput(counts: &Counts, enough: bool) -> Dimension {
     let mut parts = Map::new();
-    parts.insert("landed".into(), usize_json(landed));
-    parts.insert(
-        "open_hours".into(),
-        number(milli(counts.open_ms, HOUR_MS)),
-    );
-    out.push(Dimension {
+    parts.insert("landed".into(), usize_json(counts.landed));
+    parts.insert("open_hours".into(), number(milli(counts.open_ms, HOUR_MS)));
+    let landed = i128::try_from(counts.landed).unwrap_or(i128::MAX);
+    Dimension {
         value: if enough {
-            milli(landed_i * i128::from(HOUR_MS), counts.open_ms)
+            milli(landed * i128::from(HOUR_MS), counts.open_ms)
         } else {
             None
         },
-        n: landed,
+        n: counts.landed,
         better: Better::Higher,
         parts,
-    });
+    }
+}
 
-    let mut parts = Map::new();
-    let p90 = if enough {
-        whole(nearest_rank(&counts.lead_ms, 90))
-    } else {
-        None
-    };
-    parts.insert("p90".into(), number(p90));
-    out.push(Dimension {
-        value: if enough {
-            whole(nearest_rank(&counts.lead_ms, 50))
+fn lead_time(counts: &Counts, enough: bool) -> Dimension {
+    let rank = |percent| {
+        if enough {
+            whole(nearest_rank(&counts.lead_ms, percent))
         } else {
             None
-        },
-        n: landed,
+        }
+    };
+    let mut parts = Map::new();
+    parts.insert("p90".into(), number(rank(90)));
+    Dimension {
+        value: rank(50),
+        n: counts.landed,
         better: Better::Lower,
         parts,
-    });
+    }
+}
 
+fn first_pass(counts: &Counts, enough: bool) -> Dimension {
     let mut parts = Map::new();
     parts.insert("first_pass".into(), usize_json(counts.first_pass));
-    out.push(Dimension {
+    Dimension {
         value: per_landed(counts, enough, i128::try_from(counts.first_pass).unwrap_or(0)),
-        n: landed,
+        n: counts.landed,
         better: Better::Higher,
         parts,
-    });
-
-    for (table, total, breakdown) in [
-        (&SEND_BACKS, "send_backs", "by_verdict"),
-        (&INTERVENTIONS, "interventions", "by_kind"),
-        (&FAILURES, "events", "by_kind"),
-    ] {
-        let sum = counts.sum(&kinds(table));
-        let mut parts = Map::new();
-        parts.insert(total.into(), usize_json(sum));
-        parts.insert(breakdown.into(), by_kind(counts, table));
-        out.push(Dimension {
-            value: per_landed(counts, enough, i128::try_from(sum).unwrap_or(0)),
-            n: landed,
-            better: Better::Lower,
-            parts,
-        });
     }
+}
 
+/// Rework, autonomy or reliability: the marks of `table` per landing.
+fn marks_per_landing(
+    counts: &Counts,
+    enough: bool,
+    table: &[(Kind, &str); 4],
+    total: &str,
+    breakdown: &str,
+) -> Dimension {
+    let sum = counts.sum(&kinds(table));
+    let mut parts = Map::new();
+    parts.insert(total.into(), usize_json(sum));
+    parts.insert(breakdown.into(), by_kind(counts, table));
+    Dimension {
+        value: per_landed(counts, enough, i128::try_from(sum).unwrap_or(0)),
+        n: counts.landed,
+        better: Better::Lower,
+        parts,
+    }
+}
+
+fn cost(counts: &Counts, enough: bool) -> Dimension {
+    let by_model = counts
+        .by_model
+        .iter()
+        .filter(|(_, tokens)| **tokens > 0)
+        .map(|(model, tokens)| {
+            (
+                model.clone(),
+                json!({
+                    "tokens": tokens,
+                    "per_landed": number(per_landed(counts, enough, *tokens)),
+                }),
+            )
+        })
+        .collect();
     let mut parts = Map::new();
     parts.insert("tokens".into(), json!(counts.tokens));
-    parts.insert(
-        "by_model".into(),
-        Value::Object(
-            counts
-                .by_model
-                .iter()
-                .filter(|(_, tokens)| **tokens > 0)
-                .map(|(model, tokens)| {
-                    (
-                        model.clone(),
-                        json!({
-                            "tokens": tokens,
-                            "per_landed": number(per_landed(counts, enough, *tokens)),
-                        }),
-                    )
-                })
-                .collect(),
-        ),
-    );
+    parts.insert("by_model".into(), Value::Object(by_model));
     parts.insert("gate_ms".into(), json!(counts.gate_ms()));
     parts.insert(
         "gate_ms_per_landed".into(),
         number(per_landed(counts, enough, counts.gate_ms())),
     );
-    out.push(Dimension {
+    Dimension {
         value: per_landed(counts, enough, counts.tokens),
-        n: landed,
+        n: counts.landed,
         better: Better::Lower,
         parts,
-    });
+    }
+}
 
+fn gate_time(counts: &Counts) -> Dimension {
     let runs = counts.gate_runs.len();
     let mut parts = Map::new();
     parts.insert("runs".into(), usize_json(runs));
-    out.push(Dimension {
+    Dimension {
         value: if runs >= MIN_N {
             whole(nearest_rank(&counts.gate_runs, 50))
         } else {
@@ -432,8 +429,22 @@ fn dimensions_of(counts: &Counts) -> Vec<Dimension> {
         n: runs,
         better: Better::Lower,
         parts,
-    });
-    out
+    }
+}
+
+/// The eight dimensions of `counts`, in [`NAMES`] order.
+fn dimensions_of(counts: &Counts) -> Vec<Dimension> {
+    let enough = counts.landed >= MIN_N;
+    vec![
+        throughput(counts, enough),
+        lead_time(counts, enough),
+        first_pass(counts, enough),
+        marks_per_landing(counts, enough, &SEND_BACKS, "send_backs", "by_verdict"),
+        marks_per_landing(counts, enough, &INTERVENTIONS, "interventions", "by_kind"),
+        marks_per_landing(counts, enough, &FAILURES, "events", "by_kind"),
+        cost(counts, enough),
+        gate_time(counts),
+    ]
 }
 
 /// The eight dimensions of `counts` as JSON, each with `value`, `n`,
