@@ -288,7 +288,11 @@ fn an_input_to_a_busy_pane_waits_then_is_typed_once_the_pane_is_ready() {
     assert_eq!(rig.finished(2), Some((true, String::new())));
     assert_eq!(
         rig.steps(2),
-        [CommandStep::Waiting, CommandStep::Typing, CommandStep::Typed]
+        [
+            CommandStep::Waiting,
+            CommandStep::Typing,
+            CommandStep::Typed
+        ]
     );
     assert_eq!(rig.typed(), ["the note"]);
     for _ in 0..3 {
@@ -339,7 +343,10 @@ fn a_dispatcher_input_is_refused_at_once_and_never_typed_before_a_waiting_one() 
     rig.tick();
     let (succeeded, error) = rig.finished(2).expect("refused at once");
     assert!(!succeeded);
-    assert!(error.contains(&format!("pane state Busy {PANE_NOT_READY}")), "{error}");
+    assert!(
+        error.contains(&format!("pane state Busy {PANE_NOT_READY}")),
+        "{error}"
+    );
     assert!(rig.steps(2).is_empty(), "never waiting: {:?}", rig.steps(2));
 
     rig.say("human", "note", "the note");
@@ -352,8 +359,14 @@ fn a_dispatcher_input_is_refused_at_once_and_never_typed_before_a_waiting_one() 
     let (succeeded, error) = rig.finished(4).expect("refused at once");
     assert!(!succeeded);
     assert!(error.contains(PANE_NOT_READY), "{error}");
-    assert!(error.contains("cmd_3"), "names the input it waits behind: {error}");
-    assert!(rig.typed().is_empty(), "the dispatcher's input was not typed first");
+    assert!(
+        error.contains("cmd_3"),
+        "names the input it waits behind: {error}"
+    );
+    assert!(
+        rig.typed().is_empty(),
+        "the dispatcher's input was not typed first"
+    );
 
     rig.clock.advance(Duration::from_mins(1));
     rig.tick();
