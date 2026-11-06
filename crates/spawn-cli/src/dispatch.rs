@@ -886,6 +886,37 @@ mod tests {
         );
     }
 
+    /// The live sequence of 2026-11-06: the supervisor ended its turn on a
+    /// question for the human, Jev judged it BLOCKED at its prompt, and no
+    /// digest reached it for four hours while a worker sat idle.
+    #[test]
+    fn a_supervisor_that_asked_the_human_a_question_still_gets_digests() {
+        let mut blocked = judged(SemanticState::Blocked, 0.8);
+        blocked.attention = true;
+        let mut asking = idle_supervisor();
+        let mut question = judged(SemanticState::Blocked, 0.96);
+        question.attention = true;
+        question.needs_human = Some(0.87);
+        asking.observation = Some(question);
+        let plan = decide(
+            &[worker(blocked.clone()), asking.clone()],
+            true,
+            NOW,
+            "spawn",
+        );
+        assert_eq!(plan.orders.len(), 1, "the digest goes to the supervisor");
+        assert_eq!(plan.orders[0].session_id, "session_supervisor");
+
+        let mut working = asking;
+        working.observation = Some(judged(SemanticState::Blocked, 0.96));
+        working.observation.as_mut().expect("set").ambiguity = None;
+        let plan = decide(&[worker(blocked), working], true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty(),
+            "BLOCKED away from its prompt (a dialog, a running turn) is not idle"
+        );
+    }
+
     #[test]
     fn a_busy_or_absent_supervisor_leaves_escalations_pending() {
         let mut blocked = judged(SemanticState::Blocked, 0.8);

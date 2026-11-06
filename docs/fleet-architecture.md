@@ -285,7 +285,9 @@ it, on the same ladder.
   escalates. Its tools are CLI commands over the log: `spawn fleet` (fleet
   state as JSON), `spawn tail <session>` (screen and recent events) and
   `spawn submit`. The dispatcher wakes it by typing a digest into its pane
-  while it is idle; digests coalesce while it works. Its memory is its native
+  while it is idle; digests coalesce while it works. Idle is its turn stopped
+  at its prompt, whatever Jev judged: a turn that ended on a question for the
+  human is judged BLOCKED, and digests still reach it. Its memory is its native
   session (restored by resume) plus the log.
 - **Human**: the attention queue in the UI lists only what the supervisor
   escalated or could not resolve. Each human action is a command with
