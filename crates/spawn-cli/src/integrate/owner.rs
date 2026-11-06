@@ -68,7 +68,8 @@ pub(crate) fn full_hash(text: &str) -> bool {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct Request {
     /// The `source.push_requested` record's event id.
-    pub(super) request: i64,
+    #[serde(rename = "request")]
+    pub(super) id: i64,
     pub(super) source: String,
     pub(super) commit: String,
 }
@@ -99,7 +100,7 @@ pub(super) fn pending(store: &PostgresStore) -> Result<Vec<Request>, String> {
 pub(super) fn pending_by_source(store: &PostgresStore) -> Result<HashMap<String, i64>, String> {
     let mut held = HashMap::new();
     for request in pending(store)? {
-        held.entry(request.source).or_insert(request.request);
+        held.entry(request.source).or_insert(request.id);
     }
     Ok(held)
 }
@@ -121,7 +122,7 @@ pub(super) fn apply_pending(store: &PostgresStore) -> Result<HashMap<String, i64
         }
         let said = format!(
             "integrate: the owner's landing of {} on {} (request {})",
-            request.commit, request.source, request.request
+            request.commit, request.source, request.id
         );
         match apply(store, request) {
             Ok(Outcome::Applied { from, to }) => println!("{said}: main {from} -> {to}"),
@@ -155,14 +156,7 @@ fn contains(source: &str, ancestor: &str, commit: &str) -> bool {
 /// Apply one request (see the module's comment).
 pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome, String> {
     let source = request.source.as_str();
-    let refuse = |reason: String| -> Result<Outcome, String> {
-        record(
-            store,
-            &json!({"type": "source.push_refused", "request": request.request,
-                    "reason": reason}),
-        )?;
-        Ok(Outcome::Refused(reason))
-    };
+    let refuse = |reason: String| refused(store, request, reason);
     if let Err(error) = sources::MissionSource::parse(source) {
         return refuse(error);
     }
@@ -205,21 +199,9 @@ pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome,
     for attempt in 0..2 {
         let (branch, main) = source_head(source)?;
         if attempt == 0
-            && let Some((mission, task)) = on_source.iter().find_map(|mission| {
-                mission
-                    .landing()
-                    .filter(|task| {
-                        task.candidate
-                            .as_deref()
-                            .is_some_and(|candidate| contains(source, candidate, &main))
-                    })
-                    .map(|task| (mission.id, task.id))
-            })
+            && let Some(why) = unrecorded_landing(source, &main, &on_source)
         {
-            return Ok(Outcome::Waits(format!(
-                "task {task} of mission {mission} pushed its landing to main without its record \
-                 yet; it is resolved first"
-            )));
+            return Ok(Outcome::Waits(why));
         }
         if contains(source, commit, &main) {
             // Main holds the commit: this request moved it before its
@@ -230,13 +212,13 @@ pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome,
                 .filter_map(|mission| mission.baseline.as_deref())
                 .filter(|baseline| *baseline != main)
                 .collect();
-            let from = moved_from(source, &main, commit, request.request, &baselines);
+            let from = moved_from(source, &main, commit, request.id, &baselines);
             return moved(store, request, &from, &main);
         }
         let new = if contains(source, &main, commit) {
             commit.to_string()
         } else {
-            match owner_merge(source, &main, commit, request.request) {
+            match owner_merge(source, &main, commit, request.id) {
                 Ok(Some(merge)) => merge,
                 Ok(None) => {
                     return refuse(format!(
@@ -247,23 +229,51 @@ pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome,
                 Err(error) => return refuse(error),
             }
         };
+        let why = format!("spawn: the owner's landing (request {})", request.id);
         match git(&[
             "--git-dir",
             source,
             "update-ref",
             "-m",
-            &format!("spawn: the owner's landing (request {})", request.request),
+            &why,
             &branch,
             &new,
             &main,
         ]) {
             Ok(_) => return moved(store, request, &main, &new),
-            Err(error) => failed = error,
+            Err(error) => failed = error.to_string(),
         }
     }
     refuse(format!(
         "main moved under the owner's landing twice; the compare-and-swap failed: {failed}"
     ))
+}
+
+/// A task landing on the source whose push went out without its record (its
+/// candidate is in `main`, and it is still `landing`), said as why the
+/// owner's landing waits: main says nothing until that landing's mission
+/// resolves it.
+fn unrecorded_landing(source: &str, main: &str, on_source: &[&Mission]) -> Option<String> {
+    on_source.iter().find_map(|mission| {
+        let task = mission.landing()?;
+        let candidate = task.candidate.as_deref()?;
+        contains(source, candidate, main).then(|| {
+            format!(
+                "task {} of mission {} pushed its landing to main without its record yet; it is \
+                 resolved first",
+                task.id, mission.id
+            )
+        })
+    })
+}
+
+/// Record that `request` was refused, and why.
+fn refused(store: &PostgresStore, request: &Request, reason: String) -> Result<Outcome, String> {
+    record(
+        store,
+        &json!({"type": "source.push_refused", "request": request.id, "reason": reason}),
+    )?;
+    Ok(Outcome::Refused(reason))
 }
 
 /// Record that `request` moved its source's main `from` -> `to`.
@@ -276,7 +286,7 @@ fn moved(
     record(
         store,
         &json!({"type": "source.moved", "source": request.source, "from": from, "to": to,
-                "request": request.request, "by": "human"}),
+                "request": request.id, "by": "human"}),
     )?;
     Ok(Outcome::Applied {
         from: from.to_string(),
