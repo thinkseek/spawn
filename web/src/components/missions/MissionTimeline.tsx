@@ -45,7 +45,7 @@ import {
   useWheelZoom,
   useWidth,
 } from "../timeaxis/useTimeWindow";
-import { FOCUS_RING, cx } from "../ui";
+import { FOCUS_RING, FOCUS_RING_INSET, cx } from "../ui";
 import { useStoredChoice } from "../ViewToggle";
 import { TaskPanel } from "./TaskPanel";
 import { PHASE_COLOR, PHASE_LEGEND, verdictColor } from "./timelineStyle";
@@ -461,7 +461,8 @@ export function MissionTimeline({
                   if (row?.kind === "task" && x >= 0) zoomToBar(row.bar);
                 }}
                 className={cx(
-                  "relative select-none outline-none",
+                  "relative select-none",
+                  FOCUS_RING_INSET,
                   pan.dragging ? "cursor-grabbing" : "cursor-default",
                 )}
                 style={{ height: rows.height }}
@@ -738,9 +739,12 @@ function SectionRowLabel({
     >
       <button
         type="button"
-        tabIndex={-1}
+        aria-expanded={!folded}
         onClick={onToggle}
-        className="pointer-events-auto mb-0.5 inline-flex items-center gap-1.5 rounded bg-page-canvas px-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground outline-none hover:text-foreground"
+        className={cx(
+          "pointer-events-auto mb-0.5 inline-flex items-center gap-1.5 rounded bg-page-canvas px-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground hover:text-foreground",
+          FOCUS_RING,
+        )}
       >
         <ChevronRight
           size={11}
