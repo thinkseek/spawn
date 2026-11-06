@@ -1,8 +1,14 @@
 //! `spawn integrate`: the one landing path (docs/fleet-architecture.md
 //! §10.3).
 //!
-//! For every open mission with a gate, and every done one while the closure
-//! rule (`spawn_task_may_continue`) lets its work go on, one pass:
+//! A pass first records, before any mission's step, `source.hold_expired`
+//! for every owner's hold whose recorded `expires_ms` the database's clock
+//! (`spawn_now_ms()`) has reached ([`expire_holds`]; the hold, below at 3).
+//! Only that record ends a hold: past `expires_ms` without it nothing lands,
+//! and a hold that expired while the integrator was down is recorded at its
+//! first pass, before anything lands. Then, for every open mission with a
+//! gate, and every done one while the closure rule
+//! (`spawn_task_may_continue`) lets its work go on, one step:
 //!
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row
@@ -15,7 +21,19 @@
 //!    (its push may have moved main before its record);
 //! 2. a delivered task over its mission's budget is aborted and its worker
 //!    stopped;
-//! 3. a task whose gate passed is landed (again, after a crash);
+//! 3. a task whose gate passed is landed (again, after a crash), unless the
+//!    owner holds its source (`spawn mission hold`, a `source.held` record):
+//!    [`land`] reads the hold from the store under the landing lock, before
+//!    its push, never from memory, and on a held source pushes nothing. A
+//!    candidate already under main landed before the hold and is recorded
+//!    `task.landed`; any other records `task.held` (once per task and hold)
+//!    and stays `landing`, so a hold never splits a push from its record.
+//!    A task waiting behind the hold ends nothing early: the step goes on to
+//!    the baseline check and the assignment (5), its source is not counted
+//!    as moved, and the mission's other ready tasks wait behind it. After a
+//!    record ends the hold (`source.released`, `source.hold_expired`) it
+//!    lands at the next pass by the rules below (`stale` and judged again
+//!    when main moved meanwhile);
 //! 4. otherwise the next ready task is judged: accepted by the supervisor
 //!    (`accept` = review), or also just reported (`gate`). The candidate is
 //!    what the agent published: the source's `refs/heads/spawn/<agent>`
@@ -187,7 +205,10 @@
 //! mission. Only a landing ends anything early: it moves its source's main
 //! and the baselines of the missions on it, so the rest of that source
 //! waits for the next pass, which reads everything again; other sources go
-//! on. The ready tasks the pass found are given gates after every mission
+//! on. A task waiting behind the owner's hold is no landing: it moved
+//! nothing, and once its `task.held` names the active hold it is no landing
+//! in flight either ([`landing_elsewhere`]), so the other missions on the
+//! held source are judged as usual (their accepted tasks wait too). The ready tasks the pass found are given gates after every mission
 //! had its step ([`Integrator::start_ready`]): the one that has waited
 //! longest first, from when it was reported or from when its mission's
 //! previous judging ended, whichever is later. The mission id decides
