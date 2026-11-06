@@ -496,7 +496,8 @@ impl Mission {
     /// about it.
     fn in_flight(&self) -> Option<&Task> {
         self.tasks.iter().find(|task| {
-            task.state == TaskState::Landing && !(task.held_by.is_some() && task.held_by == self.hold)
+            task.state == TaskState::Landing
+                && !(task.held_by.is_some() && task.held_by == self.hold)
         })
     }
 }
@@ -2390,7 +2391,12 @@ enum Landing {
 /// pushed. A candidate already under main landed before the hold and is
 /// recorded `task.landed`; any other records `task.held` (once per task and
 /// hold) and stays `landing`. So a hold never splits a push from its record.
-fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Result<Landing, String> {
+fn land(
+    store: &PostgresStore,
+    mirror: &Path,
+    source: &str,
+    task: &Task,
+) -> Result<Landing, String> {
     let (Some(base), Some(candidate)) = (task.base.as_deref(), task.candidate.as_deref()) else {
         return record(
             store,
@@ -6819,7 +6825,8 @@ mod database_tests {
     // --- the owner's hold (objective 034) --------------------------------
 
     /// A stub gate that accepts every candidate.
-    const ACCEPTING_GATE: &str = "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+    const ACCEPTING_GATE: &str =
+        "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
 
     /// Hold `source` for `bound` seconds as `spawn mission hold` does: the
     /// hold's event id.
@@ -6890,8 +6897,8 @@ mod database_tests {
         db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
                           "verdict": "accepted", "base": b0, "candidate": work}));
         let held = hold(&db, &source, 600);
-        let mirror = crate::sources::ensure_mirror(&integrator.judge.root, Some(&source))
-            .expect("mirror");
+        let mirror =
+            crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
         let landing = ready_task(&db, task);
         for _ in 0..2 {
             assert_eq!(
@@ -6901,7 +6908,11 @@ mod database_tests {
         }
         integrator.pass_on(&db.store).expect("a pass");
         assert_eq!(source_main(&source), b0, "nothing was pushed");
-        assert_eq!(task_records(&db, "task.held", task).len(), 1, "once per task and hold");
+        assert_eq!(
+            task_records(&db, "task.held", task).len(),
+            1,
+            "once per task and hold"
+        );
         assert!(task_records(&db, "task.landed", task).is_empty());
         assert_eq!(task_state(&db, mission, task), "landing");
         assert!(db.mission(mission)["halted"].is_null());
@@ -6957,7 +6968,10 @@ mod database_tests {
             crate::missions::hold_source(&owner, &held_source, 600, None)
         });
         std::thread::sleep(std::time::Duration::from_millis(700));
-        assert!(!holder.is_finished(), "the hold waits for the landing's lock");
+        assert!(
+            !holder.is_finished(),
+            "the hold waits for the landing's lock"
+        );
         let c1 = main_moves(&base, &source, "landed.txt");
         db.record(&json!({"type": "task.landed", "id": task, "from": b0, "to": c1}));
         drop(lock);
@@ -6984,7 +6998,9 @@ mod database_tests {
         let db = Db::new("held_step");
         let b0 = source_main(&source);
         let a = objective_mission(&db, &base, &source, &scenarios, "rh", 2);
-        integrator.pass_on(&db.store).expect("objective 1 is assigned");
+        integrator
+            .pass_on(&db.store)
+            .expect("objective 1 is assigned");
         let tasks = |mission: i64| db.mission(mission)["tasks"].as_array().map_or(0, Vec::len);
         assert_eq!(tasks(a), 1);
         let first = db.mission(a)["tasks"][0]["id"].as_i64().expect("its task");
@@ -7003,10 +7019,19 @@ mod database_tests {
         )
         .expect("objective 2");
 
-        integrator.pass_on(&db.store).expect("a pass under the hold");
-        assert_eq!(tasks(a), 2, "objective 2 is assigned while the source is held");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass under the hold");
+        assert_eq!(
+            tasks(a),
+            2,
+            "objective 2 is assigned while the source is held"
+        );
         assert_eq!(task_records(&db, "task.held", first).len(), 1);
-        assert!(started(&marks).is_empty(), "C waited for A's task, not held yet when read");
+        assert!(
+            started(&marks).is_empty(),
+            "C waited for A's task, not held yet when read"
+        );
         integrator.pass_on(&db.store).expect("the next pass");
         let started = wait_started(&marks, 1);
         let mirror = mirror_of(&integrator, &source);
@@ -7018,11 +7043,23 @@ mod database_tests {
         );
         std::fs::write(marks.join("release"), "").expect("release");
         integrator.settle();
-        assert_eq!(verdicts(&db, ready), ["accepted"], "the gate on a held source recorded");
+        assert_eq!(
+            verdicts(&db, ready),
+            ["accepted"],
+            "the gate on a held source recorded"
+        );
         assert_eq!(task_state(&db, c, ready), "landing");
-        assert_eq!(task_records(&db, "task.held", ready).len(), 1, "its judging's land()");
+        assert_eq!(
+            task_records(&db, "task.held", ready).len(),
+            1,
+            "its judging's land()"
+        );
         assert_eq!(task_state(&db, a, first), "landing");
-        assert_eq!(source_main(&source), b0, "nothing landed on the held source");
+        assert_eq!(
+            source_main(&source),
+            b0,
+            "nothing landed on the held source"
+        );
         for mission in [a, c] {
             assert!(db.mission(mission)["halted"].is_null());
             assert_eq!(db.mission(mission)["hold"], held);
@@ -7045,16 +7082,22 @@ mod database_tests {
         let first = db.reported_task(mission, "one");
         push_work(&base, &source, &agent_of(&db, mission, first), "one.txt");
         hold(&db, &source, 600);
-        integrator.pass_on(&db.store).expect("judged under the hold");
+        integrator
+            .pass_on(&db.store)
+            .expect("judged under the hold");
         integrator.settle();
         assert_eq!(verdicts(&db, first), ["accepted"]);
-        integrator.pass_on(&db.store).expect("a pass under the hold");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass under the hold");
         assert_eq!(task_state(&db, mission, first), "landing");
         assert_eq!(task_records(&db, "task.held", first).len(), 1);
         assert_eq!(source_main(&source), b0);
         let released = db.store.source_release(&source).expect("the release");
         assert_eq!(released["waiting"], json!([first]));
-        integrator.pass_on(&db.store).expect("the pass after the release");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the release");
         assert_eq!(task_state(&db, mission, first), "landed");
         let (release, _) = source_records(&db, "source.released")[0].clone();
         assert!(task_records(&db, "task.landed", first)[0] > release);
@@ -7065,16 +7108,31 @@ mod database_tests {
         let second = db.reported_task(mission, "two");
         push_work(&base, &source, &agent_of(&db, mission, second), "two.txt");
         hold(&db, &source, 600);
-        integrator.pass_on(&db.store).expect("judged under the hold");
+        integrator
+            .pass_on(&db.store)
+            .expect("judged under the hold");
         integrator.settle();
         assert_eq!(task_state(&db, mission, second), "landing");
         let deployed = main_moves(&base, &source, "deploy.txt");
-        assert_eq!(db.store.source_moved(&source, &landed, &deployed).expect("moved"), 1);
+        assert_eq!(
+            db.store
+                .source_moved(&source, &landed, &deployed)
+                .expect("moved"),
+            1
+        );
         db.store.source_release(&source).expect("the release");
-        integrator.pass_on(&db.store).expect("its landing finds main moved");
+        integrator
+            .pass_on(&db.store)
+            .expect("its landing finds main moved");
         assert_eq!(verdicts(&db, second), ["accepted", "stale"]);
-        assert_eq!(task_state(&db, mission, second), "reported", "judged again, not discarded");
-        integrator.pass_on(&db.store).expect("judged again on the new main");
+        assert_eq!(
+            task_state(&db, mission, second),
+            "reported",
+            "judged again, not discarded"
+        );
+        integrator
+            .pass_on(&db.store)
+            .expect("judged again on the new main");
         integrator.settle();
         assert_eq!(verdicts(&db, second), ["accepted", "stale", "accepted"]);
         assert_eq!(task_state(&db, mission, second), "landed");
@@ -7100,10 +7158,14 @@ mod database_tests {
         db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
                           "verdict": "accepted", "base": b0, "candidate": work}));
         let held = hold(&db, &source, 1);
-        integrator.pass_on(&db.store).expect("a pass under the hold");
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass under the hold");
         assert_eq!(task_state(&db, mission, task), "landing");
         std::thread::sleep(std::time::Duration::from_millis(1200));
-        integrator.pass_on(&db.store).expect("the pass after its bound");
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after its bound");
         let expired = source_records(&db, "source.hold_expired");
         assert_eq!(expired.len(), 1);
         let (event, record) = &expired[0];
@@ -7111,7 +7173,10 @@ mod database_tests {
         assert_eq!(record["source"], source.as_str());
         assert_eq!(record["waiting"], json!([task]));
         assert_eq!(task_state(&db, mission, task), "landed");
-        assert!(task_records(&db, "task.landed", task)[0] > *event, "the expiry first");
+        assert!(
+            task_records(&db, "task.landed", task)[0] > *event,
+            "the expiry first"
+        );
         assert_eq!(source_main(&source), work);
         integrator.pass_on(&db.store).expect("another pass");
         assert_eq!(source_records(&db, "source.hold_expired").len(), 1, "once");

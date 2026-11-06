@@ -76,7 +76,13 @@ fn refold(client: &mut Client) {
 }
 
 /// Hold `source` as the owner's CLI does: under the landing lock.
-fn hold(store: &PostgresStore, source: &str, main: &str, bound_s: i32, reason: Option<&str>) -> Value {
+fn hold(
+    store: &PostgresStore,
+    source: &str,
+    main: &str,
+    bound_s: i32,
+    reason: Option<&str>,
+) -> Value {
     let lock = store.source_hold_lock(source).expect("the landing lock");
     let held = store
         .source_hold(source, main, bound_s, reason)
@@ -121,7 +127,11 @@ fn a_hold_is_the_owners_on_a_local_source_a_mission_names_with_a_bound() {
     }
     // A source no mission names, or one only a later mission source names.
     store
-        .mission_add("two sources", &json!(["/tmp/first.git", "/tmp/second.git"]), "human")
+        .mission_add(
+            "two sources",
+            &json!(["/tmp/first.git", "/tmp/second.git"]),
+            "human",
+        )
         .expect("add");
     for (unnamed, why) in [
         ("/tmp/no-mission.git", "no mission names"),
@@ -140,7 +150,10 @@ fn a_hold_is_the_owners_on_a_local_source_a_mission_names_with_a_bound() {
     let lock = store.source_hold_lock(source).expect("the lock");
     for bound in [0, -1, 86_401] {
         let refused = refusal(store.source_hold(source, MAIN, bound, None));
-        assert!(refused.contains("SPAWN_SOURCE_HOLD_SECS"), "{bound}: {refused}");
+        assert!(
+            refused.contains("SPAWN_SOURCE_HOLD_SECS"),
+            "{bound}: {refused}"
+        );
     }
     let long = "x".repeat(501);
     assert!(refusal(store.source_hold(source, MAIN, 60, Some(&long))).contains("500"));
@@ -161,7 +174,9 @@ fn a_hold_is_the_owners_on_a_local_source_a_mission_names_with_a_bound() {
         "select spawn_source_hold('/tmp/held.git', '1111111111111111111111111111111111111111', 60, null)",
         "select spawn_source_release('/tmp/held.git')",
     ] {
-        let refused = client.batch_execute(call).expect_err("the supervisor is refused");
+        let refused = client
+            .batch_execute(call)
+            .expect_err("the supervisor is refused");
         assert_eq!(
             refused.code(),
             Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
@@ -188,7 +203,10 @@ fn the_store_writes_expires_ms_and_a_second_hold_renews_the_first() {
     let held = records(&mut client, "source.held");
     assert_eq!(held.len(), 1);
     let record = &held[0]["record"];
-    assert_eq!(first["hold"], held[0]["id"], "the hold is its record's event id");
+    assert_eq!(
+        first["hold"], held[0]["id"],
+        "the hold is its record's event id"
+    );
     assert_eq!(record["source"], source);
     assert_eq!(record["main"], MAIN);
     assert_eq!(record["by"], "human");
@@ -235,7 +253,12 @@ fn the_store_writes_expires_ms_and_a_second_hold_renews_the_first() {
     assert_eq!(holds[0]["held_at_ms"], held[1]["at_ms"]);
     // The waiting task waits behind the new one once its landing says so.
     let second_hold = second["hold"].as_i64().expect("an id");
-    assert!(store.task_held(task, second_hold, source).expect("held").is_some());
+    assert!(
+        store
+            .task_held(task, second_hold, source)
+            .expect("held")
+            .is_some()
+    );
     let board = store.mission_board(10).expect("board");
     assert_eq!(board["holds"][0]["waiting"], json!([task]));
     assert_eq!(board["missions"][0]["hold"], second_hold);
@@ -247,15 +270,23 @@ fn a_release_ends_the_active_hold_and_with_none_records_nothing() {
     let source = "/tmp/released.git";
     let (_, task) = landing_task(&store, source);
     let mut client = admin(&schema);
-    let none = store.source_release(source).expect("a release with no hold");
-    assert_eq!(none, json!({"source": source, "released": null, "waiting": []}));
+    let none = store
+        .source_release(source)
+        .expect("a release with no hold");
+    assert_eq!(
+        none,
+        json!({"source": source, "released": null, "waiting": []})
+    );
     assert!(source_types(&mut client).is_empty(), "nothing was recorded");
 
     let held = hold(&store, source, MAIN, 600, None);
     let id = held["hold"].as_i64().expect("an id");
     store.task_held(task, id, source).expect("held");
     let released = store.source_release(source).expect("the release");
-    assert_eq!(released, json!({"source": source, "released": id, "waiting": [task]}));
+    assert_eq!(
+        released,
+        json!({"source": source, "released": id, "waiting": [task]})
+    );
     let record = &records(&mut client, "source.released")[0]["record"];
     assert_eq!(record["hold"], id);
     assert_eq!(record["source"], source);
@@ -269,7 +300,10 @@ fn a_release_ends_the_active_hold_and_with_none_records_nothing() {
 
     let again = store.source_release(source).expect("a second release");
     assert!(again["released"].is_null());
-    assert_eq!(source_types(&mut client), ["source.held", "source.released"]);
+    assert_eq!(
+        source_types(&mut client),
+        ["source.held", "source.released"]
+    );
     // No hold is left to name in a `task.held`.
     assert!(store.task_held(task, id, source).is_err());
 }
@@ -319,7 +353,10 @@ fn a_hold_expires_by_record_only_once_the_database_clock_reached_it() {
     assert_eq!(expiries[0]["source"], source);
     assert_eq!(expiries[0]["bound_s"], 1);
     assert_eq!(expiries[0]["main"], MAIN);
-    assert_eq!(expiries[0]["waiting"], json!([{"task": task, "mission": mission}]));
+    assert_eq!(
+        expiries[0]["waiting"],
+        json!([{"task": task, "mission": mission}])
+    );
     client
         .execute(
             "insert into spawn_commands (principal, idempotency_key, agent_id, session_id, action,
@@ -351,7 +388,11 @@ fn a_landing_waits_once_per_task_and_hold_and_the_fold_and_refold_agree() {
     assert!(refusal(store.task_held(task, id, "/tmp/other.git")).contains("not the active hold"));
     let first = store.task_held(task, id, source).expect("held");
     assert!(first.is_some());
-    assert_eq!(store.task_held(task, id, source).expect("again"), None, "once per task and hold");
+    assert_eq!(
+        store.task_held(task, id, source).expect("again"),
+        None,
+        "once per task and hold"
+    );
     // As a plain integrator record, the second is refused, not recorded.
     assert!(
         store
@@ -377,7 +418,11 @@ fn a_landing_waits_once_per_task_and_hold_and_the_fold_and_refold_agree() {
     assert_eq!(live["tasks"][0]["state"], "landing");
     assert_eq!(live["holds"][0]["reason"], "owner gate");
     refold(&mut client);
-    assert_eq!(folded(&mut client), live, "the refold rebuilds the holds and held_by");
+    assert_eq!(
+        folded(&mut client),
+        live,
+        "the refold rebuilds the holds and held_by"
+    );
 
     // Renewed, released: the refold agrees at every end.
     let renewed = hold(&store, source, OTHER_MAIN, 600, None);
