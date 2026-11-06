@@ -1391,6 +1391,8 @@ begin
            and (p_record ->> 'revision' is null
                 or revisions = (p_record ->> 'revision')::integer);
     when 'task.cancelled' then
+        -- `by` names who cancelled (spawn_task_cancel_by), read by the
+        -- scorecard, not by the fold.
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
         -- A task that leaves the gate ends its run of `no_room`.
         update mission_missions set gate_room_task = null, gate_room_since_ms = null,
