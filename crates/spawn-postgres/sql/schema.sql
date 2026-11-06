@@ -2332,6 +2332,15 @@ create index if not exists spawn_events_control_record
     on spawn_events ((kind -> 'detail' -> 'record' ->> 'id'), session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded';
 
+-- The owner's landing requests and the records that can be their outcome,
+-- found without reading the rest of the stream: the integrator reads the
+-- pending ones on every pass.
+create index if not exists spawn_events_source_push
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type'
+          in ('source.push_requested', 'source.push_refused', 'source.moved');
+
 -- The loop's disk records (`host.disk`, owner only): free space on a path
 -- the fleet writes to fell under the warning threshold (`low`) or came back
 -- (`recovered`). One record per crossing; the loop reads the latest per path
@@ -2525,7 +2534,8 @@ begin
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
-        'spawn_landing_hold(bigint)', 'spawn_landing_release()'] loop
+        'spawn_landing_hold(bigint)', 'spawn_landing_release()',
+        'spawn_source_push_request(text, text, text)', 'spawn_source_push_hold()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
