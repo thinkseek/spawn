@@ -164,6 +164,30 @@ pub fn names_files_outside_git(message: &str) -> bool {
     })
 }
 
+/// The locale every git Spawn runs gets (`LC_ALL`): git's own, untranslated
+/// messages.
+pub const GIT_LOCALE: &str = "C";
+
+/// A command that runs `program` (the git to run) the way Spawn runs every
+/// git: in the C locale, [`GIT_LOCALE`] as `LC_ALL` and no `LANGUAGE`.
+/// Every git of [`GitWorkspace`] and of the controller (`spawn-cli`'s
+/// `controller_git`) is built here, so none can be left to the host's
+/// locale.
+///
+/// Spawn reads what git answers: a push's summary, a merge's conflict
+/// kinds, a listing, an exit code, and the error it quotes in a record or a
+/// note. Under a translated locale (`LANG=zh_CN.UTF-8`) git, and the
+/// `git-receive-pack` or hook it starts, writes its messages in that
+/// language; nothing Spawn decides may change with the host's language.
+/// `LC_ALL` wins over `LANG` and every `LC_*`; `LANGUAGE`, which gettext
+/// would otherwise read first, is removed. Paths, listings and commit
+/// messages are bytes to git in any locale.
+pub fn git_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.env("LC_ALL", GIT_LOCALE).env_remove("LANGUAGE");
+    command
+}
+
 /// Stdout of a git command exactly as written, bytes and all, or the
 /// failure as an error. A `-z` listing is read this way: a path may begin
 /// or end with whitespace, which trimming would cut off the first or the
@@ -290,8 +314,10 @@ impl GitWorkspace {
         self
     }
 
+    /// Every git this store runs: in the C locale ([`git_command`]), on its
+    /// repository.
     fn command(&self) -> Command {
-        let mut command = Command::new(&self.git);
+        let mut command = git_command(&self.git);
         command.arg(format!("--git-dir={}", self.repo.display()));
         // commit-tree needs a committer identity. Supplying it here keeps the
         // store independent of the host's git configuration.
