@@ -51,3 +51,27 @@ export function stageDuration(ms: number | null | undefined): string {
   const hours = Math.floor(minutes / 60);
   return minutes % 60 === 0 ? `+${hours}h` : `+${hours}h ${minutes % 60}m`;
 }
+
+const pad2 = (value: number) => String(value).padStart(2, "0");
+
+/** A time as the local wall clock with its date: `2026-11-06 17:37`. */
+export function localDateTime(ms: number | null | undefined, seconds = false): string {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return "—";
+  const date = new Date(ms);
+  const day = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  const time = `${pad2(date.getHours())}:${pad2(date.getMinutes())}${seconds ? `:${pad2(date.getSeconds())}` : ""}`;
+  return `${day} ${time}`;
+}
+
+/** The same moment in UTC: `2026-11-06 09:37:22 UTC`. */
+export function utcDateTime(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return "—";
+  return `${new Date(ms).toISOString().slice(0, 19).replace("T", " ")} UTC`;
+}
+
+/** The tooltip of a relative or local time: the local time to the second,
+ * then UTC. Undefined when there is no time, so no empty tooltip shows. */
+export function absoluteTitle(ms: number | null | undefined): string | undefined {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return undefined;
+  return `${localDateTime(ms, true)} local · ${utcDateTime(ms)}`;
+}
