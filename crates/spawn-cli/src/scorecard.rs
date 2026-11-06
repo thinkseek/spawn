@@ -35,7 +35,9 @@ use spawn_postgres::PostgresStore;
 
 use history::{Facts, History};
 use measure::{MIN_N, Scope, Window, active, counts, dimensions};
-use time::{DAY_MS, format_rfc3339, parse_rfc3339, parse_span};
+// The attention view reads transcript times too (crate::serve).
+pub(crate) use time::parse_rfc3339;
+use time::{DAY_MS, format_rfc3339, parse_span};
 
 /// The window when `--since` is not given: the last seven days.
 const DEFAULT_SPAN_MS: i64 = 7 * DAY_MS;
