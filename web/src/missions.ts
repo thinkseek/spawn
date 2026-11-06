@@ -102,6 +102,13 @@ export interface MissionTask {
   revisions: number;
   review_note: string | null;
   report: string | null;
+  /** Each text's whole length in bytes: the board sends a text's first
+   * lines (`brief`, `review_note`, `report`), and of a folded task (a
+   * closed mission's, a cancelled one) no report at all; the whole is
+   * `fetchTaskTexts`. Null from an older server, which sends them whole. */
+  brief_bytes?: number | null;
+  review_note_bytes?: number | null;
+  report_bytes?: number | null;
   /** The commit the integrator built for this task. */
   candidate: string | null;
   /** The backlog objective of an objective mission's task. */
@@ -229,6 +236,9 @@ function normalizeTask(value: unknown): MissionTask | null {
     revisions: Math.max(0, optionalNumber(value.revisions) ?? 0),
     review_note: optionalText(value.review_note),
     report: optionalText(value.report),
+    brief_bytes: optionalNumber(value.brief_bytes),
+    review_note_bytes: optionalNumber(value.review_note_bytes),
+    report_bytes: optionalNumber(value.report_bytes),
     candidate: optionalText(value.candidate),
     objective: optionalNumber(value.objective),
     metric: optionalText(value.metric),
@@ -332,6 +342,32 @@ export function normalizeMissions(value: unknown): Missions {
 
 export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
   return readApi("/api/missions", signal, normalizeMissions);
+}
+
+/** A task's texts in full, as `/api/missions/task/<id>` answers them. */
+export interface TaskTexts {
+  id: number | null;
+  brief: string | null;
+  report: string | null;
+  review_note: string | null;
+  updated_at_ms: number | null;
+}
+
+export function normalizeTaskTexts(value: unknown): TaskTexts {
+  const raw = isObject(value) ? value : {};
+  return {
+    id: optionalNumber(raw.id),
+    brief: optionalText(raw.brief),
+    report: optionalText(raw.report),
+    review_note: optionalText(raw.review_note),
+    updated_at_ms: optionalNumber(raw.updated_at_ms),
+  };
+}
+
+/** GET /api/missions/task/<id>: a task's brief, report and review note in
+ * full, read when the task is opened. */
+export async function fetchTaskTexts(task: number, signal: AbortSignal): Promise<TaskTexts> {
+  return readApi(`/api/missions/task/${task}`, signal, normalizeTaskTexts);
 }
 
 /** How a task's record shows as a step: what it moved the task to.
