@@ -169,7 +169,7 @@ pub fn names_files_outside_git(message: &str) -> bool {
 const GIT_LOCALE: &str = "C";
 
 /// A command that runs `program` (the git to run) the way Spawn runs every
-/// git: in the C locale, [`GIT_LOCALE`] as `LC_ALL` and no `LANGUAGE`.
+/// git: in the C locale, `LC_ALL=C` and no `LANGUAGE`.
 /// Every git of [`GitWorkspace`] and of the controller (`spawn-cli`'s
 /// `controller_git`) is built here, so none can be left to the host's
 /// locale.
