@@ -241,7 +241,7 @@ pub(super) fn apply(store: &PostgresStore, request: &Request) -> Result<Outcome,
             &main,
         ]) {
             Ok(_) => return moved(store, request, &main, &new),
-            Err(error) => failed = error.to_string(),
+            Err(error) => failed = error,
         }
     }
     refuse(format!(
