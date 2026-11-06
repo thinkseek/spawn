@@ -2656,11 +2656,26 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
         .integrator_record(&json!({"type": "mission.halted", "id": halted, "reason": "stop"}))
         .expect("halt");
     for (bad_source, commit, reference, why) in [
-        ("https://example.invalid/x.git", c1.as_str(), owner_ref(&c1), "remote"),
-        ("relative/x.git", c1.as_str(), owner_ref(&c1), "not a mission source"),
+        (
+            "https://example.invalid/x.git",
+            c1.as_str(),
+            owner_ref(&c1),
+            "remote",
+        ),
+        (
+            "relative/x.git",
+            c1.as_str(),
+            owner_ref(&c1),
+            "not a mission source",
+        ),
         (source, "HEAD", owner_ref("HEAD"), "full hash"),
         (source, "--all", owner_ref("--all"), "full hash"),
-        (source, c1.as_str(), "refs/heads/main".to_string(), "refs/spawn-owner"),
+        (
+            source,
+            c1.as_str(),
+            "refs/heads/main".to_string(),
+            "refs/spawn-owner",
+        ),
     ] {
         let refused = refusal(store.source_push_request(bad_source, commit, &reference));
         assert!(refused.contains(why), "{bad_source} {commit}: {refused}");
@@ -2708,8 +2723,10 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     assert_eq!(outcome["event_id"], json!(refused));
     assert_eq!(outcome["source"], source);
     assert!(
-        refusal(store.integrator_record(&json!({"type": "source.moved", "source": source,
-                "from": "b0", "to": "n1", "request": request, "by": "human"})))
+        refusal(
+            store.integrator_record(&json!({"type": "source.moved", "source": source,
+                "from": "b0", "to": "n1", "request": request, "by": "human"}))
+        )
         .contains("outcome already"),
         "one outcome per request"
     );
@@ -2741,8 +2758,10 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
         assert!(store.integrator_record(&bad).is_err(), "refused: {bad}");
     }
     let moved = store
-        .integrator_record(&json!({"type": "source.moved", "source": source, "from": "b0",
-                                   "to": "n1", "request": second, "by": "human"}))
+        .integrator_record(
+            &json!({"type": "source.moved", "source": source, "from": "b0",
+                                   "to": "n1", "request": second, "by": "human"}),
+        )
         .expect("moved");
     let recorded = record_of(&mut client, moved);
     assert_eq!(recorded["missions"], json!([on_source]), "{recorded}");
@@ -2771,9 +2790,17 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
 
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the log folds to the same tables");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the log folds to the same tables"
+    );
     let types = control_types(&mut client);
-    for kind in ["source.push_requested", "source.push_refused", "source.moved"] {
+    for kind in [
+        "source.push_requested",
+        "source.push_refused",
+        "source.moved",
+    ] {
         assert!(types.iter().any(|seen| seen == kind), "{kind}: {types:?}");
     }
 
