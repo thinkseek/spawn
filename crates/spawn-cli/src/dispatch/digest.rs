@@ -253,7 +253,10 @@ pub(crate) fn hold_expiries(records: &[Value]) -> Vec<Escalation> {
                 id: format!("source-hold-expired-{id}"),
                 why: Why::HoldExpired,
                 line: format!(
-                    "the owner's hold {hold}{reason} on source {source}, taken {} with {bound},                      expired at {} and ended by record {id}: {waited}; landings on {source}                      resumed. An owner verdict judged against {main} may be stale now: tell                      the owner.",
+                    "the owner's hold {hold}{reason} on source {source}, taken {} with {bound}, \
+                     expired at {} and ended by record {id}: {waited}; landings on {source} \
+                     resumed. An owner verdict judged against {main} may be stale now: tell \
+                     the owner.",
                     time(record["held_at_ms"].as_i64()),
                     time(record["expires_ms"].as_i64()),
                 ),

@@ -63,7 +63,8 @@ fn hold_bound(text: Option<&str>) -> Result<i32, String> {
         .filter(|secs| (1..=HOLD_SECS_MAX).contains(secs))
         .ok_or_else(|| {
             format!(
-                "SPAWN_SOURCE_HOLD_SECS is a whole number of seconds from 1 to {HOLD_SECS_MAX},                  not '{text}'"
+                "SPAWN_SOURCE_HOLD_SECS is a whole number of seconds from 1 to {HOLD_SECS_MAX}, \
+                 not '{text}'"
             )
         })
 }
