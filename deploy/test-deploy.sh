@@ -251,6 +251,7 @@ check "the untracked web/public/stray.txt did not reach the controller" \
 
 echo "== the owner's hold before the gate (deploy/hold.sh)"
 spawn_live mission add --text "test-deploy: the Spawn mission" --source "$missions" >/dev/null
+: >"$SYSTEMCTL_LOG"
 hold_missions
 sed 's/^/  | /' "$scratch/hold.out"
 held=$(missions_hold)
@@ -281,7 +282,6 @@ check "the export is removed" bash -c '! compgen -G "$1/spawn-deploy-export-*" >
 
 echo "== a deploy failing after its push completes it on exit"
 git --git-dir="$missions" update-ref refs/heads/main "$base"
-spawn_live mission moved --source "$missions" --from "$head" --to "$head" >/dev/null 2>&1 || true
 hold_missions
 held=$(missions_hold)
 check "held again (hold ${held:-none})" [ -n "$held" ]
