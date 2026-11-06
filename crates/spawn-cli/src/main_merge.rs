@@ -752,15 +752,15 @@ mod tests {
         ));
         let landing = format!("refs/spawn-integrate/{agent}");
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut pushed = None;
+        let mut published = None;
         while Instant::now() < deadline {
-            pushed = fetch_pushed_into(&mirror, &source, agent, &landing).expect("fetch");
-            if pushed.as_deref() == Some(commit.as_str()) {
+            published = fetch_pushed_into(&mirror, &source, agent, &landing).expect("fetch");
+            if published.as_deref() == Some(commit.as_str()) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(pushed, Some(commit), "the retry published the merge");
+        assert_eq!(published, Some(commit), "the retry published the merge");
         let _ = std::fs::remove_dir_all(&base);
     }
 
