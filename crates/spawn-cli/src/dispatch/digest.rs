@@ -23,16 +23,22 @@ pub(super) fn told(supervisor: Option<&Facts>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Whether the supervisor can take a digest now: live, idle on its latest
-/// fact, nothing in flight.
+/// Whether the supervisor can take a digest now: live, nothing in flight,
+/// and idle on its latest fact. Idle is the turn stopped at its prompt
+/// (a fact the rules settle), whatever Jev made of it, or a judgement of
+/// WAITING or COMPLETED. A supervisor whose turn ended on a question for
+/// the human is judged BLOCKED but sits at its prompt all the same: if
+/// that verdict held digests back, one question would silence every
+/// escalation until a human answered it.
 fn supervisor_idle(supervisor: &Facts) -> bool {
-    supervisor.live_and_free()
-        && supervisor.current_observation().is_some_and(|observation| {
-            matches!(
-                observation.state,
-                SemanticState::Waiting | SemanticState::Completed
-            )
-        })
+    supervisor.turn_stopped_idle()
+        || (supervisor.live_and_free()
+            && supervisor.current_observation().is_some_and(|observation| {
+                matches!(
+                    observation.state,
+                    SemanticState::Waiting | SemanticState::Completed
+                )
+            }))
 }
 
 /// What the supervisor is asked to do about an item.
