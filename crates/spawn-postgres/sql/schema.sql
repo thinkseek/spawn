@@ -2172,13 +2172,6 @@ begin
             raise exception 'hold % is not the active hold on task %''s source %',
                             p_record ->> 'hold', p_record ->> 'id', p_record ->> 'source';
         end if;
-        if exists (select 1 from spawn_events e
-                    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-                      and e.kind -> 'detail' -> 'record' ->> 'id' = p_record ->> 'id'
-                      and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.held'
-                      and e.kind -> 'detail' -> 'record' ->> 'hold' = p_record ->> 'hold') then
-            return null;
-        end if;
     end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
@@ -2226,6 +2219,15 @@ begin
                               when 'task.aborted' then array['delivered']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
+    end if;
+    -- One `task.held` per task and hold: a second records nothing.
+    if p_record ->> 'type' = 'task.held' and exists (
+        select 1 from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'id' = p_record ->> 'id'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.held'
+           and e.kind -> 'detail' -> 'record' ->> 'hold' = p_record ->> 'hold') then
+        return null;
     end if;
     -- A verdict names the revision of the report it judged (the task's
     -- `revisions` when the gate began). The gate runs for minutes: one on a
