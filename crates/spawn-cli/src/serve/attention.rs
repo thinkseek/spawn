@@ -259,10 +259,10 @@ fn asks<'a>(facts: &'a Facts, said: Option<&Said>) -> Option<&'a Observation> {
     let observation = asking(facts)?;
     let open =
         observation.human_question.is_some() || said.is_some_and(|said| said.human.is_some());
-    let for_owner = said
+    let names_owner = said
         .and_then(|said| said.reply.as_deref())
         .is_some_and(|reply| reply.lines().any(|line| for_owner(line).is_some()));
-    (open || !for_owner).then_some(observation)
+    (open || !names_owner).then_some(observation)
 }
 
 /// What the supervisor asks, from the end of its transcript (`said`, none
