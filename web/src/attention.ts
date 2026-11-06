@@ -214,13 +214,71 @@ function byAge(left: AttentionItem, right: AttentionItem): number {
 /** The queue's sections: the supervisor's open question, then what the
  * supervisor was not told yet, then what it was told and is unresolved. */
 export function attentionGroups(attention: Attention): AttentionGroups {
-  const question = attention.supervisor?.question ?? null;
   const untold = [...attention.pending].sort(byAge);
   const told = [...attention.told].sort(byAge);
   return {
-    question,
+    question: attention.supervisor?.question ?? null,
     untold,
     told,
-    count: untold.length + told.length + (question ? 1 : 0),
+    count: needsHuman(attention).count,
   };
+}
+
+/** Who needs a human: the UI's one definition, read from the dispatcher's
+ * view and nothing else. */
+export interface NeedsHuman {
+  /** What a person may need to look at: every pending item, every item
+   * told and unresolved, and the supervisor's open question. The queue's
+   * count and the sidebar's. */
+  count: number;
+  /** The sessions and agents that need a human: those with a pending or
+   * told-and-unresolved item, and the supervisor while it asks something. */
+  ids: ReadonlySet<string>;
+}
+
+/** Who needs a human, by `/api/attention`. A judge's `attention` flag is not
+ * part of it: that is the judge's opinion, shown with its judgement (the
+ * dispatcher decides what to escalate, and does not escalate, for one, a
+ * managed worker between tasks). Items about the host or the missions count
+ * without marking an agent. */
+export function needsHuman(attention: Attention): NeedsHuman {
+  const ids = new Set<string>();
+  for (const item of [...attention.pending, ...attention.told]) {
+    if (item.agent_id) ids.add(item.agent_id);
+    if (item.session_id && item.agent_id) ids.add(item.session_id);
+  }
+  const supervisor = attention.supervisor;
+  const question = supervisor?.question ?? null;
+  if (supervisor && question) {
+    ids.add(supervisor.session_id);
+    ids.add(supervisor.agent_id);
+  }
+  return {
+    count: attention.pending.length + attention.told.length + (question ? 1 : 0),
+    ids,
+  };
+}
+
+/** Whether `agent` needs a human by `needs` (false while the dispatcher's
+ * view is unknown: no mark is guessed). */
+export function agentNeedsHuman(
+  needs: NeedsHuman | null,
+  agent: { session_id: string; agent_id: string },
+): boolean {
+  return (
+    needs !== null &&
+    (needs.ids.has(agent.session_id) || (agent.agent_id !== "" && needs.ids.has(agent.agent_id)))
+  );
+}
+
+/** `agents` with `attention` set to whether each needs a human by `needs`:
+ * the field the board, the sidebar and their ordering read. */
+export function markNeedsHuman<T extends { session_id: string; agent_id: string; attention: boolean }>(
+  agents: readonly T[],
+  needs: NeedsHuman | null,
+): T[] {
+  return agents.map((agent) => {
+    const attention = agentNeedsHuman(needs, agent);
+    return agent.attention === attention ? agent : { ...agent, attention };
+  });
 }
