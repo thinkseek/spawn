@@ -302,8 +302,18 @@ fn write_private(
     Ok(path)
 }
 
-impl TerminalHost for TmuxHost {
-    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+/// How many `new-session` calls one [`TerminalHost::start`] makes when
+/// each reaches a server that shuts down ([`server_left`]). The client sees
+/// its connection drop only once the old server's socket is closed for
+/// good, so the next call finds no server and starts one: one shutdown
+/// costs one call. The rest cover another server coming and going
+/// meanwhile, without looping on a tmux that always fails this way.
+const START_ATTEMPTS: usize = 3;
+
+impl TmuxHost {
+    /// One `new-session` for `launch`, its environment file removed unless
+    /// a pane was started to remove it.
+    fn new_session(&self, launch: &Launch) -> Result<Run, TerminalError> {
         let mut arguments = vec![
             "new-session".to_string(),
             "-d".to_string(),
@@ -337,16 +347,33 @@ impl TerminalHost for TmuxHost {
         arguments.extend(launch.arguments.iter().cloned());
 
         let run = self.run(&arguments);
-        let run = match run {
-            Ok(run) if run.code == Some(0) => return Ok(()),
-            Ok(run) => run,
-            Err(error) => {
-                let _ = std::fs::remove_file(&file);
-                return Err(error);
+        if !matches!(&run, Ok(run) if run.code == Some(0)) {
+            // No pane ran to remove it.
+            let _ = std::fs::remove_file(&file);
+        }
+        run
+    }
+}
+
+impl TerminalHost for TmuxHost {
+    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+        let mut attempts = 1;
+        let run = loop {
+            let run = self.new_session(launch)?;
+            // The server this call reached was shutting down after its last
+            // session ended (another terminal was just killed or exited)
+            // and dropped the call unread: nothing was started, and a
+            // server that goes takes its sessions with it, so a new call
+            // cannot start the terminal twice.
+            if run.code != Some(0) && server_left(&run.stderr) && attempts < START_ATTEMPTS {
+                attempts += 1;
+                continue;
             }
+            break run;
         };
-        // No pane ran to remove it.
-        let _ = std::fs::remove_file(&file);
+        if run.code == Some(0) {
+            return Ok(());
+        }
         let stderr = run.stderr.trim();
         if stderr.contains("duplicate session") {
             return Err(TerminalError(format!("{} already exists", launch.terminal)));
@@ -638,9 +665,17 @@ fn write_local(path: &str, bytes: &[u8]) -> Result<bool, TerminalError> {
 fn gone(stderr: &str) -> bool {
     stderr.contains("can't find session")
         || stderr.contains("no server running")
-        // Asked while the server shuts down after its last session ended.
-        || stderr.contains("server exited unexpectedly")
+        || server_left(stderr)
         || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
+}
+
+/// Whether tmux's error says the call reached a server that went before it
+/// read the call: one shutting down after its last session ended. Its
+/// socket is still open (the server is exiting, or a pane it is forking
+/// holds a copy until it execs), so the client connects, and the server
+/// never accepts it.
+fn server_left(stderr: &str) -> bool {
+    stderr.contains("server exited unexpectedly")
 }
 
 /// At most [`READ_LIMIT`] bytes from `offset` of the file `relative` in
