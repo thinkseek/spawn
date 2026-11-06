@@ -922,7 +922,7 @@ mod tests {
                               "class": "connection"}],
                 "backoff_ms": 600_000, "due_ms": 1_793_930_000_500_i64}),
         ];
-        let host = digest::host_fault_escalations(&records);
+        let host = super::digest::host_fault_escalations(&records);
         let tags: Vec<String> = host.iter().map(Escalation::tag).collect();
         assert_eq!(
             tags,
@@ -951,7 +951,7 @@ mod tests {
         );
         assert!(host.iter().all(|item| !item.line.contains('\n')));
         assert!(
-            digest::host_fault_escalations(&[serde_json::json!({"id": 9})]).is_empty(),
+            super::digest::host_fault_escalations(&[serde_json::json!({"id": 9})]).is_empty(),
             "a record without its event is no item"
         );
 
