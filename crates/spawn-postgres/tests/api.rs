@@ -1952,6 +1952,117 @@ fn mission_news_reports_human_commands_with_their_outcome_until_told() {
     );
 }
 
+/// The attention view (`GET /api/attention`) reads when each told
+/// escalation first reached the supervisor: the earliest successful digest
+/// that filed its tag (a failed one told nothing), and nothing for a tag no
+/// digest carried. It also reads where the supervisor's engine writes its
+/// transcript and when its latest turn ended.
+#[test]
+fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
+    let (store, schema) = store("told_at");
+    let supervisor = Worker {
+        store: &store,
+        agent: AgentId::new("agent_supervisor").expect("valid agent"),
+        session: SessionId::new("session_supervisor").expect("valid session"),
+    };
+    let digest = |key: &str, tags: &[&str], outcome: Outcome| {
+        supervisor.send(
+            "spawn-dispatch",
+            key,
+            CommandAction::Input {
+                text: "digest".to_string(),
+                tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            },
+            Some(outcome),
+        )
+    };
+    digest(
+        "digest-1",
+        &["session_worker_a 7"],
+        Outcome::Failed("pane state Busy does not accept input".to_string()),
+    );
+    let landed = digest(
+        "digest-2",
+        &["session_worker_a 7", "host disk-3"],
+        Outcome::Succeeded,
+    );
+    let again = digest("digest-3", &["host disk-3"], Outcome::Succeeded);
+    let mut admin = admin(&schema);
+    admin
+        .execute(
+            "update spawn_commands set finished_at_ms = 1000 where id = $1",
+            &[&landed],
+        )
+        .expect("date the first digest");
+    admin
+        .execute(
+            "update spawn_commands set finished_at_ms = 2000 where id = $1",
+            &[&again],
+        )
+        .expect("date the second digest");
+    let tags = [
+        "session_worker_a 7".to_string(),
+        "host disk-3".to_string(),
+        "missions mission-9".to_string(),
+    ];
+    assert_eq!(
+        store.told_at("session_supervisor", &tags).expect("told at"),
+        serde_json::json!({"session_worker_a 7": 1000, "host disk-3": 1000})
+    );
+    assert_eq!(
+        store.told_at("session_worker_a", &tags).expect("told at"),
+        serde_json::json!({}),
+        "another session's digests"
+    );
+
+    let none = store.latest_turn("session_supervisor").expect("latest turn");
+    assert_eq!(
+        none,
+        serde_json::json!({"transcript": null, "workspace": null, "turn_ended_at_ms": null})
+    );
+    supervisor.started("exec_1", landed);
+    let native = |key: &str, path: Option<&str>| {
+        supervisor.event(
+            "exec_1",
+            key,
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: "native-1".to_string(),
+                transcript_path: path.map(str::to_string),
+                engine_version: None,
+            },
+        );
+    };
+    native("native:1", Some("/home/owner/.claude/projects/p/native-1.jsonl"));
+    native("native:2", None);
+    supervisor.event(
+        "exec_1",
+        "turn:1",
+        EventKind::TurnStopped {
+            input_tokens: None,
+            output_tokens: None,
+        },
+    );
+    supervisor.event("exec_1", "message:2", EventKind::MessageReceived);
+    let turn = store.latest_turn("session_supervisor").expect("latest turn");
+    let stopped: i64 = admin
+        .query_one(
+            "select recorded_at_ms from spawn_events
+              where session_id = 'session_supervisor' and event_name = 'turn.stopped'",
+            &[],
+        )
+        .expect("the turn's end")
+        .get(0);
+    assert_eq!(
+        turn,
+        serde_json::json!({
+            "transcript": "/home/owner/.claude/projects/p/native-1.jsonl",
+            "workspace": "1:/workspaces/1",
+            "turn_ended_at_ms": stopped,
+        })
+    );
+}
+
 #[test]
 fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
     let (store, _schema) = store("facts_model");
