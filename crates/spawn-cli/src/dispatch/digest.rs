@@ -17,6 +17,10 @@ use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
 /// for the next one.
 const DIGEST_ITEMS: usize = 8;
 
+/// The words every digest opens with: a prompt in the supervisor's
+/// transcript that starts with them is a digest, not a person's answer.
+pub(crate) const OPENING: &str = "Spawn dispatcher:";
+
 /// Escalations the supervisor already received: the tags of the digests
 /// that reached its pane.
 pub(super) fn told(supervisor: Option<&Facts>) -> BTreeSet<String> {
@@ -43,8 +47,9 @@ fn supervisor_idle(supervisor: &Facts) -> bool {
             }))
 }
 
-/// What the supervisor is asked to do about an item.
-fn heading(why: Why) -> &'static str {
+/// What the supervisor is asked to do about an item: the digest's heading,
+/// and the attention view's (`GET /api/attention`).
+pub(crate) fn heading(why: Why) -> &'static str {
     match why {
         Why::Attention => "attention",
         Why::NudgeFailed => "nudge did not help",
@@ -173,6 +178,7 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      counted and nothing halts. Check the test database's host (its memory, \
                      /dev/shm, its log) or tell the owner."
                 ),
+                since_ms: record["at_ms"].as_i64(),
             })
         })
         .collect()
@@ -197,7 +203,7 @@ fn one_line(text: &str, limit: usize) -> String {
 /// The digest typed into the supervisor's pane.
 fn text(lines: &[Line<'_>], spawn: &str) -> String {
     let mut text = format!(
-        "Spawn dispatcher: {} update{} for you. Check a worker with `{spawn} tail --session \
+        "{OPENING} {} update{} for you. Check a worker with `{spawn} tail --session \
 <session>` before acting; missions and tasks with `{spawn} mission list`.\n",
         lines.len(),
         if lines.len() == 1 { "" } else { "s" },

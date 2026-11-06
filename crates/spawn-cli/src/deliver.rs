@@ -1022,6 +1022,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 mission.origin,
                 one_line(&mission.text, 300)
             ),
+            since_ms: None,
         });
     }
     for report in &news.reports {
@@ -1043,6 +1044,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 id = report.id,
                 revision = report.revisions,
             ),
+            since_ms: None,
         });
     }
     for resident in &news.approved {
@@ -1054,6 +1056,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             line: format!(
                 "a human approved resident `{name}`; assign it tasks with --kind resident --worker {name}"
             ),
+            since_ms: None,
         });
     }
     for message in &news.human {
@@ -1062,6 +1065,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             id: format!("human-{}", message.command_id),
             why: Why::Human,
             line: message.line(),
+            since_ms: None,
         });
     }
     for (task, attempts) in waiting_attempts(work, rows) {
@@ -1071,6 +1075,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 id: task.delivery_key(),
                 why: Why::DeliveryFailed,
                 line: format!("task #{} {why}", task.id),
+                since_ms: None,
             });
         }
     }
