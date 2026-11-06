@@ -754,6 +754,61 @@ mod tests {
         }
     }
 
+    /// tmux is given no locale (see the crate's documentation): it has no
+    /// translations, so what Spawn reads from it is the same on a host whose
+    /// locale is Chinese. Each answer that says a terminal is gone (no
+    /// socket, no server on it, no such session) is word for word the one
+    /// of the C locale, and read as gone.
+    #[test]
+    fn tmux_says_a_terminal_is_gone_alike_in_a_translated_locale() {
+        let dir = scratch("tmux-locale");
+        std::fs::write(dir.join("not-a-server"), b"").unwrap();
+        let answer = |locale: &str, language: Option<&str>, socket: &str, start: bool| {
+            let tmux = |arguments: &[&str]| {
+                let words: Vec<String> = ["tmux", "-S", socket, "-f", "/dev/null"]
+                    .iter()
+                    .chain(arguments)
+                    .map(ToString::to_string)
+                    .collect();
+                let mut command = super::command_of(&words);
+                command
+                    .env("LC_ALL", locale)
+                    .env("LANG", locale)
+                    .env("LC_MESSAGES", locale);
+                match language {
+                    Some(language) => command.env("LANGUAGE", language),
+                    None => command.env_remove("LANGUAGE"),
+                };
+                command.output().expect("tmux is installed")
+            };
+            if start {
+                let started = tmux(&["new-session", "-d", "-s", "spawn-locale-live"]);
+                assert!(started.status.success(), "{started:?}");
+            }
+            let asked = tmux(&["has-session", "-t", "=spawn-locale-none"]);
+            if start {
+                let _ = tmux(&["kill-server"]);
+            }
+            assert_eq!(asked.status.code(), Some(1), "{asked:?}");
+            let stderr = String::from_utf8_lossy(&asked.stderr).to_string();
+            assert!(super::gone(&stderr), "{locale}: {stderr}");
+            stderr
+        };
+        for (socket, start) in [
+            (dir.join("none/socket"), false),
+            (dir.join("not-a-server"), false),
+            (dir.join("live"), true),
+        ] {
+            let socket = socket.to_str().unwrap();
+            assert_eq!(
+                answer("zh_CN.UTF-8", Some("zh_CN:zh"), socket, start),
+                answer("C", None, socket, start),
+                "{socket}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn an_agent_planted_fifo_or_symlink_is_refused_without_blocking() {
         let dir = scratch("special");
