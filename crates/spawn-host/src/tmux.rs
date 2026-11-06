@@ -700,8 +700,32 @@ fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError>
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_LIMIT, read_in_workspace, read_local};
+    use super::{READ_LIMIT, read_in_workspace, read_local, runner_of};
+    use spawn_core::id::TerminalName;
+    use spawn_core::port::Runner;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_pane_hosts_its_runner_only_when_this_host_launched_it_and_it_lives() {
+        let terminal = TerminalName::new("spawn-exec_1").expect("valid terminal");
+        let launched = "0\t\tspawn\t/bin/sh -c \"set -a; . \\\"$0\\\"; exec \\\"$@\\\"\" \
+                        /run/user/1000/spawn-launch-spawn-exec_1-42-7.env /bin/spawn run -- claude";
+        assert_eq!(runner_of(&terminal, launched), Runner::Running);
+        // The same launch of another terminal is not this one's runner.
+        let other = launched.replace("spawn-exec_1-", "spawn-exec_10-");
+        assert!(matches!(runner_of(&terminal, &other), Runner::Untracked(_)));
+        // A shell at its prompt, as a session restored after a restart is.
+        let Runner::Untracked(why) = runner_of(&terminal, "0\t\tbash\t") else {
+            panic!("a restored shell hosts no runner");
+        };
+        assert!(why.contains("no command") && why.contains("`bash`"), "{why}");
+        // A dead pane (remain-on-exit) hosts nothing, whatever it ran.
+        let dead = launched.replacen('0', "1", 1).replacen("\t\t", "\t137\t", 1);
+        let Runner::Untracked(why) = runner_of(&terminal, &dead) else {
+            panic!("a dead pane hosts no runner");
+        };
+        assert!(why.contains("dead (exit status 137)"), "{why}");
+    }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("spawn-read-{name}-{}", std::process::id()));
