@@ -1291,6 +1291,89 @@ mod tests {
         );
     }
 
+    /// Objective 34: an owner's hold that reached its bound and was ended by
+    /// the integrator's `source.hold_expired` reaches an idle supervisor
+    /// once, as an item of `missions` tagged
+    /// `missions source-hold-expired-<event id>`, under its own heading, its
+    /// line naming the source, the hold (event id, reason, when taken, its
+    /// bound), when it expired, each waiting task with its mission, and that
+    /// landings resumed. Two expiries keep a line each.
+    #[test]
+    fn an_expired_hold_reaches_an_idle_supervisor_once_with_its_waiting_tasks() {
+        let records = [
+            serde_json::json!({"event_id": 88, "at_ms": 1_793_930_021_000_i64,
+                "source": "/srv/missions/spawn.git", "hold": 71,
+                "expires_ms": 1_793_930_020_000_i64, "reason": "owner gate ffc9fe7\nsecond line",
+                "held_at_ms": 1_793_919_220_000_i64, "bound_s": 10_800,
+                "main": "a3543c2e0f1b2c3d4e5f60718293a4b5c6d7e8f9",
+                "waiting": [{"task": 85, "mission": 4}, {"task": 91, "mission": 6}]}),
+            serde_json::json!({"event_id": 95, "at_ms": 1_793_930_030_000_i64,
+                "source": "/srv/missions/supply-pa.git", "hold": 90,
+                "expires_ms": 1_793_930_029_000_i64, "held_at_ms": 1_793_930_009_000_i64,
+                "bound_s": 20, "main": "b3543c2e0f1b2c3d4e5f60718293a4b5c6d7e8f9",
+                "waiting": []}),
+        ];
+        let items = super::digest::hold_expiries(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            ["missions source-hold-expired-88", "missions source-hold-expired-95"]
+        );
+        assert!(items.iter().all(|item| item.why == Why::HoldExpired));
+        assert_eq!(items[0].since_ms, Some(1_793_930_021_000));
+        let line = &items[0].line;
+        for part in [
+            "the owner's hold 71 (\"owner gate ffc9fe7 second line\") on source \
+             /srv/missions/spawn.git",
+            "taken 2026-11-0",
+            "a bound of 10800 s",
+            "expired at 2026-11-0",
+            "ended by record 88",
+            "task #85 of mission 4, task #91 of mission 6 waited behind it",
+            "landings on /srv/missions/spawn.git resumed",
+            "against its main a3543c2e0f1b may be stale now: tell the owner",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+        assert!(items[1].line.contains("no task waited behind it"), "{}", items[1].line);
+        assert!(items.iter().all(|item| !item.line.contains('\n')));
+        assert!(
+            super::digest::hold_expiries(&[serde_json::json!({"source": "/srv/x.git"})])
+                .is_empty(),
+            "a record without its event is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &["missions source-hold-expired-88", "missions source-hold-expired-95"]
+        );
+        let line = text
+            .lines()
+            .find(|line| line.contains("task #85"))
+            .expect("the first expiry's line");
+        assert!(
+            line.starts_with("- missions — a source hold expired: the owner's hold 71")
+                && line.contains("/srv/missions/spawn.git"),
+            "{line}"
+        );
+        assert!(
+            text.lines().any(|line| line.contains("/srv/missions/supply-pa.git")),
+            "each expiry keeps its own line: {text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &items, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty() && plan.told.is_empty(),
+            "told once, and resolved by the telling"
+        );
+    }
+
     #[test]
     fn a_busy_or_absent_supervisor_leaves_escalations_pending() {
         let mut blocked = judged(SemanticState::Blocked, 0.8);
