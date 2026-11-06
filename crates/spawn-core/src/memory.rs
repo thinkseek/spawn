@@ -694,6 +694,11 @@ impl WorkspaceStore for MemoryStore {
 
     fn notices_told(&self, _workspace: &WorkspaceId, _notices: &[String]) {}
 
+    fn hold(&self, _workspace: &WorkspaceId) -> Option<Hold> {
+        self.held.fetch_add(1, Ordering::SeqCst);
+        Some(Box::new(Held(Arc::clone(&self.held))))
+    }
+
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
         Ok(self.lock().heads.get(branch).cloned())
     }
