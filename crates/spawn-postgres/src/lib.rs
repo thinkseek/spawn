@@ -527,7 +527,8 @@ pub fn parallel_query_probe(url: &str, limit: std::time::Duration) -> Result<(),
     let query = format!(
         "a parallel query within {seconds} s (one transaction: SET LOCAL \
          max_parallel_workers_per_gather = 2, parallel_setup_cost = 0, parallel_tuple_cost = 0, \
-         debug_parallel_query = on; SELECT count(*) FROM generate_series(1, {PROBE_ROWS}))"
+         debug_parallel_query = on (force_parallel_mode before PostgreSQL 16); SELECT count(*) \
+         FROM generate_series(1, {PROBE_ROWS}))"
     );
     let failure = |probe: &str, error: String| ProbeFailure {
         probe: probe.to_string(),
