@@ -582,7 +582,12 @@ if [ "$beta_verdict" != incompatible ]; then
 fi
 [ "$2" = "$1" ] ||
     fail "(1) the incompatible verdict on task #$task_beta moved gate_rejections from $1 to $2"
-assert_eq "$(task_state "$task_beta")" revise "(1) task #$task_beta's state after its incompatible verdict"
+# Sent back: revise, or already delivered when the loop has typed the send-back
+# into beta's session by now (an input to a busy session waits its turn, 015).
+case "$(task_state "$task_beta")" in
+revise | delivered) ;;
+*) fail "(1) task #$task_beta's state after its incompatible verdict: expected revise or delivered, got $(task_state "$task_beta")" ;;
+esac
 assert_eq "$(halted)" "" "(1) the mission's halt after beta's verdict"
 
 # --- (2) the record says why ------------------------------------------------------------
