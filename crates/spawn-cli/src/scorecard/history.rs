@@ -86,7 +86,7 @@ pub(crate) struct Tokens {
     pub(crate) at: i64,
     pub(crate) missions: Vec<i64>,
     pub(crate) model: String,
-    pub(crate) tokens: i64,
+    pub(crate) count: i64,
 }
 
 /// A task as its records tell it.
@@ -668,7 +668,7 @@ impl History {
                     at: message.at_ms,
                     missions: missions.into_iter().collect(),
                     model: message.model.clone(),
-                    tokens: message.tokens,
+                    count: message.tokens,
                 }
             })
             .collect();

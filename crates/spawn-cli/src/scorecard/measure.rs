@@ -137,9 +137,9 @@ pub(crate) fn counts(history: &History, scope: Scope, window: Window) -> Counts 
     }
     for tokens in &history.tokens {
         if scope.holds_any(&tokens.missions) && window.holds(tokens.at) {
-            counts.tokens = counts.tokens.saturating_add(tokens.tokens);
+            counts.tokens = counts.tokens.saturating_add(tokens.count);
             let model = counts.by_model.entry(tokens.model.clone()).or_insert(0);
-            *model = model.saturating_add(tokens.tokens);
+            *model = model.saturating_add(tokens.count);
         }
     }
     for run in &history.gate_runs {
