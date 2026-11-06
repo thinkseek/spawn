@@ -273,6 +273,8 @@ struct Fold {
     cancelled: Vec<(i64, Option<i64>, Option<String>)>,
     /// Landing times by (mission, objective).
     objective_landings: BTreeMap<(i64, i64), Vec<i64>>,
+    /// The tasks of each (mission, objective).
+    objective_tasks: BTreeMap<(i64, i64), Vec<i64>>,
 }
 
 impl Fold {
@@ -406,6 +408,12 @@ impl Fold {
                 self.mark(at, Some(mission), Kind::CancelReassign);
             }
         }
+        if let Some(objective) = task.objective {
+            self.objective_tasks
+                .entry((mission, objective))
+                .or_default()
+                .push(id);
+        }
         self.history.tasks.insert(id, task);
     }
 
@@ -526,13 +534,13 @@ impl Fold {
                     .max()
             })
             .unwrap_or(i64::MIN);
-        self.history
-            .tasks
-            .values()
+        self.objective_tasks
+            .get(&(task.mission, objective))
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.history.tasks.get(id))
             .filter(|other| {
-                other.mission == task.mission
-                    && other.objective == Some(objective)
-                    && other.assigned_at >= round
+                other.assigned_at >= round
                     && other
                         .cancelled_at
                         .is_some_and(|cancelled| cancelled <= task.assigned_at)
@@ -673,6 +681,20 @@ impl History {
             })
             .collect();
         self.tokens = tokens;
+    }
+
+    /// Only what counts in `[since, until)`: the landings, marks, gate runs
+    /// and tokens in it, and the tasks open in it. Every count of a window
+    /// inside it is the same after; there is less to read for each.
+    pub(crate) fn clip(&mut self, since: i64, until: i64) {
+        let inside = |at: i64| since <= at && at < until;
+        self.landings.retain(|landing| inside(landing.at));
+        self.marks.retain(|mark| inside(mark.at));
+        self.gate_runs.retain(|run| inside(run.at));
+        self.tokens.retain(|tokens| inside(tokens.at));
+        self.tasks.retain(|_, task| {
+            task.assigned_at < until && task.closed_at.is_none_or(|closed| closed > since)
+        });
     }
 
     /// The open intervals of the tasks of `mission` (every task's for none):
