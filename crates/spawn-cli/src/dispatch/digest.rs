@@ -35,8 +35,9 @@ fn supervisor_idle(supervisor: &Facts) -> bool {
         })
 }
 
-/// What the supervisor is asked to do about an item.
-fn heading(why: Why) -> &'static str {
+/// What the supervisor is asked to do about an item: the digest's heading,
+/// and the attention view's (`GET /api/attention`).
+pub(crate) fn heading(why: Why) -> &'static str {
     match why {
         Why::Attention => "attention",
         Why::NudgeFailed => "nudge did not help",

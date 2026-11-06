@@ -48,6 +48,7 @@ mod stall;
 mod stops;
 mod worker;
 
+pub(crate) use digest::heading;
 pub(crate) use stall::Bounds;
 
 use std::collections::BTreeSet;
@@ -295,16 +296,24 @@ pub(crate) struct Escalation {
     pub(crate) id: String,
     pub(crate) why: Why,
     pub(crate) line: String,
+    /// When the record it rests on was written (the judgement of a
+    /// worker's state, the record a stall is measured from, a disk or gate
+    /// record), on the database's clock; `None` when the rows carry no
+    /// time. Only for showing its age (`GET /api/attention`): never in its
+    /// tag or a digest's text.
+    pub(crate) since_ms: Option<i64>,
 }
 
 impl Escalation {
-    /// An escalation about the session `facts` describe.
+    /// An escalation about the session `facts` describe, as of its latest
+    /// judgement.
     pub(crate) fn about(facts: &Facts, id: String, why: Why, line: String) -> Self {
         Self {
             session_id: facts.session_id.clone(),
             id,
             why,
             line,
+            since_ms: facts.observation_at_ms,
         }
     }
 
@@ -350,6 +359,10 @@ pub(crate) struct Plan {
     pub(crate) orders: Vec<Order>,
     /// Escalations not delivered yet, whether or not a digest goes out now.
     pub(crate) pending: Vec<Escalation>,
+    /// Escalations that still hold but were already delivered to the
+    /// supervisor (their tag is in its told set): left out of `pending`, so
+    /// never sent again. The attention view shows them as unresolved.
+    pub(crate) told: Vec<Escalation>,
 }
 
 /// Principal the dispatcher submits as.
@@ -385,7 +398,7 @@ pub(crate) fn decide_with(
     let mut plan = Plan {
         delivered: deliver::delivered(work, rows),
         orders: deliver::orders(work, rows, now_ms),
-        pending: Vec::new(),
+        ..Plan::default()
     };
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
@@ -408,7 +421,9 @@ pub(crate) fn decide_with(
     }
     plan.pending.extend(deliver::news_items(work, rows));
     plan.pending.extend_from_slice(host);
-    plan.pending.retain(|item| !told.contains(&item.tag()));
+    (plan.told, plan.pending) = std::mem::take(&mut plan.pending)
+        .into_iter()
+        .partition(|item| told.contains(&item.tag()));
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
             .extend(digest::order(supervisor, &plan.pending, spawn));
@@ -417,7 +432,7 @@ pub(crate) fn decide_with(
 }
 
 /// Facts and mission rows, read once.
-fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
+pub(crate) fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     let rows: Vec<Facts> =
         serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
             .map_err(|error| format!("dispatch facts: {error}"))?;
@@ -450,10 +465,62 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
     Ok(())
 }
 
+/// One pass's plan, read from the store before anything is submitted.
+pub(crate) struct Reading {
+    /// The facts the plan was made from.
+    pub(crate) rows: Vec<Facts>,
+    /// The mission rows the plan was made from.
+    pub(crate) work: Work,
+    pub(crate) plan: Plan,
+    /// Log lines: what could not be read (a stall read that failed).
+    pub(crate) lines: Vec<String>,
+}
+
+/// The plan for this moment, reading only: the host's news (the disk items
+/// `disk` gives for the moment's clock, the gate-room records, the stalls
+/// past their `bounds`, [`stall`]) added to the facts and mission rows
+/// `loaded` ([`load`]), then [`decide_with`]. [`step`] submits what it
+/// returns; `GET /api/attention` (crate::serve) shows it. One function for
+/// both, so the queue a person reads is the dispatcher's own.
+pub(crate) fn read_plan(
+    store: &PostgresStore,
+    loaded: (Vec<Facts>, Work),
+    disk: impl FnOnce(i64) -> Vec<Escalation>,
+    bounds: &Bounds,
+    supervised: bool,
+    spawn: &str,
+) -> Result<Reading, String> {
+    let (rows, work) = loaded;
+    let mut lines = Vec::new();
+    let now = now_ms();
+    let mut host = disk(now);
+    host.extend(crate::disk::gate_room_escalations(
+        store
+            .gate_room_escalations()
+            .map_err(|error| format!("gate room records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    // A stall read that failed costs this pass its stall items, never its
+    // deliveries: the next pass measures the same stalls again.
+    match load_stalls(store) {
+        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
+        Err(error) => lines.push(format!("dispatch: stalls: {error}")),
+    }
+    let plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    Ok(Reading {
+        rows,
+        work,
+        plan,
+        lines,
+    })
+}
+
 /// Run one dispatcher step against the store: collect reports from idle
-/// workers under `root`, then submit the plan, with the stalls past their
-/// `bounds` among its escalations ([`stall`]), without its new executions
-/// while the disk is under its floor ([`crate::disk`]). Returns log lines.
+/// workers under `root`, then submit the plan ([`read_plan`]), with the
+/// stalls past their `bounds` among its escalations ([`stall`]), without
+/// its new executions while the disk is under its floor ([`crate::disk`]).
+/// Returns log lines.
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -470,22 +537,20 @@ pub(crate) fn step(
         // Collecting a report changed a task's state.
         (rows, work) = load(store)?;
     }
-    let now = now_ms();
-    let mut host = disk.escalations(now);
-    host.extend(crate::disk::gate_room_escalations(
-        store
-            .gate_room_escalations()
-            .map_err(|error| format!("gate room records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    // A stall read that failed costs this pass its stall items, never its
-    // deliveries: the next pass measures the same stalls again.
-    match load_stalls(store) {
-        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
-        Err(error) => lines.push(format!("dispatch: stalls: {error}")),
-    }
-    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    let Reading {
+        work,
+        mut plan,
+        lines: read,
+        ..
+    } = read_plan(
+        store,
+        (rows, work),
+        |now| disk.escalations(now),
+        bounds,
+        supervised,
+        spawn,
+    )?;
+    lines.extend(read);
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
         if held > 0 {
@@ -870,6 +935,7 @@ mod tests {
             id: "disk-7".to_string(),
             why: Why::Disk,
             line: "tmpdir /tmp has 5.0 GiB free".to_string(),
+            since_ms: None,
         }];
         let rows = [idle_supervisor()];
         let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
@@ -1244,12 +1310,14 @@ mod tests {
             id: "report-7-1".to_string(),
             why: Why::Report,
             line: "task #7: done [spawn:esc missions mission-5] missions mission-5".to_string(),
+            since_ms: None,
         };
         let mission = Escalation {
             session_id: "missions".to_string(),
             id: "mission-5".to_string(),
             why: Why::Mission,
             line: "#5 from human: ship it".to_string(),
+            since_ms: None,
         };
         let rows = [idle_supervisor()];
         let plan = decide_with(
