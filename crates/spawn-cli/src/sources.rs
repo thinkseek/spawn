@@ -650,6 +650,7 @@ mod tests {
     use spawn_core::id::{BranchName, WorkspaceId};
     use spawn_core::port::{Commit, WorkspaceStore};
     use spawn_host::GitWorkspace;
+    use std::ffi::OsStr;
     use std::path::Path;
 
     /// One host's checkpoint of `agent` in its mirror: a new file.
@@ -1013,28 +1014,164 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Every git the controller runs is built by `controller_git`: no other
-    /// module of the CLI starts git itself (tests aside).
+    /// Every git the controller runs is built by `controller_git`, on
+    /// `spawn_host::git_command`, so it runs in the C locale: no module of
+    /// the CLI, this one included, starts git itself (tests aside).
     #[test]
     fn every_controller_git_is_built_in_one_place() {
-        for (name, text) in [
-            ("push.rs", include_str!("push.rs")),
-            ("integrate.rs", include_str!("integrate.rs")),
-            ("missions.rs", include_str!("missions.rs")),
-            ("config.rs", include_str!("config.rs")),
-            ("deliver.rs", include_str!("deliver.rs")),
-            ("supervise.rs", include_str!("supervise.rs")),
-            ("runtime.rs", include_str!("runtime.rs")),
-        ] {
-            let code = text.split("#[cfg(test)]").next().unwrap_or(text);
+        fn sources(directory: &Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs")
+                    && path.file_name().is_some_and(|name| name != "tests.rs")
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(
+            files.iter().any(|file| file.ends_with("src/sources.rs")),
+            "{files:?}"
+        );
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read a source");
+            let code = text.split("#[cfg(test)]\nmod ").next().unwrap_or(&text);
             assert!(
                 !code.contains("Command::new(\"git\")"),
-                "{name} starts git without controller_git"
+                "{} starts git without controller_git",
+                file.display()
             );
         }
         let own = include_str!("sources.rs");
-        let code = own.split("#[cfg(test)]").next().unwrap_or(own);
-        assert_eq!(code.matches("Command::new(\"git\")").count(), 1);
+        let code = own.split("#[cfg(test)]\nmod ").next().unwrap_or(own);
+        assert_eq!(code.matches("spawn_host::git_command(\"git\")").count(), 1);
+        let command = super::controller_git();
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))));
+        assert!(envs.contains(&(OsStr::new("LANGUAGE"), None)));
+    }
+
+    /// Marks a line of [`decisions_in_this_locale`]'s output.
+    const DECISION: &str = "spawn-decision: ";
+
+    /// Marks the line of [`decisions_in_this_locale`]'s output that shows
+    /// git's own answer, outside Spawn.
+    const PLAIN: &str = "plain-git: ";
+
+    /// What Spawn makes of git in this process's locale, one line each, the
+    /// run's scratch directory written `<base>`: a push that lost the ref
+    /// lock, a push of a rewritten branch, a fetch from a source that is
+    /// gone. Then, outside Spawn, what a plain git says about a missing
+    /// repository. Run by
+    /// [`a_translated_locale_changes_nothing_spawn_reads_from_git`] in one
+    /// process per locale; alone it only prints.
+    #[test]
+    #[ignore = "run by a_translated_locale_changes_nothing_spawn_reads_from_git"]
+    fn decisions_in_this_locale() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-locale-{}", std::process::id()));
+        let shown = base.to_string_lossy().to_string();
+        let say = |mark: &str, decision: String| {
+            println!("{mark}{}", decision.replace(&shown, "<base>"));
+        };
+        let (source, mirror, host) = published_source(&base);
+        checkpoint(&host, "agent_x", "two.txt");
+
+        // Another push holds the ref's lock: a failure, retried.
+        let lock = Path::new(&source).join("refs/heads/spawn/agent_x.lock");
+        std::fs::write(&lock, "").expect("lock");
+        let pushed = push_branch(&mirror, &source, "agent_x");
+        assert!(
+            matches!(&pushed, Pushed::Failed(why) if why.contains("[remote rejected]")),
+            "{pushed:?}"
+        );
+        say(DECISION, format!("{pushed:?}"));
+        std::fs::remove_file(&lock).expect("the other push ends");
+
+        // A rewritten branch: refused.
+        rewrite(&mirror, &host);
+        let pushed = push_branch(&mirror, &source, "agent_x");
+        assert!(
+            matches!(&pushed, Pushed::Rejected(why) if why.contains("[rejected]")),
+            "{pushed:?}"
+        );
+        say(DECISION, format!("{pushed:?}"));
+
+        // A source that is gone: an error, not "nothing published".
+        let gone = base.join("gone.git").to_string_lossy().to_string();
+        let fetched = fetch_pushed_into(&mirror, &gone, "agent_x", "refs/spawn-integrate/x");
+        assert!(fetched.is_err(), "{fetched:?}");
+        say(DECISION, format!("{fetched:?}"));
+
+        let plain = std::process::Command::new("git")
+            .args(["--git-dir", &gone, "rev-parse", "HEAD"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("git runs");
+        say(
+            PLAIN,
+            String::from_utf8_lossy(&plain.stderr).trim().replace('\n', " "),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every git the controller runs is in the C locale
+    /// ([`super::controller_git`]), so a host whose locale is translated
+    /// changes nothing Spawn reads from git: the same pushes and fetch, made
+    /// in a process whose whole environment is Chinese (`LC_ALL`, `LANG`,
+    /// `LC_MESSAGES`, `LANGUAGE`), come to the same decisions, the texts
+    /// they quote included, as in C. Before, the texts were git's Chinese.
+    /// On a host without zh_CN (`locale -a`) or git's Chinese messages,
+    /// nothing is translated and the comparison holds anyway.
+    #[test]
+    fn a_translated_locale_changes_nothing_spawn_reads_from_git() {
+        let program = std::env::current_exe().expect("the test binary");
+        let run = |locale: &str, language: Option<&str>| {
+            let mut command = std::process::Command::new(&program);
+            command
+                .args([
+                    "--exact",
+                    "sources::tests::decisions_in_this_locale",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("LC_ALL", locale)
+                .env("LANG", locale)
+                .env("LC_MESSAGES", locale);
+            match language {
+                Some(language) => command.env("LANGUAGE", language),
+                None => command.env_remove("LANGUAGE"),
+            };
+            let output = command.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{locale}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let marked = |mark: &str| -> Vec<String> {
+                stdout
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(mark))
+                    .map(str::to_string)
+                    .collect()
+            };
+            (marked(DECISION), marked(PLAIN))
+        };
+        let (english, plain_english) = run("C", None);
+        assert_eq!(english.len(), 3, "{english:?}");
+        let (translated, plain_translated) = run("zh_CN.UTF-8", Some("zh_CN:zh"));
+        if plain_translated == plain_english {
+            eprintln!("this host does not translate git ({plain_translated:?}): nothing to prove");
+        }
+        assert_eq!(translated, english, "git's answer here: {plain_translated:?}");
     }
 
     #[test]
