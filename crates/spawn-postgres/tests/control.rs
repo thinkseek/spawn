@@ -2776,43 +2776,42 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     client
         .batch_execute(&format!("set session authorization {supervisor}"))
         .expect("become the supervisor");
-    for (call, args) in [
-        ("select spawn_source_push_request($1, $2, $3)", 3),
-        ("select spawn_source_push_hold()", 0),
-    ] {
-        let (c, r) = (c1.clone(), owner_ref(&c1));
-        let params: Vec<&(dyn postgres::types::ToSql + Sync)> = if args == 3 {
-            vec![&source, &c, &r]
-        } else {
-            Vec::new()
-        };
-        assert!(
-            client.query_one(call, &params).is_err(),
-            "the supervisor may not: {call}"
-        );
-    }
+    assert!(
+        client
+            .query_one(
+                "select spawn_source_push_request($1, $2, $3)",
+                &[&source, &c1, &owner_ref(&c1)],
+            )
+            .is_err(),
+        "the supervisor asks for no owner landing"
+    );
+    assert!(
+        client
+            .query_one("select spawn_source_push_hold()", &[])
+            .is_err(),
+        "the supervisor holds no landing"
+    );
 }
 
-/// The owner's landing holds the landing hold's lock: a task landing that
-/// holds it is waited for, and the lock is released with the hold.
+/// The owner's landing holds the landing hold's lock: no one else takes it
+/// meanwhile (a task landing, a mission's drop), and it is released with
+/// the hold.
 #[test]
 fn an_owner_landing_takes_the_landing_holds_lock() {
     let (store, schema) = store("control_owner_hold");
     let hold = store.source_push_hold().expect("hold");
     let mut client = admin(&schema);
-    let free = |client: &mut Client| -> bool {
-        let row = client
-            .query_one("select pg_try_advisory_lock(1399957337)", &[])
-            .expect("try the lock");
-        let got: bool = row.get(0);
-        if got {
-            client
-                .batch_execute("select pg_advisory_unlock(1399957337)")
-                .expect("unlock");
-        }
-        got
-    };
-    assert!(!free(&mut client), "held by the owner's landing");
+    let taken: bool = client
+        .query_one("select pg_try_advisory_lock(1399957337)", &[])
+        .expect("try the lock")
+        .get(0);
+    assert!(!taken, "held by the owner's landing");
     drop(hold);
-    assert!(free(&mut client), "released with the hold");
+    // Other cases may hold it for a moment: wait, boundedly.
+    client
+        .batch_execute(
+            "set lock_timeout = '30s'; select pg_advisory_lock(1399957337);
+             select pg_advisory_unlock(1399957337);",
+        )
+        .expect("released with the hold");
 }
