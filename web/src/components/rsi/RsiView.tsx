@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 
 import { usePoll } from "../../api";
 import { clockTime, formatDuration, relativeTime } from "../../format";
+import { freshAt } from "../../validated";
 import type { RsiDashboard, RsiMission, RsiObjective, RsiTask } from "../../rsi";
 import {
   chartObjective,
