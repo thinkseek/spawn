@@ -447,7 +447,7 @@ fn an_engine_its_runner_still_runs_is_never_ended_by_a_start() {
         .iter()
         .filter(|call| *call == "unmount")
         .count();
-    assert_eq!(unmounts, 1, "only the refused start's own mount went");
+    assert_eq!(unmounts, 0, "no mount went: the start was refused before its own");
     // And a person's input goes to it: recorded waiting for its turn on
     // exec_1, not refused as "runs no execution".
     submit(
