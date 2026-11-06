@@ -549,7 +549,7 @@ function Legend() {
       </li>
       <li className="flex items-center gap-1.5 text-caption text-muted-foreground">
         <span aria-hidden="true" className="size-2 rounded-full" style={{ background: "var(--warning)" }} />
-        conflict
+        conflict · incompatible
       </li>
     </ul>
   );
