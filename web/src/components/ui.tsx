@@ -275,13 +275,15 @@ export function Tabs<T extends string>({
   );
 }
 
-/** The focus ring every interactive element shows on keyboard focus. */
+/** The focus ring every interactive element shows on keyboard focus.
+ * `outline-solid`, never `outline-none` beside it: in Tailwind 4,
+ * `outline-none` sets the style variable `outline-2` reads to none. */
 export const FOCUS_RING =
-  "outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring";
+  "focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-1 focus-visible:outline-ring";
 
 /** The same ring drawn inside, for full-width rows a scroll box would clip. */
 export const FOCUS_RING_INSET =
-  "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
+  "focus-visible:outline-2 focus-visible:outline-solid focus-visible:-outline-offset-2 focus-visible:outline-ring";
 
 /**
  * A long id truncated in the middle: the head loses its end to an
