@@ -16,34 +16,54 @@
 //!   ([`crate::dispatch::step`]), so the task starts from main and its
 //!   brief says what the merge did.
 //!
-//! Both go through [`WorkspaceStore::merge_base`] of the mission's store
-//! ([`sources::MissionWorkspaces`], which refreshes main from the source and
-//! pushes a merge commit): it takes the branch's lock, so it cannot race a
-//! checkpoint, and it writes markers only where a content conflict shows
-//! them, leaving `main` pending under `.merge/<agent>` as the second parent
-//! of the checkpoint that resolves them. A clean merge is a `base_merged`
-//! checkpoint; a conflict is recorded as `merge.conflicted`.
+//! Both go through [`WorkspaceStore::merge_base_when`] of the mission's
+//! store ([`sources::MissionWorkspaces`], which refreshes main from the
+//! source): it takes the branch's lock, so it cannot race a checkpoint, and
+//! it writes markers only where a content conflict shows them, leaving
+//! `main` pending under `.merge/<agent>` as the second parent of the
+//! checkpoint that resolves them. A clean merge is a `base_merged`
+//! checkpoint, recorded, then pushed to the source before [`merge_main`]
+//! returns (a push that fails stays queued on the process's pusher for the
+//! source, which retries it); a conflict is recorded as `merge.conflicted`.
+//!
+//! **Only while the agent is idle.** Both moments are chosen while the
+//! worker waits, but on facts read earlier: a human's input may have
+//! started a turn since. So the store asks again, under the branch's lock,
+//! after the fetch of main and right before it writes anything, on facts
+//! read then ([`may_merge`], the rule a revision is typed in by). The Bridge
+//! types under the same lock ([`WorkspaceStore::hold`]), so a turn typed in
+//! meanwhile is seen. A worker that is not idle keeps its workspace as it
+//! is: the merge is [`Merge::Busy`] and waits. The integrator's verdict then
+//! says main is merged when the revision is typed in, and the dispatcher
+//! merges it then; a delivery whose merge is busy is not sent this pass, and
+//! is tried again on the next.
 //!
 //! A conflict markers cannot show (a file deleted on one side and changed on
 //! the other, a rename, a binary file) changes nothing in the workspace but
 //! a copy of main's version of each such file under [`MAIN_COPIES`], so the
-//! worker, which cannot run git, has what it needs to resolve it.
+//! worker, which cannot run git, has what it needs to resolve it. `.spawn/`
+//! is never committed, and a mount exports the workspace afresh: the store
+//! records the copies beside the workspace and every mount puts them back
+//! while the conflict is open, so the note that names them still holds
+//! after a resume.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use spawn_core::event::{ArtifactRef, CheckpointReason, EventKind, NewEvent, Source};
 use spawn_core::id::{AgentId, BranchName, CommitId, SessionId, WorkspaceId};
-use spawn_core::port::{BaseMerge, EventLog, WorkspaceStore};
+use spawn_core::port::{BaseMerge, EventLog, MERGE_WAITS, WorkspaceError, WorkspaceStore};
 use spawn_host::GitWorkspace;
-use spawn_host::tree_path::TreePath;
 use spawn_postgres::PostgresStore;
 
+use crate::dispatch::Facts;
+use crate::push::Pushed;
 use crate::sources;
 
 /// Where main's version of a file that conflicts without markers is copied,
-/// relative to the workspace (`.spawn/` is never committed).
-pub(crate) const MAIN_COPIES: &str = ".spawn/main";
+/// relative to the workspace (`.spawn/` is never committed; every mount puts
+/// the copies back while the conflict is open).
+pub(crate) use spawn_host::MAIN_COPIES;
 
 /// What merging main into an agent's workspace did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +87,9 @@ pub(crate) enum Merge {
     /// The agent has no workspace mounted under this root (or no mission
     /// with a source): nothing was merged.
     NotMounted,
+    /// The agent was not idle (why): nothing was merged, and the merge
+    /// waits for a moment it is ([`may_merge`]).
+    Busy(String),
     /// The merge did not happen; why.
     Failed(String),
 }
@@ -83,16 +106,29 @@ fn mounted(root: &Path, agent: &str) -> Option<WorkspaceId> {
 /// Merge main into the workspace of `agent` mounted under `root`, through
 /// `workspaces` (whose `main` is the one in `mirror`). The git half of
 /// [`merge_main`], without the database.
+#[cfg(test)]
 pub(crate) fn into_workspace(
     workspaces: &dyn WorkspaceStore,
     mirror: &Path,
     root: &Path,
     agent: &str,
 ) -> Merge {
+    into_workspace_when(workspaces, mirror, root, agent, &|| Ok(()))
+}
+
+/// [`into_workspace`], only while `ready` says the agent is idle, asked by
+/// the store right before it would write ([`WorkspaceStore::merge_base_when`]).
+pub(crate) fn into_workspace_when(
+    workspaces: &dyn WorkspaceStore,
+    mirror: &Path,
+    root: &Path,
+    agent: &str,
+    ready: &dyn Fn() -> Result<(), String>,
+) -> Merge {
     let Some(workspace) = mounted(root, agent) else {
         return Merge::NotMounted;
     };
-    match workspaces.merge_base(&workspace) {
+    match workspaces.merge_base_when(&workspace, ready) {
         Ok(BaseMerge::Current) => Merge::Current,
         Ok(BaseMerge::Merged { commit, files }) => Merge::Merged {
             commit: commit.as_str().to_string(),
@@ -106,40 +142,64 @@ pub(crate) fn into_workspace(
             files,
             marked: false,
         }) => {
-            let copied = copy_mains_versions(mirror, &root.join(agent), &files);
+            // The store copied main's versions and recorded which.
+            let copied = GitWorkspace::new(mirror, root)
+                .main_copies(agent)
+                .map(|(_, copied)| copied)
+                .unwrap_or_default();
             Merge::Unmarked { files, copied }
+        }
+        Err(WorkspaceError::Refused { code, message }) if code == MERGE_WAITS => {
+            Merge::Busy(message)
         }
         Err(error) => Merge::Failed(error.to_string()),
     }
 }
 
-/// Copy main's version of each of `files` that main has to [`MAIN_COPIES`]
-/// in `workspace`; the ones copied.
-fn copy_mains_versions(mirror: &Path, workspace: &Path, files: &[String]) -> Vec<String> {
-    let mut copied = Vec::new();
-    for file in files {
-        let output = sources::controller_git()
-            .arg("--git-dir")
-            .arg(mirror)
-            .args(["cat-file", "blob", &format!("refs/heads/main:{file}")])
-            .output();
-        let Ok(output) = output else { continue };
-        if !output.status.success() {
-            continue;
-        }
-        let copy = TreePath::from(format!("{MAIN_COPIES}/{file}").as_str());
-        if spawn_host::agent_files::replace_with(workspace, &copy, &output.stdout).is_ok() {
-            copied.push(file.clone());
-        }
+/// Whether main may be merged into the workspace of the session `facts`
+/// describe now, or why not: no command in flight in the session (none
+/// being typed, no start, resume or stop under way), and a worker that runs
+/// sits idle at its prompt, its turn stopped, judged on its latest fact
+/// ([`Facts::turn_stopped_idle`], what a revision waits for before it is
+/// typed in). A session with no execution running has no turn to disturb.
+/// A session the facts do not list is not known to be idle.
+pub(crate) fn may_merge(facts: Option<&Facts>) -> Result<(), String> {
+    let Some(facts) = facts else {
+        return Err("its session has no facts yet".to_string());
+    };
+    if facts.open_command {
+        return Err("a command is in flight in its session".to_string());
     }
-    copied
+    if facts.stopping() {
+        return Err("its worker's stop is under way".to_string());
+    }
+    if facts.live && !facts.turn_stopped_idle() {
+        return Err("its worker is not idle at its prompt (a turn may be running)".to_string());
+    }
+    Ok(())
+}
+
+/// [`may_merge`] for `session`, on the dispatcher's facts read now, not the
+/// ones a pass started with.
+fn ready_to_merge(store: &PostgresStore, session: &str) -> Result<(), String> {
+    let rows: Vec<Facts> = serde_json::from_value(
+        store
+            .dispatch_facts()
+            .map_err(|error| format!("its session's facts could not be read: {error}"))?,
+    )
+    .map_err(|error| format!("its session's facts could not be read: {error}"))?;
+    may_merge(rows.iter().find(|facts| facts.session_id == session))
 }
 
 /// Merge main into the mounted workspace of the mission agent `agent`
-/// (session `session`) under `root`, through its mission's store, and record
-/// what happened in the agent's session: a clean merge as a `base_merged`
-/// `artifact.committed`, a conflict as `merge.conflicted`. A merge commit is
-/// pushed before this returns.
+/// (session `session`) under `root`, through its mission's store, only while
+/// the agent is idle ([`may_merge`], asked under the branch's lock), and
+/// record what happened in the agent's session: a clean merge as a
+/// `base_merged` `artifact.committed`, a conflict as `merge.conflicted`. A
+/// merge commit is pushed before this returns; a push that failed is not
+/// dropped but queued on the process's pusher for the source, which retries
+/// it, and the integrator pushes a branch whose recorded checkpoint the
+/// source lacks again ([`sources::push_recorded`]).
 pub(crate) fn merge_main(
     store: &Arc<PostgresStore>,
     root: &Path,
@@ -162,7 +222,7 @@ pub(crate) fn merge_main(
         let root = root.to_path_buf();
         Arc::new(move |repo: &Path| GitWorkspace::new(repo, &root))
     };
-    let workspaces = sources::MissionWorkspaces::new(
+    let workspaces = sources::MissionWorkspaces::one_shot(
         GitWorkspace::new(&mirror, root),
         root,
         Arc::clone(store),
@@ -171,12 +231,14 @@ pub(crate) fn merge_main(
     let project = workspaces.project().to_string();
     // A merge whose record failed (here, or the Bridge's at a start) is
     // recorded from the branch now; one already recorded is a no-op.
-    if let Some(earlier) = head_merge(&mirror, agent)
-        && let Err(error) = record(store, &project, agent, session, "-", &earlier)
+    let earlier = head_merge(&mirror, agent);
+    if let Some(earlier) = &earlier
+        && let Err(error) = record(store, &project, agent, session, "-", earlier)
     {
         eprintln!("merge main into {agent}: record the earlier merge: {error}");
     }
-    let merge = into_workspace(&workspaces, &mirror, root, agent);
+    let ready = || ready_to_merge(store, session);
+    let merge = into_workspace_when(&workspaces, &mirror, root, agent, &ready);
     let head = GitWorkspace::new(&mirror, root)
         .commit_id_of(&format!("refs/heads/{agent}"))
         .unwrap_or_else(|_| "-".to_string());
@@ -184,9 +246,26 @@ pub(crate) fn merge_main(
     if let Err(error) = record(store, &project, agent, session, &head, &merge) {
         eprintln!("merge main into {agent}: record (retried at its next merge): {error}");
     }
-    // Dropping the store pushes the merge commit it marked.
-    drop(workspaces);
+    if matches!(merge, Merge::Merged { .. }) || earlier.is_some() {
+        publish_merge(&mirror, &source, agent, &head);
+    }
     merge
+}
+
+/// Push the merge commit `head` of `agent`'s branch now, and say so when it
+/// did not reach the source: a failed push stays queued and is retried
+/// ([`sources::publish`]).
+fn publish_merge(mirror: &Path, source: &str, agent: &str, head: &str) {
+    match sources::publish(mirror, source, agent) {
+        None | Some(Pushed::Done) => {}
+        Some(Pushed::Failed(why)) => eprintln!(
+            "merge main into {agent}: the push of {head} failed; it stays queued and is \
+             retried: {why}"
+        ),
+        Some(Pushed::Rejected(why)) => {
+            eprintln!("merge main into {agent}: the source refused {head}: {why}");
+        }
+    }
 }
 
 /// The head of `agent`'s branch in `mirror` as a clean merge of main, when it
@@ -266,7 +345,7 @@ fn record(
                 marked: false,
             },
         ),
-        Merge::Current | Merge::NotMounted | Merge::Failed(_) => return Ok(()),
+        Merge::Current | Merge::NotMounted | Merge::Busy(_) | Merge::Failed(_) => return Ok(()),
     };
     store
         .append(NewEvent {
@@ -349,6 +428,14 @@ pub(crate) fn conflict_note(main: &str, merge: &Merge) -> String {
              into it if it merges cleanly; if not, your next report is sent back again with main \
              merged in and the conflicting regions marked, for you to resolve."
         ),
+        Merge::Busy(why) => format!(
+            "{opening} Main could not be merged into your workspace when your work was judged \
+             ({why}): nothing in it was changed. Main is merged into it right before this note is \
+             typed in, and what that merge did is said after this note. If your worker is \
+             resumed instead, main is merged into it if it merges cleanly; if not, your next \
+             report is sent back again with main merged in and the conflicting regions marked, \
+             for you to resolve."
+        ),
         Merge::Failed(error) => format!(
             "{opening} Merging main into your workspace failed ({error}). Report again: the next \
              verdict tries the merge again."
@@ -385,7 +472,7 @@ pub(crate) fn delivery_note(merge: &Merge, untold: &[String]) -> Option<String> 
             "{opening}, but it conflicts with your branch. {} Do that first.",
             unmarked_instructions(files, copied)
         )),
-        Merge::Current | Merge::NotMounted | Merge::Failed(_) => {
+        Merge::Current | Merge::NotMounted | Merge::Busy(_) | Merge::Failed(_) => {
             (!untold.is_empty()).then(|| clean(&[]))
         }
     }
