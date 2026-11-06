@@ -120,11 +120,12 @@ pub(crate) fn parse_rfc3339(text: &str) -> Option<i64> {
 /// A span back in time (`90m`, `36h`, `7d`, `2w`, `30s`), in milliseconds.
 pub(crate) fn parse_span(text: &str) -> Option<i64> {
     let unit = text.chars().last()?;
-    let count: i64 = text[..text.len() - unit.len_utf8()].parse().ok()?;
-    if count <= 0 || !text[..text.len() - unit.len_utf8()]
-        .bytes()
-        .all(|byte| byte.is_ascii_digit())
-    {
+    let number = &text[..text.len() - unit.len_utf8()];
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let count: i64 = number.parse().ok()?;
+    if count == 0 {
         return None;
     }
     let unit_ms = match unit {
