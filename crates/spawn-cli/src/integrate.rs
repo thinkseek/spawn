@@ -4,6 +4,29 @@
 //! For every open mission with a gate, and every done one while the closure
 //! rule (`spawn_task_may_continue`) lets its work go on, one pass:
 //!
+//! 0. first, before any mission's step, the owner's landings ([`owner`]):
+//!    every pending `source.push_requested` (`spawn mission push`, a request
+//!    no `source.moved` or `source.push_refused` names yet), oldest first,
+//!    is applied for its source, between the integrator's own steps. Under
+//!    the landing hold (the store's `spawn_landing_hold` lock and this
+//!    process's [`LANDING`], so no task landing's push and its record are
+//!    ever split by it), it reads the source's main M from the source (never
+//!    the mirror, which a judging may be using), moves main from M to the
+//!    commit when M is in its history, or to a merge commit (first parent M,
+//!    second the commit, by main's merge rules and the landing identity, its
+//!    message naming the owner's landing, the request and the commit's
+//!    subject), with a compare-and-swap (`update-ref <branch> <new> <M>` in
+//!    the source), and records, in the same hold, `source.moved` {source,
+//!    from M, to, request, by: human}: its fold moves the baselines of the
+//!    missions on the source that were at M (and gives the new main to those
+//!    with none yet), so no baseline check of the pass sees a main the owner
+//!    moved. A conflict, a commit the source does not have or a
+//!    compare-and-swap that fails twice records `source.push_refused`
+//!    {request, reason}: nothing moves, nothing halts. It waits for no gate,
+//!    on that source or any other: a judging in flight is never stopped,
+//!    and one of the same source finds main moved when it lands (`stale`,
+//!    judged again on the new main). The integrator is never stopped for an
+//!    owner's landing;
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row
 //!    (neither a `no_room` nor a `host_fault` counts toward either, and no
@@ -11,8 +34,12 @@
 //!    scenario count below its floor, a remote source (agents' branches
 //!    never reach it), or the source's main not where the last landing left
 //!    it. That last one is read only from a fetch that succeeded this pass,
-//!    and only while no other mission's landing on the source is unresolved
-//!    (its push may have moved main before its record);
+//!    only while no other mission's landing on the source is unresolved
+//!    (its push may have moved main before its record), and only while no
+//!    owner's landing on the source is pending after step 0 (one whose
+//!    landing failed may have moved main before its record; it is applied
+//!    or refused by a later pass). A main moved with no record at all (a
+//!    push behind Spawn's back) still halts;
 //! 2. a delivered task over its mission's budget is aborted and its worker
 //!    stopped;
 //! 3. a task whose gate passed is landed (again, after a crash);
@@ -182,7 +209,13 @@
 //!   run beside the others, still one per mission and per source.
 //!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
-//! before; the pass reads those records, never the thread's result. A
+//! before; the pass reads those records, never the thread's result. An
+//! owner's landing (step 0) never touches a judging: one on another source
+//! goes on and lands by the usual rules; one on the same source finishes,
+//! its verdict is recorded as it comes, and when its landing's
+//! compare-and-swap finds main moved, [`land`] records `stale` and a later
+//! pass judges the task again against the new main (never discarded, never
+//! counted). A
 //! finished thread is reaped only at the start of a pass, before the
 //! missions are read, so no pass acts on a snapshot older than a judging's
 //! records. A judging that panics before any record of its own is recorded
