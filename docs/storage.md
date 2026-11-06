@@ -216,6 +216,64 @@ head alone is the whole workspace, so everything below is a git operation.
   does not change that. `discard` (`{"type":"discard"}`, a person's or the
   supervisor's decision) tries the checkpoint once more and unmounts even if
   it fails, losing what was not committed.
+- **When an execution has ended** (issue #15): its runner wrote its exit
+  status (`exited`), or no runner the Bridge started runs it any more
+  (`lost`): its terminal is gone, or is there and hosts no runner. A
+  terminal of the execution's name can outlive its runner: a pane kept dead
+  by `remain-on-exit`, or a session a terminal manager (tmux-resurrect,
+  continuum) restored after a restart at a shell prompt. tmux's
+  `has-session` says yes to both, and the Bridge used to call such an
+  execution running forever, while the log's guard refused every start of
+  its session. Now the tmux host answers `TerminalHost::runner` from
+  `list-panes`: the pane alive (`pane_dead` 0) and started by this host's
+  launch (`pane_start_command` names the launch's environment file,
+  `spawn-launch-<terminal>-`; every launch has one). Anything else is
+  `lost`, and its `execution.ended` carries `evidence`: what the host saw
+  (the dead pane's status, or what the pane was started with and runs),
+  and which command found it. The end is the one above: final checkpoint,
+  terminal killed (the restored shell too: no untracked engine is ever
+  adopted), unmount, record. A start, a resume and an input settle such an
+  execution before they act (`Bridge::settle`), instead of failing on it
+  until a later tick: a start or resume then goes on, an input fails once
+  (it needs a running engine) so the normal resume path applies; a stop
+  ends it as `stopped`, with the same evidence. The Bridge's view of what
+  runs changes only by folding the log (an end it wrote is read back
+  before the execution leaves its view), and when that view runs nothing
+  for a session, a command asks the log for the session's open execution
+  (`EventLog::open_execution`, the guard's own rule: the latest
+  `execution.started` with no Bridge-written `execution.ended` after it)
+  and follows it again, with a warning: a view that missed a record cannot
+  answer "runs no execution" while the log refuses every start. At a
+  restart, a recorded mount whose start the view did not read is no
+  orphan when the log holds that execution open: it is kept and the
+  execution followed again.
+- **Workspace identity**: a workspace has one name, the one its engine
+  sees. tmux starts the pane in the workspace (`-c`), the kernel resolves
+  every symlink on the way, and Claude Code files its transcript under the
+  resolved working directory (every character but ASCII letters and digits
+  replaced by `-`). So the workspace root is resolved through its symlinks
+  once, where it is configured (`spawn_host::canonical_root`, from
+  spawn-cli's `workspace_root` and in `GitWorkspace::new`, the store that
+  mints workspace ids), and the mount, the pane's working directory, the
+  workspace id, the runner's exit file (`.spawn/exit-<execution>`) and the
+  transcript path all derive from that one id. A root reached through a
+  symlink (the reporter's `/home` -> `/data00/home`; on macOS `/tmp` and
+  `/var` are links to `/private/...`) used to give each workspace two
+  names, and the Bridge watched a transcript no engine wrote: no turn read,
+  no report collected. Everything else that names a workspace by path
+  (main merged into a workspace, set-aside, report collection, the
+  delivery marks, the mirrors under `.sources/`) builds it from the same
+  configured root, so the names agree. **Records from before**: an
+  `execution.started` or a mount step written by an earlier version names
+  the workspace under the root as configured. On a host whose root is no
+  link the two are the same string and nothing changes. On a host whose
+  root is reached through a link, `WorkspaceStore::canonical` maps such an
+  id onto the resolved root (its old root, the id's path minus the branch,
+  resolves to the store's root), the Bridge reads every execution's
+  workspace through it (so an execution started before the upgrade is
+  followed where its engine writes, its transcript read at the first tick
+  after the restart), and the git store's path check accepts it for a
+  checkpoint, a merge or an unmount.
 - **Landing**: text only, from what the agent published. The candidate is
   the source's `refs/heads/spawn/<agent>`, the branch the pusher publishes,
   fetched into the integrator's mirror as `refs/spawn-integrate/<agent>`,

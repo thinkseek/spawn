@@ -54,7 +54,7 @@ spawn_submit(principal, key, agent, session, action)
   → tmux new-session          运行 spawn run -- claude --ax-screen-reader --session-id <uuid>
   → 屏尾判定 Ready            capture-pane 尾行解析
   → tmux send-keys            投递提示
-  → Claude transcript         Bridge 每轮读 <projects>/<工作区>/<uuid>.jsonl，claude_line 归一为统一事件
+  → Claude transcript         Bridge 每轮读 <projects>/<工作区解析后的路径>/<uuid>.jsonl，claude_line 归一为统一事件
   → 屏幕                      Bridge 每轮抓屏，两次读数一致才写 screen.observed
   → 退出文件                  spawn run 把退出码写入 .spawn/exit-<execution>，Bridge 读到后写 execution.ended
   → spawn_append              写 spawn_events，双序号
@@ -66,6 +66,10 @@ spawn_submit(principal, key, agent, session, action)
 两条链路互不依赖：数据链路是引擎到事件到 SQL，状态链路是事件到判定再回到事件。
 
 worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。
+
+工作区只有一个名字，即引擎进程看到的那个。tmux 用 `-c` 在工作区启动窗格，内核沿途解析所有符号链接，引擎的工作目录（`getcwd`、`pwd -P`）是解析后的路径，Claude Code 把 transcript 写在这个路径（除 ASCII 字母和数字外的字符都换成 `-`）对应的项目目录下。所以工作区根在配置处解析一次（`spawn_host::canonical_root`：`spawn-cli` 的 `workspace_root`，以及铸造工作区 id 的 `GitWorkspace::new`），mount、窗格的 `-c`、`WorkspaceId`、runner 的退出文件和 transcript 路径都出自这一个 id，不会分叉。根经由符号链接到达的主机（`/home -> /data00/home`；macOS 的 `/tmp`、`/var` 指向 `/private/...`）以前会让 Bridge 盯着一个永远收不到数据的目录（issue #15）。旧版本按配置原样记录的 id 仍指向同一目录：`WorkspaceStore::canonical` 把它映射到解析后的根下，Bridge 读日志里每个执行的工作区都经过它，`GitWorkspace` 的路径检查也接受它（docs/storage.md「Workspace identity」）。
+
+一个执行何时算结束：runner 写了退出文件（`exited`）；或者没有 Bridge 自己启动的 runner 在跑它（`lost`）：终端不在了，或者终端还在但不托管那个 runner（窗格已死、`remain-on-exit`，或重启后终端管理器恢复出来、停在 shell 提示符的同名会话）。tmux 适配器用 `list-panes` 读 `pane_dead` 和 `pane_start_command`，后者必须带上本次启动的环境文件名（`spawn-launch-<终端>-`）。`lost` 的 `execution.ended` 带 `evidence`，记下主机看到了什么。start、resume、input 在动手前先处理这种执行（`Bridge::settle`）：照常走结束流程（最终 checkpoint、杀终端、卸载、写结束事件）后，start/resume 继续，input 失败一次并提示 resume；stop 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 对“谁在运行”的视图只随折叠日志改变；视图为空时向日志查询该会话未结束的执行（`EventLog::open_execution`，与 `spawn_append_trusted` 的守卫同一规则），所以视图与日志即便分叉也会收敛。不会静默收编不受跟踪的引擎：它会被结束，终端被杀。
 
 ## 4. 终端接入：尾行解析
 
@@ -143,7 +147,7 @@ spawn fleet
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | 必填 | PG 连接串 |
 | `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
-| `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
+| `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录；启动时解析符号链接一次，工作区 id 都在解析后的根下 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录 |
 | `SPAWN_MAX_FILE_MB` | `100` | checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次 |

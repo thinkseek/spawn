@@ -20,7 +20,7 @@ use crate::id::{
 };
 use crate::port::{
     ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Hold, Launch,
-    READ_LIMIT, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
+    READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
     WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
@@ -89,6 +89,9 @@ struct State {
     /// all fail, as a record the log can never take would.
     branch_records_refused: HashSet<SessionId>,
     terminals: HashSet<TerminalName>,
+    /// Terminals that are there but host no runner ([`MemoryStore::untrack`]),
+    /// with what the host saw.
+    untracked: HashMap<TerminalName, String>,
     /// Every terminal start, in order.
     launches: Vec<Launch>,
     panes: HashMap<TerminalName, String>,
@@ -216,6 +219,20 @@ impl MemoryStore {
             terminal.clone(),
             (path.to_string(), bytes.as_bytes().to_vec()),
         );
+    }
+
+    /// Make `terminal` one that is there but hosts no runner (its runner
+    /// died, and a terminal manager restored the session at a shell prompt
+    /// after a restart): `runner` answers [`Runner::Untracked`] with
+    /// `evidence`; the terminal stays, with its pane, until terminated.
+    /// Starts it when it is not there. Test helper.
+    pub fn untrack(&self, terminal: &TerminalName, evidence: &str) {
+        let mut state = self.lock();
+        state.terminals.insert(terminal.clone());
+        state.panes.entry(terminal.clone()).or_default();
+        state
+            .untracked
+            .insert(terminal.clone(), evidence.to_string());
     }
 
     /// Append to a file the terminal host can read, as an engine would.
@@ -791,6 +808,23 @@ impl TerminalHost for MemoryStore {
         Ok(state.terminals.contains(terminal))
     }
 
+    fn runner(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<Runner, TerminalError> {
+        if !self.is_alive(terminal, workspace)? {
+            return Ok(Runner::Gone);
+        }
+        Ok(self
+            .lock()
+            .untracked
+            .get(terminal)
+            .map_or(Runner::Running, |evidence| {
+                Runner::Untracked(evidence.clone())
+            }))
+    }
+
     fn capture_tail(
         &self,
         terminal: &TerminalName,
@@ -844,6 +878,7 @@ impl TerminalHost for MemoryStore {
         let mut state = self.lock();
         state.terminals.remove(terminal);
         state.panes.remove(terminal);
+        state.untracked.remove(terminal);
         Ok(())
     }
 }

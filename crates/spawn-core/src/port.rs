@@ -10,8 +10,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::command::{Claimed, Outcome, Submission};
-use crate::event::{Appended, EventRecord, Fork, GlobalPosition, NewEvent};
-use crate::id::{AgentId, BranchName, CommandId, CommitId, Principal, TerminalName, WorkspaceId};
+use crate::event::{Appended, EventKind, EventRecord, Fork, GlobalPosition, NewEvent, Source};
+use crate::id::{
+    AgentId, BranchName, CommandId, CommitId, Principal, SessionId, TerminalName, WorkspaceId,
+};
 
 /// Storage failure.
 #[derive(Debug, Error)]
@@ -50,6 +52,44 @@ pub trait EventLog: Send + Sync {
         after: GlobalPosition,
         limit: usize,
     ) -> Result<Vec<EventRecord>, StoreError>;
+
+    /// The session's open execution as the log has it: the record of its
+    /// latest `execution.started` when no `execution.ended` the Bridge wrote
+    /// follows it, the rule by which the log refuses a second start. The
+    /// Bridge asks when its own view of the session runs nothing, so a view
+    /// that diverged from the log (whatever made it) cannot leave the log
+    /// waiting forever for an end the Bridge sees no reason to write. The
+    /// default reads the whole log.
+    fn open_execution(&self, session: &SessionId) -> Result<Option<EventRecord>, StoreError> {
+        const BATCH: usize = 1000;
+        let mut after = GlobalPosition(0);
+        let mut open: Option<EventRecord> = None;
+        loop {
+            let batch = self.read_global(after, BATCH)?;
+            for record in &batch {
+                let event = &record.event;
+                if event.session_id != *session || event.execution_id.is_none() {
+                    continue;
+                }
+                match &event.kind {
+                    EventKind::ExecutionStarted { .. } => open = Some(record.clone()),
+                    EventKind::ExecutionEnded { .. }
+                        if event.source == Source::Bridge
+                            && open.as_ref().is_some_and(|started| {
+                                started.event.execution_id == event.execution_id
+                            }) =>
+                    {
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+            match batch.last() {
+                Some(last) if batch.len() == BATCH => after = last.position,
+                _ => return Ok(open),
+            }
+        }
+    }
 }
 
 /// Leased command queue.
@@ -228,8 +268,22 @@ pub trait WorkspaceStore: Send + Sync {
         from: Option<&str>,
     ) -> Result<Branch, WorkspaceError>;
 
-    /// Materialize `branch` where the engine can run.
+    /// Materialize `branch` where the engine can run. The id names the
+    /// directory as the engine's process sees it (every symlink on the way
+    /// resolved): the pane starts there, and the engine files its transcript
+    /// under that path.
     fn mount(&self, branch: &BranchName) -> Result<WorkspaceId, WorkspaceError>;
+
+    /// `workspace` as this store names it now ([`Self::mount`]). An id
+    /// recorded under another spelling of the store's root (the root as it
+    /// was configured, before a version that resolves it through its
+    /// symlinks) names the same directory, and comes back under the resolved
+    /// root; any other id comes back as it is. The Bridge reads the
+    /// workspace of every execution in the log through it, so an execution
+    /// started before the upgrade is followed where its engine writes.
+    fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
+        workspace.clone()
+    }
 
     /// Commit the workspace. No changes is [`Commit::Unchanged`].
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError>;
@@ -359,6 +413,19 @@ pub struct Launch {
     pub environment: Vec<(String, String)>,
 }
 
+/// What a terminal hosts ([`TerminalHost::runner`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runner {
+    /// The runner the host started there, alive.
+    Running,
+    /// No terminal of that name.
+    Gone,
+    /// A terminal of that name that does not host that runner: why, as the
+    /// host saw it (a dead pane and its status, or what the pane was started
+    /// with and runs now).
+    Untracked(String),
+}
+
 /// The most bytes one [`TerminalHost::read_from`] returns: a file an agent
 /// writes cannot make the Bridge hold an unbounded buffer.
 pub const READ_LIMIT: usize = 8 << 20;
@@ -417,6 +484,26 @@ pub trait TerminalHost: Send + Sync {
         terminal: &TerminalName,
         workspace: &WorkspaceId,
     ) -> Result<bool, TerminalError>;
+
+    /// Whether the terminal hosts the runner this host started in it
+    /// ([`Self::start`]), alive: what the Bridge asks before it calls an
+    /// execution running or types into it. A terminal of that name can
+    /// outlive its runner: a pane left dead (`remain-on-exit`), or a session
+    /// a terminal manager restored after a restart, at a shell prompt. Such
+    /// a terminal runs no engine of Spawn's, whatever its screen shows, so
+    /// its execution is lost ([`Runner::Untracked`], with what the host saw).
+    /// A host that cannot tell answers from [`Self::is_alive`].
+    fn runner(
+        &self,
+        terminal: &TerminalName,
+        workspace: &WorkspaceId,
+    ) -> Result<Runner, TerminalError> {
+        Ok(if self.is_alive(terminal, workspace)? {
+            Runner::Running
+        } else {
+            Runner::Gone
+        })
+    }
 
     /// Last `lines` lines of the terminal screen, newest last.
     fn capture_tail(

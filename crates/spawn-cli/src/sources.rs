@@ -540,6 +540,12 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(branch.as_str())?.store.mount(branch)
     }
 
+    /// Every mission's store keeps its workspaces under the one root, so
+    /// the default store names any of them; nothing is routed.
+    fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
+        self.default.canonical(workspace)
+    }
+
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
         let routed = self.route(workspace.sandbox())?;
         let commit = routed.store.commit(workspace, message)?;

@@ -203,11 +203,14 @@ pub struct GitWorkspace {
 }
 
 impl GitWorkspace {
-    /// Store that keeps working trees on this machine.
+    /// Store that keeps working trees on this machine, under `root`
+    /// resolved through its symlinks once, here ([`crate::root`]): every
+    /// workspace id it mints names the directory as the engine's process
+    /// sees it.
     pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
         Self {
             repo: repo.as_ref().to_path_buf(),
-            root: root.as_ref().to_path_buf(),
+            root: crate::root::canonical_root(root.as_ref()),
             git: "git".to_string(),
             max_file_bytes: max_file_bytes(std::env::var("SPAWN_MAX_FILE_MB").ok().as_deref()),
         }
@@ -235,9 +238,17 @@ impl GitWorkspace {
     }
 
     /// Workspace directory, refused when it lies outside the store root.
+    /// An id recorded under another spelling of the root (before the root
+    /// was resolved through its symlinks) names the same directory under the
+    /// resolved root ([`crate::root::legacy_workspace`]).
     fn checked_path(&self, workspace: &WorkspaceId) -> Result<PathBuf, WorkspaceError> {
         let directory = PathBuf::from(workspace.path());
         if directory.starts_with(&self.root) {
+            return Ok(directory);
+        }
+        if let Some(directory) =
+            crate::root::legacy_workspace(&self.root, workspace.sandbox(), &directory)
+        {
             return Ok(directory);
         }
         Err(WorkspaceError::Unavailable(format!(
@@ -911,6 +922,20 @@ impl WorkspaceStore for GitWorkspace {
             commit: CommitId::new(commit)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
         }))
+    }
+
+    /// An id under the resolved root is this store's own; one recorded
+    /// under another spelling of it names the same directory there.
+    fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
+        let directory = Path::new(workspace.path());
+        if directory.starts_with(&self.root) {
+            return workspace.clone();
+        }
+        crate::root::legacy_workspace(&self.root, workspace.sandbox(), directory)
+            .and_then(|directory| {
+                WorkspaceId::new(format!("{}:{}", workspace.sandbox(), directory.display())).ok()
+            })
+            .unwrap_or_else(|| workspace.clone())
     }
 
     /// Export the branch head as the workspace. The whole new tree is built
