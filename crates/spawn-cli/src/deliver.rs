@@ -3087,6 +3087,22 @@ mod tests {
         assert!(super::orders(&tasks, &[unsure], 60_001).is_empty());
     }
 
+    /// The scorecard's view of a delivery spent before a deploy: the spend
+    /// counts (judged with any waits alike), and the deploy's extra attempt
+    /// is no part of the delivery.
+    #[test]
+    fn the_scorecard_counts_a_delivery_spent_before_a_deploy() {
+        assert_eq!(super::delivery_of("deliver-4-0-moved-90"), None);
+        assert_eq!(
+            super::delivery_of("deliver-4-0-retry-13"),
+            Some((4, "deliver-4-0"))
+        );
+        let facts = spent_facts("deliver-4-0", 50_000);
+        let sent: Vec<&Sent> = facts.dispatched.iter().collect();
+        assert!(super::delivery_spent(&sent));
+        assert!(!super::delivery_spent(&sent[..13]), "one retry still due");
+    }
+
     /// A deploy recorded while a first delivery waits for its re-issue: the
     /// re-issue, once due, goes first, and no extra attempt beside it.
     #[test]
