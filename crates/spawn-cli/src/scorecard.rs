@@ -27,6 +27,7 @@ mod transcripts;
 #[cfg(test)]
 mod tests;
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -429,20 +430,21 @@ fn days_table(days: &[Value]) -> String {
     ];
     let mut out = String::from("  days (- not enough data):\n    day       ");
     for (_, header) in COLUMNS {
-        out.push_str(&format!("  {header:>12}"));
+        let _ = write!(out, "  {header:>12}");
     }
     out.push('\n');
     for day in days {
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "    {}",
             day.get("day").and_then(Value::as_str).unwrap_or("?")
-        ));
+        );
         for (name, _) in COLUMNS {
             let value = day
                 .pointer(&format!("/dimensions/{name}/value"))
                 .filter(|value| !value.is_null())
                 .map_or_else(|| "-".to_string(), show);
-            out.push_str(&format!("  {value:>12}"));
+            let _ = write!(out, "  {value:>12}");
         }
         out.push('\n');
     }
@@ -466,7 +468,7 @@ pub(crate) fn text(card: &Value) -> String {
             Some(id) => format!("mission {id}"),
             None => "fleet".to_string(),
         };
-        out.push_str(&format!("\n{title}\n"));
+        let _ = write!(out, "\n{title}\n");
         for name in [
             "throughput",
             "lead_time",

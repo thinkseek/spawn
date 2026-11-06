@@ -52,24 +52,19 @@ struct LineMessage {
 
 #[derive(Deserialize)]
 struct Usage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
+    #[serde(rename = "input_tokens", default)]
+    input: Option<u64>,
+    #[serde(rename = "cache_creation_input_tokens", default)]
+    cache_creation: Option<u64>,
+    #[serde(rename = "cache_read_input_tokens", default)]
+    cache_read: Option<u64>,
+    #[serde(rename = "output_tokens", default)]
+    output: Option<u64>,
 }
 
 impl Usage {
     fn total(&self) -> i64 {
-        let sum = [
-            self.input_tokens,
-            self.cache_creation_input_tokens,
-            self.cache_read_input_tokens,
-            self.output_tokens,
-        ]
+        let sum = [self.input, self.cache_creation, self.cache_read, self.output]
         .into_iter()
         .flatten()
         .fold(0_u64, u64::saturating_add);
