@@ -1001,4 +1001,55 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// Issue #7, at the dispatcher: a task about to be typed into a live
+    /// worker whose merge of main finds the worker busy (a person's input in
+    /// flight in its session) is not sent this pass: nothing is merged, the
+    /// order goes nowhere, and the next pass tries again by the same rules.
+    #[test]
+    fn the_dispatcher_holds_a_delivery_whose_merge_finds_the_worker_busy() {
+        use spawn_core::command::{CommandAction, Submission};
+        use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
+        use spawn_core::port::CommandQueue;
+        let db = Db::new("delivery_hold");
+        let (base, source, root, mirror, store) = world("delivery-hold");
+        let (agent, session) = db.task_on(&source, "held");
+        agent_with_work(&store, &agent, |directory| {
+            std::fs::write(directory.join("work.txt"), "mine\n").expect("write");
+        });
+        let before = head(&mirror, &agent);
+        main_moves(&base, &source, &mirror, |clone| {
+            std::fs::write(clone.join("added.txt"), "from main\n").expect("write");
+        });
+        db.store
+            .submit(
+                &Principal::new("human").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new(agent.clone()).expect("agent"),
+                    session_id: SessionId::new(session.clone()).expect("session"),
+                    idempotency_key: IdempotencyKey::new("human-1").expect("key"),
+                    action: CommandAction::Input {
+                        text: "one more thing".to_string(),
+                        tags: Vec::new(),
+                    },
+                },
+            )
+            .expect("submit");
+        let mut order = crate::dispatch::Order {
+            agent_id: agent.clone(),
+            session_id: session.clone(),
+            key: "deliver-1-0".to_string(),
+            action: CommandAction::Input {
+                text: "the task".to_string(),
+                tags: Vec::new(),
+            },
+            task: Some(1),
+        };
+        let held = crate::dispatch::merge_main_before(&db.store, &root, &mut order)
+            .expect_err("the delivery is held");
+        assert!(held.contains("waits") && held.contains("in flight"), "{held}");
+        assert_eq!(head(&mirror, &agent), before, "nothing merged");
+        assert!(!root.join(&agent).join("added.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

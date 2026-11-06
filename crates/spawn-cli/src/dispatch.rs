@@ -589,7 +589,7 @@ fn set_aside_before(
 /// cleanly. Returns a log line when the merge did something, and an error
 /// (the log line) when the order must not be sent this pass: the worker was
 /// not idle when the merge looked again ([`crate::main_merge::Merge::Busy`]).
-fn merge_main_before(
+pub(crate) fn merge_main_before(
     store: &std::sync::Arc<PostgresStore>,
     root: &Path,
     order: &mut Order,
