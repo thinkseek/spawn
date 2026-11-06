@@ -1063,7 +1063,10 @@ fn a_merge_into_an_agent_that_is_not_idle_waits_and_changes_nothing() {
     assert_eq!(asked.get(), 1);
     assert_eq!(fixture.head("agent_a"), head, "the branch did not move");
     assert_eq!(read(&directory, "README.md"), "base\n");
-    assert!(!directory.join("new.txt").exists(), "the workspace is as it was");
+    assert!(
+        !directory.join("new.txt").exists(),
+        "the workspace is as it was"
+    );
 
     // A conflict waits the same way: no markers, no pending merge.
     let fixture = Fixture::new("not-idle-conflict", &[("README.md", "base\n")]);
@@ -1097,7 +1100,10 @@ fn a_held_workspace_keeps_a_merge_out_until_the_hold_ends() {
     fixture.work(&workspace, &[("work.txt", "mine\n")]);
     fixture.land(&[("new.txt", "theirs\n")]);
 
-    let held = fixture.store.hold(&workspace).expect("a git workspace is held");
+    let held = fixture
+        .store
+        .hold(&workspace)
+        .expect("a git workspace is held");
     let typing_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = std::sync::Arc::clone(&typing_done);
     let store = fixture.store.clone();
@@ -1147,7 +1153,10 @@ fn mains_copies_come_back_at_every_mount_until_main_is_in() {
         fixture.store.main_copies("agent_a"),
         Some((main.clone(), vec!["notes.txt".to_string()]))
     );
-    assert!(!directory.join("notes.txt").exists(), "the workspace is unchanged");
+    assert!(
+        !directory.join("notes.txt").exists(),
+        "the workspace is unchanged"
+    );
 
     // The engine is lost and the workspace goes; a resume merges main only
     // when it is clean (it is not), then mounts the branch afresh.

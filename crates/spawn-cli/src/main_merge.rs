@@ -533,7 +533,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).expect("seed");
-        git(&["init", "-q", "--initial-branch=main", &seed.to_string_lossy()]).expect("init");
+        git(&[
+            "init",
+            "-q",
+            "--initial-branch=main",
+            &seed.to_string_lossy(),
+        ])
+        .expect("init");
         std::fs::write(seed.join("README.md"), "one\ntwo\nthree\n").expect("write");
         std::fs::write(seed.join("notes.txt"), "notes\n").expect("write");
         commit_in(&seed, "base");
@@ -557,8 +563,13 @@ mod tests {
         commit_in(&clone, "main moves");
         git(&["-C", &clone_path, "push", "-q", "origin", "main"]).expect("push main");
         crate::sources::refresh(mirror, source).expect("refresh");
-        git(&["--git-dir", &mirror.to_string_lossy(), "rev-parse", "refs/heads/main"])
-            .expect("main")
+        git(&[
+            "--git-dir",
+            &mirror.to_string_lossy(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .expect("main")
     }
 
     /// `agent`'s branch with one checkpoint by `work`, mounted.
@@ -765,7 +776,10 @@ mod tests {
         });
         let recorded = head(&mirror, agent);
         let landing = format!("refs/spawn-integrate/{agent}");
-        assert_eq!(fetch_pushed_into(&mirror, &source, agent, &landing).expect("fetch"), None);
+        assert_eq!(
+            fetch_pushed_into(&mirror, &source, agent, &landing).expect("fetch"),
+            None
+        );
         assert_eq!(
             crate::sources::push_recorded(&mirror, &source, agent, "0123abcd"),
             None,
@@ -928,8 +942,13 @@ mod tests {
             )
             .expect("submit");
         let landing = |agent: &str| {
-            fetch_pushed_into(&mirror, &source, agent, &format!("refs/spawn-integrate/{agent}"))
-                .expect("fetch")
+            fetch_pushed_into(
+                &mirror,
+                &source,
+                agent,
+                &format!("refs/spawn-integrate/{agent}"),
+            )
+            .expect("fetch")
         };
         let busy_head = head(&mirror, &busy);
         // The first merge's push loses the source's ref lock to another
@@ -967,7 +986,10 @@ mod tests {
                 "published (round {round})"
             );
             assert_eq!(
-                db.store.latest_checkpoint(&idle).expect("checkpoint").as_deref(),
+                db.store
+                    .latest_checkpoint(&idle)
+                    .expect("checkpoint")
+                    .as_deref(),
                 Some(commit.as_str()),
                 "recorded"
             );
