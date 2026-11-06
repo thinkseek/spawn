@@ -354,7 +354,7 @@ fn a_runtime_file_the_owner_removes_from_main_leaves_the_branch_and_lands_clean(
 /// durable schedule) while the agent's merge of it waits on its markers:
 /// the merge wrote it into the workspace, and it is the project's, so
 /// neither checkpoint drops it (which would delete it from `main` when the
-/// branch lands).
+/// branch lands), while the engine's lock, written meanwhile, stays out.
 #[test]
 fn a_runtime_file_main_adds_during_a_pending_merge_stays() {
     const SCHEDULE: &str = ".claude/scheduled_tasks.json";
@@ -374,18 +374,23 @@ fn a_runtime_file_main_adds_during_a_pending_merge_stays() {
         BaseMerge::Conflicted { marked: true, .. }
     ));
     assert!(directory.join(SCHEDULE).is_file(), "the merge wrote it");
+    write(&directory, LOCK, LOCK_TEXT);
 
     let reference = agent().to_string();
     assert!(matches!(
         store.commit(&workspace, "markers still in").expect("commit"),
         Commit::Created(_)
     ));
-    assert!(files_of(&checkout, &reference).contains(&SCHEDULE.to_string()));
+    let files = files_of(&checkout, &reference);
+    assert!(files.contains(&SCHEDULE.to_string()), "{files:?}");
+    assert!(!files.contains(&LOCK.to_string()), "{files:?}");
     write(&directory, "notes.txt", "agent and main\n");
     assert!(matches!(
         store.commit(&workspace, "resolved").expect("commit"),
         Commit::Created(_)
     ));
-    assert!(files_of(&checkout, &reference).contains(&SCHEDULE.to_string()));
+    let files = files_of(&checkout, &reference);
+    assert!(files.contains(&SCHEDULE.to_string()), "{files:?}");
+    assert!(!files.contains(&LOCK.to_string()), "{files:?}");
     store.unmount(&workspace).expect("unmount");
 }
