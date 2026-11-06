@@ -6,7 +6,7 @@ import { absoluteTitle } from "../../format";
 import type { AgentGroup, AgentGroupId, FleetContext, TaskRef } from "../../ordering";
 import { AGENT_GROUP_LABEL, heldTask, lastTask } from "../../ordering";
 import { useStoredChoice } from "../ViewToggle";
-import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, MiddleId, cx, sinceText } from "../ui";
+import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, MiddleId, cx, sinceText } from "../ui";
 import { FleetStateDot, JudgeBadge } from "./bits";
 
 /** One line for "what is it doing right now". */
@@ -225,8 +225,7 @@ function AgentRow({
       className={cx(
         "relative flex w-full flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-2 text-left transition-colors",
         COLUMNS,
-        FOCUS_RING,
-        "focus-visible:-outline-offset-2",
+        FOCUS_RING_INSET,
         selected ? "bg-surface-selected" : "hover:bg-surface-hover",
       )}
     >

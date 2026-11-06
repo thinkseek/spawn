@@ -279,6 +279,10 @@ export function Tabs<T extends string>({
 export const FOCUS_RING =
   "outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring";
 
+/** The same ring drawn inside, for full-width rows a scroll box would clip. */
+export const FOCUS_RING_INSET =
+  "outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring";
+
 /**
  * A long id truncated in the middle: the head loses its end to an
  * ellipsis, the distinguishing suffix stays (`agent_worker_…_96`). The

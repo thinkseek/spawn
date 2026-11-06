@@ -11,7 +11,7 @@ import { AGENT_GROUP_LABEL, groupAgents, heldTask } from "../ordering";
 import { phaseStyle } from "./rsi/Phase";
 import { StateDot, stateLabel } from "./StateDot";
 import { useStoredChoice } from "./ViewToggle";
-import { Ago, FOCUS_RING, GroupHeader, MiddleId, cx } from "./ui";
+import { Ago, FOCUS_RING_INSET, GroupHeader, MiddleId, cx } from "./ui";
 
 interface SidebarProps {
   sessions: OverviewSession[];
@@ -284,7 +284,7 @@ function SessionRow({
       title={[agentId || sessionId, sessionId, task].filter(Boolean).join("\n")}
       className={cx(
         "relative block w-full min-w-0 rounded-md px-2.5 py-1.5 text-left transition-colors",
-        FOCUS_RING,
+        FOCUS_RING_INSET,
         selected ? "bg-surface-selected" : "hover:bg-sidebar-accent",
       )}
     >
@@ -341,7 +341,7 @@ function NavItem({
       aria-current={active ? "page" : undefined}
       className={cx(
         "flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-label font-medium transition-colors",
-        FOCUS_RING,
+        FOCUS_RING_INSET,
         active
           ? "bg-surface-selected text-foreground"
           : "text-muted-foreground hover:bg-sidebar-accent hover:text-foreground",
