@@ -183,7 +183,11 @@ fn waiting_holds(holds: &Value) -> Value {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|hold| hold["waiting"].as_array().is_some_and(|tasks| !tasks.is_empty()))
+            .filter(|hold| {
+                hold["waiting"]
+                    .as_array()
+                    .is_some_and(|tasks| !tasks.is_empty())
+            })
             .cloned()
             .collect(),
     )

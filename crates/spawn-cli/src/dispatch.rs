@@ -1317,7 +1317,10 @@ mod tests {
         let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
         assert_eq!(
             tags,
-            ["missions source-hold-expired-88", "missions source-hold-expired-95"]
+            [
+                "missions source-hold-expired-88",
+                "missions source-hold-expired-95"
+            ]
         );
         assert!(items.iter().all(|item| item.why == Why::HoldExpired));
         assert_eq!(items[0].since_ms, Some(1_793_930_021_000));
@@ -1335,11 +1338,14 @@ mod tests {
         ] {
             assert!(line.contains(part), "{part}: {line}");
         }
-        assert!(items[1].line.contains("no task waited behind it"), "{}", items[1].line);
+        assert!(
+            items[1].line.contains("no task waited behind it"),
+            "{}",
+            items[1].line
+        );
         assert!(items.iter().all(|item| !item.line.contains('\n')));
         assert!(
-            super::digest::hold_expiries(&[serde_json::json!({"source": "/srv/x.git"})])
-                .is_empty(),
+            super::digest::hold_expiries(&[serde_json::json!({"source": "/srv/x.git"})]).is_empty(),
             "a record without its event is no item"
         );
 
@@ -1350,7 +1356,10 @@ mod tests {
         };
         assert_eq!(
             tags,
-            &["missions source-hold-expired-88", "missions source-hold-expired-95"]
+            &[
+                "missions source-hold-expired-88",
+                "missions source-hold-expired-95"
+            ]
         );
         let line = text
             .lines()
@@ -1362,7 +1371,8 @@ mod tests {
             "{line}"
         );
         assert!(
-            text.lines().any(|line| line.contains("/srv/missions/supply-pa.git")),
+            text.lines()
+                .any(|line| line.contains("/srv/missions/supply-pa.git")),
             "each expiry keeps its own line: {text}"
         );
         let mut supervisor = idle_supervisor();

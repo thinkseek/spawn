@@ -316,7 +316,10 @@ fn a_landing_behind_the_owners_hold_is_no_stall_and_is_measured_from_the_holds_e
     let mut held = open(7, "landing", (190, "task.gated", 3_600_000));
     held["held"] = json!(true);
     let found = stalls(json!({"tasks": [held.clone()]}));
-    assert!(items(&facts, &tasks, &found, &bounds()).is_empty(), "held an hour, no stall");
+    assert!(
+        items(&facts, &tasks, &found, &bounds()).is_empty(),
+        "held an hour, no stall"
+    );
 
     // Released 5 minutes ago: the step starts again from the release.
     let mut released = held.clone();
@@ -334,7 +337,11 @@ fn a_landing_behind_the_owners_hold_is_no_stall_and_is_measured_from_the_holds_e
     let item = only(&items(&facts, &tasks, &found, &bounds())).clone();
     assert_eq!(item.id, "stall-7-landing-260");
     assert_eq!(item.since_ms, Some(NOW - 700_000));
-    assert!(item.line.contains("source.hold_expired (record 260"), "{}", item.line);
+    assert!(
+        item.line.contains("source.hold_expired (record 260"),
+        "{}",
+        item.line
+    );
 
     // A hold that ended before the gate accepted it changes nothing.
     released["hold_end"] = json!({"id": 100, "type": "source.released",
