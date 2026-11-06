@@ -6,6 +6,12 @@
 //! `has-session` says yes to both; `runner` tells them from the runner this
 //! host launched. tmux is real, on a server of the test's own that reads no
 //! configuration.
+//!
+//! A tmux server shuts down once its last session ends, and a client that
+//! connects meanwhile is dropped with "server exited unexpectedly": the
+//! server, or a pane it is still forking (which holds its socket until it
+//! execs), had the socket open but never reads the command. A step that
+//! must not meet that runs on a server another session keeps up.
 
 use std::fs;
 use std::io::Write;
@@ -18,14 +24,23 @@ use spawn_core::id::{TerminalName, WorkspaceId};
 use spawn_core::port::{Launch, Runner, TerminalHost};
 use spawn_host::TmuxHost;
 
+/// Serialize the external programs of this test binary (see api.rs: a fork
+/// inherits the write handle of a script another thread is creating).
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Server {
     directory: PathBuf,
     socket: String,
 }
 
 impl Server {
-    fn new() -> Self {
-        let socket = format!("spawn-runner-test-{}", std::process::id());
+    /// A server of this test's own, `tag` telling it from the other tests'.
+    fn new(tag: &str) -> Self {
+        let socket = format!("spawn-runner-test-{tag}-{}", std::process::id());
         let directory = std::env::temp_dir().join(&socket);
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("scratch");
@@ -71,6 +86,16 @@ impl Drop for Server {
             .stderr(std::process::Stdio::null())
             .status();
         let _ = fs::remove_dir_all(&self.directory);
+        // tmux leaves the socket file behind; it is this test's own.
+        if let Ok(meta) = fs::metadata("/proc/self") {
+            use std::os::unix::fs::MetadataExt;
+            let dir = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+            let _ = fs::remove_file(
+                std::path::Path::new(&dir)
+                    .join(format!("tmux-{}", meta.uid()))
+                    .join(&self.socket),
+            );
+        }
     }
 }
 
@@ -111,13 +136,18 @@ fn settled(host: &TmuxHost, limit: Duration) -> Runner {
 
 #[test]
 fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
-    let server = Server::new();
+    let _exclusive = exclusive();
+    let server = Server::new("runner");
     let host = server.host();
     assert_eq!(
         host.runner(&terminal(), &workspace()).expect("runner"),
         Runner::Gone,
         "no server, no terminal"
     );
+    // A session of the terminal manager's own keeps the server up from here
+    // on, as on a server in use: no step below meets a server shutting down
+    // because the terminal it just killed was the last one.
+    server.tmux(&["new-session", "-d", "-s", "keep"]);
 
     // Launched by this host, with an environment and without one.
     for environment in [&[("SPAWN_EXECUTION_ID", "exec_1")][..], &[]] {
@@ -156,7 +186,6 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
 
     // A dead pane kept by remain-on-exit: the runner exited (3) and the
     // session stays.
-    server.tmux(&["new-session", "-d", "-s", "keep"]);
     server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
         .expect("start");
@@ -165,4 +194,25 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     };
     assert!(seen.contains("dead (exit status 3)"), "{seen}");
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
+}
+
+/// A launch right after the server's last terminal ended (the only
+/// execution stopped, the next one starts) starts: its `new-session` may
+/// reach the server while it shuts down, which drops it unread ("server
+/// exited unexpectedly"), and that says nothing about the launch.
+#[test]
+fn a_launch_starts_while_the_server_shuts_down_after_its_last_terminal() {
+    let _exclusive = exclusive();
+    let server = Server::new("restart");
+    let host = server.host();
+    for round in 0..20 {
+        host.start(&launch("/bin/cat", &[], &[]))
+            .unwrap_or_else(|error| panic!("start {round}: {error:?}"));
+        assert_eq!(
+            host.runner(&terminal(), &workspace()).expect("runner"),
+            Runner::Running
+        );
+        // The server's only session: it shuts down next.
+        host.terminate(&terminal(), &workspace()).expect("kill");
+    }
 }
