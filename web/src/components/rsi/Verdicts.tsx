@@ -23,6 +23,8 @@ function defaultNote(verdict: TaskVerdict): string {
       return "Aborted: the gate or the budget ran out";
     case "conflict":
       return "Conflicts with main; sent back";
+    case "incompatible":
+      return "Passes alone, fails merged with main; sent back, not counted";
     case "stale":
       return "Main moved; judged again";
     case "no_room":
