@@ -1012,6 +1012,71 @@ mod tests {
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
         );
+        assert_eq!(plan.told, host, "told, and the path is still low: unresolved");
+    }
+
+    /// The live page of 2026-11-06 20:30: two disk recoveries told 8 h
+    /// earlier were listed as told and unresolved. A recovery is news: told
+    /// once, then resolved, while a low path stays unresolved until its
+    /// recovery replaces it (crate::disk::escalations).
+    #[test]
+    fn a_told_recovery_is_resolved_and_a_told_low_path_is_not() {
+        let record = |id: i64, path: &str, state: &str, free: u64| {
+            serde_json::json!({"type": "host.disk", "label": "tmpdir", "path": path,
+                               "state": state, "free_bytes": free << 30, "warn_bytes": 20_u64 << 30,
+                               "floor_bytes": 2_u64 << 30, "event_id": id,
+                               "at_ms": NOW - 8 * 3_600_000})
+        };
+        let host = crate::disk::escalations(
+            &[
+                record(7, "/data/tmp", "recovered", 43),
+                record(8, "/ws", "low", 5),
+            ],
+            NOW,
+        );
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
+        let pending: Vec<String> = plan.pending.iter().map(Escalation::tag).collect();
+        assert_eq!(pending, ["host disk-7", "host disk-8"], "both news until told");
+        let CommandAction::Input { text, .. } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert!(
+            text.contains("- host — disk space back on this host: tmpdir /data/tmp has 43.0 GiB free again\n"),
+            "{text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(plan.orders.is_empty() && plan.pending.is_empty(), "told once");
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host disk-8"], "the recovery is not unresolved");
+    }
+
+    /// News of every kind is resolved by being told: a told approval, human
+    /// message or pair of host faults is never kept as unresolved, even if
+    /// its source still gives it.
+    #[test]
+    fn told_news_is_never_unresolved() {
+        let item = |why: Why, id: &str| Escalation {
+            session_id: "host".to_string(),
+            id: id.to_string(),
+            why,
+            line: String::new(),
+            since_ms: None,
+        };
+        let host = [
+            item(Why::Approved, "approved-core"),
+            item(Why::Human, "human-4"),
+            item(Why::GateHostFault, "gate-host-fault-9"),
+            item(Why::GateRoom, "gate-room-12"),
+        ];
+        let mut supervisor = idle_supervisor();
+        supervisor.told = host.iter().map(Escalation::tag).collect();
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(plan.pending.is_empty());
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host gate-room-12"], "only the condition holds");
     }
 
     /// The live sequence of 2026-11-06: 100 human notes to one worker could
