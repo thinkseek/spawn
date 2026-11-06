@@ -410,8 +410,11 @@ EOF
 chmod 755 "$WORK/tmux"
 
 for name in SPAWN_PROGRAM SPAWN_JUDGE_URL SPAWN_JUDGE_MODEL SPAWN_MODEL_RELAY SPAWN_GATE \
-    SPAWN_DISPATCH SPAWN_SUPERVISOR CLAUDE_CONFIG_DIR SPAWN_GATE_MIN_FREE_GB \
-    SPAWN_GATE_MIN_FREE_MEMORY_MB SPAWN_INTEGRATE_GATES SPAWN_TEST_DATABASE_LOG; do
+    SPAWN_DISPATCH CLAUDE_CONFIG_DIR SPAWN_GATE_MIN_FREE_GB \
+    SPAWN_GATE_MIN_FREE_MEMORY_MB SPAWN_INTEGRATE_GATES SPAWN_TEST_DATABASE_LOG \
+    SPAWN_GATE_HOST_FAULT_BACKOFF_SECS SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
+    SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
+    SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS; do
     unset "$name" 2>/dev/null || true
 done
 SPAWN_DATABASE_URL="$server_url/$SPAWN_DB_NAME"
@@ -426,10 +429,26 @@ SPAWN_WORKER=worker-bb
 SPAWN_LOOP_INTERVAL_MS=300
 SPAWN_DISK_WARN_GB=0
 SPAWN_DISK_FLOOR_GB=0
+SPAWN_SUPERVISOR=1
+SPAWN_MISSION_FILE=$WORK/mission.md
+# The stall bounds out of the way: only the host-fault escalation is checked.
+SPAWN_STALL_DELIVERY_SECS=1800
+SPAWN_STALL_ACTIVITY_SECS=1800
+SPAWN_STALL_REVIEW_SECS=1800
+SPAWN_STALL_GATE_SECS=1800
+SPAWN_STALL_LANDING_SECS=1800
+SPAWN_STALL_STOP_SECS=1800
+SPAWN_STALL_HALTED_SECS=1800
+# The first host fault's backoff (it doubles with each in a row).
+BACKOFF_SECS=5
 export SPAWN_DATABASE_URL SPAWN_GIT_REPO SPAWN_WORKSPACE_ROOT SPAWN_CLAUDE_PROGRAM \
     SPAWN_CLAUDE_PROJECTS BB_PROJECTS BB_WORK SPAWN_TMUX_PROGRAM SPAWN_WORKER \
-    SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB
+    SPAWN_LOOP_INTERVAL_MS SPAWN_DISK_WARN_GB SPAWN_DISK_FLOOR_GB SPAWN_SUPERVISOR \
+    SPAWN_MISSION_FILE SPAWN_STALL_DELIVERY_SECS SPAWN_STALL_ACTIVITY_SECS \
+    SPAWN_STALL_REVIEW_SECS SPAWN_STALL_GATE_SECS SPAWN_STALL_LANDING_SECS \
+    SPAWN_STALL_STOP_SECS SPAWN_STALL_HALTED_SECS
 mkdir -p "$SPAWN_WORKSPACE_ROOT" "$WORK/integrator"
+: >"$SPAWN_MISSION_FILE"
 : >"$WORK/integrate.log"
 : >"$WORK/passes.log"
 
@@ -456,6 +475,44 @@ log_tail() { tail -n 6 "$WORK/integrate.log" 2>/dev/null | tr '\n' ' '; }
 last_event() { q "select coalesce(max(id), 0) from spawn_events"; }
 field() { q "select kind -> 'detail' -> 'record' ->> '$2' from spawn_events where id = $1"; }
 runs_of() { grep -c " $1 " "$WORK/judged.log" || true; }
+host_faults() { q "select gate_host_faults from mission_missions where id = $mission"; }
+recorded_ms() { q "select recorded_at_ms from spawn_events where id = $1"; }
+# The time (s) of the first gate run of case `$1` noted after time `$2` (s).
+run_after() { awk -v name="$1" -v t="$2" '$2 == name && $1 >= t { print $1; exit }' "$WORK/judged.log"; }
+
+# The session is judged waiting at its prompt, live.
+waiting() {
+    [ "$(q "select coalesce(observation ->> 'state', '') from spawn_session_state
+            where session_id = '$1'")" = WAITING ] &&
+        [ "$(q "select count(*) from agent_executions
+                where session_id = '$1' and ended_at_ms is null")" -ge 1 ]
+}
+# The supervisor gets a digest only while its latest judgement covers its
+# latest fact: a line is typed into it now and then (not as `human`: no
+# news), as objective 013's scenario does.
+pings=0
+next_ping=0
+ping_supervisor() {
+    [ "$(now)" -ge "$next_ping" ] || return 0
+    next_ping=$(($(now) + 8))
+    pings=$((pings + 1))
+    capture "$SPAWN_BIN" submit --principal bb-harness --agent agent_supervisor \
+        --session session_supervisor --key "bb-ping-$pings" \
+        --action '{"type":"input","text":"ping"}'
+    [ "$status" -eq 0 ] || harness "submit of a ping to the supervisor failed: $(err)"
+}
+# The digests delivered to the supervisor whose tags match `$1` (SQL like).
+DIGEST_TAGS="select c.id, tag from spawn_commands c,
+                lateral jsonb_array_elements_text(
+                    case when jsonb_typeof(c.action -> 'tags') = 'array'
+                         then c.action -> 'tags' else '[]'::jsonb end) tag
+              where c.session_id = 'session_supervisor' and c.principal = 'spawn-dispatch'
+                and c.action ->> 'type' = 'input' and c.state = 'finished' and c.succeeded"
+digests_like() { q "select count(*) from ($DIGEST_TAGS) d where d.tag like '$1'"; }
+digest_text_tagged() {
+    sql "select action ->> 'text' from spawn_commands
+          where id = (select min(d.id) from ($DIGEST_TAGS) d where d.tag = '$1')"
+}
 
 # One pass, with 018's checks met if they exist: the real test database,
 # no disk or memory floor to speak of; the test database's log.
@@ -464,7 +521,7 @@ integrate_once() {
     before_event=$(last_event)
     capture env SPAWN_GATE="$WORK/fake-gate.sh" SPAWN_TEST_DATABASE_URL="$TEST_URL" \
         SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
-        SPAWN_TEST_DATABASE_LOG="$pglog" \
+        SPAWN_TEST_DATABASE_LOG="$pglog" SPAWN_GATE_HOST_FAULT_BACKOFF_SECS="$BACKOFF_SECS" \
         "$SPAWN_BIN" integrate --once --root "$WORK/integrator"
     cat "$WORK/out.txt" "$WORK/err.txt" >>"$WORK/integrate.log"
     [ "$status" -eq 0 ] || fail "integrate exited $status: $(err | tail -n 3)"
@@ -570,21 +627,27 @@ assert_eq "$after" "$before" "(1) gate_rejections after the host fault (was $bef
 assert_eq "$(aborts)" "$aborts_before" "(1) gate_aborts after the host fault"
 assert_eq "$(task_state "$t_hosta")" reported "(1) task #$t_hosta's state after its host fault"
 assert_eq "$(revisions "$t_hosta")" "$revisions_before" "(1) task #$t_hosta's revisions after its host fault (nothing went back)"
-assert_eq "$(halted)" "" "(1) the mission's halt after one host fault"
+assert_eq "$(halted)" "" "(1) the mission's halt after a host fault"
 assert_eq "$(field "$event" evidence)" failures "(1) the host fault's evidence"
-assert_eq "$(q "select jsonb_array_length(kind -> 'detail' -> 'record' -> 'failures') from spawn_events where id = $event")" 3 \
-    "(1) the failures the host fault names"
 assert_eq "$(q "select string_agg(f ->> 'test', ' ' order by f ->> 'test') from spawn_events,
                  jsonb_array_elements(kind -> 'detail' -> 'record' -> 'failures') f where id = $event")" \
     "api::tests::claims_in_order control::tests::the_fold_replays stalls::tests::delivery_is_measured_from_its_record" \
-    "(1) the failing tests the host fault names"
+    "(1) the failing tests the host fault names (all three FAILED lines; the excerpt shows one)"
 assert_eq "$(field "$event" host_faults)" 1 "(1) the host fault's count in a row"
+assert_eq "$(host_faults)" 1 "(1) the mission's gate_host_faults"
+assert_eq "$(field "$event" escalate)" false "(1) the first host fault's escalate"
+assert_eq "$(field "$event" backoff_ms)" $((BACKOFF_SECS * 1000)) "(1) the first host fault's backoff"
+due=$(field "$event" due_ms)
+assert_eq "$due" $(($(recorded_ms "$event") + BACKOFF_SECS * 1000)) "(1) the first host fault's due time"
 
-# --- (2) the gate runs again, and the work lands ------------------------------------------
+# --- (2) judged again after the backoff, and the work lands -------------------------------
 
 : >"$WORK/fixed-hostA"
 judge_next "$t_hosta" "$event"
-assert_eq "$verdict" accepted "(2) task #$t_hosta's verdict on the next pass, the host fixed"
+assert_eq "$verdict" accepted "(2) task #$t_hosta's verdict after its backoff, the host fixed"
+ran=$(run_after accept 0)
+[ -n "$ran" ] && [ "$ran" -ge $((due / 1000)) ] ||
+    fail "(2) task #$t_hosta was judged again at $ran, before its host fault's due time $((due / 1000)) (s)"
 assert_eq "$(runs_of accept)" 1 "(2) accepted gate runs"
 deadline=$(($(now) + 60))
 until [ "$(task_state "$t_hosta")" = landed ]; do
@@ -592,12 +655,13 @@ until [ "$(task_state "$t_hosta")" = landed ]; do
     integrate_once
     sleep 0.5
 done
+assert_eq "$(host_faults)" 0 "(2) the mission's gate_host_faults after the landing"
 
 # --- (3) mixed: a real failure among connection errors -> rejected -------------------------
 
 judge_next "$t_mixed" "$start"
 [ "$verdict" = rejected ] ||
-    fail "(3) task #$t_mixed, with a real assertion failure among connection errors, was gated '$verdict' ($(field "$event" reason)), not 'rejected'"
+    fail "(3) task #$t_mixed, with a real assertion failure among connection errors (named by its FAILED line, cut from the excerpt), was gated '$verdict' ($(field "$event" reason)), not 'rejected'"
 assert_eq "$after" "$((before + 1))" "(3) gate_rejections after the real failure (was $before)"
 
 # --- (4) olddb: database errors, a crash outside the window -> rejected ---------------------
@@ -606,30 +670,68 @@ judge_next "$t_olddb" "$start"
 [ "$verdict" = rejected ] ||
     fail "(4) task #$t_olddb, whose failures are database errors that are not connection errors, with the test database's only crash an hour before the gate, was gated '$verdict' ($(field "$event" reason)), not 'rejected'"
 assert_eq "$after" "$((before + 1))" "(4) gate_rejections after olddb's rejection (was $before)"
+assert_eq "$(host_faults)" 0 "(4) the mission's gate_host_faults after real verdicts"
 
-# --- (5) hostB: two host faults in a row halt the mission ------------------------------------
+# --- (5) hostB: two host faults in a row are escalated, never halted ------------------------
 
+wait_for_supervisor() {
+    deadline=$(($(now) + 120))
+    until waiting session_supervisor; do
+        [ "$(now)" -lt "$deadline" ] || harness "the supervisor was never judged waiting"
+        sleep 0.5
+    done
+}
+wait_for_supervisor
 judge_next "$t_hostb" "$start"
 [ "$verdict" = host_fault ] ||
-    fail "(5) task #$t_hostb's first verdict, its failures all connection errors, was '$verdict' ($(field "$event" reason)), not 'host_fault'"
+    fail "(5) task #$t_hostb's first verdict, its failures all connection errors (today's 40-line output), was '$verdict' ($(field "$event" reason)), not 'host_fault'"
 assert_eq "$after" "$before" "(5) gate_rejections after hostB's first host fault"
 assert_eq "$(field "$event" host_faults)" 1 "(5) hostB's first host fault's count in a row"
-assert_eq "$(halted)" "" "(5) the mission's halt after one host fault"
+assert_eq "$(field "$event" backoff_ms)" $((BACKOFF_SECS * 1000)) "(5) hostB's first host fault's backoff"
+due=$(field "$event" due_ms)
+first=$event
 judge_next "$t_hostb" "$event"
 [ "$verdict" = host_fault ] ||
     fail "(5) task #$t_hostb's second verdict, database errors while the test database's log shows a crash during the gate, was '$verdict' ($(field "$event" reason)), not 'host_fault'"
+ran=$(run_after hostB-2 0)
+[ -n "$ran" ] && [ "$ran" -ge $((due / 1000)) ] ||
+    fail "(5) task #$t_hostb was judged a second time at $ran, before its first host fault's due time $((due / 1000)) (s)"
 assert_eq "$after" "$before" "(5) gate_rejections after hostB's second host fault"
 assert_eq "$(field "$event" evidence)" server_log "(5) the second host fault's evidence"
 assert_contains "$(field "$event" crash)" "was terminated by signal 11" "(5) the second host fault's crash lines"
 assert_eq "$(field "$event" host_faults)" 2 "(5) the second host fault's count in a row"
+assert_eq "$(host_faults)" 2 "(5) the mission's gate_host_faults after two in a row"
+assert_eq "$(field "$event" backoff_ms)" $((2 * BACKOFF_SECS * 1000)) "(5) the second host fault's backoff (doubled)"
+due=$(field "$event" due_ms)
+assert_eq "$due" $(($(recorded_ms "$event") + 2 * BACKOFF_SECS * 1000)) "(5) the second host fault's due time"
 assert_eq "$(field "$event" escalate)" true "(5) the second host fault's escalate"
-runs_b=$(grep -c ' hostB-' "$WORK/judged.log" || true)
-for _ in 1 2 3; do
+assert_eq "$(halted)" "" "(5) the mission's halt after two host faults in a row"
+tag="host gate-host-fault-$event"
+deadline=$(($(now) + 60))
+until [ "$(digests_like "$tag")" -ge 1 ]; do
+    [ "$(now)" -lt "$deadline" ] ||
+        fail "(5) two host faults in a row on task #$t_hostb were not escalated to the supervisor within 60 s (no digest tagged '$tag')"
+    ping_supervisor
+    sleep 0.5
+done
+line=$(digest_text_tagged "$tag" | grep -F "task #$t_hostb" | head -n 1)
+assert_contains "$line" "task #$t_hostb" "(5) the escalation of two host faults in a row"
+assert_contains "$line" "was terminated by signal 11" "(5) the escalation's host evidence (the crash line)"
+judge_next "$t_hostb" "$event"
+assert_eq "$verdict" accepted "(5) task #$t_hostb's third verdict, after its backoff, the host recovered"
+ran=$(run_after hostB-3 0)
+[ -n "$ran" ] && [ "$ran" -ge $((due / 1000)) ] ||
+    fail "(5) task #$t_hostb was judged a third time at $ran, before its second host fault's due time $((due / 1000)) (s)"
+deadline=$(($(now) + 60))
+until [ "$(task_state "$t_hostb")" = landed ]; do
+    [ "$(now)" -lt "$deadline" ] || fail "(5) task #$t_hostb was accepted but did not land within 60 s"
     integrate_once
     sleep 0.5
 done
-assert_contains "$(halted)" "host fault" "(5) the mission's halt after two host faults in a row"
-assert_eq "$(grep -c ' hostB-' "$WORK/judged.log" || true)" "$runs_b" "(5) gate runs on hostB after the halt"
+assert_eq "$(host_faults)" 0 "(5) the mission's gate_host_faults after hostB landed"
+assert_eq "$(halted)" "" "(5) the mission's halt at the end"
+assert_eq "$(digests_like 'host gate-host-fault-%')" 1 "(5) host-fault escalations delivered"
+assert_eq "$(digests_like "host gate-host-fault-$first")" 0 "(5) escalations of the first host fault alone"
 
-echo "020: connection errors and a crash in the test database's log were recorded as host faults, not counted, and judged again; real failures stayed rejections; two host faults in a row halted the mission"
+echo "020: connection errors and a crash in the test database's log were recorded as host faults, not counted, and judged again after a doubling backoff; real failures stayed rejections; two in a row were escalated to the supervisor and nothing halted"
 exit 0
