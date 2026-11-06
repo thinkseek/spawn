@@ -558,8 +558,10 @@ mod tests {
         assert_eq!(report[1]["recorded"], json!(null));
     }
 
+    /// A path's latest record is an item: `low` until the path recovers,
+    /// whatever its age (a condition); `recovered` for a day (news).
     #[test]
-    fn the_digest_tells_of_each_record_of_the_last_day() {
+    fn a_low_path_is_an_item_until_it_recovers_and_a_recovery_is_news_for_a_day() {
         let day = 86_400_000;
         let records = [
             json!({"type": "host.disk", "label": "tmpdir", "path": "/tmp", "state": "low",
@@ -569,6 +571,8 @@ mod tests {
                    "free_bytes": 30 * GIB, "event_id": 9, "at_ms": 10 * day + 5}),
             json!({"type": "host.disk", "label": "workspace", "path": "/old", "state": "low",
                    "free_bytes": 1, "event_id": 3, "at_ms": 8 * day}),
+            json!({"type": "host.disk", "label": "workspace", "path": "/back", "state": "recovered",
+                   "free_bytes": 40 * GIB, "event_id": 2, "at_ms": 8 * day}),
         ];
         let items = escalations(&records, 11 * day - 1);
         let summary: Vec<(String, Why, String)> = items
@@ -579,8 +583,14 @@ mod tests {
             summary,
             [
                 ("disk-7".to_string(), Why::Disk, "host disk-7".to_string()),
-                ("disk-9".to_string(), Why::Disk, "host disk-9".to_string()),
-            ]
+                (
+                    "disk-9".to_string(),
+                    Why::DiskRecovered,
+                    "host disk-9".to_string()
+                ),
+                ("disk-3".to_string(), Why::Disk, "host disk-3".to_string()),
+            ],
+            "a recovery older than a day is stale news; a path low for three days still is"
         );
         assert!(
             items[0]
@@ -593,6 +603,7 @@ mod tests {
                 .contains("Under 2.0 GiB no new executions start")
         );
         assert_eq!(items[1].line, "workspace /ws has 30.0 GiB free again");
+        assert_eq!(items[2].since_ms, Some(8 * day));
     }
 
     #[test]
