@@ -24,7 +24,8 @@
 # not before it; a relay unit that is not installed does not stop a
 # deploy; a deploy run again keeps its rollback copies; a deploy failing
 # after its push completes it on exit; a pending deploy that main has moved
-# past stops the deploy.
+# past stops the deploy; deploy/hold.sh holds the missions repo at its main,
+# and the deploy releases that hold on success and on failure.
 #
 # TEST_DEPLOY_SCRIPT=<path> runs that deploy script instead of the
 # checkout's deploy/deploy.sh (to show which checks fail without a fix).
@@ -130,6 +131,18 @@ verdict_over() {
 verdict_over "$base"
 
 main() { git --git-dir="$missions" rev-parse main; }
+# spawn_live <args>: the installed binary against the fake live database
+# (its URL read from spawn.env, never on a command line).
+spawn_live() { (set -a && . "$live/spawn.env" && set +a && "$live/bin/spawn" "$@"); }
+# The owner's active hold on the missions repo (its event id), empty if none.
+missions_hold() {
+  spawn_live mission list |
+    jq -r --arg s "$missions" '[.holds[]? | select(.source == $s)] | first | .hold // empty'
+}
+# hold_missions: deploy/hold.sh, run from the checkout as the owner would.
+hold_missions() {
+  (cd "$checkout" && SPAWN_LIVE="$live" bash deploy/hold.sh "$head") >"$scratch/hold.out" 2>&1
+}
 # deploy [ENV=VALUE...]: run deploy.sh in $deploy_from (default the
 # checkout); output in $out, status in $status.
 deploy_from=$checkout
@@ -236,12 +249,23 @@ check "the controller has the UI's node_modules" [ -x "$live/controllers/spawn/w
 check "the untracked web/public/stray.txt did not reach the controller" \
   [ ! -e "$live/controllers/spawn/web/public/stray.txt" ]
 
+echo "== the owner's hold before the gate (deploy/hold.sh)"
+spawn_live mission add --text "test-deploy: the Spawn mission" --source "$missions" >/dev/null
+hold_missions
+sed 's/^/  | /' "$scratch/hold.out"
+held=$(missions_hold)
+check "deploy/hold.sh holds the missions repo (hold ${held:-none})" [ -n "$held" ]
+check "at its main, printed for the gate" grep -q "held landings on $missions at main $(main)" "$scratch/hold.out"
+check "the integrator was not touched" [ ! -s "$SYSTEMCTL_LOG" ]
+
 echo "== the next deploy completes it (the model relay's unit is not installed)"
 # Main is HEAD now: the operator runs the gate again, over it.
 verdict_over "$head"
 : >"$SYSTEMCTL_LOG"
 deploy
 check "succeeded (status $status)" [ "$status" -eq 0 ]
+check "released the owner's hold" [ -z "$(missions_hold)" ]
+check "says so" grep -q "released the owner's hold $held on $missions" "$out
 check "says the relay unit is not installed" grep -q "installed model-relay.py (unit spawn-model-relay is not installed" "$out"
 check "both relay scripts are installed" \
   bash -c 'cmp -s "$1/scripts/jev-relay.py" "$2/jev-relay.py" && cmp -s "$1/scripts/model-relay.py" "$2/model-relay.py"' _ "$checkout" "$live/bin"
@@ -257,10 +281,16 @@ check "the export is removed" bash -c '! compgen -G "$1/spawn-deploy-export-*" >
 
 echo "== a deploy failing after its push completes it on exit"
 git --git-dir="$missions" update-ref refs/heads/main "$base"
+spawn_live mission moved --source "$missions" --from "$head" --to "$head" >/dev/null 2>&1 || true
+hold_missions
+held=$(missions_hold)
+check "held again (hold ${held:-none})" [ -n "$held" ]
 verdict_over "$base"
 : >"$SYSTEMCTL_LOG"
 deploy DEPLOY_TEST_AFTER_PUSH=fail
 check "failed (status $status)" [ "$status" -ne 0 ]
+check "released the owner's hold on its failure" [ -z "$(missions_hold)" ]
+check "says so" grep -q "released the owner's hold $held on $missions" "$out
 check "main moved to HEAD" [ "$(main)" = "$head" ]
 check "completed the pending deploy on exit" grep -q "completed the pending deploy: main $base -> $head" "$out"
 check "deploy.pending is gone" [ ! -e "$live/deploy.pending" ]
