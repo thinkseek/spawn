@@ -1001,6 +1001,7 @@ mod tests {
             id: format!("human-{n}"),
             why: Why::Human,
             line: format!("note {n} could not be delivered"),
+            since_ms: None,
         };
         let mut host: Vec<Escalation> = (1..=20).map(human).collect();
         host.push(Escalation {
@@ -1008,6 +1009,7 @@ mod tests {
             id: "report-9-0".to_string(),
             why: Why::Report,
             line: "task #9 reported".to_string(),
+            since_ms: None,
         });
         // Items about the host are each about something else.
         for place in ["workspace", "tmpdir"] {
@@ -1016,6 +1018,7 @@ mod tests {
                 id: format!("disk-{place}"),
                 why: Why::Disk,
                 line: format!("{place} is low"),
+                since_ms: None,
             });
         }
         let plan = decide_with(
