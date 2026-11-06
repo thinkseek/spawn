@@ -3,7 +3,7 @@ import { Infinity as Forever, Wrench } from "lucide-react";
 import type { FleetAgent } from "../../fleet";
 import { stateLabelUpper } from "../../fleet";
 import { absoluteTitle, formatDuration } from "../../format";
-import type { FleetContext } from "../../ordering";
+import type { FleetContext, MissingAgent } from "../../ordering";
 import { heldTask, residentName } from "../../ordering";
 import { LiveBadge } from "../Terminal";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, MiddleId, cx, sinceText } from "../ui";
@@ -22,30 +22,34 @@ export function uptimeMs(agent: Pick<FleetAgent, "live" | "started_at_ms">, now 
  */
 export function AlwaysOnAgents({
   agents,
+  missing,
   context,
   usualEngine,
   selectedId,
   onSelect,
 }: {
   agents: FleetAgent[];
+  /** Expected to run but without a session in the fleet: shown as down. */
+  missing: MissingAgent[];
   context: FleetContext;
   usualEngine: string | null;
   selectedId: string | null;
   onSelect: (sessionId: string) => void;
 }) {
   const up = agents.filter((agent) => agent.live).length;
+  const total = agents.length + missing.length;
   return (
     <Card className="shrink-0 overflow-hidden">
       <CardHeader
         icon={<Forever size={14} />}
         title="Always-on agents"
         meta={
-          <span className={cx("tnum", up < agents.length && "font-medium text-warning")}>
-            {up} of {agents.length} live
+          <span className={cx("tnum", up < total && "font-medium text-warning")}>
+            {up} of {total} live
           </span>
         }
       />
-      {agents.length === 0 ? (
+      {total === 0 ? (
         <EmptyState
           title="No supervisor or resident yet"
           hint="The supervisor and approved residents appear here once they start."
@@ -61,6 +65,22 @@ export function AlwaysOnAgents({
                 selected={agent.session_id === selectedId}
                 onSelect={onSelect}
               />
+            </li>
+          ))}
+          {missing.map((entry) => (
+            <li key={`missing:${entry.role}:${entry.name}`} className="min-w-0 bg-warning/[0.05] px-4 py-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-warning" />
+                <span className="shrink-0 text-label font-semibold text-foreground">
+                  {entry.role === "supervisor" ? "Supervisor" : `Resident · ${entry.name}`}
+                </span>
+                <span className="ml-auto shrink-0 text-caption font-medium text-warning">No session</span>
+              </div>
+              <p className="mt-2 text-caption text-muted-foreground">
+                {entry.role === "supervisor"
+                  ? "The fleet has no supervisor session."
+                  : "Approved, but the fleet has no session for it: never started, or gone."}
+              </p>
             </li>
           ))}
         </ul>
@@ -148,7 +168,7 @@ function AlwaysOnTile({
 
         <dt className="text-faint-foreground">Task</dt>
         <dd className="min-w-0">
-          <TaskCell task={held} />
+          <TaskCell task={held} input={agent.role === "supervisor" ? agent.task : null} />
         </dd>
       </dl>
     </button>

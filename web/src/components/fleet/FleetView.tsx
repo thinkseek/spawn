@@ -4,7 +4,7 @@ import type { PollResult } from "../../api";
 import type { Fleet } from "../../fleet";
 import { relativeTime } from "../../format";
 import type { FleetContext } from "../../ordering";
-import { groupAgents, residentName, usualEngine } from "../../ordering";
+import { groupAgents, missingAlwaysOn, residentName, usualEngine } from "../../ordering";
 import { useNow } from "../rsi/Phase";
 import { LiveStatus, PageHeader } from "../ui";
 import { AgentDetail } from "./AgentDetail";
@@ -46,8 +46,9 @@ export function FleetView({
   const groups = useMemo(() => groupAgents(agents ?? [], context), [agents, context]);
   const engine = useMemo(() => usualEngine(agents ?? []), [agents]);
   const alwaysOn = groups[0].agents;
+  const missing = useMemo(() => missingAlwaysOn(agents ?? [], context), [agents, context]);
   const liveness: Liveness = {
-    total: alwaysOn.length,
+    total: alwaysOn.length + missing.length,
     up: alwaysOn.filter((agent) => agent.live).length,
     shortest: alwaysOn.reduce<Liveness["shortest"]>((best, agent) => {
       const ms = uptimeMs(agent);
@@ -93,6 +94,7 @@ export function FleetView({
             <AttentionQueue agents={data.agents} onSelect={onSelect} />
             <AlwaysOnAgents
               agents={alwaysOn}
+              missing={missing}
               context={context}
               usualEngine={engine}
               selectedId={selectedId}
