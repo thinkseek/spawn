@@ -124,16 +124,25 @@ export function FleetBoard({
                   onToggle={folds ? () => setEnded(open ? "closed" : "open") : undefined}
                   trailing={<GroupHint id={group.id} />}
                 />
-                {open &&
+                {group.id === "idle" && !context.known && (
+                  <p className="border-t border-surface-border px-4 py-2 text-caption text-warning">
+                    Tasks unknown: /api/missions has not answered, so no worker shows as on a task.
+                  </p>
+                )}
+                {/* Folded, the group still shows the agent open in the drawer. */}
+                {(open || group.agents.some((agent) => agent.session_id === selectedId)) &&
                   (group.agents.length === 0 ? (
-                    group.id === "on_task" && (
+                    group.id === "on_task" &&
+                    context.known && (
                       <p className="border-t border-surface-border px-4 py-2 text-caption text-faint-foreground">
                         No worker holds an open task.
                       </p>
                     )
                   ) : (
                     <ul className="divide-y divide-surface-border border-t border-surface-border">
-                      {group.agents.map((agent) => (
+                      {group.agents
+                        .filter((agent) => open || agent.session_id === selectedId)
+                        .map((agent) => (
                         <li key={agent.session_id}>
                           <AgentRow
                             agent={agent}
@@ -170,9 +179,31 @@ function GroupHint({ id }: { id: AgentGroupId }) {
 }
 
 /** The task cell: the held task (mission, id, title, state), the last task
- * of an ended worker, or a muted "No task". */
-export function TaskCell({ task, ended = false }: { task: TaskRef | null; ended?: boolean }) {
-  if (!task) return <span className="text-caption text-faint-foreground">No task</span>;
+ * of an ended worker, else the fleet's own free text (the agent's last
+ * input), else a muted "No task". */
+export function TaskCell({
+  task,
+  ended = false,
+  input = null,
+}: {
+  task: TaskRef | null;
+  ended?: boolean;
+  /** The fleet's `task` text: what the agent was last told, when no
+   * mission task matches it. */
+  input?: string | null;
+}) {
+  if (!task) {
+    const line = input?.split("\n").map((part) => part.trim()).find((part) => part !== "");
+    if (line) {
+      return (
+        <span className="flex min-w-0 flex-col text-caption" title={input ?? undefined}>
+          <span className="min-w-0 truncate text-muted-foreground">{line}</span>
+          <span className="text-micro text-faint-foreground">last input · no mission task</span>
+        </span>
+      );
+    }
+    return <span className="text-caption text-faint-foreground">No task</span>;
+  }
   return (
     <span className="flex min-w-0 flex-col">
       <span className="flex min-w-0 items-baseline gap-1.5 text-caption">
@@ -263,7 +294,7 @@ function AgentRow({
 
       {/* Task */}
       <div className="w-full min-w-0 pl-4 lg:w-auto lg:pl-0">
-        <TaskCell task={held ?? (group === "ended" ? last : null)} ended={!held} />
+        <TaskCell task={held ?? (group === "ended" ? last : null)} ended={!held} input={agent.task} />
       </div>
 
       {/* Doing now */}
