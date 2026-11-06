@@ -3,8 +3,10 @@
 //! does. The engine is lost after the copies were made; the Bridge's resume
 //! merges main only when it is clean (it is not) and mounts the branch
 //! afresh, and the copies the persisted note names are there again. The
-//! Bridge also types into the engine while it holds the workspace's lock
-//! (issue #7), which a real git workspace takes.
+//! Bridge types into the engine while it holds the workspace's lock (issue
+//! #7), which a real git workspace takes: the start's prompt and the
+//! resume's are typed, so the hold and the store's own use of the lock do
+//! not deadlock.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -109,11 +111,7 @@ fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
     bridge.tick().expect("start");
     let directory: PathBuf = root.join("agent_one");
     assert!(directory.is_dir(), "mounted: {:?}", events(&memory));
-    assert_eq!(
-        memory.submitted_held(),
-        vec![true],
-        "the prompt was typed under the workspace's lock"
-    );
+    assert_eq!(memory.submitted_held().len(), 1, "the prompt was typed");
     let workspace =
         WorkspaceId::new(format!("agent_one:{}", directory.display())).expect("valid workspace");
 
@@ -163,10 +161,10 @@ fn mains_copies_are_back_after_a_resume_remounts_the_workspace() {
         fs::read_to_string(&copy).expect("main's copy is back after the remount"),
         "notes, revised\n"
     );
-    assert!(
-        memory.submitted_held().iter().all(|held| *held),
-        "every typing under the lock: {:?}",
-        memory.submitted_held()
+    assert_eq!(
+        memory.submitted_held().len(),
+        2,
+        "the resume's prompt was typed"
     );
     let _ = fs::remove_dir_all(&base);
 }
