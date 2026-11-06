@@ -30,19 +30,24 @@ from (
     p.observation as judgement,
     p.observation_at_ms as judged_at_ms,
     coalesce((p.observation ->> 'attention')::boolean, false) as attention,
+    -- Since the judgement after the latest one of another state. That one
+    -- is found newest first (spawn_events_observation_time), so a session
+    -- reads its current run of judgements, not every judgement it has.
     (select min(j.recorded_at_ms) from agent_judgements j
       where j.session_id = s.session_id
         and j.recorded_at_ms > coalesce((
-              select max(k.recorded_at_ms) from agent_judgements k
-               where k.session_id = s.session_id and k.state is distinct from s.state), 0)
+              select k.recorded_at_ms from agent_judgements k
+               where k.session_id = s.session_id and k.state is distinct from s.state
+               order by k.recorded_at_ms desc limit 1), 0)
     ) as state_since_ms,
     case when coalesce((p.observation ->> 'attention')::boolean, false) then
       (select min(j.recorded_at_ms) from agent_judgements j
         where j.session_id = s.session_id
           and j.recorded_at_ms > coalesce((
-                select max(k.recorded_at_ms) from agent_judgements k
+                select k.recorded_at_ms from agent_judgements k
                  where k.session_id = s.session_id
-                   and not coalesce((k.observation ->> 'attention')::boolean, false)), 0))
+                   and not coalesce((k.observation ->> 'attention')::boolean, false)
+                 order by k.recorded_at_ms desc limit 1), 0))
     end as attention_since_ms,
     -- The assignment: the latest text a person or the supervisor gave, not
     -- a dispatcher digest or a liveness restart.
@@ -52,11 +57,6 @@ from (
         and c.principal not in ('spawn-dispatch', 'spawn-liveness')
         and coalesce(c.action ->> 'prompt', c.action ->> 'text') is not null
       order by c.id desc limit 1) as task,
-    (select left(coalesce(c.action ->> 'prompt', c.action ->> 'text'), 600)
-       from spawn_commands c
-      where c.session_id = s.session_id
-        and coalesce(c.action ->> 'prompt', c.action ->> 'text') is not null
-      order by c.id desc limit 1) as last_input,
     jsonb_build_object(
       'current_tool', (select o.tool_name from agent_open_tools o
                         where o.session_id = s.session_id
@@ -82,11 +82,17 @@ from (
 pub(crate) const FLEET_HEALTH: &str = r"
 with
   now as (select spawn_now_ms() as ms),
+  -- The day's judgements carry only their judge (the ladder counts them);
+  -- the hour's carry the whole judgement. Both read their window by time
+  -- (spawn_events_name_time).
   judged as (
-    select j.observation, j.recorded_at_ms
+    select j.observation ->> 'judge' as judge
       from agent_judgements j, now
      where j.recorded_at_ms > now.ms - 86400000),
-  hour as (select * from judged, now where judged.recorded_at_ms > now.ms - 3600000),
+  hour as (
+    select j.observation
+      from agent_judgements j, now
+     where j.recorded_at_ms > now.ms - 3600000),
   commands as (
     select c.principal, c.created_at_ms from spawn_commands c, now
      where c.created_at_ms > now.ms - 86400000),
