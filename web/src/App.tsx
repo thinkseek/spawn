@@ -1,8 +1,9 @@
 import { PanelRight } from "lucide-react";
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 
-import { fetchOverview, fetchSession, usePoll } from "./api";
-import type { SessionDetail } from "./api";
+import { fetchAttention, fetchOverview, fetchSession, usePoll } from "./api";
+import type { PollResult, SessionDetail } from "./api";
+import { markNeedsHuman, needsHuman } from "./attention";
 import { DetailsRail, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
 import { StateBadge } from "./components/StateDot";
@@ -12,6 +13,7 @@ import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
 import { ScorecardView } from "./components/scorecard/ScorecardView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
+import type { Fleet } from "./fleet";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
 import type { Missions } from "./missions";
@@ -77,8 +79,27 @@ function presenting(): boolean {
 
 export default function App() {
   const overview = usePoll("overview", fetchOverview);
-  // Polled in every view: the sidebar shows the attention count.
-  const fleet = usePoll("fleet", fetchFleet, 3_000);
+  // Both polled in every view: the sidebar shows who needs a human, which is
+  // the dispatcher's view (/api/attention), never a judge's flag.
+  const fleetPoll = usePoll("fleet", fetchFleet, 3_000);
+  const attention = usePoll("attention", fetchAttention, 3_000);
+  const needs = useMemo(
+    () => (attention.data ? needsHuman(attention.data) : null),
+    [attention.data],
+  );
+  const fleetData = useMemo<Fleet | null>(
+    () =>
+      fleetPoll.data && {
+        ...fleetPoll.data,
+        agents: markNeedsHuman(fleetPoll.data.agents, needs),
+      },
+    [fleetPoll.data, needs],
+  );
+  const fleet: PollResult<Fleet> = { data: fleetData, error: fleetPoll.error };
+  const humanCount = {
+    count: needs?.count ?? null,
+    error: attention.data ? null : attention.error,
+  };
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [railOpen, setRailOpen] = useState(false);
   // The fleet view is the landing page; the hash keeps the view (and the
@@ -163,7 +184,7 @@ export default function App() {
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-app-shell text-label text-foreground md:flex-row">
       <MobileNav
         view={view}
-        attention={fleet.data?.health.attention ?? 0}
+        attention={humanCount}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
@@ -179,7 +200,7 @@ export default function App() {
         view={view}
         rsi={rsi}
         error={overview.error}
-        attention={fleet.data?.health.attention ?? 0}
+        attention={humanCount}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
@@ -195,6 +216,7 @@ export default function App() {
       {view === "fleet" ? (
         <FleetView
           fleet={fleet}
+          attention={attention}
           context={context}
           selectedId={route.agent}
           onSelect={(agent) => setRoute({ view: "fleet", agent })}
