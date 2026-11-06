@@ -3,6 +3,9 @@
 //! spends an attempt and is tried again; only a terminal that `has-session`
 //! says is gone fails a command at once. A refusal before typing is
 //! recorded as nothing typed, never as "may have typed".
+//!
+//! Inputs here come from the dispatcher, one of Spawn's own loops (see
+//! `Rig::submit`).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -182,10 +185,13 @@ impl Rig {
         }
     }
 
+    /// Commands as Spawn's dispatcher sends them: its inputs are refused at
+    /// once when they cannot be typed (a person's or the supervisor's wait
+    /// for their turn instead: tests/waiting_inputs.rs).
     fn submit(&self, key: &str, action: CommandAction) {
         self.store
             .submit(
-                &Principal::new("tester").expect("valid principal"),
+                &Principal::new("spawn-dispatch").expect("valid principal"),
                 &Submission {
                     agent_id: AgentId::new("agent_one").expect("valid agent"),
                     session_id: SessionId::new("session_one").expect("valid session"),

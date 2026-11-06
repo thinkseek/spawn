@@ -27,8 +27,9 @@
 //! record the step is measured from (a control record's id, or for
 //! `activity` the `session_seq` of the latest fact): the existing `told`
 //! mechanism sends it once, and a step that moved and stalled anew has a new
-//! record, so a new tag. A failed retry, a `stale` verdict, a nudge or a
-//! judgement moves no step. A worker at its prompt whose screen says its
+//! record, so a new tag. A failed retry, a `stale` verdict, a nudge, a
+//! judgement or an input recorded `waiting` for the session's turn moves no
+//! step (the waiting step is not a fact: `stall_facts` skips it). A worker at its prompt whose screen says its
 //! background shells still run (Claude Code resumes it when they finish)
 //! is treated as active: its `activity` step is not escalated while that
 //! is its latest screen reading.
