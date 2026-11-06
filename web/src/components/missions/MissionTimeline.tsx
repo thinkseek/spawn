@@ -638,6 +638,10 @@ function Legend() {
         <span aria-hidden="true" className="size-2 rounded-full" style={{ background: "var(--warning)" }} />
         conflict · incompatible
       </li>
+      <li className="flex items-center gap-1.5 text-caption text-muted-foreground">
+        <span aria-hidden="true" className="size-2 rounded-full" style={{ background: "var(--info)" }} />
+        host fault
+      </li>
     </ul>
   );
 }
