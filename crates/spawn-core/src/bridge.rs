@@ -692,9 +692,10 @@ impl Bridge {
     pub fn tick(&mut self) -> Result<TickReport, StoreError> {
         self.catch_up()?;
         let mut report = TickReport::default();
-        // Inputs left waiting in this tick: one claimed again in the same
-        // tick (a retry interval of zero) waits for the next.
-        let mut waited: HashSet<CommandId> = HashSet::new();
+        // Inputs left waiting keep their lease until the claims of this tick
+        // are done, so the commands behind them are claimed now; then they
+        // are released, to be claimed again after `input_wait_retry`.
+        let mut waited: Vec<Claimed> = Vec::new();
         while report.commands < self.config.max_commands_per_tick {
             let Some(claimed) = self
                 .queue
@@ -702,24 +703,24 @@ impl Bridge {
             else {
                 break;
             };
-            if waited.contains(&claimed.command_id) {
-                self.queue.release(&claimed, self.config.input_wait_retry)?;
-                self.held.insert(claimed.command_id, claimed);
-                break;
-            }
             match self.handle(&claimed, &mut report)? {
                 Handled::Finished(outcome) => {
                     self.held.remove(&claimed.command_id);
                     self.queue.finish(&claimed, &outcome)?;
                 }
                 Handled::Waiting => {
-                    self.queue.release(&claimed, self.config.input_wait_retry)?;
-                    waited.insert(claimed.command_id);
-                    self.held.insert(claimed.command_id, claimed);
+                    self.held.insert(claimed.command_id, claimed.clone());
+                    waited.push(claimed);
                 }
             }
             report.commands += 1;
             self.catch_up()?;
+        }
+        for claimed in &waited {
+            // One its execution's end failed meanwhile is not released.
+            if self.held.contains_key(&claimed.command_id) {
+                self.queue.release(claimed, self.config.input_wait_retry)?;
+            }
         }
         self.act(&mut report)?;
         self.catch_up()?;
