@@ -276,9 +276,6 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
 /// (docs/fleet-architecture.md §10.3, "The owner's landings"). Exit 0, or,
 /// with `--wait`, 0 when applied, 1 when refused, 3 when still pending.
 fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, String> {
-    use crate::integrate::owner::{full_hash, owner_ref};
-    use crate::sources::controller_git;
-
     let source = text(flags, "source")?;
     crate::sources::MissionSource::parse(&source)?;
     if !source.starts_with('/') {
@@ -302,56 +299,7 @@ fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, Str
             .display()
             .to_string(),
     };
-    // Resolved where the owner works; a commit the source already has (by
-    // its full hash, or a name the source knows) does too.
-    let resolve = |place: &[&str]| -> Option<String> {
-        let output = controller_git()
-            .args(place)
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                "--end-of-options",
-                &format!("{wanted}^{{commit}}"),
-            ])
-            .output()
-            .ok()?;
-        let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (output.status.success() && full_hash(&hash)).then_some(hash)
-    };
-    let reference;
-    let commit = if let Some(commit) = resolve(&["-C", &repo]) {
-        reference = owner_ref(&commit);
-        // Into the source without touching any branch.
-        let pushed = controller_git()
-            .args([
-                "-C",
-                &repo,
-                "push",
-                "--quiet",
-                "--",
-                &source,
-                &format!("{commit}:{reference}"),
-            ])
-            .output()
-            .map_err(|error| format!("run git push: {error}"))?;
-        if !pushed.status.success() {
-            return Err(format!(
-                "git push of {commit} to {source} ({reference}): {}",
-                String::from_utf8_lossy(&pushed.stderr).trim()
-            ));
-        }
-        commit
-    } else if let Some(commit) = resolve(&["--git-dir", &source]) {
-        reference = owner_ref(&commit);
-        crate::sources::git(&["--git-dir", &source, "update-ref", &reference, &commit])
-            .map_err(|error| error.to_string())?;
-        commit
-    } else {
-        return Err(format!(
-            "{wanted} is not a commit in {repo} nor in the source {source}"
-        ));
-    };
+    let (commit, reference) = put_in_source(&source, &repo, &wanted)?;
     let request = store
         .source_push_request(&source, &commit, &reference)
         .map_err(|error| error.to_string())?;
@@ -383,6 +331,61 @@ fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, Str
     answer["outcome"] = outcome.unwrap_or(Value::Null);
     print(&answer);
     Ok(code)
+}
+
+/// Resolve `wanted` in the owner's repository `repo` (else in the source,
+/// which may have it already) and put it in `source` at
+/// `refs/spawn-owner/<hash>`, without touching any branch: `(hash, ref)`.
+fn put_in_source(source: &str, repo: &str, wanted: &str) -> Result<(String, String), String> {
+    use crate::integrate::owner::{full_hash, owner_ref};
+    use crate::sources::controller_git;
+
+    let resolve = |place: &[&str]| -> Option<String> {
+        let output = controller_git()
+            .args(place)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{wanted}^{{commit}}"),
+            ])
+            .output()
+            .ok()?;
+        let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (output.status.success() && full_hash(&hash)).then_some(hash)
+    };
+    if let Some(commit) = resolve(&["-C", repo]) {
+        let reference = owner_ref(&commit);
+        let pushed = controller_git()
+            .args([
+                "-C",
+                repo,
+                "push",
+                "--quiet",
+                "--",
+                source,
+                &format!("{commit}:{reference}"),
+            ])
+            .output()
+            .map_err(|error| format!("run git push: {error}"))?;
+        if !pushed.status.success() {
+            return Err(format!(
+                "git push of {commit} to {source} ({reference}): {}",
+                String::from_utf8_lossy(&pushed.stderr).trim()
+            ));
+        }
+        return Ok((commit, reference));
+    }
+    let Some(commit) = resolve(&["--git-dir", source]) else {
+        return Err(format!(
+            "{wanted} is not a commit in {repo} nor in the source {source}"
+        ));
+    };
+    let reference = owner_ref(&commit);
+    crate::sources::git(&["--git-dir", source, "update-ref", &reference, &commit])
+        .map_err(|error| error.to_string())?;
+    Ok((commit, reference))
 }
 
 /// `spawn task ...`
