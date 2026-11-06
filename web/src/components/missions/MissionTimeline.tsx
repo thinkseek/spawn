@@ -472,6 +472,8 @@ export function MissionTimeline({
                     <SectionRowLabel
                       key={row.key}
                       row={row}
+                      short={labelW < 200}
+                      onSurface={compact}
                       folded={folded(row.key, row.section === "cancelled")}
                       onToggle={() => toggleFold(row.key)}
                     />
@@ -480,6 +482,7 @@ export function MissionTimeline({
                       key={row.key}
                       row={row}
                       labelW={labelW}
+                      titled={labelW >= 200}
                       hovered={hover?.key === row.key}
                       selected={selected?.key === row.key}
                       onSelect={() => choose(row)}
@@ -719,12 +722,25 @@ function MissionChips({
 }
 
 /** A section's header inside a lane: its name and count; it folds. */
+/** Section names for a narrow label column. */
+const SECTION_SHORT: Record<TaskSection, string> = {
+  in_flight: "In flight",
+  landed: "Landed",
+  sent_back: "Sent back",
+  cancelled: "Cancelled",
+};
+
 function SectionRowLabel({
   row,
+  short,
+  onSurface,
   folded,
   onToggle,
 }: {
   row: Extract<Row, { kind: "section" }>;
+  short: boolean;
+  /** Drawn inside a card (the RSI page), not on the page canvas. */
+  onSurface: boolean;
   folded: boolean;
   onToggle: () => void;
 }) {
@@ -742,7 +758,8 @@ function SectionRowLabel({
         aria-expanded={!folded}
         onClick={onToggle}
         className={cx(
-          "pointer-events-auto mb-0.5 inline-flex items-center gap-1.5 rounded bg-page-canvas px-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground hover:text-foreground",
+          "pointer-events-auto mb-0.5 inline-flex items-center gap-1.5 rounded px-1 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground hover:text-foreground",
+          onSurface ? "bg-surface" : "bg-page-canvas",
           FOCUS_RING,
         )}
       >
@@ -751,7 +768,7 @@ function SectionRowLabel({
           aria-hidden="true"
           className={cx("transition-transform duration-150 motion-reduce:transition-none", !folded && "rotate-90")}
         />
-        {SECTION_LABEL[row.section]}
+        {(short ? SECTION_SHORT : SECTION_LABEL)[row.section]}
         <span className="tnum font-normal tracking-normal text-muted-foreground">{row.count}</span>
       </button>
     </div>
@@ -839,12 +856,15 @@ const OUTCOME_ICON: Record<TaskBar["outcome"], ReactNode> = {
 function TaskLabel({
   row,
   labelW,
+  titled,
   hovered,
   selected,
   onSelect,
 }: {
   row: Extract<Row, { kind: "task" }>;
   labelW: number;
+  /** Room for the title (and a nested attempt's outcome) beside the id. */
+  titled: boolean;
   hovered: boolean;
   selected: boolean;
   onSelect: () => void;
@@ -867,7 +887,7 @@ function TaskLabel({
         tabIndex={-1}
         onClick={onSelect}
         onPointerDown={(event) => event.stopPropagation()}
-        title={row.title ? `${bar.label} · ${row.title}` : undefined}
+        title={row.title ? `${bar.label} · ${row.title}` : row.outcome ? `${bar.label} · ${row.outcome}` : undefined}
         className={cx(
           "flex h-full shrink-0 items-center gap-2 pr-3 text-left outline-none",
           nested ? "pl-12" : "pl-9",
@@ -878,21 +898,32 @@ function TaskLabel({
           <>
             <span aria-hidden="true" className="h-3 w-2 shrink-0 border-b border-l border-border-strong" />
             <span className="tnum shrink-0 font-mono text-micro text-muted-foreground">{bar.label}</span>
-            <span
-              className={cx(
-                "min-w-0 truncate text-micro",
-                row.outcome?.startsWith("aborted") ? "text-destructive" : "text-muted-foreground",
-              )}
-            >
-              {row.outcome}
-            </span>
+            {titled && (
+              <span
+                className={cx(
+                  "min-w-0 truncate text-micro",
+                  row.outcome?.startsWith("aborted") ? "text-destructive" : "text-muted-foreground",
+                )}
+              >
+                {row.outcome}
+              </span>
+            )}
           </>
         ) : (
           <>
-            <span className="tnum shrink-0 font-mono text-micro text-faint-foreground">{bar.label}</span>
-            <span className="min-w-0 flex-1 truncate text-caption text-foreground">
-              {row.title ?? (bar.task.objective !== null ? `objective ${bar.task.objective}` : "")}
+            <span
+              className={cx(
+                "tnum shrink-0 font-mono",
+                titled ? "text-micro text-faint-foreground" : "text-caption text-foreground/90",
+              )}
+            >
+              {bar.label}
             </span>
+            {titled && (
+              <span className="min-w-0 flex-1 truncate text-caption text-foreground">
+                {row.title ?? (bar.task.objective !== null ? `objective ${bar.task.objective}` : "")}
+              </span>
+            )}
           </>
         )}
         {!nested && row.retries > 1 && (
