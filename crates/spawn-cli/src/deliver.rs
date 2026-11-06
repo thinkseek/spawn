@@ -562,7 +562,39 @@ enum Attempts {
 /// the worker is ready by the delivery rules, and counts only past
 /// [`NOT_READY_FREE`] of them.
 fn attempts(task: &TaskRow, facts: &Facts) -> Attempts {
-    let sent = delivery_attempts(task, facts);
+    judge_attempts(&delivery_attempts(task, facts))
+}
+
+/// Whether a delivery's retries are spent, from its attempts (its own
+/// command, then its retries, oldest first), judged as [`attempts`] judges
+/// them: the latest failed, typed nothing that may have arrived, and the
+/// failures past the free refusals for a pane not ready are more than
+/// [`DELIVERY_RETRIES`]. The scorecard counts each such delivery as a
+/// failure of the machinery (docs/design.md §15).
+pub(crate) fn delivery_spent(sent: &[&crate::dispatch::Sent]) -> bool {
+    matches!(judge_attempts(sent), Attempts::Failed { spent: true, .. })
+}
+
+/// The task and the delivery a delivery command's key names: `deliver-<task>-
+/// <revision>` (the delivery itself) or `<that>-retry-<n>` (a retry of it).
+pub(crate) fn delivery_of(key: &str) -> Option<(i64, &str)> {
+    let (delivery, retry) = match key.split_once("-retry-") {
+        Some((delivery, number)) => (delivery, Some(number)),
+        None => (key, None),
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if retry.is_some_and(|number| !digits(number)) {
+        return None;
+    }
+    let (task, revision) = delivery.strip_prefix("deliver-")?.split_once('-')?;
+    if !digits(task) || !digits(revision) {
+        return None;
+    }
+    Some((task.parse().ok()?, delivery))
+}
+
+/// Where a delivery stands from its attempts, oldest first ([`attempts`]).
+fn judge_attempts(sent: &[&crate::dispatch::Sent]) -> Attempts {
     let Some(last) = sent.last() else {
         return Attempts::None;
     };

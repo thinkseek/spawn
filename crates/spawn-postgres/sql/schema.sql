@@ -1419,6 +1419,8 @@ begin
            and (p_record ->> 'revision' is null
                 or revisions = (p_record ->> 'revision')::integer);
     when 'task.cancelled' then
+        -- `by` names who cancelled (spawn_task_cancel_by), read by the
+        -- scorecard, not by the fold.
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
         -- A task that leaves the gate ends its run of `no_room`.
         update mission_missions set gate_room_task = null, gate_room_since_ms = null,
@@ -1568,12 +1570,26 @@ begin
     return v_id;
 end $$;
 
+-- Who cancels, as a `task.cancelled` record names it (`by`): the caller of
+-- a checked function, `spawn_supervisor` for the supervisor's login and
+-- `human` for the owner's (the CLI; Spawn's loops record their own
+-- cancellations under their names: `spawn-integrate`, `spawn-dispatch`).
+-- The scorecard tells a person's cancellation from Spawn's by it
+-- (docs/design.md §15); a record from before it names none, and counts as
+-- a person's.
+create or replace function spawn_task_cancel_by() returns text
+language sql stable as $$
+    select case spawn_mission_caller() when 'spawn_supervisor' then 'spawn_supervisor'
+                                       else 'human' end
+$$;
+
 -- A close or a retirement cancels, in its fold, the work the closure rule
 -- does not let go on. Its writer then gives each task of `p_open` (the ones
 -- open before the close) that the fold cancelled its own `task.cancelled`
 -- record, so the task's stages end with `cancelled`. The record repeats what
 -- the fold did; the fold itself never appends, so replaying the log gives
 -- the same tables and adds nothing. Called under the append lock.
+-- The record names `by`, the caller (spawn_task_cancel_by).
 create or replace function spawn_task_record_cancelled(p_open bigint[])
 returns void language plpgsql as $$
 declare
@@ -1582,7 +1598,8 @@ begin
     for v_task in
         select id from mission_tasks where id = any(p_open) and state = 'cancelled' order by id
     loop
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
+                                                        'by', spawn_task_cancel_by()));
     end loop;
 end $$;
 
@@ -1776,7 +1793,8 @@ begin
                      and state not in ('accepted', 'cancelled', 'landing', 'landed')) then
         raise exception 'task % is already closed', p_task;
     end if;
-    perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
+    perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task,
+                                                    'by', spawn_task_cancel_by()));
 end $$;
 
 -- A resident starts only after a human approves it.
@@ -2092,7 +2110,7 @@ begin
          where k.id = (p_record ->> 'id')::bigint
            and spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)) then
         perform spawn_control_record(jsonb_build_object(
-            'type', 'task.cancelled', 'id', (p_record ->> 'id')::bigint));
+            'type', 'task.cancelled', 'id', (p_record ->> 'id')::bigint, 'by', 'spawn-integrate'));
     end if;
     return v_recorded;
 end $$;
@@ -2118,7 +2136,8 @@ begin
     perform pg_advisory_xact_lock(1399957335);
     if exists (select 1 from mission_tasks k where k.id = p_task and k.state = 'landing')
        and not spawn_task_may_move(p_task, 'landing') then
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task,
+                                                        'by', 'spawn-integrate'));
     end if;
     perform pg_advisory_unlock(1399957337);
     return false;
@@ -2239,7 +2258,7 @@ begin
     foreach v_function in array array[
         'spawn_task_may_continue(text, text, boolean, text)',
         'spawn_task_may_move(bigint, text)',
-        'spawn_task_record_cancelled(bigint[])'] loop
+        'spawn_task_record_cancelled(bigint[])', 'spawn_task_cancel_by()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -2261,7 +2280,8 @@ begin
          where not spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)
          order by k.id
     loop
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
+                                                        'by', 'spawn-migrate'));
     end loop;
 end
 $$;
@@ -2292,7 +2312,8 @@ begin
            and last.type not in ('task.cancelled', 'task.aborted')
          order by k.id
     loop
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
+                                                        'by', 'spawn-migrate'));
     end loop;
 end
 $$;
