@@ -297,17 +297,16 @@ fn ms(value: &Value) -> String {
         .map_or_else(|| show(value), |ms| format!("{ms} ms ({})", span(ms)))
 }
 
-fn counts_of(value: &Value) -> String {
-    value
-        .as_object()
-        .map(|object| {
-            object
-                .iter()
-                .map(|(name, count)| format!("{name} {}", show(count)))
-                .collect::<Vec<_>>()
-                .join(", ")
+/// The counts of a breakdown, in the order the definitions name them.
+fn counts_of(value: &Value, order: &[&str]) -> String {
+    order
+        .iter()
+        .map(|name| {
+            let count = value.get(*name).map_or_else(|| "0".to_string(), show);
+            format!("{name} {count}")
         })
-        .unwrap_or_default()
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One dimension's line: its value (or `not enough data`, with n and the
@@ -347,17 +346,26 @@ fn line(name: &str, dimension: &Value, min_n: &Value) -> String {
         "rework" => format!(
             "send-backs {}: {}",
             show(&field("send_backs")),
-            counts_of(&field("by_verdict"))
+            counts_of(
+                &field("by_verdict"),
+                &["rejected", "conflict", "incompatible", "reviewed"],
+            )
         ),
         "autonomy" => format!(
             "interventions {}: {}",
             show(&field("interventions")),
-            counts_of(&field("by_kind"))
+            counts_of(
+                &field("by_kind"),
+                &["command", "resume", "owner_task", "cancel_reassign"],
+            )
         ),
         "reliability" => format!(
             "events {}: {}",
             show(&field("events")),
-            counts_of(&field("by_kind"))
+            counts_of(
+                &field("by_kind"),
+                &["failed_command", "spent_delivery", "stall", "gate_infrastructure"],
+            )
         ),
         "cost" => {
             let models = field("by_model")
@@ -386,7 +394,7 @@ fn line(name: &str, dimension: &Value, min_n: &Value) -> String {
                 if per.is_null() {
                     String::new()
                 } else {
-                    format!(", {} per landing", ms(&per))
+                    format!(", {} ms per landing", show(&per))
                 }
             )
         }
