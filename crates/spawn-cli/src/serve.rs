@@ -826,9 +826,9 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 /// }
 /// ```
 ///
-/// An objective's `prompt` is its first lines (about 1 KB) and a task's
-/// `brief` and `review_note` theirs ([`answers::slim_rsi`]), each with its
-/// length in bytes beside it (`prompt_bytes`, `brief_bytes`,
+/// An objective's `prompt` is its first lines (about 1 KB), and a task's
+/// `brief` and `review_note` are null, their lengths in bytes beside them
+/// ([`answers::slim_rsi`]: `prompt_bytes`, `brief_bytes`,
 /// `review_note_bytes`).
 ///
 /// `GET /api/rsi/task/<id>` answers one task: the fields above plus the full
