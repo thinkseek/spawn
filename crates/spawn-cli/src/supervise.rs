@@ -387,7 +387,10 @@ mod tests {
             "cbf29ce484222325",
             "FNV-1a, stable across builds"
         );
-        assert_ne!(one.hash, Charter::of(charter("/opt/spawn", "mission.md")).hash);
+        assert_ne!(
+            one.hash,
+            Charter::of(charter("/opt/spawn", "mission.md")).hash
+        );
         assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
     }
 
