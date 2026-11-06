@@ -128,10 +128,14 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
         .collect()
 }
 
-/// `text` on one line (newlines become spaces), cut to `limit` characters.
+/// `text` on one line (line breaks become spaces), cut to `limit`
+/// characters.
 fn one_line(text: &str, limit: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    flat.chars().take(limit).collect()
+    text.trim()
+        .chars()
+        .map(|char| if char == '\n' || char == '\r' { ' ' } else { char })
+        .take(limit)
+        .collect()
 }
 
 /// The digest typed into the supervisor's pane.
