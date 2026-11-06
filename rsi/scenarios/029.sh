@@ -117,8 +117,9 @@
 # with no admission record; the gate runs in the cgroup of the process that
 # ran `spawn integrate`, with no limit; uncapped, its tool allocates nothing,
 # so the measure's gate kills itself (SIGKILL), which today is recorded
-# `aborted` (gate_aborts 0 -> 1, toward the halt) and judged again at the
-# next pass, with no due time. It fails at (1) in 2-17 s; a measure run takes
+# `aborted` ("the gate failed: the gate ended with signal: 9 (SIGKILL)";
+# gate_aborts 0 -> 1, toward the halt) and judged again 0.7 s later, at the
+# next pass, with no due time (one measure run, 38.9 s, 18:21 CST). It fails at (1) in 2-17 s; a measure run takes
 # 31-92 s.
 set -eu
 
