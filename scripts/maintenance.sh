@@ -7,7 +7,7 @@
 #               (scripts/disk.sh names them), owned by this user and not
 #               modified for SPAWN_MAINTENANCE_SCRATCH_AGE_MIN (default 1440,
 #               a day). The gate removes its own scratch on exit and the
-#               integrator kills it after 45 minutes, so one that old was
+#               integrator kills it at its wall clock (120 minutes by default), so one that old was
 #               left by a gate killed before its trap ran.
 #   2. dumps    deploy.sh's pre-deploy dumps in SPAWN_BACKUP_DIR (default
 #               ~/.local/share/spawn-rsi/backups), named exactly

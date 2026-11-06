@@ -13,6 +13,7 @@
 //! - `gateway`: grant-filtered reads and submissions for restricted logins.
 //! - `fleet`: the dashboard and dispatcher read model.
 //! - `missions`: missions, tasks and residents, and the integrator's lock.
+//! - `scorecard`: the facts `spawn scorecard` measures, read in one snapshot.
 //!
 //! [`EventLog`]: spawn_core::port::EventLog
 //! [`CommandQueue`]: spawn_core::port::CommandQueue
@@ -50,6 +51,7 @@ mod gateway;
 mod host;
 mod missions;
 mod row;
+mod scorecard;
 mod sessions;
 
 pub use missions::LandingHold;

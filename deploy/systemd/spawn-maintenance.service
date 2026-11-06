@@ -16,7 +16,8 @@ ExecStart=/bin/sh %h/.local/share/spawn-rsi/controllers/spawn/scripts/maintenanc
 EnvironmentFile=%h/.local/share/spawn-rsi/spawn.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # Scratch older than 3 h is a dead gate's: no gate runs longer (the
-# integrator's wall clock is 45 min).
+# integrator's wall clock, SPAWN_GATE_WALL_CLOCK_MINUTES, is 120 min by
+# default; keep it below this age).
 Environment=SPAWN_MAINTENANCE_SCRATCH_AGE_MIN=180
 TimeoutStartSec=1h
 Nice=10
