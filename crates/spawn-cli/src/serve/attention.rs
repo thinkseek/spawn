@@ -112,7 +112,7 @@ pub(super) fn attention() -> Result<Value, String> {
         &reading.rows,
         &reading.plan,
         &told_at,
-        question,
+        &question,
         &warnings,
         super::now_ms(),
     ))
@@ -126,7 +126,7 @@ fn answer(
     rows: &[Facts],
     plan: &Plan,
     told_at: &Value,
-    question: Value,
+    question: &Value,
     warnings: &[String],
     generated_at_ms: i64,
 ) -> Value {
@@ -161,7 +161,7 @@ fn answer(
 }
 
 /// The supervisor's liveness, its latest judgement and its `question`.
-fn supervisor(facts: &Facts, question: Value) -> Value {
+fn supervisor(facts: &Facts, question: &Value) -> Value {
     let judgement = facts.observation.as_ref().map(|observation| {
         json!({
             "state": observation.state.key(),
@@ -224,21 +224,20 @@ fn question(
         .as_i64()
         .or(facts.observation_at_ms);
     let said = transcript.map(said).filter(|said| said.reply.is_some());
-    let (text, source, human) = match said {
-        Some(said) => (said.reply, Some("transcript"), said.human),
-        None => {
-            let screen = observation
-                .evidence
-                .as_ref()
-                .and_then(|evidence| evidence["screen_tail"].as_str())
-                .map(str::to_string);
-            let source = screen.as_ref().map(|_| "screen");
-            let human = observation
-                .human_question
-                .clone()
-                .map(|question| (question, asked_at));
-            (screen, source, human)
-        }
+    let (text, source, human) = if let Some(said) = said {
+        (said.reply, Some("transcript"), said.human)
+    } else {
+        let screen = observation
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence["screen_tail"].as_str())
+            .map(str::to_string);
+        let source = screen.as_ref().map(|_| "screen");
+        let human = observation
+            .human_question
+            .clone()
+            .map(|question| (question, asked_at));
+        (screen, source, human)
     };
     json!({
         "text": text,
@@ -444,7 +443,7 @@ mod tests {
     fn the_views_pending_is_the_dispatchers_pending() {
         let (rows, work, host) = situation();
         let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
-        let view = answer(&rows, &plan, &Value::Null, Value::Null, &[], NOW);
+        let view = answer(&rows, &plan, &Value::Null, &Value::Null, &[], NOW);
         let pending = view["pending"].as_array().expect("pending");
         assert_eq!(pending.len(), plan.pending.len());
         for (shown, planned) in pending.iter().zip(&plan.pending) {
@@ -482,7 +481,7 @@ mod tests {
         let told_at = json!({
             "session_worker_objective_90 resume-exec_agent_worker_objective_90": NOW - 4_000_000,
         });
-        let view = answer(&rows, &plan, &told_at, Value::Null, &[], NOW);
+        let view = answer(&rows, &plan, &told_at, &Value::Null, &[], NOW);
         let told = view["told"].as_array().expect("told");
         assert_eq!(told.len(), 1, "a told tag no longer current is not shown");
         assert_eq!(told[0]["told"], true);
@@ -564,7 +563,7 @@ mod tests {
             crate::scorecard::parse_rfc3339("2026-11-06T05:15:56.850Z").expect("a time")
         );
         let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
-        let view = answer(&rows, &plan, &Value::Null, asked, &[], NOW);
+        let view = answer(&rows, &plan, &Value::Null, &asked, &[], NOW);
         let shown = &view["supervisor"];
         assert_eq!(shown["live"], true);
         assert_eq!(shown["judgement"]["state"], "BLOCKED");
