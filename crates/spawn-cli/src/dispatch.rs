@@ -919,13 +919,21 @@ mod tests {
         assert_eq!(tags, &["session_worker_a 100"]);
         assert!(text.contains("needs_human 90%"));
 
-        // Once delivered, the same escalation is not sent again.
+        // Once delivered, the same escalation is not sent again; while it
+        // holds, the plan keeps it as told (the attention view shows it).
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, digest);
         let rows = [rows[0].clone(), supervisor];
         let plan = decide(&rows, true, NOW, "spawn");
         assert!(plan.orders.is_empty());
         assert!(plan.pending.is_empty());
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["session_worker_a 100"]);
+        assert_eq!(
+            plan.told[0].since_ms,
+            Some(NOW - 1_000),
+            "as of its judgement"
+        );
     }
 
     #[test]

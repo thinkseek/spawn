@@ -199,9 +199,8 @@ fn supervisor(facts: &Facts, question: Value) -> Value {
 /// screen reading after it changes nothing the turn's end does not.
 fn asking(facts: &Facts) -> Option<&Observation> {
     let observation = facts.observation.as_ref()?;
-    let at_prompt = facts.live
-        && facts.turn_ended
-        && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
+    let at_prompt =
+        facts.live && facts.turn_ended && observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
     let unsure = matches!(
         observation.state,
         SemanticState::Blocked | SemanticState::Waiting
@@ -523,7 +522,11 @@ mod tests {
         // reply only refers to it.
         let transcript = [
             "{\"cut\": \"by where the read started".to_string() + "\n",
-            line("user", &json!("Owner: what about #86?"), "2026-11-06T05:15:00.000Z"),
+            line(
+                "user",
+                &json!("Owner: what about #86?"),
+                "2026-11-06T05:15:00.000Z",
+            ),
             line(
                 "assistant",
                 &json!("Two notes failed.\n\nHUMAN: Should I stop `objective_87` now?"),
@@ -599,7 +602,10 @@ mod tests {
         if let Some(observation) = sure.observation.as_mut() {
             observation.human_question = Some("Which region?".to_string());
         }
-        assert!(asking(&sure).is_some(), "a HUMAN: line asks whatever the odds");
+        assert!(
+            asking(&sure).is_some(),
+            "a HUMAN: line asks whatever the odds"
+        );
         let mut working = rows[4].clone();
         if let Some(observation) = working.observation.as_mut() {
             observation.ambiguity = None;
