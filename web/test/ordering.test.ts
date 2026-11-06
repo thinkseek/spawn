@@ -296,7 +296,7 @@ function fleetMissions(): Missions {
     task(85, "reported", [["assigned", 5], ["delivered", 6], ["reported", 20]], { objective: 18 }),
     task(82, "landed", [["assigned", 2], ["landed", 9]], { objective: 36 }),
     task(102, "assigned", [["assigned", 60]], { session_id: "session_worker_objective_100", agent_id: "agent_worker_objective_100" }),
-    task(100, "delivered", [["assigned", 20], ["delivered", 21]], { gate: null } as Partial<MissionTask>),
+    task(100, "delivered", [["assigned", 20], ["delivered", 21]]),
   ]);
   return { missions: [supply], residents: [resident("supply"), resident("rsi"), resident("old", "retired")] };
 }
