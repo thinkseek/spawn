@@ -156,7 +156,10 @@ pub enum EndCause {
     Exited,
     /// A stop command terminated the execution.
     Stopped,
-    /// The terminal disappeared without a recorded exit.
+    /// No runner the Bridge started runs the execution any more, and none
+    /// left an exit status: its terminal disappeared, or is there and hosts
+    /// no runner (a dead pane, a shell restored after a restart). The end
+    /// record's `evidence` says which.
     Lost,
 }
 
@@ -311,6 +314,13 @@ pub enum EventKind {
         cause: EndCause,
         /// Process exit code when the OS reported one.
         exit_code: Option<i32>,
+        /// What the Bridge saw when it ended an execution no runner of its
+        /// own ran any more: the terminal gone, or there and hosting no
+        /// runner ([`crate::port::Runner`]), and a stop or start that found
+        /// it so. Left out when there is nothing to tell (an exit, a stop of
+        /// a running engine), and by records made before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
     },
     /// An ending execution's final checkpoint committed and its terminal is
     /// gone; the unmount comes next. An end recovered after this record
