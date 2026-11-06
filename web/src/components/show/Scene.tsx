@@ -21,10 +21,10 @@ import {
 import type { PlaceSpec } from "./layout";
 import type { SceneMark } from "./useShowFeed";
 
-const INK = "#eef0f3";
-const MUTED = "#c0c6ce";
-const FAINT = "#a3aab4";
-const GUIDE = "rgba(192, 198, 206, 0.12)";
+const INK = "#e6e8eb";
+const MUTED = "#959ca6";
+const FAINT = "#646b75";
+const GUIDE = "rgba(149, 156, 166, 0.10)";
 
 /** The fixed links, drawn faint so the topology reads before anything
  * moves. */
@@ -135,7 +135,7 @@ function PlaceNode({ place }: { place: PlaceSpec }) {
           width={big ? 26 : 14}
           height={big ? 26 : 14}
           rx={big ? 5 : 3}
-          fill={big ? "#363c46" : "#2e333c"}
+          fill={big ? "#2a2e35" : "#22262c"}
           stroke={big ? MUTED : "none"}
           strokeOpacity={0.35}
         />
@@ -177,7 +177,7 @@ function AgentNode({ agent, stage, reduced }: { agent: StageAgent; stage: Stage;
         cy={at.y}
         r={radius}
         initial={false}
-        animate={{ fill: agent.running ? "#d4d8de" : "#747b86" }}
+        animate={{ fill: agent.running ? "#c9cdd3" : "#3a3f47" }}
         transition={{ duration: 0.8 }}
       />
       <text

@@ -91,7 +91,6 @@ fn events_round_trip_through_json() {
         EventKind::ExecutionEnded {
             cause: EndCause::Exited,
             exit_code: Some(0),
-            evidence: None,
         },
     ];
     for kind in kinds {
@@ -649,9 +648,7 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
         .expect("read")
         .into_iter()
         .find_map(|record| match record.event.kind {
-            EventKind::ExecutionEnded {
-                cause, exit_code, ..
-            } => Some((cause, exit_code)),
+            EventKind::ExecutionEnded { cause, exit_code } => Some((cause, exit_code)),
             _ => None,
         });
     assert_eq!(ended, Some((EndCause::Exited, Some(3))));
@@ -902,9 +899,7 @@ fn an_engine_that_exits_between_the_two_reads_is_exited_not_lost() {
         .expect("read")
         .into_iter()
         .find_map(|record| match record.event.kind {
-            EventKind::ExecutionEnded {
-                cause, exit_code, ..
-            } => Some((cause, exit_code)),
+            EventKind::ExecutionEnded { cause, exit_code } => Some((cause, exit_code)),
             _ => None,
         });
     assert_eq!(ended, Some((EndCause::Exited, Some(0))));

@@ -72,7 +72,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | `turn.stopped` | 会话记录（`turn_duration`、中断） | input_tokens、output_tokens |
 | `turn.failed` | 会话记录（API 错误行） | error |
 | `execution.started` | Bridge | engine、workspace、command_id（终端总是 `spawn-<execution>`，由执行推出，不记录；旧记录里的 terminal 照常读入）；本次启动新建了分支时另有 fork（from：`main` 或启动的 `from`，跨主机删除之前的旧记录里还可能是 `spawn/<agent>`；commit：分支起点） |
-| `execution.ended` | Bridge | cause、exit_code；Bridge 结束一个已无自己的 runner 在跑的执行时另带 evidence（主机看到了什么、哪条命令发现的） |
+| `execution.ended` | Bridge | cause、exit_code |
 | `execution.unmounting` | Bridge（结束流程过了最后一次 checkpoint 与 terminate、卸载之前；键 `<exec>:unmounting`） | — |
 | `command.step` | Bridge（命令处理的一步，键 `cmd_<id>:<step>`） | command_id、step（`mounted`、`mount_released`、`typing`、`typed`）、workspace（`mounted`/`mount_released` 带） |
 | `execution.end_stalled` | Bridge（最后一次 checkpoint 连续失败 20 次，每个执行一次） | cause、exit_code、failures、error |
@@ -103,7 +103,7 @@ Session 与 Agent 一一对应：一个 Agent 只有一个 Session，一个 Sess
 | | `finish(claimed, outcome)` | 记录结果并写 `command.finished` |
 | `WorkspaceStore` | `ensure_branch(branch, from)`、`mount`、`commit`、`unmount` | 工作区的四个动作；`ensure_branch` 返回 `Existing` 或 `Created(Fork)`，新分支建在 `from`（另一个 agent 的分支头或完整 commit id，`ForkFrom::parse` 校验）或基线，已有分支忽略 `from`；`commit` 返回 `Created(CommitId)` 或 `Unchanged` |
 | | `merge_base(workspace)` | 把基线（源的 `main`）合进已挂载、处于两轮之间空闲的工作区的分支（Bridge 不调用；集成器判 `conflict` 时、调度器给活着的 worker 键入任务前调用，见 spawn-cli 的 `main_merge`）：`Current`、`Merged{commit,files}` 或 `Conflicted{files,marked}`；内容冲突把带冲突标记的合并写进目录（`marked`），等标记解决后的 checkpoint 提交合并；目录与分支不符、或标记表达不了的冲突什么都不改。默认实现返回 `Current`（内存实现可配置结果） |
-| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`runner`、`capture_tail`、`read_from`、`write_new`、`terminate` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
+| `TerminalHost` | `start`、`submit_text`、`send_keys`、`is_alive`、`capture_tail`、`read_from`、`write_new`、`terminate` | 终端生命周期、屏尾读取与读写引擎的文件（`write_new` 只建不改：路径上已有东西时返回 false，文件整体出现或不出现）；`start` 之后每个方法都再传一次 `WorkspaceId`，实现层不在进程间保存状态 |
 | `TranscriptArchive` | `copies`、`read`、`append(copy, at, bytes)` | 原生会话记录的存档（见 [storage.md](./storage.md#the-transcript-archive)）：每个 agent 的每个原生会话有编号的副本，副本只增长，`at` 不等于副本当前长度的追加被拒，已存的字节从不改写；本地实现在 `<root>/.transcripts` |
 
 错误类型：
@@ -147,7 +147,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 结束流程 `end`：最后一次 checkpoint → `terminate` → `unmount` → 写 Bridge 来源的 `execution.ended`，键 `<exec>:ended`。`terminate` 之后、`unmount` 之前写 `execution.unmounting`；恢复出的结束若已有这条记录，就跳过 checkpoint，只再 terminate、unmount（工作区不在不算失败）并写 `execution.ended`。
 
-命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在、或不托管本主机启动的 runner 则失败（下个 tick 按 `Lost` 结束），绝不往这样的终端里键入，提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败（提示词可能已到引擎，所以不按 discard 结束：最后一次 checkpoint 失败时工作区不卸载，结束像 `Stop` 一样留待下个 tick 重试；键入失败时同理，只有日志表明从未开始键入的启动才按 discard 卸载）；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次，错误含 `MAY_HAVE_TYPED`）。等待中的输入也是这样：等待记在日志里（`waiting`），重启后的 Bridge 接着等；一次 Ready 读数只给一次键入用，下一条输入要等上一条 `typed` 之后的新 Ready 读数（或那次键入开始的轮次已结束）；同一会话的等待输入按 id 从旧到新键入，前面还有在等的就不键入后面的。等待的输入不挡 `Stop`、`Discard`、`Resume`：`spawn_claim` 跳过有 Bridge `waiting` 记录的未完成命令，把它后面的命令发出来（后面的输入也会发出来，以便记下自己的 `waiting`）；没有 `waiting` 记录的未完成命令仍挡住后面的一切。等待本身没有超时：Bridge 在本 tick 的领取循环结束前一直拿着它的租约，然后用 `spawn_release` 放开，`input_wait_retry`（1 秒）后可再领。执行结束时（同一 tick 或下一 tick），它的等待输入失败：`Stop`/`Discard` 结束的报 “the session was stopped before the input was typed”，其他结束报 “the session's execution ended (<cause>) before the input was typed”；`Resume` 不会让它们复活。`waiting` 不算活动：停滞层（`stall_facts` 的会话最新事实）和调度器的判定新鲜度（`dispatch_facts` 的 `evidence_seq`）都不计它，Observer 把它当普通命令步骤，之后的判定覆盖它。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`；日志仍认为这条命令的执行（或用同一工作区的执行）未结束时不算孤儿，保留挂载并重新跟踪该执行。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
+命令是日志里记账的幂等步骤：重试的命令（租约过期或 `finish` 失败）与重启后的 Bridge 都按日志续做，不重复副作用。`Start`/`Resume` 重试时若 `execution.started` 已是本命令的执行，就续做：终端不在则失败（下个 tick 按 `Lost` 结束），提示词已有 `typed`、或 `typing` 之后转录里已有这次执行的提示，则成功；只有 `typing` 而无从判断时不再键入，结束这次执行并失败（提示词可能已到引擎，所以不按 discard 结束：最后一次 checkpoint 失败时工作区不卸载，结束像 `Stop` 一样留待下个 tick 重试；键入失败时同理，只有日志表明从未开始键入的启动才按 discard 卸载）；没有 `typing` 才键入。本命令的执行已结束则失败，不再启动。`Input` 同理：有 `typed` 即成功，只有 `typing` 时失败且不再键入（至多一次，错误含 `MAY_HAVE_TYPED`）。等待中的输入也是这样：等待记在日志里（`waiting`），重启后的 Bridge 接着等；一次 Ready 读数只给一次键入用，下一条输入要等上一条 `typed` 之后的新 Ready 读数（或那次键入开始的轮次已结束）；同一会话的等待输入按 id 从旧到新键入，前面还有在等的就不键入后面的。等待的输入不挡 `Stop`、`Discard`、`Resume`：`spawn_claim` 跳过有 Bridge `waiting` 记录的未完成命令，把它后面的命令发出来（后面的输入也会发出来，以便记下自己的 `waiting`）；没有 `waiting` 记录的未完成命令仍挡住后面的一切。等待本身没有超时：Bridge 在本 tick 的领取循环结束前一直拿着它的租约，然后用 `spawn_release` 放开，`input_wait_retry`（1 秒）后可再领。执行结束时（同一 tick 或下一 tick），它的等待输入失败：`Stop`/`Discard` 结束的报 “the session was stopped before the input was typed”，其他结束报 “the session's execution ended (<cause>) before the input was typed”；`Resume` 不会让它们复活。`waiting` 不算活动：停滞层（`stall_facts` 的会话最新事实）和调度器的判定新鲜度（`dispatch_facts` 的 `evidence_seq`）都不计它，Observer 把它当普通命令步骤，之后的判定覆盖它。启动时 Bridge 重放日志后，对记了 `mounted`、没有对应 `execution.started` 也没有 `mount_released`、且没有活跃执行在用的工作区，卸载并补记 `mount_released`。`terminate` 失败时不写事件，执行保持活跃，下一次 tick 重试。工作区只在最后一次 checkpoint 提交成功后卸载，或由 `Discard` 卸载。
 
 结束的三个来源：
 
@@ -160,8 +160,6 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 折叠时只有 Bridge 来源的 `execution.ended` 清除活跃执行。其他来源的同名事件只是退出报告（`agent_executions.exit_reported`），现在已无人写：runner 把退出码写进 `SPAWN_EXIT_FILE`，所以只有那之前的旧执行可能为真。
 
 每会话一个活跃执行由日志保证，不只靠 Bridge 的内存：`Start`/`Resume` 先追上日志再查内存，日志的追加再查一次（`spawn_append_trusted`，内存实现同样）：会话最近一次执行还没有 Bridge 写的结束时拒绝 `execution.started`。被拒的启动以日志给的原因失败，卸载自己刚挂的工作区（那正是另一个执行的工作区时不卸载），不启动终端。runner 的退出报告不算结束；丢失的执行由下一个 tick 写 `execution.ended`（cause `lost`）后，会话即可再启动或恢复。
-
-“丢失”指没有 Bridge 自己启动的 runner 在跑它（issue #15）：`TerminalHost::runner` 回答 `Running`（窗格活着，且由本主机的启动拉起：tmux 的 `pane_start_command` 带有本次启动的环境文件名 `spawn-launch-<终端>-`）、`Gone`（终端不在）或 `Untracked`（终端在，但不托管那个 runner：窗格已死，或重启后终端管理器恢复出、停在 shell 提示符的同名会话）。只有 `Running` 算在运行；其余先再读一次退出文件，没有就按 `lost` 结束，`evidence` 记下主机所见。`Start`、`Resume`、`Input` 动手前先处理会话里这样的执行（`Bridge::settle`，走正常的结束流程），而不是因为它失败、等以后的 tick：start/resume 接着做，input 失败一次（需要运行中的引擎），之后照常 resume；`Stop` 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 的视图只随折叠日志改变（它写的结束被读回后，执行才离开视图）；视图里会话没有执行时，命令向日志查询（`EventLog::open_execution`，与守卫同一规则：最近一次 `execution.started` 之后没有 Bridge 写的结束），查到就重新跟踪并警告。重启时，视图没读到其启动、但日志仍认为未结束的执行所用的挂载不算孤儿，不卸载。不受跟踪的引擎从不被静默收编：它被结束，终端被杀。
 
 恢复：每次 `spawn tick` 是新进程，从位置 0 折叠全部事件得到活跃执行、原生会话 id 与待提交的 checkpoint。`Resume` 复用最新原生会话 id，新开 Execution 与 mount，优先 `--resume`；逻辑 Session 不变。
 
@@ -374,50 +372,10 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 审计第 1、2、3、9、16、23 条已修复（分支 `audit-stops`）：失败的 Stop，不论谁发的，调度器都从命令队列读出当前执行的 Stop 及其结果，换新键重发、等待加倍，三次后升级给 supervisor（`dispatch/stops.rs`）；集成器先提交中止的 Stop 再记 `task.aborted`；没打进去的 nudge 不算催过；人发的命令完成后才算消息，失败的照实说；`done-<episode>` 看记下的 `end_cause`；`dispatched` 保留当前回合的 nudge 与当前执行的 resume，关闭的临时任务在工人仍在跑时留在投递行里，批准与人的消息直到告知为止都算消息：不再凭 24 小时窗口判断“没发过”或“不是消息”。
 
-用尽的投递也按这条规则处理（objective 19，`deliver.rs`）：首次投递的重试用尽、且没有一次尝试可能打进去（错误里没有 `MAY_HAVE_TYPED`）时，调度器在最后一次尝试结束 `SPAWN_REISSUE_AFTER_SECS` 之后（数据库时钟）重发它，依据是记下的每次尝试及其结果，而不是“一直没送到”或单纯的时间；重发本身是记录：同一事务里的 `task.cancelled`（`by`、`reissued_as`、`attempts`）与 `task.assigned`（`reissue_of`）互相指名。重发的任务不再重发，它的投递也用尽时才升级给 supervisor。部署后的那次补试依据一条记下的 `source.moved`（`spawn mission moved` 每次部署都记，哪怕没有任务组的基线移动），它是一条有自己键（`deliver-<task>-<revision>-moved-<事件 id>`）的命令，结果照常检查；失败就保持原状，等下一条 `source.moved`。
-
 所有者的改动同样受它约束：线上的门禁脚本、场景、objective backlog 与维护脚本都来自控制器 `~/.local/share/spawn-rsi/controllers/<name>`（部署的那个提交的树，部署时原子切换，`deploy/controller.sh`），从不来自所有者的工作检出。否则检出里每次保存都立即生效，门禁还没评判过（曾经：改 gate.sh 改变了一个正在运行的门禁；提交到 `rsi/backlog` 的 objective 在部署前几秒内就被分派）。运行的东西必须是被评判过的东西的记录：**所有者的改动部署后才生效**。
 
 停滞的升级（`dispatch/stall.rs`，[fleet-architecture.md](fleet-architecture.md) §3 “Stalls”）同样守这条规则：每个未结任务所处的一步都从开始它的那条记录量起（控制记录的 id，或会话事实的 `session_seq`），年龄只用数据库的时钟（`spawn_now_ms()` 对 `recorded_at_ms`），从不凭“集成器最近没跑”之类的缺席推断；条目写明它量自哪条记录，标签里带着这条记录，所以每次停滞只升级一次，重启的 loop 算出同样的结果。
 
-集成器的门禁按任务组并发（每个任务组、每个来源同一时刻至多一个判定，全局至多 `--gates` 个用共享测试库的判定，默认 1；场景目录里有 `no-test-database` 的任务组拿不到测试库地址，不占名额）。每个判定在自己的线程里跑完取分支、门禁与落地，各自记下 `task.gated`、`task.landed`；主循环不读线程的返回值，只读日志。结束的线程只在一轮开始、读任务组之前回收，所以一轮看到的任务组快照不会早于任何已结束判定的记录；每一轮都给每个任务组走完停机、预算、落地与目标分派，不因别的任务组的门禁而等；只有落地会让同一来源的其余任务组等下一轮（落地移动了 main 与它们的基线）。在途判定的来源不做镜像上的事（落地、拉取、判定）。空出的门禁给等得最久的就绪任务：从它报告时起，或从它所在任务组上一次判定结束时起，取较晚者；任务组编号不决定先后。进程重启时门禁随进程一起被杀，没有记录，下一个集成器重新判定。
-
-门禁的主机故障同样守这条规则（objective 20，[fleet-architecture.md](fleet-architecture.md) §10.3）：check-tests.sh 在候选上失败时，集成器只依据记下的门禁输出里每条失败及其消息（记录的 `failures`），以及测试数据库日志里落在它自己量出的门禁时间窗内（前后各 1 秒）的崩溃行（记录的 `crash`），判定是主机的故障（`host_fault`）还是工作的（`rejected`），从不只凭拒绝理由的文字；之后的等待只依据记录里的 `due_ms`（记录自己的 `recorded_at_ms` 加退避，由存储写入），不凭进程内存或没有记录的时间。主机故障不计入任何停机规则，连续两次升级给 supervisor 一次。
-
-门禁之前先量主机，不靠门禁崩溃才知道主机没有余量（objective 018）：每次判定在候选构建之后、门禁启动之前，集成器按序量门禁 `TMPDIR` 的剩余空间（`SPAWN_GATE_MIN_FREE_GB`）、`MemAvailable`（`SPAWN_GATE_MIN_FREE_MEMORY_MB`）与测试数据库（连接，再跑一条强制并行的查询，各 10 秒内），第一项不够就不启动门禁，记 `no_room` 并写明 `check`、`measured` 与 `threshold`。判断只凭判定当时的测量和它的阈值；一次跑了 25 分钟、因测试库 `/dev/shm` 不足而崩溃的门禁，不再被读成候选的回归。
+集成器的门禁按任务组并发（每个任务组、每个来源同一时刻至多一个判定，全局至多 `--gates` 个，默认 1）。每个判定在自己的线程里跑完取分支、门禁与落地，各自记下 `task.gated`、`task.landed`；主循环不读线程的返回值，只读日志。结束的线程只在一轮开始、读任务组之前回收，所以一轮看到的任务组快照不会早于任何已结束判定的记录；每一轮都给每个任务组走完停机、预算、落地与目标分派，不因别的任务组的门禁而等；只有落地会让同一来源的其余任务组等下一轮（落地移动了 main 与它们的基线）。在途判定的来源不做镜像上的事（落地、拉取、判定）。空出的门禁给等得最久的就绪任务：从它报告时起，或从它所在任务组上一次判定结束时起，取较晚者；任务组编号不决定先后。进程重启时门禁随进程一起被杀，没有记录，下一个集成器重新判定。
 
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。
-
-## 15. 记分卡（`spawn scorecard`）
-
-所有者的目标（2026-11-06）是 Spawn 在每个维度上同时优秀，处在帕累托前沿上：没有哪个维度靠另一个维度退步来变好。`spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]` 一次量出全部八个维度，只读记录：`session_control` 的控制记录（它们的 `recorded_at_ms`）、`spawn_commands` 的行，以及 `$SPAWN_WORKSPACE_ROOT/.transcripts`（或 `--root` 下的 `.transcripts`）里归档的 transcript。没有新增手工维护的计数器、表或列：读同一份记录的人得到同样的数，给出 `--until` 之后同样的参数得到逐字节相同的 JSON。看板的 Scorecard 视图（`web/src/components/scorecard/`）读 `GET /api/scorecard?mission=&since=&until=`，它回答的正是 `spawn scorecard --json` 同样参数的 JSON；`spawn serve` 以 reader 登录读库，从它自己的 `SPAWN_WORKSPACE_ROOT` 读 transcript。代码在 `crates/spawn-cli/src/scorecard.rs`（`history` 折叠记录，`measure` 计数，`transcripts` 读 token，`time` 读写时间），事实的查询在 `crates/spawn-postgres/src/scorecard.rs`。
-
-**窗口。** `<time>` 是 RFC 3339（`2026-10-02T00:00:00Z`）或往回的一段时长（`36h`、`7d`）。`--until` 默认是现在（数据库的时钟 `spawn_now_ms()`，一段时长从现在往回数）；`--since` 默认 `7d`，一段时长从窗口的终点往回数，所以给定 `--until` 就固定了窗口。窗口是 [since, until)，至多 400 天；前一个窗口是紧挨在它前面、同样长的一段。不带 `--mission`：先是全队（fleet），然后按 id 列出每个在任一窗口里有任务在开、落地或有任何计入记录的任务（在 `until` 之前指派）的 mission；带 `--mission N`：只有那个 mission（没有记录提到它就拒绝）。事实在一个快照里读：`until` 之前的每条记录，之后的一条都不读。
-
-**定义**（照目标原文）：
-
-Times are a record's `recorded_at_ms`; an event belongs to a window or day when since <= t < until. Days are UTC dates; `days` lists every UTC day the window covers, oldest first, each computed as a window of its own (clipped to the window). A task is *landed* at its `task.landed`, or, on a mission without a gate, at its `task.reviewed` with `accepted` true; it is *closed* at its landing or its `task.cancelled`; it is *open* from its `task.assigned` until it is closed (or until the window's end). A task's mission is its `mission_id`. A command belongs to the mission of the task its key names (`deliver-<task>-...`), else of the task open on its session when it was created, else to the fleet only.
-
-- **throughput**: landings in the window divided by the open hours, where the open hours are the length of the union of the scope's open-task intervals clipped to the window. Higher is better. Parts: `landed`, `open_hours`.
-- **lead time**: for each landing in the window, its landing time minus its assignment time; for a task with an objective, the assignment of the earliest task of the same mission and objective that was cancelled at or before this task's assignment (the objective's first try, so a re-issue does not hide the wait). `value` is the median, `p90` the 90th percentile, both by nearest rank (the value at rank ceil(p/100 x n) of the sorted list), in whole ms. Lower is better.
-- **first-pass quality**: the share of the window's landings whose task never had a send-back. Higher is better. Part: `first_pass`.
-- **rework**: send-backs in the window per landing in the window. A send-back is a `task.gated` with verdict `rejected`, `conflict` or `incompatible`, or a `task.reviewed` with `accepted` false. Lower is better. Parts: `send_backs`, `by_verdict` {`rejected`, `conflict`, `incompatible`, `reviewed`}.
-- **autonomy**: owner interventions in the window per landing. An intervention is (a) a command whose principal is `human` or `spawn` (the board's and the CLI's: Spawn's loops have principals of their own), at its creation; (b) a `mission.resumed` (only a human resumes); (c) an owner task: a `task.assigned` with `created_by` `human` on a mission whose `accept` is `review`; (d) a cancel-and-reassign: a `task.cancelled` whose `by` is absent or `human`, followed in its mission by a `task.assigned` for the same objective (or, without one, the same brief), counted at that assignment. A cancellation by one of Spawn's loops (`by` `spawn-dispatch`, objective 019) is not an intervention. Lower is better. Parts: `interventions`, `by_kind` {`command`, `resume`, `owner_task`, `cancel_reassign`}.
-- **reliability**: failures of the machinery in the window per landing: every command finished with `succeeded` false (at its creation); every spent delivery, judged as deliver.rs `attempts()` judges it (no attempt succeeded, none open, none `MAY_HAVE_TYPED`, more than `DELIVERY_RETRIES` failures past the first `NOT_READY_FREE` refusals for a pane not ready), at its last attempt's finish; every stall, a distinct `stall-<task>-<step>-<n>` tag in a `spawn-dispatch` input's `tags`, counted once whatever the number of digests that carried it, at the first; and every infrastructure gate outcome, a `task.gated` with verdict `aborted`, `no_room` or `host_fault` (objective 020). Lower is better. Parts: `events`, `by_kind` {`failed_command`, `spent_delivery`, `stall`, `gate_infrastructure`}.
-- **cost**: model tokens in the window per landing. A transcript's assistant line with a `message.usage` counts once per (agent, `message.id`), across every copy file, at its `timestamp`: input + cache creation + cache read + output tokens, under its `message.model`. A mission's tokens are those of its tasks' agents between each task's first `task.delivered` and its close (the window's end when open); the fleet's are every agent's, the supervisor's included. Also the gate's machine time: the sum of the gate runs' wall clock in the window (below). Lower is better. Parts: `tokens`, `by_model` {<model>: {`tokens`, `per_landed`}}, `gate_ms`, `gate_ms_per_landed`.
-- **gate time**: the median (nearest rank) wall clock of the gate runs in the window, in ms. A gate run is a `task.gated` whose record names its wall clock: its `gate_ms` when present, else the last `| stage gate <result> <ms>ms total` line of its `log`; a record with neither ran no measured gate and is not counted. Lower is better. Part: `runs`.
-
-**答案。** 每个维度，对每个范围、每一天，都是一个带 `value`、`n`、`enough`、`better`（`higher` 或 `lower`）、`previous`、`trend` 和它各部分的对象。`n` 是落地数（门禁耗时是门禁运行数）。最小 n 是 3（JSON 里的 `min_n`）：低于它，`value` 和每个按落地平均的部分（`p90`、`per_landed`、`gate_ms_per_landed`）都是 null，`enough` 为 false，文本形式写 `not enough data`（带 n 和最小值）而不写数。`previous` 是前一个窗口的值（那里不够时为 null）；`trend` 按维度的方向比较四舍五入后的值，给出 `better`、`worse` 或 `same`，任一为 null 时为 null；每一天的 `previous` 和 `trend` 都是 null。比值四舍五入到 3 位小数（一半时远离零，用整数算，不经浮点舍入）；毫秒和 token 数是整数。部分总在（没有值时为 null），从不省略。JSON 是 `{since_ms, until_ms, previous_since_ms, min_n, scopes: [{scope: "fleet"|"mission", mission: null|id, dimensions: {throughput, lead_time, first_pass, rework, autonomy, reliability, cost, gate_time}, days: [{day: "YYYY-MM-DD", dimensions: {...}}]}]}`；不带 `--json` 的文本形式给出同样的数，每个维度一行，带方向和趋势，再加每天一行的表。
-
-**定义没说死的地方，这样读：**
-
-- 一个任务只落地一次（第一条落地记录）；关闭之后的记录不再落地、不再关闭它。`task.aborted`（超预算中止，折叠成 `cancelled`）也是一次取消：它关闭任务，也算重试链里“取消过的一次尝试”，但它是集成器的，不是人的干预。
-- 重新指派的前导时间：一个目标在本 mission 里上一次落地之前的尝试属于那次落地，不属于这一次（循环的目标每轮从自己的第一次尝试量起）。
-- 一个会话上同时开着几个任务时（常驻工人的队列），命令归最早指派的那个（投递按最早的先送）。
-- 取消再指派：每个人的取消，配它之后（按流的顺序）在同一 mission 里第一个同目标（或无目标时同 brief）的指派，各算一次。
-- token：一个消息算在它最早一行的 `timestamp`，用它各行里最大的用量（实际上各行相同）；不是 assistant 的行、没有用量、没有消息 id 或时间读不出的行不算。最后写入早于前一个窗口起点一天以上的 transcript 文件不读：一行在它的消息写出时写入，这样的文件里没有窗口内的行（一天的余量吸收主机与数据库时钟的偏差）。一个消息同时落在几个 mission 的任务里时，每个 mission 各算一次，全队只算一次。
-- 门禁日志的 stage 行在数据库里读出（只取整行 `| stage gate <result> <ms>ms total`，允许前后空白），日志本身不离开数据库；brief 只以 md5 比较。
-
-**记录。** `task.cancelled` 写明 `by`（调用者）：所有者登录（CLI、人的关闭或退休）是 `human`，supervisor 是 `spawn_supervisor`，循环写自己的名字（集成器 `spawn-integrate`，调度器 `spawn-dispatch`，迁移补的记录 `spawn-migrate`）。更早的记录没有它，算人的取消；不回填。
-
-**因果（§14）。** 每个数都读自一条写明自己覆盖了什么的记录：一条记录自己的时间和它点名的任务或 mission，一个命令的键、会话和时间，一行 transcript 的消息 id 和时间戳。没有任何东西凭缺席推断（任务直到一条记录关闭它之前都开着；投递只有它的尝试这么说时才算用尽，判断和 `deliver.rs` 的 `attempts()` 是同一段代码），也不凭循环运行的先后。

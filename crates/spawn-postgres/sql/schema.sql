@@ -1078,8 +1078,7 @@ create table if not exists mission_missions (
     gate_rejections integer not null default 0,
     gate_aborts     integer not null default 0,
     -- The gate's current run of `no_room` outcomes (TMPDIR short of room,
-    -- scripts/disk.sh, or a check the integrator makes before a gate:
-    -- disk, memory, the test database) on one task, `gate_room_task`: when the first and
+    -- scripts/disk.sh) on one task, `gate_room_task`: when the first and
     -- the latest were recorded, how many, and whether one of them escalated
     -- to the supervisor. No verdict on the work, so it counts toward no
     -- halt. A gate that judged (or aborted) ends the run, and so does its
@@ -1091,16 +1090,7 @@ create table if not exists mission_missions (
     gate_room_waits    integer not null default 0,
     gate_room_escalated boolean not null default false,
     -- An objective mission (§10.4): `{"backlog": <dir>, "resident": <name>}`.
-    objectives      jsonb,
-    -- The gate's current run of `host_fault` outcomes (the gate failed
-    -- because the host did: the test database), in a row across the
-    -- mission: how many, the task the latest was about and when it is due to
-    -- be judged again (the record's `due_ms`). No verdict on the work, so it
-    -- counts toward no halt. `no_room` and `stale` leave the run; every
-    -- other verdict, a landing and a resume end it.
-    gate_host_faults integer not null default 0,
-    gate_host_task   bigint,
-    gate_host_due_ms bigint
+    objectives      jsonb
 );
 
 create table if not exists mission_residents (
@@ -1144,12 +1134,7 @@ create table if not exists mission_tasks (
     delivered_at_ms bigint,
     -- The models the task's worker runs on (docs/fleet-architecture.md,
     -- "Engine models"): `default`, or `cheap` for simple, well-specified work.
-    model           text   not null default 'default' check (model in ('default', 'cheap')),
-    -- The task this one re-issues (its `task.assigned` names it): a first
-    -- delivery spent without typing is cancelled and assigned again once,
-    -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
-    -- re-issued again.
-    reissue_of      bigint
+    model           text   not null default 'default' check (model in ('default', 'cheap'))
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1168,9 +1153,6 @@ alter table mission_missions add column if not exists gate_room_last_ms bigint;
 alter table mission_missions add column if not exists gate_room_waits integer not null default 0;
 alter table mission_missions add column if not exists gate_room_escalated boolean not null default false;
 alter table mission_missions add column if not exists objectives jsonb;
-alter table mission_missions add column if not exists gate_host_faults integer not null default 0;
-alter table mission_missions add column if not exists gate_host_task bigint;
-alter table mission_missions add column if not exists gate_host_due_ms bigint;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
 alter table mission_tasks add column if not exists gate_log text;
@@ -1180,7 +1162,6 @@ alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
-alter table mission_tasks add column if not exists reissue_of bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1284,13 +1265,12 @@ begin
                    (select r.state from mission_residents r where r.agent_id = k.agent_id));
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
-                                   created_by, objective, scenario, model, reissue_of,
+                                   created_by, objective, scenario, model,
                                    created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
-                p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
-                (p_record ->> 'reissue_of')::bigint, p_at, p_at);
+                p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'), p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -1309,9 +1289,7 @@ begin
                                     gate_aborts = 0, scenario_floor = 0, gate_room_task = null,
                                     gate_room_since_ms = null,
                                     gate_room_last_ms = null, gate_room_waits = 0,
-                                    gate_room_escalated = false, gate_host_faults = 0,
-                                    gate_host_task = null, gate_host_due_ms = null,
-                                    updated_at_ms = p_at
+                                    gate_room_escalated = false, updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
         -- The owner moved a source's main on purpose (a deploy), forward from
@@ -1355,8 +1333,7 @@ begin
                          else state end,
                base = coalesce(p_record ->> 'base', base),
                candidate = case when v_verdict = 'accepted' then p_record ->> 'candidate'
-                                when v_verdict in ('aborted', 'no_room', 'host_fault')
-                                     then candidate end,
+                                when v_verdict in ('aborted', 'no_room') then candidate end,
                gate_log = coalesce(p_record ->> 'log', gate_log),
                metric = case when v_verdict = 'accepted' then p_record ->> 'metric' else metric end,
                review_note = case when v_verdict in ('rejected', 'conflict', 'incompatible') then p_record ->> 'note'
@@ -1368,31 +1345,12 @@ begin
            set baseline = coalesce(baseline, p_record ->> 'base'),
                gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
                                                 when 'accepted' then 0 else gate_rejections end,
-               -- `no_room`: no room to judge (TMPDIR's free space, the
-               -- host's memory or the test database, measured before the
-               -- gate or by the gate's own floor), a fact about the host,
-               -- not the work. It moves neither count.
-               -- `host_fault`: the gate failed because the host did (the
-               -- test database): neither count grows nor resets.
+               -- `no_room`: the gate found no room in TMPDIR to judge, a
+               -- fact about the host, not the work. It moves neither count.
                gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
                                             when 'stale' then gate_aborts
                                             when 'no_room' then gate_aborts
-                                            when 'host_fault' then gate_aborts
                                             else 0 end,
-               -- The mission's host faults in a row: a landing or a real
-               -- verdict ends the run; `no_room` and `stale` leave it. The
-               -- task waits until the record's `due_ms`.
-               gate_host_faults = case v_verdict when 'host_fault' then gate_host_faults + 1
-                                                 when 'no_room' then gate_host_faults
-                                                 when 'stale' then gate_host_faults
-                                                 else 0 end,
-               gate_host_task = case v_verdict when 'host_fault' then v_id
-                                               when 'no_room' then gate_host_task
-                                               when 'stale' then gate_host_task end,
-               gate_host_due_ms = case v_verdict
-                                    when 'host_fault' then (p_record ->> 'due_ms')::bigint
-                                    when 'no_room' then gate_host_due_ms
-                                    when 'stale' then gate_host_due_ms end,
                -- The run is this task's: a `no_room` on another task starts
                -- a new one (no inherited backoff or age).
                gate_room_task = case v_verdict when 'no_room' then v_id
@@ -1419,10 +1377,6 @@ begin
          where id = v_mission;
     when 'task.landed' then
         update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
-        -- A landing ends its mission's run of host faults.
-        update mission_missions set gate_host_faults = 0, gate_host_task = null,
-                                    gate_host_due_ms = null
-         where id = (select mission_id from mission_tasks where id = v_id);
         -- Every mission on the same source sees the same main: the landing
         -- moves its own mission's baseline, and those of the other missions
         -- it names (spawn_integrator_record: the ones whose baseline was its
@@ -1465,8 +1419,6 @@ begin
            and (p_record ->> 'revision' is null
                 or revisions = (p_record ->> 'revision')::integer);
     when 'task.cancelled' then
-        -- `by` names who cancelled (spawn_task_cancel_by), read by the
-        -- scorecard, not by the fold.
         update mission_tasks set state = 'cancelled', updated_at_ms = p_at where id = v_id;
         -- A task that leaves the gate ends its run of `no_room`.
         update mission_missions set gate_room_task = null, gate_room_since_ms = null,
@@ -1506,8 +1458,7 @@ begin
             select * from jsonb_populate_record(null::mission_missions,
                 jsonb_build_object('accept', 'review', 'scenario_floor', 0,
                                    'gate_rejections', 0, 'gate_aborts', 0, 'gate_room_waits', 0,
-                                   'gate_room_escalated', false, 'gate_host_faults', 0)
-                || (p_record -> 'row'));
+                                   'gate_room_escalated', false) || (p_record -> 'row'));
         when 'mission_residents' then
             insert into mission_residents
             select * from jsonb_populate_record(null::mission_residents, p_record -> 'row');
@@ -1534,18 +1485,6 @@ begin
       from spawn_append_trusted('agent_control', 'session_control', null, 'control', null,
                                 jsonb_build_object('name', 'control.recorded',
                                                    'detail', jsonb_build_object('record', p_record))) a;
-    -- A host fault is judged again `backoff_ms` after its own record: its
-    -- `due_ms` is the record's time plus that, which only the append knows.
-    -- It is written into the record in the transaction that appends it, so
-    -- no reader ever sees the record without it.
-    if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
-       and jsonb_typeof(p_record -> 'backoff_ms') = 'number' then
-        p_record := p_record || jsonb_build_object(
-            'due_ms', v_at + (p_record ->> 'backoff_ms')::numeric::bigint);
-        update spawn_events
-           set kind = jsonb_set(kind, '{detail,record}', p_record)
-         where id = v_id;
-    end if;
     perform spawn_control_apply(p_record, v_at);
     return v_id;
 end $$;
@@ -1629,26 +1568,12 @@ begin
     return v_id;
 end $$;
 
--- Who cancels, as a `task.cancelled` record names it (`by`): the caller of
--- a checked function, `spawn_supervisor` for the supervisor's login and
--- `human` for the owner's (the CLI; Spawn's loops record their own
--- cancellations under their names: `spawn-integrate`, `spawn-dispatch`).
--- The scorecard tells a person's cancellation from Spawn's by it
--- (docs/design.md §15); a record from before it names none, and counts as
--- a person's.
-create or replace function spawn_task_cancel_by() returns text
-language sql stable as $$
-    select case spawn_mission_caller() when 'spawn_supervisor' then 'spawn_supervisor'
-                                       else 'human' end
-$$;
-
 -- A close or a retirement cancels, in its fold, the work the closure rule
 -- does not let go on. Its writer then gives each task of `p_open` (the ones
 -- open before the close) that the fold cancelled its own `task.cancelled`
 -- record, so the task's stages end with `cancelled`. The record repeats what
 -- the fold did; the fold itself never appends, so replaying the log gives
 -- the same tables and adds nothing. Called under the append lock.
--- The record names `by`, the caller (spawn_task_cancel_by).
 create or replace function spawn_task_record_cancelled(p_open bigint[])
 returns void language plpgsql as $$
 declare
@@ -1657,8 +1582,7 @@ begin
     for v_task in
         select id from mission_tasks where id = any(p_open) and state = 'cancelled' order by id
     loop
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
-                                                        'by', spawn_task_cancel_by()));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
     end loop;
 end $$;
 
@@ -1852,77 +1776,7 @@ begin
                      and state not in ('accepted', 'cancelled', 'landing', 'landed')) then
         raise exception 'task % is already closed', p_task;
     end if;
-    perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task,
-                                                    'by', spawn_task_cancel_by()));
-end $$;
-
--- The dispatcher's re-issue, owner only (docs/fleet-architecture.md §3,
--- "Deliveries"): a task waiting for its first delivery, whose retries are
--- spent and none of whose attempts may have typed, is cancelled and
--- assigned again, in this one transaction, so its objective (if any) has a
--- task in flight throughout. `p_attempts` is every attempt of the spent
--- delivery, in order (`command`, `key`, `error`), as the dispatcher read
--- them from the queue: the `task.cancelled` record keeps them, names `by`
--- `spawn-dispatch` and `reissued_as` the new task, whose `task.assigned`
--- names `reissue_of` and copies the old task's mission, kind, worker (a
--- resident's; an ephemeral task gets a new worker with the same label, as
--- `spawn_task_assign` names it), brief, model, objective, scenario and
--- `created_by`. Refused for a task that is not `assigned` at revision 0,
--- one that is itself a re-issue, or one the closure rule holds. Returns the
--- new task's id.
-create or replace function spawn_task_reissue(p_task bigint, p_attempts jsonb)
-returns bigint language plpgsql security definer as $$
-declare
-    v_old mission_tasks%rowtype;
-    v_id bigint;
-    v_agent text;
-    v_session text;
-    v_label text;
-begin
-    -- Check and record under the append lock, so no other change interleaves.
-    perform pg_advisory_xact_lock(1399957335);
-    if spawn_mission_caller() is distinct from 'owner' then
-        raise exception '% may not re-issue tasks', session_user using errcode = '42501';
-    end if;
-    select * into v_old from mission_tasks where id = p_task;
-    if v_old.id is null then
-        raise exception 'task % does not exist', p_task;
-    end if;
-    if v_old.state <> 'assigned' or v_old.revisions <> 0 then
-        raise exception 'task % is %, not waiting for its first delivery: it is not re-issued',
-            p_task, v_old.state;
-    end if;
-    if v_old.reissue_of is not null then
-        raise exception 'task % re-issues task % already: it is not re-issued again',
-            p_task, v_old.reissue_of;
-    end if;
-    if jsonb_typeof(p_attempts) is distinct from 'array' or jsonb_array_length(p_attempts) = 0 then
-        raise exception 'the re-issue of task % names no attempts of its delivery', p_task;
-    end if;
-    if not exists (select 1 from mission_missions
-                    where id = v_old.mission_id and state in ('open', 'active'))
-       or not spawn_task_may_move(p_task, 'cancelled') then
-        raise exception 'task % may not be assigned again (its mission or worker is closed)',
-            p_task;
-    end if;
-    v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
-    if v_old.kind = 'ephemeral' then
-        v_label := coalesce(substring(v_old.agent_id from '^agent_worker_(.+)_[0-9]+$'), 'task');
-        v_agent := format('agent_worker_%s_%s', v_label, v_id);
-        v_session := format('session_worker_%s_%s', v_label, v_id);
-    else
-        v_agent := v_old.agent_id;
-        v_session := v_old.session_id;
-    end if;
-    perform spawn_control_record(jsonb_build_object(
-        'type', 'task.cancelled', 'id', p_task, 'by', 'spawn-dispatch', 'reissued_as', v_id,
-        'attempts', p_attempts));
-    perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
-        'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
-        'kind', v_old.kind, 'agent_id', v_agent, 'session_id', v_session,
-        'brief', v_old.brief, 'model', v_old.model, 'created_by', v_old.created_by,
-        'objective', v_old.objective, 'scenario', v_old.scenario, 'reissue_of', p_task)));
-    return v_id;
+    perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
 end $$;
 
 -- A resident starts only after a human approves it.
@@ -2115,11 +1969,7 @@ end $$;
 -- The owner moved a source's main forward outside the gate (a deploy): the
 -- missions whose baseline is `p_from` take `p_to` instead of halting. The
 -- caller checks that `p_to` descends from `p_from`; returns how many missions
--- moved. A mission without a baseline yet, or halted, is left alone. The
--- move is recorded for every deploy, also when it moves no mission
--- (`missions` empty: the fold moves nothing then): a deploy is when a host
--- fault may have gone, and the dispatcher tries every spent delivery once
--- more after each `source.moved` record.
+-- moved. A mission without a baseline yet, or halted, is left alone.
 create or replace function spawn_source_moved(p_source text, p_from text, p_to text)
 returns integer language plpgsql security definer as $$
 declare
@@ -2135,9 +1985,11 @@ begin
     select count(*), coalesce(jsonb_agg(id order by id), '[]'::jsonb) into v_count, v_missions
       from mission_missions
      where sources ->> 0 = p_source and baseline = p_from and halted is null;
-    perform spawn_control_record(jsonb_build_object(
-        'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
-        'missions', v_missions));
+    if v_count > 0 then
+        perform spawn_control_record(jsonb_build_object(
+            'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
+            'missions', v_missions));
+    end if;
     return v_count;
 end $$;
 
@@ -2160,38 +2012,14 @@ begin
     end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
-                                          'aborted', 'stale', 'no_room', 'host_fault') then
+                                          'aborted', 'stale', 'no_room') then
         raise exception 'unknown gate verdict %', p_record ->> 'verdict';
     end if;
-    -- A host fault names its evidence (§14): the failures the gate printed,
-    -- each the host's, and, when the test database's log decided it, the
-    -- crash lines stamped inside the gate's window; and its backoff.
-    if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
-       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log')
-            or case when jsonb_typeof(p_record -> 'failures') = 'array'
-                    then jsonb_array_length(p_record -> 'failures') else 0 end = 0
-            or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
-            or (p_record ->> 'evidence' = 'server_log'
-                and case when jsonb_typeof(p_record -> 'crash') = 'array'
-                         then jsonb_array_length(p_record -> 'crash') else 0 end = 0)) then
-        raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
-                        p_record;
-    end if;
-    -- No room to judge names what it measured: the check that fell short
-    -- (`disk`, `memory` or `database`), its `measured` and its `threshold`
-    -- (the integrator's checks before a gate, docs/fleet-architecture.md
-    -- §10.3); a disk one, or one that names no check (the gate's own fact,
-    -- and records from before the checks), the free space and the directory.
+    -- No room to judge names what it saw: the free space and the directory.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'no_room'
-       and ((p_record ? 'check'
-             and (coalesce(p_record ->> 'check', '') not in ('disk', 'memory', 'database')
-                  or coalesce(p_record ->> 'measured', '') = ''
-                  or coalesce(p_record ->> 'threshold', '') = ''))
-            or (coalesce(p_record ->> 'check', 'disk') = 'disk'
-                and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
-                     or p_record ->> 'tmpdir' is null))) then
-        raise exception 'a no_room verdict names its check, measured and threshold, and a disk one free_kb and tmpdir: %',
-                        p_record;
+       and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
+            or p_record ->> 'tmpdir' is null) then
+        raise exception 'a no_room verdict names free_kb and tmpdir: %', p_record;
     end if;
     -- The gate runs for minutes: the task may have been closed meanwhile.
     -- A verdict only moves work that is still waiting for it.
@@ -2264,7 +2092,7 @@ begin
          where k.id = (p_record ->> 'id')::bigint
            and spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)) then
         perform spawn_control_record(jsonb_build_object(
-            'type', 'task.cancelled', 'id', (p_record ->> 'id')::bigint, 'by', 'spawn-integrate'));
+            'type', 'task.cancelled', 'id', (p_record ->> 'id')::bigint));
     end if;
     return v_recorded;
 end $$;
@@ -2290,8 +2118,7 @@ begin
     perform pg_advisory_xact_lock(1399957335);
     if exists (select 1 from mission_tasks k where k.id = p_task and k.state = 'landing')
        and not spawn_task_may_move(p_task, 'landing') then
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task,
-                                                        'by', 'spawn-integrate'));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task));
     end if;
     perform pg_advisory_unlock(1399957337);
     return false;
@@ -2336,14 +2163,6 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
--- The `source.moved` records (deploys), found without reading the rest of
--- the stream: the dispatcher reads the latest on every step
--- (`LATEST_SOURCE_MOVED`).
-create index if not exists spawn_events_source_moved
-    on spawn_events (session_seq)
-    where session_id = 'session_control' and event_name = 'control.recorded'
-      and kind -> 'detail' -> 'record' ->> 'type' = 'source.moved';
-
 -- The `no_room` gate records that escalate, found without reading the rest
 -- of the stream (the dispatcher reads them on every step).
 create index if not exists spawn_events_gate_room
@@ -2351,15 +2170,6 @@ create index if not exists spawn_events_gate_room
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
       and kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
-      and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
-
--- The `host_fault` gate records that escalate (the second host fault in a
--- row), found the same way.
-create index if not exists spawn_events_gate_host_fault
-    on spawn_events (session_seq)
-    where session_id = 'session_control' and event_name = 'control.recorded'
-      and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
-      and kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
       and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
 
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
@@ -2429,7 +2239,7 @@ begin
     foreach v_function in array array[
         'spawn_task_may_continue(text, text, boolean, text)',
         'spawn_task_may_move(bigint, text)',
-        'spawn_task_record_cancelled(bigint[])', 'spawn_task_cancel_by()'] loop
+        'spawn_task_record_cancelled(bigint[])'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -2451,8 +2261,7 @@ begin
          where not spawn_task_may_continue(k.state, m.state, m.gate is not null, r.state)
          order by k.id
     loop
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
-                                                        'by', 'spawn-migrate'));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
     end loop;
 end
 $$;
@@ -2483,8 +2292,7 @@ begin
            and last.type not in ('task.cancelled', 'task.aborted')
          order by k.id
     loop
-        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task,
-                                                        'by', 'spawn-migrate'));
+        perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', v_task));
     end loop;
 end
 $$;
@@ -2501,8 +2309,7 @@ begin
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
-        'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
-        'spawn_resident_propose(text, text)',
+        'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',

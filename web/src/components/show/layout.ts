@@ -131,15 +131,14 @@ export function routePath(route: NodeKey[], stage: Stage): string | null {
 /** Seconds a mark takes: longer paths a little slower, never sluggish. */
 export const travelSeconds = scaleLinear().domain([0, 1400]).range([1.1, 3.2]).clamp(true);
 
-/** Mark colours: the trace kinds' slots (spawn.css --trace-*, stepped for
- * the dimmed canvas), one per kind of work, and a quiet neutral for plain
- * log appends. */
+/** Mark colours: the validated categorical order (dataviz palette, dark),
+ * one per kind of work, and the faint text tone for plain log appends. */
 export const TONE_COLOR: Record<Tone, string> = {
-  commit: "#4a93ea",
-  command: "#e7703a",
-  task: "#22ab7b",
+  commit: "#3987e5",
+  command: "#d95926",
+  task: "#199e70",
   landing: "#c98500",
-  trace: "#7d848e",
+  trace: "#646b75",
 };
 
 export const TONE_LABEL: Record<Tone, string> = {

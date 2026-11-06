@@ -14,19 +14,15 @@
 #       then deleted. The integrator runs on a fresh root that never held X:
 #       the task lands, the source's main carries X's file, and the gate
 #       judged a candidate with the pushed branch's tree.
-#   (2) A pushed branch that lags is stale where no host holds the recorded
-#       checkpoint. Agent Y makes checkpoints C1 then C2 on host A; the
-#       source's spawn/Y is moved back to C1 (a push that was lost). On the
-#       fresh root (no branch of Y), and on host A while its branch of Y is
-#       at a commit past C2 that has no record, nothing lands, main does not
-#       move, the task goes back to `reported` (verdict `stale`, not a
-#       rejection), and host A's branch of Y is left where it was.
-#   (3) A lost push of the recorded checkpoint is made again, and the
-#       mounted workspace is not the candidate (issue #8). With host A's
-#       branch of Y back at C2, the agent's latest recorded checkpoint, the
-#       integrator on host A pushes C2 to the source again and lands exactly
-#       C2: Y's file at its C2 content, and not a file Y's mounted workspace
-#       holds that was never checkpointed.
+#   (2) A pushed branch that lags is stale. Agent Y makes checkpoints C1 then
+#       C2 on host A; the source's spawn/Y is moved back to C1 (a pusher that
+#       has not caught up). On the fresh root and on host A alike, nothing
+#       lands, main does not move, the task goes back to `reported` (verdict
+#       `stale`, not a rejection), and host A's own branch of Y is untouched.
+#   (3) The mounted workspace is not the candidate. While Y is mounted on
+#       host A with a file written after its last checkpoint, spawn/Y catches
+#       up to C2 and the integrator on host A lands exactly C2: Y's file at
+#       its C2 content, and not the unpushed file.
 #
 # Exit status: 0 every check passed; 1 an assertion failed (the behaviour is
 # missing or wrong); 2 a harness or infrastructure failure. Any unexpected
@@ -295,15 +291,6 @@ latest_checkpoint() {
     q "select kind -> 'detail' -> 'artifact' ->> 'commit' from spawn_events
        where agent_id = '$1' and event_name = 'artifact.committed' order by id desc limit 1"
 }
-# Host A's mirror of the source that holds the agent's branch.
-host_mirror() {
-    for mirror in "$host_a"/.sources/*.git; do
-        [ "$(basename "$mirror")" = scratch.git ] && continue
-        git --git-dir="$mirror" rev-parse --verify --quiet "refs/heads/$1" >/dev/null &&
-            echo "$mirror" && return 0
-    done
-    harness "host A holds no branch of $1"
-}
 # The agent's branch in host A's mirror of the source.
 host_branch() {
     for mirror in "$host_a"/.sources/*.git; do
@@ -355,8 +342,7 @@ assert_eq "$(judged_tree)" "$(tree_of "$pushed_x")" "(1) the gate judged the pus
 main1=$(src_ref refs/heads/main)
 [ "$main1" != "$main0" ] || fail "(1) main did not move"
 
-# --- (2) a pushed branch that lags the recorded checkpoint is stale where no
-# host holds that checkpoint ---------------------------------------------------
+# --- (2) a pushed branch that lags the last checkpoint is stale ---------------
 
 task_y=$(assign y)
 agent_y=$(task_agent "$task_y")
@@ -385,17 +371,9 @@ done
 [ -f "$host_a/$agent_y/UNPUSHED.txt" ] || harness "UNPUSHED.txt is not in Y's mounted workspace"
 assert_eq "$(latest_checkpoint "$agent_y")" "$c2" "(2) no checkpoint since C2"
 
-# The push of C2 was lost: spawn/Y is still at C1. (Set after the last tick:
-# a tick's pusher would publish C2 again.)
+# The pusher has not caught up: spawn/Y is still at C1. (Set after the last
+# tick: a tick's pusher would publish C2 again.)
 git --git-dir="$source" update-ref "refs/heads/spawn/$agent_y" "$c1" "$c2"
-# Host A's branch of Y is past C2 at a commit with no record (as when a
-# checkpoint's commit is made and its record is still due): not the recorded
-# checkpoint, so it is not pushed.
-mirror_a=$(host_mirror "$agent_y")
-c3=$(git --git-dir="$mirror_a" commit-tree "$c2^{tree}" -p "$c2" -m "no record") ||
-    harness "could not make an unrecorded commit on host A"
-git --git-dir="$mirror_a" update-ref "refs/heads/$agent_y" "$c3" "$c2" ||
-    harness "could not move host A's branch of Y past C2"
 
 report "$task_y" ky1
 judged_before=$(wc -l <"$WORK/judged.log" | tr -d ' ')
@@ -405,24 +383,17 @@ assert_eq "$(src_ref refs/heads/main)" "$main1" \
 assert_eq "$(task_state "$task_y")" reported "(2) a lagging push is stale, the task stays reported (fresh root)"
 integrate_on "$host_a"
 assert_eq "$(src_ref refs/heads/main)" "$main1" \
-    "(2) main moved while host A's branch of $agent_y is not the recorded checkpoint (host A; integrate: $(log_tail))"
-assert_eq "$(task_state "$task_y")" reported \
-    "(2) a lagging push is stale while no host holds the recorded checkpoint (host A)"
-assert_eq "$(src_ref "refs/heads/spawn/$agent_y")" "$c1" \
-    "(2) a branch head that is not the recorded checkpoint was pushed"
-assert_eq "$(host_branch "$agent_y")" "$c3" "(2) the integrator left host A's own branch of Y alone"
+    "(2) main moved while spawn/$agent_y lags the last checkpoint (host A; integrate: $(log_tail))"
+assert_eq "$(task_state "$task_y")" reported "(2) a lagging push is stale, the task stays reported (host A)"
+assert_eq "$(host_branch "$agent_y")" "$c2" "(2) the integrator left host A's own branch of Y alone"
 assert_eq "$(q "select revisions from mission_tasks where id = $task_y")" 0 \
     "(2) a stale task is not sent back as a rejection"
 
-# --- (3) the lost push of the recorded checkpoint is made again; the mounted
-# workspace is not the candidate ----------------------------------------------
+# --- (3) the pusher catches up; the mounted workspace is not the candidate ----
 
-git --git-dir="$mirror_a" update-ref "refs/heads/$agent_y" "$c2" "$c3" ||
-    harness "could not move host A's branch of Y back to C2"
+git --git-dir="$source" update-ref "refs/heads/spawn/$agent_y" "$c2" "$c1"
 integrate_on "$host_a"
-assert_eq "$(src_ref "refs/heads/spawn/$agent_y")" "$c2" \
-    "(3) the recorded checkpoint C2 was pushed again from host A (integrate: $(log_tail))"
-assert_eq "$(task_state "$task_y")" landed "(3) task Y once C2 was pushed again (integrate: $(log_tail))"
+assert_eq "$(task_state "$task_y")" landed "(3) task Y once spawn/$agent_y caught up (integrate: $(log_tail))"
 assert_eq "$(main_file Y.txt)" two "(3) Y.txt on main is the content of the last checkpoint"
 assert_eq "$(main_file UNPUSHED.txt)" missing \
     "(3) a file only in the mounted workspace, never checkpointed or pushed, must not land"
@@ -430,5 +401,5 @@ assert_eq "$(main_file X.txt)" from-x "(3) X's landing is still on main"
 assert_eq "$(judged_tree)" "$(tree_of "$c2")" "(3) the gate judged C2's tree"
 [ "$(wc -l <"$WORK/judged.log" | tr -d ' ')" -gt "$judged_before" ] || fail "(3) the gate never ran for Y"
 
-echo "004: landed from spawn/<agent> on a fresh root, refused a lagging push as stale, pushed a lost recorded checkpoint again, ignored the mounted workspace"
+echo "004: landed from spawn/<agent> on a fresh root, refused a lagging push as stale, ignored the mounted workspace"
 exit 0
