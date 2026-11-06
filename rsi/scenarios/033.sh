@@ -99,7 +99,7 @@
 # assignment; run 1 is gated `aborted` ("the gate failed: the gate ended with
 # exit status: 4"; gate_aborts 0 -> 1); run 2 starts in the next pass,
 # 0.34-0.42 s after run 1's record, `aborted` (2), with no wait of any kind;
-# run 3 0.30-0.34 s after run 2's, `aborted` (3); the next pass halts the
+# run 3 0.30-0.35 s after run 2's, `aborted` (3); the next pass halts the
 # mission "3 gate aborts in a row", 1.25-1.43 s after the first abort: three
 # disagreeing bases halt a mission for a person in under a second and a half
 # (the halt reaches the supervisor only as 013's halted-mission stall; 1800 s
