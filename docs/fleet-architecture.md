@@ -287,8 +287,20 @@ it, on the same ladder.
   `spawn submit`. The dispatcher wakes it by typing a digest into its pane
   while it is idle; digests coalesce while it works. Its memory is its native
   session (restored by resume) plus the log.
-- **Human**: the attention queue in the UI lists only what the supervisor
-  escalated or could not resolve. Each human action is a command with
+- **Human**: the attention queue in the UI ("Needs a human", top of the
+  Fleet page) is computed by the dispatcher's own code, not by the UI:
+  `GET /api/attention` runs the plan of the dispatcher's pass for this moment
+  (`dispatch::read_plan`, the function the pass itself calls: the same facts,
+  mission rows, disk and gate-room records and stalls, then `decide_with`)
+  and submits, marks and collects nothing. The queue shows, top to bottom:
+  the supervisor's open question, when its turn ended at its prompt judged
+  BLOCKED or WAITING with `needs_human` at least 0.5 (or with a `HUMAN:` line),
+  in its own words from its transcript, with when it was asked and its last
+  `HUMAN:` line not answered since; then the escalations not yet told to the
+  supervisor; then those its digests told it that still hold, with when they
+  were told. A managed worker between tasks is not in it, since the
+  dispatcher does not escalate it. Each item carries its digest heading, its
+  line, its agent and its age. Each human action is a command with
   principal `human`; it is the event the whole system tries to make rarer.
 - **Inputs to a busy session wait for its turn.** A person's or the
   supervisor's input (`spawn submit`, any principal but `spawn-dispatch`,
@@ -505,15 +517,22 @@ decisions per agent-hour over the last 24 h) are computed from the log by
 
 | View | Answers |
 | --- | --- |
-| Attention queue (top of the board) | What reached a human, since when, the question on the screen, which tiers already tried |
+| Attention queue (top of the board) | The supervisor's open question in full; the dispatcher's escalations not yet told to the supervisor, and those told and unresolved, each with its heading, line, agent and age (`/api/attention`, computed by the dispatcher's code) |
 | Fleet board | One card per agent: role, engine, state and for how long, decided by rules / Jev / supervisor, task, current tool |
 | Agent detail | Live terminal; the Jev panel (distribution, needs_human, stuck, evidence, rules-vs-Jev); state timeline; event timeline |
 | Ladder health | Decisions per tier, escalations, human decisions per agent-hour, Jev failures and disagreements with the rules, engine restarts |
 | Missions | Missions with their landing settings; tasks with brief, report and review note; residents waiting for a human's approval |
 | RSI | Objective missions: the backlog's objectives, tasks, gate verdicts and logs, metrics, the resident's terminal |
 
-The API is read-only. Humans talk to the supervisor through
-`spawn submit --session session_supervisor --action '{"type":"input",...}'`.
+The API is read-only: `/api/overview`, `/api/fleet` (with
+`/api/fleet/<session>/judgements` and `/commands`), `/api/attention`,
+`/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
+`/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
+`/api/scorecard`; each answer's shape is documented in
+`crates/spawn-cli/src/serve.rs` and, for `/api/attention`, in
+`crates/spawn-cli/src/serve/attention.rs`. Humans talk to the supervisor
+through its pane, or `spawn submit --session session_supervisor --action
+'{"type":"input",...}'`.
 
 ## 6. Invariants
 
@@ -530,6 +549,7 @@ Known edges, each with its rule:
 | --- | --- |
 | The UI's live terminal reads tmux | A compute peek, labelled as such; the stored copy is the screen tail in each model observation |
 | The supervisor's native transcript lives on the host (`~/.claude`, copied to the host's transcript archive) | A cache; the handoff rebuilt from the log is the authoritative recovery path (§3.1) |
+| The attention queue reads the supervisor's question from its transcript | A compute peek at the transcript the log names (`session.native_started`), read by the Observer's own reply reader; where it cannot be read, the screen tail stored with the judgement stands in, labelled as such |
 | Code lives in git | Artifact storage; every commit is referenced from an event |
 
 - The event log is the only state; every process is restartable.
