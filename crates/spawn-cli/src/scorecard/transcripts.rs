@@ -64,7 +64,12 @@ struct Usage {
 
 impl Usage {
     fn total(&self) -> i64 {
-        let sum = [self.input, self.cache_creation, self.cache_read, self.output]
+        let sum = [
+            self.input,
+            self.cache_creation,
+            self.cache_read,
+            self.output,
+        ]
         .into_iter()
         .flatten()
         .fold(0_u64, u64::saturating_add);
@@ -119,8 +124,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Fold one file's lines into `messages`, keyed by message id.
-fn read_file(path: &Path, messages: &mut BTreeMap<String, (i64, String, i64)>) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+fn read_file(
+    path: &Path,
+    messages: &mut BTreeMap<String, (i64, String, i64)>,
+) -> Result<(), String> {
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
     let mut bytes = Vec::new();
     loop {

@@ -256,7 +256,9 @@ pub(crate) fn stall_of(tag: &str) -> Option<(&str, i64)> {
     if !number(task)
         || !number(n)
         || step.is_empty()
-        || !step.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        || !step
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
     {
         return None;
     }
@@ -439,10 +441,12 @@ impl Fold {
                 let at = int(&record.created_at_ms).unwrap_or(record.at);
                 self.assigned(record, at);
                 let Some(id) = int(&record.id) else { return };
-                let gated = self.task_mission(Some(id)).is_some_and(|m| self.mission(m).gated);
+                let gated = self
+                    .task_mission(Some(id))
+                    .is_some_and(|m| self.mission(m).gated);
                 let state = text(&record.state).unwrap_or_default();
-                let closed = matches!(state, "cancelled" | "landed")
-                    || (state == "accepted" && !gated);
+                let closed =
+                    matches!(state, "cancelled" | "landed") || (state == "accepted" && !gated);
                 if let Some(task) = self.history.tasks.get_mut(&id) {
                     task.delivered_at = int(&record.delivered_at_ms);
                     if closed {
@@ -604,10 +608,18 @@ impl History {
             let mission = self.command_mission(command, &by_session);
             let at = command.created_at_ms;
             if matches!(command.principal.as_str(), "human" | "spawn") {
-                marks.push(Mark { at, mission, kind: Kind::Command });
+                marks.push(Mark {
+                    at,
+                    mission,
+                    kind: Kind::Command,
+                });
             }
             if command.succeeded == Some(false) {
-                marks.push(Mark { at, mission, kind: Kind::FailedCommand });
+                marks.push(Mark {
+                    at,
+                    mission,
+                    kind: Kind::FailedCommand,
+                });
             }
             if command.principal == "spawn-dispatch" {
                 if let Some((task, delivery)) = delivery_of(&command.key) {
@@ -633,7 +645,11 @@ impl History {
                         // Once, at the first digest that carried it.
                         if stalls.insert(stall.to_string()) {
                             let mission = self.tasks.get(&task).map(|task| task.mission);
-                            marks.push(Mark { at, mission, kind: Kind::Stall });
+                            marks.push(Mark {
+                                at,
+                                mission,
+                                kind: Kind::Stall,
+                            });
                         }
                     }
                 }

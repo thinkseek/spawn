@@ -243,7 +243,11 @@ impl Better {
 
 /// `better`, `worse` or `same`: the rounded values compared by the
 /// direction; `None` when either is missing.
-pub(crate) fn trend(value: Option<Number>, previous: Option<Number>, better: Better) -> Option<&'static str> {
+pub(crate) fn trend(
+    value: Option<Number>,
+    previous: Option<Number>,
+    better: Better,
+) -> Option<&'static str> {
     let (value, previous) = (value?.key(), previous?.key());
     Some(match (value.cmp(&previous), better) {
         (std::cmp::Ordering::Equal, _) => "same",
@@ -268,7 +272,10 @@ fn usize_json(value: usize) -> Value {
 
 fn per_landed(counts: &Counts, enough: bool, numerator: impl Into<i128>) -> Option<Number> {
     if enough {
-        milli(numerator, i128::try_from(counts.landed).unwrap_or(i128::MAX))
+        milli(
+            numerator,
+            i128::try_from(counts.landed).unwrap_or(i128::MAX),
+        )
     } else {
         None
     }
@@ -358,7 +365,11 @@ fn first_pass(counts: &Counts, enough: bool) -> Dimension {
     let mut parts = Map::new();
     parts.insert("first_pass".into(), usize_json(counts.first_pass));
     Dimension {
-        value: per_landed(counts, enough, i128::try_from(counts.first_pass).unwrap_or(0)),
+        value: per_landed(
+            counts,
+            enough,
+            i128::try_from(counts.first_pass).unwrap_or(0),
+        ),
         n: counts.landed,
         better: Better::Higher,
         parts,

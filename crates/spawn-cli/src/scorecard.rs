@@ -43,8 +43,7 @@ const DEFAULT_SPAN_MS: i64 = 7 * DAY_MS;
 /// The longest window a scorecard measures, so one request stays bounded.
 const MAX_WINDOW_DAYS: i64 = 400;
 
-const USAGE: &str =
-    "usage: spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
+const USAGE: &str = "usage: spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
 
 /// What a scorecard is asked: the flags of `spawn scorecard`, the
 /// parameters of `/api/scorecard`.
@@ -134,8 +133,16 @@ pub(crate) fn measure(
     query: &Query,
 ) -> Result<Value, Failure> {
     let mission = query.mission.as_deref().map(mission_of).transpose()?;
-    let since = query.since.as_deref().map(|text| when("since", text)).transpose()?;
-    let until = query.until.as_deref().map(|text| when("until", text)).transpose()?;
+    let since = query
+        .since
+        .as_deref()
+        .map(|text| when("since", text))
+        .transpose()?;
+    let until = query
+        .until
+        .as_deref()
+        .map(|text| when("until", text))
+        .transpose()?;
     let root = root.ok_or_else(|| {
         Failure::Record(
             "no transcript archive to read the cost from: SPAWN_WORKSPACE_ROOT is not set \
@@ -157,11 +164,9 @@ pub(crate) fn measure(
     )
     .map_err(|error| Failure::Record(format!("the record's facts: {error}")))?;
     let previous_since = window.since - (window.until - window.since);
-    let messages = transcripts::read_archive(
-        &root.join(spawn_host::TRANSCRIPT_DIRECTORY),
-        previous_since,
-    )
-    .map_err(Failure::Record)?;
+    let messages =
+        transcripts::read_archive(&root.join(spawn_host::TRANSCRIPT_DIRECTORY), previous_since)
+            .map_err(Failure::Record)?;
     let mut history = History::from_record(&facts, &messages);
     history.clip(previous_since, window.until);
     card(&history, window, mission)
@@ -340,7 +345,12 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
             show(&field("events")),
             counts_of(
                 &field("by_kind"),
-                &["failed_command", "spent_delivery", "stall", "gate_infrastructure"],
+                &[
+                    "failed_command",
+                    "spent_delivery",
+                    "stall",
+                    "gate_infrastructure"
+                ],
             )
         ),
         "cost" => {
@@ -352,7 +362,9 @@ fn parts_of(name: &str, field: &dyn Fn(&str) -> Value) -> String {
                         .map(|(model, part)| {
                             let tokens = part.get("tokens").map(show).unwrap_or_default();
                             match part.get("per_landed").filter(|value| !value.is_null()) {
-                                Some(per) => format!("{model} {tokens} ({} per landing)", show(per)),
+                                Some(per) => {
+                                    format!("{model} {tokens} ({} per landing)", show(per))
+                                }
                                 None => format!("{model} {tokens}"),
                             }
                         })
@@ -477,7 +489,12 @@ pub(crate) fn text(card: &Value) -> String {
         format_rfc3339(at("previous_since_ms")),
         show(&min_n)
     );
-    for scope in card.get("scopes").and_then(Value::as_array).into_iter().flatten() {
+    for scope in card
+        .get("scopes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let title = match scope.get("mission").and_then(Value::as_i64) {
             Some(id) => format!("mission {id}"),
             None => "fleet".to_string(),
