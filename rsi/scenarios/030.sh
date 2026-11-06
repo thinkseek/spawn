@@ -15,6 +15,13 @@
 # by its latest judgement (objective 011), an admission wait over its bound
 # (029's records), a backup older than its schedule and a failed restore
 # drill (031's records), and a model login that expired (028's record).
+# Two alerts the owner ruled (2026-11-06) for objectives solved before this
+# one are fields of their producers' records until it exists, and alerts
+# here: 033's (a `task.gated` host fault with `alert` true: the third base
+# in a row that disagreed with itself) and 031's (a backup record with
+# `over_alert` true: R2 over its 8 GB alert threshold). The PostgreSQL log
+# files the crash alert reads are the owner's to provide (deploy/); the
+# scenario writes its own.
 #
 # A real `spawn loop` (the Bridge, the dispatcher, the supervisor) runs a
 # resident `r1` of one gated mission and the supervisor on a fake engine,
@@ -28,7 +35,7 @@
 # SPAWN_DATABASE_LOG naming two log files of its own, and host thresholds
 # that cannot fire (SPAWN_ALERT_MEMORY_LOW_MB=1, SPAWN_ALERT_TMPFS_HIGH_MB=
 # 100000000 on SPAWN_ALERT_TMPFS_PATH=$WORK/ram) except while it is
-# restarted to make them fire. The records 028, 029 and 031 define are
+# restarted to make them fire. The records 028, 029, 031 and 033 define are
 # appended to the log as their producers write them (spawn_append_trusted,
 # no fold), so this objective does not wait for theirs. Checked:
 #   (1) `spawn alerts --once --json` exits 0 with a JSON array, `GET
@@ -68,7 +75,11 @@
 #       after them and within 9 s, cleared by newer ones; `backup.verified`
 #       ok false -> one `drill_failed` within 5 s, cleared by one ok true;
 #       `execution.interrupted` cause `model_auth` -> one `model_auth`
-#       within 5 s, cleared by its `execution.cleared`.
+#       within 5 s, cleared by its `execution.cleared`; a `task.gated`
+#       host fault with `alert` true (033's) -> one `gate_base_disagrees`
+#       notice within 5 s; the dump that clears the stale one carries
+#       `over_alert` true (031's) -> one `backup_budget` within 5 s, cleared
+#       by a later dump with `over_alert` false.
 #   (9) every alert above appears once, with the same state and event ids,
 #       in `spawn alerts --once --json`, in `GET /api/alerts` and in the
 #       `--follow` stream (one `fired` line, and one `cleared` line after
@@ -966,7 +977,7 @@ if [ -z "$missing" ]; then
     fi
 fi
 
-# --- (8) the records of 028, 029 and 031 ---------------------------------------------------
+# --- (8) the records of 028, 029, 031 and 033 ------------------------------------------
 
 max_id=$(q "select max(id) from spawn_events")
 sha=$(printf 'bb-030-%s' "$run" | sha256sum | cut -d' ' -f1)
@@ -975,7 +986,11 @@ dump1=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/
 bundle1=$(append_record "{\"type\": \"backup.bundled\", \"key\": \"bundles/daily/spawn-bb-1.tar.gpg\", \"sha256\": \"$sha\", \"bytes\": 31000000}")
 drill_bad=$(append_record "{\"type\": \"backup.verified\", \"key\": \"postgres/hourly/spawn-bb-1.dump.gpg\", \"ok\": false, \"reason\": \"the restored database holds 8105 events; the dump's record says 8106\", \"events\": 8105, \"max_event_id\": $max_id, \"expected\": {\"events\": 8106, \"max_event_id\": $max_id}}")
 auth=$(append_record '{"type": "execution.interrupted", "agent_id": "agent_worker_bb_auth", "session_id": "session_worker_bb_auth", "execution_id": "exec_bb_auth", "cause": "model_auth", "evidence": {"error": "authentication_failed", "status": 401, "text": "Please run /login · API Error: 401"}, "path": "wait", "attempt": 1, "due_ms": null}')
-for id in "$wait_rec" "$dump1" "$bundle1" "$drill_bad" "$auth"; do
+# 033's alert before this objective: the third base in a row on T1's mission
+# that disagreed with itself, a host fault with `alert` true (no fold: T1's
+# state and the mission's counters do not move, so no other notice).
+gbd=$(append_record "{\"type\": \"task.gated\", \"id\": $t1, \"verdict\": \"host_fault\", \"evidence\": \"base_disagrees\", \"scenario\": \"011.sh\", \"exits\": [1, 0], \"setup_s\": 244, \"base_disagrees\": 3, \"host_faults\": 3, \"escalate\": false, \"alert\": true, \"backoff_ms\": 16000, \"due_ms\": $(($(now_ms) + 16000)), \"reason\": \"host fault: the base disagrees with itself: 011.sh exited 1, then 0 on the base (setup 244 s); not a verdict, judged again later\"}")
+for id in "$wait_rec" "$dump1" "$bundle1" "$drill_bad" "$auth" "$gbd"; do
     [ -n "$id" ] || harness "a record could not be appended to the log"
 done
 check_fire() { # <what> <kind> <subject> <record id> <wait s> <at least ms> <at most ms> <key>
@@ -990,14 +1005,28 @@ check_fire "(8) the hourly dump's age" backup_stale dump "$dump1" 10 4000 9000 "
 check_fire "(8) the daily bundle's age" backup_stale bundle "$bundle1" 10 4000 9000 "backup_stale:bundle:$bundle1"
 check_fire "(8) the failed drill" drill_failed drill "$drill_bad" 5 0 5000 "drill_failed:$drill_bad"
 check_fire "(8) the model login" model_auth session_worker_bb_auth "$auth" 5 0 5000 "model_auth:$auth"
+if fired 5 gate_base_disagrees "mission #$mission" "(8) 033's base-disagreement alert" "its record is event $gbd"; then
+    [ "$key" = "gate_base_disagrees:$gbd" ] && [ "$(field .evidence.event_id)" = "$gbd" ] &&
+        [ "$(field .state)" = notice ] && [ "$(field .evidence.scenario)" = 011.sh ] ||
+        measured_fail "(8) 033's base-disagreement alert is $alert; wanted key gate_base_disagrees:$gbd, state notice, evidence.event_id $gbd and scenario 011.sh"
+    within "(8) 033's base-disagreement alert" "$(event_at "$gbd")" 5000
+    provoked notice
+fi
 today "admission wait" "$(event_at "$wait_rec")" "agent_worker_bb_wait|admission"
 today "backup older than its schedule" "$(event_at "$dump1")" "backup|bundle"
 today "restore drill failed" "$(event_at "$drill_bad")" "drill|8105"
 today "model login expired" "$(event_at "$auth")" "exec_bb_auth|session_worker_bb_auth|login"
+today "three bases in a row that disagreed with themselves (033)" "$(event_at "$gbd")" "base|011\\.sh"
+if [ -n "$missing" ]; then
+    over=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-over.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id, \"over_alert\": true, \"held_bytes\": 8100000000, \"written_bytes\": 2400100, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
+    today "R2 over its alert threshold (031)" "$(event_at "$over")" "R2|budget|over"
+fi
 if [ -z "$missing" ]; then
     waited=$(($(now_ms) - $(event_at "$wait_rec")))
     admitted=$(append_record "{\"type\": \"admission.admitted\", \"kind\": \"execution\", \"agent_id\": \"agent_worker_bb_wait\", \"session_id\": \"session_worker_bb_wait\", \"envelope_bytes\": 6442450944, \"waited_ms\": $waited}")
-    dump2=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-2.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id}")
+    # The dump that clears the stale one also finds R2 over its alert
+    # threshold (031's `over_alert`).
+    dump2=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-2.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400100, \"events\": 8107, \"max_event_id\": $max_id, \"over_alert\": true, \"held_bytes\": 8100000000, \"written_bytes\": 2400100, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
     bundle2=$(append_record "{\"type\": \"backup.bundled\", \"key\": \"bundles/daily/spawn-bb-2.tar.gpg\", \"sha256\": \"$sha\", \"bytes\": 31000100}")
     drill_ok=$(append_record "{\"type\": \"backup.verified\", \"key\": \"postgres/hourly/spawn-bb-2.dump.gpg\", \"ok\": true, \"reason\": \"\", \"events\": 8107, \"max_event_id\": $max_id, \"expected\": {\"events\": 8107, \"max_event_id\": $max_id}}")
     auth_ok=$(append_record "{\"type\": \"execution.cleared\", \"execution_id\": \"exec_bb_auth\", \"session_id\": \"session_worker_bb_auth\", \"cause\": \"model_auth\", \"evidence\": {\"credentials\": \"changed\"}, \"waited_ms\": $waited}")
@@ -1017,6 +1046,18 @@ if [ -z "$missing" ]; then
             measured_fail "(8) $1 for $2 was not cleared within 8 s of the record that clears it (event $3)"
         fi
     done
+    if fired 5 backup_budget r2 "(8) R2 over its alert threshold (031)" "its record is event $dump2 (over_alert true)"; then
+        [ "$key" = "backup_budget:$dump2" ] && [ "$(field .evidence.event_id)" = "$dump2" ] &&
+            [ "$(field .evidence.held_bytes)" = 8100000000 ] && [ "$(field .evidence.alert_bytes)" = 8000000000 ] ||
+            measured_fail "(8) R2's alert is $alert; wanted key backup_budget:$dump2, evidence.event_id $dump2, held_bytes 8100000000 and alert_bytes 8000000000"
+        within "(8) R2 over its alert threshold (031)" "$(event_at "$dump2")" 5000
+        dump3=$(append_record "{\"type\": \"backup.dumped\", \"key\": \"postgres/hourly/spawn-bb-3.dump.gpg\", \"sha256\": \"$sha\", \"bytes\": 2400200, \"events\": 8108, \"max_event_id\": $max_id, \"over_alert\": false, \"held_bytes\": 7900000000, \"written_bytes\": 2400200, \"alert_bytes\": 8000000000, \"limit_bytes\": 10000000000, \"skipped\": []}")
+        if cleared 8 backup_budget r2 "(8) R2 back under its alert threshold (031)"; then
+            [ "$(field .cleared_evidence.event_id)" = "$dump3" ] ||
+                measured_fail "(8) R2's alert was cleared naming $(field '.cleared_evidence | tostring'), not the record under the threshold (event $dump3)"
+            provoked cleared
+        fi
+    fi
 fi
 
 # --- (9) the same alerts everywhere, once ---------------------------------------------------
