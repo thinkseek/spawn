@@ -153,7 +153,19 @@ test("a task's title: the objective's title, else the first line of its text", (
     taskTitle({ brief: "Owner work on Spawn: fix four open GitHub issues" }, { missionName: "Owner work on Spawn" }),
     "Fix four open GitHub issues",
   );
-  assert.equal(taskTitle({ brief: "## Goal: add a read-only Missions view" }), "Goal: add a read-only Missions view");
+  assert.equal(taskTitle({ brief: "## Goal: add a read-only Missions view" }), "Add a read-only Missions view");
+  assert.equal(
+    taskTitle(
+      { brief: "Owner work on Spawn (protected files: you may edit rsi/backlog/028.json only). Goal: record the owner's rulings." },
+      { missionName: "Owner work on Spawn" },
+    ),
+    "Record the owner's rulings.",
+  );
+  assert.equal(
+    taskTitle({ brief: "Owner-protected work on Supply PA (you may edit vitest.config.ts). The gate rejected task 38." }),
+    "The gate rejected task 38.",
+  );
+  assert.equal(taskTitle({ brief: "Owner work on Spawn:" }, { missionName: "Owner work on Spawn" }), "Owner work on Spawn:");
   assert.equal(taskTitle({ brief: "x" }, { objectiveTitle: "Land an agent's work from its pushed branch" }), "Land an agent's work from its pushed branch");
   assert.equal(taskTitle({ brief: "Objective 3: Real title" }, { objectiveTitle: "Task 3" }), "Real title");
   assert.equal(taskTitle({ brief: null }), null);
