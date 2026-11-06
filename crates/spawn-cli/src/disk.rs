@@ -643,5 +643,53 @@ free in TMPDIR /data/tmp, under SPAWN_GATE_MIN_FREE_GB=10"
             "{}",
             items[0].line
         );
+        assert!(items[0].line.starts_with("disk check: "), "{}", items[0].line);
+    }
+
+    /// Objective 018: the item names the check that fell short, its measure
+    /// and its threshold: memory and the test database too.
+    #[test]
+    fn a_gate_without_room_is_told_with_its_check_measure_and_threshold() {
+        let records = [
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 4,
+                   "check": "memory", "measured": 1500, "threshold": 2048,
+                   "event_id": 21, "mission": 7}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 5,
+                   "check": "database",
+                   "measured": "ERROR: could not resize shared memory segment (53100)",
+                   "threshold": "a parallel query within 10 s",
+                   "server": "/run/test-pg:5432/spawn_test", "event_id": 22, "mission": 8}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 6,
+                   "check": "disk", "measured": 1_048_576, "threshold": 10_485_760,
+                   "free_kb": 1_048_576, "min_gb": 10, "tmpdir": "/tmp",
+                   "event_id": 23, "mission": 9}),
+        ];
+        let items = gate_room_escalations(&records);
+        let lines: Vec<&str> = items.iter().map(|item| item.line.as_str()).collect();
+        assert_eq!(
+            lines[0],
+            "memory check: the gate of mission 7 has had no room to judge for over two hours: \
+1500 MiB of memory available, under SPAWN_GATE_MIN_FREE_MEMORY_MB=2048. Its work waits (no halt \
+counts); free memory on this host or tell the owner."
+        );
+        assert!(
+            lines[1].starts_with(
+                "database check: the gate of mission 8 has had no room to judge for over two \
+hours: the test database (/run/test-pg:5432/spawn_test) failed the probe \"a parallel query \
+within 10 s\": ERROR: could not resize shared memory segment (53100)."
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with(
+                "disk check: the gate of mission 9 has had no room to judge for over two hours: \
+1.0 GiB free in TMPDIR /tmp, under SPAWN_GATE_MIN_FREE_GB=10."
+            ),
+            "{}",
+            lines[2]
+        );
+        assert!(items.iter().all(|item| item.why == Why::GateRoom));
+        assert_eq!(items[1].tag(), "host gate-room-22");
     }
 }
