@@ -268,7 +268,7 @@ it, on the same ladder.
   measured from (the control record's id; for `activity` the `session_seq`
   of the latest fact, or the delivery record's id when no fact came after
   it): `told` sends it once, and a step that moved and stalled anew has a
-  new record and a new tag. A failed retry, a stale verdict, a nudge or a
+  new record and a new tag. A failed retry, a stale verdict, a nudge, an input waiting for its turn or a
   judgement moves no step. Every age is on the database's clock
   (`spawn_now_ms()` against the records' times); nothing is inferred from
   another loop's timing or absence; a restarted loop computes the same

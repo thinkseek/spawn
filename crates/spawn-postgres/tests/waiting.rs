@@ -76,9 +76,17 @@ fn a_stop_behind_a_waiting_input_is_handed_out_and_nothing_behind_an_input_not_w
     assert_eq!(claimed.principal, "human");
     // Its lease is let go: it is claimable again once the wait is over.
     store.release(&claimed, Duration::ZERO).expect("release");
-    let again = store.claim("w1", ttl).expect("claim").expect("the first again");
-    assert_eq!(again.command_id, first, "nothing behind an input not waiting");
-    store.release(&again, Duration::from_mins(5)).expect("release");
+    let again = store
+        .claim("w1", ttl)
+        .expect("claim")
+        .expect("the first again");
+    assert_eq!(
+        again.command_id, first,
+        "nothing behind an input not waiting"
+    );
+    store
+        .release(&again, Duration::from_mins(5))
+        .expect("release");
     assert!(
         store.claim("w1", ttl).expect("claim").is_none(),
         "unfinished and not waiting: everything behind it waits, a stop too"
@@ -107,7 +115,9 @@ fn only_the_bridges_waiting_step_lets_commands_pass() {
     let first = submit(&store, "human", "note-1", input("first"));
     submit(&store, "human", "stop-1", CommandAction::Stop);
     let claimed = store.claim("w1", ttl).expect("claim").expect("the first");
-    store.release(&claimed, Duration::from_mins(5)).expect("release");
+    store
+        .release(&claimed, Duration::from_mins(5))
+        .expect("release");
     waiting(&store, first, Source::Gateway);
     assert!(
         store.claim("w1", ttl).expect("claim").is_none(),
@@ -148,9 +158,7 @@ fn a_release_moves_only_the_lease_that_holds_the_command() {
         after > 30_000 && after <= before,
         "the stale attempt left the lease alone: {before} then {after}"
     );
-    store
-        .release(&current, Duration::ZERO)
-        .expect("release");
+    store.release(&current, Duration::ZERO).expect("release");
     assert!(lease(&schema) <= 0, "released at once");
 
     // A finished command is not revived by a release.
@@ -160,7 +168,12 @@ fn a_release_moves_only_the_lease_that_holds_the_command() {
         .expect("again");
     store.finish(&claimed, &Outcome::Succeeded).expect("finish");
     store.release(&claimed, Duration::ZERO).expect("release");
-    assert!(store.claim("w1", Duration::from_mins(1)).expect("claim").is_none());
+    assert!(
+        store
+            .claim("w1", Duration::from_mins(1))
+            .expect("claim")
+            .is_none()
+    );
 }
 
 /// The dispatcher's `evidence_seq` (what a judgement must cover not to look
