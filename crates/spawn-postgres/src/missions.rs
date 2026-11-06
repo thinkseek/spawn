@@ -812,10 +812,81 @@ impl PostgresStore {
     }
 
     /// Record a gate verdict, a landing, an abort or a halt (owner only).
+    /// A record the store declines as already made (a second `task.held`
+    /// for one task and hold: [`Self::task_held`]) is an error here.
     pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
+        self.query_one("select spawn_integrator_record($1)", &[record])?
+            .get::<_, Option<i64>>(0)
+            .ok_or_else(|| StoreError::Rejected(format!("already recorded: {record}")))
+    }
+
+    /// Take the integrator's landing lock for an owner's hold on `source`
+    /// (owner only; a source no mission names, or a remote one, is
+    /// refused): a landing whose push has begun records its outcome first.
+    /// Read the source's main while the guard lives, then record the hold
+    /// with [`Self::source_hold`].
+    pub fn source_hold_lock(&self, source: &str) -> Result<LandingHold<'_>, StoreError> {
+        self.execute("select spawn_source_hold_lock($1)", &[&source])?;
+        Ok(LandingHold { store: self })
+    }
+
+    /// Record the owner's hold on `source` at `main` (read under
+    /// [`Self::source_hold_lock`]) for `bound_s` seconds, with a `reason`:
+    /// `{hold, source, main, expires_ms, renews}`. Owner only.
+    pub fn source_hold(
+        &self,
+        source: &str,
+        main: &str,
+        bound_s: i32,
+        reason: Option<&str>,
+    ) -> Result<Value, StoreError> {
         Ok(self
-            .query_one("select spawn_integrator_record($1)", &[record])?
+            .query_one(
+                "select spawn_source_hold($1, $2, $3, $4)",
+                &[&source, &main, &bound_s, &reason],
+            )?
             .get(0))
+    }
+
+    /// Release the active hold on `source`, if there is one:
+    /// `{source, released, waiting}` (`released` null: nothing recorded).
+    /// Owner only.
+    pub fn source_release(&self, source: &str) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one("select spawn_source_release($1)", &[&source])?
+            .get(0))
+    }
+
+    /// The active hold on `source` (its `source.held` event id), read from
+    /// the fold now: the integrator reads it under the landing lock, right
+    /// before a push.
+    pub fn active_hold(&self, source: &str) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .query_opt(
+                "select hold from mission_source_holds where source = $1",
+                &[&source],
+            )?
+            .map(|row| row.get(0)))
+    }
+
+    /// Record that `task`'s landing waits behind `hold` on `source` and
+    /// pushed nothing (owner only): the event id, or `None` when one was
+    /// recorded for this task and hold already (nothing is recorded).
+    pub fn task_held(&self, task: i64, hold: i64, source: &str) -> Result<Option<i64>, StoreError> {
+        let record = serde_json::json!({"type": "task.held", "id": task, "hold": hold,
+                                        "source": source});
+        Ok(self
+            .query_one("select spawn_integrator_record($1)", &[&record])?
+            .get(0))
+    }
+
+    /// Record that `hold`, the active hold on `source`, reached its
+    /// `expires_ms` on the database's clock (owner only); the store names
+    /// its bound and the tasks waiting behind it, and refuses it before then
+    /// or for a hold that is not active. The record's event id.
+    pub fn hold_expired(&self, source: &str, hold: i64) -> Result<i64, StoreError> {
+        self.integrator_record(&serde_json::json!({"type": "source.hold_expired",
+                                                   "source": source, "hold": hold}))
     }
 
     /// Missions with a gate and the tasks the integrator may act on: open
@@ -834,6 +905,18 @@ impl PostgresStore {
     /// supervisor yet ([`GATE_HOST_FAULT_ESCALATIONS`]).
     pub fn gate_host_fault_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
+    }
+
+    /// The `source.hold_expired` records not told to the supervisor yet,
+    /// with their holds and waiting tasks ([`HOLD_EXPIRIES`]).
+    pub fn hold_expiries(&self) -> Result<Value, StoreError> {
+        self.query_json(HOLD_EXPIRIES, &[])
+    }
+
+    /// Every active owner's hold with the tasks waiting behind it, and the
+    /// database's clock ([`SOURCE_HOLDS`]).
+    pub fn source_holds(&self) -> Result<Value, StoreError> {
+        self.query_json(SOURCE_HOLDS, &[])
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.
