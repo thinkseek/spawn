@@ -294,8 +294,11 @@ export function MissionTimeline({
   };
 
   const hoveredRow = hover ? rows.list.find((row) => row.key === hover.key) : undefined;
-  const nowX = timeline.openCount > 0 ? px(now) : null;
+  // The marker follows the clock: it shows only while a task is live, never
+  // frozen at page load for a halted mission's stalled task.
+  const nowX = live ? px(now) : null;
   const totalTasks = timeline.lanes.reduce((sum, lane) => sum + lane.bars.length, 0);
+  const empty = !hasBars(timeline);
 
   return (
     <div ref={rootRef} className="relative flex min-h-0 flex-1 flex-col">
