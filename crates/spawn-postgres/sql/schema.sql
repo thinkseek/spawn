@@ -1144,7 +1144,11 @@ create table if not exists mission_tasks (
     delivered_at_ms bigint,
     -- The models the task's worker runs on (docs/fleet-architecture.md,
     -- "Engine models"): `default`, or `cheap` for simple, well-specified work.
-    model           text   not null default 'default' check (model in ('default', 'cheap'))
+    model           text   not null default 'default' check (model in ('default', 'cheap')),
+    -- The owner's hold this landing task last waited behind (`task.held`,
+    -- the `source.held` record's event id): its `land()` pushed nothing
+    -- under it. Set only by `task.held`; the hold's end does not clear it.
+    held_by         bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1175,6 +1179,7 @@ alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
+alter table mission_tasks add column if not exists held_by bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1192,6 +1197,25 @@ end
 $$;
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
+
+-- The owner's holds on mission sources (docs/fleet-architecture.md §10.3,
+-- "Landing: the owner's hold"): the fold of `source.held` (keyed by source:
+-- a source has at most one active hold, and a new one renews it) less the
+-- `source.released` or `source.hold_expired` naming its hold. While a source
+-- has a row here, no task lands on it: the integrator reads the row under
+-- the landing lock before any push. `hold` is the `source.held` record's
+-- event id, `main` the source's main when it was taken, `held_at_ms` its
+-- record's time and `expires_ms` that time plus its bound, written into the
+-- record by the store. Only a record ends a hold, never the clock.
+create table if not exists mission_source_holds (
+    source     text   primary key,
+    hold       bigint not null,
+    main       text   not null,
+    by         text   not null,
+    reason     text,
+    held_at_ms bigint not null,
+    expires_ms bigint not null
+);
 
 
 -- Who may call the mission functions: the owner (humans' CLI, the
