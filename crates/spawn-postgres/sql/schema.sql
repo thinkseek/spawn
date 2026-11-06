@@ -1050,7 +1050,8 @@ create table if not exists mission_missions (
     gate_rejections integer not null default 0,
     gate_aborts     integer not null default 0,
     -- The gate's current run of `no_room` outcomes (TMPDIR short of room,
-    -- scripts/disk.sh) on one task, `gate_room_task`: when the first and
+    -- scripts/disk.sh, or a check the integrator makes before a gate:
+    -- disk, memory, the test database) on one task, `gate_room_task`: when the first and
     -- the latest were recorded, how many, and whether one of them escalated
     -- to the supervisor. No verdict on the work, so it counts toward no
     -- halt. A gate that judged (or aborted) ends the run, and so does its
