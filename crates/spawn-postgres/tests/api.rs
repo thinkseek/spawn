@@ -2015,7 +2015,9 @@ fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
         "another session's digests"
     );
 
-    let none = store.latest_turn("session_supervisor").expect("latest turn");
+    let none = store
+        .latest_turn("session_supervisor")
+        .expect("latest turn");
     assert_eq!(
         none,
         serde_json::json!({"transcript": null, "workspace": null, "turn_ended_at_ms": null})
@@ -2033,7 +2035,10 @@ fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
             },
         );
     };
-    native("native:1", Some("/home/owner/.claude/projects/p/native-1.jsonl"));
+    native(
+        "native:1",
+        Some("/home/owner/.claude/projects/p/native-1.jsonl"),
+    );
     native("native:2", None);
     supervisor.event(
         "exec_1",
@@ -2044,7 +2049,9 @@ fn the_attention_view_reads_when_a_tag_was_told_and_the_latest_turn() {
         },
     );
     supervisor.event("exec_1", "message:2", EventKind::MessageReceived);
-    let turn = store.latest_turn("session_supervisor").expect("latest turn");
+    let turn = store
+        .latest_turn("session_supervisor")
+        .expect("latest turn");
     let stopped: i64 = admin
         .query_one(
             "select recorded_at_ms from spawn_events
