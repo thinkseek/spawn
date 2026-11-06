@@ -822,7 +822,9 @@ record of what was judged (§14 of design.md).
        PostgreSQL 16) and `SELECT count(*) FROM generate_series(1, 100000)`
        within 10 s: a Gather with a worker, so the dynamic shared memory the
        tests need (`/dev/shm` in a container) is exercised. Any error fails
-       it.
+       it. Not for a mission whose scenarios hold `no-test-database` (§10.4):
+       its gate never gets the URL, so a test server that is down does not
+       hold back its work.
 
      A threshold of 0 disables its check; one that does not parse is an
      abort, as a bad `SPAWN_GATE_MIN_FREE_GB` is to the gate. A check that

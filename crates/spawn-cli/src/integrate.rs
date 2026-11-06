@@ -109,7 +109,9 @@
 //!    environment (whatever [`gate::withhold_owners_cluster`] then decides
 //!    for the gate), a connection to the test database within 10 s and a
 //!    forced parallel query (a Gather with a worker, so its dynamic shared
-//!    memory is exercised) within 10 s. A check that falls short runs no
+//!    memory is exercised) within 10 s; not for a mission marked
+//!    [`NO_TEST_DATABASE`], whose gate never gets the URL, so a test server
+//!    that is down never holds back its work. A check that falls short runs no
 //!    gate: the task is gated `no_room`, the path above, unchanged in its
 //!    meaning (no verdict, no count, the same `gate_room_*` run, backoff and
 //!    escalation), and the record names `check` (`disk`, `memory`,
