@@ -321,6 +321,8 @@ fn two_waiting_inputs_are_typed_oldest_first_each_on_its_own_ready_reading() {
     assert_eq!(rig.typed(), ["first note"]);
 
     rig.turn();
+    // Commands come before the screen in a tick: the next tick types it.
+    rig.tick();
     assert_eq!(rig.typed(), ["first note", "second note"]);
     assert_eq!(rig.finished(2), Some((true, String::new())));
     assert_eq!(rig.finished(3), Some((true, String::new())));
