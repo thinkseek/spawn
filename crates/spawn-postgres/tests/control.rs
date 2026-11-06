@@ -390,6 +390,7 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
 /// objective history, the stall facts' `revise` record and the store's
 /// check all know it.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn an_incompatible_verdict_sends_the_task_back_and_counts_no_rejection() {
     let (store, schema) = store("control_incompatible");
     let mission = store
