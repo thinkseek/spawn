@@ -518,9 +518,17 @@ pub(crate) fn step(
         }
         // A task typed into a live worker starts from the source's main:
         // merged into its idle workspace first, and the brief says what the
-        // merge did ([`crate::main_merge`]).
+        // merge did ([`crate::main_merge`]). A worker found busy at the
+        // merge gets nothing this pass: the delivery is tried again on the
+        // next, by the same rules.
         if let Some(root) = root {
-            lines.extend(merge_main_before(store, root, &mut order));
+            match merge_main_before(store, root, &mut order) {
+                Ok(line) => lines.extend(line),
+                Err(held) => {
+                    lines.push(held);
+                    continue;
+                }
+            }
         }
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
         // Before the command exists, so the worker's report for it comes
@@ -578,17 +586,27 @@ fn set_aside_before(
 /// Merge main into the workspace of the live worker `order` types a task
 /// into, and add what the merge did to the typed text. A start or resume
 /// mounts its workspace later; the Bridge merges main then, when it merges
-/// cleanly. Returns a log line when the merge did something.
-fn merge_main_before(
+/// cleanly. Returns a log line when the merge did something, and an error
+/// (the log line) when the order must not be sent this pass: the worker was
+/// not idle when the merge looked again ([`crate::main_merge::Merge::Busy`]).
+pub(crate) fn merge_main_before(
     store: &std::sync::Arc<PostgresStore>,
     root: &Path,
     order: &mut Order,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let CommandAction::Input { text, .. } = &mut order.action else {
-        return None;
+        return Ok(None);
     };
-    let task = order.task?;
+    let Some(task) = order.task else {
+        return Ok(None);
+    };
     let merge = crate::main_merge::merge_main(store, root, &order.agent_id, &order.session_id);
+    if let crate::main_merge::Merge::Busy(why) = &merge {
+        return Err(format!(
+            "deliver: task #{task} waits: main is not merged into its workspace while {why}; \
+             tried again next pass"
+        ));
+    }
     // What earlier merges changed and no typed delivery told yet, from
     // their records: this attempt's merge may find main already in.
     let untold = store
@@ -599,12 +617,12 @@ fn merge_main_before(
         text.push_str("\n\n");
         text.push_str(&note);
     }
-    match merge {
+    Ok(match merge {
         crate::main_merge::Merge::Current | crate::main_merge::Merge::NotMounted => None,
         other => Some(format!(
             "deliver: task #{task}: main into its workspace: {other:?}"
         )),
-    }
+    })
 }
 
 #[cfg(test)]
