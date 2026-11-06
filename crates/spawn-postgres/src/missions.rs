@@ -732,7 +732,7 @@ impl PostgresStore {
     }
 
     /// The `no_room` gate records that escalate and were not told to the
-    /// supervisor yet ([`GATE_ROOM_ESCALATIONS`]).
+    /// supervisor yet, or were and still hold ([`GATE_ROOM_ESCALATIONS`]).
     pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_ROOM_ESCALATIONS, &[])
     }
