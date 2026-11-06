@@ -123,7 +123,7 @@ Bridge 做四件事：领取命令、启动与恢复执行、投递文本、提�
 
 | 命令 | 行为 |
 | --- | --- |
-| `Start{engine,prompt,parent_session_id,from,model}` | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ 干净时把 `main` 合入分支（`merge_main_clean`，冲突时分支不动并记 `merge.conflicted`）→ mount，写 `command.step{mounted}` → 写 `execution.started`（新分支带 fork；这之前的追加失败时卸载并记 `mount_released`）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
+| `Start{engine,prompt,parent_session_id,from,model,charter}`（`charter` 是 supervisor 新原生会话所给章程的哈希，只供控制层记录，Bridge 不读） | 检查会话是否已有执行 → 开分支（`ensure_branch(branch, from)`；分支已存在时 `from` 被忽略并在 tick 报告里警告，`from` 解析不到 commit 时命令失败）→ 干净时把 `main` 合入分支（`merge_main_clean`，冲突时分支不动并记 `merge.conflicted`）→ mount，写 `command.step{mounted}` → 写 `execution.started`（新分支带 fork；这之前的追加失败时卸载并记 `mount_released`）→ 启动终端 → Claude 走屏尾等待投递。终端启动失败走结束流程，原因记为 `Lost` |
 | `Input{text}` | Ready 才 `send-keys`；键入前写 `command.step{typing}`，成功后写 `{typed}`。屏尾非 Ready（或终端还活着、抓屏一直失败）时：人和 supervisor 的输入等轮次——写一次 `command.step{waiting}`（键 `<command>:waiting`），命令不结束，等下一次 Ready 读数再键入；循环自己的输入（principal 为 `spawn-dispatch`、`spawn-integrate`、`spawn-liveness`）照旧立即拒绝（`pane state <state> does not accept input`），排在等待中的输入之后的也立即拒绝。会话没有执行时立即失败 |
 | `Stop` | 走结束流程，原因记为 `Stopped`；最后一次 checkpoint 失败时工作区不卸载 |
 | `Discard` | 同 `Stop`，但最后一次 checkpoint 失败也卸载工作区，未提交的内容丢失；只由人或 supervisor 在 `execution.end_stalled` 之后发出 |
