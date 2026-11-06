@@ -1714,8 +1714,8 @@ impl Bridge {
             .evidence
             .clone()
             .unwrap_or_else(|| format!("its runner exited ({exit_code:?})"));
-        if let Some(evidence) = active.follow.evidence.as_mut() {
-            evidence.push_str(&format!("; found by {}", claimed.command_id));
+        if let Some(evidence) = active.follow.evidence.take() {
+            active.follow.evidence = Some(format!("{evidence}; found by {}", claimed.command_id));
         }
         let ended = self.end(
             &claimed.agent_id,
@@ -2389,6 +2389,7 @@ impl Bridge {
                 held.reported_end = ending.reported_end;
                 held.follow.end_failures = ending.follow.end_failures;
                 held.follow.end_tried_at = ending.follow.end_tried_at;
+                held.follow.evidence = ending.follow.evidence;
             }
         }
         report.warnings.insert(0, why);
@@ -2889,6 +2890,7 @@ impl Bridge {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.evidence = active.follow.evidence;
         }
         if report.warnings.is_empty() {
             report.warnings.push(format!(
