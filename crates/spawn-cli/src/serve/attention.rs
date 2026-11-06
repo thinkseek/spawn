@@ -34,7 +34,8 @@
 //!       "source": "transcript" | "screen" | null,
 //!       "asked_at_ms": 1793957000000 | null,  // the end of that turn
 //!       "human": null | {"text": "Should I ...?", "at_ms": ... | null}
-//!     }
+//!     },
+//!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null}]
 //!   },
 //!   "warnings": ["dispatch: stalls: ..."]   // what could not be read
 //! }
@@ -50,6 +51,19 @@
 //! screen tail stored with the judgement stands in. `human` is the last
 //! `HUMAN:` line it wrote since a prompt that was not a dispatcher digest:
 //! a digest answers no question, so one asked a few turns ago is still open.
+//!
+//! A `For the owner:` line is no question. The supervisor's charter
+//! (`supervise::charter`) has it decide what its grants allow and name what
+//! they do not (a deploy, an owner-protected file, money, deleting data, a
+//! grant) in such a line, then move on without waiting. A latest reply with
+//! one asks nothing, whatever the judge made of it, unless a `HUMAN:`
+//! question is open (an old-style turn, answered by no person since).
+//! Instead `for_owner` lists the lines, read from the same transcript end
+//! whenever there is a supervisor: newest first, each once (its latest
+//! time), at most [`FOR_OWNER_ITEMS`]. They are items for the owner to read,
+//! not a queue: nothing waits on them, and an owner's message, an
+//! instruction rather than an answer, does not clear them. Without a
+//! transcript the list is empty and the judgement alone decides.
 
 use std::collections::BTreeMap;
 
@@ -68,6 +82,13 @@ const ASKS_NEEDS_HUMAN: f64 = 0.5;
 /// Bytes of the transcript's end read for the supervisor's words: the end
 /// of its latest reply, and the questions of its last turns.
 const TRANSCRIPT_TAIL: u64 = 1 << 20;
+
+/// What starts a line the supervisor writes for the owner without waiting
+/// on it (its charter's `For the owner:`), the colon after it.
+const FOR_OWNER: &str = "For the owner";
+
+/// Most `For the owner:` lines shown.
+const FOR_OWNER_ITEMS: usize = 10;
 
 /// `GET /api/attention`.
 pub(super) fn attention() -> Result<Value, String> {
@@ -98,21 +119,37 @@ pub(super) fn attention() -> Result<Value, String> {
         .rows
         .iter()
         .find(|facts| facts.session_id == SUPERVISOR_SESSION);
-    let question = match supervisor.and_then(|facts| asking(facts).map(|seen| (facts, seen))) {
-        Some((facts, observation)) => match store.latest_turn(SUPERVISOR_SESSION) {
-            Ok(turn) => question(facts, observation, &turn, transcript_tail(&turn).as_deref()),
-            Err(error) => {
-                warnings.push(format!("attention: the supervisor's turn: {error}"));
-                question(facts, observation, &Value::Null, None)
-            }
-        },
-        None => Value::Null,
+    // Its words, whenever there is a supervisor: its lines for the owner
+    // are worth reading while it works, and they decide whether it asks.
+    let (turn, said) = match supervisor.map(|_| store.latest_turn(SUPERVISOR_SESSION)) {
+        Some(Ok(turn)) => {
+            let said = transcript_tail(&turn).map(|bytes| said(&bytes));
+            (turn, said)
+        }
+        Some(Err(error)) => {
+            warnings.push(format!("attention: the supervisor's turn: {error}"));
+            (Value::Null, None)
+        }
+        None => (Value::Null, None),
     };
+    let question = supervisor
+        .and_then(|facts| {
+            asks(facts, said.as_ref())
+                .map(|observation| question(facts, observation, &turn, said.as_ref()))
+        })
+        .unwrap_or(Value::Null);
+    let for_owner = said
+        .as_ref()
+        .map_or(&[][..], |said| said.for_owner.as_slice())
+        .iter()
+        .map(|(text, at_ms)| json!({ "text": text, "at_ms": at_ms }))
+        .collect();
     Ok(answer(
         &reading.rows,
         &reading.plan,
         &told_at,
         &question,
+        &Value::Array(for_owner),
         &warnings,
         super::now_ms(),
     ))
@@ -120,13 +157,15 @@ pub(super) fn attention() -> Result<Value, String> {
 
 /// The answer from what was read: `plan` as [`dispatch::decide_with`] made
 /// it from `rows`, when each told item was first told (`told_at`, `{tag:
-/// ms}`), the supervisor's `question` ([`question`], or null) and the
-/// `warnings` of the reads.
+/// ms}`), the supervisor's `question` ([`question`], or null), its lines
+/// for the owner (`for_owner`, `[{text, at_ms}]`) and the `warnings` of the
+/// reads.
 fn answer(
     rows: &[Facts],
     plan: &Plan,
     told_at: &Value,
     question: &Value,
+    for_owner: &Value,
     warnings: &[String],
     generated_at_ms: i64,
 ) -> Value {
@@ -150,7 +189,7 @@ fn answer(
     let supervisor = rows
         .iter()
         .find(|facts| facts.session_id == SUPERVISOR_SESSION)
-        .map_or(Value::Null, |facts| supervisor(facts, question));
+        .map_or(Value::Null, |facts| supervisor(facts, question, for_owner));
     json!({
         "generated_at_ms": generated_at_ms,
         "pending": plan.pending.iter().map(|escalation| item(escalation, false)).collect::<Vec<_>>(),
@@ -160,8 +199,9 @@ fn answer(
     })
 }
 
-/// The supervisor's liveness, its latest judgement and its `question`.
-fn supervisor(facts: &Facts, question: &Value) -> Value {
+/// The supervisor's liveness, its latest judgement, its `question` and its
+/// lines `for_owner`.
+fn supervisor(facts: &Facts, question: &Value, for_owner: &Value) -> Value {
     let judgement = facts.observation.as_ref().map(|observation| {
         json!({
             "state": observation.state.key(),
@@ -188,6 +228,7 @@ fn supervisor(facts: &Facts, question: &Value) -> Value {
         "turn_ended": facts.turn_ended,
         "judgement": judgement,
         "question": question,
+        "for_owner": for_owner,
     })
 }
 
@@ -210,22 +251,30 @@ fn asking(facts: &Facts) -> Option<&Observation> {
     (at_prompt && (unsure || observation.human_question.is_some())).then_some(observation)
 }
 
-/// What the supervisor asks, from the end of its transcript (`transcript`,
-/// none when it could not be read) or else the screen tail stored with its
+/// The supervisor's judgement when it asks a person something ([`asking`]),
+/// unless its latest reply in its transcript (`said`, none when it could
+/// not be read) has a [`FOR_OWNER`] line and no `HUMAN:` question is open:
+/// such a line is one it does not wait on, whatever the judge made of it.
+fn asks<'a>(facts: &'a Facts, said: Option<&Said>) -> Option<&'a Observation> {
+    let observation = asking(facts)?;
+    let open = observation.human_question.is_some() || said.is_some_and(|said| said.human.is_some());
+    let for_owner = said
+        .and_then(|said| said.reply.as_deref())
+        .is_some_and(|reply| reply.lines().any(|line| for_owner(line).is_some()));
+    (open || !for_owner).then_some(observation)
+}
+
+/// What the supervisor asks, from the end of its transcript (`said`, none
+/// when it could not be read) or else the screen tail stored with its
 /// judgement; asked when its latest turn ended (`turn`, from
 /// `PostgresStore::latest_turn`), else when it was judged.
-fn question(
-    facts: &Facts,
-    observation: &Observation,
-    turn: &Value,
-    transcript: Option<&[u8]>,
-) -> Value {
+fn question(facts: &Facts, observation: &Observation, turn: &Value, said: Option<&Said>) -> Value {
     let asked_at = turn["turn_ended_at_ms"]
         .as_i64()
         .or(facts.observation_at_ms);
-    let said = transcript.map(said).filter(|said| said.reply.is_some());
+    let said = said.filter(|said| said.reply.is_some());
     let (text, source, human) = if let Some(said) = said {
-        (said.reply, Some("transcript"), said.human)
+        (said.reply.clone(), Some("transcript"), said.human.clone())
     } else {
         let screen = observation
             .evidence
@@ -271,6 +320,9 @@ struct Said {
     /// The last `HUMAN:` line it wrote since a prompt that was not a
     /// dispatcher digest, and that line's time.
     human: Option<(String, Option<i64>)>,
+    /// Its [`FOR_OWNER`] lines, whatever prompts came since: newest first,
+    /// each once with its latest time, at most [`FOR_OWNER_ITEMS`].
+    for_owner: Vec<(String, Option<i64>)>,
 }
 
 /// Read `bytes`, the end of a Claude Code transcript. A first line cut by
@@ -283,6 +335,7 @@ fn said(bytes: &[u8]) -> Said {
         .rposition(|byte| *byte == b'\n')
         .map_or(&[][..], |end| &bytes[..end]);
     let mut human = None;
+    let mut notes = Vec::new();
     for line in whole.split(|byte| *byte == b'\n') {
         let line = String::from_utf8_lossy(line);
         match claude_reply(&line) {
@@ -295,14 +348,49 @@ fn said(bytes: &[u8]) -> Said {
                 {
                     human = Some((question.trim().to_string(), line_time(&line)));
                 }
+                let words: Vec<&str> = text
+                    .lines()
+                    .filter_map(for_owner)
+                    .filter(|words| !words.is_empty())
+                    .collect();
+                if !words.is_empty() {
+                    let at = line_time(&line);
+                    notes.extend(words.into_iter().map(|words| (words.to_string(), at)));
+                }
             }
             _ => {}
+        }
+    }
+    let mut for_owner: Vec<(String, Option<i64>)> = Vec::new();
+    for (words, at) in notes.into_iter().rev() {
+        if for_owner.len() == FOR_OWNER_ITEMS {
+            break;
+        }
+        if !for_owner.iter().any(|(seen, _)| *seen == words) {
+            for_owner.push((words, at));
         }
     }
     Said {
         reply: reply.text().map(str::to_string),
         human,
+        for_owner,
     }
+}
+
+/// The words of a line the supervisor wrote for the owner: one that starts
+/// with [`FOR_OWNER`] and a colon, after any list marker, quote or emphasis
+/// (`- **For the owner:** ...`). Empty for a heading over a list.
+fn for_owner(line: &str) -> Option<&str> {
+    let emphasis = |c: char| matches!(c, '*' | '_');
+    let rest = line
+        .trim_start_matches(|c: char| c.is_whitespace() || emphasis(c) || matches!(c, '-' | '>'))
+        .strip_prefix(FOR_OWNER)?
+        .trim_start_matches(emphasis)
+        .strip_prefix(':')?;
+    Some(
+        rest.trim_start_matches(|c: char| c.is_whitespace() || emphasis(c))
+            .trim_end(),
+    )
 }
 
 /// Whether a transcript's prompt line is a dispatcher digest
