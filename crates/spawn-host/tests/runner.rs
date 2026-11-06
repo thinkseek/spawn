@@ -49,16 +49,21 @@ impl Server {
 
     /// The host, through a `tmux` that runs on this server.
     fn host(&self) -> TmuxHost {
+        self.host_through(&format!("exec {}", self.command()))
+    }
+
+    /// `tmux` on this server, as a shell command.
+    fn command(&self) -> String {
+        format!("tmux -L {} -f /dev/null \"$@\"", self.socket)
+    }
+
+    /// The host, through a `tmux` that runs `script` (shell).
+    fn host_through(&self, script: &str) -> TmuxHost {
         let target = self.directory.join("tmux");
         let temporary = self.directory.join("tmux.tmp");
         {
             let mut file = fs::File::create(&temporary).expect("create");
-            write!(
-                file,
-                "#!/bin/sh\nexec tmux -L {} -f /dev/null \"$@\"\n",
-                self.socket
-            )
-            .expect("write");
+            write!(file, "#!/bin/sh\n{script}\n").expect("write");
             file.sync_all().expect("sync");
         }
         let mut permissions = fs::metadata(&temporary).expect("stat").permissions();
@@ -76,6 +81,29 @@ impl Server {
             .status()
             .expect("tmux is installed");
         assert!(status.success(), "tmux {arguments:?}");
+    }
+
+    /// Wait until the launch in `terminal()` runs `program`: its shell has
+    /// read and removed the environment file, which a pane killed earlier
+    /// leaves behind.
+    fn wait_running(&self, program: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = Command::new("tmux")
+                .args(["-L", &self.socket, "-f", "/dev/null", "list-panes"])
+                .args(["-t", "=spawn-exec_1:", "-F", "#{pane_current_command}"])
+                .output()
+                .expect("tmux is installed");
+            let running = String::from_utf8_lossy(&output.stdout);
+            if running.trim() == program {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the launch runs {running:?}, not {program}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
