@@ -8,8 +8,11 @@
 //! [`RECOVERY_MARGIN`] above that, so a path hovering at the threshold does
 //! not flap. The latest record per path is read back from the log on start,
 //! so a restart records nothing twice. The supervisor's digest carries each
-//! record of the last day once (a [`Why::Disk`] escalation); the fleet view's
-//! health shows the records and the free space now.
+//! path's latest record once ([`escalations`]): a `low` one is a condition
+//! ([`Why::Disk`]) that holds until a `recovered` record replaces it, told
+//! or not; a `recovered` one is news ([`Why::DiskRecovered`]) for a day, and
+//! told, it is done. The fleet view's health shows the records and the free
+//! space now.
 //!
 //! Under `SPAWN_DISK_FLOOR_GB` (default 2 GiB) on any of the paths, the loop
 //! starts no new executions: the dispatcher's `start` and `resume` orders
@@ -37,10 +40,10 @@ pub(crate) const CHECK_EVERY: Duration = Duration::from_mins(1);
 /// is recorded as recovered.
 pub(crate) const RECOVERY_MARGIN: u64 = GIB;
 
-/// The window in which a record reaches the supervisor's digest: the same
-/// day the dispatcher reads delivered digests back over, so a record told
-/// once is not told again.
-const DIGEST_WINDOW_MS: i64 = 86_400_000;
+/// How long a `recovered` record is news for the supervisor's digest: one
+/// nobody was told of within a day is stale. A `low` record has no window:
+/// it holds until its path recovers.
+const RECOVERY_NEWS_MS: i64 = 86_400_000;
 
 /// The thresholds, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,67 +187,110 @@ pub(crate) fn hold_new_executions(orders: &mut Vec<Order>) -> usize {
     before - orders.len()
 }
 
-/// The digest items for `records` (the latest per path, as
-/// `PostgresStore::host_disk` returns them) recorded within the last day.
+/// The digest items for `records`, the latest per path (as
+/// `PostgresStore::host_disk` returns them): a `low` record, whatever its
+/// age, since its path has not recovered ([`Why::Disk`], a condition); a
+/// `recovered` one of the last [`RECOVERY_NEWS_MS`] ([`Why::DiskRecovered`],
+/// news: once told, [`crate::dispatch::decide_with`] drops it).
 pub(crate) fn escalations(records: &[Value], now_ms: i64) -> Vec<Escalation> {
     records
         .iter()
-        .filter(|record| {
-            record["at_ms"]
-                .as_i64()
-                .is_some_and(|at| now_ms - at < DIGEST_WINDOW_MS)
-        })
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
+            let at_ms = record["at_ms"].as_i64()?;
             let free = gib(record["free_bytes"].as_u64()?);
             let path = record["path"].as_str()?;
             let label = record["label"].as_str().unwrap_or("disk");
-            let line = match record["state"].as_str()? {
-                "low" => format!(
-                    "{label} {path} has {free} free, under {} (`SPAWN_DISK_WARN_GB`). Under {} \
+            let (why, line) = match record["state"].as_str()? {
+                "low" => (
+                    Why::Disk,
+                    format!(
+                        "{label} {path} has {free} free, under {} (`SPAWN_DISK_WARN_GB`). Under {} \
 no new executions start; free space (old workspaces, build output) or tell the owner.",
-                    gib(record["warn_bytes"].as_u64().unwrap_or_default()),
-                    gib(record["floor_bytes"].as_u64().unwrap_or_default()),
+                        gib(record["warn_bytes"].as_u64().unwrap_or_default()),
+                        gib(record["floor_bytes"].as_u64().unwrap_or_default()),
+                    ),
                 ),
-                "recovered" => format!("{label} {path} has {free} free again"),
+                "recovered" if now_ms - at_ms < RECOVERY_NEWS_MS => (
+                    Why::DiskRecovered,
+                    format!("{label} {path} has {free} free again"),
+                ),
                 _ => return None,
             };
             Some(Escalation {
                 session_id: "host".to_string(),
                 id: format!("disk-{id}"),
-                why: Why::Disk,
+                why,
                 line,
+                since_ms: Some(at_ms),
             })
         })
         .collect()
 }
 
 /// The digest items for `records`, the integrator's `no_room` gate records
-/// that carry `escalate` and that no delivered digest told yet
-/// (`PostgresStore::gate_room_escalations`): a mission's gate has had no
-/// room in TMPDIR for more than two hours. No time window: a record stays
-/// an item until a digest carrying its tag reaches the supervisor, and the
-/// integrator writes one per run, so the supervisor is told once.
+/// that carry `escalate` (`PostgresStore::gate_room_escalations`): a
+/// mission's gate has had no room to judge for more than two hours. Each
+/// names the check that fell short (`disk`, `memory` or `database`; a record
+/// that names none is the gate's own disk floor), its measure and its
+/// threshold. No time window: a record stays an item until a digest carrying
+/// its tag reaches the supervisor, and after that while the run of `no_room`
+/// it escalated goes on (the mission's `gate_room_*`), so the plan holds it
+/// as told and unresolved until the gate gets room or the task leaves the
+/// gate. The integrator writes one per run, so the supervisor is told once.
 pub(crate) fn gate_room_escalations(records: &[Value]) -> Vec<Escalation> {
     records
         .iter()
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
-            let free = gib(record["free_kb"].as_u64()?.saturating_mul(1024));
-            let tmpdir = record["tmpdir"].as_str()?;
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "a mission".to_string(), |id| format!("mission {id}"));
+            let check = record["check"].as_str().unwrap_or("disk");
+            let text = |name: &str| match &record[name] {
+                Value::String(text) => text.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            let (what, advice) = match check {
+                "memory" => (
+                    format!(
+                        "{} MiB of memory available, under SPAWN_GATE_MIN_FREE_MEMORY_MB={}",
+                        text("measured"),
+                        text("threshold")
+                    ),
+                    "free memory on this host",
+                ),
+                "database" => (
+                    format!(
+                        "the test database{} failed the probe \"{}\": {}",
+                        record["server"]
+                            .as_str()
+                            .map_or_else(String::new, |server| format!(" ({server})")),
+                        text("threshold"),
+                        text("measured")
+                    ),
+                    "repair the test database server (its /dev/shm, its connections)",
+                ),
+                _ => (
+                    format!(
+                        "{} free in TMPDIR {}, under SPAWN_GATE_MIN_FREE_GB={}",
+                        gib(record["free_kb"].as_u64()?.saturating_mul(1024)),
+                        record["tmpdir"].as_str()?,
+                        record["min_gb"].as_u64().unwrap_or_default()
+                    ),
+                    "free space there (old gate scratch, build output)",
+                ),
+            };
             Some(Escalation {
                 session_id: "host".to_string(),
                 id: format!("gate-room-{id}"),
                 why: Why::GateRoom,
                 line: format!(
-                    "the gate of {mission} has had no room to judge for over two hours: {free} \
-free in TMPDIR {tmpdir}, under SPAWN_GATE_MIN_FREE_GB={}. Its work waits (no halt counts); free \
-space there (old gate scratch, build output) or tell the owner.",
-                    record["min_gb"].as_u64().unwrap_or_default()
+                    "{check} check: the gate of {mission} has had no room to judge for over two \
+hours: {what}. Its work waits (no halt counts); {advice} or tell the owner."
                 ),
+                since_ms: record["at_ms"].as_i64(),
             })
         })
         .collect()
@@ -546,8 +592,10 @@ mod tests {
         assert_eq!(report[1]["recorded"], json!(null));
     }
 
+    /// A path's latest record is an item: `low` until the path recovers,
+    /// whatever its age (a condition); `recovered` for a day (news).
     #[test]
-    fn the_digest_tells_of_each_record_of_the_last_day() {
+    fn a_low_path_is_an_item_until_it_recovers_and_a_recovery_is_news_for_a_day() {
         let day = 86_400_000;
         let records = [
             json!({"type": "host.disk", "label": "tmpdir", "path": "/tmp", "state": "low",
@@ -557,6 +605,8 @@ mod tests {
                    "free_bytes": 30 * GIB, "event_id": 9, "at_ms": 10 * day + 5}),
             json!({"type": "host.disk", "label": "workspace", "path": "/old", "state": "low",
                    "free_bytes": 1, "event_id": 3, "at_ms": 8 * day}),
+            json!({"type": "host.disk", "label": "workspace", "path": "/back", "state": "recovered",
+                   "free_bytes": 40 * GIB, "event_id": 2, "at_ms": 8 * day}),
         ];
         let items = escalations(&records, 11 * day - 1);
         let summary: Vec<(String, Why, String)> = items
@@ -567,8 +617,14 @@ mod tests {
             summary,
             [
                 ("disk-7".to_string(), Why::Disk, "host disk-7".to_string()),
-                ("disk-9".to_string(), Why::Disk, "host disk-9".to_string()),
-            ]
+                (
+                    "disk-9".to_string(),
+                    Why::DiskRecovered,
+                    "host disk-9".to_string()
+                ),
+                ("disk-3".to_string(), Why::Disk, "host disk-3".to_string()),
+            ],
+            "a recovery older than a day is stale news; a path low for three days still is"
         );
         assert!(
             items[0]
@@ -581,6 +637,7 @@ mod tests {
                 .contains("Under 2.0 GiB no new executions start")
         );
         assert_eq!(items[1].line, "workspace /ws has 30.0 GiB free again");
+        assert_eq!(items[2].since_ms, Some(8 * day));
     }
 
     #[test]
@@ -608,5 +665,57 @@ free in TMPDIR /data/tmp, under SPAWN_GATE_MIN_FREE_GB=10"
             "{}",
             items[0].line
         );
+        assert!(
+            items[0].line.starts_with("disk check: "),
+            "{}",
+            items[0].line
+        );
+    }
+
+    /// Objective 018: the item names the check that fell short, its measure
+    /// and its threshold: memory and the test database too.
+    #[test]
+    fn a_gate_without_room_is_told_with_its_check_measure_and_threshold() {
+        let records = [
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 4,
+                   "check": "memory", "measured": 1500, "threshold": 2048,
+                   "event_id": 21, "mission": 7}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 5,
+                   "check": "database",
+                   "measured": "ERROR: could not resize shared memory segment (53100)",
+                   "threshold": "a parallel query within 10 s",
+                   "server": "/run/test-pg:5432/spawn_test", "event_id": 22, "mission": 8}),
+            json!({"type": "task.gated", "verdict": "no_room", "escalate": true, "id": 6,
+                   "check": "disk", "measured": 1_048_576, "threshold": 10_485_760,
+                   "free_kb": 1_048_576, "min_gb": 10, "tmpdir": "/tmp",
+                   "event_id": 23, "mission": 9}),
+        ];
+        let items = gate_room_escalations(&records);
+        let lines: Vec<&str> = items.iter().map(|item| item.line.as_str()).collect();
+        assert_eq!(
+            lines[0],
+            "memory check: the gate of mission 7 has had no room to judge for over two hours: \
+1500 MiB of memory available, under SPAWN_GATE_MIN_FREE_MEMORY_MB=2048. Its work waits (no halt \
+counts); free memory on this host or tell the owner."
+        );
+        assert!(
+            lines[1].starts_with(
+                "database check: the gate of mission 8 has had no room to judge for over two \
+hours: the test database (/run/test-pg:5432/spawn_test) failed the probe \"a parallel query \
+within 10 s\": ERROR: could not resize shared memory segment (53100)."
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].starts_with(
+                "disk check: the gate of mission 9 has had no room to judge for over two hours: \
+1.0 GiB free in TMPDIR /tmp, under SPAWN_GATE_MIN_FREE_GB=10."
+            ),
+            "{}",
+            lines[2]
+        );
+        assert!(items.iter().all(|item| item.why == Why::GateRoom));
+        assert_eq!(items[1].tag(), "host gate-room-22");
     }
 }
