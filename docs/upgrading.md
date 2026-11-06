@@ -88,16 +88,7 @@ These are not about process lifetime. They break when two versions meet.
    with. It writes the exit code to `SPAWN_EXIT_FILE` (`.spawn/exit-<execution>`
    in the workspace); the Bridge reads it, so its path and format must stay
    the same across versions. An execution with no exit file is
-   ended as `Lost` once no runner the Bridge launched runs it: its pane is
-   gone, dead, or does not hold the launch (issue #15). The tmux host tells
-   its own launch by the pane's start command, which names the launch's
-   environment file (`spawn-launch-<terminal>-...`); every launch since
-   6f677b4 (2026-11-05) has one. A runner launched by an older binary that
-   is still running when this one is deployed carries no such name and is
-   ended as lost (its final checkpoint taken, its terminal killed) at the
-   first tick: stop such executions before the deploy, or let the normal
-   paths resume them (the liveness rule for the supervisor and residents,
-   the dispatcher's one resume of a lost worker).
+   ended as `Lost` once its pane is gone.
 5. **The Claude transcript.** Its format is the engine's. `claude_line` skips
    lines it does not know, so an engine release that adds line types causes
    no failure, but a renamed field silently drops the events it carried.

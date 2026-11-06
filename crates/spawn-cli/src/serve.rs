@@ -10,12 +10,7 @@
 //! API request must carry it (`Authorization: Bearer <token>` or
 //! `?token=<token>`), except, with `SPAWN_SERVE_LOCAL_OPEN=1`, from a loopback
 //! client that runs as the owner's uid (Linux: the uid of its socket in
-//! `/proc/net/tcp{,6}`; without `/proc`, no client is exempt), and, with
-//! `SPAWN_SERVE_OPEN_NETWORKS` (comma-separated CIDRs, e.g. the owner's
-//! intranet `192.168.31.0/24`), from a client inside one of them that names
-//! this server by an IP address inside one of them (an IP literal `Host`:
-//! a page that rebinds its own name sends its name, so it reads nothing).
-//! Off by default.
+//! `/proc/net/tcp{,6}`; without `/proc`, no client is exempt).
 //! An API read served without the token (no token set, or the local-open
 //! exemption) also needs a `Host` naming this server (127.0.0.1, localhost,
 //! [::1] or the bound address, with its port) and no cross-origin `Origin`:
@@ -24,8 +19,6 @@
 //! The built UI's static files are served without it:
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
-
-mod attention;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -76,19 +69,8 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
             .unwrap_or_else(|| env_or("SPAWN_WEB_DIR", "web/dist")),
     );
     let token = access_token(&address, env_value("SPAWN_SERVE_TOKEN"))?;
-    let open = open_networks(env_value("SPAWN_SERVE_OPEN_NETWORKS").as_deref())?;
     let server = Server::http(&address).map_err(|error| format!("listen {address}: {error}"))?;
-    let guard = match (&token, open.is_empty()) {
-        (None, _) => "none".to_string(),
-        (Some(_), true) => "token".to_string(),
-        (Some(_), false) => format!(
-            "token, none from {}",
-            open.iter()
-                .map(Network::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
+    let guard = if token.is_some() { "token" } else { "none" };
     // The bound address, not the requested one: with port 0 the kernel picks.
     println!(
         "serve: http://{} web {} auth {guard}",
@@ -104,7 +86,6 @@ pub fn serve(flags: &Flags) -> Result<i32, String> {
         token,
         port,
         hosts,
-        open,
     });
     serve_requests(&server, &shared, MAX_IN_FLIGHT);
     Ok(0)
@@ -124,9 +105,6 @@ struct Shared {
     token: Option<String>,
     port: Option<u16>,
     hosts: Vec<String>,
-    /// Networks whose clients read without the token
-    /// (`SPAWN_SERVE_OPEN_NETWORKS`, [`open_network_request`]).
-    open: Vec<Network>,
 }
 
 /// Requests in flight, at most `limit`.
@@ -182,7 +160,6 @@ fn serve_requests(server: &Server, shared: &Arc<Shared>, limit: usize) {
                     shared.token.as_deref(),
                     shared.port,
                     &shared.hosts,
-                    &shared.open,
                 ) {
                     eprintln!("serve: {error}");
                 }
@@ -330,116 +307,6 @@ fn owners_own_request(peer: Option<SocketAddr>, port: Option<u16>) -> bool {
     local_exemption(true, peer, uid, owner_uid())
 }
 
-/// One network of `SPAWN_SERVE_OPEN_NETWORKS`: an address and how many of
-/// its leading bits a client's address must share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Network {
-    address: std::net::IpAddr,
-    prefix: u8,
-}
-
-impl Network {
-    /// Whether `ip` lies in this network. An IPv4 address mapped into IPv6
-    /// is compared as the IPv4 address it is.
-    fn contains(&self, ip: std::net::IpAddr) -> bool {
-        use std::net::IpAddr;
-        let ip = match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-            IpAddr::V4(_) => ip,
-        };
-        let prefix = u32::from(self.prefix);
-        match (self.address, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
-                u32::from(net) & mask == u32::from(ip) & mask
-            }
-            (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
-                u128::from(net) & mask == u128::from(ip) & mask
-            }
-            _ => false,
-        }
-    }
-}
-
-impl std::fmt::Display for Network {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.address, self.prefix)
-    }
-}
-
-/// `SPAWN_SERVE_OPEN_NETWORKS` (`text`): comma-separated CIDRs, IPv4 or
-/// IPv6 (`192.168.31.0/24`, `fd00::/8`); an address without `/` is that one
-/// address. Unset or empty: none. A malformed entry stops `serve` from
-/// starting rather than opening more or less than the owner wrote. A
-/// network as wide as the whole address space (`/0`) is refused: that is
-/// no token at all.
-fn open_networks(text: Option<&str>) -> Result<Vec<Network>, String> {
-    let mut networks = Vec::new();
-    for entry in text.unwrap_or_default().split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let refuse = |why: &str| {
-            format!("refusing to serve: SPAWN_SERVE_OPEN_NETWORKS entry {entry:?} {why}")
-        };
-        let (address, prefix) = entry
-            .split_once('/')
-            .map_or((entry, None), |(address, prefix)| (address, Some(prefix)));
-        let address: std::net::IpAddr = address
-            .parse()
-            .map_err(|_| refuse("is not an IP address or CIDR"))?;
-        let width: u8 = if address.is_ipv4() { 32 } else { 128 };
-        let prefix = match prefix {
-            None => width,
-            Some(prefix) => prefix
-                .parse::<u8>()
-                .ok()
-                .filter(|prefix| *prefix <= width)
-                .ok_or_else(|| refuse("has no valid prefix length"))?,
-        };
-        if prefix == 0 {
-            return Err(refuse("opens every address: set no token instead of that"));
-        }
-        networks.push(Network { address, prefix });
-    }
-    Ok(networks)
-}
-
-/// Whether a request from `peer` reads without the token because it comes
-/// from an open network (`SPAWN_SERVE_OPEN_NETWORKS`): its address lies in
-/// one of `open`, its `Host` is an IP address inside one of them with this
-/// server's `port` (an IP literal: a page that rebinds its own name to this
-/// host sends that name, so it reads nothing), and its `Origin`, if any, is
-/// that same host over http.
-fn open_network_request(
-    peer: Option<SocketAddr>,
-    host: Option<&str>,
-    origin: Option<&str>,
-    port: Option<u16>,
-    open: &[Network],
-) -> bool {
-    let inside = |ip: std::net::IpAddr| open.iter().any(|network| network.contains(ip));
-    let (Some(peer), Some(host), Some(port)) = (peer, host, port) else {
-        return false;
-    };
-    if !inside(plain(peer).ip()) {
-        return false;
-    }
-    let named: Option<SocketAddr> = authority(host).parse().ok();
-    if !named.is_some_and(|named| named.port() == port && inside(named.ip())) {
-        return false;
-    }
-    let host = authority(host);
-    origin.is_none_or(|origin| {
-        origin
-            .trim()
-            .strip_prefix("http://")
-            .is_some_and(|rest| authority(rest) == host)
-    })
-}
-
 /// Longest token `serve` accepts, and the UI sends.
 const MAX_TOKEN_LEN: usize = 512;
 
@@ -567,7 +434,6 @@ fn handle(
     token: Option<&str>,
     port: Option<u16>,
     hosts: &[String],
-    open: &[Network],
 ) -> Result<(), String> {
     let url = request.url().to_string();
     let (path, query) = match url.split_once('?') {
@@ -587,13 +453,6 @@ fn handle(
             Some(token) => {
                 authorized(&request, query, token)
                     || (named && owners_own_request(request.remote_addr().copied(), port))
-                    || open_network_request(
-                        request.remote_addr().copied(),
-                        header(&request, "Host"),
-                        header(&request, "Origin"),
-                        port,
-                        open,
-                    )
             }
         };
         if !open {
@@ -605,10 +464,8 @@ fn handle(
         "/api/rsi" => rsi_overview(),
         "/api/rsi/pane" => rsi_pane(query),
         "/api/fleet" => fleet(),
-        "/api/attention" => attention::attention(),
         "/api/missions" => missions(),
         "/api/events" => events(query),
-        "/api/scorecard" => scorecard(query),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
                 session(id, query)
@@ -766,7 +623,7 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///       "updated_at_ms",
 ///       "gates": [{                       // task.gated records, oldest first
 ///         "verdict": "accepted" | "rejected" | "aborted" | "conflict" | "incompatible"
-///                    | "stale" | "no_room" | "host_fault",
+///                    | "stale" | "no_room",
 ///         "reason": "..." | null, "metric": "METRIC ..." | null,
 ///         "candidate": "<commit>" | null, "at_ms": 1793724858000
 ///       }]
@@ -1003,15 +860,12 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
 }
 
 /// The fleet board: every session with its judgement and activity, plus
-/// fleet health, the decision ladder and each gated mission's gate-room
-/// waits. Computed by SQL from storage, except what the host has now, read
-/// at this request: the health's `disk` (free space, [`crate::disk::report`])
-/// and `memory` (`/proc/meminfo`, [`crate::memory::report`]).
+/// fleet health and the decision ladder. Computed by SQL from storage,
+/// except the health's `disk`: free space read now ([`crate::disk::report`]).
 fn fleet() -> Result<Value, String> {
     let store = open_store()?;
     let mut health = store.fleet_health().map_err(err)?;
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
-    health["memory"] = crate::memory::report();
     Ok(json!({
         "agents": store.fleet_board().map_err(err)?,
         "health": health,
@@ -1231,56 +1085,6 @@ fn events(query: &str) -> Result<Value, String> {
     Ok(json!({ "events": events, "next": next.0, "now_ms": now_ms() }))
 }
 
-/// `/api/scorecard?mission=&since=&until=`: exactly the JSON of `spawn
-/// scorecard --json` with the same flags (crate::scorecard), read through
-/// the reader login and from this server's own transcript archive
-/// (`SPAWN_WORKSPACE_ROOT`). An empty parameter is one not given.
-fn scorecard(query: &str) -> Result<Value, String> {
-    let given = |name: &str| -> Result<Option<String>, String> {
-        parameter(query, name)
-            .map(|text| {
-                percent_decoded(text).ok_or_else(|| format!("{BAD_REQUEST}bad {name} {text}"))
-            })
-            .transpose()
-            .map(|value| value.filter(|text| !text.is_empty()))
-    };
-    let asked = crate::scorecard::Query {
-        mission: given("mission")?,
-        since: given("since")?,
-        until: given("until")?,
-    };
-    let store = open_store()?;
-    let root = env_value("SPAWN_WORKSPACE_ROOT");
-    crate::scorecard::measure(&store, root.as_deref().map(Path::new), &asked).map_err(|failure| {
-        match failure {
-            crate::scorecard::Failure::Request(error) => format!("{BAD_REQUEST}{error}"),
-            crate::scorecard::Failure::Record(error) => error,
-        }
-    })
-}
-
-/// A query parameter's value with its `%XX` escapes decoded (a `+` stays a
-/// `+`: a time zone offset is one); `None` when it decodes to no UTF-8.
-fn percent_decoded(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && let Some(byte) = text
-                .get(index + 1..index + 3)
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            out.push(byte);
-            index += 3;
-            continue;
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8(out).ok()
-}
-
 fn parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
@@ -1341,9 +1145,9 @@ mod tests {
 
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_LIMIT, ProcSocket, Shared, access_token,
-        handle, is_loopback, local_exemption, log_window, objective_json, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_summary, same_secret, serve_requests,
-        server_hosts, tokenless_request, with_last_gates,
+        handle, is_loopback, local_exemption, log_window, objective_json, owner_uid, peer_uid,
+        proc_sockets, rsi_summary, same_secret, serve_requests, server_hosts, tokenless_request,
+        with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1423,168 +1227,6 @@ mod tests {
             peer_uid(address("127.0.0.1:54322"), 8787, &[]),
             None,
             "no /proc"
-        );
-    }
-
-    #[test]
-    fn open_networks_are_cidrs_and_a_malformed_one_stops_serve() {
-        assert!(open_networks(None).expect("unset").is_empty());
-        assert!(open_networks(Some(" , ")).expect("empty").is_empty());
-        let open = open_networks(Some("192.168.31.0/24, 100.64.0.0/10,fd00::/8, 10.0.0.5"))
-            .expect("four networks");
-        let shown: Vec<String> = open.iter().map(ToString::to_string).collect();
-        assert_eq!(
-            shown,
-            [
-                "192.168.31.0/24",
-                "100.64.0.0/10",
-                "fd00::/8",
-                "10.0.0.5/32"
-            ]
-        );
-        for wrong in [
-            "192.168.31.0/33",
-            "intranet",
-            "192.168.31.0/x",
-            "fd00::/129",
-        ] {
-            assert!(open_networks(Some(wrong)).is_err(), "{wrong} is refused");
-        }
-        for everything in ["0.0.0.0/0", "::/0"] {
-            assert!(
-                open_networks(Some(everything)).is_err(),
-                "{everything} would be no token at all"
-            );
-        }
-        let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
-        let lan = open[0];
-        assert!(lan.contains(ip("192.168.31.7")));
-        assert!(!lan.contains(ip("192.168.32.7")));
-        assert!(
-            lan.contains(ip("::ffff:192.168.31.7")),
-            "IPv4 mapped into IPv6"
-        );
-        assert!(!lan.contains(ip("fd00::1")));
-        assert!(open[2].contains(ip("fd12:3456::1")));
-        assert!(open[3].contains(ip("10.0.0.5")) && !open[3].contains(ip("10.0.0.6")));
-    }
-
-    /// The owner's intranet reads without the token (2026-11-06, "No token
-    /// needed for the intranet"): a client inside an open network that names
-    /// this server by its address inside it. Nothing else does.
-    #[test]
-    fn a_client_on_an_open_network_reads_without_the_token_and_nothing_else_does() {
-        let open = open_networks(Some("192.168.31.0/24")).expect("network");
-        let peer = Some(address("192.168.31.50:51234"));
-        let host = Some("192.168.31.112:8787");
-        let port = Some(8787);
-        assert!(open_network_request(peer, host, None, port, &open));
-        assert!(open_network_request(
-            peer,
-            host,
-            Some("http://192.168.31.112:8787"),
-            port,
-            &open
-        ));
-        assert!(
-            open_network_request(
-                Some(address("[::ffff:192.168.31.50]:51234")),
-                host,
-                None,
-                port,
-                &open
-            ),
-            "an IPv4 client on an IPv6 socket"
-        );
-        let refused = [
-            (
-                Some(address("100.126.1.1:51234")),
-                host,
-                None,
-                "a client outside the network",
-            ),
-            (
-                peer,
-                Some("evil.example:8787"),
-                None,
-                "a page that rebinds its own name",
-            ),
-            (
-                peer,
-                Some("192.168.31.112:9999"),
-                None,
-                "a Host naming another port",
-            ),
-            (
-                peer,
-                Some("192.168.31.112"),
-                None,
-                "a Host with no port (port 80)",
-            ),
-            (
-                peer,
-                Some("8.8.8.8:8787"),
-                None,
-                "a Host outside the network",
-            ),
-            (
-                peer,
-                host,
-                Some("http://evil.example"),
-                "a cross-origin page",
-            ),
-            (
-                peer,
-                host,
-                Some("https://192.168.31.112:8787"),
-                "another scheme",
-            ),
-            (None, host, None, "no peer address"),
-            (peer, None, None, "no Host"),
-        ];
-        for (peer, host, origin, why) in refused {
-            assert!(
-                !open_network_request(peer, host, origin, port, &open),
-                "{why}"
-            );
-        }
-        assert!(
-            !open_network_request(peer, host, None, port, &[]),
-            "no open network set: the token, as before"
-        );
-    }
-
-    /// The handler itself lets an open network's client through with a token
-    /// set, and only then: here the "intranet" is loopback, the one network
-    /// a test can be a client on. A read let through finds no database (no
-    /// SPAWN_DATABASE_URL in the test), which is anything but 401.
-    #[test]
-    fn the_handler_opens_the_api_to_an_open_network_only() {
-        let named = "Host: 127.0.0.1:PORT\r\n";
-        assert_eq!(
-            status_with(Some("secret"), "", "/api/overview", named),
-            401,
-            "no open network: the token"
-        );
-        assert_ne!(
-            status_with(Some("secret"), "127.0.0.0/8", "/api/overview", named),
-            401,
-            "a client inside the open network naming this server by its address"
-        );
-        assert_eq!(
-            status_with(
-                Some("secret"),
-                "127.0.0.0/8",
-                "/api/overview",
-                "Host: localhost:PORT\r\n"
-            ),
-            401,
-            "a name, not an address: the token"
-        );
-        assert_eq!(
-            status_with(Some("secret"), "10.0.0.0/8", "/api/overview", named),
-            401,
-            "a client outside the open network: the token"
         );
     }
 
@@ -1855,22 +1497,14 @@ mod tests {
     /// token set, sending `headers` (each line ending in CRLF, `PORT` replaced
     /// by the server's port) and no other.
     fn tokenless_status(path: &str, headers: &str) -> u16 {
-        status_with(None, "", path, headers)
-    }
-
-    /// Status of one GET of `path` from `serve`'s request handler with
-    /// `token` set (or none) and `open` as `SPAWN_SERVE_OPEN_NETWORKS`,
-    /// sending `headers` as [`tokenless_status`] does.
-    fn status_with(token: Option<&'static str>, open: &str, path: &str, headers: &str) -> u16 {
         use std::io::{Read, Write};
         let server = tiny_http::Server::http("127.0.0.1:0").expect("listen");
         let port = server.server_addr().to_ip().expect("ip").port();
         let hosts = server_hosts("127.0.0.1:0", port);
         let web = std::env::temp_dir();
-        let open = open_networks(Some(open)).expect("networks");
         let worker = std::thread::spawn(move || {
             let request = server.recv().expect("request");
-            handle(request, &web, token, Some(port), &hosts, &open).expect("answered");
+            handle(request, &web, None, Some(port), &hosts).expect("answered");
         });
         let headers = headers.replace("PORT", &port.to_string());
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -1903,7 +1537,6 @@ mod tests {
             token: None,
             port: Some(port),
             hosts: server_hosts("127.0.0.1:0", port),
-            open: Vec::new(),
         });
         std::thread::spawn(move || serve_requests(&server, &shared, limit));
         (port, web)

@@ -12,22 +12,12 @@ use crate::PostgresStore;
 
 /// One task the dispatcher has to look at, with what it needs to deliver it.
 /// A closed ephemeral task stays for a day, and for as long as its worker
-/// still runs: its worker is stopped, and it is managed until then. A
-/// re-issue names the task it re-issues (`reissue_of`) and that task's
-/// spent attempts, as its `task.cancelled` record keeps them
-/// (`reissued_attempts`), for the escalation if the re-issue is spent too.
+/// still runs: its worker is stopped, and it is managed until then.
 pub(crate) const DELIVERY_TASKS: &str = r"
 select coalesce(jsonb_agg(row_to_json(t) order by t.id), '[]'::jsonb)
 from (
   select k.id, k.mission_id, k.kind, k.agent_id, k.session_id, k.brief, k.state,
-         k.revisions, k.review_note, k.delivered_at_ms, k.model, k.reissue_of,
-         case when k.reissue_of is not null then
-           (select e.kind -> 'detail' -> 'record' -> 'attempts' from spawn_events e
-             where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-               and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.cancelled'
-               and e.kind -> 'detail' -> 'record' ->> 'id' = k.reissue_of::text
-             order by e.session_seq desc limit 1)
-         end as reissued_attempts,
+         k.revisions, k.review_note, k.delivered_at_ms, k.model,
          m.text as mission_text,
          m.gate is not null as gated,
          r.charter, r.name as resident
@@ -41,16 +31,6 @@ from (
                or exists (select 1 from agent_status s
                            where s.session_id = k.session_id and s.live)))
 ) t";
-
-/// The latest `source.moved` record (a deploy, `spawn mission moved`), as
-/// its event's id and time on the database's clock, or null: after it, the
-/// dispatcher tries every spent delivery once more.
-pub(crate) const LATEST_SOURCE_MOVED: &str = r"
-select coalesce((select jsonb_build_object('id', e.id, 'at_ms', e.recorded_at_ms)
-                   from spawn_events e
-                  where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-                    and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.moved'
-                  order by e.session_seq desc limit 1), 'null'::jsonb)";
 
 /// Residents (not retired) whose latest delivered task is cancelled: the
 /// dispatcher stops such a worker, sets the task's work aside and tells it
@@ -362,8 +342,7 @@ from (
   select m.id, m.state, m.gate, m.accept, m.budget, m.baseline, m.halted, m.scenario_floor,
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
-         m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
-         m.gate_host_due_ms, m.objectives, m.sources ->> 0 as source,
+         m.gate_room_waits, m.gate_room_escalated, m.objectives, m.sources ->> 0 as source,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -385,15 +364,12 @@ from (
 ) x";
 
 /// The `no_room` gate records that carry `escalate` (the mission's gate
-/// went without room past the integrator's limit), oldest first, each with
-/// its `event_id`, `at_ms` and `mission`: those the supervisor was not told
-/// of yet, and those it was told of whose run of `no_room` still goes on
-/// (the mission's `gate_room_*` name the record's task, escalated, since
-/// the record or before), which the dispatcher keeps as told and
-/// unresolved. Told is a record, not a window: a digest that reached the
+/// went without room past the integrator's limit) and that the supervisor
+/// was not told of yet, oldest first, each with its `event_id`, `at_ms` and
+/// `mission`. Told is a record, not a window: a digest that reached the
 /// supervisor carrying the tag `host gate-room-<event_id>` (as
-/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was
-/// away for days is still told once.
+/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was away
+/// for days is still told once.
 pub(crate) const GATE_ROOM_ESCALATIONS: &str = r"
 with told as (
   select distinct tag
@@ -413,39 +389,7 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
-   and (not exists (select 1 from told where tag = 'host gate-room-' || e.id)
-        or exists (select 1 from mission_missions m
-                    where m.id = k.mission_id and m.gate_room_escalated
-                      and m.gate_room_task = (r ->> 'id')::bigint
-                      and m.gate_room_since_ms <= e.recorded_at_ms))";
-
-/// The `host_fault` gate records that carry `escalate` (the mission's second
-/// host fault in a row) and that the supervisor was not told of yet, oldest
-/// first, each with its `event_id`, `at_ms` and `mission`, without the
-/// gate's `log`. Told is a record, as for [`GATE_ROOM_ESCALATIONS`]: a digest
-/// that reached the supervisor carrying the tag
-/// `host gate-host-fault-<event_id>`, however long ago.
-pub(crate) const GATE_HOST_FAULT_ESCALATIONS: &str = r"
-with told as (
-  select distinct tag
-    from spawn_commands d
-   cross join lateral jsonb_array_elements_text(
-           case when jsonb_typeof(d.action -> 'tags') = 'array'
-                then d.action -> 'tags' else '[]'::jsonb end) tag
-   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
-)
-select coalesce(jsonb_agg((r - 'log') || jsonb_build_object('event_id', e.id,
-                                                           'at_ms', e.recorded_at_ms,
-                                                           'mission', k.mission_id)
-                          order by e.session_seq), '[]'::jsonb)
-  from spawn_events e
- cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
-  left join mission_tasks k on k.id = (r ->> 'id')::bigint
- where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-   and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
-   and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
-   and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
-   and not exists (select 1 from told where tag = 'host gate-host-fault-' || e.id)";
+   and not exists (select 1 from told where tag = 'host gate-room-' || e.id)";
 
 /// The last `task.gated` record of every task, keyed by task id:
 /// `{"<id>": {verdict, reason, metric, candidate, at_ms}}`. Kept out of
@@ -728,9 +672,7 @@ impl PostgresStore {
 
     /// The owner moved `source`'s main from `from` to `to` outside the gate
     /// (owner only; the caller checks `to` descends from `from`). Returns how
-    /// many missions took `to` as their baseline. The move is recorded
-    /// (`source.moved`) even when none did: the dispatcher tries every spent
-    /// delivery once more after it.
+    /// many missions took `to` as their baseline.
     pub fn source_moved(&self, source: &str, from: &str, to: &str) -> Result<i32, StoreError> {
         Ok(self
             .query_one(
@@ -754,15 +696,9 @@ impl PostgresStore {
     }
 
     /// The `no_room` gate records that escalate and were not told to the
-    /// supervisor yet, or were and still hold ([`GATE_ROOM_ESCALATIONS`]).
+    /// supervisor yet ([`GATE_ROOM_ESCALATIONS`]).
     pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_ROOM_ESCALATIONS, &[])
-    }
-
-    /// The `host_fault` gate records that escalate and were not told to the
-    /// supervisor yet ([`GATE_HOST_FAULT_ESCALATIONS`]).
-    pub fn gate_host_fault_escalations(&self) -> Result<Value, StoreError> {
-        self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.
@@ -816,16 +752,6 @@ impl PostgresStore {
     pub fn task_cancel(&self, task: i64) -> Result<(), StoreError> {
         self.execute("select spawn_task_cancel($1)", &[&task])?;
         Ok(())
-    }
-
-    /// Re-issue `task`, a first delivery spent without typing (owner only,
-    /// the dispatcher): cancel it naming `attempts` (every attempt of its
-    /// delivery, in order, each `{command, key, error}`) and assign it again,
-    /// in one transaction. Returns the new task's id.
-    pub fn task_reissue(&self, task: i64, attempts: &Value) -> Result<i64, StoreError> {
-        Ok(self
-            .query_one("select spawn_task_reissue($1, $2)", &[&task, attempts])?
-            .get(0))
     }
 
     /// Propose a resident (or revise a pending proposal).
@@ -883,12 +809,6 @@ impl PostgresStore {
     /// Tasks the dispatcher has to deliver, watch or wind down.
     pub fn delivery_rows(&self) -> Result<Value, StoreError> {
         self.query_json(DELIVERY_TASKS, &[])
-    }
-
-    /// The latest `source.moved` record, `{id, at_ms}`, or null
-    /// ([`LATEST_SOURCE_MOVED`]).
-    pub fn latest_source_moved(&self) -> Result<Value, StoreError> {
-        self.query_json(LATEST_SOURCE_MOVED, &[])
     }
 
     /// Residents whose latest delivered task is cancelled, with the

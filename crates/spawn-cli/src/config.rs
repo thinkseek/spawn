@@ -44,22 +44,9 @@ fn resolve_spawn_program(configured: Option<String>, current: Option<PathBuf>) -
         .unwrap_or_else(|| "spawn".to_string())
 }
 
-/// `--root`, else `SPAWN_WORKSPACE_ROOT`, resolved through its symlinks,
-/// once, here (`spawn_host::canonical_root`). An engine's process sees its
-/// workspace under the resolved path, and files its transcript under it:
-/// the mounts, the panes, the workspace ids and the transcript paths all
-/// derive from this one root, so no two of them can name a workspace two
-/// ways.
+/// `--root`, else `SPAWN_WORKSPACE_ROOT`.
 pub(crate) fn workspace_root(flags: &Flags) -> Option<String> {
     resolve_workspace_root(flags.get("root"), env_value("SPAWN_WORKSPACE_ROOT"))
-        .map(|root| canonical_workspace_root(&root))
-}
-
-/// `root` resolved through its symlinks ([`workspace_root`]).
-fn canonical_workspace_root(root: &str) -> String {
-    spawn_host::canonical_root(std::path::Path::new(root))
-        .display()
-        .to_string()
 }
 
 fn resolve_workspace_root(flag: Option<String>, environment: Option<String>) -> Option<String> {
@@ -196,26 +183,6 @@ mod tests {
     #[test]
     fn the_git_on_this_host_is_new_enough() {
         require_git().expect("the build host runs a current git");
-    }
-
-    #[test]
-    fn the_workspace_root_is_resolved_through_its_symlinks() {
-        let base = std::env::temp_dir().join(format!("spawn-root-config-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("real/ws")).expect("scratch");
-        std::os::unix::fs::symlink(base.join("real"), base.join("link")).expect("link");
-        let real = std::fs::canonicalize(base.join("real/ws")).expect("resolve");
-        let configured = base.join("link/ws").display().to_string();
-        assert_eq!(
-            super::canonical_workspace_root(&configured),
-            real.display().to_string()
-        );
-        let flags = Flags::parse(&["--root".to_string(), configured.clone()]).expect("flags");
-        assert_eq!(
-            workspace_root(&flags).as_deref(),
-            Some(real.display().to_string().as_str())
-        );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

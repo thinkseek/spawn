@@ -18,11 +18,6 @@
 #      accepted; an ephemeral worker reports and is stopped once accepted; a
 #      human message to a worker reaches the supervisor; a resident killed is
 #      resumed, a resident stopped by the supervisor stays down.
-# The workspace root is reached through a symlink ($work/ws -> ws-real), as
-# /home is on some hosts and /tmp and /var are on macOS, and the scripted
-# engine files its transcript under its resolved working directory, as
-# Claude Code does: every hop that reads a transcript fails if the Bridge
-# names a workspace other than the engine sees it (issue #15).
 #
 # Usage: SPAWN_DATABASE_URL=postgres://... scripts/e2e.sh
 # With SPAWN_TIMING=adversarial it runs under perturbed timing
@@ -160,8 +155,7 @@ printf 'base\n' >"$seed/README.md"
 git -C "$seed" add -A
 git -C "$seed" -c user.name=e2e -c user.email=e2e@localhost commit -qm base
 git -C "$seed" push -q "$repo" main:main
-mkdir -p "$work/ws-real"
-ln -s ws-real "$work/ws"
+mkdir -p "$work/ws"
 
 # --- scripted engine ------------------------------------------------------
 # Draws a prompt, writes a Claude Code session transcript where the real
@@ -182,7 +176,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
   shift
 done
-dir=$E2E_WORK/claude-projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')
+dir=$E2E_WORK/claude-projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
 mkdir -p "$dir"
 transcript=$dir/$native.jsonl
 c=0

@@ -1,9 +1,8 @@
 import { PanelRight } from "lucide-react";
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 
-import { fetchAttention, fetchOverview, fetchSession, usePoll } from "./api";
-import type { PollResult, SessionDetail } from "./api";
-import { markNeedsHuman, needsHuman } from "./attention";
+import { fetchOverview, fetchSession, usePoll } from "./api";
+import type { SessionDetail } from "./api";
 import { DetailsRail, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
 import { StateBadge } from "./components/StateDot";
@@ -11,21 +10,16 @@ import { Timeline } from "./components/Timeline";
 import { FleetView } from "./components/fleet/FleetView";
 import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
-import { ScorecardView } from "./components/scorecard/ScorecardView";
 import { Button, Drawer, LiveStatus, PageHeader } from "./components/ui";
-import type { Fleet } from "./fleet";
 import { fetchFleet } from "./fleet";
 import { relativeTime } from "./format";
-import type { Missions } from "./missions";
-import { fetchMissions } from "./missions";
-import { fleetContext } from "./ordering";
 
 // Its own chunk: Motion and d3 load only when the Show view opens.
 const ShowView = lazy(() =>
   import("./components/show/ShowView").then((module) => ({ default: module.ShowView })),
 );
 
-export type View = "fleet" | "missions" | "rsi" | "scorecard" | "show" | "sessions";
+export type View = "fleet" | "missions" | "rsi" | "show" | "sessions";
 
 interface Route {
   view: View;
@@ -38,7 +32,6 @@ function routeFromHash(): Route {
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
-  if (hash.startsWith("#/scorecard")) return { view: "scorecard", agent: null };
   if (hash.startsWith("#/show")) return { view: "show", agent: null };
   const match = /^#\/fleet\/(.+)$/.exec(hash);
   let agent: string | null = null;
@@ -59,7 +52,6 @@ function hashFor(route: Route): string {
       : "#/fleet";
   }
   if (route.view === "missions") return "#/missions";
-  if (route.view === "scorecard") return "#/scorecard";
   // The Show view keeps its options (`?present`, `?replay`) in its hash.
   if (route.view === "show") {
     return window.location.hash.startsWith("#/show") ? window.location.hash : "#/show";
@@ -79,41 +71,14 @@ function presenting(): boolean {
 
 export default function App() {
   const overview = usePoll("overview", fetchOverview);
-  // Both polled in every view: the sidebar shows who needs a human, which is
-  // the dispatcher's view (/api/attention), never a judge's flag.
-  const fleetPoll = usePoll("fleet", fetchFleet, 3_000);
-  const attention = usePoll("attention", fetchAttention, 3_000);
-  const needs = useMemo(
-    () => (attention.data ? needsHuman(attention.data) : null),
-    [attention.data],
-  );
-  const fleetData = useMemo<Fleet | null>(
-    () =>
-      fleetPoll.data && {
-        ...fleetPoll.data,
-        agents: markNeedsHuman(fleetPoll.data.agents, needs),
-      },
-    [fleetPoll.data, needs],
-  );
-  const fleet: PollResult<Fleet> = { data: fleetData, error: fleetPoll.error };
-  const humanCount = {
-    count: needs?.count ?? null,
-    error: attention.data ? null : attention.error,
-  };
+  // Polled in every view: the sidebar shows the attention count.
+  const fleet = usePoll("fleet", fetchFleet, 3_000);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [railOpen, setRailOpen] = useState(false);
   // The fleet view is the landing page; the hash keeps the view (and the
   // open agent) across reloads.
   const [route, setRoute] = useState<Route>(routeFromHash);
   const view = route.view;
-  // Polled in every view too: the sidebar and the fleet board group agents
-  // by the tasks they hold. Faster while the missions page shows them.
-  const missions = usePoll<Missions>(
-    "missions",
-    fetchMissions,
-    view === "missions" ? 5_000 : 15_000,
-  );
-  const context = useMemo(() => fleetContext(missions.data), [missions.data]);
   const setView = (next: View) => setRoute({ view: next, agent: null });
 
   useEffect(() => {
@@ -184,27 +149,23 @@ export default function App() {
     <div className="flex h-dvh w-full flex-col overflow-hidden bg-app-shell text-label text-foreground md:flex-row">
       <MobileNav
         view={view}
-        attention={humanCount}
+        attention={fleet.data?.health.attention ?? 0}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
-        onShowScorecard={() => setView("scorecard")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
       />
       <Sidebar
         sessions={overview.data?.sessions ?? []}
-        agents={fleet.data?.agents ?? null}
-        context={context}
         selectedId={view === "sessions" ? selectedId : null}
         view={view}
         rsi={rsi}
         error={overview.error}
-        attention={humanCount}
+        attention={fleet.data?.health.attention ?? 0}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
-        onShowScorecard={() => setView("scorecard")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
         onSelect={(id) => {
@@ -216,18 +177,14 @@ export default function App() {
       {view === "fleet" ? (
         <FleetView
           fleet={fleet}
-          attention={attention}
-          context={context}
           selectedId={route.agent}
           onSelect={(agent) => setRoute({ view: "fleet", agent })}
           onOpenTimeline={openTimeline}
         />
       ) : view === "missions" ? (
-        <MissionsView missions={missions} />
+        <MissionsView />
       ) : view === "rsi" ? (
         <RsiView onOpenSession={openTimeline} />
-      ) : view === "scorecard" ? (
-        <ScorecardView missions={missions.data} />
       ) : view === "show" ? (
         <Suspense fallback={<div className="flex-1 bg-page-canvas" />}>
           <ShowView fleet={fleet} present={false} />

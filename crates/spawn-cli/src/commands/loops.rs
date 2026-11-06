@@ -88,9 +88,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let mut store: Option<std::sync::Arc<PostgresStore>> = None;
     let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
     let mut disk = disk::Monitor::new(workspace_root.as_deref());
-    let (bounds, mut warnings) = dispatch::Bounds::from_env();
-    let (waits, more) = crate::deliver::Waits::from_env();
-    warnings.extend(more);
+    let (bounds, warnings) = dispatch::Bounds::from_env();
     for warning in &warnings {
         eprintln!("spawn loop warning: {warning}");
     }
@@ -142,7 +140,6 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
                         workspace_root.as_deref(),
                         &disk,
                         &bounds,
-                        waits,
                     ),
                 );
             }

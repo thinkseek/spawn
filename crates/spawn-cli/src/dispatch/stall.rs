@@ -21,8 +21,7 @@
 //! halt's: the escalation is about the mission, once per `mission.halted`.
 //! A failed command (a delivery attempt, a Stop, a resume) is the evidence
 //! of the step it blocks, never a step of its own; a delivery whose retries
-//! are spent is re-issued (a first delivery that typed nothing) or was
-//! escalated as [`Why::DeliveryFailed`], and gets no stall.
+//! are spent was escalated as [`Why::DeliveryFailed`], and gets no stall.
 //!
 //! The tag is `<session> stall-<task>-<step>-<n>`, where `n` names the
 //! record the step is measured from (a control record's id, or for
@@ -170,8 +169,7 @@ pub(crate) struct OpenTask {
 pub(crate) struct Verdict {
     pub(crate) mission_id: i64,
     pub(crate) id: i64,
-    /// `accepted`, `rejected`, `conflict`, `incompatible`, `aborted`,
-    /// `no_room` or `host_fault`.
+    /// `accepted`, `rejected`, `conflict`, `incompatible` or `aborted`.
     #[serde(rename = "verdict")]
     pub(crate) outcome: String,
     #[serde(default)]
@@ -470,13 +468,8 @@ fn gate(
         || "no verdict in the mission yet".to_string(),
         |verdict| {
             format!(
-                "the mission's latest verdict: {}{} on task #{} (record {}, {} ago)",
+                "the mission's latest verdict: {} on task #{} (record {}, {} ago)",
                 verdict.outcome,
-                if verdict.outcome == "host_fault" {
-                    " (the host's, not the work's: judged again after its backoff)"
-                } else {
-                    ""
-                },
                 verdict.task.as_deref().unwrap_or("?"),
                 verdict.id,
                 took(now - verdict.at_ms)
@@ -679,7 +672,6 @@ pub(crate) fn items(
                 ),
                 3000,
             ),
-            since_ms: Some(measured.since_ms),
         });
     }
     for halt in &stalls.halted {
@@ -708,7 +700,6 @@ pub(crate) fn items(
                 ),
                 3000,
             ),
-            since_ms: Some(record.at_ms),
         });
     }
     items
