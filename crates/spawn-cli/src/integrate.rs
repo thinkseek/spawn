@@ -5514,14 +5514,29 @@ mod database_tests {
             "a digest that failed told nothing"
         );
         digest("dispatch-digest-told", true);
+        // Told once, by its record: the dispatcher's told set has its tag,
+        // so it is never pending again. Its run goes on, so it is still
+        // read, and the plan holds it as told and unresolved.
+        let held = db.store.gate_room_escalations().expect("escalations");
+        assert_eq!(held.as_array().map(Vec::len), Some(1), "{held}");
+        let items = crate::disk::gate_room_escalations(held.as_array().map_or(&[][..], Vec::as_slice));
+        let supervisor: crate::dispatch::Facts = serde_json::from_value(json!({
+            "session_id": "session_supervisor", "agent_id": "agent_supervisor", "told": [tag],
+        }))
+        .expect("facts");
+        let plan = crate::dispatch::decide_with(
+            &[supervisor],
+            &crate::deliver::Work::default(),
+            &items,
+            false,
+            0,
+            "spawn",
+        );
+        assert!(plan.pending.is_empty(), "told once: {:?}", plan.pending);
         assert_eq!(
-            db.store
-                .gate_room_escalations()
-                .expect("escalations")
-                .as_array()
-                .map(Vec::len),
-            Some(0),
-            "told once, by its record"
+            plan.told.iter().map(crate::dispatch::Escalation::tag).collect::<Vec<_>>(),
+            [tag.clone()],
+            "told, and the gate still has no room"
         );
 
         // A no_room that names no free space or TMPDIR is refused.
@@ -5541,6 +5556,15 @@ mod database_tests {
         assert_eq!(after.gate_aborts, 3);
         assert_eq!(after.gate_room_waits, 0, "a gate that ran ends the run");
         assert!(after.gate_room_since_ms.is_none() && !after.gate_room_escalated);
+        assert_eq!(
+            db.store
+                .gate_room_escalations()
+                .expect("escalations")
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "told, and its run is over: resolved"
+        );
         assert!(super::halt_reason(&after, 0).is_some_and(|reason| reason.contains("aborts")));
         let _ = std::fs::remove_dir_all(&base);
     }
