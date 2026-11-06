@@ -981,3 +981,26 @@ fn shows_a_duration(line: &str) -> bool {
         rest.starts_with('h') || rest.starts_with("ms") || rest.starts_with("min")
     })
 }
+
+#[test]
+fn clipping_the_history_to_both_windows_changes_no_number() {
+    let mut story = small_card_story();
+    story
+        .assign(at(-200), 70, 1, Some(3), "spawn-integrate")
+        .cancelled(at(-199), 70, None)
+        .assign(at(-150), 71, 1, Some(3), "spawn-integrate")
+        .task(71, "task.landed", at(-149))
+        .assign(at(30), 72, 1, Some(3), "spawn-integrate")
+        .task(72, "task.landed", at(31))
+        .message("agent_72", at(30), "opus", 7)
+        .message("agent_supervisor", at(-300), "opus", 9)
+        .command("human", "board-9", "session_72", "input", at(-250), Some(false), None, &[]);
+    let whole = story.history();
+    let mut clipped = story.history();
+    clipped.clip(at(-48), at(48));
+    assert!(clipped.tasks.len() < whole.tasks.len());
+    assert_eq!(
+        card(&clipped, window_hours(0, 48), None),
+        card(&whole, window_hours(0, 48), None)
+    );
+}
