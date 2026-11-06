@@ -212,9 +212,10 @@ function GroupedSessions({
               expanded={folds ? open : undefined}
               onToggle={folds ? () => setEnded(open ? "closed" : "open") : undefined}
             />
-            {open && (
+            {/* Folded, the group still shows the session open in the main view. */}
+            {(open || group.agents.some((agent) => agent.session_id === selectedId)) && (
               <ul className="space-y-px">
-                {group.agents.map((agent) => {
+                {group.agents.filter((agent) => open || agent.session_id === selectedId).map((agent) => {
                   const held = heldTask(agent, context);
                   const state = sessionState(agent.state);
                   const label =
