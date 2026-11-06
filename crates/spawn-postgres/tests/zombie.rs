@@ -141,7 +141,8 @@ fn restarted(case: &str) -> (Arc<PostgresStore>, Arc<MemoryStore>, String) {
     submit(&store, "key_start", "spawn-liveness", start("charter"));
     tick(store.clone(), &store, &host);
     let workspace = WorkspaceId::new("1:/workspaces/1").expect("valid workspace");
-    host.terminate(&terminal(1), &workspace).expect("the host restarts");
+    host.terminate(&terminal(1), &workspace)
+        .expect("the host restarts");
     host.untrack(
         &terminal(1),
         "spawn-exec_1 does not host the runner Spawn started there: its pane was started with \
@@ -154,6 +155,24 @@ fn restarted(case: &str) -> (Arc<PostgresStore>, Arc<MemoryStore>, String) {
         .and_then(|record| record.event.execution_id);
     assert_eq!(open, Some(ExecutionId::for_command(CommandId(1))));
     (store, host, schema)
+}
+
+/// The log through the port's default `open_execution`: a scan of every
+/// record.
+struct Scan<'a>(&'a PostgresStore);
+
+impl EventLog for Scan<'_> {
+    fn append(&self, event: NewEvent) -> Result<spawn_core::event::Appended, StoreError> {
+        self.0.append(event)
+    }
+
+    fn read_global(
+        &self,
+        after: GlobalPosition,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        self.0.read_global(after, limit)
+    }
 }
 
 #[test]
@@ -195,26 +214,23 @@ fn the_log_answers_the_open_execution_its_guard_refuses_by() {
     append("exec_1", Source::Bridge, "exec_1:started", started(1));
     assert_eq!(open().as_deref(), Some("exec_1"));
     // An old runner's exit report is no end.
-    append("exec_1", Source::Claude, "exec_1:exit", ended(EndCause::Exited));
+    append(
+        "exec_1",
+        Source::Claude,
+        "exec_1:exit",
+        ended(EndCause::Exited),
+    );
     assert_eq!(open().as_deref(), Some("exec_1"));
-    append("exec_1", Source::Bridge, "exec_1:ended", ended(EndCause::Lost));
+    append(
+        "exec_1",
+        Source::Bridge,
+        "exec_1:ended",
+        ended(EndCause::Lost),
+    );
     assert_eq!(open(), None);
     append("exec_2", Source::Bridge, "exec_2:started", started(2));
     assert_eq!(open().as_deref(), Some("exec_2"));
     // The default (a scan of the whole log) agrees with the query.
-    struct Scan<'a>(&'a PostgresStore);
-    impl EventLog for Scan<'_> {
-        fn append(&self, event: NewEvent) -> Result<spawn_core::event::Appended, StoreError> {
-            self.0.append(event)
-        }
-        fn read_global(
-            &self,
-            after: GlobalPosition,
-            limit: usize,
-        ) -> Result<Vec<EventRecord>, StoreError> {
-            self.0.read_global(after, limit)
-        }
-    }
     let scanned = Scan(&store)
         .open_execution(&session())
         .expect("scan")

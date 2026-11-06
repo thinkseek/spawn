@@ -137,7 +137,16 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
 
     // A session of the same name restored at a shell prompt: tmux has it,
     // and it hosts no runner.
-    server.tmux(&["new-session", "-d", "-s", "spawn-exec_1", "-x", "80", "-y", "20"]);
+    server.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "spawn-exec_1",
+        "-x",
+        "80",
+        "-y",
+        "20",
+    ]);
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
     let Runner::Untracked(seen) = host.runner(&terminal(), &workspace()).expect("runner") else {
         panic!("a restored shell hosts no runner");
