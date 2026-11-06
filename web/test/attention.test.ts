@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  agentNeedsHuman,
   attentionGroups,
   itemSince,
+  markNeedsHuman,
+  needsHuman,
   normalizeAttention,
 } from "../src/attention.ts";
+import { groupAgents, fleetContext } from "../src/ordering.ts";
 
 const NOW = 1_793_957_840_000;
 const HOUR = 3_600_000;
@@ -215,4 +219,111 @@ test("nothing held and nothing asked is an empty queue", () => {
   const groups = attentionGroups(normalizeAttention(raw));
   assert.equal(groups.question, null);
   assert.equal(groups.count, 0);
+});
+
+/** A board row, as fleet.ts normalizes it: `attention` false until marked. */
+function agent(agent_id: string, judgedAttention = false) {
+  return {
+    session_id: agent_id.replace(/^agent_/, "session_"),
+    agent_id,
+    role: agent_id === "agent_supervisor" ? ("supervisor" as const) : ("worker" as const),
+    live: true,
+    attention: false,
+    ended_at_ms: null,
+    started_at_ms: NOW - HOUR,
+    activity: { last_event_at_ms: NOW - 60_000 },
+    judgement: { attention: judgedAttention },
+  };
+}
+
+test("needs a human: one definition, from the dispatcher's view alone", () => {
+  const view = normalizeAttention(answer());
+  const needs = needsHuman(view);
+  // Three pending, two told and unresolved, and the supervisor's question.
+  assert.equal(needs.count, 6);
+  assert.equal(needs.count, attentionGroups(view).count, "the queue's count is the sidebar's");
+  for (const id of [
+    "agent_worker_objective_87",
+    "session_worker_objective_87",
+    "agent_worker_objective_90",
+    "agent_worker_objective_86",
+    "agent_supervisor",
+    "session_supervisor",
+  ]) {
+    assert.ok(needs.ids.has(id), id);
+  }
+});
+
+test("the live page of 2026-11-06 20:30: a judge's flag is no mark, an item is", () => {
+  // Worker 106's task is reported and waits for the gate: a managed worker
+  // between tasks, which the dispatcher does not escalate, though its judge
+  // flags attention. Worker 97 has a told, unresolved item. The supervisor
+  // waits at its prompt and asks nothing.
+  const raw = answer() as Record<string, unknown> & { supervisor: { question: unknown } };
+  raw.pending = [];
+  raw.told = [
+    {
+      session_id: "session_worker_objective_97",
+      agent_id: "agent_worker_objective_97",
+      why: "nudge did not help",
+      line: "stopped again after `continue`",
+      tag: "session_worker_objective_97 nudge-412",
+      since_ms: NOW - HOUR,
+      told: true,
+      told_at_ms: NOW - 48 * 60_000,
+    },
+  ];
+  raw.supervisor.question = null;
+  const needs = needsHuman(normalizeAttention(raw));
+  const agents = markNeedsHuman(
+    [
+      agent("agent_supervisor"),
+      agent("agent_worker_objective_106", true),
+      agent("agent_worker_objective_97"),
+    ],
+    needs,
+  );
+  assert.deepEqual(
+    agents.map((row) => [row.agent_id, row.attention]),
+    [
+      ["agent_supervisor", false],
+      ["agent_worker_objective_106", false],
+      ["agent_worker_objective_97", true],
+    ],
+  );
+  assert.equal(needs.count, 1, "the sidebar says what the queue says");
+  // The board's "needs a human first" reads the same mark.
+  const groups = groupAgents(agents, fleetContext(null));
+  const idle = groups.find((group) => group.id === "idle");
+  assert.deepEqual(
+    idle?.agents.map((row) => row.agent_id),
+    ["agent_worker_objective_97", "agent_worker_objective_106"],
+  );
+});
+
+test("a host or mission item counts but marks no agent; an unknown view marks none", () => {
+  const raw = answer() as Record<string, unknown> & { supervisor: { question: unknown } };
+  raw.pending = [
+    {
+      session_id: "host",
+      agent_id: null,
+      why: "disk space on this host",
+      line: "tmpdir /var/tmp has 5.0 GiB free",
+      tag: "host disk-7",
+      since_ms: NOW,
+      told: false,
+      told_at_ms: null,
+    },
+  ];
+  raw.told = [];
+  raw.supervisor.question = null;
+  const needs = needsHuman(normalizeAttention(raw));
+  assert.equal(needs.count, 1);
+  const supervisor = agent("agent_supervisor");
+  assert.equal(agentNeedsHuman(needs, supervisor), false);
+  assert.equal(agentNeedsHuman(null, { ...supervisor, attention: true }), false);
+  const marked = markNeedsHuman([{ ...supervisor, attention: true }], null);
+  assert.equal(marked[0].attention, false, "no view, no mark: none is guessed");
+  const same = [supervisor];
+  assert.equal(markNeedsHuman(same, needs)[0], supervisor, "an unchanged row is kept as it is");
 });
