@@ -382,6 +382,8 @@ Bridge、Observer、调度器（`deliver.rs`、`dispatch.rs`）、集成器（`i
 
 门禁的主机故障同样守这条规则（objective 20，[fleet-architecture.md](fleet-architecture.md) §10.3）：check-tests.sh 在候选上失败时，集成器只依据记下的门禁输出里每条失败及其消息（记录的 `failures`），以及测试数据库日志里落在它自己量出的门禁时间窗内（前后各 1 秒）的崩溃行（记录的 `crash`），判定是主机的故障（`host_fault`）还是工作的（`rejected`），从不只凭拒绝理由的文字；之后的等待只依据记录里的 `due_ms`（记录自己的 `recorded_at_ms` 加退避，由存储写入），不凭进程内存或没有记录的时间。主机故障不计入任何停机规则，连续两次升级给 supervisor 一次。
 
+门禁之前先量主机，不靠门禁崩溃才知道主机没有余量（objective 018）：每次判定在候选构建之后、门禁启动之前，集成器按序量门禁 `TMPDIR` 的剩余空间（`SPAWN_GATE_MIN_FREE_GB`）、`MemAvailable`（`SPAWN_GATE_MIN_FREE_MEMORY_MB`）与测试数据库（连接，再跑一条强制并行的查询，各 10 秒内），第一项不够就不启动门禁，记 `no_room` 并写明 `check`、`measured` 与 `threshold`。判断只凭判定当时的测量和它的阈值；一次跑了 25 分钟、因测试库 `/dev/shm` 不足而崩溃的门禁，不再被读成候选的回归。
+
 写新代码时的检查：读另一个循环的产物时，问它覆盖的是哪一个 commit、哪一个会话位置、哪一个命令 id；读 `spawn_commands` 时区分成功、失败与尚未运行；超时只决定何时再看，不证明任何事；删掉一个生产者时，搜出它的每个读者。
 
 ## 15. 记分卡（`spawn scorecard`）

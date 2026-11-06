@@ -328,7 +328,8 @@ export function landedToday(events: readonly LogEvent[], nowMs: number): number 
 }
 
 /** Verdicts that judge the work. `stale` (main moved on), `aborted` (the
- * gate itself did not finish), `no_room` (TMPDIR had no room to start) and
+ * gate itself did not finish), `no_room` (no room to judge: disk, memory or
+ * the test database, measured before the gate or by its own floor) and
  * `host_fault` (the host failed it: the test database) say nothing about
  * the candidate. */
 const JUDGING = new Set(["accepted", "rejected", "conflict", "incompatible"]);
