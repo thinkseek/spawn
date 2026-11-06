@@ -21,6 +21,23 @@
 //! under the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is
 //! an abort, as is a fact with any other exit status.
 //!
+//! **The host's room is measured before a gate, not learned from its
+//! crash.** Before it starts a gate, the integrator checks the host
+//! ([`Room::check`]), in this order, stopping at the first that falls short:
+//! free disk in the gate's TMPDIR against SPAWN_GATE_MIN_FREE_GB (the
+//! floor `scripts/disk.sh` reads too), `MemAvailable` against
+//! SPAWN_GATE_MIN_FREE_MEMORY_MB (default 2048 MiB), and, when
+//! SPAWN_TEST_DATABASE_URL is set, the test database: a connection, then a
+//! forced parallel query, each within 10 s, so a server without the shared
+//! memory a parallel query needs (/dev/shm in a container) is found before
+//! the workspace tests are. A check that falls short ([`Shortfall`]) means
+//! the gate does not run; the integrator records `no_room` with the check,
+//! its measure and its threshold, which is no verdict on the work. A gate
+//! that ran 25 minutes into a crashed test database is never needed to
+//! learn the host had no room. A threshold of 0 disables its check. The
+//! gate's own exit 5 above stays: a TMPDIR that fills between the check and
+//! the gate's start is still found.
+//!
 //! The gate runs with a cleared environment: [`GATE_ENV`] and nothing else.
 //! The integrator's own database URL never reaches candidate code.
 
