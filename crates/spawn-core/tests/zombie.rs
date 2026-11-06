@@ -270,7 +270,7 @@ fn an_input_ends_an_execution_nothing_runs_and_the_resume_goes_on() {
             principal,
             CommandAction::Input {
                 text: "digest".to_string(),
-                images: Vec::new(),
+                tags: Vec::new(),
             },
         );
         tick_fresh(&store);
@@ -373,7 +373,7 @@ fn an_execution_the_view_lost_and_the_log_holds_open_is_ended_by_each_command() 
         "spawn-dispatch",
         CommandAction::Input {
             text: "digest".to_string(),
-            images: Vec::new(),
+            tags: Vec::new(),
         },
     );
     let report = tick_over(missed.clone(), &store);
@@ -432,7 +432,7 @@ fn an_engine_its_runner_still_runs_is_never_ended_by_a_start() {
         "tester",
         CommandAction::Input {
             text: "status?".to_string(),
-            images: Vec::new(),
+            tags: Vec::new(),
         },
     );
     tick_over(Arc::new(Missed(store.clone())), &store);
