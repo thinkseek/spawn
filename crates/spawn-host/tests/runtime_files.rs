@@ -253,3 +253,138 @@ fn a_runtime_file_main_removes_during_a_pending_merge_stays_removed() {
     assert!(!files_of(&checkout, &reference).contains(&LOCK.to_string()));
     store.unmount(&workspace).expect("unmount");
 }
+
+/// git with the store's work tree and index, as the Bridge runs it.
+fn git_in(checkout: &Path, directory: &Path, index: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", checkout.join(".git").display()))
+        .arg(format!("--work-tree={}", directory.display()))
+        .env("GIT_INDEX_FILE", index)
+        .args(arguments)
+        .output()
+        .expect("git is installed");
+    assert!(output.status.success(), "git {arguments:?}: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A workspace mounted and checkpointed before this version (Supply PA's
+/// `spawn checkpoint exec_212`): the branch head and the kept index hold
+/// the engine's lock and worktree. `main` never held them, so the next
+/// checkpoint takes them out of the branch; the engine keeps its files.
+#[test]
+fn a_runtime_file_only_a_checkpoint_from_before_put_in_the_branch_leaves_it() {
+    let (checkout, store, root) = project("before", &[("README.md", "base\n")]);
+    let (workspace, directory) = mount(&store);
+    write(&directory, LOCK, LOCK_TEXT);
+    write(&directory, WORKTREE_FILE, "fn main() {}\n");
+    write(&directory, "src/lib.rs", "pub fn f() {}\n");
+    // The checkpoint of the version before: `add -A` against the kept
+    // index, whatever the engine wrote.
+    let index = root.join(".index").join(agent().as_str());
+    git_in(&checkout, &directory, &index, &["add", "-A"]);
+    let tree = git_in(&checkout, &directory, &index, &["write-tree"]);
+    let reference = agent().to_string();
+    let head = git(&checkout, &["rev-parse", &reference]);
+    let before = git(
+        &checkout,
+        &["commit-tree", &tree, "-p", &head, "-m", "spawn checkpoint exec_212"],
+    );
+    git(&checkout, &["update-ref", &format!("refs/heads/{reference}"), &before, &head]);
+    assert!(files_of(&checkout, &reference).contains(&LOCK.to_string()));
+
+    assert!(matches!(
+        store.commit(&workspace, "after the deploy").expect("commit"),
+        Commit::Created(_)
+    ));
+    let files = files_of(&checkout, &reference);
+    assert!(files.contains(&"src/lib.rs".to_string()), "{files:?}");
+    assert!(!files.contains(&LOCK.to_string()), "{files:?}");
+    assert!(!files.contains(&WORKTREE_FILE.to_string()), "{files:?}");
+    assert!(directory.join(LOCK).is_file() && directory.join(WORKTREE_FILE).is_file());
+    assert_eq!(
+        store.commit(&workspace, "again").expect("commit"),
+        Commit::Unchanged
+    );
+    store.unmount(&workspace).expect("unmount");
+}
+
+/// The owner removes a tracked runtime file from `main` (Supply PA's
+/// 37641e9) while a branch holds the engine's own version of it: the
+/// branch's next checkpoint lets it go as well, so the landing is clean
+/// instead of a modify/delete conflict.
+#[test]
+fn a_runtime_file_the_owner_removes_from_main_leaves_the_branch_and_lands_clean() {
+    let (checkout, store, _) = project(
+        "removed",
+        &[("README.md", "base\n"), (LOCK, "{\"sessionId\":\"committed\"}")],
+    );
+    let (workspace, directory) = mount(&store);
+    write(&directory, LOCK, LOCK_TEXT);
+    write(&directory, "work.txt", "work\n");
+    assert!(matches!(
+        store.commit(&workspace, "work").expect("commit"),
+        Commit::Created(_)
+    ));
+    let reference = agent().to_string();
+    assert_eq!(git(&checkout, &["show", &format!("{reference}:{LOCK}")]), LOCK_TEXT);
+
+    git(&checkout, &["rm", "-q", "--cached", LOCK]);
+    git(&checkout, &["commit", "-qm", "the lock is not the project's"]);
+    assert!(matches!(
+        store.commit(&workspace, "after the owner's removal").expect("commit"),
+        Commit::Created(_)
+    ));
+    let files = files_of(&checkout, &reference);
+    assert!(!files.contains(&LOCK.to_string()), "{files:?}");
+    assert!(files.contains(&"work.txt".to_string()), "{files:?}");
+    assert!(directory.join(LOCK).is_file(), "the engine keeps its lock");
+    // The landing: `main` first, as the integrator merges.
+    let landed = Command::new("git")
+        .arg("-C")
+        .arg(&checkout)
+        .args(["merge-tree", "--write-tree", "main", &reference])
+        .output()
+        .expect("git is installed");
+    assert!(landed.status.success(), "the landing is clean: {landed:?}");
+    store.unmount(&workspace).expect("unmount");
+}
+
+/// `main` adds a runtime file on purpose (a project that commits its
+/// durable schedule) while the agent's merge of it waits on its markers:
+/// the merge wrote it into the workspace, and it is the project's, so
+/// neither checkpoint drops it (which would delete it from `main` when the
+/// branch lands).
+#[test]
+fn a_runtime_file_main_adds_during_a_pending_merge_stays() {
+    const SCHEDULE: &str = ".claude/scheduled_tasks.json";
+    let (checkout, store, _) = project("added", &[("notes.txt", "base\n")]);
+    let (workspace, directory) = mount(&store);
+    write(&directory, "notes.txt", "agent\n");
+    assert!(matches!(
+        store.commit(&workspace, "agent's notes").expect("commit"),
+        Commit::Created(_)
+    ));
+    write(&checkout, "notes.txt", "main\n");
+    write(&checkout, SCHEDULE, "{\"tasks\":[]}\n");
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-qm", "notes, and the project's schedule"]);
+    assert!(matches!(
+        store.merge_base(&workspace).expect("merge main"),
+        BaseMerge::Conflicted { marked: true, .. }
+    ));
+    assert!(directory.join(SCHEDULE).is_file(), "the merge wrote it");
+
+    let reference = agent().to_string();
+    assert!(matches!(
+        store.commit(&workspace, "markers still in").expect("commit"),
+        Commit::Created(_)
+    ));
+    assert!(files_of(&checkout, &reference).contains(&SCHEDULE.to_string()));
+    write(&directory, "notes.txt", "agent and main\n");
+    assert!(matches!(
+        store.commit(&workspace, "resolved").expect("commit"),
+        Commit::Created(_)
+    ));
+    assert!(files_of(&checkout, &reference).contains(&SCHEDULE.to_string()));
+    store.unmount(&workspace).expect("unmount");
+}
