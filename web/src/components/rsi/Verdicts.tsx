@@ -28,7 +28,13 @@ function defaultNote(verdict: TaskVerdict): string {
     case "stale":
       return "Main moved; judged again";
     case "no_room":
+<<<<<<< e2c6976a9684f35be79092d8189a9c360be937d8
+      return "No disk room for the gate; judged again later";
+    case "host_fault":
+      return "The host failed (the test database), not the work; judged again after a backoff";
+=======
       return "No room for the gate (disk, memory or the test database); judged again later";
+>>>>>>> e3a9bfe683d09a57da5f7f00c9375051096c282e
     default:
       return "";
   }
