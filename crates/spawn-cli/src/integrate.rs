@@ -3072,7 +3072,7 @@ mod tests {
     #[test]
     fn an_incompatible_note_bounds_the_commits_it_lists() {
         let commits: Vec<(String, String)> = (0..super::NOTE_COMMITS + 3)
-            .map(|n| (format!("{n:040x}"), format!("landing {n}")))
+            .map(|n| (format!("{n:012x}{}", "a".repeat(28)), format!("landing {n}")))
             .collect();
         let note = super::incompatible_note(
             "candidate tests do not build",
