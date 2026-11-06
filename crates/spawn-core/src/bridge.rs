@@ -876,9 +876,13 @@ impl Bridge {
                 ))
             })
             .collect();
+        let mut ended_now = Vec::new();
         for (session, agent_id, native, mut active) in running {
             let ended =
                 self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
+            if ended {
+                ended_now.push((session.clone(), active.execution_id.clone()));
+            }
             if let Some(view) = self.sessions.get_mut(&session) {
                 if ended {
                     view.active = None;
@@ -889,6 +893,18 @@ impl Bridge {
                     held.reported_end = active.reported_end;
                     held.follow = active.follow;
                 }
+            }
+        }
+        if !ended_now.is_empty() {
+            // What waited for a turn of an execution that ended is never
+            // typed: failed now, with how the execution ended.
+            self.catch_up()?;
+            for (session, execution) in ended_now {
+                let cause = self
+                    .sessions
+                    .get(&session)
+                    .and_then(|view| view.inputs.ended.get(&execution).copied());
+                self.fail_waiting(&session, cause)?;
             }
         }
         Ok(())
@@ -2562,7 +2578,11 @@ impl Bridge {
     /// Fail every input of `session` this Bridge left waiting, now that its
     /// execution has ended (`cause`): none of them was typed. One claimed by
     /// someone else since is failed when it is claimed next.
-    fn fail_waiting(&mut self, session: &SessionId, cause: EndCause) -> Result<(), StoreError> {
+    fn fail_waiting(
+        &mut self,
+        session: &SessionId,
+        cause: Option<EndCause>,
+    ) -> Result<(), StoreError> {
         let mine: Vec<CommandId> = self
             .held
             .iter()
@@ -2575,7 +2595,7 @@ impl Bridge {
             };
             match self
                 .queue
-                .finish(&claimed, &Outcome::Failed(untyped_because(Some(cause))))
+                .finish(&claimed, &Outcome::Failed(untyped_because(cause)))
             {
                 Ok(()) | Err(StoreError::LeaseLost { .. }) => {}
                 Err(error) => return Err(error),
@@ -2610,7 +2630,7 @@ impl Bridge {
         self.catch_up()?;
         if ended {
             // What waited for a turn of this execution is never typed.
-            self.fail_waiting(&claimed.session_id, cause)?;
+            self.fail_waiting(&claimed.session_id, Some(cause))?;
             // A discard that lost work says so in the tick's report too.
             tick.warnings.append(&mut report.warnings);
             return Ok(Outcome::Succeeded);
