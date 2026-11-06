@@ -1306,11 +1306,14 @@ begin
                                     updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
-        -- The owner moved a source's main on purpose (a deploy), forward from
-        -- where the last landing left it: the missions on that source take
-        -- the new main as their baseline instead of halting at the next pass.
-        -- The record names them (never a halted one); a record from before
-        -- it did moved every mission on the source at that baseline.
+        -- The owner moved a source's main on purpose: a deploy behind
+        -- Spawn's back (`spawn mission moved`), forward from where the last
+        -- landing left it, or the integrator's landing of the owner's
+        -- request (`spawn mission push`; the record names the `request`):
+        -- the missions on that source take the new main as their baseline
+        -- instead of halting at the next pass. The record names them (never
+        -- a halted one); a record from before it did moved every mission on
+        -- the source at that baseline.
         update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
          where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
            and (p_record -> 'missions' is null
@@ -1486,6 +1489,18 @@ begin
     when 'host.disk' then
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
+        null;
+    when 'source.push_requested' then
+        -- The owner asked for a commit on a source's main (`spawn mission
+        -- push`): a request the integrator applies between its steps, read
+        -- from the log, folded into no table. Its outcome names it: a
+        -- `source.moved` (which moves the baselines) or a
+        -- `source.push_refused`.
+        null;
+    when 'source.push_refused' then
+        -- The integrator could not apply an owner's request (a conflict, a
+        -- commit not in the source, main moving under it twice): main and
+        -- every baseline stay where they were.
         null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
