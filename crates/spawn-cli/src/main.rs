@@ -10,6 +10,8 @@
 //! - `mission`, `task`, `resident` manage the mission layer.
 //! - `integrate` lands gated missions' work and assigns objectives (RSI).
 //! - `serve` serves the read-only dashboard and API.
+//! - `scorecard` measures every dimension of the fleet at once, from the
+//!   record alone (docs/design.md §15).
 //! - `fleet` prints every session with its judgement; `tail` one session's
 //!   judgement, events, judgements and commands.
 //! - `run` starts the engine inside the terminal, records its exit, and
@@ -36,6 +38,7 @@ mod missions;
 mod objectives;
 mod push;
 mod runtime;
+mod scorecard;
 mod serve;
 mod set_aside;
 mod sources;
@@ -46,7 +49,7 @@ pub(crate) use config::{Flags, env_or, env_value, open_store};
 
 use commands::{engine, inspect, loops, queue};
 
-const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|serve|fleet|tail|run|version>";
+const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|resident|integrate|serve|scorecard|fleet|tail|run|version>";
 
 fn main() {
     let code = match dispatch() {
@@ -75,6 +78,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "tick" => loops::tick(&Flags::parse(&rest)?),
         "loop" => loops::resident_loop(&Flags::parse(&rest)?),
         "serve" => serve::serve(&Flags::parse(&rest)?),
+        "scorecard" => scorecard::command(&rest),
         "integrate" => integrate::integrate(&rest),
         "mission" => missions::mission(&rest),
         "task" => missions::task(&rest),
