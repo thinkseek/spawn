@@ -92,9 +92,7 @@
 #
 # Today (2026-11-06, the deployed binary): `spawn mission hold --source
 # <SA>` exits 1 with the usage of `spawn mission` ("spawn: usage: ...");
-# the scenario fails at (1) 0.8-1.0 s after it starts. A pass takes 1-4
-# minutes (most of it the loop's setup, two reports, and the 20 s bound
-# of (4)).
+# the scenario fails at (1) 0.8-1.0 s after it starts.
 set -eu
 
 asserted=""
