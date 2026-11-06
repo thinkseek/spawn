@@ -121,8 +121,10 @@ from (
 ///   review or verdict that sent it back (`rejected`, `conflict` or
 ///   `incompatible`); `task.delivered`; `task.reported`;
 ///   the review that accepted it; the gate's `accepted`; the record that
-///   closed it), and `stale`, the latest `stale` verdict on it, which moves
-///   no step;
+///   closed it), `stale`, the latest `stale` verdict on it, which moves
+///   no step, and, for a landing, `held` (its mission's source has an
+///   active owner's hold: it waits behind it) and `hold_end` (the latest
+///   `source.released` or `source.hold_expired` on its source);
 /// - `verdicts`: per gated mission with a task waiting for the gate, the
 ///   latest verdict on any of its tasks that is not `stale`;
 /// - `sessions`: per session with a delivered task, its latest fact (a
@@ -137,7 +139,8 @@ with now as (select spawn_now_ms() as ms),
 open as (
   select k.id, k.mission_id, k.kind, k.session_id, k.state, k.revisions,
          m.gate is not null as gated, coalesce(m.accept, 'review') as accept,
-         m.halted is not null as halted
+         m.halted is not null as halted, m.sources ->> 0 as source,
+         exists (select 1 from mission_source_holds h where h.source = m.sources ->> 0) as held
     from mission_tasks k
     join mission_missions m on m.id = k.mission_id
    where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
@@ -150,7 +153,8 @@ select jsonb_build_object(
   'tasks', coalesce((select jsonb_agg(jsonb_build_object(
       'id', o.id, 'mission_id', o.mission_id, 'kind', o.kind, 'session_id', o.session_id,
       'state', o.state, 'revisions', o.revisions, 'gated', o.gated, 'accept', o.accept,
-      'halted', o.halted, 'record', rec.record, 'stale', st.stale) order by o.id)
+      'halted', o.halted, 'record', rec.record, 'stale', st.stale,
+      'held', o.state = 'landing' and o.held, 'hold_end', he.record) order by o.id)
     from open o
     left join lateral (
       select jsonb_build_object('id', e.id, 'type', x.r ->> 'type', 'at_ms', e.recorded_at_ms,
@@ -182,7 +186,17 @@ select jsonb_build_object(
          and e.kind -> 'detail' -> 'record' ->> 'id' = o.id::text
          and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
          and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'stale'
-       order by e.session_seq desc limit 1) st on true), '[]'::jsonb),
+       order by e.session_seq desc limit 1) st on true
+    left join lateral (
+      select jsonb_build_object('id', e.id, 'type', e.kind -> 'detail' -> 'record' ->> 'type',
+                                'at_ms', e.recorded_at_ms,
+                                'age_ms', (select ms from now) - e.recorded_at_ms) as record
+        from spawn_events e
+       where o.state = 'landing'
+         and e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'type' in ('source.released', 'source.hold_expired')
+         and e.kind -> 'detail' -> 'record' ->> 'source' = o.source
+       order by e.session_seq desc limit 1) he on true), '[]'::jsonb),
   'verdicts', coalesce((select jsonb_agg(v order by v.mission_id) from (
       select distinct on (k.mission_id) k.mission_id, e.id,
              e.kind -> 'detail' -> 'record' ->> 'verdict' as verdict,
@@ -278,13 +292,37 @@ select jsonb_build_object(
                                  where tag = c.session_id || ' human-' || c.id)), '[]'::jsonb)
 )";
 
+/// Every active owner's hold on a mission source, by source:
+/// `[{source, hold, main, by, reason, held_at_ms, expires_ms, waiting}]`,
+/// `waiting` the tasks waiting behind it (`landing`, `held_by` the hold),
+/// oldest first. Read from the fold alone, so the supervisor's login reads
+/// it too.
+macro_rules! active_holds {
+    () => {
+        r"coalesce((select jsonb_agg(jsonb_build_object(
+      'source', h.source, 'hold', h.hold, 'main', h.main, 'by', h.by, 'reason', h.reason,
+      'held_at_ms', h.held_at_ms, 'expires_ms', h.expires_ms,
+      'waiting', coalesce((select jsonb_agg(k.id order by k.id) from mission_tasks k
+                            where k.state = 'landing' and k.held_by = h.hold), '[]'::jsonb))
+      order by h.source)
+    from mission_source_holds h), '[]'::jsonb)"
+    };
+}
+
 /// The board of missions with their tasks, newest first; each task carries
-/// its stages ([`PostgresStore::task_stages`]).
-pub(crate) const MISSION_BOARD: &str = r"
+/// its stages ([`PostgresStore::task_stages`]) and each mission the `hold`
+/// on its source (the active hold's event id, or null); `holds` is every
+/// active hold ([`SOURCE_HOLDS`]).
+pub(crate) const MISSION_BOARD: &str = concat!(
+    r"
 select jsonb_build_object(
+  'holds', ",
+    active_holds!(),
+    r",
   'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
       select m.id, m.text, m.origin, m.sources, m.state, m.summary,
              m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
+             (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
                  'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
@@ -293,6 +331,7 @@ select jsonb_build_object(
                  'review_note', k.review_note, 'report', k.report,
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
                  'model', k.model, 'stages', spawn_task_stages(k.id),
+                 'held_by', k.held_by,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
                  'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
@@ -301,7 +340,59 @@ select jsonb_build_object(
   'residents', coalesce((select jsonb_agg(row_to_json(r) order by r.name) from (
       select name, agent_id, session_id, charter, state, proposed_by, approved_by,
              created_at_ms, updated_at_ms from mission_residents) r), '[]'::jsonb)
-)";
+)"
+);
+
+/// Every active owner's hold ([`MISSION_BOARD`]'s `holds`) and the
+/// database's clock: `{now_ms, holds}`. The integrator ends a hold whose
+/// `expires_ms` that clock reached, by record; the attention view shows the
+/// ones with tasks waiting.
+pub(crate) const SOURCE_HOLDS: &str = concat!(
+    r"
+select jsonb_build_object('now_ms', spawn_now_ms(), 'holds', ",
+    active_holds!(),
+    ")"
+);
+
+/// The `source.hold_expired` records the supervisor was not told of yet,
+/// oldest first: `{event_id, at_ms, source, hold, expires_ms, reason,
+/// held_at_ms, bound_s, main, waiting: [{task, mission}]}`, the hold's own
+/// fields read from its `source.held` record. Told is a record, as for
+/// [`GATE_HOST_FAULT_ESCALATIONS`]: a digest that reached the supervisor
+/// carrying the tag `missions source-hold-expired-<event_id>`, however long
+/// ago.
+pub(crate) const HOLD_EXPIRIES: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(jsonb_build_object(
+         'event_id', e.id, 'at_ms', e.recorded_at_ms, 'source', x.r ->> 'source',
+         'hold', x.r -> 'hold', 'expires_ms', x.r -> 'expires_ms',
+         'reason', held.r ->> 'reason', 'held_at_ms', held.at_ms, 'bound_s', held.r -> 'bound_s',
+         'main', held.r ->> 'main',
+         'waiting', coalesce((
+            select jsonb_agg(jsonb_build_object('task', w.id::bigint, 'mission', k.mission_id)
+                             order by w.n)
+              from jsonb_array_elements_text(
+                     case when jsonb_typeof(x.r -> 'waiting') = 'array'
+                          then x.r -> 'waiting' else '[]'::jsonb end) with ordinality w(id, n)
+              left join mission_tasks k on k.id = w.id::bigint), '[]'::jsonb))
+         order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join lateral (
+    select h.kind -> 'detail' -> 'record' as r, h.recorded_at_ms as at_ms
+      from spawn_events h
+     where h.id = (x.r ->> 'hold')::bigint and h.session_id = 'session_control') held on true
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' in ('source.released', 'source.hold_expired')
+   and x.r ->> 'type' = 'source.hold_expired'
+   and not exists (select 1 from told where tag = 'missions source-hold-expired-' || e.id)";
 
 // Checked decisions, one SQL function each.
 
@@ -335,7 +426,8 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
 /// the integrator may judge, land, or hold to its budget, with the brief and
-/// the report a landing's message is written from.
+/// the report a landing's message is written from. Each names `hold`, the
+/// active owner's hold on its source (or null), and each task `held_by`.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
@@ -344,6 +436,7 @@ from (
          m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
          m.gate_host_due_ms, m.objectives, m.sources ->> 0 as source,
+         (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -353,7 +446,7 @@ from (
                'candidate', k.candidate, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
-               'updated_at_ms', k.updated_at_ms)
+               'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
