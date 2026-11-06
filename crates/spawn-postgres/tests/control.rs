@@ -447,14 +447,20 @@ fn a_no_room_with_its_check_measure_and_threshold_folds_as_before() {
                    "threshold": "a parallel query within 10 s",
                    "server": "/run/test-pg:5432/spawn_test", "escalate": true}))
     .expect("a database no_room");
-    no_room(json!({"check": "disk", "measured": 1024, "threshold": 10_485_760,
-                   "free_kb": 1024, "min_gb": 10, "tmpdir": "/tmp"}))
+    no_room(
+        json!({"check": "disk", "measured": 1024, "threshold": 10_485_760,
+                   "free_kb": 1024, "min_gb": 10, "tmpdir": "/tmp"}),
+    )
     .expect("a disk no_room");
     no_room(json!({"free_kb": 0, "min_gb": 10, "tmpdir": "/data/tmp"}))
         .expect("the gate's own fact, as before, names no check");
     let row = mission_row(&mut client);
     assert_eq!(
-        (&row["gate_room_task"], &row["gate_room_waits"], &row["gate_room_escalated"]),
+        (
+            &row["gate_room_task"],
+            &row["gate_room_waits"],
+            &row["gate_room_escalated"]
+        ),
         (&json!(task), &json!(4), &json!(true)),
         "one run, counted on"
     );
@@ -478,7 +484,11 @@ fn a_no_room_with_its_check_measure_and_threshold_folds_as_before() {
     assert_eq!(mission_row(&mut client)["gate_room_waits"], 4);
 
     let escalations = store.gate_room_escalations().expect("escalations");
-    assert_eq!(escalations.as_array().map(Vec::len), Some(1), "{escalations}");
+    assert_eq!(
+        escalations.as_array().map(Vec::len),
+        Some(1),
+        "{escalations}"
+    );
     assert_eq!(escalations[0]["check"], "database");
     assert_eq!(escalations[0]["threshold"], "a parallel query within 10 s");
     assert_eq!(escalations[0]["mission"], mission);
@@ -497,7 +507,11 @@ fn a_no_room_with_its_check_measure_and_threshold_folds_as_before() {
 
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
 }
 
 /// Objective 16: `incompatible` (the head passes the gate alone and fails

@@ -3375,7 +3375,11 @@ mod tests {
         let disk = no_room(&waiting, 4, 3 * 1_048_576, 10, "/data/tmp", "log", 0);
         assert_eq!(
             (&disk["check"], &disk["measured"], &disk["threshold"]),
-            (&json!("disk"), &json!(3 * 1_048_576), &json!(10 * 1_048_576))
+            (
+                &json!("disk"),
+                &json!(3 * 1_048_576),
+                &json!(10 * 1_048_576)
+            )
         );
         assert_eq!(
             (&disk["free_kb"], &disk["min_gb"], &disk["tmpdir"]),
@@ -5038,7 +5042,10 @@ mod database_tests {
                 spawn_core::mission::TaskState::Reported
             );
             assert_eq!((after.gate_aborts, after.gate_rejections), (0, 0));
-            assert_eq!((after.gate_room_task, after.gate_room_waits), (Some(task), 1));
+            assert_eq!(
+                (after.gate_room_task, after.gate_room_waits),
+                (Some(task), 1)
+            );
             assert!(
                 super::room_wait(&after, task, super::now_ms()).is_some(),
                 "judged again after the backoff"
@@ -5055,7 +5062,10 @@ mod database_tests {
         let probed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&probed);
         let room = measured_room(
-            &[("SPAWN_TEST_DATABASE_URL", "postgres://t:pw@%2Frun%2Fpg/spawn_test")],
+            &[(
+                "SPAWN_TEST_DATABASE_URL",
+                "postgres://t:pw@%2Frun%2Fpg/spawn_test",
+            )],
             u64::MAX / 2,
             u64::MAX / 2,
             Ok(()),
@@ -5078,16 +5088,14 @@ mod database_tests {
         assert_eq!(verdicts(&db, task), vec!["accepted"]);
         let _ = std::fs::remove_dir_all(&base);
 
-        let room = measured_room(
-            &[("SPAWN_GATE_MIN_FREE_MEMORY_MB", "lots")],
-            0,
-            0,
-            Ok(()),
-        );
+        let room = measured_room(&[("SPAWN_GATE_MIN_FREE_MEMORY_MB", "lots")], 0, 0, Ok(()));
         let (db, mission, task, base) = judged_on("room-bad", room);
         assert_eq!(gate_runs(&base), 0);
         let record = last_gated(&db);
-        assert_eq!((&record["id"], &record["verdict"]), (&json!(task), &json!("aborted")));
+        assert_eq!(
+            (&record["id"], &record["verdict"]),
+            (&json!(task), &json!("aborted"))
+        );
         assert!(
             record["reason"]
                 .as_str()

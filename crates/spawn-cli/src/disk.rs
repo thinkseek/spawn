@@ -643,7 +643,11 @@ free in TMPDIR /data/tmp, under SPAWN_GATE_MIN_FREE_GB=10"
             "{}",
             items[0].line
         );
-        assert!(items[0].line.starts_with("disk check: "), "{}", items[0].line);
+        assert!(
+            items[0].line.starts_with("disk check: "),
+            "{}",
+            items[0].line
+        );
     }
 
     /// Objective 018: the item names the check that fell short, its measure

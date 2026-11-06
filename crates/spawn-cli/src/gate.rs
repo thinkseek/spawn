@@ -109,7 +109,8 @@ pub(crate) type FreeKb = dyn Fn(&Path) -> Option<u64> + Send + Sync;
 /// Available MiB of memory ([`Room`]'s memory measure).
 pub(crate) type AvailableMb = dyn Fn() -> Option<u64> + Send + Sync;
 /// The test database's probe by URL ([`Room`]'s database measure).
-pub(crate) type DatabaseProbe = dyn Fn(&str) -> Result<(), spawn_postgres::ProbeFailure> + Send + Sync;
+pub(crate) type DatabaseProbe =
+    dyn Fn(&str) -> Result<(), spawn_postgres::ProbeFailure> + Send + Sync;
 
 /// What the integrator measures before it starts a gate, and against what
 /// (objective 018). At the start of each judging, after the candidate is
@@ -434,7 +435,10 @@ pub(crate) fn without_password(text: &str, url: &str) -> String {
             secrets.push(password.to_string());
         }
     }
-    let decoded: Vec<String> = secrets.iter().map(|secret| percent_decoded(secret)).collect();
+    let decoded: Vec<String> = secrets
+        .iter()
+        .map(|secret| percent_decoded(secret))
+        .collect();
     secrets.extend(decoded);
     // The longest first, so a password that contains another is masked whole.
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
@@ -1537,7 +1541,8 @@ mod room_tests {
     fn each_check_short_names_its_measure_and_threshold() {
         // Disk: the gate's TMPDIR under the default floor of 10 GiB.
         let seen = taken();
-        let (disk, log) = short(room(&[], Some(3 * GIB_KB), PLENTY, Ok(()), &seen).check(&gate_env(&[])));
+        let (disk, log) =
+            short(room(&[], Some(3 * GIB_KB), PLENTY, Ok(()), &seen).check(&gate_env(&[])));
         assert_eq!(
             disk,
             Shortfall::Disk {
@@ -1625,7 +1630,10 @@ mod room_tests {
         .check(&gate_env(&[("SPAWN_GATE_MIN_FREE_GB", "0")]))
         .expect("nothing is checked, so nothing falls short");
         assert!(seen.lock().expect("taken").is_empty(), "no measure taken");
-        assert!(checks.contains("SPAWN_GATE_MIN_FREE_GB=0, not checked"), "{checks}");
+        assert!(
+            checks.contains("SPAWN_GATE_MIN_FREE_GB=0, not checked"),
+            "{checks}"
+        );
         assert!(
             checks.contains("SPAWN_GATE_MIN_FREE_MEMORY_MB=0, not checked"),
             "{checks}"
@@ -1657,7 +1665,11 @@ mod room_tests {
         assert_eq!(checks.lines().count(), 3, "{checks}");
         let (result, seen) = order(Some(0), Some(0), Err(shared_memory()));
         assert_eq!(short(result).0.check(), "disk");
-        assert_eq!(seen, ["disk /data/tmp"], "disk short: nothing else measured");
+        assert_eq!(
+            seen,
+            ["disk /data/tmp"],
+            "disk short: nothing else measured"
+        );
         let (result, seen) = order(PLENTY, Some(0), Err(shared_memory()));
         assert_eq!(short(result).0.check(), "memory");
         assert_eq!(seen, ["disk /data/tmp", "memory"], "memory short: no probe");
@@ -1686,7 +1698,10 @@ mod room_tests {
             "{database:?}"
         );
         assert_eq!(database.threshold(), "a parallel query within 10 s");
-        assert!(log.contains("could not resize shared memory segment"), "{log}");
+        assert!(
+            log.contains("could not resize shared memory segment"),
+            "{log}"
+        );
         assert!(log.contains("the gate did not run"), "{log}");
     }
 
@@ -1710,16 +1725,25 @@ mod room_tests {
             .check(&gate_env(&[])),
         );
         let text = format!("{database:?} {log}");
-        assert!(!text.contains("hun@ter2") && !text.contains("hun%40ter2"), "{text}");
+        assert!(
+            !text.contains("hun@ter2") && !text.contains("hun%40ter2"),
+            "{text}"
+        );
         assert!(matches!(
             database,
             Shortfall::Database { ref server, .. } if server == "db.internal:5434/spawn_test"
         ));
         assert_eq!(
-            without_password("x postgres://u:pw@h/d?password=other y other", "postgres://u:pw@h/d?password=other"),
+            without_password(
+                "x postgres://u:pw@h/d?password=other y other",
+                "postgres://u:pw@h/d?password=other"
+            ),
             "x postgres://u:***@h/d?password=*** y ***"
         );
-        assert_eq!(without_password("no secret", "postgres://u@h/d"), "no secret");
+        assert_eq!(
+            without_password("no secret", "postgres://u@h/d"),
+            "no secret"
+        );
     }
 
     #[test]
@@ -1729,7 +1753,10 @@ mod room_tests {
             (vec![("SPAWN_GATE_MIN_FREE_GB", "+5")], vec![]),
             (vec![], vec![("SPAWN_GATE_MIN_FREE_MEMORY_MB", "2G")]),
             (vec![], vec![("SPAWN_GATE_MIN_FREE_MEMORY_MB", "-1")]),
-            (vec![], vec![("SPAWN_GATE_MIN_FREE_MEMORY_MB", "99999999999999999999999")]),
+            (
+                vec![],
+                vec![("SPAWN_GATE_MIN_FREE_MEMORY_MB", "99999999999999999999999")],
+            ),
         ] {
             let seen = taken();
             let result = room(&integrator, Some(0), Some(0), Ok(()), &seen).check(&gate_env(&gate));
@@ -1749,7 +1776,10 @@ mod room_tests {
             .check(&gate_env(&[]))
             .expect("the gate runs and checks its own floor");
         assert_eq!(*seen.lock().expect("taken"), ["disk /data/tmp", "memory"]);
-        assert!(checks.contains("SPAWN_TEST_DATABASE_URL is unset"), "{checks}");
+        assert!(
+            checks.contains("SPAWN_TEST_DATABASE_URL is unset"),
+            "{checks}"
+        );
         assert!(checks.contains("cannot be read"), "{checks}");
         // TMPDIR unset in the gate's environment: /tmp, as gate.sh reads it.
         let seen = taken();
@@ -1763,7 +1793,11 @@ mod room_tests {
         let meminfo = "MemTotal:       32800860 kB\nMemFree:         1000000 kB\n\
                        MemAvailable:   20293592 kB\nBuffers:          100 kB\n";
         assert_eq!(available_mb(meminfo), Some(19_817));
-        assert_eq!(available_mb("MemTotal: 1 kB\n"), None, "no MemAvailable line");
+        assert_eq!(
+            available_mb("MemTotal: 1 kB\n"),
+            None,
+            "no MemAvailable line"
+        );
         assert_eq!(available_mb("MemAvailable: lots kB\n"), None);
     }
 
@@ -1773,7 +1807,10 @@ mod room_tests {
             server_of("postgres://u:p@%2Fhome%2Fu%2Fsock/spawn_test"),
             "/home/u/sock:5432/spawn_test"
         );
-        assert_eq!(server_of("postgresql://u:p@127.0.0.1:15434/x?sslmode=disable"), "127.0.0.1:15434/x");
+        assert_eq!(
+            server_of("postgresql://u:p@127.0.0.1:15434/x?sslmode=disable"),
+            "127.0.0.1:15434/x"
+        );
         assert_eq!(server_of("postgres://u:p@[::1]:5433/x"), "[::1]:5433/x");
         assert_eq!(
             server_of("postgres:///spawn_test?host=/run/pg&port=5433&password=p"),

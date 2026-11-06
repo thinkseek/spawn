@@ -30,7 +30,10 @@ fn a_socket_directory_with_no_server_fails_the_connect_probe_without_the_passwor
     let url = format!("postgres://probe:pr0besecret@{directory}/nothing");
     let started = Instant::now();
     let failure = parallel_query_probe(&url, Duration::from_secs(10)).expect_err("no server");
-    assert!(started.elapsed() < Duration::from_secs(10), "refused at once");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "refused at once"
+    );
     assert_eq!(failure.probe, "connect within 10 s");
     assert!(!failure.error.is_empty());
     assert!(
