@@ -597,10 +597,12 @@ impl Bridge {
         let mut orphans = Vec::new();
         for (session, view) in &self.sessions {
             for (command, steps) in &view.steps {
+                // Compared as the store names them now (an execution's
+                // workspace is read that way): one directory, one name.
                 if let Some(workspace) = steps.mounted.as_ref()
                     && !steps.released
                     && !steps.started
-                    && !used.contains(workspace)
+                    && !used.contains(&self.workspaces.canonical(workspace))
                 {
                     orphans.push((
                         view.agent_id.clone(),
@@ -815,7 +817,9 @@ impl Bridge {
                 if let Some(execution_id) = event.execution_id.clone() {
                     view.active = Some(Active {
                         execution_id,
-                        workspace: workspace.clone(),
+                        // As the store names it now: a record from before
+                        // the root was resolved names the same directory.
+                        workspace: self.workspaces.canonical(workspace),
                         checkpoint: None,
                         reported_end: None,
                         unmounting: false,
