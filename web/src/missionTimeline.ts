@@ -115,7 +115,7 @@ export interface Lane {
 }
 
 export interface MissionTimeline {
-  /** Newest activity first. */
+  /** In the missions' order (ordering.ts, compareMissions). */
   lanes: Lane[];
   start: number;
   end: number;
@@ -355,9 +355,9 @@ export function deriveMissionTimeline(
       lastActivity,
     });
   }
-  lanes.sort(
-    (a, b) => b.lastActivity - a.lastActivity || (b.mission.id ?? 0) - (a.mission.id ?? 0),
-  );
+  // The one mission order (ordering.ts): open missions, then idle active
+  // ones, then closed ones, each by its latest recorded activity.
+  lanes.sort((a, b) => compareMissions(a.mission, b.mission));
   if (!Number.isFinite(start)) {
     start = now;
     end = now;
