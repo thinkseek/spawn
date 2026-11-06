@@ -4,6 +4,8 @@
 
 import type { SessionState } from "./api";
 import { apiError, apiHeaders } from "./api";
+import type { GateRoom, Memory } from "./resources";
+import { normalizeGateRoom, normalizeMemory } from "./resources";
 import type { RsiPane } from "./rsi";
 import { normalizePane } from "./rsi";
 
@@ -38,7 +40,10 @@ export interface Judgement {
   needs_human: number | null;
   stuck: number | null;
   latency_ms: number | null;
+  /** The judge's own opinion that someone should look, and why. Not who
+   * needs a human: that is the dispatcher's view (attention.ts). */
   attention: boolean | null;
+  attention_reason: string | null;
   evidence: Evidence | null;
   fingerprint: string | null;
 }
@@ -64,6 +69,9 @@ export interface FleetAgent {
   ended_at_ms: number | null;
   state: FleetState;
   state_since_ms: number | null;
+  /** Needs a human, by the dispatcher's view (`/api/attention`, set by
+   * attention.ts `markNeedsHuman`); false until that view is read. Never
+   * the judge's flag, which is `judgement.attention`. */
   attention: boolean;
   judged_at_ms: number | null;
   task: string | null;
@@ -85,7 +93,6 @@ export interface FleetHealth {
   agents_total: number;
   live: number;
   by_state: Record<FleetState, number>;
-  attention: number;
   last_hour: {
     judgements: number;
     by_judge: Record<string, number>;
@@ -102,6 +109,10 @@ export interface FleetHealth {
   human_per_agent_hour: number | null;
   /** Free disk on the paths the fleet writes to, read when the page loaded. */
   disk: DiskPlace[];
+  /** Memory on this host, read with the disk; null when not reported. */
+  memory: Memory | null;
+  /** Each gated mission's waits for gate room; null when not reported. */
+  gate_room: GateRoom[] | null;
 }
 
 export interface DiskPlace {
@@ -269,6 +280,7 @@ export function normalizeJudgement(value: unknown): Judgement | null {
     stuck: optionalNumber(value.stuck),
     latency_ms: optionalNumber(value.latency_ms),
     attention: optionalBool(value.attention),
+    attention_reason: optionalText(value.attention_reason),
     evidence: evidence(value.evidence),
     fingerprint: optionalText(value.fingerprint),
   };
@@ -293,7 +305,9 @@ function normalizeAgent(value: unknown): FleetAgent | null {
     ended_at_ms: optionalNumber(raw.ended_at_ms),
     state: fleetState(raw.state ?? judgement?.state),
     state_since_ms: optionalNumber(raw.state_since_ms),
-    attention: raw.attention === true || judgement?.attention === true,
+    // The server's `attention` is the judge's flag; who needs a human comes
+    // from /api/attention (attention.ts `markNeedsHuman`).
+    attention: false,
     judged_at_ms: optionalNumber(raw.judged_at_ms),
     task: optionalText(raw.task),
     activity: {
@@ -354,10 +368,6 @@ function normalizeHealth(value: unknown, agents: FleetAgent[]): FleetHealth {
     agents_total: number(health.agents_total, agents.length),
     live: number(health.live, agents.filter((agent) => agent.live).length),
     by_state: byState,
-    attention: number(
-      health.attention,
-      agents.filter((agent) => agent.attention).length,
-    ),
     last_hour: {
       judgements: number(lastHour.judgements),
       by_judge: byJudge,
@@ -381,6 +391,8 @@ function normalizeHealth(value: unknown, agents: FleetAgent[]): FleetHealth {
         floor_bytes: number(place.floor_bytes),
       };
     }),
+    memory: normalizeMemory(health.memory),
+    gate_room: normalizeGateRoom(health.gate_room),
   };
 }
 

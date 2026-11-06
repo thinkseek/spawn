@@ -57,7 +57,10 @@ started with. `SPAWN_CHEAP_MODEL` (default `deepseek-flash`) and
 Configuration lives in `~/.local/share/spawn-rsi/spawn.env` (KEY=VALUE),
 including `SPAWN_SUPERVISOR=1`, `SPAWN_MISSION_FILE`, and `SPAWN_SERVE_ADDRESS`
 with `SPAWN_SERVE_TOKEN` when the UI serves the LAN (a URL-safe secret, e.g.
-`openssl rand -hex 32`).
+`openssl rand -hex 32`). `SPAWN_SERVE_OPEN_NETWORKS` (e.g. `192.168.31.0/24`)
+lets the owner's intranet read without the token, by the server's address
+(`http://192.168.31.112:8787/`); a client elsewhere (Tailscale, a container)
+still needs it.
 
 ## Disk room
 

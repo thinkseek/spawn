@@ -385,12 +385,15 @@ from (
 ) x";
 
 /// The `no_room` gate records that carry `escalate` (the mission's gate
-/// went without room past the integrator's limit) and that the supervisor
-/// was not told of yet, oldest first, each with its `event_id`, `at_ms` and
-/// `mission`. Told is a record, not a window: a digest that reached the
+/// went without room past the integrator's limit), oldest first, each with
+/// its `event_id`, `at_ms` and `mission`: those the supervisor was not told
+/// of yet, and those it was told of whose run of `no_room` still goes on
+/// (the mission's `gate_room_*` name the record's task, escalated, since
+/// the record or before), which the dispatcher keeps as told and
+/// unresolved. Told is a record, not a window: a digest that reached the
 /// supervisor carrying the tag `host gate-room-<event_id>` (as
-/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was away
-/// for days is still told once.
+/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was
+/// away for days is still told once.
 pub(crate) const GATE_ROOM_ESCALATIONS: &str = r"
 with told as (
   select distinct tag
@@ -410,7 +413,11 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
-   and not exists (select 1 from told where tag = 'host gate-room-' || e.id)";
+   and (not exists (select 1 from told where tag = 'host gate-room-' || e.id)
+        or exists (select 1 from mission_missions m
+                    where m.id = k.mission_id and m.gate_room_escalated
+                      and m.gate_room_task = (r ->> 'id')::bigint
+                      and m.gate_room_since_ms <= e.recorded_at_ms))";
 
 /// The `host_fault` gate records that carry `escalate` (the mission's second
 /// host fault in a row) and that the supervisor was not told of yet, oldest
@@ -747,7 +754,7 @@ impl PostgresStore {
     }
 
     /// The `no_room` gate records that escalate and were not told to the
-    /// supervisor yet ([`GATE_ROOM_ESCALATIONS`]).
+    /// supervisor yet, or were and still hold ([`GATE_ROOM_ESCALATIONS`]).
     pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_ROOM_ESCALATIONS, &[])
     }

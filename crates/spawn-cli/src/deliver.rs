@@ -1304,6 +1304,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 mission.origin,
                 one_line(&mission.text, 300)
             ),
+            since_ms: None,
         });
     }
     for report in &news.reports {
@@ -1325,6 +1326,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 id = report.id,
                 revision = report.revisions,
             ),
+            since_ms: None,
         });
     }
     for resident in &news.approved {
@@ -1336,6 +1338,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             line: format!(
                 "a human approved resident `{name}`; assign it tasks with --kind resident --worker {name}"
             ),
+            since_ms: None,
         });
     }
     for message in &news.human {
@@ -1344,8 +1347,20 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             id: format!("human-{}", message.command_id),
             why: Why::Human,
             line: message.line(),
+            since_ms: None,
         });
     }
+<<<<<<< 4bd4c19bb866659500033efdfca36db64186d47e
+    for (task, attempts) in waiting_attempts(work, rows) {
+        if let Attempts::Failed { why, .. } = attempts {
+            items.push(Escalation {
+                session_id: task.session_id.clone(),
+                id: task.delivery_key(),
+                why: Why::DeliveryFailed,
+                line: format!("task #{} {why}", task.id),
+                since_ms: None,
+            });
+=======
     for (task, facts, attempts) in waiting_attempts(work, rows) {
         let Attempts::Failed { why, spent, .. } = attempts else {
             continue;
@@ -1353,6 +1368,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
         // A first delivery spent without typing is re-issued instead.
         if spent && task.reissuable() {
             continue;
+>>>>>>> 3507ae04337ca0bb051e24d94e36024394f9065e
         }
         let line = match task.reissue_of {
             Some(old) if spent => reissue_spent(task, facts, old),

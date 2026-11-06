@@ -1,6 +1,7 @@
 //! The event log port over `spawn_events`.
 
 use spawn_core::event::{Appended, EventRecord, GlobalPosition, NewEvent};
+use spawn_core::id::SessionId;
 use spawn_core::port::{EventLog, StoreError};
 use spawn_core::time::Timestamp;
 
@@ -31,6 +32,26 @@ pub(crate) const READ_GLOBAL: &str = concat!(
                   where id > $1
                   order by id
                   limit $2"
+);
+
+/// The session's open execution: its latest `execution.started` when no
+/// `execution.ended` the Bridge wrote follows it, the rule by which
+/// `spawn_append_trusted` refuses a second start, read the same way. `$1`
+/// session.
+pub(crate) const OPEN_EXECUTION: &str = concat!(
+    "select ",
+    event_record_columns!(),
+    "
+                   from (select * from spawn_events e
+                          where e.session_id = $1 and e.event_name = 'execution.started'
+                            and e.execution_id is not null
+                          order by e.id desc
+                          limit 1) s
+                  where not exists (
+                        select 1 from spawn_events x
+                         where x.session_id = s.session_id and x.event_name = 'execution.ended'
+                           and x.execution_id = s.execution_id and x.source = 'bridge'
+                           and x.id > s.id)"
 );
 
 impl EventLog for PostgresStore {
@@ -84,5 +105,12 @@ impl EventLog for PostgresStore {
             }
         }
         Ok(records)
+    }
+
+    fn open_execution(&self, session: &SessionId) -> Result<Option<EventRecord>, StoreError> {
+        match self.query_opt(OPEN_EXECUTION, &[&session.as_str()])? {
+            Some(row) => event_record(&row),
+            None => Ok(None),
+        }
     }
 }

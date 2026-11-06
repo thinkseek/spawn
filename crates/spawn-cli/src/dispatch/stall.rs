@@ -679,6 +679,7 @@ pub(crate) fn items(
                 ),
                 3000,
             ),
+            since_ms: Some(measured.since_ms),
         });
     }
     for halt in &stalls.halted {
@@ -707,6 +708,7 @@ pub(crate) fn items(
                 ),
                 3000,
             ),
+            since_ms: Some(record.at_ms),
         });
     }
     items
