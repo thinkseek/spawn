@@ -68,7 +68,9 @@ pub trait CommandQueue: Send + Sync {
     ) -> Result<CommandId, StoreError>;
 
     /// Lease the oldest unfinished command of a session that has no live
-    /// lease, or `None`.
+    /// lease, or `None`. An unfinished input the Bridge recorded `waiting`
+    /// (it waits for the session's turn) does not hold the commands behind
+    /// it; any other unfinished command does.
     fn claim(&self, worker: &str, ttl: Duration) -> Result<Option<Claimed>, StoreError>;
 
     /// Record the outcome and its `command.finished` event atomically.
