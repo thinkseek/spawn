@@ -296,20 +296,30 @@ pub(crate) enum Why {
     GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
+    /// An owner's hold on a mission source reached its bound and the
+    /// integrator ended it by record ([`digest::hold_expiries`]): landings
+    /// there resumed, and an owner verdict judged against its main may be
+    /// stale.
+    HoldExpired,
 }
 
 impl Why {
     /// Whether an item of this kind is news rather than a condition: told
     /// once, it leaves nothing to resolve. A disk recovery, an approval, a
-    /// human's message and a pair of host faults at the gate (the
-    /// integrator judges again on its own) are news. Every other item is a
+    /// human's message, a pair of host faults at the gate (the integrator
+    /// judges again on its own) and an expired hold (its landings resumed
+    /// on their own) are news. Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
     pub(crate) fn is_news(self) -> bool {
         matches!(
             self,
-            Self::DiskRecovered | Self::Approved | Self::Human | Self::GateHostFault
+            Self::DiskRecovered
+                | Self::Approved
+                | Self::Human
+                | Self::GateHostFault
+                | Self::HoldExpired
         )
     }
 }
@@ -507,7 +517,8 @@ pub(crate) struct Reading {
 
 /// The plan for this moment, reading only: the host's news (the disk items
 /// `disk` gives for the moment's clock, the gate-room and gate host-fault
-/// records, the stalls past their `bounds`, [`stall`]) added to the facts and mission rows
+/// records, the owner's holds that expired, the stalls past their `bounds`,
+/// [`stall`]) added to the facts and mission rows
 /// `loaded` ([`load`]), then [`decide_with`]. [`step`] submits what it
 /// returns; `GET /api/attention` (crate::serve) shows it. One function for
 /// both, so the queue a person reads is the dispatcher's own.
@@ -534,6 +545,13 @@ pub(crate) fn read_plan(
         store
             .gate_host_fault_escalations()
             .map_err(|error| format!("gate host fault records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::hold_expiries(
+        store
+            .hold_expiries()
+            .map_err(|error| format!("source hold records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
