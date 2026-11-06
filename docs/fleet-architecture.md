@@ -528,9 +528,9 @@ The API is read-only: `/api/overview`, `/api/fleet` (with
 `/api/fleet/<session>/judgements` and `/commands`), `/api/attention`,
 `/api/missions`, `/api/events`, `/api/session/<id>`, `/api/pane/<id>`,
 `/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
-`/api/scorecard`; each answer's shape is documented in
-`crates/spawn-cli/src/serve.rs` and, for `/api/attention`, in
-`crates/spawn-cli/src/serve/attention.rs`. Humans talk to the supervisor
+`/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
+`/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
+Humans talk to the supervisor
 through its pane, or `spawn submit --session session_supervisor --action
 '{"type":"input",...}'`.
 
