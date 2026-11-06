@@ -476,4 +476,68 @@ mod tests {
         let refused = model(&flags(&["--model", "opus"])).expect_err("not a profile");
         assert!(refused.contains("default or cheap"), "{refused}");
     }
+
+    /// A scratch world: a bare source with one commit on main, and the
+    /// owner's clone of it. `(base, source, owner)`.
+    fn owner_world(tag: &str) -> (std::path::PathBuf, String, String) {
+        use crate::sources::git;
+        let base = std::env::temp_dir().join(format!("spawn-push-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        crate::integrate::tests::commit_in(&seed_path, "base");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("source");
+        let owner = base.join("owner").to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &owner]).expect("the owner's clone");
+        (base, source, owner)
+    }
+
+    /// `spawn mission push` resolves the commit where the owner works and
+    /// puts it in the source at `refs/spawn-owner/<hash>`, moving no branch;
+    /// a commit already in the source (by a name it knows) gets the same
+    /// ref; anything else is refused before any request is recorded.
+    #[test]
+    fn the_owners_commit_waits_in_the_source_and_no_branch_moves() {
+        use crate::sources::git;
+        let (base, source, owner) = owner_world("put");
+        let main = git(&["--git-dir", &source, "rev-parse", "refs/heads/main"]).expect("main");
+        std::fs::write(std::path::Path::new(&owner).join("CONTRACT.md"), "v1\n").expect("write");
+        crate::integrate::tests::commit_in(&owner, "owner: the contract");
+        let head = git(&["-C", &owner, "rev-parse", "HEAD"]).expect("head");
+
+        let (commit, reference) = super::put_in_source(&source, &owner, "HEAD").expect("put");
+        assert_eq!(commit, head, "resolved in the owner's repository");
+        assert_eq!(reference, format!("refs/spawn-owner/{head}"));
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", &reference]).expect("the ref"),
+            head
+        );
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", "refs/heads/main"]).expect("main"),
+            main,
+            "no branch moves"
+        );
+
+        // Already in the source, named as the source knows it, from a
+        // directory that is no repository.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("a directory");
+        let (known, known_ref) =
+            super::put_in_source(&source, &elsewhere.to_string_lossy(), &main).expect("known");
+        assert_eq!(known, main);
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", &known_ref]).expect("the ref"),
+            main
+        );
+
+        for wanted in ["no-such-branch", "--all", "0123456789abcdef0123456789abcdef01234567"] {
+            let refused = super::put_in_source(&source, &owner, wanted).expect_err(wanted);
+            assert!(refused.contains("is not a commit"), "{wanted}: {refused}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
