@@ -111,7 +111,8 @@
 //!    gate's run as this process measured it, give or take a second
 //!    ([`host::crash_lines`]). At least one failure read, and every one the
 //!    host's: `host_fault`, not `rejected`, and C's head is not judged
-//!    alone. The task stays where it was, its revisions and note do not
+//!    alone. Only a gate that got SPAWN_TEST_DATABASE_URL has host faults (a
+//!    mission marked [`NO_TEST_DATABASE`] has none). The task stays where it was, its revisions and note do not
 //!    move, nothing goes back to the worker, and neither `gate_rejections`
 //!    nor `gate_aborts` grows or resets. The record names `candidate`,
 //!    `reason` (`host fault: ...`, saying which evidence), `log`,
@@ -1493,6 +1494,12 @@ impl Judge {
                 gate_wall_clock(),
             )
         };
+        // Only a gate that got the test database can fail because it did: a
+        // mission whose gate needs none (or whose URL was withheld) has no
+        // host faults, and the test server's log says nothing about it.
+        let test_database = gate_env
+            .iter()
+            .any(|(name, _)| name == "SPAWN_TEST_DATABASE_URL");
         // The candidate's gate run, measured: a crash in the test
         // database's log counts only inside this window.
         let started = now_ms();
@@ -1518,9 +1525,11 @@ impl Judge {
             // database failed) is no verdict on the work: `host_fault`, not
             // counted, judged again after a backoff.
             Ok(verdict)
-                if let Some(fault) = host::host_fault(&verdict.reason, &verdict.output, || {
-                    self.crash_in(started, ended)
-                }) =>
+                if test_database
+                    && let Some(fault) =
+                        host::host_fault(&verdict.reason, &verdict.output, || {
+                            self.crash_in(started, ended)
+                        }) =>
             {
                 let faults = mission.gate_host_faults.saturating_add(1);
                 let backoff = host_fault_backoff(self.host.backoff, faults);
