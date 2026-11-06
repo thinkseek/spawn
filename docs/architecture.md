@@ -15,7 +15,7 @@
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
 | 终端 | tmux | 建会话、输入文本、抓取屏尾 |
 
-Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。`spawn serve` 只提供只读看板和事件查询（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`），不是控制面；所有写入仍只经 Bridge 和 `spawn_submit`。
+Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。`spawn serve` 只提供只读看板和事件查询（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token），不是控制面；所有写入仍只经 Bridge 和 `spawn_submit`。
 
 ## 2. crate 结构
 
