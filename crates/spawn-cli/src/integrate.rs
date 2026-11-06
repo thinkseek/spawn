@@ -424,25 +424,84 @@ pub(crate) fn no_room(
     log: &str,
     now_ms: i64,
 ) -> Value {
+    let disk = Shortfall::Disk {
+        free_kb,
+        min_gb,
+        tmpdir: tmpdir.to_string(),
+    };
+    short_of_room(mission, task, &disk, log, now_ms)
+}
+
+/// The record of a judging of `task` that found the host short of room at
+/// `now_ms`, by the gate's own floor or by the integrator's checks before
+/// it ([`gate::Room`]): `check`, `measured` and `threshold`; for disk also
+/// `free_kb`, `min_gb` and `tmpdir`, for the database its `server` (never
+/// the URL, so never its password); a reason that names the check, the
+/// measure and the threshold; `log`; and `escalate` as [`no_room`] says.
+pub(crate) fn short_of_room(
+    mission: &Mission,
+    task: i64,
+    short: &Shortfall,
+    log: &str,
+    now_ms: i64,
+) -> Value {
     let after = i64::try_from(ROOM_ESCALATE_AFTER.as_millis()).unwrap_or(i64::MAX);
     let escalate = mission.gate_room_task == Some(task)
         && !mission.gate_room_escalated
         && mission
             .gate_room_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) > after);
-    #[allow(clippy::cast_precision_loss)]
-    let free_gib = free_kb as f64 / 1_048_576.0;
-    json!({
-        "reason": format!(
-            "no room to judge now: {free_gib:.1} GiB free in {tmpdir} (TMPDIR), under \
-             SPAWN_GATE_MIN_FREE_GB={min_gb}; not a verdict, judged again later"
+    let reason = match short {
+        Shortfall::Disk {
+            free_kb,
+            min_gb,
+            tmpdir,
+        } => {
+            #[allow(clippy::cast_precision_loss)]
+            let free_gib = *free_kb as f64 / 1_048_576.0;
+            format!(
+                "no room to judge now: {free_gib:.1} GiB free in {tmpdir} (TMPDIR), under \
+                 SPAWN_GATE_MIN_FREE_GB={min_gb}; not a verdict, judged again later"
+            )
+        }
+        Shortfall::Memory {
+            available_mb,
+            min_mb,
+        } => format!(
+            "no room to judge now: the host's memory has {available_mb} MiB available \
+             (MemAvailable), under SPAWN_GATE_MIN_FREE_MEMORY_MB={min_mb}; not a verdict, judged \
+             again later"
         ),
-        "free_kb": free_kb,
-        "min_gb": min_gb,
-        "tmpdir": tmpdir,
+        Shortfall::Database {
+            server,
+            probe,
+            error,
+        } => format!(
+            "no room to judge now: the test database ({server}) failed the probe \"{probe}\": \
+             {error}; not a verdict, judged again later"
+        ),
+    };
+    let mut record = json!({
+        "reason": reason,
+        "check": short.check(),
+        "measured": short.measured(),
+        "threshold": short.threshold(),
         "log": log,
         "escalate": escalate,
-    })
+    });
+    let extra = match short {
+        Shortfall::Disk {
+            free_kb,
+            min_gb,
+            tmpdir,
+        } => json!({"free_kb": free_kb, "min_gb": min_gb, "tmpdir": tmpdir}),
+        Shortfall::Memory { .. } => json!({}),
+        Shortfall::Database { server, .. } => json!({ "server": server }),
+    };
+    if let (Some(target), Some(extra)) = (record.as_object_mut(), extra.as_object()) {
+        target.extend(extra.clone());
+    }
+    record
 }
 
 /// Whether a delivered task ran past its mission's budget
