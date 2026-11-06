@@ -258,7 +258,13 @@ head alone is the whole workspace, so everything below is a git operation.
   `main` is merged into its workspace (above); one whose merge is clean as
   text but fails the gate, while the head alone passes it against its
   merge-base with `main`, is gated `incompatible` and sent back the same
-  way, not counted as a rejection (fleet-architecture.md §10.3); marker blocks in the files
+  way, not counted as a rejection (fleet-architecture.md §10.3); one whose
+  check-tests.sh failures are all the host's (connection errors to the test
+  database, or database errors while the test database's log,
+  `SPAWN_TEST_DATABASE_LOG`, shows a crash during the gate) is gated
+  `host_fault`: no verdict on the work, never counted, the task left where it
+  was and judged again after a backoff from the record's `due_ms`, two in a
+  row escalated to the supervisor (fleet-architecture.md §10.3); marker blocks in the files
   the branch changes are gated `conflict`, a pending merge of `main` (it lives with the workspace
   directory, on the Bridge's host) blocks judging when that directory is on
   the integrator's host, and its markers, once checkpointed and pushed, are
