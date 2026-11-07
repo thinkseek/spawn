@@ -549,28 +549,35 @@ mod tests {
     /// own time came, and only that one.
     #[test]
     fn a_due_time_reached_runs_its_step_with_the_watermark_unmoved() {
-        let mut steps = [Step::new(), Step::new()];
-        steps[0].ran(5, Some(9_000));
-        steps[1].ran(5, Some(3_000));
+        let mut schedule = Schedule::new();
+        schedule.dispatch.ran(5, Some(9_000));
+        schedule.alive.ran(5, Some(3_000));
         let now = 5_000;
         assert!(
-            !steps[0].runs(5, now),
-            "the first waits for a time not come"
+            !schedule.dispatch.runs(5, now),
+            "the dispatcher waits for a time not come"
         );
-        assert!(steps[1].runs(5, now), "the second's time has come");
-        assert_eq!(schedule_of(&steps).earliest(), Some(3_000));
+        assert!(
+            schedule.alive.runs(5, now),
+            "the liveness rule's time has come"
+        );
+        assert_eq!(
+            schedule.earliest(),
+            Some(3_000),
+            "the loop waits for the earliest of them"
+        );
     }
 
     /// The wait is never longer than the next due time, and the loop has no
     /// due time when no step waits on a clock.
     #[test]
     fn the_earliest_due_time_is_the_loops_wait() {
-        let mut steps = [Step::new(), Step::new()];
-        steps[0].ran(1, Some(4_000));
-        steps[1].ran(1, None);
-        assert_eq!(schedule_of(&steps).earliest(), Some(4_000));
-        steps[0].ran(1, None);
-        assert_eq!(schedule_of(&steps).earliest(), None);
+        let mut schedule = Schedule::new();
+        schedule.dispatch.ran(1, Some(4_000));
+        schedule.alive.ran(1, None);
+        assert_eq!(schedule.earliest(), Some(4_000));
+        schedule.dispatch.ran(1, None);
+        assert_eq!(schedule.earliest(), None);
     }
 
     /// A deploy's SIGTERM ends the loop's pause instead of the process, so
