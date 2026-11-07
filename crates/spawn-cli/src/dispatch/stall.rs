@@ -701,7 +701,7 @@ fn walk(
         .iter()
         .find(|facts| facts.session_id == SUPERVISOR_SESSION)
         .map_or(&empty, |facts| &facts.told);
-    let mut context = Context {
+    let context = Context {
         stalls,
         work,
         facts: rows

@@ -602,7 +602,7 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
         }
     }
     for found in rows {
-        for (key, tries) in notes(&found.dispatched) {
+        for tries in notes(&found.dispatched).into_values() {
             let Some(last) = tries.last() else {
                 continue;
             };
