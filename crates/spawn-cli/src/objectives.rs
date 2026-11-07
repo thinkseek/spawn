@@ -1212,6 +1212,15 @@ mod tests {
         Outcome {
             kind: kind.to_string(),
             objective,
+            task: 0,
+            at_ms: None,
+            continues: None,
+            branch: None,
+            commit: None,
+            diff: None,
+            tool_calls: None,
+            budget: None,
+            reason: None,
             verdict: verdict.map(str::to_string),
             merge: merge.map(str::to_string),
             yielded: None,
@@ -1363,7 +1372,7 @@ mod tests {
         }
         let backlog: Vec<Task> = [19, 21, 23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &after, 3)),
+            ids(&choose(&backlog, &[], &BTreeSet::new(), &after, &BTreeSet::new(), 3)),
             vec![25, 26, 19]
         );
 
@@ -1420,7 +1429,7 @@ mod tests {
             [127]
         );
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::from([21]), &tried, 2)),
+            ids(&choose(&backlog, &[], &BTreeSet::from([21]), &tried, &BTreeSet::new(), 2)),
             vec![25, 26]
         );
     }
@@ -1508,7 +1517,7 @@ mod tests {
         );
         let backlog: Vec<Task> = [23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &tried, 3)),
+            ids(&choose(&backlog, &[], &BTreeSet::new(), &tried, &BTreeSet::new(), 3)),
             vec![26, 23, 25],
             "the untried first, then the yielded"
         );
