@@ -1656,9 +1656,10 @@ begin
          where id = v_mission;
     when 'task.landed' then
         update mission_tasks set state = 'landed', updated_at_ms = p_at where id = v_id;
-        -- A landing ends its mission's run of host faults.
+        -- A landing ends its mission's run of host faults, and its run of
+        -- bases that disagreed with themselves.
         update mission_missions set gate_host_faults = 0, gate_host_task = null,
-                                    gate_host_due_ms = null
+                                    gate_host_due_ms = null, gate_base_disagrees = 0
          where id = (select mission_id from mission_tasks where id = v_id);
         -- Every mission on the same source sees the same main: the landing
         -- moves its own mission's baseline, and those of the other missions
