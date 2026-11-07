@@ -496,6 +496,22 @@ mod tests {
 
     use super::{Schedule, Step, backoff, pause_unless_stopped, stop_on_signal};
 
+    /// A schedule whose steps have all run on `watermark` and wait for no
+    /// clock, for the cases that set one of them.
+    fn settled(watermark: i64) -> Schedule {
+        let mut schedule = Schedule::new();
+        for step in [
+            &mut schedule.bridge,
+            &mut schedule.observer,
+            &mut schedule.dispatch,
+            &mut schedule.residents,
+            &mut schedule.alive,
+        ] {
+            step.ran(watermark, None);
+        }
+        schedule
+    }
+
     /// A step runs on a record or on a time, never on the clock: a pass
     /// whose watermark is unchanged and whose due times are in the future
     /// runs nothing, one whose watermark moved runs it, and one whose due
@@ -549,7 +565,7 @@ mod tests {
     /// own time came, and only that one.
     #[test]
     fn a_due_time_reached_runs_its_step_with_the_watermark_unmoved() {
-        let mut schedule = Schedule::new();
+        let mut schedule = settled(5);
         schedule.dispatch.ran(5, Some(9_000));
         schedule.alive.ran(5, Some(3_000));
         let now = 5_000;
@@ -572,7 +588,7 @@ mod tests {
     /// due time when no step waits on a clock.
     #[test]
     fn the_earliest_due_time_is_the_loops_wait() {
-        let mut schedule = Schedule::new();
+        let mut schedule = settled(1);
         schedule.dispatch.ran(1, Some(4_000));
         schedule.alive.ran(1, None);
         assert_eq!(schedule.earliest(), Some(4_000));
