@@ -75,14 +75,16 @@ progress; all waiting happens at a point (a landing that waits for a hold to
 end or for its turn, §10.3, waits at the Gate). At a point nothing moves on
 until a record names exactly what it covers (the task, the report's
 revision, the commit) and who decided. A loop that moves on from inferred
-progress (a quiet pane, a file that exists, a status that looks done)
-instead of such a record is a defect, wherever it is.
+progress (a quiet pane, a status that looks done) instead of such a
+record is a defect, wherever it is. A file becomes a record only through
+the one who reads it: a worker's `.spawn/report.md` counts once the
+dispatcher has stored it as `task.reported`.
 
 | Point | Joins | Moves on when | Record | Decided by | Enforced today |
 | --- | --- | --- | --- | --- | --- |
-| Brief | asker → worker | the task names its goal, inputs and done criteria | `task.assigned` | supervisor, the integrator for objective tasks (§10.4), or the owner | the record; its base is the workspace's branch point ([storage.md](storage.md)), not a field of the record |
+| Brief | asker → worker | the task names its goal, inputs and done criteria | `task.assigned` | supervisor, the integrator for objective tasks (§10.4), or the owner | the record; its base is the agent's branch at delivery, with `main` merged in ([storage.md](storage.md), "Main into a workspace"), not a field of the record |
 | Review | worker → reviewer | a verdict names the task, the report's revision and the commit it read | review verdict | a ccd session that did not write the work | not in code: the lead runs it, outside the log (§9) |
-| Accept | report → mission | in a review-mode mission, the verdict names the revision it judged | `task.reviewed` (§10.3) | supervisor, or the owner | the revision check; citing a review verdict is not checked (§9) |
+| Accept | report → mission | in a review-mode mission, the verdict names the revision it judged | `task.reviewed` (§10.3) | supervisor, or the owner | the revision check, when `--revision` is given; citing a review verdict is not checked (§9) |
 | Gate | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit, by compare-and-swap | `task.gated`, `task.landed` (§10.2, §10.3) | integrator; the owner's gate for owner work | yes |
 | Deploy | `main` → live | HEAD is the candidate of a passing verdict and the tree is clean | the deploy's log line | `deploy/deploy.sh` | yes, by `deploy/deploy.sh` |
 | Publish | owner's checkout → remote | the pushed commit passed its gate and a secret scan | the push | owner | by the owner's procedure, not by code |
@@ -1078,7 +1080,8 @@ record of what was judged (§14 of design.md).
   - `review`: the supervisor accepts, then the gate runs;
   - `gate`: the gate alone decides. The supervisor is not told of its
     reports (`mission_news`) and `spawn_task_review` refuses them: a review
-    could send back the revision the gate is judging;
+    could send back the revision the gate is judging (until the Review
+    point is built, §1.1 and §9);
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
     aborted (`task.aborted`) and its worker stopped (the Stop is submitted
     before the record, so a failed record is retried with it; a Stop that
