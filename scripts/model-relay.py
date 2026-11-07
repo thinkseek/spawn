@@ -32,8 +32,9 @@ streams partway without `message_stop`, over HTTP/1.1 and HTTP/2 alike:
   then a failed attempt is asked for again: a SERVER_ERRORS status,
   DEEPSEEK_SILENCE seconds without headers or without an event (keep-alives
   are no progress), a stream that ends or breaks. Up to STREAM_ATTEMPTS
-  attempts, none started after STREAM_BUDGET seconds; then the client gets a
-  529 `overloaded_error`, which Claude Code retries as it does the API's.
+  attempts, all within STREAM_BUDGET seconds of the request's arrival; then
+  the client gets a 529 `overloaded_error`, which Claude Code retries as it
+  does the API's.
   This is the only real protection: the client never sees a failed attempt.
 - From the first event on, the stream passes as it arrives and a cut can no
   longer be mended. A stream DeepSeek breaks off, or ends without
@@ -48,8 +49,11 @@ streams partway without `message_stop`, over HTTP/1.1 and HTTP/2 alike:
 Holding a stream until whole (tried first) left the client without content
 for minutes on a long answer, and Claude Code gave up on it after 5 to 8
 minutes, pings or not. Waiting for the first event costs a retried request
-its place in DeepSeek's queue; STREAM_BUDGET keeps the wait well inside the
-client's patience.
+its place in DeepSeek's queue. The hold has one deadline, STREAM_BUDGET
+(120 s) from the request's arrival: every wait (for headers, for the first
+event, for a socket read) is capped at what is left of it, so the client
+has its first byte or its 529 within 120 s, well inside the 180 s
+byte-idle default of Claude Code (2.1.319).
 
 A request that is not streamed waits up to TIMEOUT for its answer, DeepSeek's
 too: DeepSeek sends a non-streamed body only once it is done, so a silence
@@ -84,6 +88,7 @@ Environment:
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -129,10 +134,10 @@ SERVER_ERRORS = {429, 500, 502, 503, 504, 529}
 # keep-alives not counting: then the attempt is over. Seen 2026-11-07: a
 # request held over 120 s without headers.
 DEEPSEEK_SILENCE = 60
-# Seconds after which no new attempt at a DeepSeek stream starts: the client
-# gets the overloaded error and asks again itself, well before its own
-# patience runs out.
-STREAM_BUDGET = 180
+# Seconds from a DeepSeek stream request's arrival to its first byte or its
+# 529, whatever DeepSeek does: inside Claude Code's 180 s byte-idle default,
+# with room to spare.
+STREAM_BUDGET = 120
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -247,6 +252,15 @@ def has_event(data):
     return any(line and not line.startswith(b":") for line in sse_lines(data))
 
 
+def read_timeout(response, seconds):
+    """Make the next socket reads of `response` wait at most `seconds`.
+    http.client keeps its socket private (`fp.raw._sock`); without it, reads
+    keep the timeout the request was opened with."""
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    if sock is not None:
+        sock.settimeout(max(seconds, 0.001))
+
+
 def ends_whole(tail):
     """Whether `tail`, the end of a stream, holds its `message_stop` event.
     Matched as a whole line: the same words inside an event's JSON data
@@ -291,7 +305,7 @@ def handler(settings):
             self._send(body, headers=True)
 
         def _relay(self):
-            started = time.monotonic()
+            started = self._arrived = time.monotonic()
             # Set once the response's status line is out: an error after it
             # can only cut the connection.
             self._started = False
@@ -436,42 +450,68 @@ def handler(settings):
         def _chunk(self, data):
             self._send(f"{len(data):x}\r\n".encode() + data + b"\r\n")
 
-        def _open(self, request):
-            """One attempt at a DeepSeek request: its response, its status and
-            "", or None, None and why (unreachable, or silent for
-            DEEPSEEK_SILENCE seconds)."""
-            try:
-                response = opener().open(request, timeout=DEEPSEEK_SILENCE)
-            except urllib.error.HTTPError as error:
-                response = error
-            except Exception as error:
-                return None, None, repr(error)[:120]
+        def _open(self, request, seconds):
+            """One attempt at a DeepSeek request, waited for at most `seconds`
+            of wall clock (connect, TLS and headers together): its response,
+            its status and "", or None, None and why. The open runs in a
+            thread, since a socket timeout bounds each step, not their sum;
+            one given up on closes its own response when it comes."""
+            got, lock, done = {}, threading.Lock(), threading.Event()
+
+            def run():
+                try:
+                    response = opener().open(request, timeout=max(seconds, 0.001))
+                except urllib.error.HTTPError as error:
+                    response = error
+                except Exception as error:
+                    got["why"] = repr(error)[:120]
+                    done.set()
+                    return
+                with lock:
+                    if got.get("given up"):
+                        response.close()
+                        return
+                    got["response"] = response
+                done.set()
+
+            threading.Thread(target=run, daemon=True).start()
+            done.wait(seconds)
+            with lock:
+                if "response" not in got:
+                    got["given up"] = True
+                    return None, None, got.get("why") or f"no headers in {seconds:.1f}s"
+            response = got["response"]
             status = response.status if hasattr(response, "status") else response.code
             return response, status, ""
 
-        def _first_event(self, response):
+        def _first_event(self, response, deadline):
             """Read DeepSeek's 200 stream up to its first event, keep-alive
             comments before it being no progress. Returns the bytes read and
             "", or None and why: the stream ended or broke first, or brought
-            no event for DEEPSEEK_SILENCE seconds. The response is then
-            closed. (The deadline is checked as bytes arrive, so a stall of
-            keep-alives ends within one keep-alive of it; total silence ends
-            at the socket's own timeout.)"""
-            deadline = time.monotonic() + DEEPSEEK_SILENCE
-            data = b""
+            no event by `deadline` (monotonic). The response is then closed.
+            Each read waits only for what is left until the deadline, so
+            neither a keep-alive just before it nor a silence after one
+            stretches the attempt."""
+            began, data = time.monotonic(), b""
             try:
                 while not has_event(data):
-                    if time.monotonic() >= deadline:
-                        why = f"no event in {DEEPSEEK_SILENCE}s"
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        why = f"no event in {time.monotonic() - began:.0f}s"
                         break
+                    read_timeout(response, left)
                     chunk = response.read1(CHUNK)
                     if not chunk:
                         why = "ended before an event"
                         break
                     data += chunk
                 else:
+                    # The live stream gets the open's own timeout back.
+                    read_timeout(response, DEEPSEEK_SILENCE)
                     return data, ""
-            except Exception as error:  # a reset, a timeout: nothing was sent yet
+            except TimeoutError:
+                why = f"no event in {time.monotonic() - began:.0f}s"
+            except Exception as error:  # a reset: nothing was sent yet
                 why = f"cut before an event: {error!r}"[:120]
             response.close()
             return None, why
@@ -481,13 +521,18 @@ def handler(settings):
             asked for again until then (see the module's notes). Records the
             attempts and their failures; returns why the stream was cut after
             it started, if it was."""
-            budget = time.monotonic() + STREAM_BUDGET
+            # One deadline for the whole hold, from the request's arrival:
+            # every wait below is capped at what is left of it.
+            end = self._arrived + STREAM_BUDGET
             self._attempts = 0
             while True:
                 self._attempts += 1
-                response, status, why = self._open(request)
+                response, status, why = self._open(
+                    request, min(DEEPSEEK_SILENCE, end - time.monotonic())
+                )
                 if response is not None and status == 200:
-                    start, why = self._first_event(response)
+                    deadline = min(time.monotonic() + DEEPSEEK_SILENCE, end)
+                    start, why = self._first_event(response, deadline)
                     if start is not None:
                         return self._pass_live(response, start)
                 elif response is not None and status not in SERVER_ERRORS:
@@ -498,13 +543,15 @@ def handler(settings):
                     response.close()
                     why = str(status)
                 self._failures.append(why)
-                if self._attempts >= STREAM_ATTEMPTS or time.monotonic() >= budget:
+                backoff = STREAM_BACKOFF[min(self._attempts, len(STREAM_BACKOFF)) - 1]
+                # No attempt starts at or after the deadline, its backoff included.
+                if self._attempts >= STREAM_ATTEMPTS or time.monotonic() + backoff >= end:
                     body = error_body(
                         f"DeepSeek failed {self._attempts} times; try again", "overloaded_error"
                     )
                     self._reply(529, body)
                     return ""
-                time.sleep(STREAM_BACKOFF[min(self._attempts, len(STREAM_BACKOFF)) - 1])
+                time.sleep(backoff)
 
         def _pass_live(self, response, start):
             """Send DeepSeek's 200 stream from `start` (its bytes up to the

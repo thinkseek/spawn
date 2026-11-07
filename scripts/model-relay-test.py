@@ -69,6 +69,14 @@ class Upstream:
         # Seconds a non-stream answer's body follows its headers: DeepSeek
         # sends it only once done.
         self.slow = 0
+        # Seconds between the keep-alives of a stall.
+        self.keepalive_every = 0.2
+        # Stream requests still to answer each in its own way, before any of
+        # the above: a cut's name (handed to the stream), "silent" (no
+        # headers for 3 s, then closed), or "fail" (a `failure_status` after
+        # `failure_delay` seconds).
+        self.plan = []
+        self.failure_delay = 0
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -83,6 +91,7 @@ class Upstream:
                         "path": self.path,
                         "headers": {k.lower(): v for k, v in self.headers.items()},
                         "body": body,
+                        "at": time.monotonic(),
                     }
                 )
                 return body
@@ -107,6 +116,18 @@ class Upstream:
                 elif request.get("hang_up"):
                     # Closed before any response, as a server that drops a request.
                     self.close_connection = True
+                elif request.get("stream") and upstream.plan:
+                    step = upstream.plan.pop(0)
+                    if step == "silent":
+                        time.sleep(3)
+                        self.close_connection = True
+                    elif step == "fail":
+                        time.sleep(upstream.failure_delay)
+                        error = {"type": "error", "error": {"type": "x"}}
+                        self._json(upstream.failure_status, error)
+                    else:
+                        upstream.cuts.insert(0, step)
+                        self._stream()
                 elif request.get("stream") and upstream.silences:
                     upstream.silences -= 1
                     time.sleep(3)
@@ -148,7 +169,7 @@ class Upstream:
                             chunk(KEEP_ALIVE)
                         except OSError:  # the relay hung up
                             return
-                        time.sleep(0.2)
+                        time.sleep(upstream.keepalive_every if cut == "stall" else 0.2)
                     if cut != "late_start":
                         self.close_connection = True
                         return
@@ -382,7 +403,7 @@ class RelayTest(unittest.TestCase):
         self.gateway.release.set()
         rest = response.read()
         self.assertIn(b"message_stop", first + rest)
-        self.assertTrue(self.gateway.finished.is_set())
+        self.assertTrue(self.gateway.finished.wait(5))
         connection.close()
 
     def stream(self, model="deepseek-flash", server=None):
@@ -559,16 +580,69 @@ class RelayTest(unittest.TestCase):
     def test_no_attempt_at_a_deepseek_stream_starts_after_the_budget(self):
         self.fast_retries()
         self.patch("STREAM_BACKOFF", (0.6,) * 4)
-        self.patch("STREAM_BUDGET", 1.0)
+        self.patch("STREAM_BUDGET", 2.0)
         self.deepseek.failures = relay.STREAM_ATTEMPTS
         connection, response = self.stream()
         self.assertEqual(response.status, 529)
         self.assertEqual(json.loads(response.read())["error"]["type"], "overloaded_error")
         connection.close()
-        # Attempts at about 0, 0.6 and 1.2 s; none after the budget, so
-        # fewer than STREAM_ATTEMPTS.
+        # Attempts at about 0, 0.6, 1.2 and 1.8 s; the next would start at
+        # 2.4 s, past the deadline, so fewer than STREAM_ATTEMPTS (a loaded
+        # host may fit fewer, never more).
         self.assertGreaterEqual(len(self.deepseek.requests), 2)
         self.assertLess(len(self.deepseek.requests), relay.STREAM_ATTEMPTS)
+
+    def test_holding_a_deepseek_stream_ends_with_a_529_before_180_s(self):
+        # The live numbers: one deadline from the request's arrival, inside
+        # the 180 s byte-idle default of Claude Code 2.1.319.
+        self.assertLess(relay.STREAM_BUDGET, 180)
+        # The worst cases scaled down 120 times (silence 0.5 s, deadline
+        # 1 s, Claude Code's bound 1.5 s), backoffs longer than the live
+        # ones: silent opens, keep-alive-only stalls with a keep-alive just
+        # before each event deadline, and a 500 that leaves just enough time
+        # for one more attempt.
+        scale = 0.5 / relay.DEEPSEEK_SILENCE
+        self.patch("DEEPSEEK_SILENCE", 0.5)
+        self.patch("STREAM_BUDGET", relay.STREAM_BUDGET * scale)
+        self.patch("STREAM_BACKOFF", (0.05,) * 4)
+        self.deepseek.keepalive_every = 0.4
+        self.deepseek.failure_delay = 0.25
+        plans = (
+            ["silent"] * 5,
+            ["stall"] * 5,
+            ["silent", "stall", "stall"],
+            ["stall", "fail", "silent", "stall", "stall"],
+        )
+        for plan in plans:
+            self.deepseek.requests.clear()
+            self.deepseek.plan = list(plan)
+            started = time.monotonic()
+            connection, response = self.stream()
+            self.assertEqual(response.status, 529, plan)
+            self.assertEqual(json.loads(response.read())["error"]["type"], "overloaded_error")
+            took = time.monotonic() - started
+            connection.close()
+            # The 529 by the deadline (plus a little scheduling slack), far
+            # inside the bound.
+            self.assertLess(took, relay.STREAM_BUDGET + 0.3, plan)
+            self.assertLess(took, 180 * scale, plan)
+            for seen in self.deepseek.requests:
+                self.assertLess(seen["at"] - started, relay.STREAM_BUDGET, plan)
+
+    def test_a_stall_ends_at_the_silence_bound_not_at_the_next_keep_alive(self):
+        self.fast_retries()
+        self.patch("DEEPSEEK_SILENCE", 0.5)
+        self.deepseek.release.set()
+        # Keep-alives at 0, 0.4 and 0.8 s: the one at 0.4 s must not let the
+        # next read wait its whole socket timeout (to 0.8 s); the attempt
+        # ends at 0.5 s.
+        self.deepseek.keepalive_every = 0.4
+        self.deepseek.cuts = ["stall"]
+        connection, response = self.stream()
+        self.assertEqual(response.read(), WHOLE)
+        connection.close()
+        first, second = (seen["at"] for seen in self.deepseek.requests)
+        self.assertLess(second - first, 0.7)
 
     def test_a_non_stream_deepseek_answer_may_take_longer_than_the_silence(self):
         self.fast_retries()
