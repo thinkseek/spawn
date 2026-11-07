@@ -711,6 +711,57 @@ impl PostgresStore {
         Ok(self.query_one(sql, params)?.get(0))
     }
 
+    /// A fixed statement, prepared on this connection the first time and
+    /// reused after: the loop runs the same reads on every pass, and parsing
+    /// and planning them again each time is work with no decision in it.
+    /// `sql` is `'static` so the statement cache is keyed by the SQL text
+    /// this build ships, never by a string built at run time.
+    fn query_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<Vec<Row>, StoreError> {
+        let mut client = self.lock();
+        let mut prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let statement = match prepared.get(sql) {
+            Some(statement) => statement.clone(),
+            None => {
+                let statement = client.prepare(sql).map_err(|error| backend(&error))?;
+                prepared.insert(sql, statement.clone());
+                statement
+            }
+        };
+        drop(prepared);
+        client
+            .query(&statement, params)
+            .map_err(|error| backend(&error))
+    }
+
+    /// One row from a fixed statement (prepared once, [`Self::query_prepared`]).
+    fn query_one_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<Row, StoreError> {
+        let mut rows = self.query_prepared(sql, params)?;
+        rows.pop().ok_or_else(|| {
+            StoreError::Backend(format!("a prepared statement returned no row: {sql}"))
+        })
+    }
+
+    /// The single `jsonb` value of a fixed statement (prepared once,
+    /// [`Self::query_prepared`]).
+    fn query_json_prepared(
+        &self,
+        sql: &'static str,
+        params: &Params<'_>,
+    ) -> Result<serde_json::Value, StoreError> {
+        Ok(self.query_one_prepared(sql, params)?.get(0))
+    }
+
     /// Rows changed.
     fn execute(&self, sql: &str, params: &Params<'_>) -> Result<u64, StoreError> {
         self.lock()
