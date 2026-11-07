@@ -290,7 +290,7 @@ fn now_ms() -> i64 {
 /// the dispatcher and the liveness rule run only when that watermark has
 /// moved since they last ran, or when a time one of their records named has
 /// come. Between passes the loop waits on `LISTEN spawn_events` with a
-/// timeout of the earliest of the pass interval and the next due time, so a
+/// timeout of the earlier of the pass interval and the next due time, so a
 /// change ends the wait at once and is acted on sooner than a clock could,
 /// and a notification lost costs one interval at most. The Bridge's own
 /// reading of screens and transcripts is not on this schedule: neither is
@@ -303,136 +303,101 @@ fn now_ms() -> i64 {
 /// systemd starts it again.
 pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     let stopping = stop_on_signal()?;
-    let interval = loop_interval();
-    let (mut bridge, mut observer) = runtime(flags)?;
-    let supervised = supervised();
-    let dispatching = env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0");
-    let spawn = spawn_program();
-    let mut store: Option<std::sync::Arc<PostgresStore>> = None;
-    let mut listener: Option<spawn_postgres::Listener> = None;
-    let mut bridge_step = Step::new();
-    let mut observer_step = Step::new();
-    let mut dispatch_step = Step::new();
-    let mut residents_step = Step::new();
-    let mut alive_step = Step::new();
-    let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
-    let mut disk = disk::Monitor::new(workspace_root.as_deref());
+    let (bridge, observer) = runtime(flags)?;
     let (bounds, warnings) = dispatch::Bounds::from_env();
     for warning in &warnings {
         eprintln!("spawn loop warning: {warning}");
     }
-    let mut failures: u32 = 0;
+    let workspace_root = workspace_root(flags).map(std::path::PathBuf::from);
+    let mut fleet = Fleet {
+        bridge,
+        observer,
+        store: None,
+        listener: None,
+        schedule: Schedule::new(),
+        supervised: supervised(),
+        dispatching: env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0"),
+        spawn: spawn_program(),
+        workspace_root,
+        disk: disk::Monitor::new(workspace_root.as_deref()),
+        bounds,
+        interval: loop_interval(),
+        failures: 0,
+    };
     loop {
+        fleet.pass();
+        if fleet.failed() >= MAX_FAILURES {
+            return Err(format!(
+                "{} failed passes in a row; exiting",
+                fleet.failed()
+            ));
+        }
+        if fleet.wait(&stopping) {
+            eprintln!("spawn loop: stopping; pending pushes are made first");
+            return Ok(0);
+        }
+    }
+}
+
+/// The loop between passes: the Bridge, the Observer and the reads over the
+/// store, and the marks that say what each has acted on.
+struct Fleet {
+    bridge: spawn_core::bridge::Bridge,
+    observer: spawn_core::observe::Observer,
+    /// The store's connection, reopened after a failed pass.
+    store: Option<std::sync::Arc<PostgresStore>>,
+    /// The connection that listens for `spawn_events`, on its own session.
+    listener: Option<spawn_postgres::Listener>,
+    schedule: Schedule,
+    supervised: bool,
+    dispatching: bool,
+    spawn: String,
+    workspace_root: Option<std::path::PathBuf>,
+    disk: disk::Monitor,
+    bounds: dispatch::Bounds,
+    interval: Duration,
+    /// Consecutive failed passes: the wait and the exit both grow with them.
+    failures: u32,
+}
+
+impl Fleet {
+    /// One pass: open the store if it was closed, read the watermark once,
+    /// run the steps it names, and read the Bridge's screens and
+    /// transcripts — which no append announces, so they are read every
+    /// pass.
+    fn pass(&mut self) {
         let now = now_ms();
-        let mut failed = false;
-        let mut fail = |what: &str, error: &str| {
-            failed = true;
-            eprintln!("spawn loop: {what}: {error}");
-        };
         let mut lines: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
-        if store.is_none() {
-            store = open_store()
-                .map(std::sync::Arc::new)
-                .map_err(|error| fail("store", &error))
-                .ok();
-            listener = None;
+        let mut failed = false;
+        if self.store.is_none() {
+            match open_store().map(std::sync::Arc::new) {
+                Ok(open) => self.store = Some(open),
+                Err(error) => {
+                    self.fail(&mut failed, "store", &error);
+                }
+            }
+            self.listener = None;
         }
-        let watermark = match &store {
+        let watermark = match &self.store {
             Some(open) => match open.watermark() {
                 Ok(watermark) => Some(watermark),
                 Err(error) => {
-                    fail("watermark", &error.to_string());
+                    self.fail(&mut failed, "watermark", &error.to_string());
                     None
                 }
             },
             None => None,
         };
-        if let Some(open) = store.clone() {
-            let watermark = watermark.unwrap_or_default();
-            // The Bridge's reading of the log and its claims of the queue:
-            // its input is the records, so it runs on change, and its own
-            // wait is the earliest lease still running.
-            if bridge_step.runs(watermark, now) {
-                match bridge.work() {
-                    Ok((report, more)) => {
-                        warnings.extend(report.warnings);
-                        let due = if more {
-                            // The claim stopped at its per-tick limit: a
-                            // command may be waiting for one now.
-                            Some(now)
-                        } else {
-                            match open.next_lease_ms() {
-                                Ok(due) => due,
-                                Err(error) => {
-                                    fail("bridge", &error.to_string());
-                                    None
-                                }
-                            }
-                        };
-                        bridge_step.ran(watermark, due);
-                    }
-                    Err(error) => fail("bridge", &error.to_string()),
-                }
-            }
-            // The Observer's own read of the log, and the judgements its
-            // schedule waits for (facts settling, a recheck, a backoff).
-            if observer_step.runs(watermark, now) {
-                match observer.tick() {
-                    Ok(_) => observer_step.ran(watermark, observer.next_due_ms()),
-                    Err(error) => fail("observer", &error.to_string()),
-                }
-            }
-            // The disk watch never fails a pass: a fleet must not stop
-            // because it cannot record a warning. It reads free space on its
-            // own clock ([`disk::CHECK_EVERY`]) and the log once.
-            lines.extend(
-                disk.check(&open)
-                    .unwrap_or_else(|error| vec![format!("disk: {error}")]),
-            );
-            if dispatching && dispatch_step.runs(watermark, now) {
-                match dispatch::step(
-                    &open,
-                    supervised,
-                    &spawn,
-                    workspace_root.as_deref(),
-                    &disk,
-                    &bounds,
-                ) {
-                    Ok((more, due)) => {
-                        lines.extend(more);
-                        dispatch_step.ran(watermark, due);
-                    }
-                    Err(error) => fail("dispatch", &error),
-                }
-            }
-            // Under the disk floor no resident is revived (a new execution);
-            // the supervisor still is, to act on the warning.
-            if !disk.below_floor() && residents_step.runs(watermark, now) {
-                match supervise::keep_residents(&open) {
-                    Ok((more, due)) => {
-                        lines.extend(more);
-                        residents_step.ran(watermark, due);
-                    }
-                    Err(error) => fail("residents", &error),
-                }
-            }
-            if supervised && alive_step.runs(watermark, now) {
-                match supervise::keep_alive(&open) {
-                    Ok((line, due)) => {
-                        lines.extend(line);
-                        alive_step.ran(watermark, due);
-                    }
-                    Err(error) => fail("supervise", &error),
-                }
-            }
+        if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
+            self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
         }
         // The screens and transcripts the Bridge reads are not announced by
         // an append: this is what keeps them on the pass interval, and what
         // keeps an engine's turn end seen as soon as it is written.
-        match bridge.poll() {
+        match self.bridge.poll() {
             Ok(report) => warnings.extend(report.warnings),
-            Err(error) => fail("bridge", &error.to_string()),
+            Err(error) => self.fail(&mut failed, "bridge", &error.to_string()),
         }
         for warning in &warnings {
             eprintln!("spawn loop warning: {warning}");
@@ -442,50 +407,140 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         }
         if failed {
             // A broken connection is reopened on the next pass.
-            store = None;
-            listener = None;
-            failures = failures.saturating_add(1);
-            if failures >= MAX_FAILURES {
-                return Err(format!("{failures} failed passes in a row; exiting"));
-            }
+            self.store = None;
+            self.listener = None;
+            self.failures = self.failures.saturating_add(1);
         } else {
-            failures = 0;
+            self.failures = 0;
         }
-        // What the next pass waits for: the pass interval at most (the
-        // Bridge's screens need it), or the earliest due time among the
-        // steps, or a failed pass's backoff.
-        let wait = if failures > 0 {
-            backoff(interval, failures)
+    }
+
+    /// The steps whose input is the store: the Bridge's reads of the log and
+    /// its claims of the queue, the Observer's judgements, the dispatcher,
+    /// the liveness rule. Each runs when the watermark moved or its own time
+    /// came, and records both.
+    fn steps(
+        &mut self,
+        open: &std::sync::Arc<PostgresStore>,
+        watermark: i64,
+        now: i64,
+        lines: &mut Vec<String>,
+        warnings: &mut Vec<String>,
+        failed: &mut bool,
+    ) {
+        if self.schedule.bridge.runs(watermark, now) {
+            match self.bridge.work() {
+                Ok((report, more)) => {
+                    warnings.extend(report.warnings);
+                    // Its own wait is the earliest lease still running, or
+                    // the next pass when the claim stopped at its per-tick
+                    // limit and a command may still be waiting for one.
+                    let due = if more {
+                        Some(now)
+                    } else {
+                        open.next_lease_ms().unwrap_or_else(|error| {
+                            self.fail(failed, "bridge", &error.to_string());
+                            None
+                        })
+                    };
+                    self.schedule.bridge.ran(watermark, due);
+                }
+                Err(error) => self.fail(failed, "bridge", &error.to_string()),
+            }
+        }
+        if self.schedule.observer.runs(watermark, now) {
+            match self.observer.tick() {
+                Ok(_) => self
+                    .schedule
+                    .observer
+                    .ran(watermark, self.observer.next_due_ms()),
+                Err(error) => self.fail(failed, "observer", &error.to_string()),
+            }
+        }
+        // The disk watch never fails a pass: a fleet must not stop because it
+        // cannot record a warning. It reads free space on its own clock
+        // ([`disk::CHECK_EVERY`]) and the log once.
+        lines.extend(
+            self.disk
+                .check(open)
+                .unwrap_or_else(|error| vec![format!("disk: {error}")]),
+        );
+        if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
+            match dispatch::step(
+                open,
+                self.supervised,
+                &self.spawn,
+                self.workspace_root.as_deref(),
+                &self.disk,
+                &self.bounds,
+            ) {
+                Ok((more, due)) => {
+                    lines.extend(more);
+                    self.schedule.dispatch.ran(watermark, due);
+                }
+                Err(error) => self.fail(failed, "dispatch", &error),
+            }
+        }
+        // Under the disk floor no resident is revived (a new execution); the
+        // supervisor still is, to act on the warning.
+        if !self.disk.below_floor() && self.schedule.residents.runs(watermark, now) {
+            match supervise::keep_residents(open) {
+                Ok((more, due)) => {
+                    lines.extend(more);
+                    self.schedule.residents.ran(watermark, due);
+                }
+                Err(error) => self.fail(failed, "residents", &error),
+            }
+        }
+        if self.supervised && self.schedule.alive.runs(watermark, now) {
+            match supervise::keep_alive(open) {
+                Ok((line, due)) => {
+                    lines.extend(line);
+                    self.schedule.alive.ran(watermark, due);
+                }
+                Err(error) => self.fail(failed, "supervise", &error),
+            }
+        }
+    }
+
+    /// Log a failed step and mark the pass failed.
+    fn fail(&self, failed: &mut bool, what: &str, error: &str) {
+        *failed = true;
+        eprintln!("spawn loop: {what}: {error}");
+    }
+
+    /// Consecutive failed passes.
+    fn failed(&self) -> u32 {
+        self.failures
+    }
+
+    /// Wait for the next pass: the pass interval at most (the Bridge's
+    /// screens need it), the earliest due time among the steps, or a failed
+    /// pass's backoff — ended early by a notification or a stop. True when
+    /// the loop must stop.
+    fn wait(&mut self, stopping: &AtomicBool) -> bool {
+        let pause = if self.failures > 0 {
+            backoff(self.interval, self.failures)
         } else {
-            let next = earliest(&[
-                &bridge_step,
-                &observer_step,
-                &dispatch_step,
-                &residents_step,
-                &alive_step,
-            ]);
-            next.map_or(interval, |due| {
-                interval.min(std::time::Duration::from_millis(
+            self.schedule.earliest().map_or(self.interval, |due| {
+                self.interval.min(Duration::from_millis(
                     u64::try_from(due.saturating_sub(now_ms())).unwrap_or(0),
                 ))
             })
         };
-        // A notification on the log ends the wait at once: it is a hint that
-        // the watermark moved, never the record that it did. Without a
-        // listener the wait is the interval and the watermark is still read
-        // every pass.
-        if listener.is_none()
-            && let Some(open) = &store
+        // A notification on the log ends the wait at once: a hint that the
+        // watermark moved, never the record that it did. Without a listener
+        // the wait is the interval, and the watermark is still read every
+        // pass.
+        if self.listener.is_none()
+            && let Some(open) = &self.store
         {
             match open.listen() {
-                Ok(open) => listener = Some(open),
+                Ok(listener) => self.listener = Some(listener),
                 Err(error) => eprintln!("spawn loop: listen: {error}; the watermark alone wakes it"),
             }
         }
-        if wait_unless_stopped(listener.as_mut(), wait, &stopping) {
-            eprintln!("spawn loop: stopping; pending pushes are made first");
-            return Ok(0);
-        }
+        wait_unless_stopped(self.listener.as_mut(), pause, stopping)
     }
 }
 
