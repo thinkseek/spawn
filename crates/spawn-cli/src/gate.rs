@@ -601,28 +601,31 @@ pub(crate) struct BaseDisagrees {
 }
 
 /// Read the gate's own account of a base that disagreed with itself from
-/// its stdout: the last two lines are its pair
-/// (`| <name> exited 1, then 0 on the base: …`, then `| stage gate aborted
-/// <ms>ms base: <name> again (…)`), with the same `<name>` in both, a
-/// scenario's file name (no space, no `|`), optionally followed by its
-/// `| gate time:` line and nothing else. Anywhere else in the log, with
-/// another prefix (`| | …`: a nested gate's line, prefixed again), with
-/// other exits, or with anything after the pair it says nothing.
+/// its stdout: the last two lines before the gate's own trailing ones are
+/// its pair (`| <name> exited 1, then 0 on the base: …`, then `| stage gate
+/// aborted <ms>ms base: <name> again (…)`), with the same `<name>` in both,
+/// a scenario's file name (no space, no `|`), optionally followed by its
+/// `| base runs:` line and its `| gate time:` line (the gate's own trailing
+/// lines, the timing one read for the setup) and nothing else. Anywhere else
+/// in the log, with another prefix (`| | …`: a nested gate's line, prefixed
+/// again), with other exits, or with anything after the pair it says
+/// nothing.
 fn base_disagrees(stdout: &str) -> Option<BaseDisagrees> {
     let mut lines: Vec<&str> = stdout.lines().collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
-    let setup_s = match lines
-        .last()
-        .and_then(|line| line.strip_prefix(GATE_TIME_LINE))
-    {
-        Some(times) => {
+    let mut setup_s = None;
+    while let Some(line) = lines.last() {
+        if line.starts_with(BASE_RUNS_LINE) {
             lines.pop();
-            setup_seconds(times)
+        } else if let Some(times) = line.strip_prefix(GATE_TIME_LINE) {
+            setup_s = setup_seconds(times);
+            lines.pop();
+        } else {
+            break;
         }
-        None => None,
-    };
+    }
     let stage = lines.pop()?;
     let exited = lines.pop()?;
     let name = exited
