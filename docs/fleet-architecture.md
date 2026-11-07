@@ -336,7 +336,7 @@ it, on the same ladder.
   | Step | The task | Measured from | Bound (default) |
   | --- | --- | --- | --- |
   | `delivery` | assigned or sent back, and its session's turn (a revision first, then the oldest new task; no earlier open task of the session holding it) | `task.assigned`, or the review or gate verdict that sent it back | `SPAWN_STALL_DELIVERY_SECS` (600) |
-  | `activity` | delivered, waiting for its worker (a worker idle at its prompt with no report collected included) | the later of `task.delivered` and the session's latest fact (a record of the session that is not the Observer's nor storage's) | `SPAWN_STALL_ACTIVITY_SECS` (900) |
+  | `activity` | delivered, waiting for its worker (a worker idle at its prompt with no report collected included, or with a report not taken as unfinished) | the later of `task.delivered` and the session's latest fact (a record of the session that is not the Observer's nor storage's) | `SPAWN_STALL_ACTIVITY_SECS` (900) |
   | `judgement` | reported, under review | `task.reported` | `SPAWN_STALL_REVIEW_SECS` (1800) |
   | `judgement` | in a gated mission, the task the integrator judges next (`Mission::ready`'s order) | the later of the record that made it ready and the mission's latest verdict that is not `stale` | `SPAWN_STALL_GATE_SECS` (3600) |
   | `landing` | landing, its source not held by the owner (§10.3, "Landing: the owner's hold") | the later of its `task.gated` accepted and the record that ended the latest hold on its source | `SPAWN_STALL_LANDING_SECS` (600) |
@@ -579,9 +579,15 @@ input of a mission.
    inputs, done criteria, report format), never the supervisor's conversation.
 4. Reports, not transcripts. A worker ends by writing `.spawn/report.md`
    (outcome, what changed, open issues); the dispatcher stores it with the
-   task and digests it. The supervisor reads reports and judgements, and
-   opens a transcript (`tail`) only when it must. Its own context stays
-   about the mission.
+   task and digests it. The brief tells it to write the file once, at the
+   end, and to draft anywhere else: a report that is still a draft (a
+   template placeholder such as `PENDING_RESULTS`, a line that is only
+   `(pending)`, `TBD` or `TODO`, an Outcome that says draft or in progress)
+   is not taken. The task stays delivered, the worker is told once per
+   content of the file which markers are on which lines, and the check is
+   recorded (`task.report_unfinished`, §10.1). The supervisor reads reports
+   and judgements, and opens a transcript (`tail`) only when it must. Its
+   own context stays about the mission.
 5. Isolated workspaces. Every worker has its own; combining results is a task
    the supervisor decides on, not a side effect.
 6. Human input is context too. A human may type to a worker directly. The
@@ -894,9 +900,16 @@ controller. Missions, tasks, residents and landings are events in
   no `EventKind` variant.
 - **Record types:** `mission.added`, `mission.configured`, `mission.closed`,
   `mission.halted`, `mission.resumed`, `source.moved`, `task.assigned`,
-  `task.delivered`, `task.reported`, `task.reviewed`, `task.cancelled`,
-  `task.gated`, `task.landed`, `task.aborted`, `resident.proposed`,
-  `resident.approved`, `resident.retired`, `legacy.imported`, `host.disk`.
+  `task.delivered`, `task.report_unfinished`, `task.reported`,
+  `task.reviewed`, `task.cancelled`, `task.gated`, `task.landed`,
+  `task.aborted`, `resident.proposed`, `resident.approved`,
+  `resident.retired`, `legacy.imported`, `host.disk`.
+  `task.report_unfinished` is a delivered task's report the dispatcher read
+  and did not take because it is still a draft: it names the task's
+  `revision`, the content's `digest`, the `markers` (each with its `line`,
+  `kind`, `marker` and `text`) and the note that told the worker (`note`,
+  its idempotency key, and `command_id`); one per revision and content,
+  folded into no table (the task stays delivered).
   `legacy.imported` carries one row of the mission tables as it stood
   before the control stream existed: a database with mission rows and no
   records imports them once, on migration. A `task.cancelled` names `by`,
