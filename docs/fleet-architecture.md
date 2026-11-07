@@ -1078,7 +1078,19 @@ record of what was judged (§14 of design.md).
 
 - **Mission settings** (`spawn mission configure`, owner only): a gate (a
   scenarios directory in the controller, the deployed tree), how tasks are accepted,
-  and an optional budget:
+  an optional budget, and objectives (§10.4). `configure` changes only the
+  settings it is given and keeps the others: `spawn_mission_reconfigure`
+  merges the change into the mission's settings under the append lock (the
+  gate and accept replaced, the budget's and the objectives' keys one by
+  one), checks the result as `spawn_mission_configure` checks any, and
+  records it whole, so `mission.configured` always carries every setting.
+  A setting is cleared only by naming it: `--clear` with any of `gate`,
+  `budget`, `minutes`, `tool-calls`, `objectives`, `workers`. A flag it does
+  not know, no change at all, or a setting both given and cleared is
+  refused. (2026-11-08: `configure --id 4 --tool-calls 600` replaced every
+  setting of mission 4, dropping its gate, objectives and minutes, and
+  setting accept to review, until the owner restored them.) `spawn mission
+  add` takes the settings whole, for a mission that has none yet:
   - `review`: the supervisor accepts, then the gate runs;
   - `gate`: the gate alone decides. The supervisor is not told of its
     reports (`mission_news`) and `spawn_task_review` refuses them, because

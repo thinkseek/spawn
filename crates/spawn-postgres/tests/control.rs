@@ -2935,3 +2935,136 @@ fn an_unfinished_report_is_recorded_once_per_content_and_revision_and_moves_noth
         ]
     );
 }
+
+/// The settings `mission_missions` holds for a mission, and those its latest
+/// `mission.configured` record carries.
+fn settings(client: &mut Client, mission: i64) -> (serde_json::Value, serde_json::Value) {
+    let row = client
+        .query_one(
+            "select jsonb_build_object('gate', gate, 'accept', accept, 'budget', budget,
+                                       'objectives', objectives)
+               from mission_missions where id = $1",
+            &[&mission],
+        )
+        .expect("the mission")
+        .get(0);
+    let record: serde_json::Value = client
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where session_id = 'session_control' and source = 'control'
+                and event_name = 'control.recorded'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
+                and (kind -> 'detail' -> 'record' ->> 'id')::bigint = $1
+              order by session_seq desc limit 1",
+            &[&mission],
+        )
+        .expect("its latest mission.configured")
+        .get(0);
+    let record = json!({"gate": record["gate"], "accept": record["accept"],
+                        "budget": record["budget"], "objectives": record["objectives"]});
+    (row, record)
+}
+
+/// `spawn mission configure --id 4 --tool-calls 600` (2026-11-08) replaced
+/// every setting of mission 4: a change keeps what it does not name, and
+/// only an explicit null clears.
+#[test]
+fn a_partial_configure_keeps_the_other_settings_and_only_a_null_clears() {
+    let (store, schema) = store("control_reconfigure");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("Supply", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let objectives = json!({"backlog": "/controller/backlog", "resident": "supply", "workers": 2});
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/scenarios"),
+            "gate",
+            Some(&json!({"minutes": 90})),
+            Some(&objectives),
+        )
+        .expect("configure");
+    let full = json!({"gate": "/controller/scenarios", "accept": "gate",
+                      "budget": {"minutes": 90}, "objectives": objectives});
+    assert_eq!(settings(&mut client, mission), (full.clone(), full.clone()));
+
+    let after = store
+        .mission_reconfigure(mission, &json!({"budget": {"tool_calls": 600}}))
+        .expect("the tool-call limit alone");
+    let mut expected = full.clone();
+    expected["budget"] = json!({"minutes": 90, "tool_calls": 600});
+    assert_eq!(
+        after,
+        json!({"mission": mission, "gate": expected["gate"],
+                             "accept": "gate", "budget": expected["budget"],
+                             "objectives": expected["objectives"]})
+    );
+    assert_eq!(
+        settings(&mut client, mission),
+        (expected.clone(), expected.clone()),
+        "the record carries every setting, the fold keeps them"
+    );
+
+    store
+        .mission_reconfigure(
+            mission,
+            &json!({"objectives": {"workers": 4}, "accept": "review"}),
+        )
+        .expect("workers and accept");
+    expected["objectives"]["workers"] = json!(4);
+    expected["accept"] = json!("review");
+    assert_eq!(settings(&mut client, mission).0, expected);
+
+    store
+        .mission_reconfigure(
+            mission,
+            &json!({"budget": {"minutes": null}, "objectives": {"workers": null}}),
+        )
+        .expect("clear the minutes and the workers");
+    expected["budget"] = json!({"tool_calls": 600});
+    expected["objectives"] = json!({"backlog": "/controller/backlog", "resident": "supply"});
+    assert_eq!(
+        settings(&mut client, mission),
+        (expected.clone(), expected.clone())
+    );
+
+    // The result is checked as a whole, and a refusal records nothing.
+    let before = control_types(&mut client).len();
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"gate": null})))
+            .contains("objectives need a gate"),
+        "objectives keep needing a gate"
+    );
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"budgets": {}})))
+            .contains("no setting budgets")
+    );
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"budget": 5})))
+            .contains("is a JSON object")
+    );
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"accept": "vote"})))
+            .contains("review or gate")
+    );
+    assert_eq!(control_types(&mut client).len(), before, "nothing recorded");
+    assert_eq!(settings(&mut client, mission).0, expected);
+
+    store
+        .mission_reconfigure(
+            mission,
+            &json!({"gate": null, "objectives": null, "budget": {"tool_calls": null}}),
+        )
+        .expect("clear the gate, the objectives and the last budget key");
+    let cleared = json!({"gate": null, "accept": "review", "budget": null, "objectives": null});
+    assert_eq!(settings(&mut client, mission), (cleared.clone(), cleared));
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
