@@ -395,7 +395,6 @@ mod tests {
         assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
     }
 
-    #[test]
     /// The monitor retires: the fleet's alerts are Spawn's own records now,
     /// read through the supervisor's restricted login.
     #[test]
