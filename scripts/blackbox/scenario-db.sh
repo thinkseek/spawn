@@ -73,16 +73,18 @@ else
 fi
 # One session: the settings, the statement, its result.
 # shellcheck disable=SC2086
-result=$($psql_command -X -d postgres -tAq \
-    -c "select set_config('spawn_logins.database', '$database', false),
-               set_config('spawn_logins.prefix', '$prefix', false)" \
+output=$($psql_command -X -d postgres -tAq \
+    -c "select set_config('spawn_logins.database', '$database', false) is null,
+               set_config('spawn_logins.prefix', '$prefix', false) is null" \
     -c "$sql" \
-    -c "select current_setting('spawn_logins.result', true)" 2>&1 | tail -n 1)
+    -c "select 'result: ' || current_setting('spawn_logins.result', true)" 2>&1)
+result=$(printf '%s\n' "$output" | sed -n 's/^result: //p' | tail -n 1)
 case "$result" in
 "dropped "* | "skipped: "*)
     echo "$action $name: $result"
     exit 0
     ;;
 esac
-echo "scenario-db: $action $name failed: $result" >&2
+echo "scenario-db: $action $name failed:" >&2
+printf '%s\n' "$output" | tail -n 5 >&2
 exit 1
