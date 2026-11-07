@@ -128,7 +128,9 @@ class RelayTest(unittest.TestCase):
         self.deepseek = Upstream("deepseek")
         self.relay = self.start_relay(self.gateway.url, self.deepseek.url + "/anthropic")
 
-    def start_relay(self, upstream, deepseek, max_body=4096, client_timeout=10):
+    def start_relay(
+        self, upstream, deepseek, max_body=4096, client_timeout=10, every_model_as=""
+    ):
         settings = relay.config(
             {
                 "DEEPSEEK_API_KEY": FAKE_KEY,
@@ -137,6 +139,7 @@ class RelayTest(unittest.TestCase):
                 "MODEL_RELAY_ADDRESS": "127.0.0.1:0",
                 "MODEL_RELAY_MAX_BODY": str(max_body),
                 "MODEL_RELAY_CLIENT_TIMEOUT": str(client_timeout),
+                "MODEL_RELAY_EVERY_MODEL_AS": every_model_as,
             }
         )
         server = relay.serve(settings)
@@ -200,6 +203,41 @@ class RelayTest(unittest.TestCase):
             self.assertNotIn("authorization", seen["headers"])
             self.assertEqual(seen["headers"]["anthropic-version"], "2023-06-01")
             self.assertEqual(json.loads(seen["body"])["model"], "deepseek-flash")
+
+    def test_every_model_goes_to_deepseek_as_its_model_when_set(self):
+        sending = self.start_relay(
+            self.gateway.url, self.deepseek.url + "/anthropic", every_model_as="deepseek-v4-pro"
+        )
+        request = {
+            "model": "claude-opus-5-5",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "héllo"}],
+        }
+        for path in ("/v1/messages", "/v1/messages/count_tokens"):
+            status, payload = self.post(path, request, server=sending)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(payload)["from"], "deepseek")
+        status, _ = self.post(
+            "/v1/messages", {"model": "deepseek-flash", "max_tokens": 1}, server=sending
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.gateway.requests, [])
+        sent = [json.loads(seen["body"]) for seen in self.deepseek.requests]
+        self.assertEqual(
+            [body["model"] for body in sent],
+            ["deepseek-v4-pro", "deepseek-v4-pro", "deepseek-flash"],
+        )
+        # Only the model is rewritten.
+        self.assertEqual(sent[0], {**request, "model": "deepseek-v4-pro"})
+        for seen in self.deepseek.requests:
+            self.assertEqual(seen["headers"]["x-api-key"], FAKE_KEY)
+            self.assertNotIn("authorization", seen["headers"])
+        # A request without a model still has nowhere else to go.
+        connection = self.connect(sending)
+        connection.request("GET", "/v1/models", headers={"Authorization": CLIENT_TOKEN})
+        connection.getresponse().read()
+        connection.close()
+        self.assertEqual([seen["path"] for seen in self.gateway.requests], ["/v1/models"])
 
     def test_requests_without_a_model_go_to_the_gateway(self):
         connection = self.connect()
@@ -330,9 +368,13 @@ class RelayTest(unittest.TestCase):
         good = {"DEEPSEEK_API_KEY": FAKE_KEY, "MODEL_RELAY_UPSTREAM": "http://gateway"}
         self.assertIsNone(relay.refusal(relay.config(good)))
         self.assertEqual(relay.config({**good, "MODEL_RELAY_ADDRESS": ":9"})["host"], "127.0.0.1")
+        self.assertIsNone(
+            relay.refusal(relay.config({**good, "MODEL_RELAY_EVERY_MODEL_AS": "deepseek-v4-pro"}))
+        )
         for change in (
             {"DEEPSEEK_API_KEY": ""},
             {"MODEL_RELAY_ADDRESS": "0.0.0.0:8791"},
+            {"MODEL_RELAY_EVERY_MODEL_AS": "claude-opus-5-5"},
         ):
             self.assertIsNotNone(relay.refusal(relay.config({**good, **change})))
 

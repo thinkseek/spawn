@@ -10,6 +10,12 @@ by the `model` of its JSON body:
   gateway header) plus `x-api-key: $DEEPSEEK_API_KEY`.
 - Everything else goes unchanged to the upstream gateway, with the client's
   own auth headers. The relay never holds the gateway's token.
+- With `MODEL_RELAY_EVERY_MODEL_AS` set (a `deepseek-*` name), every other
+  model goes to DeepSeek too, as that model: the request's `model` is
+  rewritten and nothing else. For when the gateway cannot serve (its quota
+  spent), so engines keep working without a restart; unset it to send them
+  back. DeepSeek takes a history written by another model, signed thinking
+  blocks and tool calls included (checked 2026-11-07 with deepseek-v4-pro).
 
 Responses, server-sent events included, are passed on as they arrive. A
 redirect is passed back to the client, never followed: following it would
@@ -21,6 +27,8 @@ the engine's environment, the event log, or an agent's terminal.
 Environment:
   DEEPSEEK_API_KEY        required
   DEEPSEEK_ANTHROPIC_URL  default https://api.deepseek.com/anthropic
+  MODEL_RELAY_EVERY_MODEL_AS  a deepseek-* model every other model is sent
+                          to DeepSeek as; unset (the default) for none
   MODEL_RELAY_UPSTREAM    the gateway every other model goes to; default the
                           `env.ANTHROPIC_BASE_URL` of Claude Code's user
                           settings ($CLAUDE_CONFIG_DIR or ~/.claude), which
@@ -108,6 +116,7 @@ def config(environ):
         "port": int(port),
         "max_body": int(environ.get("MODEL_RELAY_MAX_BODY", str(32 * 1024 * 1024))),
         "client_timeout": float(environ.get("MODEL_RELAY_CLIENT_TIMEOUT", "60")),
+        "every_model_as": environ.get("MODEL_RELAY_EVERY_MODEL_AS", ""),
     }
 
 
@@ -118,6 +127,13 @@ def routed_model(body):
     except (ValueError, AttributeError, UnicodeDecodeError):
         return ""
     return model if isinstance(model, str) else ""
+
+
+def as_model(body, model):
+    """`body` (a JSON object naming a model) naming `model` instead."""
+    request = json.loads(body)
+    request["model"] = model
+    return json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 def error_body(message):
@@ -177,12 +193,16 @@ def handler(settings):
                 self._reply(400, error_body("body is shorter than Content-Length"), close=True)
                 return
             model = routed_model(body) if body else ""
+            sent_as = model
+            if model and not model.startswith("deepseek-") and settings["every_model_as"]:
+                sent_as = settings["every_model_as"]
+                body = as_model(body, sent_as)
             headers = {
                 name: value
                 for name, value in self.headers.items()
                 if name.lower() not in HOP
             }
-            if model.startswith("deepseek-"):
+            if sent_as.startswith("deepseek-"):
                 route, base = "deepseek", settings["deepseek"]
                 headers = {
                     name: value
@@ -218,7 +238,8 @@ def handler(settings):
             elapsed = (time.monotonic() - started) * 1000
             sys.stderr.write(
                 f"model-relay: {self.command} {self.path.split('?')[0]} "
-                f"{model or '-'} -> {route} {status} {elapsed:.0f}ms "
+                f"{model or '-'}{'' if sent_as == model else ' as ' + sent_as} "
+                f"-> {route} {status} {elapsed:.0f}ms "
                 f"{len(body)}B in {sent}B out\n"
             )
 
@@ -283,6 +304,11 @@ def refusal(settings):
         return "DEEPSEEK_API_KEY is not set"
     if not settings["upstream"]:
         return "no upstream; set MODEL_RELAY_UPSTREAM"
+    if settings["every_model_as"] and not settings["every_model_as"].startswith("deepseek-"):
+        return (
+            f"MODEL_RELAY_EVERY_MODEL_AS names {settings['every_model_as']}, "
+            "not a deepseek-* model"
+        )
     # Whoever reaches the relay spends the key, so it serves loopback only.
     if settings["host"] not in ("127.0.0.1", "::1", "[::1]", "localhost"):
         return f"refusing to listen on {settings['host']}; use 127.0.0.1"
@@ -297,9 +323,14 @@ def main():
     server = serve(settings)
     upstream = urllib.parse.urlsplit(settings["upstream"]).hostname
     deepseek = urllib.parse.urlsplit(settings["deepseek"]).hostname
+    others = (
+        f"others to {deepseek} as {settings['every_model_as']}"
+        if settings["every_model_as"]
+        else f"others to {upstream}"
+    )
     sys.stderr.write(
         f"model-relay: http://{settings['host']}:{server.server_port}/v1/ -> "
-        f"deepseek-* to {deepseek}, others to {upstream}\n"
+        f"deepseek-* to {deepseek}, {others}\n"
     )
     server.serve_forever()
 
