@@ -3069,7 +3069,11 @@ fn a_base_that_disagrees_with_itself_is_a_host_fault_with_its_own_count() {
     store
         .integrator_record(&disagrees(task, 0, 2, 2, false))
         .expect("a base disagrees");
-    assert_eq!(mission_row(&mut client)["gate_base_disagrees"], 2);
+    assert_eq!(
+        mission_row(&mut client)["gate_base_disagrees"],
+        1,
+        "a new run after the abort"
+    );
     verdict(landing, 0, "accepted");
     store
         .integrator_record(&json!({"type": "task.landed", "id": landing, "from": "b1",
