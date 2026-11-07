@@ -122,7 +122,10 @@ mod tests {
             MORE_USAGE.contains("spawn backup dump|bundle|verify"),
             "{MORE_USAGE}"
         );
-        assert!(!USAGE.contains("backup"), "the contract's line stays as it was");
+        assert!(
+            !USAGE.contains("backup"),
+            "the contract's line stays as it was"
+        );
     }
 
     #[test]

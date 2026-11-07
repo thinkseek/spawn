@@ -66,7 +66,12 @@ impl PostgresStore {
     }
 
     /// The records of one `backup.*` type since `since_ms` ([`BACKUP_RECORDS`]).
-    pub fn backup_records(&self, kind: &str, since_ms: i64, limit: i64) -> Result<Value, StoreError> {
+    pub fn backup_records(
+        &self,
+        kind: &str,
+        since_ms: i64,
+        limit: i64,
+    ) -> Result<Value, StoreError> {
         self.query_json(BACKUP_RECORDS, &[&kind, &since_ms, &limit])
     }
 
