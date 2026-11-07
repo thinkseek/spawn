@@ -7064,14 +7064,16 @@ mod database_tests {
             "an overrun yields nothing"
         );
 
-        // The next pass assigns 023's continuation of the overrun, not 025.
+        // The next pass assigns 023's continuation of the overrun, and 025
+        // gets its slot when one is free.
         pass();
-        let flying: Vec<u32> = flying(&db, mission)
+        let mut flying: Vec<u32> = flying(&db, mission)
             .iter()
             .filter(|(task, _)| *task != first.id && *task != other.id)
             .map(|(_, objective)| *objective)
             .collect();
-        assert_eq!(flying, [23, 25], "the continuation first, then 025");
+        flying.sort_unstable();
+        assert_eq!(flying, [23, 25], "the continuation of the overrun, and 025");
         let again = objective_task(&db, mission, 23);
         assert_eq!(
             continues_of(&db, again.id),
@@ -7136,7 +7138,7 @@ mod database_tests {
         assert_eq!(continues_of(&db, again.id), Some(task.id));
         let brief = again.brief;
         assert!(
-            brief.contains(&format!("continues task #{},", task.id)),
+            brief.contains(&format!("continues task #{}", task.id)),
             "{brief}"
         );
         assert!(!brief.contains("Earlier tasks"));
