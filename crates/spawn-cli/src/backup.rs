@@ -1758,10 +1758,10 @@ fn restore_and_compare(
 ) -> Result<Drilled, RestoreError> {
     let mut drilled = Drilled::default();
     let fail = |reason: String, drilled: Drilled| RestoreError { reason, drilled };
-    let snapshot = |drilled: &Drilled| drilled.clone();
     let key = latest.record["keys"][0].as_str().unwrap_or_default();
     let expected_sha = latest.record["sha256"].as_str().unwrap_or_default();
-    let Some((bytes, headers)) = get_object_bytes(settings, key)X
+    let Some((bytes, headers)) = get_object_bytes(settings, key)
+        .map_err(|error| fail(error, drilled.clone()))?
     else {
         return Err(RestoreError {
             reason: format!("the bucket does not hold {key}"),
@@ -1776,10 +1776,10 @@ fn restore_and_compare(
             drilled,
         });
     }
-    let scratch = Scratch::new("drill")X;
+    let scratch = Scratch::new("drill").map_err(|error| fail(error, drilled.clone()))?;
     let encrypted = scratch.join("dump.gpg");
     fs::write(&encrypted, &bytes)
-        .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled))?;
+        .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled.clone()))?;
     let raw = scratch.join("dump");
     if let Err(error) = decrypt(settings, &encrypted, &raw) {
         return Err(RestoreError {
@@ -1797,7 +1797,7 @@ fn restore_and_compare(
         }
         Err(error) => return Err(RestoreError { reason: error, drilled }),
     }
-    let url = parse_pg_url(drill_url)X;
+    let url = parse_pg_url(drill_url).map_err(|error| fail(error, drilled.clone()))?;
     let base = if url.database.is_empty() {
         "postgres".to_string()
     } else {
