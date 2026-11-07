@@ -2464,6 +2464,121 @@ impl Drop for Databases {
     }
 }
 
+/// A sweep, under the migration lock: a run of a case that holds it can
+/// meet a migration of another case; it is tried again, not skipped.
+fn sweep(maintenance: &mut Client, prefix: &str) -> String {
+    let mut result = String::new();
+    for _ in 0..12 {
+        result = drop_logins(maintenance, "", prefix);
+        if !result.starts_with("skipped: a migration") {
+            break;
+        }
+    }
+    result
+}
+
+#[test]
+fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
+    let base = url();
+    let (server, _) = base.rsplit_once('/').expect("a database URL");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let prefix = format!("spawn_sweep_{}_{nanos:x}_", std::process::id());
+    let mut databases = Databases {
+        maintenance: format!("{server}/postgres"),
+        names: Vec::new(),
+    };
+    let mut maintenance =
+        Client::connect(&databases.maintenance, NoTls).expect("maintenance connection");
+    let migrate = |name: &str| {
+        spawn_postgres::PostgresStore::connect(&format!("{server}/{name}"))
+            .and_then(|store| store.migrate())
+            .expect("migrate");
+    };
+    // Kept: an existing database; gone: a dropped one, and one whose name is
+    // long enough for spawn_login_role's hash; outside: another prefix.
+    let kept = format!("{prefix}kept");
+    let gone = format!("{prefix}gone");
+    let long = format!("{prefix}{}", "long".repeat(10));
+    let outside = format!("spawn_sweeq_{}_{nanos:x}_gone", std::process::id());
+    for name in [&kept, &gone, &long, &outside] {
+        maintenance
+            .batch_execute(&format!("create database {name}"))
+            .expect("create a database");
+        databases.names.push(name.clone());
+        migrate(name);
+    }
+    for name in [&gone, &long, &outside] {
+        maintenance
+            .batch_execute(&format!("drop database {name} with (force)"))
+            .expect("drop a database, not its logins");
+    }
+    // A login-shaped role of no database that still holds a privilege.
+    let holding = format!("spawn_reader_{prefix}holding");
+    maintenance
+        .batch_execute(&format!(
+            "create role {holding} nologin; grant connect on database postgres to {holding}"
+        ))
+        .expect("a role that holds a privilege");
+    let logins = |client: &mut Client, pattern: &str| -> Vec<String> {
+        client
+            .query(
+                "select rolname::text from pg_roles
+                  where rolname ~ ('^spawn_(supervisor|reader|human)_' || $1) order by 1",
+                &[&pattern],
+            )
+            .expect("the logins")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+    let hashed = logins(&mut maintenance, "spawn_sweep_.*_[0-9a-f]{8}$");
+    assert_eq!(
+        hashed
+            .iter()
+            .filter(|login| login.contains(&prefix[..20]))
+            .count(),
+        3,
+        "the long name's logins are hashed: {hashed:?}"
+    );
+    assert_eq!(logins(&mut maintenance, &format!("{prefix}.*")).len(), 10);
+
+    // One database's logins, while it still exists: none go.
+    assert_eq!(drop_logins(&mut maintenance, &kept, ""), "dropped 0 of 3");
+    assert_eq!(sweep(&mut maintenance, &prefix), "dropped 6 of 10");
+    let left = logins(&mut maintenance, &format!("{prefix}.*"));
+    assert_eq!(
+        left,
+        [
+            holding.clone(),
+            format!("spawn_human_{kept}"),
+            format!("spawn_reader_{kept}"),
+            format!("spawn_supervisor_{kept}"),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        logins(&mut maintenance, &outside).len(),
+        3,
+        "another prefix's logins stay"
+    );
+    // The kept database works with the logins it kept.
+    let reader = spawn_postgres::role_url(&format!("{server}/{kept}"), "spawn_reader")
+        .expect("the reader's URL");
+    assert!(Client::connect(&reader, NoTls).is_ok(), "the kept login logs in");
+
+    maintenance
+        .batch_execute(&format!(
+            "revoke connect on database postgres from {holding}; drop role {holding}"
+        ))
+        .expect("drop the holding role");
+    assert_eq!(drop_logins(&mut maintenance, &outside, ""), "dropped 3 of 3");
+}
+
 #[test]
 fn migrations_racing_on_one_server_all_succeed() {
     // Roles and grants are shared by the whole server: parallel migrations of
@@ -2518,7 +2633,6 @@ fn migrations_racing_on_one_server_all_succeed() {
     // The guard drops the databases and their logins.
     let names = databases.names.clone();
     drop(databases);
-    let mut admin = Client::connect(&base, NoTls).expect("admin connection");
     let left: i64 = admin
         .query_one(
             "select count(*) from pg_roles r, unnest($1::text[]) d
