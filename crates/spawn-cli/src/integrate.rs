@@ -2862,7 +2862,7 @@ mod tests {
         .expect("fetch")
         .expect("pushed");
         let main =
-            crate::sources::git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
+            crate::sources::test_git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
                 .expect("main");
         super::landing_candidate(&mirror_path, &main, &pushed, "Work (task 1)\n\nThe work.\n")
             .expect("candidate")
