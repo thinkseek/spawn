@@ -32,9 +32,12 @@ interface SidebarProps {
   /** What is escalated, by the dispatcher's view (attention.ts
    * `needsHuman`): the queue's count, null while it is unknown, with why. */
   attention: HumanCount;
+  /** How many alerts are open (the record's own count, from /api/alerts). */
+  openAlerts: number;
   onShowFleet: () => void;
   onShowMissions: () => void;
   onShowRsi: () => void;
+  onShowAlerts: () => void;
   onShowScorecard: () => void;
   onShowShow: () => void;
   onShowSessions: () => void;
@@ -63,9 +66,11 @@ export function Sidebar({
   rsi,
   error,
   attention,
+  openAlerts,
   onShowFleet,
   onShowMissions,
   onShowRsi,
+  onShowAlerts,
   onShowScorecard,
   onShowShow,
   onSelect,
@@ -107,6 +112,22 @@ export function Sidebar({
                   )}
                 />
                 {phase}
+              </span>
+            )
+          }
+        />
+        <NavItem
+          active={view === "alerts"}
+          onClick={onShowAlerts}
+          icon={<BellRing size={15} />}
+          label="Alerts"
+          trailing={
+            openAlerts > 0 && (
+              <span
+                title={`${openAlerts} open alert${openAlerts === 1 ? "" : "s"}`}
+                className="tnum rounded bg-destructive/15 px-1.5 py-px text-micro font-medium text-destructive"
+              >
+                {openAlerts}
               </span>
             )
           }
@@ -395,9 +416,11 @@ function AttentionCount({ count, error }: HumanCount) {
 export function MobileNav({
   view,
   attention,
+  openAlerts,
   onShowFleet,
   onShowMissions,
   onShowRsi,
+  onShowAlerts,
   onShowScorecard,
   onShowShow,
   onShowSessions,
@@ -408,6 +431,8 @@ export function MobileNav({
   | "onShowFleet"
   | "onShowMissions"
   | "onShowRsi"
+  | "openAlerts"
+  | "onShowAlerts"
   | "onShowScorecard"
   | "onShowShow"
   | "onShowSessions"
@@ -421,6 +446,7 @@ export function MobileNav({
             ["fleet", "Fleet", <LayoutGrid key="f" size={13} />, onShowFleet],
             ["missions", "Missions", <Target key="m" size={13} />, onShowMissions],
             ["rsi", "RSI", <Activity key="a" size={13} />, onShowRsi],
+            ["alerts", "Alerts", <BellRing key="b" size={13} />, onShowAlerts],
             ["scorecard", "Score", <Gauge key="g" size={13} />, onShowScorecard],
             ["show", "Show", <Waypoints key="w" size={13} />, onShowShow],
             ["sessions", "Sessions", <Rows3 key="s" size={13} />, onShowSessions],
@@ -441,6 +467,11 @@ export function MobileNav({
             {icon}
             {label}
             {id === "fleet" && <AttentionCount {...attention} />}
+            {id === "alerts" && openAlerts > 0 && (
+              <span className="tnum text-micro font-medium text-destructive">
+                {openAlerts}
+              </span>
+            )}
           </button>
         ))}
       </div>
