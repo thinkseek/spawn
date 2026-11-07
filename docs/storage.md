@@ -155,7 +155,15 @@ commit with a key no agent holds cannot hang or fail a test.
     text names the files of every `base_merged` record since the last
     delivery the worker was typed, not only this attempt's merge: a
     delivery refused before typing (a pane not ready) is retried, and the
-    retry's merge finds main already in.
+    retry's merge finds main already in;
+  - the dispatcher's fork of a re-assigned objective's ephemeral task from
+    the work its predecessor left (docs/fleet-architecture.md §10.4), before
+    its Start, when nothing of the agent runs: the branch is created at that
+    work's last checkpoint and main merged into it cleanly, or, on a
+    conflict, into the workspace mounted for it, the markers committed (a
+    plain commit, recorded `base_merged` with no file, so the merge stays
+    pending and the Start's mount keeps it) and the workspace unmounted.
+    The Start's prompt says what the merge did.
 
   A clean merge is a merge commit recorded as `artifact.committed`
   (`base_merged`, its files) and then pushed at once (a push that fails
@@ -599,6 +607,7 @@ holds the agents' history; none of them is pruned automatically.
 | Code: agents' work | per-agent branches in host-local mirrors (`ws/.sources/*.git`), pushed as `spawn/<agent>` to a source that is a directory on this host (a remote source receives none) | Yes for missions with a directory source; no for remote sources, scratch missions and the default repository |
 | Work a task lands | the source's `spawn/<agent>`, fetched by the integrator into its mirror's `refs/spawn-integrate/<agent>`; judged only when it contains the agent's latest checkpoint (its `artifact.committed` in the event log) | Yes: the source holds it; nothing on the host that ran the agent is needed |
 | Large files in workspaces | git blobs on the agent's branch, up to `SPAWN_MAX_FILE_MB`; larger ones only in the workspace | Up to the cap, as code; **no** over it |
+| A mission's settings (gate, accept, budget, objectives) | `mission_missions`, the fold of its latest `mission.configured`, which holds the whole configuration: `spawn mission configure` merges what it is given into the row read under the append lock and records the result, clearing only on its `--no-<setting>` switches; clearing the gate, or moving accept away from gate, is refused while a task of the mission is `landing` (nothing would land it: GitHub issue #9) ([fleet-architecture.md](fleet-architecture.md) §10.3) | Yes: from the log |
 | Backlog, scenarios, gate | files in the controller's checkout, by absolute path | **No** on another host (versioning them with the source is not built) |
 | Secrets | `spawn.env`, `~/.config/spawn/*`, mode 600 | Deliberately not stored |
 

@@ -50,7 +50,16 @@
 //!    or refused by a later pass). A main moved with no record at all (a
 //!    push behind Spawn's back) still halts;
 //! 2. a delivered task over its mission's budget is aborted and its worker
-//!    stopped;
+//!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
+//!    session's events, readings (`screen.observed`,
+//!    `observation.recorded`) left out; a gap counts at most
+//!    `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the model's
+//!    progress (a tool, a job, a stopped turn), not in a failed turn, a
+//!    prompt or a command; a gap inside a tool or job that ended counts
+//!    while the whole fleet was alive. So no outage (the fleet stopped, a
+//!    frozen host, a dead engine, the model API down) can by itself put a
+//!    task over budget (a subagent's job open across a model API outage
+//!    adds up to its retry window, see [`active_ms`]);
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
@@ -299,7 +308,7 @@ use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::mission::TaskState;
 use spawn_core::port::CommandQueue;
 use spawn_host::GitWorkspace;
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ActivityEvent, PostgresStore};
 
 use crate::config::{loop_interval, workspace_root};
 use crate::gate::{self, GateFailure, RoomFailure, Shortfall};
@@ -360,6 +369,127 @@ fn wall_clock_minutes(text: Option<&str>) -> Duration {
         .filter(|minutes| *minutes > 0)
         .unwrap_or(DEFAULT_MINUTES);
     Duration::from_mins(minutes)
+}
+
+/// The most one silence adds to a task's active time, unless
+/// `SPAWN_BUDGET_GAP_SECS` says otherwise ([`active_ms`]).
+const BUDGET_GAP: Duration = Duration::from_mins(5);
+
+/// [`BUDGET_GAP`] from the setting's text: a whole number of seconds from 1
+/// up; anything else is the default.
+pub(crate) fn budget_gap(text: Option<&str>) -> Duration {
+    text.and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(BUDGET_GAP, Duration::from_secs)
+}
+
+/// The events that are the model's progress: a gap ending in one is time a
+/// worker worked ([`active_ms`]). Not `message.received`: that is a prompt
+/// arriving (ingest's user turn: a delivery, a nudge, a job's
+/// notification), and the gap before it is the worker waiting for it.
+const PROGRESS: [&str; 6] = [
+    "tool.started",
+    "tool.completed",
+    "tool.failed",
+    "job.started",
+    "job.ended",
+    "turn.stopped",
+];
+
+/// Milliseconds a task delivered at `delivered_at_ms` could work by
+/// `now_ms`: what its minute budget measures. `events` are its session's
+/// events since delivery, in log order, without the readings (the Bridge's
+/// `screen.observed`, the observer's `observation.recorded`: a busy pane
+/// is re-read every 30 s, also while Claude Code only retries a model API
+/// that is down, so a reading says the pane is busy, not that work moves).
+///
+/// The points are the delivery, each event and now. A gap that ends in the
+/// model's progress (a tool call starting or ending, a background job
+/// starting or ending, a turn stopping: [`PROGRESS`]) counts, at most
+/// `gap_ms`: a worker at work makes progress far more often. Any other gap
+/// counts nothing: one that ends in a failed turn (the model API did not
+/// answer), in a prompt arriving or a command (a delivery, a nudge, a
+/// resume: the worker waited), or in the engine's own events (a start, an
+/// unmount). The gap
+/// from the last event to now counts at most `gap_ms`. A long tool still
+/// counts: a gap inside a tool call or background job that later ended (its
+/// `tool.completed`, `tool.failed` or `job.ended` with the same id) gets
+/// the time the whole fleet was alive in it (`fleet_alive(from_id, to_id)`:
+/// the log's gaps between those two events, all events, readings included,
+/// each capped at `gap_ms`), at least the cap and at most the gap.
+///
+/// Why no outage can by itself put a task over budget. The fleet stopped,
+/// the host frozen or rebooted, a dead engine: the session is silent, and
+/// the gap ends in the restart's command, which counts nothing, or is the
+/// gap to now, at most `gap_ms`; a tool it interrupted never ends, so its
+/// gap is not inside one, and a frozen host writes nothing anywhere, so the
+/// fleet's own gap is capped. A model API outage: Claude Code retries behind
+/// a busy pane, whose readings are no points; each retried turn ends in
+/// `turn.failed` and each nudge in a command, which count nothing; only the
+/// model's first progress after it counts the gap before it, at most
+/// `gap_ms`. So an outage of any length or cause adds at most `gap_ms`,
+/// with one bound that is not the cap: a subagent (an agent job,
+/// `job.started` kind `agent`) open across a model API outage retries in
+/// sidechain lines the log does not carry, and once it fails its
+/// `job.ended` pairs with its start, so its gap counts the fleet's alive
+/// time, which a model API outage does not interrupt. That adds up to
+/// Claude Code's retry window for the subagent, not the outage's length:
+/// a failed subagent ends its job (rev-e, session 145 on 2026-11-07).
+/// The safe side: a model that thinks or streams for longer than `gap_ms`
+/// without a tool call counts `gap_ms`, and a hung tool that never ends
+/// counts `gap_ms` (the stall rules own a hung session).
+pub(crate) fn active_ms(
+    delivered_at_ms: i64,
+    now_ms: i64,
+    events: &[ActivityEvent],
+    gap_ms: i64,
+    mut fleet_alive: impl FnMut(i64, i64) -> Result<i64, String>,
+) -> Result<i64, String> {
+    let capped = |from: i64, to: i64| (to - from).clamp(0, gap_ms);
+    let (Some(first), Some(last)) = (events.first(), events.last()) else {
+        return Ok(capped(delivered_at_ms, now_ms));
+    };
+    // covered[k] > 0: the gap after events[k] lies inside a tool or job
+    // that ended.
+    let mut covered = vec![0i64; events.len()];
+    let mut open: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        let Some(key) = event.key.as_deref() else {
+            continue;
+        };
+        match event.name.as_str() {
+            "tool.started" | "job.started" => {
+                open.insert(key, index);
+            }
+            "tool.completed" | "tool.failed" | "job.ended" => {
+                if let Some(start) = open.remove(key) {
+                    covered[start] += 1;
+                    covered[index] -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let progress = |event: &ActivityEvent| PROGRESS.contains(&event.name.as_str());
+    let first_gap = if progress(first) {
+        capped(delivered_at_ms, first.at_ms)
+    } else {
+        0
+    };
+    let mut total = first_gap + capped(last.at_ms, now_ms);
+    let mut inside = 0;
+    for (index, pair) in events.windows(2).enumerate() {
+        inside += covered[index];
+        let gap = (pair[1].at_ms - pair[0].at_ms).max(0);
+        total += if inside > 0 && gap > gap_ms {
+            fleet_alive(pair[0].id, pair[1].id)?.clamp(gap_ms, gap)
+        } else if inside > 0 || progress(&pair[1]) {
+            gap.min(gap_ms)
+        } else {
+            0
+        };
+    }
+    Ok(total)
 }
 
 /// Guard against runaway candidates.
@@ -786,12 +916,16 @@ pub(crate) fn short_of_room(
 }
 
 /// Whether a delivered task ran past its mission's budget
-/// (`{"minutes": n, "tool_calls": n}`, either optional).
-pub(crate) fn over_budget(budget: &Value, elapsed_ms: i64, tool_calls: i64) -> Option<String> {
+/// (`{"minutes": n, "tool_calls": n}`, either optional). `active_ms` is the
+/// time it could work ([`active_ms`]), never the wall clock.
+pub(crate) fn over_budget(budget: &Value, active_ms: i64, tool_calls: i64) -> Option<String> {
     if let Some(minutes) = budget.get("minutes").and_then(Value::as_i64)
-        && elapsed_ms > minutes.saturating_mul(60_000)
+        && active_ms > minutes.saturating_mul(60_000)
     {
-        return Some(format!("the task ran past its {minutes}-minute budget"));
+        return Some(format!(
+            "the task worked past its {minutes}-minute budget ({} minutes active)",
+            active_ms / 60_000
+        ));
     }
     if let Some(limit) = budget.get("tool_calls").and_then(Value::as_i64)
         && tool_calls > limit
@@ -1091,6 +1225,16 @@ pub(crate) fn needs_test_database(scenarios: &Path) -> bool {
     !scenarios.join(NO_TEST_DATABASE).exists()
 }
 
+/// The gate's variables a mission marked [`NO_TEST_DATABASE`] does not get:
+/// the shared test server's URL, and the programs (a docker image, or the
+/// host's directory of them) the gate would run a server of its own from.
+fn withheld_without_test_database(name: &str) -> bool {
+    matches!(
+        name,
+        "SPAWN_TEST_DATABASE_URL" | "SPAWN_GATE_PG_IMAGE" | "SPAWN_GATE_PG_BIN"
+    )
+}
+
 /// Whether a judging must wait for a gate: only one that shares the test
 /// server, when `shared_running` such judgings already fill the `cap`.
 fn waits_for_gate(shares_server: bool, shared_running: usize, cap: usize) -> bool {
@@ -1269,7 +1413,7 @@ impl Integrator {
         if let Some(reason) = halt_reason(mission, count) {
             return halt(store, mission, &reason).map(|()| false);
         }
-        Self::enforce_budget(store, mission)?;
+        let aborted = Self::enforce_budget(store, mission)?;
         let Some(source) = mission.source.as_deref() else {
             return Ok(false);
         };
@@ -1313,8 +1457,18 @@ impl Integrator {
         }
         // An objective mission's free slots get their objectives, whatever
         // its gate is doing; a closed mission gets none.
+        // A task this pass aborted, or one whose gate runs now, yields
+        // nothing: the first is over, the second is being judged.
+        let mut settled: std::collections::BTreeSet<i64> = aborted.into_iter().collect();
+        settled.extend(
+            self.running
+                .borrow()
+                .iter()
+                .filter(|gate| gate.mission == mission.id)
+                .map(|gate| gate.task),
+        );
         if mission.state != "done"
-            && let Err(error) = objectives::assign_next(store, mission)
+            && let Err(error) = objectives::assign_next(store, mission, &settled)
         {
             eprintln!("integrate: mission {}: {error}", mission.id);
         }
@@ -1442,31 +1596,57 @@ impl Integrator {
         Ok(())
     }
 
-    /// Abort delivered tasks over budget. True when it aborted one.
-    fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<bool, String> {
+    /// Abort delivered tasks over budget; the ids of those it aborted.
+    fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
         let Some(budget) = &mission.budget else {
-            return Ok(false);
+            return Ok(Vec::new());
         };
-        let mut aborted = false;
+        let mut aborted = Vec::new();
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let gap_ms = budget_gap(crate::config::env_value("SPAWN_BUDGET_GAP_SECS").as_deref())
+            .as_millis()
+            .try_into()
+            .unwrap_or(i64::MAX);
         for task in &mission.tasks {
             let (TaskState::Delivered, Some(at)) = (task.state, task.delivered_at_ms) else {
                 continue;
             };
-            let calls = store
-                .tool_calls_since(&task.session_id, at)
+            let events = store
+                .session_activity(&task.session_id, at)
                 .map_err(|error| error.to_string())?;
-            if let Some(reason) = over_budget(budget, now - at, calls) {
+            let calls = events
+                .iter()
+                .filter(|event| event.name == "tool.started")
+                .count()
+                .try_into()
+                .unwrap_or(i64::MAX);
+            let active = active_ms(at, now, &events, gap_ms, |from, to| {
+                store
+                    .fleet_alive_ms(from, to, gap_ms)
+                    .map_err(|error| error.to_string())
+            })?;
+            if let Some(reason) = over_budget(budget, active, calls) {
                 // The Stop first, under its fixed key: if the record then
                 // fails, the next pass finds the task still delivered and
                 // over budget, and submits (a no-op) and records again.
                 stop(store, task)?;
-                record(
-                    store,
-                    &json!({"type": "task.aborted", "id": task.id, "reason": reason}),
-                )?;
+                // An abort that is its objective's last failed attempt
+                // before the limit is the yield too: the task is gone, and
+                // nothing else would yield the slot.
+                let mut aborted_record =
+                    json!({"type": "task.aborted", "id": task.id, "reason": reason});
+                if let Some(yielded) = objectives::abort_yield(store, mission, task)?
+                    && let (Some(record), Some(fields)) =
+                        (aborted_record.as_object_mut(), yielded.as_object())
+                {
+                    record.extend(fields.clone());
+                }
+                record(store, &aborted_record)?;
                 println!("integrate: task {} aborted: {reason}", task.id);
-                aborted = true;
+                if let Some(why) = aborted_record["yield_reason"].as_str() {
+                    println!("integrate: mission {}: {why}", mission.id);
+                }
+                aborted.push(task.id);
             }
         }
         Ok(aborted)
@@ -1613,7 +1793,9 @@ impl Judge {
             .conflict_markers(main, &branch)
             .map_err(|error| error.to_string())?;
         if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
-            return gated("conflict", json!({ "note": note }));
+            // Markers of an earlier merge, still in the branch: the
+            // worker has them to resolve.
+            return gated("conflict", json!({ "note": note, "merge": "pending" }));
         }
         let message = landing_message(task, &branch);
         let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
@@ -1627,7 +1809,7 @@ impl Judge {
             );
             return gated(
                 "conflict",
-                json!({"note": main_merge::conflict_note(main, &merge)}),
+                json!({"note": main_merge::conflict_note(main, &merge), "merge": merge.kind()}),
             );
         };
         let tree_of = |commit: &str| {
@@ -1686,7 +1868,7 @@ impl Judge {
                 spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
             });
         if !needs_test_database(scenarios) {
-            gate_env.retain(|(name, _)| name != "SPAWN_TEST_DATABASE_URL");
+            gate_env.retain(|(name, _)| !withheld_without_test_database(name));
         }
         if let Some(warning) = warning {
             eprintln!("integrate: {warning}");
@@ -2736,7 +2918,7 @@ fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Option<(i64, i6
         .find_map(|other| other.in_flight().map(|task| (other.id, task.id)))
 }
 
-fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
+pub(crate) fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
     store
         .integrator_record(value)
         .map(|_| ())
@@ -2756,11 +2938,17 @@ fn halt(store: &PostgresStore, mission: &Mission, reason: &str) -> Result<(), St
 /// command's: one that fails is pursued and escalated by the dispatcher
 /// (`dispatch::stops`), like every Stop.
 fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
+    stop_worker(store, task, "integrate-abort")
+}
+
+/// Submit the Stop of `task`'s worker, keyed `<key>-<task>` so a retried
+/// pass submits it once (an abort over budget, a yield of its slot).
+pub(crate) fn stop_worker(store: &PostgresStore, task: &Task, key: &str) -> Result<(), String> {
     let error = |error: &dyn std::fmt::Display| format!("stop task {}'s worker: {error}", task.id);
     let submission = Submission {
         agent_id: AgentId::new(task.agent_id.clone()).map_err(|e| error(&e))?,
         session_id: SessionId::new(task.session_id.clone()).map_err(|e| error(&e))?,
-        idempotency_key: IdempotencyKey::new(format!("integrate-abort-{}", task.id))
+        idempotency_key: IdempotencyKey::new(format!("{key}-{}", task.id))
             .map_err(|e| error(&e))?,
         action: CommandAction::Stop,
     };
@@ -2794,9 +2982,10 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Freshness, Mission, NO_TEST_DATABASE, aborted, freshness, halt_reason, markers_note,
-        merged_tree, needs_test_database, no_room, over_budget, pinned, report_freshness,
-        room_backoff, room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
+        BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap,
+        freshness, halt_reason, markers_note, merged_tree, needs_test_database, no_room,
+        over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
+        task_scenario, waits_for_gate, wall_clock_minutes, withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
@@ -4152,6 +4341,25 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_without_the_test_database_gets_no_server_of_its_own_either() {
+        for name in [
+            "SPAWN_TEST_DATABASE_URL",
+            "SPAWN_GATE_PG_IMAGE",
+            "SPAWN_GATE_PG_BIN",
+        ] {
+            assert!(withheld_without_test_database(name), "{name}");
+        }
+        for name in [
+            "PATH",
+            "TMPDIR",
+            "SPAWN_GATE_JOBS",
+            "SPAWN_GATE_MIN_FREE_GB",
+        ] {
+            assert!(!withheld_without_test_database(name), "{name}");
+        }
+    }
+
+    #[test]
     fn the_gate_wall_clock_is_a_setting_with_a_default() {
         let minutes = |text: Option<&str>| wall_clock_minutes(text).as_secs() / 60;
         assert_eq!(minutes(None), 120);
@@ -4170,6 +4378,232 @@ mod tests {
         assert!(over_budget(&budget, 46 * 60_000, 0).is_some());
         assert!(over_budget(&budget, 0, 61).is_some());
         assert_eq!(over_budget(&json!({}), i64::MAX, i64::MAX), None);
+    }
+
+    const MIN: i64 = 60_000;
+    const GAP: i64 = 5 * MIN;
+
+    /// A session event at `at_ms` (its id follows its time), with a tool or
+    /// job id when it has one.
+    fn event(id: i64, at_ms: i64, name: &str, key: Option<&str>) -> spawn_postgres::ActivityEvent {
+        spawn_postgres::ActivityEvent {
+            id,
+            at_ms,
+            name: name.to_string(),
+            key: key.map(str::to_string),
+        }
+    }
+
+    /// Steady work from `from_ms` to `to_ms`: a tool call every 30 s.
+    fn steady(from_ms: i64, to_ms: i64, first_id: i64) -> Vec<spawn_postgres::ActivityEvent> {
+        let mut events = Vec::new();
+        let (mut at, mut id) = (from_ms, first_id);
+        while at <= to_ms {
+            let key = format!("t{id}");
+            events.push(event(id, at, "tool.started", Some(&key)));
+            events.push(event(id + 1, at + 5_000, "tool.completed", Some(&key)));
+            at += 30_000;
+            id += 2;
+        }
+        events
+    }
+
+    fn never_asked(_: i64, _: i64) -> Result<i64, String> {
+        panic!("no gap inside an ended tool is longer than the cap")
+    }
+
+    /// 2026-11-07 23:05:46: the fleet stopped 17:55-23:05, and the
+    /// integrator's first pass after the restart aborted task 159 (a
+    /// 90-minute budget, 13 minutes of work before the stop) and task 113
+    /// (240 minutes; it stopped inside a tool call that never ended). The
+    /// wall clock (main's rule) aborts both; their active time aborts
+    /// neither.
+    #[test]
+    fn a_fleet_stopped_for_five_hours_puts_no_task_over_its_budget() {
+        let delivered = 1_794_044_765_209;
+        let first_pass = 1_794_063_946_655;
+        let mut events = steady(delivered + 10_000, delivered + 13 * MIN, 1);
+        assert!(over_budget(&json!({"minutes": 90}), first_pass - delivered, 0).is_some());
+        let active = active_ms(delivered, first_pass, &events, GAP, never_asked).expect("active");
+        assert!(active < 13 * MIN + 2 * GAP, "{active}");
+        assert_eq!(over_budget(&json!({"minutes": 90}), active, 0), None);
+
+        // Task 113: a tool started before the stop never ends; the restart's
+        // first event comes five hours later.
+        let last = events.last().expect("events").clone();
+        events.push(event(
+            last.id + 1,
+            last.at_ms + 1_000,
+            "tool.started",
+            Some("cargo"),
+        ));
+        events.push(event(
+            last.id + 2,
+            first_pass - 2_000,
+            "command.accepted",
+            None,
+        ));
+        let active = active_ms(delivered, first_pass, &events, GAP, never_asked).expect("active");
+        assert!(active < 13 * MIN + 3 * GAP, "{active}");
+        assert_eq!(over_budget(&json!({"minutes": 240}), active, 0), None);
+    }
+
+    /// No silence of any length adds more than the cap: an outage alone
+    /// puts nothing over budget, at delivery, between events, or up to now.
+    #[test]
+    fn an_outage_of_any_length_adds_at_most_the_cap() {
+        let day = 24 * 60 * MIN;
+        assert_eq!(active_ms(0, 30 * day, &[], GAP, never_asked), Ok(GAP));
+        let events = [
+            event(1, 30 * day, "tool.started", Some("a")),
+            event(2, 60 * day, "tool.completed", Some("b")),
+        ];
+        assert_eq!(
+            active_ms(0, 90 * day, &events, GAP, never_asked),
+            Ok(3 * GAP)
+        );
+        // A clock that steps back counts nothing.
+        let back = [
+            event(1, 10 * MIN, "tool.started", Some("a")),
+            event(2, MIN, "turn.stopped", None),
+        ];
+        assert_eq!(active_ms(0, MIN, &back, GAP, never_asked), Ok(GAP));
+    }
+
+    /// A model API outage (rev-e on 988c85d): Claude Code retries behind a
+    /// busy pane for 30 minutes and the turn fails; the dispatcher nudges
+    /// three times an hour and each nudged turn fails too. The readings are
+    /// not in `events` (the store leaves them out); the failed turns and the
+    /// commands count nothing, so two hours of it add nothing, and the
+    /// model's first progress afterwards adds one cap.
+    #[test]
+    fn a_model_api_outage_counts_nothing_but_one_cap() {
+        let mut events = steady(0, 10 * MIN, 1);
+        let mut id = 1_000;
+        let mut at = 10 * MIN;
+        let mut next = |name: &str, step: i64| {
+            id += 1;
+            at += step;
+            event(id, at, name, None)
+        };
+        events.push(next("turn.failed", 30 * MIN));
+        for _ in 0..6 {
+            events.push(next("command.accepted", 20 * MIN));
+            events.push(next("command.step", 1_000));
+            events.push(next("command.finished", 1_000));
+            events.push(next("turn.failed", 9 * MIN));
+        }
+        let outage_end = events.last().expect("events").at_ms;
+        let before = active_ms(0, outage_end, &events, GAP, never_asked).expect("active");
+        assert_eq!(before, 10 * MIN + 5_000, "the outage itself counts nothing");
+        // A nudge's prompt arriving is no progress: the worker waited for it.
+        events.push(next("message.received", 12 * MIN));
+        let last = |events: &[spawn_postgres::ActivityEvent]| events.last().expect("events").at_ms;
+        let prompted = active_ms(0, last(&events), &events, GAP, never_asked).expect("active");
+        assert_eq!(prompted, before, "a prompt arriving counts nothing");
+        events.push(next("tool.started", 2 * MIN));
+        let after = active_ms(0, last(&events), &events, GAP, never_asked).expect("active");
+        assert_eq!(
+            after,
+            before + 2 * MIN,
+            "the model's first progress counts the gap before it, at most a cap"
+        );
+        assert!(over_budget(&json!({"minutes": 20}), after, 0).is_none());
+    }
+
+    /// The fleet's restart after a stop: the gap ends in the restart's
+    /// command, which counts nothing, then work goes on and counts.
+    #[test]
+    fn a_restart_counts_nothing_for_the_stop() {
+        let mut events = steady(0, 5 * MIN, 1);
+        let stop = events.last().expect("events").at_ms;
+        events.push(event(500, stop + 300 * MIN, "command.accepted", None));
+        events.push(event(
+            501,
+            stop + 300 * MIN + 2_000,
+            "session.native_started",
+            None,
+        ));
+        events.extend(steady(stop + 301 * MIN, stop + 311 * MIN, 600));
+        let active = active_ms(0, stop + 311 * MIN, &events, GAP, never_asked).expect("active");
+        // Five minutes before, ten after, and the first tool call after the
+        // engine's start: about a minute.
+        assert!(active < 17 * MIN, "{active}");
+        assert!(active > 15 * MIN, "{active}");
+    }
+
+    #[test]
+    fn steady_work_runs_past_the_budget() {
+        let events = steady(0, 100 * MIN, 1);
+        let active = active_ms(0, 100 * MIN, &events, GAP, never_asked).expect("active");
+        // Every gap is short: all of it counts (to its last event, 5 s past now).
+        assert_eq!(active, 100 * MIN + 5_000);
+        assert!(over_budget(&json!({"minutes": 90}), active, 0).is_some());
+    }
+
+    /// A tool that runs an hour without an event of its session (a build, a
+    /// gate in the worker) counts while the fleet was alive, at most its
+    /// gap; a host frozen meanwhile counts only the cap. A job counts the
+    /// same way.
+    #[test]
+    fn a_long_tool_counts_while_the_fleet_was_alive() {
+        for (start, end, key) in [
+            ("tool.started", "tool.completed", "toolu_1"),
+            ("tool.started", "tool.failed", "toolu_1"),
+            ("job.started", "job.ended", "job_1"),
+        ] {
+            let events = [
+                event(10, MIN, start, Some(key)),
+                event(90, 61 * MIN, end, Some(key)),
+            ];
+            let mut asked = Vec::new();
+            let alive = active_ms(0, 61 * MIN, &events, GAP, |from, to| {
+                asked.push((from, to));
+                Ok(60 * MIN)
+            });
+            assert_eq!(alive, Ok(61 * MIN), "{start}");
+            assert_eq!(asked, [(10, 90)]);
+            let frozen = active_ms(0, 61 * MIN, &events, GAP, |_, _| Ok(MIN));
+            assert_eq!(frozen, Ok(MIN + GAP), "{start}");
+            // More than the gap is never credited.
+            let over = active_ms(0, 61 * MIN, &events, GAP, |_, _| Ok(500 * MIN));
+            assert_eq!(over, Ok(61 * MIN), "{start}");
+        }
+        // A tool still running counts the cap until it ends, and the fleet's
+        // answer is never needed for it.
+        let running = [event(1, 0, "tool.started", Some("t"))];
+        assert_eq!(active_ms(0, 60 * MIN, &running, GAP, never_asked), Ok(GAP));
+        // An end with another id, or one without an id, covers nothing.
+        let unpaired = [
+            event(1, 0, "tool.started", Some("t")),
+            event(2, 60 * MIN, "tool.completed", Some("u")),
+            event(3, 120 * MIN, "tool.completed", None),
+        ];
+        assert_eq!(
+            active_ms(0, 120 * MIN, &unpaired, GAP, never_asked),
+            Ok(2 * GAP)
+        );
+        // The fleet's error is the pass's.
+        let errs = active_ms(
+            0,
+            61 * MIN,
+            &[
+                event(1, 0, "tool.started", Some("t")),
+                event(2, 60 * MIN, "tool.completed", Some("t")),
+            ],
+            GAP,
+            |_, _| Err("down".to_string()),
+        );
+        assert_eq!(errs, Err("down".to_string()));
+    }
+
+    #[test]
+    fn the_budget_gap_is_a_whole_number_of_seconds() {
+        assert_eq!(budget_gap(None), BUDGET_GAP);
+        assert_eq!(budget_gap(Some(" 90 ")), std::time::Duration::from_secs(90));
+        for bad in ["", "0", "-5", "1.5", "2m", "ten"] {
+            assert_eq!(budget_gap(Some(bad)), BUDGET_GAP, "{bad:?}");
+        }
     }
 
     /// Objective 34: a task whose `task.held` names the active hold on its
@@ -4833,6 +5267,44 @@ mod host_fault_tests {
                 failure("sources::tests::empty", ""),
             ]
         );
+    }
+
+    /// check-tests.sh prints what a suite run by one test says of its own
+    /// failures (the relay's Python unittest) as `  in <test>: <line>`,
+    /// before the FAILED lines. Those lines are never failures of their own,
+    /// whatever they say: the classification reads the FAILED lines alone.
+    #[test]
+    fn a_suites_own_lines_are_not_failures() {
+        let relay = "the_model_relay_passes_its_self_test";
+        let relay_failed =
+            format!("FAILED {relay}: crates/spawn-cli/tests/model_relay.rs:19:5: ..F");
+        let refused_in =
+            format!("  in {relay}: ConnectionRefusedError: [Errno 111] Connection refused");
+        let assertion_in = format!("  in {relay}: AssertionError: 2 != 3");
+        let reason = host::CHECK_TESTS_REGRESSION;
+        let no_log = || -> Vec<String> { panic!("connection errors need no log") };
+
+        // A real failure, whose suite also printed a connection error: only
+        // the FAILED line is read, and it stays a rejection.
+        let work = output_of(&[refused_in.clone(), assertion_in.clone(), relay_failed]);
+        assert_eq!(tests_of(&host::check_tests_failures(&work)), [relay]);
+        assert_eq!(host::host_fault(reason, &work, Vec::new), None);
+        // Connection errors only, beside a suite's assertion: still the
+        // host's.
+        let refused = output_of(&[
+            assertion_in,
+            refused_in,
+            format!("FAILED api::tests::claims_in_order: {REFUSED}"),
+            format!("FAILED control::tests::the_fold_replays: {REFUSED}"),
+        ]);
+        assert_eq!(
+            tests_of(&host::check_tests_failures(&refused)),
+            [
+                "api::tests::claims_in_order",
+                "control::tests::the_fold_replays"
+            ]
+        );
+        assert!(host::host_fault(reason, &refused, no_log).is_some());
     }
 
     /// Today's form, one failure: the panic's test and its message, every
@@ -5927,6 +6399,559 @@ mod database_tests {
         for base in [base_a, base_b, marks] {
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    /// One event of `task`'s session at `at`, written straight into the log.
+    fn session_event(db: &Db, task: &super::Task, at: i64, name: &str, detail: &Value) {
+        db.admin()
+            .execute(
+                "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+                 values ($1, $2, 'test', jsonb_build_object('name', $3::text, 'detail', $4::jsonb),
+                         (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                           where session_id = $2),
+                         $5)",
+                &[&task.agent_id, &task.session_id, &name, detail, &at],
+            )
+            .expect("write an event");
+    }
+
+    /// Tool calls every 30 s in `task`'s session from `from` to `to`, with
+    /// the Bridge's screen readings between them.
+    fn tool_work(db: &Db, task: &super::Task, from: i64, to: i64) {
+        let mut at = from;
+        let mut call = 0;
+        while at < to {
+            let id = json!({"tool_use_id": format!("toolu_{}_{call}", task.id)});
+            session_event(db, task, at, "tool.started", &id);
+            session_event(db, task, at + 10_000, "tool.completed", &id);
+            session_event(db, task, at + 20_000, "screen.observed", &json!({}));
+            at += 30_000;
+            call += 1;
+        }
+    }
+
+    /// The integrator's budget pass end to end, on the store: a task that
+    /// worked 13 minutes, then sat through a five-hour stop of the fleet,
+    /// is not aborted by the first pass after it (2026-11-07 23:05:46, task
+    /// 159); one that worked past its budget is, with the worker stopped.
+    #[test]
+    fn the_budget_pass_aborts_an_overrun_and_not_a_stop() {
+        let db = Db::new("budget_pass");
+        let mission = db
+            .store
+            .mission_add("budget", &json!(["/nowhere.git"]), "human")
+            .expect("add");
+        db.store
+            .mission_configure(
+                mission,
+                Some("/nowhere/scenarios"),
+                "gate",
+                Some(&json!({"minutes": 60})),
+                None,
+            )
+            .expect("configure");
+        let gated = || -> super::Mission {
+            let missions: Vec<super::Mission> =
+                serde_json::from_value(db.store.gated_missions().expect("gated"))
+                    .expect("missions");
+            missions
+                .into_iter()
+                .find(|row| row.id == mission)
+                .expect("the mission")
+        };
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let min = 60_000;
+
+        let stopped = db
+            .store
+            .task_assign(mission, "ephemeral", "worker_stopped", "brief", "default")
+            .expect("assign");
+        db.store.task_delivered(stopped, 1).expect("delivered");
+        let delivered = now - 5 * 60 * min - 13 * min;
+        db.admin()
+            .execute(
+                "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                &[&stopped, &delivered],
+            )
+            .expect("deliver five hours ago");
+        let task = ready_task(&db, stopped);
+        tool_work(&db, &task, delivered + 5_000, delivered + 13 * min);
+        // The fleet stopped with a tool open; the restart's commands.
+        session_event(
+            &db,
+            &task,
+            delivered + 13 * min,
+            "tool.started",
+            &json!({"tool_use_id": "toolu_open"}),
+        );
+        session_event(&db, &task, now - min, "command.accepted", &json!({}));
+        assert_eq!(
+            Integrator::enforce_budget(&db.store, &gated()).expect("the pass"),
+            Vec::<i64>::new(),
+            "five hours of wall clock, about 20 minutes of work"
+        );
+        assert_eq!(task_state(&db, mission, stopped), "delivered");
+
+        let overran = db
+            .store
+            .task_assign(mission, "ephemeral", "worker_overran", "brief", "default")
+            .expect("assign");
+        db.store.task_delivered(overran, 1).expect("delivered");
+        let delivered = now - 70 * min;
+        db.admin()
+            .execute(
+                "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                &[&overran, &delivered],
+            )
+            .expect("deliver 70 minutes ago");
+        tool_work(&db, &ready_task(&db, overran), delivered + 5_000, now);
+        assert_eq!(
+            Integrator::enforce_budget(&db.store, &gated()).expect("the pass"),
+            vec![overran]
+        );
+        assert_eq!(
+            task_state(&db, mission, stopped),
+            "delivered",
+            "the stop still counts once"
+        );
+        assert_eq!(task_state(&db, mission, overran), "cancelled");
+        let stops: i64 = db
+            .admin()
+            .query_one(
+                "select count(*) from spawn_commands where idempotency_key = $1",
+                &[&format!("integrate-abort-{overran}")],
+            )
+            .expect("the stop")
+            .get(0);
+        assert_eq!(stops, 1, "the worker is stopped");
+    }
+
+    /// An objective mission on no real source: a backlog of `objectives`,
+    /// an approved resident, `workers` slots and `budget`.
+    fn backlog_mission(
+        db: &Db,
+        base: &Path,
+        name: &str,
+        objectives: &[u32],
+        workers: u32,
+        budget: Option<&Value>,
+    ) -> i64 {
+        let backlog = base.join("backlog");
+        let scenarios = base.join("scenarios");
+        std::fs::create_dir_all(&backlog).expect("backlog");
+        std::fs::create_dir_all(&scenarios).expect("scenarios");
+        for id in objectives {
+            std::fs::write(
+                backlog.join(format!("{id:03}.json")),
+                json!({"id": id, "title": format!("Objective {id}"), "prompt": "Do it."})
+                    .to_string(),
+            )
+            .expect("objective");
+        }
+        db.store
+            .resident_propose(name, "Pursues objectives")
+            .expect("propose");
+        db.store.resident_approve(name).expect("approve");
+        let mission = db
+            .store
+            .mission_add(
+                name,
+                &json!([base.join("source.git").to_string_lossy()]),
+                "human",
+            )
+            .expect("add");
+        db.store
+            .mission_configure(
+                mission,
+                Some(&scenarios.to_string_lossy()),
+                "gate",
+                budget,
+                Some(
+                    &json!({"backlog": backlog.to_string_lossy(), "resident": name,
+                             "workers": workers}),
+                ),
+            )
+            .expect("configure");
+        mission
+    }
+
+    /// The mission as the integrator reads it in a pass.
+    fn snapshot(db: &Db, mission: i64) -> super::Mission {
+        let missions: Vec<super::Mission> =
+            serde_json::from_value(db.store.gated_missions().expect("gated")).expect("missions");
+        missions
+            .into_iter()
+            .find(|row| row.id == mission)
+            .expect("the mission")
+    }
+
+    /// `(task, objective)` of the mission's tasks in flight, by task.
+    fn flying(db: &Db, mission: i64) -> Vec<(i64, u32)> {
+        let mut tasks: Vec<(i64, u32)> = snapshot(db, mission)
+            .tasks
+            .iter()
+            .filter_map(|task| Some((task.id, task.objective?)))
+            .collect();
+        tasks.sort_unstable();
+        tasks
+    }
+
+    fn objective_task(db: &Db, mission: i64, objective: u32) -> super::Task {
+        snapshot(db, mission)
+            .tasks
+            .into_iter()
+            .find(|task| task.objective == Some(objective))
+            .expect("the objective's task")
+    }
+
+    /// `task` delivered, reported, and sent back by `conflicts` gate
+    /// verdicts of a merge that left markers.
+    fn conflicts(db: &Db, task: i64, conflicts: i32) {
+        for revision in 0..conflicts {
+            db.store.task_delivered(task, 1).expect("delivered");
+            assert!(
+                db.store
+                    .task_reported(task, "## Outcome\nhalf of it")
+                    .expect("reported")
+            );
+            db.record(
+                &json!({"type": "task.gated", "id": task, "revision": revision,
+                              "verdict": "conflict", "merge": "marked", "base": "b",
+                              "reason": "main conflicts with your branch"}),
+            );
+        }
+    }
+
+    /// A checkpoint of `task`'s session at `at`, written straight into the log.
+    fn checkpoint(db: &Db, task: &super::Task, at: i64, commit: &str, reason: &str) {
+        db.admin()
+            .execute(
+                "insert into spawn_events (agent_id, session_id, source, kind, session_seq,
+                                           recorded_at_ms)
+                 values ($1, $2, 'bridge',
+                         jsonb_build_object('name', 'artifact.committed', 'detail',
+                           jsonb_build_object('reason', $3::text, 'artifact',
+                             jsonb_build_object('branch', $1::text, 'commit', $4::text,
+                                                'project', 'missions'))),
+                         (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                           where session_id = $2), $5)",
+                &[&task.agent_id, &task.session_id, &reason, &commit, &at],
+            )
+            .expect("a checkpoint");
+    }
+
+    /// The integrator cancels only an objective's task being worked, to
+    /// yield: not without `yielded`, not `reported` (an objective's task
+    /// waiting for its gate), not a task of a mission without objectives.
+    fn integrator_refuses_other_cancels(db: &Db, base: &Path, objective_task: i64) {
+        let cancel = |task: i64, yielded: bool| {
+            db.store
+                .integrator_record(&json!({"type": "task.cancelled", "id": task,
+                                           "yielded": yielded}))
+        };
+        assert!(cancel(objective_task, false).is_err(), "it does not yield");
+        db.store
+            .task_delivered(objective_task, 1)
+            .expect("delivered");
+        assert!(
+            db.store
+                .task_reported(objective_task, "again")
+                .expect("reported")
+        );
+        assert!(
+            cancel(objective_task, true).is_err(),
+            "it waits for its gate"
+        );
+        let plain = db.gated_mission("/nowhere.git", &base.join("scenarios"));
+        let plain_task = db
+            .store
+            .task_assign(plain, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        assert!(cancel(plain_task, true).is_err(), "no objective");
+    }
+
+    /// `task.cancelled` records by spawn-integrate for `tasks` alone, each
+    /// with its worker stopped once.
+    fn yields_recorded(db: &Db, tasks: &[i64]) {
+        let mut admin = db.admin();
+        let yielded: Vec<(i64, String)> = admin
+            .query(
+                "select (kind -> 'detail' -> 'record' ->> 'id')::bigint,
+                        kind -> 'detail' -> 'record' ->> 'by'
+                   from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.cancelled'
+                  order by session_seq",
+                &[],
+            )
+            .expect("the yields")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let expected: Vec<(i64, String)> = tasks
+            .iter()
+            .map(|task| (*task, "spawn-integrate".to_string()))
+            .collect();
+        assert_eq!(yielded, expected);
+        let keys: Vec<String> = tasks
+            .iter()
+            .map(|task| format!("integrate-yield-{task}"))
+            .collect();
+        let stops: i64 = admin
+            .query_one(
+                "select count(*) from spawn_commands where idempotency_key = any($1)",
+                &[&keys],
+            )
+            .expect("the stops")
+            .get(0);
+        assert_eq!(
+            stops,
+            i64::try_from(tasks.len()).expect("few"),
+            "each worker stopped"
+        );
+    }
+
+    /// Mission 4's stall (2026-11-07), on the store: three slots, two of
+    /// them held by objectives at their limit of failed attempts, one by
+    /// an objective under it. The pass yields the two (worker stopped,
+    /// `task.cancelled` with `yielded` by spawn-integrate, the supervisor
+    /// told once), leaves the third, and fills the slots fewest attempts
+    /// first: 025, then 019 again, whose brief names the yielded task's
+    /// branch and last checkpoint (not its set-aside). The store refuses
+    /// any other cancel by the integrator.
+    #[test]
+    fn objectives_at_their_limit_yield_and_the_next_get_the_slots() {
+        let base = std::env::temp_dir().join(format!("spawn-db-yield-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("objective_yield");
+        let mission = backlog_mission(&db, &base, "ry", &[19, 21, 23, 25], 3, None);
+        let none = std::collections::BTreeSet::new();
+        let pass = || {
+            crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+                .expect("a pass")
+        };
+        pass();
+        let first = flying(&db, mission);
+        assert_eq!(
+            first.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+            [19, 21, 23]
+        );
+        let task_19 = objective_task(&db, mission, 19);
+        let (t19, t21, t23) = (first[0].0, first[1].0, first[2].0);
+        conflicts(&db, t19, 3);
+        conflicts(&db, t21, 3);
+        conflicts(&db, t23, 2);
+        let assigned_at: i64 = db
+            .admin()
+            .query_one(
+                "select created_at_ms from mission_tasks where id = $1",
+                &[&t19],
+            )
+            .expect("the task")
+            .get(0);
+        let work = "1111111111111111111111111111111111111111";
+        let before = "0000000000000000000000000000000000000000";
+        checkpoint(&db, &task_19, assigned_at - 1, before, "tool_completed");
+        checkpoint(&db, &task_19, assigned_at + 1, before, "tool_completed");
+        checkpoint(&db, &task_19, assigned_at + 2, work, "tool_completed");
+        integrator_refuses_other_cancels(&db, &base, t23);
+
+        assert_eq!(pass().len(), 2);
+        assert_eq!(task_state(&db, mission, t19), "cancelled");
+        assert_eq!(task_state(&db, mission, t21), "cancelled");
+        assert_eq!(
+            task_state(&db, mission, t23),
+            "reported",
+            "under its limit, untouched"
+        );
+        let now_flying: Vec<u32> = flying(&db, mission)
+            .iter()
+            .filter(|(task, _)| *task != t19 && *task != t21)
+            .map(|(_, objective)| *objective)
+            .collect();
+        assert_eq!(
+            now_flying,
+            [23, 25, 19],
+            "by task: 023 kept, then 025, and 019 again"
+        );
+        yields_recorded(&db, &[t19, t21]);
+        let told = db.store.objective_yields().expect("the yields to tell");
+        assert_eq!(told.as_array().map(Vec::len), Some(2));
+
+        let again = objective_task(&db, mission, 19).brief;
+        for part in [
+            "Their reports below say what each did and found".to_string(),
+            format!("- task {t19}: yielded (objective 19 had 3 failed attempts"),
+            format!("its last checkpoint {work}"),
+            "> half of it".to_string(),
+        ] {
+            assert!(again.contains(&part), "{part}: {again}");
+        }
+        // The set-aside the dispatcher records after the cancel is not the work.
+        checkpoint(&db, &task_19, assigned_at + 3, &"2".repeat(40), "set_aside");
+        let prior = db
+            .store
+            .objective_prior_work(mission, 19, 3)
+            .expect("prior work");
+        assert_eq!(prior[0]["commit"], work);
+        let fresh = objective_task(&db, mission, 25).brief;
+        assert!(!fresh.contains("Earlier tasks"), "a first task has none");
+
+        assert!(pass().is_empty(), "nothing more yields, no slot is free");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// rev-b on 226fa4a, on the store: objective 023 has two failed
+    /// attempts when its task is aborted over budget, its third. The abort
+    /// is recorded as the yield (`yielded`, its count and reason), told to
+    /// the supervisor once, and the objective goes behind the untried 025;
+    /// when 023 is assigned again its new task does not yield at once. An
+    /// abort under the limit stays a plain abort.
+    #[test]
+    fn an_abort_at_the_limit_is_recorded_as_the_yield() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-db-abort-yield-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("abort_yield");
+        let mission = backlog_mission(
+            &db,
+            &base,
+            "ra",
+            &[23, 25],
+            2,
+            Some(&json!({"minutes": 60})),
+        );
+        let none = std::collections::BTreeSet::new();
+        let pass = || {
+            crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+                .expect("a pass")
+        };
+        pass();
+        let first = objective_task(&db, mission, 23);
+        let other = objective_task(&db, mission, 25);
+        conflicts(&db, first.id, 2);
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let overrun = |task: &super::Task| {
+            db.store.task_delivered(task.id, 1).expect("delivered");
+            let delivered = now - 70 * 60_000;
+            db.admin()
+                .execute(
+                    "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                    &[&task.id, &delivered],
+                )
+                .expect("deliver 70 minutes ago");
+            tool_work(&db, task, delivered + 5_000, now);
+        };
+        overrun(&first);
+        // 025's first abort: under the limit, a plain abort.
+        overrun(&other);
+        let aborted =
+            Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
+        assert_eq!(aborted, vec![first.id, other.id]);
+        let record = |task: i64| -> Value {
+            db.admin()
+                .query_one(
+                    "select kind -> 'detail' -> 'record' from spawn_events
+                      where session_id = 'session_control'
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'
+                        and kind -> 'detail' -> 'record' ->> 'id' = $1",
+                    &[&task.to_string()],
+                )
+                .expect("the abort")
+                .get(0)
+        };
+        let yielded = record(first.id);
+        assert_eq!(yielded["yielded"], true);
+        assert_eq!(
+            (yielded["objective"].as_i64(), yielded["failures"].as_i64()),
+            (Some(23), Some(3))
+        );
+        let why = yielded["yield_reason"]
+            .as_str()
+            .expect("its reason")
+            .to_string();
+        assert!(
+            why.contains("objective 23 had 3 failed attempts")
+                && why.contains("conflict, conflict, aborted over budget"),
+            "{why}"
+        );
+        assert!(record(other.id).get("yielded").is_none(), "under the limit");
+        let told = db.store.objective_yields().expect("the yields to tell");
+        let told = told.as_array().expect("a list");
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0]["id"], first.id);
+        assert_eq!(told[0]["reason"].as_str(), Some(why.as_str()));
+
+        // Both slots free: 025 (one failure, no yield) first, then 023.
+        pass();
+        let flying: Vec<u32> = flying(&db, mission)
+            .iter()
+            .filter(|(task, _)| *task != first.id && *task != other.id)
+            .map(|(_, objective)| *objective)
+            .collect();
+        assert_eq!(flying, [25, 23]);
+        let again = objective_task(&db, mission, 23);
+        assert!(pass().is_empty(), "nothing yields, no slot is free");
+        assert_eq!(
+            task_state(&db, mission, again.id),
+            "assigned",
+            "023's new task stays"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pass that aborts a task over budget does not re-issue its
+    /// objective (task 113 aborted at 23:05:46, task 160 for objective 023
+    /// at 23:05:51): its slot frees from the next pass on, and goes to the
+    /// objective with the fewest attempts, 025, not 023.
+    #[test]
+    fn an_aborted_objective_is_not_reissued_at_once() {
+        let base = std::env::temp_dir().join(format!("spawn-db-reissue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("objective_reissue");
+        let mission = backlog_mission(
+            &db,
+            &base,
+            "rr",
+            &[23, 25],
+            1,
+            Some(&json!({"minutes": 60})),
+        );
+        let none = std::collections::BTreeSet::new();
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("first fill");
+        let task = objective_task(&db, mission, 23);
+        db.store.task_delivered(task.id, 1).expect("delivered");
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let delivered = now - 70 * 60_000;
+        db.admin()
+            .execute(
+                "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                &[&task.id, &delivered],
+            )
+            .expect("deliver 70 minutes ago");
+        tool_work(&db, &task, delivered + 5_000, now);
+        let pass = snapshot(&db, mission);
+        let aborted = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
+        assert_eq!(aborted, vec![task.id]);
+        let settled = aborted.into_iter().collect();
+        assert!(
+            crate::objectives::assign_next(&db.store, &pass, &settled)
+                .expect("the same pass")
+                .is_empty(),
+            "nothing in the pass that aborted"
+        );
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("the next pass");
+        let next: Vec<u32> = flying(&db, mission)
+            .iter()
+            .filter(|(id, _)| *id != task.id)
+            .map(|(_, objective)| *objective)
+            .collect();
+        assert_eq!(next, [25], "the fewest attempts, not the aborted objective");
+        let brief = objective_task(&db, mission, 25).brief;
+        assert!(!brief.contains("Earlier tasks"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The task as the integrator reads it.

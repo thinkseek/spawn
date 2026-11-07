@@ -7,10 +7,14 @@
 // It is also the UI's one definition of what is escalated (`needsHuman`):
 // the queue's count, the sidebar's, and every "escalated" mark.
 //
-// Pure: no runtime imports, so `node --test` loads it as it is.
+// Pure: its one runtime import (label.ts) is pure too, so `node --test`
+// loads it as it is.
+
+import type { Labels } from "./label.ts";
+import { labels } from "./label.ts";
 
 /** One escalation of the dispatcher's plan. */
-export interface AttentionItem {
+export interface AttentionItem extends Labels {
   session_id: string;
   /** The agent of the session, or null for `host` and `missions` items. */
   agent_id: string | null;
@@ -58,7 +62,7 @@ export interface OwnerNote {
   at_ms: number | null;
 }
 
-export interface SupervisorView {
+export interface SupervisorView extends Labels {
   session_id: string;
   agent_id: string;
   live: boolean;
@@ -85,7 +89,7 @@ export interface OwnJob {
 /** A worker the rules hold as working on a background job of its own (its
  * turn ended while a job it started runs): in no queue, listed so a person
  * sees why. */
-export interface OnOwnJob {
+export interface OnOwnJob extends Labels {
   session_id: string;
   agent_id: string;
   judged_at_ms: number | null;
@@ -171,6 +175,7 @@ function normalizeItem(value: unknown, told: boolean): AttentionItem | null {
   const tag = text(raw.tag);
   if (!session && !tag) return null;
   return {
+    ...labels(raw),
     session_id: session,
     agent_id: optionalText(raw.agent_id),
     why: text(raw.why, "escalation"),
@@ -244,6 +249,7 @@ function normalizeOnOwnJobs(value: unknown): OnOwnJob[] {
         : [];
     });
     return [{
+      ...labels(raw),
       session_id: session,
       agent_id: text(raw.agent_id),
       judged_at_ms: optionalNumber(raw.judged_at_ms),
@@ -256,6 +262,7 @@ function normalizeSupervisor(value: unknown): SupervisorView | null {
   const raw = object(value);
   if (!raw) return null;
   return {
+    ...labels(raw),
     session_id: text(raw.session_id, "session_supervisor"),
     agent_id: text(raw.agent_id, "agent_supervisor"),
     live: raw.live === true,
