@@ -806,7 +806,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         Ok(settings) => settings,
         Err(error) => {
             eprintln!("spawn backup dump: {error}");
-            record_refusal(&error);
+            record_refusal("dump", &error);
             return Ok(2);
         }
     };
@@ -961,14 +961,32 @@ fn skip(tier: &str, held: u64, written: u64, copy: u64, settings: &Settings) -> 
 }
 
 /// Record a refusal with its reason, so the failure is a record and not an
-/// absence (best effort: the store may be what is broken).
-fn record_refusal(reason: &str) {
+/// absence (best effort: the store may be what is broken). A refused dump is
+/// recorded as one that stored nothing, its hourly tier skipped for the
+/// reason; a refused bundle likewise.
+fn record_refusal(verb: &str, reason: &str) {
     let Ok(store) = open_store() else {
         return;
     };
-    let _ = store.backup_record(&json!({
-        "type": "backup.verified", "ok": false, "reason": reason,
-    }));
+    let record = if verb == "bundle" {
+        json!({
+            "type": "backup.bundled", "kind": "incremental", "base_event_id": null,
+            "keys": [], "tiers": [], "skipped": [{"tier": "incr", "reason": reason}],
+            "sha256": "", "bytes": 0, "stored_bytes": 0, "repos": [], "missing": [],
+            "transcripts": {"files": 0, "bytes": 0, "sizes": {}},
+            "held_bytes": 0, "written_bytes": 0,
+            "alert_bytes": 0, "limit_bytes": 0, "over_alert": false, "duration_ms": 0,
+        })
+    } else {
+        json!({
+            "type": "backup.dumped", "keys": [], "tiers": [],
+            "skipped": [{"tier": "hourly", "reason": reason}],
+            "sha256": "", "bytes": 0, "stored_bytes": 0, "events": 0, "max_event_id": 0,
+            "held_bytes": 0, "written_bytes": 0, "alert_bytes": 0, "limit_bytes": 0,
+            "over_alert": false, "dump_ms": 0, "upload_ms": 0,
+        })
+    };
+    let _ = store.backup_record(&record);
 }
 
 /// The earlier `backup.dumped` records, oldest first, with their event ids.
