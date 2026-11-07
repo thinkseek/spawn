@@ -2470,17 +2470,10 @@ impl Drop for Databases {
     }
 }
 
-/// A sweep, under the migration lock: a run of a case that holds it can
-/// meet a migration of another case; it is tried again, not skipped.
+/// A sweep of the logins of every database under `prefix` that no longer
+/// exists.
 fn sweep(maintenance: &mut Client, prefix: &str) -> String {
-    let mut result = String::new();
-    for _ in 0..12 {
-        result = drop_logins(maintenance, "", prefix);
-        if !result.starts_with("skipped: a migration") {
-            break;
-        }
-    }
-    result
+    drop_logins(maintenance, "", prefix)
 }
 
 #[test]
