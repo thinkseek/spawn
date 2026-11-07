@@ -439,7 +439,7 @@ mod tests {
     fn a_pass_runs_each_step_once_per_moved_watermark() {
         let mut steps = [Step::new(), Step::new(), Step::new()];
         let mut runs = [0_u32; 3];
-        let mut pass = |steps: &mut [Step], runs: &mut [u32; 3], watermark: i64, now: i64| {
+        let pass = |steps: &mut [Step], runs: &mut [u32; 3], watermark: i64, now: i64| {
             for (step, count) in steps.iter_mut().zip(runs.iter_mut()) {
                 if step.runs(watermark, now) {
                     *count += 1;
