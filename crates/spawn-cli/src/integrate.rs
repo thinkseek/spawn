@@ -4183,7 +4183,14 @@ mod tests {
         std::fs::write(seed.join("control.txt"), "control\n").expect("write");
         git(&["-C", &seed_path, "add", "-A"]).expect("add");
         let control = crate::sources::controller_git()
-            .args(["-C", &seed_path, "-c", "user.name=t", "-c", "user.email=t@t"])
+            .args([
+                "-C",
+                &seed_path,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+            ])
             .args(["commit", "-qm", "control"])
             .output()
             .expect("git runs");
@@ -4258,7 +4265,11 @@ mod tests {
             .expect("run the test binary");
         let limit = Duration::from_mins(2);
         let started = Instant::now();
-        while child.try_wait().expect("wait for the test binary").is_none() {
+        while child
+            .try_wait()
+            .expect("wait for the test binary")
+            .is_none()
+        {
             if started.elapsed() >= limit {
                 let _ = child.kill();
                 let _ = child.wait();

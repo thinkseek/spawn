@@ -1036,8 +1036,11 @@ mod tests {
     }
 
     /// Every git the controller runs is built by `controller_git`, on
-    /// `spawn_host::git_command`, so it runs in the C locale: no module of
-    /// the CLI, this one included, starts git itself (tests aside).
+    /// `spawn_host::git_command`, so it runs in the C locale; every git a
+    /// test runs for itself by `test_git` (`spawn_host::test_git_command`),
+    /// which no setting of the host's git configuration reaches. No file of
+    /// the CLI, its tests included, starts git itself, and no test runs its
+    /// own git through the controller's `git`.
     #[test]
     fn every_controller_git_is_built_in_one_place() {
         fn sources(directory: &Path, found: &mut Vec<std::path::PathBuf>) {
@@ -1045,31 +1048,68 @@ mod tests {
                 let path = entry.expect("an entry").path();
                 if path.is_dir() {
                     sources(&path, found);
-                } else if path.extension().is_some_and(|extension| extension == "rs")
-                    && path.file_name().is_some_and(|name| name != "tests.rs")
-                {
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
                     found.push(path);
                 }
             }
         }
+        /// Whether `code` names the controller's `git`: a path that ends in
+        /// `::git`, or `git` alone in a `use` list (`test_git as git` is
+        /// the test's).
+        fn names_git(code: &str) -> bool {
+            let needle = concat!(":", ":git");
+            let path = code.match_indices(needle).any(|(at, _)| {
+                !code[at + needle.len()..]
+                    .starts_with(|next: char| next.is_alphanumeric() || next == '_')
+            });
+            let listed = code.match_indices("use ").any(|(at, _)| {
+                let line = code[..at].rfind('\n').map_or(0, |newline| newline + 1);
+                code[line..at].trim().is_empty()
+                    && code[at..]
+                        .split(';')
+                        .next()
+                        .and_then(|statement| statement.split_once('{'))
+                        .is_some_and(|(_, items)| {
+                            items
+                                .split([',', '{', '}'])
+                                .any(|item| item.trim() == "git")
+                        })
+            });
+            path || listed
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
-        sources(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        sources(&root.join("src"), &mut files);
+        sources(&root.join("tests"), &mut files);
         assert!(
             files.iter().any(|file| file.ends_with("src/sources.rs")),
             "{files:?}"
         );
         for file in &files {
             let text = std::fs::read_to_string(file).expect("read a source");
-            let code = text.split("#[cfg(test)]\nmod ").next().unwrap_or(&text);
             assert!(
-                !code.contains("Command::new(\"git\")"),
-                "{} starts git without controller_git",
+                !text.contains("Command::new(\"git\")"),
+                "{} starts git without controller_git or test_git",
+                file.display()
+            );
+            let tests = if file.starts_with(root.join("tests")) || file.ends_with("tests.rs") {
+                text.as_str()
+            } else {
+                text.split_once("#[cfg(test)]\nmod ")
+                    .map_or("", |(_, tests)| tests)
+            };
+            assert!(
+                !names_git(tests),
+                "{} runs a test's own git through the controller's git, not test_git",
                 file.display()
             );
         }
+        assert!(names_git("let git = crate::sources::git;"));
+        assert!(names_git("    use crate::sources::{ensure_mirror, git};"));
+        assert!(!names_git(
+            "    use crate::sources::{ensure_mirror, test_git as git};"
+        ));
+        assert!(!names_git("let git = crate::sources::test_git;"));
         let own = include_str!("sources.rs");
         let code = own.split("#[cfg(test)]\nmod ").next().unwrap_or(own);
         assert_eq!(code.matches("spawn_host::git_command(\"git\")").count(), 1);
