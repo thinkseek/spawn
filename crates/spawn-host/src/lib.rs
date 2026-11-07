@@ -25,6 +25,8 @@ pub use git::{
     git_command, has_conflict_block, has_conflict_block_sized, max_file_bytes,
     names_files_outside_git,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use git::test_git_command;
 pub use root::canonical_root;
 pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
