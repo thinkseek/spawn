@@ -56,6 +56,9 @@ export class Validated {
       headers,
     });
     if (response.status === 304 && kept) {
+      // Read the (empty) body: left unread, the browser ends the request as
+      // aborted, and its developer tools list every 304 as a failure.
+      await response.arrayBuffer().catch(() => undefined);
       // Read again by another caller with another reading of the same
       // answer: normalize it its own way.
       if (kept.normalize !== normalize) return normalize(kept.raw);
