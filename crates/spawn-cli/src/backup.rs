@@ -865,21 +865,14 @@ fn dump(flags: &Flags) -> Result<i32, String> {
     }
     drop(back);
 
-    let held = list_bucket(&settings.r2)?.0;
+    let held = list_bucket(&settings)?.0;
     let mut written = 0u64;
-    let mut upload_started = Instant::now();
+    let upload_started = Instant::now();
     match suspect(events, bytes, newest_good) {
         Some(reason) => {
             let key = format!("postgres/suspect/spawn-{}.dump.gpg", now.text());
             if within_limit(held, written, stored_bytes, settings.limit_bytes) {
-                put_object(
-                    &settings.r2,
-                    &key,
-                    &encrypted,
-                    &sha256,
-                    events,
-                    &scratch,
-                )?;
+                put_object(&settings, &key, &encrypted, &sha256, events)?;
                 written = written.saturating_add(stored_bytes);
                 keys.push(key);
             } else {
@@ -894,7 +887,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
                     skipped.push(skip(tier.name(), held, written, stored_bytes, &settings));
                     continue;
                 }
-                put_object(&settings.r2, &key, &encrypted, &sha256, events, &scratch)?;
+                put_object(&settings, &key, &encrypted, &sha256, events)?;
                 written = written.saturating_add(stored_bytes);
                 keys.push(key);
                 tiers.push(tier.name().to_string());
@@ -902,8 +895,6 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         }
     }
     let upload_ms = i64::try_from(upload_started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    upload_started = Instant::now();
-    let _ = upload_started;
     let over_alert = held.saturating_add(written) > settings.alert_bytes;
     let mut record = json!({
         "type": "backup.dumped",
@@ -1684,4 +1675,445 @@ fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
         return Err(format!("git bundle create {source}: {}", stderr.trim()));
     }
     Ok(())
+}
+
+/// What the drill restored and where, for its record.
+#[derive(Debug, Default)]
+struct Drilled {
+    database: Option<String>,
+    events: Option<i64>,
+    max_event_id: Option<i64>,
+}
+
+/// `spawn backup verify`: the newest good dump restored into a database of
+/// its own and compared with its record.
+fn verify(flags: &Flags) -> Result<i32, String> {
+    let started = Instant::now();
+    let settings = match Settings::from_env(flags) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("spawn backup verify: {error}");
+            record_verified(None, false, &error, &json!({}), &Drilled::default(), started);
+            return Ok(2);
+        }
+    };
+    let _lock = Lock::acquire(&settings.root)?;
+    let store = open_store()?;
+    let Some(drill_url) = settings.drill_url.clone() else {
+        let reason = "SPAWN_BACKUP_DRILL_DATABASE_URL is not set: the drill has no server to restore into";
+        record_verified(
+            Some(&store),
+            false,
+            reason,
+            &json!({}),
+            &Drilled::default(),
+            started,
+        );
+        return Ok(2);
+    };
+    let now_ms = store.now_ms().map_err(|error| error.to_string())?;
+    let dumps = dump_records(&store, now_ms)?;
+    let latest = dumps.iter().rev().find(|entry| {
+        entry.record["suspect"].is_null()
+            && entry.record["keys"]
+                .as_array()
+                .is_some_and(|keys| !keys.is_empty())
+    });
+    let Some(latest) = latest else {
+        record_verified(
+            Some(&store),
+            false,
+            "no backup.dumped record with a key to verify",
+            &json!({}),
+            &Drilled::default(),
+            started,
+        );
+        return Ok(2);
+    };
+    let key = latest.record["keys"][0]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let expected_sha = latest.record["sha256"].as_str().unwrap_or_default().to_string();
+    let expected = json!({
+        "events": latest.record["events"],
+        "max_event_id": latest.record["max_event_id"],
+    });
+    let naming = json!({
+        "key": key,
+        "sha256": expected_sha,
+        "dumped_event_id": latest.event_id,
+        "expected": expected,
+    });
+    let outcome = restore_and_compare(&settings, &drill_url, latest);
+    let (ok, reason, drilled, counts) = match outcome {
+        Ok(drilled) => (true, String::new(), drilled, None),
+        Err(RestoreError { reason, drilled }) => (false, reason, drilled, None),
+    };
+    let mut record = naming;
+    record["events"] = counts
+        .map(|(events, _)| json!(events))
+        .unwrap_or_else(|| json!(drilled_events(&drilled)));
+    record["max_event_id"] = json!(drilled.max_event_id);
+    let code = if ok {
+        record_verified(Some(&store), true, "", &record, &drilled, started);
+        0
+    } else {
+        record_verified(Some(&store), false, &reason, &record, &drilled, started);
+        1
+    };
+    if ok {
+        println!(
+            "spawn backup verify: {} restored to its record ({} events, max id {}) into {}",
+            key,
+            record["events"],
+            record["max_event_id"],
+            drilled.database.as_deref().unwrap_or("a scratch database")
+        );
+    } else {
+        eprintln!("spawn backup verify: {reason}");
+    }
+    Ok(code)
+}
+
+fn drilled_events(drilled: &Drilled) -> i64 {
+    drilled.events.unwrap_or(0)
+}
+
+/// A drill that failed, with what it had made when it did.
+struct RestoreError {
+    reason: String,
+    drilled: Drilled,
+}
+
+/// Fetch, check, restore, compare; the scratch database is dropped on every
+/// path after it was made.
+fn restore_and_compare(
+    settings: &Settings,
+    drill_url: &str,
+    latest: &DumpRecord,
+) -> Result<Drilled, RestoreError> {
+    let mut drilled = Drilled::default();
+    let fail = |reason: String, drilled: Drilled| RestoreError { reason, drilled };
+    let key = latest.record["keys"][0].as_str().unwrap_or_default();
+    let expected_sha = latest.record["sha256"].as_str().unwrap_or_default();
+    let response = get_object(settings, key).map_err(|error| fail(error, drilled))?;
+    let Some(response) = response else {
+        return Err(RestoreError {
+            reason: format!("the bucket does not hold {key}"),
+            drilled,
+        });
+    };
+    if let Some(meta) = header_value(&response.headers, "x-amz-meta-sha256")
+        && meta != expected_sha
+    {
+        return Err(RestoreError {
+            reason: format!("the object's x-amz-meta-sha256 {meta} is not the record's {expected_sha}"),
+            drilled,
+        });
+    }
+    let scratch = Scratch::new("drill").map_err(|error| fail(error, drilled))?;
+    let encrypted = scratch.join("dump.gpg");
+    fs::write(&encrypted, response.body.as_bytes())
+        .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled))?;
+    // The object is bytes, not text: write them back as they came.
+    let bytes = match get_object_bytes(settings, key) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return Err(RestoreError {
+                reason: format!("the bucket does not hold {key}"),
+                drilled,
+            });
+        }
+        Err(error) => return Err(RestoreError { reason: error, drilled }),
+    };
+    fs::write(&encrypted, &bytes)
+        .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled))?;
+    let raw = scratch.join("dump");
+    if let Err(error) = decrypt(settings, &encrypted, &raw) {
+        return Err(RestoreError {
+            reason: format!("the object does not decrypt: {error}"),
+            drilled,
+        });
+    }
+    match sha256_file(&raw) {
+        Ok(found) if found == expected_sha => {}
+        Ok(found) => {
+            return Err(RestoreError {
+                reason: format!("the dump's sha256 {found} is not the record's {expected_sha}"),
+                drilled,
+            });
+        }
+        Err(error) => return Err(RestoreError { reason: error, drilled }),
+    }
+    let url = parse_pg_url(drill_url).map_err(|error| fail(error, drilled))?;
+    let base = if url.database.is_empty() {
+        "postgres".to_string()
+    } else {
+        url.database.clone()
+    };
+    let database = format!(
+        "spawn_drill_{}_{}",
+        spawn_unix_seconds(),
+        random_hex(4).unwrap_or_default()
+    );
+    if let Err(error) = create_database(settings, &url, &base, &database) {
+        return Err(RestoreError { reason: error, drilled });
+    }
+    drilled.database = Some(database.clone());
+    let outcome = restore_into(settings, &url, &base, &database, &raw, &scratch);
+    // The database the drill made goes on every path.
+    let dropped = drop_database(settings, &url, &base, &database);
+    match outcome {
+        Ok((events, max_event_id)) => {
+            drilled.events = Some(events);
+            drilled.max_event_id = Some(max_event_id);
+            let want_events = latest.record["events"].as_i64().unwrap_or(-1);
+            let want_max = latest.record["max_event_id"].as_i64().unwrap_or(-1);
+            if events != want_events || max_event_id != want_max {
+                return Err(RestoreError {
+                    reason: format!(
+                        "the restore holds {events} events (max id {max_event_id}); its record says \
+{want_events} (max id {want_max})"
+                    ),
+                    drilled,
+                });
+            }
+            if let Err(error) = dropped {
+                return Err(RestoreError {
+                    reason: format!("the scratch database {database} could not be dropped: {error}"),
+                    drilled,
+                });
+            }
+            Ok(drilled)
+        }
+        Err(error) => Err(RestoreError {
+            reason: match dropped {
+                Ok(()) => error,
+                Err(drop) => format!("{error}; and {drop}"),
+            },
+            drilled,
+        }),
+    }
+}
+
+/// The object's bytes, as they are (not through a String).
+fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<Vec<u8>>, String> {
+    let scratch = Scratch::new("fetch")?;
+    let output = scratch.join("object");
+    let options = format!(
+        "output = \"{}\"\n",
+        escape_config(&output.display().to_string())
+    );
+    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
+    match response.status {
+        200 => Ok(Some(
+            fs::read(&output).map_err(|error| format!("{}: {error}", output.display()))?,
+        )),
+        404 => Ok(None),
+        status => Err(format!("GET {key} answered {status}")),
+    }
+}
+
+fn spawn_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// A psql run: `-X -q -tA`, its connection settings in the environment, and
+/// `ON_ERROR_STOP` when it is given SQL to run.
+fn psql(
+    settings: &Settings,
+    url: &PgUrl,
+    database: &str,
+    sql: Option<&str>,
+    file: Option<&Path>,
+) -> Result<(bool, String, String), String> {
+    let mut command = Command::new(settings.pg_tool("psql"));
+    command.args(["-X", "-q", "-tA", "-d", database]);
+    if file.is_some() {
+        command.args(["-v", "ON_ERROR_STOP=1", "--single-transaction"]);
+    }
+    if let Some(sql) = sql {
+        command.args(["-v", "ON_ERROR_STOP=1", "-c", sql]);
+    }
+    if let Some(file) = file {
+        command.arg("-f").arg(file);
+    }
+    for (name, value) in url.env() {
+        command.env(name, value);
+    }
+    output(command, "psql")
+}
+
+fn create_database(
+    settings: &Settings,
+    url: &PgUrl,
+    base: &str,
+    database: &str,
+) -> Result<(), String> {
+    if !database
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!("the scratch database name {database:?} is not a plain identifier"));
+    }
+    let (ok, found, stderr) = psql(
+        settings,
+        url,
+        base,
+        Some(&format!(
+            "select 1 from pg_database where datname = '{database}'"
+        )),
+        None,
+    )?;
+    if !ok {
+        return Err(format!("the drill server: {}", stderr.trim()));
+    }
+    if !found.trim().is_empty() {
+        return Err(format!("the database {database} already exists: the drill makes its own"));
+    }
+    let (ok, _stdout, stderr) = psql(
+        settings,
+        url,
+        base,
+        Some(&format!("create database \"{database}\"")),
+        None,
+    )?;
+    if !ok {
+        return Err(format!("create database {database}: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+fn drop_database(
+    settings: &Settings,
+    url: &PgUrl,
+    base: &str,
+    database: &str,
+) -> Result<(), String> {
+    let (ok, _stdout, stderr) = psql(
+        settings,
+        url,
+        base,
+        Some(&format!("drop database if exists \"{database}\" with (force)")),
+        None,
+    )?;
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("drop database {database}: {}", stderr.trim()))
+    }
+}
+
+/// The server's major version, so a newer `pg_restore`'s `SET
+/// transaction_timeout = 0;` is left out for a server that predates it.
+pub(crate) fn server_major(version: &str) -> u32 {
+    version
+        .trim()
+        .split(['.', ' '])
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Drop `SET transaction_timeout = 0;` from a restore script, for a server
+/// older than 17 that does not know the parameter.
+pub(crate) fn without_transaction_timeout(sql: &str, major: u32) -> String {
+    if major >= 17 {
+        return sql.to_string();
+    }
+    sql.lines()
+        .filter(|line| line.trim() != "SET transaction_timeout = 0;")
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+fn restore_into(
+    settings: &Settings,
+    url: &PgUrl,
+    base: &str,
+    database: &str,
+    dump: &Path,
+    scratch: &Scratch,
+) -> Result<(i64, i64), String> {
+    let (ok, version, stderr) = psql(settings, url, base, Some("show server_version"), None)?;
+    if !ok {
+        return Err(format!("the drill server: {}", stderr.trim()));
+    }
+    let major = server_major(&version);
+    let script = scratch.join("restore.sql");
+    let (ok, _stdout, stderr) = output(
+        {
+            let mut command = Command::new(settings.pg_tool("pg_restore"));
+            command
+                .args(["--no-owner", "--no-acl", "-f"])
+                .arg(&script)
+                .arg(dump);
+            command
+        },
+        "pg_restore",
+    )?;
+    if !ok {
+        return Err(format!("pg_restore: {}", stderr.trim()));
+    }
+    let sql = fs::read_to_string(&script).map_err(|error| format!("{}: {error}", script.display()))?;
+    let filtered = scratch.join("restore.filtered.sql");
+    fs::write(&filtered, without_transaction_timeout(&sql, major))
+        .map_err(|error| format!("{}: {error}", filtered.display()))?;
+    let (ok, _stdout, stderr) = psql(settings, url, database, None, Some(&filtered))?;
+    if !ok {
+        return Err(format!("the restore failed: {}", stderr.trim()));
+    }
+    let (ok, counts, stderr) = psql(
+        settings,
+        url,
+        database,
+        Some("select count(*), coalesce(max(id), 0) from spawn_events"),
+        None,
+    )?;
+    if !ok {
+        return Err(format!("the restored database: {}", stderr.trim()));
+    }
+    let mut parts = counts.split_whitespace();
+    let events = parts.next().and_then(|part| part.parse().ok()).unwrap_or(-1);
+    let max = parts.next().and_then(|part| part.parse().ok()).unwrap_or(-1);
+    Ok((events, max))
+}
+
+/// Record one drill, ok or not, with what it restored and where.
+fn record_verified(
+    store: Option<&PostgresStore>,
+    ok: bool,
+    reason: &str,
+    naming: &Value,
+    drilled: &Drilled,
+    started: Instant,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let mut record = json!({
+        "type": "backup.verified",
+        "ok": ok,
+        "reason": reason,
+        "key": naming.get("key").cloned().unwrap_or(Value::Null),
+        "sha256": naming.get("sha256").cloned().unwrap_or(Value::Null),
+        "dumped_event_id": naming.get("dumped_event_id").cloned().unwrap_or(Value::Null),
+        "expected": naming.get("expected").cloned().unwrap_or(Value::Null),
+        "events": drilled.events,
+        "max_event_id": drilled.max_event_id,
+        "database": drilled.database,
+        "server": naming.get("server").cloned().unwrap_or(Value::Null),
+        "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+    });
+    if record["server"].is_null()
+        && let Some(drilled_url) = env_value("SPAWN_BACKUP_DRILL_DATABASE_URL")
+        && let Ok(url) = parse_pg_url(&drilled_url)
+    {
+        record["server"] = json!(url.server());
+    }
+    let _ = store.backup_record(&record);
 }
