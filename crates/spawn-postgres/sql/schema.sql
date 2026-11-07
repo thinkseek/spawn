@@ -1350,6 +1350,30 @@ create table if not exists mission_source_holds (
     expires_ms bigint not null
 );
 
+-- What went wrong, in the record (docs/fleet-architecture.md, "Alerts";
+-- docs/storage.md, "Alerts"). One row per occurrence, keyed by the key its
+-- `alert.fired` and `alert.cleared` records share: an alert fires once and
+-- clears at most once, across loop restarts and two loops at once. A notice
+-- is a `fired` that never clears. The loop writes the records
+-- (`spawn_alert_record`, owner only); the table is their fold, so a
+-- restarted loop reads its alerts back and fires nothing twice.
+create table if not exists spawn_alerts (
+    key              text    primary key,
+    kind             text    not null,
+    subject          text    not null,
+    state            text    not null,
+    notice           boolean not null default false,
+    text             text,
+    evidence         jsonb   not null default '{}'::jsonb,
+    fired_event_id   bigint  not null,
+    fired_at_ms      bigint  not null,
+    cleared_event_id bigint,
+    cleared_at_ms    bigint,
+    cleared_evidence jsonb
+);
+
+create index if not exists spawn_alerts_time on spawn_alerts (fired_at_ms);
+
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
