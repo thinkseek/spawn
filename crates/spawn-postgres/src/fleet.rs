@@ -258,7 +258,32 @@ from (
     r")
         and ",
     died_young!("x"),
-    r") as resumed_young
+    r") as resumed_young,
+    (select jsonb_build_object(
+              'execution_id', x.execution_id,
+              'command_id', c.id,
+              'ended_at_ms', x.ended_at_ms,
+              'evidence', (select e.kind -> 'detail' ->> 'evidence' from spawn_events e
+                            where e.session_id = x.session_id
+                              and e.execution_id = x.execution_id
+                              and e.event_name = 'execution.ended' and e.source = 'bridge'
+                            order by e.id limit 1),
+              'error', c.error)
+       from agent_executions x
+       join spawn_commands c on c.id = x.command_id
+      where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.idempotency_key like 'dispatch-resume-%'
+        and ",
+    lost_before_ready!("x"),
+    r"
+        and x.started_at_ms > (select coalesce(max(h.started_at_ms), 0)
+                                 from agent_executions h
+                                where h.session_id = s.session_id and not ",
+    died_young!("h"),
+    r" and not ",
+    lost_before_ready!("h"),
+    r")
+      order by x.started_at_ms desc, x.execution_id desc limit 1) as failed_resume
   from agent_status s
   join spawn_session_state p using (session_id)
   left join lateral (select c.id, c.action from spawn_commands c
