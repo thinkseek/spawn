@@ -8892,7 +8892,7 @@ printf '{"verdict":"accepted"}\n' >"$SPAWN_GATE_VERDICT"
         };
         let db = Db::new("base_disagrees_pass");
         let mission = db.gated_mission(&source, &scenarios);
-        let task = db.reported_task(mission, "w");
+        let _task = db.reported_task(mission, "w");
         let agent = db.mission(mission)["tasks"][0]["agent_id"]
             .as_str()
             .expect("the task's agent")
