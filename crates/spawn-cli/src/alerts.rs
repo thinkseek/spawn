@@ -1710,7 +1710,6 @@ fn read_appended(path: &Path, log: &mut LogWatch) -> Result<Option<(String, bool
         log.offset = start;
         log.carry.clear();
     }
-    use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(log.offset))
         .map_err(|error| error.to_string())?;
     let mut bytes = Vec::new();
@@ -1797,16 +1796,13 @@ fn zone(text: &str) -> Option<(i32, &str)> {
         b'-' => -1,
         _ => return None,
     };
-    let digits = text
-        .get(1..)
-        .map(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>())
-        .unwrap_or_default();
+    let digits: String = text
+        .get(1..)?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     let (hours, minutes, rest) = match digits.len() {
-        2 => (
-            digits.get(..2)?.parse::<i32>().ok()?,
-            0,
-            text.get(3..)?,
-            ),
+        2 => (digits.parse::<i32>().ok()?, 0, text.get(3..)?),
         4 => (
             digits.get(..2)?.parse::<i32>().ok()?,
             digits.get(2..4)?.parse::<i32>().ok()?,
