@@ -646,6 +646,8 @@ fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
                 Box::new(move || session(id, query))
             } else if let Some(task) = path.strip_prefix("/api/rsi/task/") {
                 Box::new(move || rsi_task(task))
+            } else if let Some(rest) = path.strip_prefix("/api/rsi/objective/") {
+                Box::new(move || rsi_objective(rest))
             } else if let Some(task) = path.strip_prefix("/api/missions/task/") {
                 Box::new(move || mission_task(task))
             } else if let Some(id) = path.strip_prefix("/api/pane/") {
@@ -834,6 +836,10 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 /// `GET /api/rsi/task/<id>` answers one task: the fields above plus the full
 /// `brief`, `report`, `gate_log` (the latest), `mission_id`, and `log` on
 /// every gate verdict.
+///
+/// `GET /api/rsi/objective/<mission>/<id>` answers one objective's whole
+/// prompt, `{mission, id, title, prompt, prompt_bytes}`, as the page asks
+/// when the objective is pointed at.
 ///
 /// `GET /api/rsi/pane[?mission=<id>]` answers the live pane of the mission's
 /// resident (the first open objective mission by default), in the shape of
@@ -1030,6 +1036,44 @@ fn rsi_task(task: &str) -> Result<Value, String> {
         .objective_task(id)
         .map_err(err)?
         .ok_or_else(|| format!("task {id} does not exist"))
+}
+
+/// `/api/rsi/objective/<mission>/<id>`: one objective's whole prompt, read
+/// from the backlog of that open objective mission (`/api/rsi` sends the
+/// prompt's first lines).
+fn rsi_objective(rest: &str) -> Result<Value, String> {
+    let bad = || format!("{BAD_REQUEST}bad objective {rest}");
+    let (mission, objective) = rest.split_once('/').ok_or_else(bad)?;
+    let mission: i64 = mission.parse().map_err(|_| bad())?;
+    let objective: u32 = objective.parse().map_err(|_| bad())?;
+    let store = open_store()?;
+    let missions = store.objective_missions().map_err(err)?;
+    objective_prompt(&missions, mission, objective)
+}
+
+/// Objective `objective` of mission `mission` among the open objective
+/// `missions`, with its whole prompt, from the mission's backlog.
+fn objective_prompt(missions: &Value, mission: i64, objective: u32) -> Result<Value, String> {
+    let backlog = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["id"].as_i64() == Some(mission))
+        .ok_or_else(|| format!("mission {mission} is not an open objective mission"))?
+        .pointer("/objectives/backlog")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("mission {mission} names no backlog"))?;
+    let found = load_backlog(Path::new(backlog))?
+        .into_iter()
+        .find(|task| task.id == objective)
+        .ok_or_else(|| format!("objective {objective} is not in mission {mission}'s backlog"))?;
+    Ok(json!({
+        "mission": mission,
+        "id": found.id,
+        "title": found.title,
+        "prompt_bytes": found.prompt.len(),
+        "prompt": found.prompt,
+    }))
 }
 
 /// The live pane of an objective mission's resident.
