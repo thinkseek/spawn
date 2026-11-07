@@ -227,9 +227,9 @@ from (
     s.live,
     s.execution_id,
     s.end_cause,
-    p.observation,
-    p.observation_event_id,
-    p.observation_at_ms,
+    s.observation,
+    s.observation_event_id,
+    s.observation_at_ms,
     (select max(e.session_seq) from spawn_events e
       where e.session_id = s.session_id and e.source <> 'observer'
         and e.event_name not in ('artifact.committed', 'merge.conflicted')
