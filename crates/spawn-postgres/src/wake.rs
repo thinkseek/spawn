@@ -96,14 +96,16 @@ impl Listener {
         if received > 0 {
             return Ok(received);
         }
-        let mut notifications = self.client.notifications();
-        let mut waiting = notifications.timeout_iter(timeout);
-        match waiting.next() {
-            Ok(Some(_)) => received += 1,
-            Ok(None) | Err(_) => return Ok(received),
+        let blocked = {
+            let mut notifications = self.client.notifications();
+            let mut waiting = notifications.timeout_iter(timeout);
+            matches!(waiting.next(), Ok(Some(_)))
+        };
+        if blocked {
+            received += 1;
+            received += self.drain();
         }
-        drop(waiting);
-        Ok(received + self.drain())
+        Ok(received)
     }
 
     /// Every notification already buffered on the connection.
