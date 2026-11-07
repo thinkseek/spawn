@@ -5,7 +5,8 @@ Run: python3 -I scripts/model-relay-test.py   (no network, no keys)
 
 Covers routing by model, header replacement (an allow-list toward DeepSeek),
 server-sent events arriving before the upstream finishes (the gateway's), a
-DeepSeek stream passed only whole and asked for again when cut, upstream errors,
+DeepSeek stream asked for again on a server error or silence before it starts and
+ending in an overloaded error when cut, upstream errors,
 an unreachable upstream, redirects passed back unfollowed, a stalled client
 timed out, and the request size cap.
 """
@@ -341,50 +342,43 @@ class RelayTest(unittest.TestCase):
         return connection, connection.getresponse()
 
     def fast_retries(self):
-        settings = (("STREAM_BACKOFF", (0, 0, 0, 0)), ("PING_EVERY", 1), ("DEEPSEEK_SILENCE", 1))
-        for name, value in settings:
+        for name, value in (("STREAM_BACKOFF", (0, 0, 0, 0)), ("DEEPSEEK_SILENCE", 1)):
             self.addCleanup(setattr, relay, name, getattr(relay, name))
             setattr(relay, name, value)
 
-    def test_a_deepseek_stream_arrives_whole_with_pings_while_it_is_held(self):
-        self.fast_retries()
+    def test_a_deepseek_stream_arrives_event_by_event(self):
         connection, response = self.stream()
         self.assertEqual(response.status, 200)
         self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
         first = response.read1(65536)
-        # Only pings while the upstream holds the rest.
-        self.assertEqual(first.replace(relay.PING, b""), b"")
-        self.assertIn(b"ping", first)
+        # The upstream still holds the rest: the client already has the start.
+        self.assertIn(b"message_start", first)
         self.assertFalse(self.deepseek.finished.is_set())
         self.deepseek.release.set()
-        events = (first + response.read()).replace(relay.PING, b"")
-        self.assertEqual(events, WHOLE)
+        self.assertEqual(first + response.read(), WHOLE)
         connection.close()
 
-    def test_a_cut_deepseek_stream_is_asked_for_again(self):
-        self.fast_retries()
-        self.deepseek.release.set()
-        self.deepseek.cuts = ["close", "end"]
-        connection, response = self.stream()
-        events = response.read().replace(relay.PING, b"")
-        connection.close()
-        # The client gets the one whole stream, nothing of the cut ones.
-        self.assertEqual(events, WHOLE)
-        self.assertEqual(len(self.deepseek.requests), 3)
-        self.assertEqual(self.deepseek.cuts, [])
+    def test_a_cut_deepseek_stream_ends_with_an_overloaded_error(self):
+        for cut in ("close", "end"):
+            self.deepseek.cuts = [cut]
+            connection, response = self.stream()
+            self.assertEqual(response.status, 200)
+            events = response.read()
+            connection.close()
+            start, error = events.split(b"event: error\ndata: ")
+            self.assertEqual(start, b"event: message_start\ndata: {}\n\n")
+            self.assertEqual(json.loads(error)["error"]["type"], "overloaded_error", cut)
+        self.assertEqual(len(self.deepseek.requests), 2)
 
     def test_a_deepseek_stream_refused_with_a_server_error_is_asked_for_again(self):
         self.fast_retries()
         self.deepseek.release.set()
         self.deepseek.failures = 2
-        self.deepseek.cuts = ["end"]
         connection, response = self.stream()
         self.assertEqual(response.status, 200)
-        events = response.read().replace(relay.PING, b"")
+        self.assertEqual(response.read(), WHOLE)
         connection.close()
-        self.assertEqual(events, WHOLE)
-        self.assertEqual(len(self.deepseek.requests), 4)
-        self.assertEqual((self.deepseek.failures, self.deepseek.cuts), (0, []))
+        self.assertEqual(len(self.deepseek.requests), 3)
 
     def test_a_silent_deepseek_is_asked_again(self):
         self.fast_retries()
@@ -392,13 +386,11 @@ class RelayTest(unittest.TestCase):
         self.deepseek.silences = 1
         connection, response = self.stream()
         self.assertEqual(response.status, 200)
-        events = response.read().replace(relay.PING, b"")
+        self.assertEqual(response.read(), WHOLE)
         connection.close()
-        self.assertEqual(events, WHOLE)
         self.assertEqual(len(self.deepseek.requests), 2)
 
     def test_a_deepseek_stream_refused_for_its_request_passes_as_it_is(self):
-        self.fast_retries()
         connection = self.connect()
         body = json.dumps({"model": "deepseek-flash", "stream": True, "unauthorized": True})
         connection.request(
@@ -410,18 +402,14 @@ class RelayTest(unittest.TestCase):
         connection.close()
         self.assertEqual(len(self.deepseek.requests), 1)
 
-    def test_a_deepseek_stream_cut_every_time_is_an_overloaded_error(self):
+    def test_a_deepseek_stream_failing_every_time_is_an_overloaded_529(self):
         self.fast_retries()
-        self.deepseek.release.set()
-        self.deepseek.cuts = ["end"] * relay.STREAM_ATTEMPTS
+        self.deepseek.failures = relay.STREAM_ATTEMPTS
         connection, response = self.stream()
-        events = response.read().replace(relay.PING, b"")
+        self.assertEqual(response.status, 529)
+        self.assertEqual(json.loads(response.read())["error"]["type"], "overloaded_error")
         connection.close()
         self.assertEqual(len(self.deepseek.requests), relay.STREAM_ATTEMPTS)
-        self.assertTrue(events.startswith(b"event: error\ndata: "), events)
-        error = json.loads(events.split(b"data: ", 1)[1])
-        self.assertEqual(error["error"]["type"], "overloaded_error")
-        self.assertNotIn(b"message_start", events)
 
     def test_deepseek_gets_only_the_messages_api_headers(self):
         extra = {"Cookie": "session=gateway", "X-Gateway-Tenant": "tenant-secret"}
