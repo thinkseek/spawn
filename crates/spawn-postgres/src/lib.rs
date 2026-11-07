@@ -80,8 +80,10 @@ mod missions;
 mod row;
 mod scorecard;
 mod sessions;
+mod wake;
 
 pub use missions::LandingHold;
+pub use wake::Listener;
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };
