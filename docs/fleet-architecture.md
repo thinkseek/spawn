@@ -475,9 +475,9 @@ input of a mission.
    `(pending)`, `TBD` or `TODO`, an Outcome that says draft or in progress)
    is not taken. The task stays delivered, the worker is told once per
    content of the file which markers are on which lines, and the check is
-   recorded (`task.report_unfinished`, §10.1). The supervisor reads reports and judgements, and
-   opens a transcript (`tail`) only when it must. Its own context stays
-   about the mission.
+   recorded (`task.report_unfinished`, §10.1). The supervisor reads reports
+   and judgements, and opens a transcript (`tail`) only when it must. Its
+   own context stays about the mission.
 5. Isolated workspaces. Every worker has its own; combining results is a task
    the supervisor decides on, not a side effect.
 6. Human input is context too. A human may type to a worker directly. The
