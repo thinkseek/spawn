@@ -1130,39 +1130,35 @@ times in a row)",
         if self.settings.memory_low_mb == 0 {
             return;
         }
-        match available_mb() {
-            Ok(measured) => {
-                if measured < self.settings.memory_low_mb
-                    && self.open_keys("memory_low", "host").is_empty()
-                {
-                    out.push(Event::Fire {
-                        key: format!("memory_low:{now}"),
-                        kind: "memory_low",
-                        subject: "host".to_string(),
-                        evidence: json!({
-                            "measured_mb": measured,
-                            "threshold_mb": self.settings.memory_low_mb,
-                            "top": top_processes(),
-                        }),
-                        text: format!(
-                            "MemAvailable is {measured} MiB, under {}",
-                            self.settings.memory_low_mb
-                        ),
-                        notice: false,
+        let measured = match available_mb() {
+            Ok(measured) => measured,
+            Err(error) => {
+                lines.push(format!("alerts: {error}"));
+                return;
+            }
+        };
+        let open = self.open_keys("memory_low", "host");
+        let (low, ok) = (self.settings.memory_low_mb, self.settings.memory_ok_mb);
+        match crossing(!open.is_empty(), measured, low, ok, true) {
+            Crossing::Fire => out.push(Event::Fire {
+                key: format!("memory_low:{now}"),
+                kind: "memory_low",
+                subject: "host".to_string(),
+                evidence: json!({
+                    "measured_mb": measured, "threshold_mb": low, "top": top_processes(),
+                }),
+                text: format!("MemAvailable is {measured} MiB, under {low}"),
+                notice: false,
+            }),
+            Crossing::Clear => {
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
+                        evidence: json!({"measured_mb": measured, "threshold_mb": ok}),
                     });
-                } else if measured >= self.settings.memory_ok_mb {
-                    for key in self.open_keys("memory_low", "host") {
-                        out.push(Event::Clear {
-                            key,
-                            evidence: json!({
-                                "measured_mb": measured,
-                                "threshold_mb": self.settings.memory_ok_mb,
-                            }),
-                        });
-                    }
                 }
             }
-            Err(error) => lines.push(format!("alerts: {error}")),
+            Crossing::Nothing => {}
         }
     }
 
@@ -1170,41 +1166,40 @@ times in a row)",
         if self.settings.tmpfs_high_mb == 0 {
             return;
         }
-        match used_mb(&self.settings.tmpfs_path) {
-            Ok(measured) => {
-                if measured > self.settings.tmpfs_high_mb
-                    && self.open_keys("tmpfs_high", "host").is_empty()
-                {
-                    out.push(Event::Fire {
-                        key: format!("tmpfs_high:{now}"),
-                        kind: "tmpfs_high",
-                        subject: "host".to_string(),
+        let path = self.settings.tmpfs_path.clone();
+        let measured = match used_mb(&path) {
+            Ok(measured) => measured,
+            Err(error) => {
+                lines.push(format!("alerts: {error}"));
+                return;
+            }
+        };
+        let open = self.open_keys("tmpfs_high", "host");
+        let (high, ok) = (self.settings.tmpfs_high_mb, self.settings.tmpfs_ok_mb);
+        match crossing(!open.is_empty(), measured, high, ok, false) {
+            Crossing::Fire => out.push(Event::Fire {
+                key: format!("tmpfs_high:{now}"),
+                kind: "tmpfs_high",
+                subject: "host".to_string(),
+                evidence: json!({
+                    "path": path.display().to_string(),
+                    "measured_mb": measured, "threshold_mb": high,
+                }),
+                text: format!("{} holds {measured} MiB, over {high}", path.display()),
+                notice: false,
+            }),
+            Crossing::Clear => {
+                for key in open {
+                    out.push(Event::Clear {
+                        key,
                         evidence: json!({
-                            "path": self.settings.tmpfs_path.display().to_string(),
-                            "measured_mb": measured,
-                            "threshold_mb": self.settings.tmpfs_high_mb,
+                            "path": path.display().to_string(),
+                            "measured_mb": measured, "threshold_mb": ok,
                         }),
-                        text: format!(
-                            "{} holds {measured} MiB, over {}",
-                            self.settings.tmpfs_path.display(),
-                            self.settings.tmpfs_high_mb
-                        ),
-                        notice: false,
                     });
-                } else if measured < self.settings.tmpfs_ok_mb {
-                    for key in self.open_keys("tmpfs_high", "host") {
-                        out.push(Event::Clear {
-                            key,
-                            evidence: json!({
-                                "path": self.settings.tmpfs_path.display().to_string(),
-                                "measured_mb": measured,
-                                "threshold_mb": self.settings.tmpfs_ok_mb,
-                            }),
-                        });
-                    }
                 }
             }
-            Err(error) => lines.push(format!("alerts: {error}")),
+            Crossing::Nothing => {}
         }
     }
 
@@ -1469,6 +1464,37 @@ impl LogWatch {
             last_match_ms: 0,
             last_line: None,
         }
+    }
+}
+
+/// What one reading of a condition does: the crossing in, the crossing out
+/// past the margin, or nothing (a reading between the two thresholds does
+/// neither, so a host hovering at the threshold does not flap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Crossing {
+    Fire,
+    Clear,
+    Nothing,
+}
+
+/// Where a reading leaves a condition: `turn_on` is the threshold it fires
+/// over (or under, when `under`), `turn_off` the one it clears at, on the
+/// other side of the margin.
+fn crossing(open: bool, measured: u64, turn_on: u64, turn_off: u64, under: bool) -> Crossing {
+    let bad = if under {
+        measured < turn_on
+    } else {
+        measured > turn_on
+    };
+    let good = if under {
+        measured >= turn_off
+    } else {
+        measured < turn_off
+    };
+    match (open, bad, good) {
+        (false, true, _) => Crossing::Fire,
+        (true, _, true) => Crossing::Clear,
+        _ => Crossing::Nothing,
     }
 }
 
