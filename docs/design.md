@@ -143,11 +143,11 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 **Bridge 读什么，什么时候读。** 监视走 `FileWatch` 端口：Linux 上是 inotify（`spawn_host::InotifyWatch`），一个描述符、每个文件一条目录监视；路径还不存在时监视它上面最深的已存在目录，目录随引擎出现时监视跟着往下走（transcript 在 `<projects>/<工作目录转义>/`，退出文件在 `<工作区>/.spawn/`，两者都由引擎稍后创建）。设不了监视的执行（系统调用出错、文件系统不支持、`max_user_watches` 到顶）退回每个 pass 都读，并在循环输出里告警一次。读的偏移规则不变：只读整行，读到一半的行留到下一次变化或下一个 pass，绝不丢；一次 checkpoint 没提交的行同样留到下一个 pass。
 
-一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不问 runner（一次 tmux `list-panes`）、不读文件。屏幕只在能改变决定时抓：
+一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不读任何文件、也不为它单独问一次 runner（`list-panes`）。屏幕只在能改变决定时抓：
 
 | 何时 | 出处 |
 | --- | --- |
-| 会话上有命令在飞（领取了没完成，或排队等它） | 投递等着它的读数 |
+| 会话上有命令在飞（Bridge 领取了还没完成；同一个 pass 领到的也算） | 投递等着它的读数 |
 | transcript 自上次增长以来静止满 `SPAWN_SCREEN_QUIET_MS`（默认 500 ms）而屏幕此后还没读过，之后的 pass 接着读，直到连续两次读数一致 | transcript 说不了的事：提示符回来了 |
 | 距上次抓屏满 `screen_refresh`（30 s）的兜底 | transcript 不动而屏幕变了：对话框、掉回 shell |
 
