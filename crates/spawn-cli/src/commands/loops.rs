@@ -225,18 +225,6 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
                     Err(error) => fail("observer", &error.to_string()),
                 }
             }
-            let mut step = |what: &str, result: Result<(Vec<String>, Option<i64>), String>| {
-                match result {
-                    Ok((more, due)) => {
-                        lines.extend(more);
-                        Some(due)
-                    }
-                    Err(error) => {
-                        fail(what, &error);
-                        None
-                    }
-                }
-            };
             // The disk watch never fails a pass: a fleet must not stop
             // because it cannot record a warning. It reads free space on its
             // own clock ([`disk::CHECK_EVERY`]) and the log once.
@@ -244,26 +232,32 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
                 disk.check(&open)
                     .unwrap_or_else(|error| vec![format!("disk: {error}")]),
             );
-            if dispatching && let Some(due) = step(
-                "dispatch",
-                dispatch::step(
+            if dispatching && dispatch_step.runs(watermark, now) {
+                match dispatch::step(
                     &open,
                     supervised,
                     &spawn,
                     workspace_root.as_deref(),
                     &disk,
                     &bounds,
-                ),
-            ) {
-                dispatch_step.ran(watermark, due);
+                ) {
+                    Ok((more, due)) => {
+                        lines.extend(more);
+                        dispatch_step.ran(watermark, due);
+                    }
+                    Err(error) => fail("dispatch", &error),
+                }
             }
             // Under the disk floor no resident is revived (a new execution);
             // the supervisor still is, to act on the warning.
-            if !disk.below_floor()
-                && residents_step.runs(watermark, now)
-                && let Some(due) = step("residents", supervise::keep_residents(&open))
-            {
-                residents_step.ran(watermark, due);
+            if !disk.below_floor() && residents_step.runs(watermark, now) {
+                match supervise::keep_residents(&open) {
+                    Ok((more, due)) => {
+                        lines.extend(more);
+                        residents_step.ran(watermark, due);
+                    }
+                    Err(error) => fail("residents", &error),
+                }
             }
             if supervised && alive_step.runs(watermark, now) {
                 match supervise::keep_alive(&open) {
