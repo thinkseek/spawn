@@ -437,6 +437,7 @@ impl Why {
                 | Self::Approved
                 | Self::Human
                 | Self::GateHostFault
+                | Self::GateBaseDisagrees
                 | Self::HoldExpired
         )
     }
