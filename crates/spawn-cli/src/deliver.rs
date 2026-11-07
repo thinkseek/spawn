@@ -1480,12 +1480,6 @@ mod tests {
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
-
-    /// The helpers the due-time tests in [`super::due_tests`] share.
-    pub(super) use super::{NOT_READY_RETRY_MS, next_due, retry_wait_ms};
-    pub(super) use super::{sent as sent_of, task as task_of, worker as worker_of};
-    pub(super) use spawn_core::mission::TaskState as DueState;
-    pub(super) type DueWork = super::Work;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
     use spawn_core::mission::TaskState;
@@ -3119,10 +3113,6 @@ PENDING_ISSUES\n";
         assert!(db.records(task.id, "task.report_unfinished").is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
-}
-
-#[cfg(test)]
-mod due_tests {
     use super::{
         NOT_READY_RETRY_MS, TaskState, Work, next_due, retry_wait_ms, sent_of, task_of, worker_of,
     };
