@@ -285,6 +285,7 @@ report() {
 
 integrate_on() {
     capture env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+        SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
         "$SPAWN_BIN" integrate --once --root "$1"
     cat "$WORK/out.txt" "$WORK/err.txt" >>"$WORK/integrate.log"
     [ "$status" -eq 0 ] || fail "integrate on $1 exited $status: $(err)"

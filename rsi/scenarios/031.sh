@@ -163,13 +163,15 @@ cleanup() {
         gpgconf --homedir "$GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
     fi
     if [ -n "$database_made" ]; then
-        # A scratch database a drill named and left behind goes too.
+        # A scratch database a drill named and left behind goes too, but only
+        # a name of this run's (it contains this run's id): candidate code may
+        # name any database in a backup.verified record, and a database a
+        # parallel gate is using is not this run's to drop.
         for left in $(psql -d "$SPAWN_DB_NAME" -tA -c "select distinct e.kind -> 'detail' -> 'record' ->> 'database'
                 from spawn_events e where e.session_id = 'session_control'
                  and e.kind -> 'detail' -> 'record' ->> 'type' = 'backup.verified'" 2>/dev/null); do
             case "$left" in
-            *[!A-Za-z0-9_]* | "" | "$SPAWN_DB_NAME" | postgres | template*) ;;
-            *) sh "$controller/scripts/blackbox/scenario-db.sh" drop "$left" >/dev/null 2>&1 || true ;;
+            *"$run"*) sh "$controller/scripts/blackbox/scenario-db.sh" drop "$left" >/dev/null 2>&1 || true ;;
             esac
         done
         # The database and the logins init-db made for it.
