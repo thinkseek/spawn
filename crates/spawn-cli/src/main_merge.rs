@@ -1194,7 +1194,7 @@ mod tests {
         let task = |objective: i32| {
             let id = db
                 .store
-                .objective_assign(mission, objective, None, "brief")
+                .objective_assign(mission, objective, None, "brief", None)
                 .expect("assign");
             let mut client =
                 postgres::Client::connect(&db.url, postgres::NoTls).expect("connection");
@@ -1329,7 +1329,7 @@ mod tests {
         // Another objective, never tried: nothing.
         let fresh = db
             .store
-            .objective_assign(mission, 8, None, "brief")
+            .objective_assign(mission, 8, None, "brief", None)
             .expect("assign");
         let (agent, session) = {
             let mut client =
@@ -1478,7 +1478,7 @@ mod tests {
     fn assigned(db: &Db, mission: i64, objective: i32) -> (i64, String, String) {
         let id = db
             .store
-            .objective_assign(mission, objective, None, "brief")
+            .objective_assign(mission, objective, None, "brief", None)
             .expect("assign");
         let mut client = postgres::Client::connect(&db.url, postgres::NoTls).expect("connection");
         client
