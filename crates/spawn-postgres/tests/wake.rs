@@ -126,8 +126,10 @@ fn collect(node: &Value, scans: &mut Vec<String>) {
                     .unwrap_or_default();
                 scans.push(format!("{kind} on {relation}"));
             }
-            if let Some(plans) = map.get("Plans") {
-                collect(plans, scans);
+            // Every value: `EXPLAIN`'s document nests the plan under `Plan`
+            // and its child nodes under `Plans`.
+            for value in map.values() {
+                collect(value, scans);
             }
         }
         _ => {}
