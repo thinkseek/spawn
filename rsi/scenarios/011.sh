@@ -378,29 +378,44 @@ busy_observations=$(q "select count(*) from spawn_events
 
 # --- the premise: a fact after the idle judgement --------------------------------
 
-stopped=$(q "select max(session_seq) from spawn_events
-              where session_id = '$session' and event_name = 'turn.stopped'")
 waiting_after_stop() {
     [ "$(q "select count(*) from spawn_events
              where session_id = '$session' and source = 'observer'
                and event_name = 'observation.recorded' and session_seq > $stopped
                and kind -> 'detail' -> 'observation' ->> 'state' = 'WAITING'")" -ge 1 ]
 }
-# Premise waits, not the contract: generous, so a loaded host (other jobs
-# share it) does not fail the setup; they return as soon as the fact is there.
-wait_for 45 waiting_after_stop ||
-    fail "the worker was never judged WAITING after its turn ended ($(explain))"
-first_waiting=$(q "select min(session_seq) from spawn_events
-                    where session_id = '$session' and source = 'observer'
-                      and event_name = 'observation.recorded' and session_seq > $stopped
-                      and kind -> 'detail' -> 'observation' ->> 'state' = 'WAITING'")
 screen_after() {
     [ "$(q "select count(*) from spawn_events
              where session_id = '$session' and event_name = 'screen.observed'
                and session_seq > $first_waiting")" -ge 1 ]
 }
-wait_for 30 screen_after ||
-    fail "no screen reading recorded after the WAITING judgement that followed the turn's end: the screen settling at the prompt is a fact and is recorded ($(explain))"
+engine_settled() { grep -q "^settled [0-9]* $1\$" "$WORK/engine.log"; }
+
+# settle_after_waiting <file>: the task turn that wrote <file> has ended in
+# the log, and the engine holds its screen. Once the Observer has judged that
+# end WAITING, the engine is told to settle at the prompt, and the screen
+# reading must follow that judgement. The premise waits are generous, so a
+# loaded host (other jobs share it) does not fail the setup; they return as
+# soon as the fact is there. A premise that cannot be set up within them is
+# the harness's failure, not a verdict.
+settle_after_waiting() {
+    stopped=$(q "select max(session_seq) from spawn_events
+                  where session_id = '$session' and event_name = 'turn.stopped'")
+    wait_for 45 waiting_after_stop ||
+        harness "premise: the worker was never judged WAITING after the turn that wrote $1 ended, so its screen could not settle after that judgement ($(explain))"
+    first_waiting=$(q "select min(session_seq) from spawn_events
+                        where session_id = '$session' and source = 'observer'
+                          and event_name = 'observation.recorded' and session_seq > $stopped
+                          and kind -> 'detail' -> 'observation' ->> 'state' = 'WAITING'")
+    : >"$WORK/settle.$1" || harness "cannot tell the engine to settle its screen"
+    wait_for 30 engine_settled "$1" ||
+        harness "premise: the engine did not settle its screen within 30 s of being told (turn that wrote $1; engine log: $(tail -n 3 "$WORK/engine.log" | tr '\n' ' '))"
+    # The screen settled after the judgement: its reading is a fact the Bridge
+    # records, after that judgement.
+    wait_for 30 screen_after ||
+        fail "no screen reading recorded after the WAITING judgement that followed the turn's end: the screen settling at the prompt is a fact and is recorded ($(explain))"
+}
+settle_after_waiting one.txt
 
 # --- (1) the judgement covers the latest fact -------------------------------------
 
@@ -425,6 +440,9 @@ assert_eq "$(q "select count(*) from spawn_commands where session_id = '$session
 # --- (3) no churn while nothing happens -------------------------------------------
 
 wait_for 30 turn_ended_after_busy || harness "the busy turn of task $task2 never ended"
+# The same order again, so the screen reading is in the log before the idle
+# window starts.
+settle_after_waiting two.txt
 wait_for 30 is_state "$task2" reported ||
     fail "(2) the second report was not collected within 30 s ($(explain))"
 wait_for 15 covered WAITING ||
