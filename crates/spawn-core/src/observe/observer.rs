@@ -298,6 +298,19 @@ impl Observer {
         self.catch_up()
     }
 
+    /// When the loop must run [`Self::tick`] again even if the log has not
+    /// moved: the earliest time a session's own schedule waits for (its
+    /// facts settling, a recheck of a running execution, a judge's backoff),
+    /// on this clock. `None`: nothing waits on the clock.
+    pub fn next_due_ms(&self) -> Option<i64> {
+        let now = self.clock.now();
+        self.sessions
+            .values()
+            .filter_map(|tracked| tracked.due_at(now))
+            .map(|at| at.0)
+            .min()
+    }
+
     /// Read new events and classify changed or due sessions.
     ///
     /// Returns the number of observations written.
