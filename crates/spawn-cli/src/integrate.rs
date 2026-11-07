@@ -6329,7 +6329,7 @@ mod base_disagrees_tests {
         .expect("a mission");
         assert_eq!(
             host_wait(&waiting, 4, due - 8_000),
-            Some(Duration::from_millis(8_000))
+            Some(Duration::from_secs(8))
         );
         assert_eq!(host_wait(&waiting, 4, due), None, "due: judged again");
         assert_eq!(host_wait(&waiting, 5, 0), None, "another task's");
