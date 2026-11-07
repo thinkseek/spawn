@@ -16,6 +16,7 @@ pub mod root;
 pub mod tmux;
 pub mod transcripts;
 pub mod tree_path;
+pub mod watch;
 
 #[cfg(test)]
 mod audit;
@@ -30,3 +31,4 @@ pub use git::{
 pub use root::canonical_root;
 pub use tmux::TmuxHost;
 pub use transcripts::{LocalTranscriptArchive, TRANSCRIPT_DIRECTORY};
+pub use watch::InotifyWatch;
