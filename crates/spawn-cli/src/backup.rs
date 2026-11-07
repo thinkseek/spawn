@@ -324,8 +324,8 @@ impl Settings {
         let alert_bytes = megabytes("SPAWN_BACKUP_R2_ALERT_MB", DEFAULT_ALERT_MB)?;
         if alert_bytes > limit_bytes {
             return Err(format!(
-                "SPAWN_BACKUP_R2_ALERT_MB ({} bytes) is above SPAWN_BACKUP_R2_LIMIT_MB ({} bytes)",
-                alert_bytes, limit_bytes
+                "SPAWN_BACKUP_R2_ALERT_MB ({alert_bytes} bytes) is above \
+SPAWN_BACKUP_R2_LIMIT_MB ({limit_bytes} bytes)"
             ));
         }
         let transcript_days = match env_value("SPAWN_BACKUP_TRANSCRIPT_DAYS") {
@@ -426,13 +426,19 @@ impl Drop for Scratch {
     }
 }
 
+/// Bytes as lower-case hex digits.
+#[allow(clippy::format_collect)]
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Hex digits from the system's random device.
 fn random_hex(bytes: usize) -> Result<String, String> {
     let mut buffer = vec![0u8; bytes];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut buffer))
         .map_err(|error| format!("/dev/urandom: {error}"))?;
-    Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(hex(&buffer))
 }
 
 /// sha256 of a file.
@@ -450,7 +456,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(hex(&hasher.finalize()))
 }
 
 /// The MD5 of a file, as S3's ETag spells it: computed here so no tool or
@@ -516,13 +522,11 @@ pub(crate) fn md5_hex(bytes: &[u8]) -> String {
         c0 = c0.wrapping_add(c);
         d0 = d0.wrapping_add(d);
     }
-    let mut out = String::with_capacity(32);
-    for word in [a0, b0, c0, d0] {
-        for byte in word.to_le_bytes() {
-            out.push_str(&format!("{byte:02x}"));
-        }
+    let mut bytes = [0u8; 16];
+    for (index, word) in [a0, b0, c0, d0].into_iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
-    out
+    hex(&bytes)
 }
 
 /// A UTC time as `YYYYMMDD-HHMMSS` and the fields a tier decision needs.
@@ -689,8 +693,7 @@ pub(crate) fn copy_events(text: &str) -> (i64, i64) {
                 let columns = line
                     .split_once('(')
                     .and_then(|(_, rest)| rest.split_once(')'))
-                    .map(|(inner, _)| inner)
-                    .unwrap_or("");
+                    .map_or("", |(inner, _)| inner);
                 column = columns
                     .split(',')
                     .position(|name| name.trim() == "id")
@@ -795,6 +798,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
 }
 
 /// `spawn backup dump`: one encrypted copy of the log, now.
+#[allow(clippy::too_many_lines)]
 fn dump(flags: &Flags) -> Result<i32, String> {
     let started = Instant::now();
     let settings = match Settings::from_env(flags) {
@@ -832,8 +836,7 @@ fn dump(flags: &Flags) -> Result<i32, String> {
         .collect();
     let newest_good = prior
         .iter()
-        .filter(|(_, _, _, suspect)| !suspect)
-        .next_back()
+        .rfind(|(_, _, _, suspect)| !suspect)
         .map(|(_, events, bytes, _)| (*events, *bytes));
 
     let scratch = Scratch::new("backup-dump")?;
@@ -1102,16 +1105,12 @@ fn bucket_request(settings: &Settings, url: &str, options: &str) -> Result<Respo
         headers_file.display(),
         options
     );
-    let mut secret = String::new();
-    secret.push_str("silent\nshow-error\n");
-    secret.push_str(&format!(
-        "user = \"{}:{}\"\n",
+    let secret = format!(
+        "silent\nshow-error\nuser = \"{}:{}\"\naws-sigv4 = \"aws:amz:auto:s3\"\n\
+max-time = \"600\"\nconnect-timeout = \"20\"\n{config}",
         escape_config(&settings.r2.access_key),
         escape_config(&settings.r2.secret_key)
-    ));
-    secret.push_str("aws-sigv4 = \"aws:amz:auto:s3\"\n");
-    secret.push_str("max-time = \"600\"\nconnect-timeout = \"20\"\n");
-    secret.push_str(&config);
+    );
     let mut command = Command::new("curl");
     command
         .arg("--config")
@@ -1373,6 +1372,7 @@ fn source_name(source: &str, taken: &mut BTreeSet<String>, index: usize) -> Stri
 
 /// `spawn backup bundle`: the mission sources and the transcript archive, a
 /// full bundle or an increment of its base.
+#[allow(clippy::too_many_lines)]
 fn bundle(flags: &Flags) -> Result<i32, String> {
     let started = Instant::now();
     let settings = match Settings::from_env(flags) {
