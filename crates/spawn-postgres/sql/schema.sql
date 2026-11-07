@@ -3328,7 +3328,7 @@ begin
 end
 $$;
 
-revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds from public;
+revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds, spawn_alerts from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -3353,6 +3353,7 @@ begin
         'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
+        'spawn_alert_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
@@ -3371,7 +3372,8 @@ begin
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
-                   'mission_source_holds to %I', spawn_login_role('spawn_supervisor'));
+                   'mission_source_holds, spawn_alerts to %I',
+                   spawn_login_role('spawn_supervisor'));
 end
 $$;
 
