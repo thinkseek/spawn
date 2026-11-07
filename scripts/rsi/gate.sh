@@ -31,7 +31,13 @@
 #   base and so fail on any tree that did not improve, and objective
 #   scenarios (`<digits>.sh`) the base fails too: an objective nobody has
 #   solved yet is not a regression, and must not block unrelated work.
-#   `check-*` scenarios are invariants and always must pass.
+#   `check-*` scenarios are invariants and always must pass. A check that
+#   fails on the candidate is run again there; one that fails twice is run
+#   on the base: passing there, it is a regression (rejected); failing there
+#   too, it is no verdict on the candidate (a host or harness fault, as a
+#   harness error on the base: exit 4). One that passes the second time is
+#   a flake, said in the log, and the gate goes on ("Checks run twice"
+#   below).
 #
 # Exit-code contract for objective scenarios and the task scenario: 0 =
 # pass, 1 = an assertion failed, anything else = a harness error (a missing
@@ -1708,6 +1714,7 @@ if [ "$base_misses" -gt 0 ]; then
         echo "gate: cannot copy the base's spawn for its scenarios" >&2
         exit 3
     fi
+    : >"$work/base-built"
     stage_close ok
 fi
 phase_start
@@ -1817,19 +1824,104 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; th
 fi
 
 # The candidate's scenarios, N at a time: the task scenario first, then
-# every other but the ratchets, in order. The first failure in that order
-# decides, as in the serial gate.
-# candidate_job <job>: one run, in the background.
+# check-tests.sh (the regression most often decisive, so a failure there
+# stops the rest early), then every other but the ratchets, in order. The
+# first failure in that order decides, as in the serial gate.
+#
+# Checks run twice. A `check-*` scenario holds for every tree, so one failing
+# run is evidence of the candidate or of the host (a starved loop, a slow
+# disk: task 127's 85-minute gate was rejected by one e2e run that the same
+# tree passes). A failing check is run again on the candidate, in the same
+# slot; failing twice, it is run once on the base, built for it if the base
+# phase did not (every base result cached). The base run comes after
+# candidate code ran on the shared test server, so it can only spare the
+# candidate a rejection by aborting the gate, never accept it:
+# - passes the second time: a flake, not a regression (said in the log);
+# - fails twice, passes on the base: a regression, rejected as before;
+# - fails twice and on the base: no verdict on the candidate, a host or
+#   harness fault: the gate aborts (exit 4), as for a harness error on the
+#   base, and the integrator judges the task again later.
+# The first run's block keeps its header, so the integrator reads
+# check-tests' failures from the first run (integrate/host.rs `section`).
+# candidate_job <job>: one scenario on the candidate (its runs), in the
+# background.
 candidate_job() {
     job=$1 job_part=0
-    job_say "| == $(cat "$job/section")"
+    run_name=$(cat "$job/section")
+    job_scenario=$(cat "$job/scenario")
+    job_say "| == $run_name"
     run_at=$(stage_now)
     run_status=0
-    job_run "$job" 1 "$work/candidate" "$(cat "$job/scenario")" || run_status=$?
+    job_run "$job" 1 "$work/candidate" "$job_scenario" || run_status=$?
     job_output 1
-    echo "$(($(stage_now) - run_at))" >"$job/ms"
+    is_check=""
+    case "$(basename "$job_scenario")" in check-*) is_check=1 ;; esac
+    if [ -n "$is_check" ] && [ "$run_status" -ne 0 ]; then
+        job_stage "$(($(stage_now) - run_at))" "exit $run_status" "$run_name"
+        job_say "| == $run_name (again: a failing check runs twice)"
+        run_at=$(stage_now)
+        again=0
+        job_run "$job" 2 "$work/candidate" "$job_scenario" || again=$?
+        job_output 2
+        if [ "$again" -eq 0 ]; then
+            job_say "| $(basename "$job_scenario") failed once ($run_status) and passed again on the candidate: a flake, not a regression"
+            run_status=0
+        else
+            again_ms=$(($(stage_now) - run_at))
+            job_stage "$again_ms" "exit $again" "$run_name (again)"
+            run_at=$(stage_now)
+            base_name="base: $(basename "$job_scenario") (it failed twice on the candidate)"
+            job_say "| == $base_name"
+            if ! base_ready; then
+                job_say "| the base cannot be built to run it: no verdict on the candidate"
+                run_status=abort
+            else
+                on_base=0
+                job_run "$job" 3 "$work/baseline" "$job_scenario" || on_base=$?
+                job_output 3
+                job_stage "$(($(stage_now) - run_at))" "exit $on_base" "$base_name"
+                if [ "$on_base" -eq 0 ]; then
+                    job_say "| $(basename "$job_scenario") passes on the base and failed twice on the candidate: a regression"
+                    run_status=$again
+                else
+                    job_say "| $(basename "$job_scenario") fails on the base too ($on_base): a host or harness fault, no verdict on the candidate"
+                    run_status=abort
+                fi
+                run_name=$base_name
+            fi
+        fi
+    fi
+    # The last run's time; a check that failed twice has a stage line for
+    # each of its runs already, so its verdict's line adds none.
+    if [ -n "${again_ms-}" ]; then
+        echo 0 >"$job/ms"
+    else
+        echo "$(($(stage_now) - run_at))" >"$job/ms"
+    fi
+    echo "$run_name" >"$job/last"
     job_done "$run_status"
 }
+# base_ready: the base built and its spawn copied, once for the gate (a
+# check's base run may be the first the gate needs, from several jobs at
+# once: one builds while the others wait on its lock, which a killed job
+# releases; without flock, as for the base cache's lock, they do not wait).
+# 0 = ready.
+base_ready() {
+    if command -v flock >/dev/null 2>&1 && { command exec 7>>"$work/base-build.lock"; } 2>/dev/null; then
+        flock 7
+    fi
+    if [ ! -e "$work/base-built" ]; then
+        if build "$work/baseline" >"$work/base-build.out" 2>&1 &&
+            snapshot_bin "$work/baseline" >>"$work/base-build.out" 2>&1; then
+            : >"$work/base-built"
+        else
+            sed 's/^/| /' "$work/base-build.out" | tail -n 20 >>"$job/text.$job_part"
+        fi
+    fi
+    exec 7>&-
+    [ -e "$work/base-built" ]
+}
+
 # decisive <job>: 0 when its failure is the verdict: the task scenario's, or
 # a regression's (an objective the base did not leave unsolved).
 decisive() {
@@ -1851,6 +1943,12 @@ candidate_printed() {
         phase_time candidate
         echo "gate: the gate could not run $(basename "$printed_scenario") on the candidate" >&2
         exit 3
+    fi
+    if [ "$printed_status" = abort ]; then
+        run_stage "aborted|$(cat "$1/last")" "$printed_ms"
+        phase_time candidate
+        echo "| $(basename "$printed_scenario") fails on the candidate and on the base: the gate aborts (no verdict)"
+        exit 4
     fi
     if [ -e "$1/task" ]; then
         # The metric is the scenario's: one line on its stdout. Stderr is
@@ -1896,9 +1994,11 @@ if [ -n "$scenario" ]; then
     add_candidate_job "$scenario" "candidate: $(basename "$scenario") must pass"
     : >"$job/task"
 fi
-for other in "$scenarios"/*.sh; do
+for other in "$scenarios"/check-tests.sh "$scenarios"/*.sh; do
     [ -f "$other" ] || continue
     [ "$other" = "$scenario" ] && continue
+    [ "$other" = "$scenarios/check-tests.sh" ] && [ -n "${tests_queued-}" ] && continue
+    [ "$other" = "$scenarios/check-tests.sh" ] && tests_queued=1
     grep -q '^# rsi: ratchet' "$other" && continue
     add_candidate_job "$other" "regression: $(basename "$other") must still pass"
 done
