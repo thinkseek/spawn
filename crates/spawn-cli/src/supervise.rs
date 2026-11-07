@@ -404,7 +404,7 @@ task; when it is finished, write `{REPORT}` once, with everything done (draft an
 
 #[cfg(test)]
 mod tests {
-    use super::{Charter, Revive, charter, decide};
+    use super::{Charter, Revive, charter, decide, next_due};
     use spawn_postgres::LivenessFacts;
 
     /// The hash a start records names the text it gave: the same text, the
