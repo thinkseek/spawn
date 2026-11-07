@@ -1002,7 +1002,13 @@ fn assign(
     .map_err(|error| format!("objective prior work: {error}"))?;
     let scenario = Path::new(&mission.gate).join(format!("{:03}.sh", task.id));
     let scenario = scenario.is_file().then(|| scenario.display().to_string());
-    let text = brief(task, landed_value(task, landings), &prior, &history, continues);
+    let text = brief(
+        task,
+        landed_value(task, landings),
+        &prior,
+        &history,
+        continues,
+    );
     let assigned = store
         .objective_assign_continuing(
             mission.id,
@@ -1020,7 +1026,10 @@ fn assign(
             task.id,
             overrun.task,
             overrun.branch,
-            overrun.commit.as_deref().unwrap_or("no commit (the push failed)")
+            overrun
+                .commit
+                .as_deref()
+                .unwrap_or("no commit (the push failed)")
         ),
         None => println!(
             "integrate: mission {} objective {} -> task {assigned}",
@@ -1112,7 +1121,14 @@ mod tests {
         ];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &untried(), &BTreeSet::new(), 3)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                3
+            )),
             vec![1, 2, 3],
             "lowest first"
         );
@@ -1120,7 +1136,14 @@ mod tests {
         let solved = [landing(1, None)];
         let flying = BTreeSet::from([2]);
         assert_eq!(
-            ids(&choose(&backlog, &solved, &flying, &untried(), &BTreeSet::new(), 3)),
+            ids(&choose(
+                &backlog,
+                &solved,
+                &flying,
+                &untried(),
+                &BTreeSet::new(),
+                3
+            )),
             vec![3, 4]
         );
         // No free slot, nothing.
@@ -1128,7 +1151,14 @@ mod tests {
         // Fewer open objectives than slots: only those.
         let three_solved = [landing(1, None), landing(2, None), landing(3, None)];
         assert_eq!(
-            ids(&choose(&backlog, &three_solved, &none, &untried(), &BTreeSet::new(), 3)),
+            ids(&choose(
+                &backlog,
+                &three_solved,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                3
+            )),
             vec![4]
         );
     }
@@ -1143,12 +1173,26 @@ mod tests {
         )];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &missed, &none, &untried(), &BTreeSet::new(), 2)),
+            ids(&choose(
+                &backlog,
+                &missed,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                2
+            )),
             vec![1, 2]
         );
         let flying = BTreeSet::from([1]);
         assert_eq!(
-            ids(&choose(&backlog, &missed, &flying, &untried(), &BTreeSet::new(), 2)),
+            ids(&choose(
+                &backlog,
+                &missed,
+                &flying,
+                &untried(),
+                &BTreeSet::new(),
+                2
+            )),
             vec![2]
         );
     }
@@ -1300,7 +1344,10 @@ mod tests {
             ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 5)),
             vec![25, 26, 21, 23, 19]
         );
-        assert_eq!(ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 1)), vec![25]);
+        assert_eq!(
+            ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 1)),
+            vec![25]
+        );
     }
 
     /// Three slots held by three objectives at the limit: the tasks being
@@ -1350,7 +1397,14 @@ mod tests {
         }
         let backlog: Vec<Task> = [19, 21, 23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &after, &BTreeSet::new(), 3)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &after,
+                &BTreeSet::new(),
+                3
+            )),
             vec![25, 26, 19]
         );
 
@@ -1397,7 +1451,10 @@ mod tests {
             .map(|id| objective(id, false))
             .to_vec();
         let flying = BTreeSet::from([19, 21]);
-        assert_eq!(ids(&choose(&backlog, &[], &flying, &tried, &BTreeSet::new(), 1)), vec![25]);
+        assert_eq!(
+            ids(&choose(&backlog, &[], &flying, &tried, &BTreeSet::new(), 1)),
+            vec![25]
+        );
         // Had 127 been sent back to revise, it would yield as well, and 026
         // take its slot.
         let sent_back = mission(3, &[(127, 19, "revise"), (106, 21, "reported")]);
@@ -1407,7 +1464,14 @@ mod tests {
             [127]
         );
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::from([21]), &tried, &BTreeSet::new(), 2)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::from([21]),
+                &tried,
+                &BTreeSet::new(),
+                2
+            )),
             vec![25, 26]
         );
     }
@@ -1495,7 +1559,14 @@ mod tests {
         );
         let backlog: Vec<Task> = [23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &tried, &BTreeSet::new(), 3)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &tried,
+                &BTreeSet::new(),
+                3
+            )),
             vec![26, 23, 25],
             "the untried first, then the yielded"
         );
@@ -1523,14 +1594,38 @@ mod tests {
         let backlog = vec![objective(28, false), objective(29, false), later, gone];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &untried(), &BTreeSet::new(), 4)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                4
+            )),
             vec![28, 29]
         );
         let one = [landing(28, None)];
-        assert_eq!(ids(&choose(&backlog, &one, &none, &untried(), &BTreeSet::new(), 4)), vec![29]);
+        assert_eq!(
+            ids(&choose(
+                &backlog,
+                &one,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                4
+            )),
+            vec![29]
+        );
         let both = [landing(29, None), landing(28, None), landing(22, None)];
         assert_eq!(
-            ids(&choose(&backlog, &both, &none, &untried(), &BTreeSet::new(), 4)),
+            ids(&choose(
+                &backlog,
+                &both,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                4
+            )),
             vec![30, 32]
         );
 

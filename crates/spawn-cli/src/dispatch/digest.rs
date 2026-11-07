@@ -246,14 +246,14 @@ pub(crate) fn over_budget_escalations(records: &[Value]) -> Vec<Escalation> {
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
-            let objective = record["objective"]
-                .as_u64()
-                .map_or_else(|| "an objective".to_string(), |id| format!("objective {id}"));
-            let branch = record["branch"].as_str().unwrap_or("its branch");
-            let commit = record["commit"].as_str().map_or_else(
-                || "none (its push failed)".to_string(),
-                str::to_string,
+            let objective = record["objective"].as_u64().map_or_else(
+                || "an objective".to_string(),
+                |id| format!("objective {id}"),
             );
+            let branch = record["branch"].as_str().unwrap_or("its branch");
+            let commit = record["commit"]
+                .as_str()
+                .map_or_else(|| "none (its push failed)".to_string(), str::to_string);
             let diff = record["diff"]
                 .as_str()
                 .map(str::trim)

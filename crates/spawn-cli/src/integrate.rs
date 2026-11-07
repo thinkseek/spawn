@@ -1703,7 +1703,10 @@ impl Integrator {
                 overrun["pushed"] = json!(false);
             }
             record(store, &overrun)?;
-            println!("integrate: task {} over its budget, its work kept on {branch}: {reason}", task.id);
+            println!(
+                "integrate: task {} over its budget, its work kept on {branch}: {reason}",
+                task.id
+            );
             if commit.is_none() {
                 eprintln!(
                     "integrate: task {}: its work never reached {branch} (the push failed): its \
@@ -3087,7 +3090,10 @@ fn kept_work(store: &PostgresStore, mission: &Mission, task: &Task) -> Result<Ke
     else {
         return Ok(Kept::Lost { branch });
     };
-    let commit = checkpoint["commit"].as_str().unwrap_or_default().to_string();
+    let commit = checkpoint["commit"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let at_ms = checkpoint["at_ms"].as_i64().unwrap_or_default();
     if commit.is_empty() {
         return Ok(Kept::Lost { branch });
@@ -7139,7 +7145,10 @@ mod database_tests {
     /// The task a continuation continues, as the store folded it.
     fn continues_of(db: &Db, task: i64) -> Option<i64> {
         db.admin()
-            .query_one("select continues from mission_tasks where id = $1", &[&task])
+            .query_one(
+                "select continues from mission_tasks where id = $1",
+                &[&task],
+            )
             .expect("the task")
             .get(0)
     }
