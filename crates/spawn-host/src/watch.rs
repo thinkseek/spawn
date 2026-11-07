@@ -145,12 +145,12 @@ impl InotifyWatch {
         let previous = state
             .wanted
             .insert((key.to_string(), path.to_string()), anchor.clone());
-        if previous.is_some_and(|previous| previous != anchor) {
-            if let Some(previous) = previous {
-                self.release(state, key, &previous);
-            }
+        if let Some(previous) = previous
+            && previous != anchor
+        {
             // The change that moved the watch may have landed in the
             // directory just joined: it is due once more.
+            self.release(state, key, &previous);
             state.recheck.insert(key.to_string());
         }
         Ok(())
