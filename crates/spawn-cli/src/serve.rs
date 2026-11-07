@@ -56,6 +56,7 @@
 
 mod answers;
 mod attention;
+mod labels;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -1010,12 +1011,15 @@ fn now_ms() -> i64 {
 /// first lines, each with its length in bytes (`brief_bytes`, ...); a
 /// closed mission's or a cancelled task's report is its length alone
 /// ([`answers::slim_board`]). The texts in full are
-/// `/api/missions/task/<id>`.
+/// `/api/missions/task/<id>`. Each mission carries its `mission_name`, each
+/// task its `label`, `task_title` and `mission_name`, each resident its
+/// `label` ([`labels`]).
 fn missions() -> Result<Value, String> {
     let store = open_store()?;
     let mut board = store.mission_board(50).map_err(err)?;
     let gates = store.last_gates().map_err(err)?;
     with_last_gates(&mut board, &gates);
+    labels::label_board(&mut board);
     answers::slim_board(&mut board);
     Ok(board)
 }
@@ -1067,7 +1071,8 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///   "generated_at_ms": 1793766328633,
 ///   "halt_after": 3,                      // rejections (or aborts) in a row that halt
 ///   "missions": [{                        // open objective missions, by id
-///     "id": 4, "text": "...", "state": "open", "sources": ["..."],
+///     "id": 4, "text": "...", "mission_name": "Spawn RSI",
+///     "state": "open", "sources": ["..."],
 ///     "gate": "/.../rsi/scenarios", "accept": "gate",
 ///     "budget": {"minutes": 45, "tool_calls": 60} | null,
 ///     "baseline": "<commit>" | null,      // where the last landing left main
@@ -1075,7 +1080,8 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///     "scenario_floor": 7, "gate_rejections": 0, "gate_aborts": 0,
 ///     "backlog": "/.../rsi/backlog" | null,
 ///     "backlog_error": "<why it could not be read>" | null,
-///     "resident": {"name", "agent_id", "session_id", "state"} | null,
+///     "resident": {"name", "agent_id", "session_id", "state", "label",
+///                  "task_title", "mission_name"} | null,
 ///     "next_objective": 3 | null,         // what the integrator assigns next
 ///     "objectives": [{                    // the backlog, by id
 ///       "id": 2, "title": "...", "prompt": "...", "recurring": true,
@@ -1091,7 +1097,8 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 ///       }]
 ///     }],
 ///     "tasks": [{                         // newest first
-///       "id", "kind", "agent_id", "session_id", "state", "revisions",
+///       "id", "label", "task_title", "mission_name",   // labels.rs
+///       "kind", "agent_id", "session_id", "state", "revisions",
 ///       "objective", "candidate", "base", "metric", "scenario", "brief",
 ///       "review_note", "created_by", "created_at_ms", "delivered_at_ms",
 ///       "updated_at_ms",
@@ -1125,6 +1132,7 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 fn rsi_overview() -> Result<Value, String> {
     let store = open_store()?;
     let mut missions = objective_missions(&store)?;
+    labels::label_rsi(&mut missions);
     answers::slim_rsi(&mut missions);
     Ok(json!({
         "generated_at_ms": now_ms(),
@@ -1382,7 +1390,8 @@ fn rsi_pane(query: &str) -> Result<Value, String> {
     Ok(body)
 }
 
-/// The fleet board: every session with its judgement and activity, plus
+/// The fleet board: every session with its judgement, activity and label
+/// (`label`, `task_title`, `mission_name`: [`labels`]), plus
 /// fleet health, the decision ladder and each gated mission's gate-room
 /// waits. Computed by SQL from storage, except what the host has now, read
 /// at this request: the health's `disk` (free space, [`crate::disk::report`])
@@ -1392,10 +1401,19 @@ fn fleet() -> Result<Value, String> {
     let mut health = store.fleet_health().map_err(err)?;
     health["disk"] = crate::disk::report(&store.host_disk().map_err(err)?);
     health["memory"] = crate::memory::report();
+    let mut agents = store.fleet_board().map_err(err)?;
+    labels::label_fleet(&mut agents, &label_context(&store)?);
     Ok(json!({
-        "agents": store.fleet_board().map_err(err)?,
+        "agents": agents,
         "health": health,
     }))
+}
+
+/// What the fleet board and the attention queue label their agents with
+/// ([`labels`]): the missions, their tasks and the residents.
+fn label_context(store: &spawn_postgres::PostgresStore) -> Result<labels::Context, String> {
+    let facts = store.label_facts().map_err(err)?;
+    Ok(labels::Context::from_board(&facts, &labels::Titles::new()))
 }
 
 /// `/api/fleet/<session>/judgements` and `/api/fleet/<session>/commands`.
@@ -2518,6 +2536,7 @@ mod tests {
             unit: "ns".to_string(),
             lower_is_better: true,
             target: recurring.then_some(1100.0),
+            after: Vec::new(),
         }
     }
 

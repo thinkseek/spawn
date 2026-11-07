@@ -8,7 +8,7 @@ The north-star metric is human interventions per agent-hour, at a given
 throughput (tasks completed, scenarios passed). Every part below exists to
 push that number down, and to do it with the system itself as the improver.
 
-Three ideas carry the design:
+Four ideas carry the design:
 
 1. **A decision ladder.** Every judgement and every action goes to the
    cheapest tier that can decide it with confidence:
@@ -25,6 +25,8 @@ Three ideas carry the design:
 3. **RSI consumes the experience.** The system improves its own code through
    gated missions (§10.4). The objectives that would move decisions down the
    ladder by replaying recorded episodes are not built (§9).
+4. **Synchronization points.** Work runs in parallel and joins only at
+   named points, where a record says exactly what it covers (§1.1).
 
 ## 1. Layers
 
@@ -61,6 +63,62 @@ No layer calls another layer's process directly; they meet in the log.
 | 3 Observation | Observer: rules first, then the model judge (Jev) on ambiguity; without a Jev URL, the rules alone |
 | 4 Control | dispatcher and liveness rule (in `spawn loop`), supervisor session, integrator (`spawn integrate`) |
 | 5 Interface | `spawn serve` (API and web UI: reads, and one write, a person's input to a session), the `spawn` CLI |
+
+### 1.1 Synchronization points
+
+Work runs in parallel between synchronization points and joins only at
+them. A synchronization point is where work changes hands: the points
+are named in the table below, one row per hand-off. Between two points no one waits on another's
+progress; all waiting happens at a point (a landing that waits for a hold to
+end or for its turn, §10.3, waits at the Gate). At a point nothing moves on
+until a record names exactly what it covers (the task, the report's
+revision, the commit) and who decided. A loop that moves on from inferred
+progress (a quiet pane, a status that looks done) instead of such a
+record is a defect, wherever it is. A file becomes a record only through
+the one who reads it: a worker's `.spawn/report.md` counts once the
+dispatcher has stored it as `task.reported`.
+
+Two terms used below. The *lead* is the session that decides for a
+mission's owner: Spawn's supervisor, or the owner's own supervising
+session. A *ccd* is a Claude Code session run interactively with
+`claude --dangerously-skip-permissions` (never print mode).
+
+| Point | Joins | Moves on when | Record | Decided by | Enforced today |
+| --- | --- | --- | --- | --- | --- |
+| Brief | asker → worker | the task names its goal, inputs and done criteria, and is delivered once its worker has reported its previous task (§3.2) | `task.assigned`, then `task.delivered` | supervisor, the integrator for objective tasks (§10.4), or the owner | the records, and a brief that is not empty; its content is not checked. The base is the agent's latest `artifact.committed` at delivery (`reason` `base_merged` when the delivery merged `main`), or `execution.started` `fork.commit` for a branch the start created; it is not in `task.assigned` |
+| Review | worker → reviewer | a verdict names the task, the report's revision and the commit it read | review verdict | a ccd session that did not write the work | not in code: the lead runs it, outside the log (§9) |
+| Accept | report → mission | in a review-mode mission, the accept or reject names the revision it judged | `task.reviewed` (§10.3) | supervisor, or the owner | the revision check when `--revision` is given, a note on every send-back, and a refusal in a gate-mode mission; citing a review verdict is not checked (§9) |
+| Gate, fleet | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit, by compare-and-swap | `task.gated`, `task.landed` (§10.2, §10.3) | integrator | yes |
+| Gate, owner work | owner's checkout → candidate | the owner's gate names the candidate and the base it judged against (the missions' `main`) | the gate's verdict file | the owner's gate | only at Deploy: accepted owner work reaches the owner's checkout before any gate |
+| Deploy | candidate → `main` and live | the verdict is `accepted`, its candidate is HEAD, its base is the missions' `main`, and the tree is clean | `source.moved` when `main` moves (`spawn mission moved`, §10.3) | `deploy/deploy.sh` | yes, by `deploy/deploy.sh` |
+| Publish | owner's checkout → remote | the pushed commit passed its gate and a secret scan | the push | owner | by the owner's procedure, not by code |
+
+**The review.** A report gets a review before it moves on: in a
+review-mode mission before it is accepted, in a gate-mode mission before
+its gate runs (the cheap check first, the gate after). The reviewer is a
+ccd that did not write the work, and it starts from the brief, the diff and the report,
+never from the author's conversation. It checks two things:
+
+- *Completion quality.* Every done criterion in the brief is met and shown
+  (a test, a command and its output), not only claimed. The diff touches
+  only what the brief needs. Changed behaviour has tests. Nothing is left
+  half done: no TODO, no skipped or weakened test, no disabled check. The
+  report matches the diff.
+- *Efficiency.* What the work cost (elapsed time, turns, deliveries, restarts,
+  rejected attempts, model spend) against the size of the change. It also
+  looks for loops (the same failing command again and again), wandering
+  outside the brief, and work redone that already existed. An efficiency
+  finding never rejects correct work: it goes into experience, and into the
+  briefs and routing rules that caused it.
+
+The verdict is `pass`, `fix` (concrete defects, each with `file:line` and how
+it fails) or `reject`. It holds for the revision and commit it names and no
+other: a report sent back and revised needs a new review. Several review
+sessions may run at once. The lead works with them as peers, one subject per session. The
+lead's own commits pass the same point: a session other than the lead
+reviews them. Today the lead runs reviews for owner work (missions 7 and 8)
+and for everything it merges, gates or deploys; for the fleet's other
+reports the Review point is not built (§9).
 
 ## 2. Observation: rules first, Jev on ambiguity
 
@@ -930,6 +988,11 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
+- **The Review point in code** (§1.1). Review sessions are run by the lead
+  and their verdicts are kept outside the log. No record type holds a
+  verdict, `spawn task accept` does not require one on the report's
+  revision, and a gate-mode mission's integrator gates a report without
+  one.
 
 ## 10. One log, one landing path
 
@@ -944,9 +1007,10 @@ controller. Missions, tasks, residents and landings are events in
   `control.recorded`, whose detail is `{type, ...}`. A new record type adds
   no `EventKind` variant.
 - **Record types:** `mission.added`, `mission.configured`, `mission.closed`,
-  `mission.halted`, `mission.resumed`, `source.moved`, `task.assigned`,
+  `mission.halted`, `mission.resumed`, `source.moved`, `source.held`,
+  `source.released`, `source.hold_expired`, `task.assigned`,
   `task.delivered`, `task.report_unfinished`, `task.reported`,
-  `task.reviewed`, `task.cancelled`, `task.gated`, `task.landed`,
+  `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
   `task.aborted`, `resident.proposed`, `resident.approved`,
   `resident.retired`, `legacy.imported`, `host.disk`,
   `source.push_requested`, `source.push_refused` (§10.3, "The owner's
@@ -1066,16 +1130,63 @@ record of what was judged (§14 of design.md).
 
 - **Mission settings** (`spawn mission configure`, owner only): a gate (a
   scenarios directory in the controller, the deployed tree), how tasks are accepted,
-  and an optional budget:
+  an optional budget, and objectives (§10.4). `configure` changes only the
+  settings it is given and keeps every other as the mission has it
+  (objective 027): `spawn_mission_reconfigure` reads the mission's row
+  under the append lock, merges the change into it (the gate and accept
+  replaced, the budget's and the objectives' fields one by one), checks the
+  result as `spawn_mission_configure` checks any, and records it whole, so
+  `mission.configured` always carries every setting and two configures
+  never lose each other's change. A setting is cleared only by its own
+  switch, which takes no value: `--no-gate`, `--no-budget` (both fields),
+  `--no-minutes`, `--no-tool-calls`, `--no-objectives`, `--no-workers`
+  (back to the default 1). A switch and a value for the same setting, or a
+  flag configure does not know, are refused; a refused call changes
+  nothing. It prints `{mission, before, after}`; a call that leaves the
+  settings as they were (nothing given, or the values they already have)
+  records nothing. Clearing the gate, or moving accept away from `gate`,
+  is refused while a task of the mission is `landing`, naming it (GitHub
+  issue #9: nothing would land it, and `spawn task cancel` refuses
+  `landing`). (2026-11-08: before this, `configure --id 4 --tool-calls 600`
+  replaced every setting of mission 4, dropping its gate, objectives and
+  minutes, and setting accept to review, until the owner restored them.)
+  `spawn mission add` takes the settings whole, for a mission that has none yet:
   - `review`: the supervisor accepts, then the gate runs;
   - `gate`: the gate alone decides. The supervisor is not told of its
-    reports (`mission_news`) and `spawn_task_review` refuses them: a review
-    could send back the revision the gate is judging;
+    reports (`mission_news`) and `spawn_task_review` refuses them, because
+    a review could send back the revision the gate is judging. Both stand
+    until the Review point is built (§1.1, §9);
   - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
     aborted (`task.aborted`) and its worker stopped (the Stop is submitted
     before the record, so a failed record is retried with it; a Stop that
     fails is pursued and escalated by the dispatcher); an abort counts
     toward the abort halt, not as a rejection.
+    The minutes are active time, never the wall clock (`integrate::active_ms`):
+    from the delivery, through each event of the task's session, to now.
+    Readings are no events here: the Bridge re-reads a busy pane every
+    30 s (`screen.observed`, and the observer's `observation.recorded`),
+    also while Claude Code only retries a model API that is down. A gap
+    counts at most `SPAWN_BUDGET_GAP_SECS` (300 by default), and only if it
+    ends in the model's progress: a tool call or background job starting
+    or ending, a turn stopping. A gap that ends in a failed turn, a prompt
+    arriving (`message.received`: a delivery, a nudge, a job's
+    notification), a command (a delivery, a nudge, a resume) or the
+    engine's own events counts nothing: the worker waited. The gap to now
+    counts at most the cap. So a silence of any length or cause (the fleet
+    stopped, the host frozen or rebooted, no live execution, the model API
+    down) adds at most one cap, and no outage can by itself put a task over
+    budget (2026-11-07 23:05: a five-hour stop aborted tasks 113 and 159 by
+    the wall clock). One bound is not the cap: a subagent's job open across
+    a model API outage retries out of the log's sight and, once it fails,
+    ends; its gap counts the fleet's alive time, so up to Claude Code's
+    retry window for a subagent, not the outage's length. The safe side: a
+    model that thinks or streams longer than the cap without a tool call
+    counts the cap.
+    A gap inside a tool call or background job that later
+    ended (a build, a gate in the worker) counts the time the whole fleet
+    was alive in it: the log's gaps between those two events, each capped
+    the same way, since an outage either kills the tool's engine or writes
+    nothing anywhere.
 
   A gate needs a source that is a directory on the integrator's host:
   agents' branches reach no other (storage.md, "Landing"), so a gate on a
@@ -1493,18 +1604,58 @@ record of what was judged (§14 of design.md).
   tasks may be in flight at once. A task is in flight from `task.assigned`
   until it lands or is cancelled (assigned, delivered, revise, reported,
   accepted, landing).
-  - Each integrator pass fills the free slots with the lowest open
-    objectives that have no task in flight: an objective never has two
-    tasks in flight. `spawn_objective_assign` checks both rules again under
-    the append lock, so a second integrator or a stale read cannot
+  - Each integrator pass fills the free slots with the open objectives
+    that have no task in flight (an objective never has two), fewest
+    attempts first: fewest yields, then fewest failed attempts since the
+    last yield, then the lowest id. With no failures this is the lowest open
+    objective, as before. `spawn_objective_assign` checks both rules again
+    under the append lock, so a second integrator or a stale read cannot
     oversubscribe.
+  - **No objective holds a slot for ever.** A failed attempt is an outcome
+    that says the work did not make it: the gate's `rejected`,
+    `incompatible`, or `conflict` when the worker got conflicts to resolve
+    (the record's `merge` is `marked`, `unmarked` or `pending`, or absent on
+    records from before it was named; not `not_mounted`, `busy`, `failed`
+    or a clean merge), or an abort over budget. The host's outcomes
+    (`no_room`, `host_fault`, a gate `aborted`) count for nothing, as for
+    the halt rules, and an `accepted` verdict ends the count. Once an
+    objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3, a whole number from 1)
+    failed attempts since its last yield, its task yields the slot as soon
+    as it is being worked again (assigned, delivered or `revise`; a
+    reported task waits for its gate, whose verdict may land it): the
+    integrator stops its worker (`integrate-yield-<task>`) and records
+    `task.cancelled` with `yielded`, `objective`, `failures`, `limit` and a
+    one-line `reason` (the store adds `by: spawn-integrate` and refuses
+    any other cancel by the integrator). Its work is set aside like any
+    cancel's, no halt counts it, the supervisor's digest tells it once
+    (`missions objective-yielded-<event id>`), and a resident's cancel
+    notice gives the reason. An abort over budget that is the objective's
+    limit-th failed attempt is the yield itself: its `task.aborted` carries
+    `yielded`, the count and a `yield_reason`, and is told the same way
+    (otherwise the objective kept its failures and no yield, sorted ahead,
+    and its next task yielded at once). The objective goes to the back of
+    the queue. A task whose gate runs now, or that this pass
+    aborted, does not yield; the slot an abort frees is filled from the
+    next pass on, fewest attempts first, so the aborted objective is not
+    re-issued at once. Before this, on 2026-11-07, three objectives whose
+    tasks kept failing held mission 4's three slots for a day (an abort was
+    followed by a new task for the same objective five seconds later), and
+    objectives 025 to 034 were never assigned.
+  - **Named order.** A backlog objective may name the objectives it comes
+    after (`"after": [28]` in its JSON, versioned with the backlog): it is
+    not assigned while one of them is open (one the backlog does not hold
+    must have landed). Only 032 names one (after 028, whose wait paths its
+    soak exercises); the owner's preferred order of 028-033 stays prose,
+    since those prompts say each may be solved before or with the others.
   - Who gets which task: the resident takes a task whenever it has none
     open in the mission; every other task goes to a new per-task worker
     (kind `ephemeral`, agent `agent_worker_objective_<task>`, session
     `session_worker_objective_<task>`). It needs no approval, starts from
-    the source's main as it is then, keeps no context, and is stopped by the
+    the source's main as it is then (or from its objective's earlier work,
+    below), keeps no context, and is stopped by the
     dispatcher once its task lands or is cancelled (`retire-task-<id>`). Its
-    report reaches the supervisor's digest like any report. With N = 1 this
+    report reaches the supervisor's digest only in a review-mode mission;
+    a gate-mode mission's reports do not (§10.3). With N = 1 this
     is one task at a time on the resident, as before.
   - Landing stays one at a time per mission: one candidate judged at a
     time, the lowest ready task first, main moved by compare-and-swap.
@@ -1512,12 +1663,51 @@ record of what was judged (§14 of design.md).
     mission that is always ready does not starve another's. A task whose base is
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
-  - Budgets apply per task, from its delivery; the halt rules stay per
+  - Budgets apply per task, in active time from its delivery (§10.3); the halt rules stay per
     mission (three rejections in a row from any of its tasks halt it), and
     a halted mission gets no new task and no judging until a human resumes
     it.
-  - The brief is the objective, the working rules, and the gate verdicts of
-    its recent attempts, read from the log.
+  - The brief is the objective, the working rules, the work its earlier
+    tasks left without landing, and the gate verdicts of its recent
+    attempts, all read from the log at assignment. For each of the last
+    three tasks of the objective that were cancelled, aborted or yielded:
+    its id, its outcome and reason (its last gate verdict, abort or
+    cancel), its last checkpoint (the latest `artifact.committed` of its
+    session while it ran, not a set-aside), and its report, with the
+    instruction to use the reports and not redo what they established (task
+    161 rebuilt 2264 lines that task 155 had mostly written). The brief
+    names no branch: a worker has no `.git` and cannot read one. The first
+    prompt of a forked task (below) says its workspace already contains
+    that work.
+  - **An ephemeral task starts from that work.** When the newest earlier
+    task of its objective that ended without landing left work (a
+    checkpoint of its own while it ran, before its set-aside if it was a
+    resident's), the dispatcher, before the task's Start, creates the
+    worker's branch at that task's last such checkpoint (never the
+    set-aside, nor the merge of main a resident's next delivery put on top
+    of it), and merges main into it the way a worker's delivery does
+    (storage.md, "Main into a workspace"): cleanly, as a `base_merged`
+    checkpoint; or, on a conflict, in the workspace mounted for the merge,
+    with markers where they show, committed (a `base_merged` checkpoint
+    naming no file) so the branch carries them and the Start's mount keeps
+    the pending merge, the workspace unmounted again; a conflict markers
+    cannot show leaves main's copies under `.spawn/main/`, which the
+    Start's mount puts back. The Start's prompt says the workspace already
+    contains that task's work (its commit) and what the merge did (the
+    files it changed, the files with markers to resolve first, or the
+    copies). A checkpoint that holds no change main lacks (in git: nothing
+    between its merge base with main and it) is no work: the task starts
+    from main. A fork that fails holds the Start, so the task does not
+    start from main over work it should continue; its first failure is
+    recorded (`task.fork_failed`, once per task: the predecessor, its
+    commit, the error), and once that record is `SPAWN_FORK_GIVE_UP_SECS`
+    old (300, under the delivery stall's 600) the Start goes without the
+    fork, from the branch as far as the fork got or from main, its prompt
+    saying so and pointing to the brief's reports. With no such earlier
+    work its branch forks from main at the Start, as before; a resident
+    keeps its own branch. (A worker's workspace is an export without
+    `.git`: it cannot read another branch, so the work has to be in its
+    tree.)
   - The task's scenario is `rsi/scenarios/<id>.sh`.
   - A one-shot objective is solved once a task for it lands. A recurring one
     (`recurring`, `metric`, `target`) stays open until the metric of its

@@ -405,6 +405,12 @@ pub(crate) enum Why {
     /// there resumed, and an owner verdict judged against its main may be
     /// stale.
     HoldExpired,
+    /// An objective ran out of attempts and its task yielded the slot to
+    /// the next objective ([`digest::objective_yields`]).
+    ObjectiveYielded,
+    /// An objective mission's backlog names an order that cannot be met
+    /// ([`digest::objective_order`]): a condition until the backlog changes.
+    ObjectiveOrder,
 }
 
 impl Why {
@@ -639,6 +645,10 @@ pub(crate) struct Reading {
 /// supervisor the `deployed` charter if it holds another ([`charter::give`];
 /// `None`: no input, as for a reader that submits nothing). [`step`]
 /// submits what it returns; `GET /api/attention` (crate::serve) shows it.
+/// The tags of the backlog order items this process logged
+/// ([`read_plan`]): each is said once.
+static ORDER_LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
 /// One function for both, so the queue a person reads is the dispatcher's
 /// own.
 pub(crate) fn read_plan(
@@ -668,6 +678,20 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
+    host.extend(digest::objective_yields(
+        store
+            .objective_yields()
+            .map_err(|error| format!("objective yield records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::objective_order(
+        store
+            .objective_backlogs()
+            .map_err(|error| format!("objective backlogs: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
     host.extend(digest::hold_expiries(
         store
             .hold_expiries()
@@ -683,6 +707,16 @@ pub(crate) fn read_plan(
     }
     host.extend(jobs::items(&rows, bounds.job));
     let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    // An order no task can meet is said in the log once per tag, the
+    // first pass that has it untold.
+    if let Ok(mut logged) = ORDER_LOGGED.lock() {
+        lines.extend(
+            plan.pending
+                .iter()
+                .filter(|item| item.why == Why::ObjectiveOrder && logged.insert(item.tag()))
+                .map(|item| format!("dispatch: {}", item.line)),
+        );
+    }
     if let Some(deployed) = deployed.filter(|_| supervised) {
         charter::give(&mut plan, &rows, deployed);
     }
@@ -777,6 +811,19 @@ pub(crate) fn step(
                 }
             }
         }
+        // A re-assigned objective's ephemeral task starts from the work
+        // its predecessor left, with main merged in ([`fork_before`]); a
+        // fork that fails holds the Start until a later pass, so the task
+        // never starts from main over work it should continue.
+        if let Some(root) = root {
+            match fork_before(store, root, &mut order) {
+                Ok(line) => lines.extend(line),
+                Err(error) => {
+                    lines.push(format!("deliver: {error}; tried again next pass"));
+                    continue;
+                }
+            }
+        }
         // A task typed into a live worker starts from the source's main:
         // merged into its idle workspace first, and the brief says what the
         // merge did ([`crate::main_merge`]). A worker found busy at the
@@ -842,6 +889,125 @@ fn set_aside_before(
         }
         _ => None,
     })
+}
+
+/// How long the dispatcher holds a Start whose fork keeps failing, from
+/// its first failure's record, before it starts the task without the fork:
+/// `SPAWN_FORK_GIVE_UP_SECS`, a whole number of seconds from 1 up (300,
+/// under the delivery stall's 600); anything else is the default.
+pub(crate) fn fork_give_up_ms(text: Option<&str>) -> i64 {
+    const DEFAULT: i64 = 300;
+    text.and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT)
+        .saturating_mul(1_000)
+}
+
+/// Fork the branch of the ephemeral objective task `order` starts from
+/// the work its objective's earlier task left without landing, with main
+/// merged in ([`crate::main_merge::fork_from_prior`]), and add to the
+/// Start's prompt what it starts from and what the merge did. Nothing for
+/// any other order, or a task with no such predecessor, or whose
+/// predecessor's checkpoint holds no change of its own (its branch forks
+/// from main at the Start, as before). Returns a log line when it forked.
+///
+/// A fork that fails holds the Start, so the task does not start from
+/// main over work it should continue; its first failure is recorded
+/// (`task.fork_failed`, once per task), and once that record is
+/// [`fork_give_up_ms`] old the Start goes without the fork, its prompt
+/// saying so ([`crate::main_merge::fork_failed_note`]): a fork that can
+/// never succeed does not hold the task's slot for ever (rev-e on a114a9e).
+pub(crate) fn fork_before(
+    store: &std::sync::Arc<PostgresStore>,
+    root: &Path,
+    order: &mut Order,
+) -> Result<Option<String>, String> {
+    let give_up = fork_give_up_ms(crate::config::env_value("SPAWN_FORK_GIVE_UP_SECS").as_deref());
+    fork_before_within(store, root, order, give_up)
+}
+
+/// [`fork_before`], giving up on a failing fork `give_up_ms` after its
+/// first failure.
+pub(crate) fn fork_before_within(
+    store: &std::sync::Arc<PostgresStore>,
+    root: &Path,
+    order: &mut Order,
+    give_up_ms: i64,
+) -> Result<Option<String>, String> {
+    use crate::main_merge::Fork;
+    use std::fmt::Write as _;
+    let CommandAction::Start { prompt, .. } = &mut order.action else {
+        return Ok(None);
+    };
+    let Some(task) = order.task else {
+        return Ok(None);
+    };
+    let prior: Option<crate::main_merge::PriorWork> = serde_json::from_value(
+        store
+            .objective_fork(task)
+            .map_err(|error| format!("task #{task}'s earlier work: {error}"))?,
+    )
+    .map_err(|error| format!("task #{task}'s earlier work: {error}"))?;
+    let Some(prior) = prior else {
+        return Ok(None);
+    };
+    match crate::main_merge::fork_from_prior(
+        store,
+        root,
+        &order.agent_id,
+        &order.session_id,
+        &prior,
+    ) {
+        Ok(Fork::Forked(merge)) => {
+            prompt.push_str("\n\n");
+            prompt.push_str(&crate::main_merge::fork_note(&prior, &merge));
+            Ok(Some(format!(
+                "deliver: task #{task} starts from task #{}'s work {}: main {merge:?}",
+                prior.task, prior.commit
+            )))
+        }
+        Ok(Fork::NoWork) => {
+            prompt.push_str("\n\n");
+            let _ = write!(
+                prompt,
+                "Task #{}'s last checkpoint (commit {}) holds nothing the source's main lacks: \
+                 its work is already in main, and your workspace starts from main.",
+                prior.task, prior.commit
+            );
+            Ok(Some(format!(
+                "deliver: task #{task}: task #{}'s checkpoint {} holds nothing main lacks; it \
+                 starts from main",
+                prior.task, prior.commit
+            )))
+        }
+        Ok(Fork::NoSource) => Ok(None),
+        Err(error) => {
+            let age = store
+                .task_fork_failed(task, prior.task, &prior.commit, &error)
+                .map_err(|failure| format!("{error}; and its record: {failure}"))?;
+            match age {
+                Some(age) if age >= give_up_ms => {
+                    let head = crate::main_merge::branch_head(store, root, &order.agent_id);
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&crate::main_merge::fork_failed_note(
+                        &prior,
+                        &error,
+                        head.as_deref(),
+                    ));
+                    Ok(Some(format!(
+                        "deliver: task #{task} starts without task #{}'s work after its fork \
+                         failed for {} s: {error}",
+                        prior.task,
+                        age / 1_000
+                    )))
+                }
+                _ => Err(format!(
+                    "task #{task}'s Start waits: its fork from task #{}'s work failed: {error}",
+                    prior.task
+                )),
+            }
+        }
+    }
 }
 
 /// Merge main into the workspace of the live worker `order` types a task
@@ -1436,6 +1602,132 @@ mod tests {
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
+        );
+    }
+
+    /// A backlog whose order no task can meet reaches the supervisor as
+    /// one `missions` item per mission and content of the problems: the
+    /// same problems keep their tag (told once), changed ones get a new
+    /// one, a fixed backlog none; the pass's log says it until it is told.
+    #[test]
+    fn a_backlog_order_no_task_can_meet_is_told_once_per_content() {
+        let dir = std::env::temp_dir().join(format!("spawn-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("backlog");
+        let write = |id: u32, after: &[u32]| {
+            std::fs::write(
+                dir.join(format!("{id:03}.json")),
+                serde_json::json!({"id": id, "prompt": "p", "after": after}).to_string(),
+            )
+            .expect("write");
+        };
+        write(28, &[30]);
+        write(30, &[28]);
+        let rows = [serde_json::json!({"mission": 4, "backlog": dir.to_string_lossy()})];
+        let items = super::digest::objective_order(&rows);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::ObjectiveOrder);
+        assert!(
+            items[0].tag().starts_with("missions objective-order-4-")
+                && items[0]
+                    .line
+                    .starts_with("mission 4's backlog names an order no task can meet")
+                && items[0]
+                    .line
+                    .contains("objectives 28, 30 come after each other"),
+            "{:?}",
+            items[0]
+        );
+        assert_eq!(
+            super::digest::objective_order(&rows)[0].tag(),
+            items[0].tag()
+        );
+        write(30, &[28, 99]);
+        let changed = super::digest::objective_order(&rows);
+        assert_ne!(changed[0].tag(), items[0].tag(), "new content, told again");
+        write(30, &[]);
+        assert!(super::digest::objective_order(&rows).is_empty(), "fixed");
+        assert!(!Why::ObjectiveOrder.is_news(), "a condition while it holds");
+        write(30, &[28]);
+        let rows_plan = [idle_supervisor()];
+        let plan = decide_with(&rows_plan, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(tags, &[items[0].tag()]);
+        assert!(
+            text.contains("- missions — a backlog names an order no task can meet: mission 4"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An objective that ran out of attempts and yielded its slot reaches
+    /// an idle supervisor once, as an item of `missions` tagged
+    /// `missions objective-yielded-<event id>`, its line naming the mission
+    /// and the record's reason; two yields keep a line each.
+    #[test]
+    fn a_yielded_objective_reaches_an_idle_supervisor_once() {
+        let reason = "objective 19 had 3 failed attempts since its last turn (conflict, \
+                      conflict, rejected); task #127 yields its slot to the next objective, its \
+                      work set aside";
+        let records = [
+            serde_json::json!({"event_id": 901, "at_ms": 1_794_063_946_000_i64, "id": 127,
+                "mission": 4, "objective": 19, "failures": 3, "limit": 3, "reason": reason}),
+            serde_json::json!({"event_id": 902, "at_ms": 1_794_063_947_000_i64, "id": 106,
+                "mission": 4, "objective": 21, "failures": 3, "limit": 3}),
+        ];
+        let items = super::digest::objective_yields(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "missions objective-yielded-901",
+                "missions objective-yielded-902"
+            ]
+        );
+        assert!(items.iter().all(|item| item.why == Why::ObjectiveYielded));
+        assert_eq!(items[0].since_ms, Some(1_794_063_946_000));
+        assert!(
+            items[0]
+                .line
+                .starts_with("mission 4: objective 19 had 3 failed attempts")
+                && items[0].line.contains("task #127 yields its slot")
+                && items[0].line.contains("nothing halts"),
+            "{}",
+            items[0].line
+        );
+        assert!(
+            items[1].line.contains("task #106 yielded its slot"),
+            "{}",
+            items[1].line
+        );
+        assert!(
+            super::digest::objective_yields(&[serde_json::json!({"id": 5})]).is_empty(),
+            "a record without its event is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &[
+                "missions objective-yielded-901",
+                "missions objective-yielded-902"
+            ]
+        );
+        assert!(
+            text.lines().any(|line| line.starts_with(
+                "- missions — an objective ran out of attempts and yielded its slot: mission 4"
+            ) && line.contains("task #127")),
+            "{text}"
+        );
+        assert!(
+            text.lines().any(|line| line.contains("task #106")),
+            "each yield keeps its own line: {text}"
         );
     }
 

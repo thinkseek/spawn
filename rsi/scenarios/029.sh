@@ -194,8 +194,8 @@ cleanup() {
         rm -rf "$XDG_RUNTIME_DIR/systemd/user.control/$slice.d"
     fi
     if [ -n "$database_made" ]; then
-        psql -d postgres -tA -c "drop database if exists $SPAWN_DB_NAME with (force)" \
-            >/dev/null 2>&1 || true
+        # The database and the logins init-db made for it.
+        sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
     chmod -R u+rwX "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
@@ -236,6 +236,9 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT TERM
 
+# Logins of this scenario's databases that a run killed before its cleanup
+# left behind (scripts/blackbox/scenario-db.sh): this prefix only.
+sh "$controller/scripts/blackbox/scenario-db.sh" sweep "${SPAWN_DB_NAME%"$run"}" >/dev/null 2>&1 || true
 psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
     harness "cannot create the scenario database"
 database_made=1
@@ -611,6 +614,7 @@ within() {
 integrate_once() {
     capture env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
         SPAWN_GATE_HOST_FAULT_BACKOFF_SECS="$BACKOFF_SECS" \
+        SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
         "$SPAWN_BIN" integrate --once --root "$WORK/integrator"
     cat "$WORK/out.txt" "$WORK/err.txt" >>"$WORK/integrate.log"
     [ "$status" -eq 0 ] || harness "integrate exited $status: $(err | tail -n 3)"

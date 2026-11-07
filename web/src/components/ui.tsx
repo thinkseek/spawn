@@ -311,6 +311,37 @@ export function MiddleId({
   );
 }
 
+/** What a row names first: the server's semantic label (one line that says
+ * what the agent, task or item is doing, crates/spawn-cli/src/serve/labels.rs),
+ * with the raw id under it, small and monospace, selectable whole: ids are
+ * the keys of the CLI and of SQL. Without a label (an older server) the id
+ * alone, as before. */
+export function LabeledId({
+  label,
+  id,
+  className,
+  clamp = 2,
+}: {
+  label: string | null;
+  id: string;
+  className?: string;
+  /** Lines the label may wrap to before it is cut. */
+  clamp?: 1 | 2;
+}) {
+  if (!label) return <MiddleId id={id} className={className} />;
+  return (
+    <span className="flex min-w-0 max-w-full flex-col">
+      <span
+        className={cx("min-w-0", clamp === 2 ? "line-clamp-2 break-words" : "truncate", className)}
+        title={label}
+      >
+        {label}
+      </span>
+      <MiddleId id={id} className="select-all font-mono text-micro font-normal text-faint-foreground" />
+    </span>
+  );
+}
+
 /** A relative time ("12m ago") that carries the absolute local time, and
  * UTC, in its tooltip. */
 export function Ago({

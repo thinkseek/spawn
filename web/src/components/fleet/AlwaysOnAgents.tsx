@@ -6,7 +6,7 @@ import { absoluteTitle, formatDuration } from "../../format";
 import type { FleetContext, MissingAgent } from "../../ordering";
 import { heldTask, residentName } from "../../ordering";
 import { LiveBadge } from "../Terminal";
-import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, MiddleId, cx, sinceText } from "../ui";
+import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, LabeledId, MiddleId, cx, sinceText } from "../ui";
 import { FleetStateDot } from "./bits";
 import { DoingIcon, TaskCell, doingNow } from "./FleetBoard";
 
@@ -124,15 +124,27 @@ function AlwaysOnTile({
       {agent.attention && (
         <span aria-hidden="true" className="absolute inset-y-0 left-0 w-0.5 bg-warning" />
       )}
-      <div className="flex min-w-0 items-center gap-2">
-        <FleetStateDot state={agent.state} />
-        <span className="shrink-0 text-label font-semibold text-foreground">
-          {agent.role === "supervisor" ? "Supervisor" : `Resident · ${resident ?? "?"}`}
+      <div className="flex min-w-0 items-start gap-2">
+        <span className="mt-1.5 shrink-0">
+          <FleetStateDot state={agent.state} />
         </span>
-        <MiddleId
-          id={agent.agent_id || agent.session_id}
-          className="font-mono text-micro text-faint-foreground"
-        />
+        {agent.label ? (
+          <LabeledId
+            label={agent.label}
+            id={agent.agent_id || agent.session_id}
+            className="text-label font-semibold text-foreground"
+          />
+        ) : (
+          <>
+            <span className="shrink-0 text-label font-semibold text-foreground">
+              {agent.role === "supervisor" ? "Supervisor" : `Resident · ${resident ?? "?"}`}
+            </span>
+            <MiddleId
+              id={agent.agent_id || agent.session_id}
+              className="font-mono text-micro text-faint-foreground"
+            />
+          </>
+        )}
         <span className="ml-auto shrink-0">
           <LiveBadge live={agent.live} />
         </span>

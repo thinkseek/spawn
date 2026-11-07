@@ -4,8 +4,54 @@
 //! The integrator keeps up to N of the mission's tasks in flight, N being its
 //! worker limit (`objectives ->> 'workers'`, 1 to 16, default 1). A task is
 //! in flight from `task.assigned` until it lands or is cancelled. Each pass
-//! fills the free slots with the lowest open objectives that have no task in
-//! flight: an objective never has two. The mission's resident takes a task
+//! fills the free slots with the open objectives that have no task in flight
+//! (an objective never has two), fewest attempts first: those that yielded
+//! fewest times, then those with fewest failed attempts since their last
+//! yield, then the lowest id. With no failures this is the lowest open id.
+//!
+//! No objective holds a slot for ever. A failed attempt is an outcome that
+//! says the work did not make it: a gate's `rejected`, `incompatible` or
+//! `conflict` (unless main could not be merged into the workspace, or merged
+//! cleanly: `merge` names how), or an abort over budget (`task.aborted`).
+//! The host's outcomes (`no_room`, `host_fault`, a gate `aborted`) are not
+//! the work's and count for nothing, as for the halt rules. Once an
+//! objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3) failed attempts since its
+//! last yield (an accepted verdict also ends the count), its task yields
+//! the slot once it is being worked again (assigned, delivered or sent back;
+//! a reported task waits for its gate): its worker is stopped and it is
+//! recorded `task.cancelled` with `yielded` (its work set aside as any
+//! cancel's; no halt counts it), and the supervisor is told once. The
+//! objective goes to the back of the queue: it is tried again after the
+//! others had their turn. A task whose gate runs now, or that this pass
+//! aborted, does not yield, and a slot an abort frees is filled from the
+//! next pass on, fewest attempts first, so the aborted objective is not
+//! re-issued at once (task 113 aborted at 23:05:46, task 160 for the same
+//! objective 023 five seconds later). All of it is read from the control
+//! stream ([`attempts`]), never from the integrator's memory. Before this
+//! (2026-11-07), three objectives whose tasks kept failing held mission 4's
+//! three slots for a day and ten objectives were never assigned.
+//!
+//! An objective assigned again after earlier tasks of it ended without
+//! landing (cancelled, aborted, yielded) gets their work in its brief: each
+//! one's id, last checkpoint, last verdict or reason, and report, with the
+//! instruction to use the reports and not redo what they established
+//! ([`PriorWork`], read from the records at assignment). A worker has no
+//! `.git` and cannot read another branch: an ephemeral task's workspace is
+//! forked from the newest such work instead, and its first prompt says so
+//! (`main_merge::fork_from_prior`). Task 161 rebuilt 2264 lines that task
+//! 155 had mostly written.
+//!
+//! **Order.** A backlog objective may name the objectives it comes after
+//! (`"after": [28, 29]`): it is not assigned while one of them is open (a
+//! named objective the backlog does not hold must have landed). Order is
+//! kept only where it is named; otherwise fewest attempts first decides.
+//! An order that cannot be met (an id the backlog does not hold and that
+//! has not landed, or objectives that come after each other) would hold
+//! them back for ever without a word, so the dispatcher checks each open
+//! mission's backlog ([`order_problems`]) and tells the supervisor once per
+//! content of the problems (`missions objective-order-<mission>-<digest>`).
+//!
+//! The mission's resident takes a task
 //! whenever it has none open in the mission; every other task goes to a new
 //! per-task worker (`agent_worker_objective_<task>`, ephemeral: no approval,
 //! a fresh workspace from the source's main, stopped once its task lands).
@@ -17,17 +63,28 @@
 //! metric is the gate's verdict line, never scenario output, which candidate
 //! code controls.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
 use serde::Deserialize;
 use spawn_postgres::PostgresStore;
 
+use serde_json::json;
+use spawn_core::mission::TaskState;
+
 use crate::integrate::Mission;
 
 /// Gate verdicts quoted in an objective task's brief.
 const HISTORY: i64 = 6;
+
+/// Earlier tasks whose work an objective task's brief carries.
+const PRIOR_WORK: i64 = 3;
+
+/// Characters of an earlier task's report, and of its reason, a brief
+/// quotes; the rest is cut, marked.
+const REPORT_CHARS: usize = 3000;
+const REASON_CHARS: usize = 300;
 
 /// One backlog task.
 ///
@@ -43,6 +100,9 @@ pub(crate) struct Task {
     pub(crate) unit: String,
     pub(crate) lower_is_better: bool,
     pub(crate) target: Option<f64>,
+    /// The objectives it comes after (`"after": [..]`): it is not assigned
+    /// while one of them is open ([`choose`]).
+    pub(crate) after: Vec<u32>,
 }
 
 impl Task {
@@ -141,6 +201,19 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
             unit: text_field("unit").unwrap_or_default(),
             lower_is_better: text_field("direction").as_deref() != Some("higher"),
             target: value.get("target").and_then(serde_json::Value::as_f64),
+            after: match value.get("after") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(after) => after
+                    .as_array()
+                    .and_then(|ids| {
+                        ids.iter()
+                            .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+                            .collect::<Option<Vec<u32>>>()
+                    })
+                    .ok_or_else(|| {
+                        format!("{}: `after` is not a list of objective ids", path.display())
+                    })?,
+            },
         };
         // Without both, a recurring objective could never be met.
         if task.recurring && (task.metric.is_none() || task.target.is_none()) {
@@ -174,6 +247,30 @@ pub(crate) struct GateRecord {
     pub(crate) metric: Option<String>,
 }
 
+/// An earlier task of an objective that ended without landing, and the
+/// work it left (`PostgresStore::objective_prior_work`), newest first.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PriorWork {
+    pub(crate) task: i64,
+    #[serde(default)]
+    pub(crate) commit: Option<String>,
+    #[serde(default)]
+    pub(crate) outcome: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) report: Option<String>,
+}
+
+/// `text` up to `chars` characters, cut marked.
+fn cut(text: &str, chars: usize) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(chars) {
+        Some((end, _)) => format!("{}… (cut)", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
 /// The latest landed value of a recurring objective's metric.
 pub(crate) fn landed_value(task: &Task, landings: &[Landing]) -> Option<f64> {
     let name = task.metric.as_deref()?;
@@ -199,19 +296,353 @@ pub(crate) fn next_open<'a>(backlog: &'a [Task], landings: &[Landing]) -> Option
     backlog.iter().find(|task| is_open(task, landings))
 }
 
-/// The objectives that fill `free` slots: the lowest open ones without a
-/// task in flight (`in_flight`), at most `free` of them.
+/// Whether every objective `task` comes after is solved: not open in
+/// `backlog`, or, when the backlog does not hold it, landed.
+fn ordered(task: &Task, backlog: &[Task], landings: &[Landing]) -> bool {
+    task.after.iter().all(|before| {
+        backlog
+            .iter()
+            .find(|other| other.id == *before)
+            .map_or_else(
+                || landings.iter().any(|landing| landing.objective == *before),
+                |other| !is_open(other, landings),
+            )
+    })
+}
+
+/// What is wrong with the order `backlog` names: each `after` id the
+/// backlog does not hold (its objective waits until that id lands, which
+/// no task of this backlog can make happen), and each set of objectives
+/// that come after each other (a strongly connected component of more than
+/// one, or one that comes after itself: none of them is ever assigned),
+/// once each, by id. Linear in the objectives and their `after` ids
+/// (Tarjan's components, without recursion): it runs in every dispatcher
+/// pass, and a long chain of objectives each after the ones before must
+/// cost no more than its length.
+pub(crate) fn order_problems(backlog: &[Task]) -> Vec<String> {
+    let index: BTreeMap<u32, usize> = backlog
+        .iter()
+        .enumerate()
+        .map(|(at, task)| (task.id, at))
+        .collect();
+    let mut problems = Vec::new();
+    for task in backlog {
+        for before in &task.after {
+            if !index.contains_key(before) {
+                problems.push(format!(
+                    "objective {} comes after {before}, which the backlog does not hold: it \
+                     waits until {before} lands",
+                    task.id
+                ));
+            }
+        }
+    }
+    let edges: Vec<Vec<usize>> = backlog
+        .iter()
+        .map(|task| {
+            task.after
+                .iter()
+                .filter_map(|id| index.get(id).copied())
+                .collect()
+        })
+        .collect();
+    let mut cycles: Vec<Vec<u32>> = components(&edges)
+        .into_iter()
+        .filter(|component| component.len() > 1 || edges[component[0]].contains(&component[0]))
+        .map(|component| {
+            let mut ids: Vec<u32> = component.iter().map(|at| backlog[*at].id).collect();
+            ids.sort_unstable();
+            ids
+        })
+        .collect();
+    cycles.sort();
+    for ids in cycles {
+        problems.push(if let [id] = ids.as_slice() {
+            format!("objective {id} comes after itself: it is never assigned")
+        } else {
+            let shown: Vec<String> = ids.iter().map(u32::to_string).collect();
+            format!(
+                "objectives {} come after each other: none of them is ever assigned",
+                shown.join(", ")
+            )
+        });
+    }
+    problems
+}
+
+/// The strongly connected components of the graph `edges` (node `n`'s
+/// successors are `edges[n]`), by Tarjan's algorithm with an explicit
+/// stack: O(nodes + edges).
+fn components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let mut order = vec![UNSEEN; edges.len()];
+    let mut low = vec![0; edges.len()];
+    let mut on_stack = vec![false; edges.len()];
+    let mut stack = Vec::new();
+    let mut found = Vec::new();
+    let mut next = 0;
+    for root in 0..edges.len() {
+        if order[root] != UNSEEN {
+            continue;
+        }
+        // Each frame: a node and how many of its edges were followed.
+        let mut frames = vec![(root, 0)];
+        order[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (node, ref mut edge)) = frames.last_mut() {
+            if let Some(&target) = edges[node].get(*edge) {
+                *edge += 1;
+                if order[target] == UNSEEN {
+                    order[target] = next;
+                    low[target] = next;
+                    next += 1;
+                    stack.push(target);
+                    on_stack[target] = true;
+                    frames.push((target, 0));
+                } else if on_stack[target] {
+                    low[node] = low[node].min(order[target]);
+                }
+                continue;
+            }
+            frames.pop();
+            if let Some(&(parent, _)) = frames.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == order[node] {
+                let mut component = Vec::new();
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                found.push(component);
+            }
+        }
+    }
+    found
+}
+
+/// The objectives that fill `free` slots: the open ones without a task in
+/// flight (`in_flight`) whose `after` objectives are solved, fewest attempts
+/// first (yields, then failed attempts since the last yield, then the
+/// lowest id), at most `free` of them.
 pub(crate) fn choose<'a>(
     backlog: &'a [Task],
     landings: &[Landing],
     in_flight: &BTreeSet<u32>,
+    attempts: &BTreeMap<u32, Attempts>,
     free: usize,
 ) -> Vec<&'a Task> {
-    backlog
+    let mut open: Vec<&Task> = backlog
         .iter()
-        .filter(|task| is_open(task, landings) && !in_flight.contains(&task.id))
-        .take(free)
+        .filter(|task| {
+            is_open(task, landings)
+                && !in_flight.contains(&task.id)
+                && ordered(task, backlog, landings)
+        })
+        .collect();
+    open.sort_by_key(|task| {
+        let tried = attempts.get(&task.id).cloned().unwrap_or_default();
+        (tried.yields, tried.failures.len(), task.id)
+    });
+    open.truncate(free);
+    open
+}
+
+/// One outcome of an objective mission's task, oldest first
+/// (`PostgresStore::objective_outcomes`): a gate verdict, an abort or a
+/// yield.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Outcome {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) objective: u32,
+    #[serde(default)]
+    pub(crate) verdict: Option<String>,
+    /// For a conflict, how main went into the workspace (`main_merge`'s
+    /// `Merge::kind`); absent on records from before it was named.
+    #[serde(default)]
+    pub(crate) merge: Option<String>,
+    /// The task yielded its objective's slot by this record: a
+    /// `task.cancelled` of the integrator's, or a `task.aborted` whose
+    /// abort was the objective's last failed attempt before its limit.
+    #[serde(default)]
+    pub(crate) yielded: Option<bool>,
+}
+
+impl Outcome {
+    /// The failed attempt this outcome is, if it is one: what it says about
+    /// the work. A conflict is one when the worker got conflicts to resolve
+    /// (`marked`, `unmarked`, or markers still `pending`; a record from
+    /// before `merge` was named counts too), not when main could not be
+    /// merged (`not_mounted`, `busy`, `failed`) or merged cleanly.
+    fn failure(&self) -> Option<&str> {
+        match (self.kind.as_str(), self.verdict.as_deref()) {
+            ("task.aborted", _) => Some("aborted over budget"),
+            ("task.gated", Some(verdict @ ("rejected" | "incompatible"))) => Some(verdict),
+            ("task.gated", Some("conflict")) => match self.merge.as_deref() {
+                None | Some("marked" | "unmarked" | "pending") => Some("conflict"),
+                Some(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A yield: an abort that yields counts as the failure that reached
+    /// the limit, then as the yield, which ends the count.
+    fn is_yield(&self) -> bool {
+        self.kind == "task.cancelled" || (self.kind == "task.aborted" && self.yielded == Some(true))
+    }
+}
+
+/// An objective's attempts, read from its tasks' outcomes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Attempts {
+    /// Times one of its tasks yielded the slot.
+    pub(crate) yields: u32,
+    /// Its failed attempts since its last yield or acceptance, oldest
+    /// first.
+    pub(crate) failures: Vec<String>,
+}
+
+/// Every objective's attempts, from `outcomes` (oldest first). An accepted
+/// verdict ends the failures before it: the work made it (a recurring
+/// objective whose landing missed its target starts afresh).
+pub(crate) fn attempts(outcomes: &[Outcome]) -> BTreeMap<u32, Attempts> {
+    let mut attempts: BTreeMap<u32, Attempts> = BTreeMap::new();
+    for outcome in outcomes {
+        let entry = attempts.entry(outcome.objective).or_default();
+        if outcome.is_yield() {
+            entry.yields += 1;
+            entry.failures.clear();
+        } else if outcome.kind == "task.gated" && outcome.verdict.as_deref() == Some("accepted") {
+            entry.failures.clear();
+        } else if let Some(failure) = outcome.failure() {
+            entry.failures.push(failure.to_string());
+        }
+    }
+    attempts
+}
+
+/// Failed attempts after which an objective's task yields its slot:
+/// `SPAWN_OBJECTIVE_ATTEMPTS`, a whole number from 1 up; anything else is 3.
+pub(crate) fn attempt_limit(text: Option<&str>) -> usize {
+    const DEFAULT: usize = 3;
+    text.and_then(|text| text.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// A task that yields its objective's slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Yield {
+    pub(crate) task: i64,
+    pub(crate) objective: u32,
+    /// The objective's failed attempts since its last yield, oldest first.
+    pub(crate) failures: Vec<String>,
+}
+
+impl Yield {
+    /// The one line the record and the supervisor get.
+    pub(crate) fn reason(&self) -> String {
+        format!(
+            "objective {} had {} failed attempts since its last turn ({}); task #{} yields its \
+             slot to the next objective, its work set aside",
+            self.objective,
+            self.failures.len(),
+            self.failures.join(", "),
+            self.task
+        )
+    }
+}
+
+/// The tasks of `mission` being worked (assigned, delivered, or sent back
+/// to revise) whose objective has `limit` failed attempts or more since its
+/// last yield, but none in `settled` (aborted this pass, or under a gate
+/// now). A reported task waits for its gate, whose verdict settles it: it
+/// lands, or goes back to revise and yields then (task 106 of mission 4 had
+/// four failures when its fifth verdict was `accepted`).
+pub(crate) fn yields(
+    mission: &Mission,
+    attempts: &BTreeMap<u32, Attempts>,
+    limit: usize,
+    settled: &BTreeSet<i64>,
+) -> Vec<Yield> {
+    mission
+        .tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.state,
+                TaskState::Assigned | TaskState::Delivered | TaskState::Revise
+            ) && !settled.contains(&task.id)
+        })
+        .filter_map(|task| {
+            let objective = task.objective?;
+            let tried = attempts.get(&objective)?;
+            (tried.failures.len() >= limit).then(|| Yield {
+                task: task.id,
+                objective,
+                failures: tried.failures.clone(),
+            })
+        })
         .collect()
+}
+
+/// Whether aborting `task` (of `objective`) over budget is its objective's
+/// last failed attempt before `limit`: then the abort is recorded as the
+/// yield ([`abort_yield`]), since the task is gone and nothing else would
+/// yield the slot. Without this the objective kept no yield and its
+/// failures, sorted ahead, and the next task for it yielded at once (rev-b
+/// on 226fa4a: objective 023, task 113 aborted with its fifth failure).
+pub(crate) fn abort_yields(
+    attempts: &BTreeMap<u32, Attempts>,
+    task: i64,
+    objective: u32,
+    limit: usize,
+) -> Option<Yield> {
+    let mut failures = attempts
+        .get(&objective)
+        .map(|tried| tried.failures.clone())
+        .unwrap_or_default();
+    failures.push("aborted over budget".to_string());
+    (failures.len() >= limit).then_some(Yield {
+        task,
+        objective,
+        failures,
+    })
+}
+
+/// The yield an abort of `task` over budget makes, read from the store:
+/// the fields its `task.aborted` record adds (`yielded`, `objective`,
+/// `failures`, `limit`, `yield_reason`), or none.
+pub(crate) fn abort_yield(
+    store: &PostgresStore,
+    mission: &Mission,
+    task: &crate::integrate::Task,
+) -> Result<Option<serde_json::Value>, String> {
+    let (Some(_), Some(objective)) = (&mission.objectives, task.objective) else {
+        return Ok(None);
+    };
+    let outcomes: Vec<Outcome> = serde_json::from_value(
+        store
+            .objective_outcomes(mission.id)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("objective outcomes: {error}"))?;
+    let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
+    Ok(
+        abort_yields(&attempts(&outcomes), task.id, objective, limit).map(|slot| {
+            json!({"yielded": true, "objective": slot.objective,
+               "failures": slot.failures.len(), "limit": limit,
+               "yield_reason": slot.reason()})
+        }),
+    )
 }
 
 /// An objective mission's worker limit: `objectives ->> 'workers'`, 1 when
@@ -225,9 +656,15 @@ pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
         .max(1)
 }
 
-/// The brief of an objective task: the objective, the working rules, and
-/// what the gate said about earlier attempts.
-pub(crate) fn brief(task: &Task, current: Option<f64>, history: &[GateRecord]) -> String {
+/// The brief of an objective task: the objective, the working rules, the
+/// work earlier tasks of it left without landing, and what the gate said
+/// about earlier attempts.
+pub(crate) fn brief(
+    task: &Task,
+    current: Option<f64>,
+    prior: &[PriorWork],
+    history: &[GateRecord],
+) -> String {
     let mut brief = format!("Objective {}: {}\n\n{}\n", task.id, task.title, task.prompt);
     brief.push_str(
         "\nWork only inside this workspace. Do not run git commands and do not create \
@@ -258,6 +695,43 @@ pub(crate) fn brief(task: &Task, current: Option<f64>, history: &[GateRecord]) -
         }
         brief.push('\n');
     }
+    if !prior.is_empty() {
+        brief.push_str(
+            "\nEarlier tasks on this objective ended without landing, newest first. Their \
+             reports below say what each did and found: use them, and do not redo what they \
+             established. When your workspace starts from one's work, your first prompt says \
+             so.\n",
+        );
+        for work in prior {
+            let _ = write!(
+                brief,
+                "- task {}: {}",
+                work.task,
+                work.outcome.as_deref().unwrap_or("cancelled")
+            );
+            if let Some(reason) = &work.reason {
+                let _ = write!(brief, " ({})", cut(reason, REASON_CHARS));
+            }
+            match &work.commit {
+                Some(commit) => {
+                    let _ = write!(brief, "; its last checkpoint {commit}");
+                }
+                None => brief.push_str("; it recorded no checkpoint"),
+            }
+            brief.push('\n');
+            if let Some(report) = work
+                .report
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                let _ = writeln!(
+                    brief,
+                    "  Its report:\n  > {}",
+                    cut(report, REPORT_CHARS).replace('\n', "\n  > ")
+                );
+            }
+        }
+    }
     if !history.is_empty() {
         brief.push_str("\nEarlier gate verdicts on this objective, newest first:\n");
         for verdict in history {
@@ -285,16 +759,59 @@ pub(crate) fn brief(task: &Task, current: Option<f64>, history: &[GateRecord]) -
     brief
 }
 
-/// Fill an objective mission's free slots: up to its worker limit, every
-/// open task of the mission taking one, with the lowest open objectives that
-/// have no task in flight. Returns the ids of the tasks assigned. A first
-/// assignment that fails is the error; a later one ends the filling, logged,
-/// keeping what was assigned.
-pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
+/// Fill an objective mission's free slots: first the tasks of objectives
+/// at their limit yield theirs ([`yields`]: worker stopped, `task.cancelled`
+/// with `yielded`), then, up to its worker limit, every open task of the
+/// mission taking one, the slots go to the open objectives without a task
+/// in flight, fewest attempts first ([`choose`]). `settled`: tasks this
+/// pass aborted, or under a gate now; they do not yield, and `mission` is
+/// the pass's read, so an aborted task's slot frees only from the next
+/// pass on. Returns the ids of the tasks assigned. A first assignment that
+/// fails is the error; a later one ends the filling, logged, keeping what
+/// was assigned.
+pub(crate) fn assign_next(
+    store: &PostgresStore,
+    mission: &Mission,
+    settled: &BTreeSet<i64>,
+) -> Result<Vec<i64>, String> {
     let Some(config) = &mission.objectives else {
         return Ok(Vec::new());
     };
-    let free = workers(config).saturating_sub(mission.tasks.len());
+    let outcomes: Vec<Outcome> = serde_json::from_value(
+        store
+            .objective_outcomes(mission.id)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("objective outcomes: {error}"))?;
+    let mut attempts = attempts(&outcomes);
+    let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
+    let mut yielded = BTreeSet::new();
+    for slot in yields(mission, &attempts, limit, settled) {
+        let Some(task) = mission.tasks.iter().find(|task| task.id == slot.task) else {
+            continue;
+        };
+        // The Stop first, under its fixed key: if the record then fails,
+        // the next pass finds the task still in flight and yields again.
+        crate::integrate::stop_worker(store, task, "integrate-yield")?;
+        let reason = slot.reason();
+        crate::integrate::record(
+            store,
+            &json!({"type": "task.cancelled", "id": slot.task, "yielded": true,
+                    "objective": slot.objective, "failures": slot.failures.len(),
+                    "limit": limit, "reason": reason}),
+        )?;
+        println!("integrate: mission {}: {reason}", mission.id);
+        yielded.insert(slot.task);
+        let tried = attempts.entry(slot.objective).or_default();
+        tried.yields += 1;
+        tried.failures.clear();
+    }
+    let flying: Vec<_> = mission
+        .tasks
+        .iter()
+        .filter(|task| !yielded.contains(&task.id))
+        .collect();
+    let free = workers(config).saturating_sub(flying.len());
     if free == 0 {
         return Ok(Vec::new());
     }
@@ -309,13 +826,9 @@ pub(crate) fn assign_next(store: &PostgresStore, mission: &Mission) -> Result<Ve
             .map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("objective landings: {error}"))?;
-    let in_flight: BTreeSet<u32> = mission
-        .tasks
-        .iter()
-        .filter_map(|task| task.objective)
-        .collect();
+    let in_flight: BTreeSet<u32> = flying.iter().filter_map(|task| task.objective).collect();
     let mut assigned = Vec::new();
-    for task in choose(&objectives, &landings, &in_flight, free) {
+    for task in choose(&objectives, &landings, &in_flight, &attempts, free) {
         match assign(store, mission, task, &landings) {
             Ok(id) => assigned.push(id),
             Err(error) if assigned.is_empty() => return Err(error),
@@ -345,9 +858,15 @@ fn assign(
             .map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("objective history: {error}"))?;
+    let prior: Vec<PriorWork> = serde_json::from_value(
+        store
+            .objective_prior_work(mission.id, id, PRIOR_WORK)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("objective prior work: {error}"))?;
     let scenario = Path::new(&mission.gate).join(format!("{:03}.sh", task.id));
     let scenario = scenario.is_file().then(|| scenario.display().to_string());
-    let text = brief(task, landed_value(task, landings), &history);
+    let text = brief(task, landed_value(task, landings), &prior, &history);
     let assigned = store
         .objective_assign(mission.id, id, scenario.as_deref(), &text)
         .map_err(|error| error.to_string())?;
@@ -360,9 +879,16 @@ fn assign(
 
 #[cfg(test)]
 mod tests {
-    use super::{Landing, Task, choose, load_backlog, metric_lines, next_open, workers};
+    use super::{
+        Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
+        choose, load_backlog, metric_lines, next_open, order_problems, workers, yields,
+    };
     use serde_json::json;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn untried() -> BTreeMap<u32, Attempts> {
+        BTreeMap::new()
+    }
 
     fn objective(id: u32, recurring: bool) -> Task {
         Task {
@@ -374,6 +900,7 @@ mod tests {
             unit: "ns".to_string(),
             lower_is_better: true,
             target: recurring.then_some(1100.0),
+            after: Vec::new(),
         }
     }
 
@@ -432,19 +959,25 @@ mod tests {
         ];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, 3)),
+            ids(&choose(&backlog, &[], &none, &untried(), 3)),
             vec![1, 2, 3],
             "lowest first"
         );
         // Solved objectives and those in flight are skipped.
         let solved = [landing(1, None)];
         let flying = BTreeSet::from([2]);
-        assert_eq!(ids(&choose(&backlog, &solved, &flying, 3)), vec![3, 4]);
+        assert_eq!(
+            ids(&choose(&backlog, &solved, &flying, &untried(), 3)),
+            vec![3, 4]
+        );
         // No free slot, nothing.
-        assert!(choose(&backlog, &[], &none, 0).is_empty());
+        assert!(choose(&backlog, &[], &none, &untried(), 0).is_empty());
         // Fewer open objectives than slots: only those.
         let three_solved = [landing(1, None), landing(2, None), landing(3, None)];
-        assert_eq!(ids(&choose(&backlog, &three_solved, &none, 3)), vec![4]);
+        assert_eq!(
+            ids(&choose(&backlog, &three_solved, &none, &untried(), 3)),
+            vec![4]
+        );
     }
 
     #[test]
@@ -456,9 +989,15 @@ mod tests {
             Some("METRIC ingest_total_ns baseline=1500 candidate=1200"),
         )];
         let none = BTreeSet::new();
-        assert_eq!(ids(&choose(&backlog, &missed, &none, 2)), vec![1, 2]);
+        assert_eq!(
+            ids(&choose(&backlog, &missed, &none, &untried(), 2)),
+            vec![1, 2]
+        );
         let flying = BTreeSet::from([1]);
-        assert_eq!(ids(&choose(&backlog, &missed, &flying, 2)), vec![2]);
+        assert_eq!(
+            ids(&choose(&backlog, &missed, &flying, &untried(), 2)),
+            vec![2]
+        );
     }
 
     #[test]
@@ -492,5 +1031,445 @@ mod tests {
         write(r#"{"id": 1, "prompt": "go faster", "recurring": true, "metric": "ns"}"#);
         assert!(load_backlog(&dir).is_err(), "never met");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn outcome(kind: &str, objective: u32, verdict: Option<&str>, merge: Option<&str>) -> Outcome {
+        Outcome {
+            kind: kind.to_string(),
+            objective,
+            verdict: verdict.map(str::to_string),
+            merge: merge.map(str::to_string),
+            yielded: None,
+        }
+    }
+
+    fn gated(objective: u32, verdict: &str) -> Outcome {
+        outcome("task.gated", objective, Some(verdict), None)
+    }
+
+    /// An objective mission with `workers` slots and these tasks in flight:
+    /// `(id, objective, state)`.
+    fn mission(workers: u32, tasks: &[(i64, u32, &str)]) -> crate::integrate::Mission {
+        serde_json::from_value(json!({
+            "id": 4, "gate": "/g", "accept": "gate",
+            "objectives": {"backlog": "/b", "resident": "rsi", "workers": workers},
+            "tasks": tasks.iter().map(|(id, objective, state)| json!({
+                "id": id, "agent_id": format!("agent_worker_objective_{id}"),
+                "session_id": format!("session_worker_objective_{id}"),
+                "state": state, "objective": objective,
+            })).collect::<Vec<_>>(),
+        }))
+        .expect("a mission")
+    }
+
+    /// What the work did counts; what the host did, or a clean or failed
+    /// merge of main, does not; a yield or an acceptance starts the count
+    /// again.
+    #[test]
+    fn failed_attempts_are_the_works_outcomes() {
+        let outcomes = [
+            gated(1, "rejected"),
+            gated(1, "incompatible"),
+            outcome("task.gated", 1, Some("conflict"), Some("marked")),
+            outcome("task.gated", 1, Some("conflict"), Some("unmarked")),
+            outcome("task.gated", 1, Some("conflict"), Some("pending")),
+            outcome("task.gated", 1, Some("conflict"), None),
+            outcome("task.aborted", 1, None, None),
+            // The host's, or main not merged: nothing.
+            gated(1, "no_room"),
+            gated(1, "host_fault"),
+            gated(1, "aborted"),
+            outcome("task.gated", 1, Some("conflict"), Some("not_mounted")),
+            outcome("task.gated", 1, Some("conflict"), Some("busy")),
+            outcome("task.gated", 1, Some("conflict"), Some("failed")),
+            outcome("task.gated", 1, Some("conflict"), Some("merged")),
+        ];
+        let counted = attempts(&outcomes);
+        assert_eq!(counted[&1].yields, 0);
+        assert_eq!(
+            counted[&1].failures,
+            [
+                "rejected",
+                "incompatible",
+                "conflict",
+                "conflict",
+                "conflict",
+                "conflict",
+                "aborted over budget"
+            ]
+        );
+        let after = attempts(&[
+            gated(2, "rejected"),
+            outcome("task.cancelled", 2, None, None),
+            gated(2, "rejected"),
+            gated(3, "rejected"),
+            gated(3, "rejected"),
+            gated(3, "accepted"),
+            gated(3, "conflict"),
+        ]);
+        assert_eq!(
+            after[&2],
+            Attempts {
+                yields: 1,
+                failures: vec!["rejected".to_string()]
+            }
+        );
+        assert_eq!(
+            after[&3].failures,
+            ["conflict"],
+            "an acceptance ends the count"
+        );
+    }
+
+    /// Fewest yields first, then fewest failed attempts, then the lowest id.
+    #[test]
+    fn free_slots_go_to_the_fewest_attempts() {
+        let backlog: Vec<Task> = [19, 21, 23, 25, 26].map(|id| objective(id, false)).to_vec();
+        let tried = attempts(&[
+            gated(19, "conflict"),
+            gated(19, "conflict"),
+            outcome("task.cancelled", 19, None, None),
+            gated(21, "rejected"),
+            gated(23, "rejected"),
+            gated(23, "rejected"),
+        ]);
+        let none = BTreeSet::new();
+        assert_eq!(
+            ids(&choose(&backlog, &[], &none, &tried, 5)),
+            vec![25, 26, 21, 23, 19]
+        );
+        assert_eq!(ids(&choose(&backlog, &[], &none, &tried, 1)), vec![25]);
+    }
+
+    /// Three slots held by three objectives at the limit: the tasks being
+    /// worked again yield, and the others get the slots, 025 and 026 first.
+    /// A healthy objective (under the limit) and a reported task keep
+    /// theirs; a task under a gate or aborted this pass does not yield.
+    #[test]
+    fn objectives_at_the_limit_yield_their_slots() {
+        let three = |objective| {
+            [
+                gated(objective, "conflict"),
+                gated(objective, "rejected"),
+                gated(objective, "conflict"),
+            ]
+        };
+        let outcomes: Vec<Outcome> = [three(19), three(21), three(23)].concat();
+        let tried = attempts(&outcomes);
+        let stuck = mission(
+            3,
+            &[
+                (127, 19, "revise"),
+                (106, 21, "delivered"),
+                (160, 23, "assigned"),
+            ],
+        );
+        let none = BTreeSet::new();
+        let slots = yields(&stuck, &tried, 3, &none);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| (slot.task, slot.objective))
+                .collect::<Vec<_>>(),
+            [(127, 19), (106, 21), (160, 23)]
+        );
+        assert!(
+            slots[0]
+                .reason()
+                .contains("objective 19 had 3 failed attempts")
+        );
+        assert!(slots[0].reason().contains("task #127 yields its slot"));
+        // After the yields: every slot free, the others first.
+        let mut after = tried.clone();
+        for slot in &slots {
+            let entry = after.entry(slot.objective).or_default();
+            entry.yields += 1;
+            entry.failures.clear();
+        }
+        let backlog: Vec<Task> = [19, 21, 23, 25, 26].map(|id| objective(id, false)).to_vec();
+        assert_eq!(
+            ids(&choose(&backlog, &[], &BTreeSet::new(), &after, 3)),
+            vec![25, 26, 19]
+        );
+
+        // Under the limit, reported, under a gate, aborted this pass: none yields.
+        assert!(yields(&stuck, &tried, 4, &none).is_empty(), "healthy");
+        let waiting = mission(
+            3,
+            &[
+                (127, 19, "reported"),
+                (106, 21, "landing"),
+                (160, 23, "accepted"),
+            ],
+        );
+        assert!(yields(&waiting, &tried, 3, &none).is_empty());
+        assert!(yields(&stuck, &tried, 3, &BTreeSet::from([127, 106, 160])).is_empty());
+        // An objective with no failures is untouched at any limit.
+        let healthy = mission(1, &[(200, 30, "revise")]);
+        assert!(yields(&healthy, &tried, 1, &none).is_empty());
+    }
+
+    /// Mission 4 as the live log had it at 2026-11-07 23:05:46, when task
+    /// 113 (objective 023) was aborted over budget: every gate verdict,
+    /// abort and yield of its objective tasks until then (read-only, the
+    /// store's objective outcomes). Then, 127 (019) and 106 (021) were
+    /// reported, and the old rule gave the freed slot to 023 again (task
+    /// 160, five seconds later). Now neither reported task yields (106 went
+    /// on to land), and the slot goes to 025: 023 has five failed attempts
+    /// and 025 none.
+    #[test]
+    fn mission_4_at_23_05_assigns_objective_25() {
+        let outcomes: Vec<Outcome> = serde_json::from_str(include_str!(
+            "../tests/data/mission-4-outcomes-2026-11-07T23-05-46.json"
+        ))
+        .expect("the outcomes");
+        let tried = attempts(&outcomes);
+        assert_eq!(tried[&19].failures.len(), 7);
+        assert_eq!(tried[&21].failures.len(), 4);
+        assert_eq!(tried[&23].failures.len(), 5);
+        let after_abort = mission(3, &[(127, 19, "reported"), (106, 21, "reported")]);
+        let none = BTreeSet::new();
+        assert!(yields(&after_abort, &tried, attempt_limit(None), &none).is_empty());
+        // The deployed backlog then: open are 019, 021, 023, 025-034.
+        let backlog: Vec<Task> = [19, 21, 23, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34]
+            .map(|id| objective(id, false))
+            .to_vec();
+        let flying = BTreeSet::from([19, 21]);
+        assert_eq!(ids(&choose(&backlog, &[], &flying, &tried, 1)), vec![25]);
+        // Had 127 been sent back to revise, it would yield as well, and 026
+        // take its slot.
+        let sent_back = mission(3, &[(127, 19, "revise"), (106, 21, "reported")]);
+        let slots = yields(&sent_back, &tried, attempt_limit(None), &none);
+        assert_eq!(
+            slots.iter().map(|slot| slot.task).collect::<Vec<_>>(),
+            [127]
+        );
+        assert_eq!(
+            ids(&choose(&backlog, &[], &BTreeSet::from([21]), &tried, 2)),
+            vec![25, 26]
+        );
+    }
+
+    #[test]
+    fn the_attempt_limit_is_a_whole_number_from_one() {
+        assert_eq!(attempt_limit(None), 3);
+        assert_eq!(attempt_limit(Some(" 5 ")), 5);
+        for bad in ["0", "-1", "two", "", "2.5"] {
+            assert_eq!(attempt_limit(Some(bad)), 3, "{bad:?}");
+        }
+    }
+
+    /// A re-assigned objective's brief carries its predecessors' work: id,
+    /// outcome and reason, last checkpoint, report, and the instruction to
+    /// use the reports; it sends no worker to a branch it cannot read.
+    #[test]
+    fn a_brief_carries_the_earlier_tasks_work() {
+        let prior = [
+            PriorWork {
+                task: 155,
+                commit: Some("c245db93e981880756015f1efac78939fbbfe11c".to_string()),
+                outcome: Some("aborted".to_string()),
+                reason: Some("the task ran past its 90-minute budget".to_string()),
+                report: Some("## Outcome\nmostly done\n\n## Left\nthe tests".to_string()),
+            },
+            PriorWork {
+                task: 150,
+                commit: None,
+                outcome: Some("yielded".to_string()),
+                reason: None,
+                report: Some("x".repeat(5000)),
+            },
+        ];
+        let text = brief(&objective(59, false), None, &prior, &[]);
+        assert!(text.contains("Their reports below say what each did and found"));
+        assert!(!text.contains("branch"), "{text}");
+        assert!(text.contains(
+            "- task 155: aborted (the task ran past its 90-minute budget); its last checkpoint \
+             c245db93e981880756015f1efac78939fbbfe11c"
+        ));
+        assert!(text.contains("  > mostly done\n"));
+        assert!(text.contains("- task 150: yielded; it recorded no checkpoint"));
+        assert!(text.contains("… (cut)"), "a long report is cut");
+        assert!(text.len() < 5000);
+        let first = brief(&objective(59, false), None, &[], &[]);
+        assert!(!first.contains("Earlier tasks"), "a first task has none");
+    }
+
+    /// rev-b on 226fa4a: an objective whose limit-th failure is an abort
+    /// over budget. The abort is recorded as the yield, so the objective
+    /// goes behind the others as any yield does, and its next task starts
+    /// a fresh count instead of yielding at once.
+    #[test]
+    fn an_abort_that_reaches_the_limit_is_the_yield() {
+        let before = attempts(&[gated(23, "conflict"), gated(23, "conflict")]);
+        let slot = abort_yields(&before, 113, 23, 3).expect("the abort yields");
+        assert_eq!(
+            slot.failures,
+            ["conflict", "conflict", "aborted over budget"]
+        );
+        assert!(slot.reason().contains("task #113 yields its slot"));
+        assert!(
+            abort_yields(&before, 113, 23, 4).is_none(),
+            "under the limit"
+        );
+        assert!(abort_yields(&attempts(&[]), 113, 23, 3).is_none());
+
+        let mut aborted = outcome("task.aborted", 23, None, None);
+        aborted.yielded = Some(true);
+        let outcomes = [
+            gated(23, "conflict"),
+            gated(23, "conflict"),
+            aborted,
+            gated(25, "rejected"),
+            outcome("task.cancelled", 25, None, None),
+        ];
+        let tried = attempts(&outcomes);
+        assert_eq!(
+            tried[&23],
+            Attempts {
+                yields: 1,
+                failures: Vec::new()
+            }
+        );
+        let backlog: Vec<Task> = [23, 25, 26].map(|id| objective(id, false)).to_vec();
+        assert_eq!(
+            ids(&choose(&backlog, &[], &BTreeSet::new(), &tried, 3)),
+            vec![26, 23, 25],
+            "the untried first, then the yielded"
+        );
+        let next = mission(1, &[(200, 23, "assigned")]);
+        assert!(
+            yields(&next, &tried, 3, &BTreeSet::new()).is_empty(),
+            "its next task does not yield at once"
+        );
+        // An abort under the limit stays a failure, as before.
+        let plain = attempts(&[outcome("task.aborted", 23, None, None)]);
+        assert_eq!(plain[&23].failures, ["aborted over budget"]);
+        assert_eq!(plain[&23].yields, 0);
+    }
+
+    /// An objective that names the objectives it comes after is not chosen
+    /// while one of them is open; a named objective the backlog does not
+    /// hold must have landed. `after` is read from the backlog's JSON, and
+    /// one that is not a list of ids is an error.
+    #[test]
+    fn an_objective_waits_for_those_it_comes_after() {
+        let mut later = objective(30, false);
+        later.after = vec![28, 29];
+        let mut gone = objective(32, false);
+        gone.after = vec![22];
+        let backlog = vec![objective(28, false), objective(29, false), later, gone];
+        let none = BTreeSet::new();
+        assert_eq!(
+            ids(&choose(&backlog, &[], &none, &untried(), 4)),
+            vec![28, 29]
+        );
+        let one = [landing(28, None)];
+        assert_eq!(ids(&choose(&backlog, &one, &none, &untried(), 4)), vec![29]);
+        let both = [landing(29, None), landing(28, None), landing(22, None)];
+        assert_eq!(
+            ids(&choose(&backlog, &both, &none, &untried(), 4)),
+            vec![30, 32]
+        );
+
+        let dir = std::env::temp_dir().join(format!("spawn-backlog-after-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("030.json"),
+            r#"{"id": 30, "prompt": "p", "after": [28, 29]}"#,
+        )
+        .expect("write");
+        std::fs::write(dir.join("031.json"), r#"{"id": 31, "prompt": "p"}"#).expect("write");
+        let read = load_backlog(&dir).expect("valid");
+        assert_eq!(read[0].after, [28, 29]);
+        assert!(read[1].after.is_empty());
+        std::fs::write(
+            dir.join("031.json"),
+            r#"{"id": 31, "prompt": "p", "after": "028"}"#,
+        )
+        .expect("write");
+        assert!(load_backlog(&dir).is_err(), "not a list of ids");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The backlog names the one order its objectives need: 032, the
+    /// soak that exercises 028's wait paths, after 028. The owner's order
+    /// of 028-033 is a preference the prompts say may be broken (029 "with
+    /// or after 028", 033 "with or after 020", 030 "can be solved before
+    /// 028, 029, 031 and 033"): no `after` holds them back.
+    #[test]
+    fn the_backlog_names_its_order() {
+        let backlog = load_backlog(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rsi/backlog"),
+        )
+        .expect("the backlog");
+        let after = |id: u32| {
+            backlog
+                .iter()
+                .find(|task| task.id == id)
+                .map(|task| task.after.clone())
+                .expect("in the backlog")
+        };
+        assert_eq!(after(32), [28]);
+        for free in [29, 30, 31, 33] {
+            assert!(after(free).is_empty(), "{free}");
+        }
+    }
+
+    /// An order no task can meet is found: an `after` id the backlog does
+    /// not hold, and every cycle once (two and three objectives), by its
+    /// lowest id; a sound order, and the repository's backlog, have none.
+    #[test]
+    fn an_order_that_cannot_be_met_is_found() {
+        let task = |id: u32, after: &[u32]| {
+            let mut task = objective(id, false);
+            task.after = after.to_vec();
+            task
+        };
+        assert!(order_problems(&[task(28, &[]), task(32, &[28])]).is_empty());
+        let problems = order_problems(&[
+            task(28, &[30]),
+            task(30, &[28]),
+            task(31, &[33]),
+            task(32, &[31]),
+            task(33, &[32, 99]),
+        ]);
+        assert_eq!(
+            problems,
+            [
+                "objective 33 comes after 99, which the backlog does not hold: it waits until \
+                 99 lands",
+                "objectives 28, 30 come after each other: none of them is ever assigned",
+                "objectives 31, 32, 33 come after each other: none of them is ever assigned",
+            ]
+        );
+        assert_eq!(
+            order_problems(&[task(30, &[30])]),
+            ["objective 30 comes after itself: it is never assigned"]
+        );
+        // A dense order with no cycle (each of 200 after every one before
+        // it, 19,900 edges) is checked at once: no path is enumerated.
+        let dense: Vec<Task> = (1..=200)
+            .map(|id| task(id, &(1..id).collect::<Vec<u32>>()))
+            .collect();
+        let started = std::time::Instant::now();
+        assert!(order_problems(&dense).is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        let mut cyclic = dense.clone();
+        cyclic[0].after = vec![200];
+        assert_eq!(
+            order_problems(&cyclic).len(),
+            1,
+            "one component of all 200, said once"
+        );
+        let backlog = load_backlog(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rsi/backlog"),
+        )
+        .expect("the backlog");
+        assert!(order_problems(&backlog).is_empty());
     }
 }
