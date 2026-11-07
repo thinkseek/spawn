@@ -2093,7 +2093,7 @@ fn restore_into(
         settings,
         url,
         database,
-        Some("select count(*), coalesce(max(id), 0) from spawn_events"),
+        Some("select count(*) || ' ' || coalesce(max(id), 0) from spawn_events"),
         None,
     )?;
     if !ok {
