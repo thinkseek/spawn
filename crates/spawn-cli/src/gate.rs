@@ -607,7 +607,10 @@ fn base_disagrees(stdout: &str) -> Option<BaseDisagrees> {
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
         lines.pop();
     }
-    let setup_s = match lines.last().and_then(|line| line.strip_prefix(GATE_TIME_LINE)) {
+    let setup_s = match lines
+        .last()
+        .and_then(|line| line.strip_prefix(GATE_TIME_LINE))
+    {
         Some(times) => {
             lines.pop();
             setup_seconds(times)
@@ -631,9 +634,7 @@ fn base_disagrees(stdout: &str) -> Option<BaseDisagrees> {
     if millis.is_empty() || !millis.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    let staged = rest
-        .strip_prefix("base: ")?
-        .strip_suffix(BASE_STAGE_SAID)?;
+    let staged = rest.strip_prefix("base: ")?.strip_suffix(BASE_STAGE_SAID)?;
     (staged == scenario).then(|| BaseDisagrees {
         scenario: scenario.to_string(),
         setup_s,
@@ -1392,15 +1393,13 @@ mod tests {
 
     /// The gate's own pair for a scenario that exited 1 and then 0 on the
     /// base, as scripts/rsi/gate.sh prints it, inside a log.
-    const DISAGREES_PAIR: &str =
-        "| == base: 011.sh\n\
+    const DISAGREES_PAIR: &str = "| == base: 011.sh\n\
          | 011: covered within 10 s, delivered within 30 s, no churn\n\
          | 011.sh exited 1, then 0 on the base: a harness error, not a verdict; the gate aborts\n\
          | stage gate aborted 66871ms base: 011.sh again (unsolved needs two runs that agree)\n";
 
     /// The gate's timing line, after the pair.
-    const GATE_TIME_LINE: &str =
-        "| gate time: base 141 s (2 scenario runs, 19 results from the cache), candidate 0 s, \
+    const GATE_TIME_LINE: &str = "| gate time: base 141 s (2 scenario runs, 19 results from the cache), candidate 0 s, \
          setup 244 s (exports, socket scan, static checks), total 385 s\n";
 
     /// A gate that prints `output` on stdout, then runs `status`.
@@ -1424,10 +1423,7 @@ mod tests {
         assert!(log.contains("| 011.sh exited 1, then 0"), "{log}");
 
         // Its `| gate time:` line may follow the pair, and nothing else.
-        let gate = printing_gate(
-            &format!("{DISAGREES_PAIR}{GATE_TIME_LINE}"),
-            "exit 4",
-        );
+        let gate = printing_gate(&format!("{DISAGREES_PAIR}{GATE_TIME_LINE}"), "exit 4");
         let Err(GateFailure::BaseDisagrees {
             scenario, setup_s, ..
         }) = gate.judge(&path_only())
@@ -1461,7 +1457,8 @@ mod tests {
             })
         );
         for (seconds, want) in [("0", 0), ("29", 29), ("244", 244), ("1417", 1417)] {
-            let line = format!("| gate time: base 1 s, candidate 0 s, setup {seconds} s (x), total 2 s\n");
+            let line =
+                format!("| gate time: base 1 s, candidate 0 s, setup {seconds} s (x), total 2 s\n");
             assert_eq!(
                 pair(&line).map(|found| found.setup_s),
                 Some(Some(want)),
