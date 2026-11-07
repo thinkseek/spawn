@@ -1469,8 +1469,6 @@ begin
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-=======
         -- An owner's landing also names the missions on the source with no
         -- baseline yet (new, or resumed), not halted: they take the new main
         -- as their first baseline, so a gate of theirs that was judging
@@ -1480,7 +1478,6 @@ begin
            and jsonb_typeof(p_record -> 'without_baseline') = 'array'
            and id in (select m::bigint
                         from jsonb_array_elements_text(p_record -> 'without_baseline') m);
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
     when 'source.held' then
         -- The owner holds landings on a source (spawn_source_hold): the
         -- source's active hold is this one. A hold on a source already held
@@ -2317,26 +2314,17 @@ end $$;
 
 -- The integrator's records (`spawn integrate`, owner only): gate verdicts,
 -- landings, aborts over budget, halts, the landings an owner's hold keeps
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
--- waiting (`task.held`) and the holds past their bound (`source.hold_expired`).
--- Returns the record's event id; null for a `task.held` already recorded for
--- the task and hold (it records nothing).
-=======
 -- waiting (`task.held`), the holds past their bound (`source.hold_expired`),
 -- and the outcomes of the owner's landing requests (`source.moved` naming its
 -- `request`, `source.push_refused`). Returns the record's event id; null for
 -- a `task.held` already recorded for the task and hold (it records nothing).
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
     v_mission bigint;
     v_stale bigint;
     v_recorded bigint;
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-=======
     v_request jsonb;
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
     v_hold mission_source_holds;
 begin
     -- Check and record under the append lock, so no other change interleaves.
@@ -2344,12 +2332,6 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
-                                   'task.held', 'source.hold_expired') then
-        raise exception 'the integrator does not record %', p_record ->> 'type';
-    end if;
-=======
     if p_record ->> 'type' is null
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'source.moved',
@@ -2412,7 +2394,6 @@ begin
         end if;
         return spawn_control_record(p_record);
     end if;
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
     -- A hold past its bound ends by this record alone, and only the active
     -- hold of its source, once the database's clock has reached its
     -- `expires_ms`: a release or a renewal recorded first wins. The store
@@ -2937,12 +2918,8 @@ begin
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-        'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)'] loop
-=======
         'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',
         'spawn_source_push_request(text, text, text)', 'spawn_source_push_hold()'] loop
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;

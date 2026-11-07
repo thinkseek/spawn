@@ -858,41 +858,6 @@ impl PostgresStore {
             .get(0))
     }
 
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-    /// Record a gate verdict, a landing, an abort or a halt (owner only).
-    /// A record the store declines as already made (a second `task.held`
-    /// for one task and hold: [`Self::task_held`]) is an error here.
-    pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
-        self.query_one("select spawn_integrator_record($1)", &[record])?
-            .get::<_, Option<i64>>(0)
-            .ok_or_else(|| StoreError::Rejected(format!("already recorded: {record}")))
-    }
-
-    /// Take the integrator's landing lock for an owner's hold on `source`
-    /// (owner only; a source no mission names, or a remote one, is
-    /// refused): a landing whose push has begun records its outcome first.
-    /// Read the source's main while the guard lives, then record the hold
-    /// with [`Self::source_hold`].
-    pub fn source_hold_lock(&self, source: &str) -> Result<LandingHold<'_>, StoreError> {
-        self.execute("select spawn_source_hold_lock($1)", &[&source])?;
-        Ok(LandingHold { store: self })
-    }
-
-    /// Record the owner's hold on `source` at `main` (read under
-    /// [`Self::source_hold_lock`]) for `bound_s` seconds, with a `reason`:
-    /// `{hold, source, main, expires_ms, renews}`. Owner only.
-    pub fn source_hold(
-        &self,
-        source: &str,
-        main: &str,
-        bound_s: i32,
-        reason: Option<&str>,
-    ) -> Result<Value, StoreError> {
-        Ok(self
-            .query_one(
-                "select spawn_source_hold($1, $2, $3, $4)",
-                &[&source, &main, &bound_s, &reason],
-=======
     /// Ask for `commit` on `source`'s main (`spawn mission push`, owner
     /// only): the commit waits in the source at `reference`
     /// (`refs/spawn-owner/<commit>`). Records `source.push_requested` and
@@ -907,13 +872,10 @@ impl PostgresStore {
             .query_one(
                 "select spawn_source_push_request($1, $2, $3)",
                 &[&source, &commit, &reference],
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
             )?
             .get(0))
     }
 
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-=======
     /// The owner's landing requests without an outcome yet, oldest first
     /// ([`SOURCE_PUSHES_PENDING`]).
     pub fn source_pushes_pending(&self) -> Result<Value, StoreError> {
@@ -976,7 +938,6 @@ impl PostgresStore {
             .get(0))
     }
 
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
     /// Release the active hold on `source`, if there is one:
     /// `{source, released, waiting}` (`released` null: nothing recorded).
     /// Owner only.

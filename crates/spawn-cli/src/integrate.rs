@@ -1199,8 +1199,6 @@ impl Integrator {
         // A hold past its bound ends by its record, before any mission's
         // step: nothing lands on its source until then.
         expire_holds(store)?;
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-=======
         // Step 0: the owner's landings, applied before any mission's step
         // reads its source's main, so no baseline check sees a main the
         // owner moved without its record. A source whose request is still
@@ -1218,7 +1216,6 @@ impl Integrator {
         store: &Arc<PostgresStore>,
         pending: &std::collections::HashMap<String, i64>,
     ) -> Result<(), String> {
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
@@ -2469,12 +2466,8 @@ fn land(
         .map(|()| Landing::Stale);
     };
     // Held until the landing is recorded: dropping the mission waits for it,
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-    // and so does an owner's hold.
-=======
     // and so does an owner's hold (an owner's landing takes the lock on a
     // connection of its own).
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
     let Some(_lock) = store
         .landing_hold(task.id)
         .map_err(|error| error.to_string())?
@@ -7505,8 +7498,6 @@ mod database_tests {
         assert_eq!(source_records(&db, "source.hold_expired").len(), 1, "once");
         let _ = std::fs::remove_dir_all(&base);
     }
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-=======
 
     // Objective 21: the owner's landings (`spawn mission push`), step 0.
 
@@ -7912,5 +7903,4 @@ mod database_tests {
         assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
         let _ = std::fs::remove_dir_all(&base);
     }
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
 }

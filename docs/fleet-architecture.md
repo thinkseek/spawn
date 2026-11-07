@@ -1031,12 +1031,8 @@ record of what was judged (§14 of design.md).
   gate run on revision 0 never lands, or sends back, revision 1.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). A pass
   first records the owner's holds past their bound as expired (below,
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
-  "Landing: the owner's hold"). A mission
-=======
   "Landing: the owner's hold"), then applies the owner's pending landings
   (below, "The owner's landings"), then visits the missions. A mission
->>>>>>> b27e713d490c91749a1e5fde719c8d3cf523fcdc
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
   another mission's task in `landing` waits for it (the push may have moved
