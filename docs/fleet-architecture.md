@@ -1649,9 +1649,11 @@ record of what was judged (§14 of design.md).
     no record explains (a push behind Spawn's back) halts.
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
-  No rule counts host faults, however many in a row: a halt needs a human,
-  and a host fault is the host's, so it is judged again after its backoff
-  and escalated at two in a row instead.
+  No rule counts host faults, however many in a row, whatever their evidence:
+  a halt needs a human, and a host fault is the host's, so it is judged again
+  after its backoff; 020's evidence (the test database) is escalated at two
+  in a row instead, and a base that disagreed with itself raises one alert at
+  three in a row (its record's `alert`), never a halt.
 - **A shared source has one baseline.** A landing moves the baseline of
   every mission on that source whose baseline was its `from` and that is not
   halted (the record names them), so RSI and fleet work on the same
