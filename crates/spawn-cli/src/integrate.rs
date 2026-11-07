@@ -1695,6 +1695,19 @@ impl Integrator {
             }
             if let Some(continues) = task.continues {
                 overrun["continues"] = json!(continues);
+                // A second overrun of a chain: a task that continues an
+                // overrun task, while no configure came between (a third
+                // overrun after a configure is a first).
+                let earlier = store
+                    .overrun_at(continues)
+                    .map_err(|error| error.to_string())?;
+                if earlier.is_some_and(|at| {
+                    mission
+                        .configured_ms
+                        .is_none_or(|configured| configured <= at)
+                }) {
+                    overrun["chain"] = json!(true);
+                }
             }
             if let Some(objective) = task.objective {
                 overrun["objective"] = json!(objective);
