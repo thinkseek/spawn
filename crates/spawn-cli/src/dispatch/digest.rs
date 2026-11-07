@@ -143,6 +143,11 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
             let task = record["id"].as_i64()?;
+            // Only a record that carries the escalation is one: a base that
+            // disagreed with itself never does (objective 033).
+            if record["escalate"].as_bool() != Some(true) {
+                return None;
+            }
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
