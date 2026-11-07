@@ -3987,6 +3987,30 @@ mod tests {
         );
     }
 
+    /// A terminal killed from outside ends its execution on the next pass,
+    /// as before: the fleet's liveness is one call per pass, not a capture
+    /// and not a call per agent.
+    #[test]
+    fn a_killed_terminal_ends_its_execution_on_the_next_pass() {
+        let mut world = World::new();
+        assert_eq!(world.pass(), 0, "idle: nothing to do");
+        world.store.untrack(
+            &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+            "a shell prompt after the host move",
+        );
+        world.tick();
+        let ended = world
+            .store
+            .read_global(GlobalPosition(0), 500)
+            .expect("read")
+            .into_iter()
+            .find_map(|record| match record.event.kind {
+                EventKind::ExecutionEnded { cause, .. } => Some(cause),
+                _ => None,
+            });
+        assert_eq!(ended, Some(crate::event::EndCause::Lost), "ended as lost");
+    }
+
     /// A watch that can be set on one of an execution's files and not on
     /// another falls back for the whole execution: both are read on every
     /// pass, and the file that could not be watched is named once.
