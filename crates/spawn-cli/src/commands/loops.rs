@@ -253,6 +253,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         eprintln!("spawn loop warning: {warning}");
     }
     let root = workspace_root(flags).map(std::path::PathBuf::from);
+    let monitor = disk::Monitor::new(root.as_deref());
     let mut fleet = Fleet {
         bridge,
         observer,
@@ -263,7 +264,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         dispatching: env_value("SPAWN_DISPATCH").is_none_or(|value| value != "0"),
         spawn: spawn_program(),
         workspace_root: root,
-        disk: disk::Monitor::new(root.as_deref()),
+        disk: monitor,
         bounds,
         interval: loop_interval(),
         failures: 0,
