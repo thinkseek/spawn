@@ -188,6 +188,43 @@ pub fn git_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// A command that runs git the way a test runs its own (a seed's `init`,
+/// `add` and `commit`, a look at a ref or an index): [`git_command`],
+/// without the user's or the system's git configuration.
+///
+/// `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` leave out
+/// `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and `/etc/gitconfig`, and
+/// configuration inherited through the environment (`GIT_CONFIG_COUNT`,
+/// `GIT_CONFIG_PARAMETERS`) is removed. So a host whose configuration signs
+/// every commit (`commit.gpgsign` with a key no agent holds: `ssh-keygen -Y
+/// sign` waits forever), runs hooks (`core.hooksPath`) or refuses to guess
+/// an identity (`user.useConfigOnly`) neither hangs nor fails a test, and
+/// a configuration a test sets on the command itself still counts. It
+/// leaves out every setting, not just signing: no setting of the host's
+/// can reach a test's own git. Standard input is empty; the identity
+/// (`spawn-test`) is one a test may override with its own `-c`.
+///
+/// Never Spawn's own git: what Spawn runs must hold under the host's
+/// configuration, and a test runs it that way (`spawn-cli`'s
+/// `spawn_s_own_commits_ignore_forced_signing`).
+#[cfg(any(test, feature = "testing"))]
+pub fn test_git_command() -> Command {
+    let mut command = git_command("git");
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .stdin(Stdio::null())
+        .args([
+            "-c",
+            "user.name=spawn-test",
+            "-c",
+            "user.email=spawn@localhost",
+        ]);
+    command
+}
+
 /// Stdout of a git command exactly as written, bytes and all, or the
 /// failure as an error. A `-z` listing is read this way: a path may begin
 /// or end with whitespace, which trimming would cut off the first or the
