@@ -8,22 +8,28 @@
 //! the brief carries it, the resident roster. Nothing is stored and no id is
 //! renamed (docs/view-architecture.md §12).
 //!
-//! - `mission_name`: the head of the mission's text (`RSI: improve ...` is
-//!   `RSI`, `Owner work on Supply PA: ...` is `Supply PA owner work`), or its
-//!   first sentence, with the project of its source in front when the head
-//!   does not name it (`Spawn RSI`); at most [`MISSION_MAX`] characters.
+//! - `mission_name`: a short head of the mission's text (four words at
+//!   most before its first colon: `RSI: ...` is `Spawn RSI`, `Owner work on
+//!   Supply PA: ...` is `Supply PA · owner work`), the project of its source
+//!   in front when the head does not name it; otherwise the project and the
+//!   mission's id (`Spawn mission 3`): never a clip of a sentence.
 //! - `task_title`: an objective task's backlog title (the brief's first line,
 //!   `Objective <n>: <title>`, as `objectives::brief` writes it; a title that
 //!   is only `Task <n>` gives way to the prompt's first sentence); any other
-//!   task's brief's first sentence, without the owner-work boilerplate in
-//!   front, parentheses and markdown; at most [`TITLE_MAX`] characters, cut
-//!   on a word.
-//! - `label`: one line of at most [`LABEL_MAX`] characters, parts joined by
-//!   ` · `: a task's is `<mission> · task <id>` (`objective <n>` for an
-//!   objective task) `· <title> · <state>`; an agent's is its task's, with
-//!   `resident <name>` before the state for a resident on its current task,
-//!   `resident <name> · idle · last: ...` for one without, and
-//!   `supervisor · ...` for the supervisor.
+//!   task's `Goal:` line when its brief has one (a brief may open with a
+//!   setup step), else its first line, as its first sentence, without the
+//!   owner-work boilerplate in front, parentheses and markdown; at most
+//!   [`TITLE_MAX`] characters, cut on a word.
+//! - `label`: a complete phrase, parts joined by ` · `, that leaves out what
+//!   its row shows beside it (the raw id, the state): a task's is
+//!   `<mission> · <title>`, with `objective <n>` after it for an objective
+//!   task; a worker's is its latest task's; a resident's is its task's while
+//!   it works one (assigned, delivered, revise), else `resident <name> ·
+//!   idle · ...` with its last task, or what its latest input says (a task
+//!   cancelled); the supervisor's says what its latest input asks of it (a
+//!   dispatcher digest: `supervisor · reviewing the report of task 162 ·
+//!   Implement extras`; an owner note: `supervisor · answering an owner
+//!   note`), `idle · last: ...` once its turn has ended.
 
 use std::collections::BTreeMap;
 
@@ -31,25 +37,16 @@ use serde_json::{Value, json};
 
 use crate::supervise::SUPERVISOR_SESSION;
 
-/// Most characters of a label.
-pub(super) const LABEL_MAX: usize = 90;
+/// Most characters of a label: a bound against a runaway text, never met by
+/// the parts themselves (a mission name, a whole title, a reference), so a
+/// label is never cut mid-phrase. Two lines of the page.
+pub(super) const LABEL_MAX: usize = 160;
 
 /// Most characters of a task title.
-pub(super) const TITLE_MAX: usize = 80;
+pub(super) const TITLE_MAX: usize = 120;
 
-/// Most characters of a mission name.
-pub(super) const MISSION_MAX: usize = 32;
-
-/// Fewest characters a title keeps inside a label, however long the rest.
-const TITLE_MIN: usize = 16;
-
-/// Characters of its title a label keeps before it shortens the mission
-/// name.
-const TITLE_ROOM: usize = 40;
-
-/// Fewest characters a mission name keeps inside a label that shortens it
-/// for its title.
-const MISSION_MIN: usize = 12;
+/// Most words of a mission text's head that name the mission.
+const HEAD_WORDS: usize = 4;
 
 /// What joins the parts of a label.
 const JOIN: &str = " · ";
@@ -83,6 +80,14 @@ struct Resident {
     session_id: String,
 }
 
+/// A session's latest input: who sent it (`spawn-dispatch`, `human`,
+/// `spawn-liveness`, ...) and its text's start.
+#[derive(Debug, Clone)]
+struct Input {
+    principal: String,
+    text: String,
+}
+
 /// What a label is made of: missions, tasks and residents, from a board
 /// (`/api/missions`' shape, or [`spawn_postgres::PostgresStore::label_facts`]).
 #[derive(Debug, Clone, Default)]
@@ -90,6 +95,8 @@ pub(super) struct Context {
     missions: Vec<Mission>,
     tasks: Vec<Task>,
     residents: Vec<Resident>,
+    /// The latest input of the supervisor and of each resident.
+    inputs: BTreeMap<String, Input>,
 }
 
 /// Objective titles by `(mission, objective)`, from a loaded backlog: what
@@ -98,7 +105,8 @@ pub(super) type Titles = BTreeMap<(i64, u64), String>;
 
 impl Context {
     /// From `{missions: [{id, text, sources, gate, accept, tasks: [...]}],
-    /// residents: [{name, session_id}]}`.
+    /// residents: [{name, session_id}], inputs?: [{session_id, principal,
+    /// text}]}`.
     pub(super) fn from_board(board: &Value, titles: &Titles) -> Context {
         let mut context = Context::default();
         for mission in rows(&board["missions"]) {
@@ -108,6 +116,7 @@ impl Context {
             context.missions.push(Mission {
                 id,
                 name: mission_name(
+                    id,
                     mission["text"].as_str().unwrap_or_default(),
                     &sources(mission),
                 ),
@@ -146,6 +155,19 @@ impl Context {
                 });
             }
         }
+        for input in rows(&board["inputs"]) {
+            if let (Some(session), Some(principal)) =
+                (input["session_id"].as_str(), input["principal"].as_str())
+            {
+                context.inputs.insert(
+                    session.to_string(),
+                    Input {
+                        principal: principal.to_string(),
+                        text: input["text"].as_str().unwrap_or_default().to_string(),
+                    },
+                );
+            }
+        }
         context
     }
 
@@ -158,7 +180,7 @@ impl Context {
         let task = self.tasks.iter().find(|task| task.id == id)?;
         let mission = self.mission(task.mission)?;
         Some(json!({
-            "label": task_label(mission, task, None),
+            "label": task_label(mission, task),
             "task_title": task.title,
             "mission_name": mission.name,
         }))
@@ -179,45 +201,49 @@ impl Context {
                 "mission_name": null,
             });
         }
-        // Newest first: a session that took more than one task is on its
-        // latest.
-        let mut mine: Vec<&Task> = self
-            .tasks
-            .iter()
-            .filter(|task| task.session_id.as_deref() == Some(session_id))
-            .collect();
-        mine.sort_by_key(|task| std::cmp::Reverse(task.id));
+        let mine = self.tasks_of(session_id);
         if let Some(resident) = self
             .residents
             .iter()
             .find(|resident| resident.session_id == session_id)
         {
-            let current = mine.iter().find(|task| self.open(task));
-            return match (current, mine.first()) {
-                (Some(task), _) => self.with_task(task, Some(&resident.name)),
-                (None, Some(last)) => {
-                    let mission = self.mission(last.mission);
-                    let head = vec![format!("resident {}", resident.name), "idle".to_string()];
-                    let last_ref = format!(
-                        "last: {}{}",
-                        mission.map(|m| format!("{} ", m.name)).unwrap_or_default(),
-                        task_ref(last)
-                    );
-                    json!({
-                        "label": fit(&[head, vec![last_ref]].concat(), &last.title, &[]),
-                        "task_title": last.title,
-                        "mission_name": mission.map(|m| m.name.clone()),
-                    })
+            // A resident works a task while it is assigned, delivered or
+            // sent back; once reported it waits on others.
+            let current = mine
+                .iter()
+                .find(|task| matches!(task.state.as_str(), "assigned" | "delivered" | "revise"));
+            if let Some(task) = current {
+                return self.with_task(task);
+            }
+            let idle = format!("resident {}{JOIN}idle", resident.name);
+            let cancelled = self
+                .inputs
+                .get(session_id)
+                .and_then(|input| cancelled_task(&input.text));
+            let label = match (cancelled, mine.first()) {
+                (Some(id), _) => {
+                    let what = self
+                        .task_by_id(id)
+                        .map(|task| format!(" · {}", task.title))
+                        .unwrap_or_default();
+                    format!("{idle}{JOIN}task {id} cancelled{what}")
                 }
-                (None, None) => json!({
-                    "label": format!("resident {}{JOIN}idle", resident.name),
-                    "task_title": null,
-                    "mission_name": null,
-                }),
+                (None, Some(last)) => format!(
+                    "{idle}{JOIN}last: {} ({})",
+                    self.task_phrase(last),
+                    state_phrase(last.state.as_str(), self.gated(last))
+                ),
+                (None, None) => idle,
             };
+            let last = mine.first();
+            return json!({
+                "label": clip(&label, LABEL_MAX),
+                "task_title": last.map(|task| task.title.clone()),
+                "mission_name": last.and_then(|task| self.mission(task.mission)).map(|m| m.name.clone()),
+            });
         }
         if let Some(task) = mine.first() {
-            return self.with_task(task, None);
+            return self.with_task(task);
         }
         let mut label = humanized(agent_id.unwrap_or(session_id));
         if let Some(state) = state {
@@ -226,31 +252,71 @@ impl Context {
         json!({"label": clip(&label, LABEL_MAX), "task_title": null, "mission_name": null})
     }
 
-    fn with_task(&self, task: &Task, resident: Option<&str>) -> Value {
+    /// A session's tasks, newest first.
+    fn tasks_of(&self, session_id: &str) -> Vec<&Task> {
+        let mut mine: Vec<&Task> = self
+            .tasks
+            .iter()
+            .filter(|task| task.session_id.as_deref() == Some(session_id))
+            .collect();
+        mine.sort_by_key(|task| std::cmp::Reverse(task.id));
+        mine
+    }
+
+    fn task_by_id(&self, id: i64) -> Option<&Task> {
+        self.tasks.iter().find(|task| task.id == id)
+    }
+
+    fn gated(&self, task: &Task) -> bool {
+        self.mission(task.mission).is_some_and(|m| m.gated)
+    }
+
+    /// A task as a label names it: its mission and title.
+    fn task_phrase(&self, task: &Task) -> String {
         match self.mission(task.mission) {
-            Some(mission) => json!({
-                "label": task_label(mission, task, resident),
-                "task_title": task.title,
-                "mission_name": mission.name,
-            }),
-            None => json!({"label": clip(&task.title, LABEL_MAX), "task_title": task.title,
-                           "mission_name": null}),
+            Some(mission) => task_label(mission, task),
+            None => task_words(task),
         }
     }
 
-    /// Whether a task is still being worked: not landed or cancelled, and
-    /// not accepted unless its mission's gate still has to take it.
-    fn open(&self, task: &Task) -> bool {
-        match task.state.as_str() {
-            "landed" | "cancelled" => false,
-            "accepted" => self.mission(task.mission).is_some_and(|m| m.gated),
-            _ => true,
-        }
+    fn with_task(&self, task: &Task) -> Value {
+        let mission = self.mission(task.mission);
+        json!({
+            "label": clip(&self.task_phrase(task), LABEL_MAX),
+            "task_title": task.title,
+            "mission_name": mission.map(|m| m.name.clone()),
+        })
     }
 
-    /// `supervisor · reviewing <n> reports (missions 7, 8)` while reports
-    /// wait in its review missions, else `supervisor · <state>`.
+    /// What the supervisor is doing, from its latest input (module
+    /// comment); `idle · last: ...` when its fleet state says its turn has
+    /// ended. Without an input: the reports waiting in its review missions,
+    /// else its state.
     fn supervisor_label(&self, state: Option<&str>) -> String {
+        let busy = state.is_none_or(|state| state.eq_ignore_ascii_case("WORKING"));
+        let doing = self
+            .inputs
+            .get(SUPERVISOR_SESSION)
+            .map(|input| self.input_phrase(input));
+        let label = match doing {
+            Some(doing) if busy => format!("supervisor{JOIN}{doing}"),
+            Some(doing) => format!("supervisor{JOIN}idle{JOIN}last: {doing}"),
+            None => self.reviews_waiting().map_or_else(
+                || {
+                    format!(
+                        "supervisor{JOIN}{}",
+                        state.map_or_else(|| "idle".to_string(), str::to_lowercase)
+                    )
+                },
+                |reviews| format!("supervisor{JOIN}{reviews}"),
+            ),
+        };
+        clip(&label, LABEL_MAX)
+    }
+
+    /// `reviewing 2 reports (missions 7, 8)`, while reported tasks wait in
+    /// review missions.
+    fn reviews_waiting(&self) -> Option<String> {
         let waiting: Vec<&Task> = self
             .tasks
             .iter()
@@ -259,8 +325,7 @@ impl Context {
             })
             .collect();
         if waiting.is_empty() {
-            let state = state.map_or_else(|| "idle".to_string(), str::to_lowercase);
-            return format!("supervisor{JOIN}{state}");
+            return None;
         }
         let mut missions: Vec<i64> = waiting.iter().map(|task| task.mission).collect();
         missions.sort_unstable();
@@ -276,14 +341,98 @@ impl Context {
         } else {
             "missions"
         };
-        clip(
-            &format!(
-                "supervisor{JOIN}reviewing {} {noun} ({which} {})",
-                waiting.len(),
-                names.join(", ")
-            ),
-            LABEL_MAX,
-        )
+        Some(format!(
+            "reviewing {} {noun} ({which} {})",
+            waiting.len(),
+            names.join(", ")
+        ))
+    }
+
+    /// What an input asks of the supervisor, in a few words.
+    fn input_phrase(&self, input: &Input) -> String {
+        match input.principal.as_str() {
+            "spawn-dispatch" => self.digest_phrase(&input.text),
+            "human" => "answering an owner note".to_string(),
+            "spawn-liveness" => "restarted, catching up on the fleet".to_string(),
+            other => format!("working on {} input", humanized(other)),
+        }
+    }
+
+    /// A dispatcher digest (`Spawn dispatcher: 2 updates for you. ... -
+    /// session_x — completed, review it: ...`): its first update in words,
+    /// and how many more.
+    fn digest_phrase(&self, text: &str) -> String {
+        let Some((session, kind)) = first_update(text) else {
+            return "reading a dispatcher digest".to_string();
+        };
+        let reference = match self.tasks_of(&session).first() {
+            Some(task) => format!("task {}{JOIN}{}", task.id, self.task_phrase(task)),
+            None if session == "host" || session == "missions" => session.clone(),
+            None => humanized(&session),
+        };
+        let kind = kind.to_lowercase();
+        let doing = if kind.starts_with("completed") {
+            format!("reviewing the report of {reference}")
+        } else if kind.starts_with("idle") {
+            format!("next step for {reference}")
+        } else if kind.starts_with("human message") {
+            format!("following up a human's message to {reference}")
+        } else if kind.starts_with("attention") || kind.starts_with("stalled") {
+            format!(
+                "checking {reference} ({})",
+                kind.split([':', ',']).next().unwrap_or("").trim()
+            )
+        } else {
+            format!(
+                "handling {reference}: {}",
+                kind.split([':', ',']).next().unwrap_or("").trim()
+            )
+        };
+        match updates(text) {
+            Some(count) if count > 1 => format!("{doing} (+{} more)", count - 1),
+            _ => doing,
+        }
+    }
+}
+
+/// The session and kind of a digest's first update: `- session_x — <kind>`.
+fn first_update(text: &str) -> Option<(String, String)> {
+    let at = text.find("- session_").map(|at| at + 2).or_else(|| {
+        ["- host — ", "- missions — "]
+            .iter()
+            .filter_map(|mark| text.find(mark).map(|at| at + 2))
+            .min()
+    })?;
+    let rest = &text[at..];
+    let (session, kind) = rest.split_once(" — ")?;
+    let session = session.trim();
+    if session.is_empty() || session.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((session.to_string(), kind.trim().to_string()))
+}
+
+/// The count of a digest's `Spawn dispatcher: <n> update(s) for you.`
+fn updates(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix("Spawn dispatcher: ")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+/// The task of a `[Task #149 was cancelled ...` notice.
+fn cancelled_task(text: &str) -> Option<i64> {
+    let rest = text.strip_prefix("[Task #")?;
+    let (id, after) = rest.split_once(' ')?;
+    after
+        .starts_with("was cancelled")
+        .then(|| id.parse().ok())?
+}
+
+/// A task without its mission: its title, or `task <id>`.
+fn task_words(task: &Task) -> String {
+    if task.title.is_empty() {
+        format!("task {}", task.id)
+    } else {
+        task.title.clone()
     }
 }
 
@@ -298,14 +447,6 @@ fn sources(mission: &Value) -> Vec<String> {
         .collect()
 }
 
-/// `task <id>`, or `objective <n>` for an objective task.
-fn task_ref(task: &Task) -> String {
-    match task.objective {
-        Some(objective) => format!("objective {objective}"),
-        None => format!("task {}", task.id),
-    }
-}
-
 /// A task state as a label says it: `working` for delivered, `revising`
 /// for revise, `awaiting gate` for accepted work a gate still has to take.
 fn state_phrase(state: &str, gated: bool) -> &str {
@@ -317,31 +458,21 @@ fn state_phrase(state: &str, gated: bool) -> &str {
     }
 }
 
-/// `<mission> · task <id> · <title> [· resident <name>] · <state>`.
-fn task_label(mission: &Mission, task: &Task, resident: Option<&str>) -> String {
-    let mut after = Vec::new();
-    if let Some(name) = resident {
-        after.push(format!("resident {name}"));
-    }
-    after.push(state_phrase(&task.state, mission.gated).to_string());
+/// `<mission> · <title>`, `· objective <n>` after it for an objective
+/// task: the whole title, never cut (the task's id and state are beside the
+/// label on its row).
+fn task_label(mission: &Mission, task: &Task) -> String {
     let title = without_place(&task.title, &mission.name);
-    // The title says most: a long mission name gives way to it first.
-    let len = |part: &String| part.chars().count();
-    let rest = len(&task_ref(task))
-        + after.iter().map(len).sum::<usize>()
-        + JOIN.chars().count() * (after.len() + 2);
-    let named = mission.name.chars().count();
-    let room = LABEL_MAX.saturating_sub(rest + named);
-    let wanted = title.chars().count().min(TITLE_ROOM);
-    let name = if room >= wanted {
-        mission.name.clone()
+    let mut parts = vec![mission.name.clone()];
+    parts.push(if title.is_empty() {
+        format!("task {}", task.id)
     } else {
-        clip(
-            &mission.name,
-            named.saturating_sub(wanted - room).max(MISSION_MIN),
-        )
-    };
-    fit(&[name, task_ref(task)], title, &after)
+        title.to_string()
+    });
+    if let Some(objective) = task.objective {
+        parts.push(format!("objective {objective}"));
+    }
+    parts.join(JOIN)
 }
 
 /// `title` without a closing ` in <place>` the mission's name already says
@@ -353,23 +484,24 @@ fn without_place<'a>(title: &'a str, mission: &str) -> &'a str {
     }
 }
 
-/// `before · title · after`, the title cut on a word so that the whole is
-/// at most [`LABEL_MAX`] characters (it keeps [`TITLE_MIN`] at least; the
-/// whole is then clipped). An empty title is left out.
-fn fit(before: &[String], title: &str, after: &[String]) -> String {
-    let fixed: usize = before
-        .iter()
-        .chain(after)
-        .map(|part| part.chars().count())
-        .sum::<usize>()
-        + JOIN.chars().count() * (before.len() + after.len());
-    let room = LABEL_MAX.saturating_sub(fixed).max(TITLE_MIN);
-    let mut parts: Vec<String> = before.to_vec();
-    if !title.is_empty() {
-        parts.push(clip(title, room));
+/// `text` at most `max` characters, as a complete phrase: a sentence longer
+/// than that ends at its last clause boundary (`, `, `; `, ` — `) inside
+/// the bound, so a title is not cut mid-phrase; only a sentence with no
+/// such boundary in its first third onward is cut on a word ([`clip`]).
+fn whole_clause(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
     }
-    parts.extend(after.iter().cloned());
-    clip(&parts.join(JOIN), LABEL_MAX)
+    let inside: String = text.chars().take(max).collect();
+    let boundary = [", ", "; ", " — "]
+        .iter()
+        .filter_map(|mark| inside.rfind(mark))
+        .max()
+        .filter(|at| *at >= inside.len() / 3);
+    match boundary {
+        Some(at) => inside[..at].trim_end().to_string(),
+        None => clip(text, max),
+    }
 }
 
 /// `text` cut on a word boundary to at most `max` characters, `…` marking
@@ -420,44 +552,36 @@ fn project(source: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
-/// A mission's name, from its text and sources (module comment).
-pub(super) fn mission_name(text: &str, sources: &[String]) -> String {
+/// A mission's name, from its id, text and sources (module comment).
+pub(super) fn mission_name(id: i64, text: &str, sources: &[String]) -> String {
     let first = text
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
     let first = unmarked(first);
     // A short head before a colon names the mission (`RSI: ...`).
-    let head = first
-        .split_once(':')
-        .map(|(head, _)| head.trim())
-        .and_then(|head| {
-            let head = without_parentheses(head);
-            let head = head.trim();
-            (!head.is_empty() && head.split_whitespace().count() <= 6).then(|| head.to_string())
-        });
-    let from_head = head.is_some();
-    let name = match head {
-        Some(head) => match strip_prefix_ci(&head, "Owner work on ") {
-            Some(subject) => format!("{subject} owner work"),
-            None => head,
-        },
-        None => sentence(&without_parentheses(&first)),
-    };
+    let head = first.split_once(':').and_then(|(head, _)| {
+        let head = without_parentheses(head);
+        let head = head.trim();
+        let subject = strip_prefix_ci(head, "Owner work on ").unwrap_or(head);
+        (!head.is_empty() && subject.split_whitespace().count() <= HEAD_WORDS)
+            .then(|| head.to_string())
+    });
     let project = sources.first().and_then(|source| project(source));
-    let name = match project {
-        Some(project) if !mentions(&name, &project) => {
-            if name.is_empty() {
-                project
-            } else if from_head {
-                format!("{project} {name}")
-            } else {
-                format!("{project}: {name}")
-            }
-        }
-        _ => name,
+    let Some(head) = head else {
+        return match project {
+            Some(project) => format!("{project} mission {id}"),
+            None => format!("mission {id}"),
+        };
     };
-    clip(&name, MISSION_MAX)
+    let name = match strip_prefix_ci(&head, "Owner work on ") {
+        Some(subject) => format!("{subject}{JOIN}owner work"),
+        None => head,
+    };
+    match project {
+        Some(project) if !mentions(&name, &project) => format!("{project} {name}"),
+        _ => name,
+    }
 }
 
 /// Whether `text` names `project`, case and `-` aside.
@@ -493,13 +617,25 @@ pub(super) fn task_title(brief: &str, objective: Option<u64>, fallback: Option<&
             .filter(|title| !generic(title))
             .or(fallback.filter(|title| !generic(title)));
         if let Some(title) = title {
-            return clip(&capitalized(&sentence(&unmarked(title))), TITLE_MAX);
+            return whole_clause(&capitalized(&sentence(&unmarked(title))), TITLE_MAX);
+        }
+    }
+    // A brief may open with a setup step ("First check you have ..."): its
+    // `Goal:` line, when it has one, says what the task is.
+    let goal = rest
+        .iter()
+        .take(8)
+        .find(|line| strip_prefix_ci(unmarked(line).trim(), "Goal:").is_some());
+    if let Some(line) = goal {
+        let title = cleaned(line);
+        if !title.is_empty() {
+            return whole_clause(&title, TITLE_MAX);
         }
     }
     for line in rest {
         let title = cleaned(line);
         if !title.is_empty() {
-            return clip(&title, TITLE_MAX);
+            return whole_clause(&title, TITLE_MAX);
         }
     }
     String::new()
@@ -803,52 +939,67 @@ mod tests {
 
     /// Mission texts as the live missions 1-8 begin (read 2026-11-07).
     #[test]
-    fn a_mission_is_named_by_its_texts_head_with_its_project() {
+    fn a_mission_is_named_by_a_short_head_or_its_project_and_id() {
         let cases = [
             (
+                8,
                 "Owner work on Supply PA: changes the owner reviews before merging (protected files included: gate/, ...). Each",
                 SUPPLY,
-                "Supply PA owner work",
+                "Supply PA · owner work",
             ),
             (
+                7,
                 "Owner work on Spawn: changes the owner reviews before merging (protected files included: the gate, rsi/, scripts/, deploy/).",
                 SPAWN,
-                "Spawn owner work",
+                "Spawn · owner work",
             ),
             (
+                6,
                 "Supply PA: give every provider (merchants, drivers, tour guides, producers, independent professionals) an AI business agent",
                 SUPPLY,
                 "Supply PA",
             ),
             (
+                4,
                 "RSI: improve Spawn by pursuing the controller's backlog objectives (rsi/backlog).",
                 SPAWN,
                 "Spawn RSI",
             ),
             (
+                3,
                 "Spawn follow-ups from mission 1 (behaviour-preserving unless stated):\n1. Task states as a type",
                 SPAWN,
-                "Spawn follow-ups from mission 1",
+                "Spawn mission 3",
             ),
             (
+                5,
                 "Move the RSI page onto the RSI objective mission, and retire the old RSI controller's last reader (docs/fleet-architecture.md §10.4 and §10.6).\n\nRSI is now mission 4",
                 SPAWN,
-                "Spawn: Move the RSI page onto…",
+                "Spawn mission 5",
             ),
             (
+                1,
                 "Recode Spawn for clarity and structure, without changing behaviour or the core.",
                 SPAWN,
-                "Recode Spawn for clarity and…",
+                "Spawn mission 1",
             ),
-            ("", SPAWN, "Spawn"),
+            (9, "", SPAWN, "Spawn mission 9"),
         ];
-        for (text, source, name) in cases {
-            assert_eq!(mission_name(text, &sources(source)), name, "{text}");
-            assert!(name.chars().count() <= MISSION_MAX);
+        for (id, text, source, name) in cases {
+            assert_eq!(mission_name(id, text, &sources(source)), name, "{text}");
         }
+        assert_eq!(mission_name(2, "Add a view.", &[]), "mission 2");
     }
 
-    /// Brief shapes of the live tasks (first lines, read 2026-11-07).
+    #[test]
+    fn a_brief_that_opens_with_a_setup_step_is_titled_by_its_goal() {
+        let brief = "First check you have the refactored tree: crates/spawn-cli/src/commands/ must exist. If they do not, stop.\n\nGoal: fix two configuration inconsistencies in spawn-cli. This task deliberately changes behaviour.\n\nFacts: (a) ...";
+        assert_eq!(
+            task_title(brief, None, None),
+            "Fix two configuration inconsistencies in spawn-cli"
+        );
+    }
+
     #[test]
     fn a_title_is_the_briefs_first_sentence_without_boilerplate() {
         let cases = [
@@ -884,11 +1035,11 @@ mod tests {
             ),
             (
                 "Owner work on Spawn, top priority: make the gate fast by running scenarios in parallel, each gate on its own disposable PostgreSQL server (G",
-                "Make the gate fast by running scenarios in parallel, each gate on its own…",
+                "Make the gate fast by running scenarios in parallel, each gate on its own disposable PostgreSQL server",
             ),
             (
                 "Owner work on Spawn's web UI (web/): make it easier to read, ordered and grouped the way an observer needs, and lighter.",
-                "Make it easier to read, ordered and grouped the way an observer needs, and…",
+                "Make it easier to read, ordered and grouped the way an observer needs, and lighter",
             ),
             // Goal: ..., e.g.
             (
@@ -902,7 +1053,7 @@ mod tests {
             // Reviews.
             (
                 "Review only, change nothing. Review branch spawn/agent_worker_gate_throughput_45 of ~/.local/share/spawn-rsi/missions/spawn.git (fetch read-",
-                "Review branch spawn/agent_worker_gate_throughput_45 of…",
+                "Review branch spawn/agent_worker_gate_throughput_45 of ~/.local/share/spawn-rsi/missions/spawn.git",
             ),
             (
                 "Review only, change nothing. The owner merged six branches into ~/projects/Spawn main at 0fb9e3f (fetch it read-only: git fetch",
@@ -911,7 +1062,7 @@ mod tests {
             // Plain sentences.
             (
                 "A gate that cannot run for lack of disk room must not count toward a mission's halt.\n\nToday scripts/rsi/gate.sh exits 3",
-                "A gate that cannot run for lack of disk room must not count toward a mission's…",
+                "A gate that cannot run for lack of disk room must not count toward a mission's halt",
             ),
             (
                 "Small owner-protected fix in Supply PA's .gitignore. Its rule 'node_modules/' (trailing slash) matches",
@@ -934,7 +1085,6 @@ mod tests {
             assert!(got.chars().count() <= TITLE_MAX, "{got}");
         }
     }
-
     #[test]
     fn an_objective_tasks_title_is_its_backlog_title() {
         // RSI: the brief carries the backlog's title.
@@ -973,54 +1123,6 @@ mod tests {
             "Do the thing"
         );
     }
-
-    #[test]
-    fn a_label_gives_its_title_room_before_a_long_mission_name() {
-        let long = Mission {
-            id: 1,
-            name: "Recode Spawn for clarity and…".to_string(),
-            gated: false,
-            review: true,
-        };
-        let task = Task {
-            id: 7,
-            mission: 1,
-            session_id: None,
-            state: "cancelled".to_string(),
-            objective: None,
-            title: "Fix two configuration inconsistencies in spawn-cli".to_string(),
-        };
-        let label = task_label(&long, &task, None);
-        assert_eq!(
-            label,
-            "Recode Spawn for clarity… · task 7 · Fix two configuration inconsistencies… · cancelled"
-        );
-        assert!(label.chars().count() <= LABEL_MAX);
-        // A place the mission already names is not said twice.
-        let supply = Mission {
-            id: 6,
-            name: "Supply PA".to_string(),
-            gated: true,
-            review: false,
-        };
-        let objective = Task {
-            id: 152,
-            mission: 6,
-            session_id: None,
-            state: "accepted".to_string(),
-            objective: Some(58),
-            title: "Implement languages in Supply PA".to_string(),
-        };
-        assert_eq!(
-            task_label(&supply, &objective, None),
-            "Supply PA · objective 58 · Implement languages · awaiting gate"
-        );
-        assert_eq!(
-            without_place("Move the RSI page in Spawn", "Supply PA"),
-            "Move the RSI page in Spawn"
-        );
-    }
-
     #[test]
     fn a_clip_cuts_on_a_word() {
         assert_eq!(clip("short", 10), "short");
@@ -1028,7 +1130,6 @@ mod tests {
         assert_eq!(clip("abcdefghijklmnop", 8), "abcdefg…");
         assert_eq!(clip("one two, three", 10), "one two…");
     }
-
     fn board() -> Value {
         json!({
             "missions": [
@@ -1064,13 +1165,25 @@ mod tests {
                  "tasks": [
                     {"id": 139, "session_id": "session_resident_supply",
                      "agent_id": "agent_resident_supply", "state": "landed", "objective": 51,
-                     "brief": "Objective 51: Task 51\n\nImplement provider teams in Supply PA: docs/protocol.md"}
+                     "brief": "Objective 51: Task 51\n\nImplement provider teams in Supply PA: docs/protocol.md"},
+                    {"id": 149, "session_id": "session_resident_supply",
+                     "agent_id": "agent_resident_supply", "state": "cancelled", "objective": 53,
+                     "brief": "Objective 53: Task 53\n\nImplement packages and memberships in Supply PA: docs"},
+                    {"id": 162, "session_id": "session_worker_objective_162",
+                     "agent_id": "agent_worker_objective_162", "state": "delivered", "objective": 62,
+                     "brief": "Objective 62: Task 62\n\nImplement extras in Supply PA: docs/protocol.md, sections \"Extras\""}
                  ]}
             ],
             "residents": [
                 {"name": "rsi", "agent_id": "agent_resident_rsi", "session_id": "session_resident_rsi"},
                 {"name": "supply", "agent_id": "agent_resident_supply", "session_id": "session_resident_supply"},
                 {"name": "spare", "agent_id": "agent_resident_spare", "session_id": "session_resident_spare"}
+            ],
+            "inputs": [
+                {"session_id": "session_supervisor", "principal": "spawn-dispatch",
+                 "text": "Spawn dispatcher: 2 updates for you. Check a worker with `spawn tail --session <session>` before acting. - session_worker_objective_162 — completed, review it: finished its task (COMPLETED). - host — disk space"},
+                {"session_id": "session_resident_supply", "principal": "spawn-dispatch",
+                 "text": "[Task #149 was cancelled — this is not a new task] Task #149 of mission #6 was cancelled by the integrator."}
             ]
         })
     }
@@ -1088,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_are_labelled_by_their_task_or_their_role() {
+    fn a_label_carries_the_whole_title_and_leaves_out_the_id_and_state() {
         let context = Context::from_board(&board(), &Titles::new());
         assert_eq!(
             label_of(
@@ -1097,23 +1210,22 @@ mod tests {
                 None,
                 Some("COMPLETED")
             ),
-            "Supply PA owner work · task 156 · Write the slice 12 owner contract the same… · cancelled"
+            "Supply PA · owner work · Write the slice 12 owner contract the same way slice 11 was written"
         );
         assert_eq!(
-            label_of(&context, "session_resident_rsi", None, Some("WORKING")),
-            "Spawn RSI · objective 58 · Budget overrun keeps the work… · resident rsi · awaiting gate"
+            label_of(
+                &context,
+                "session_worker_objective_162",
+                None,
+                Some("WORKING")
+            ),
+            "Supply PA · Implement extras · objective 62"
         );
+        let fields = context.agent_fields("session_worker_draft_report_141", None, None);
+        assert_eq!(fields["mission_name"], "Spawn · owner work");
         assert_eq!(
-            label_of(&context, "session_resident_supply", None, None),
-            "resident supply · idle · last: Supply PA objective 51 · Implement provider teams in…"
-        );
-        assert_eq!(
-            label_of(&context, "session_resident_spare", None, None),
-            "resident spare · idle"
-        );
-        assert_eq!(
-            label_of(&context, SUPERVISOR_SESSION, None, Some("WORKING")),
-            "supervisor · reviewing 2 reports (missions 7, 8)"
+            fields["label"],
+            "Spawn · owner work · A report that is still a draft is not taken as the task's report"
         );
         assert_eq!(
             label_of(
@@ -1124,46 +1236,74 @@ mod tests {
             ),
             "smoke transcript · completed"
         );
-        let fields = context.agent_fields("session_worker_draft_report_141", None, None);
-        assert_eq!(fields["mission_name"], "Spawn owner work");
-        assert_eq!(
-            fields["task_title"],
-            "A report that is still a draft is not taken as the task's report"
+        // Long live titles stay whole.
+        let mut long = board();
+        long["missions"][2]["tasks"][1]["state"] = json!("delivered");
+        long["missions"][2]["tasks"][1]["objective"] = json!(19);
+        long["missions"][2]["tasks"][1]["brief"] = json!(
+            "Objective 19: A delivery whose retries are spent without typing is re-issued, not left for a human\n\nRead"
         );
-        // Every label is one line within the bound.
-        for session in [
-            "session_worker_slice12_156",
-            "session_worker_flaky_157",
-            "session_worker_draft_report_141",
-            "session_resident_rsi",
-            "session_resident_supply",
-            SUPERVISOR_SESSION,
-        ] {
-            let label = label_of(&context, session, None, None);
-            assert!(label.chars().count() <= LABEL_MAX, "{label}");
-            assert!(!label.contains('\n'), "{label}");
-        }
+        let context = Context::from_board(&long, &Titles::new());
+        let label = label_of(&context, "session_resident_rsi", None, Some("WORKING"));
+        assert_eq!(
+            label,
+            "Spawn RSI · A delivery whose retries are spent without typing is re-issued, not left for a human · objective 19"
+        );
+        assert!(!label.contains('…'));
     }
 
     #[test]
-    fn the_supervisor_without_reports_says_its_state() {
+    fn a_resident_between_tasks_says_idle_and_why() {
+        let context = Context::from_board(&board(), &Titles::new());
+        // Its latest task is accepted, waiting on the gate: idle, its last.
+        assert_eq!(
+            label_of(&context, "session_resident_rsi", None, Some("COMPLETED")),
+            "resident rsi · idle · last: Spawn RSI · Budget overrun keeps the work it did · objective 58 (awaiting gate)"
+        );
+        // Its latest input is a cancellation.
+        assert_eq!(
+            label_of(&context, "session_resident_supply", None, None),
+            "resident supply · idle · task 149 cancelled · Implement packages and memberships in Supply PA"
+        );
+        assert_eq!(
+            label_of(&context, "session_resident_spare", None, None),
+            "resident spare · idle"
+        );
+    }
+
+    #[test]
+    fn the_supervisor_says_what_its_latest_input_asks_of_it() {
+        let context = Context::from_board(&board(), &Titles::new());
+        assert_eq!(
+            label_of(&context, SUPERVISOR_SESSION, None, Some("WORKING")),
+            "supervisor · reviewing the report of task 162 · Supply PA · Implement extras · objective 62 (+1 more)"
+        );
+        assert_eq!(
+            label_of(&context, SUPERVISOR_SESSION, None, Some("COMPLETED")),
+            "supervisor · idle · last: reviewing the report of task 162 · Supply PA · Implement extras · objective 62 (+1 more)"
+        );
+        let mut noted = board();
+        noted["inputs"][0] = json!({"session_id": "session_supervisor", "principal": "human",
+                                    "text": "Owner note (2026-11-07 23:07 SGT), act on it now: ..."});
+        let context = Context::from_board(&noted, &Titles::new());
+        assert_eq!(
+            label_of(&context, SUPERVISOR_SESSION, None, Some("WORKING")),
+            "supervisor · answering an owner note"
+        );
+        noted["inputs"][0] = json!({"session_id": "session_supervisor", "principal": "spawn-dispatch",
+                                    "text": "Spawn dispatcher: 1 update for you. - session_worker_flaky_157 — idle, give it the next step or review it: s"});
+        let context = Context::from_board(&noted, &Titles::new());
+        assert_eq!(
+            label_of(&context, SUPERVISOR_SESSION, None, None),
+            "supervisor · next step for task 157 · Supply PA · owner work · Make 048's restart test deterministic"
+        );
+        // No input: the reports waiting in its review missions.
         let mut quiet = board();
-        quiet["missions"][0]["tasks"][1]["state"] = json!("accepted");
-        quiet["missions"][1]["tasks"][0]["state"] = json!("accepted");
+        quiet["inputs"] = json!([]);
         let context = Context::from_board(&quiet, &Titles::new());
         assert_eq!(
             label_of(&context, SUPERVISOR_SESSION, None, Some("WORKING")),
-            "supervisor · working"
-        );
-        assert_eq!(
-            label_of(&context, SUPERVISOR_SESSION, None, None),
-            "supervisor · idle"
-        );
-        quiet["missions"][1]["tasks"][0]["state"] = json!("reported");
-        let context = Context::from_board(&quiet, &Titles::new());
-        assert_eq!(
-            label_of(&context, SUPERVISOR_SESSION, None, None),
-            "supervisor · reviewing 1 report (mission 7)"
+            "supervisor · reviewing 2 reports (missions 7, 8)"
         );
     }
 
@@ -1172,21 +1312,14 @@ mod tests {
         let mut labelled = board();
         label_board(&mut labelled);
         let mission = &labelled["missions"][0];
-        assert_eq!(mission["mission_name"], "Supply PA owner work");
+        assert_eq!(mission["mission_name"], "Supply PA · owner work");
         let task = &mission["tasks"][1];
-        assert_eq!(task["mission_name"], "Supply PA owner work");
         assert_eq!(task["task_title"], "Make 048's restart test deterministic");
         assert_eq!(
             task["label"],
-            "Supply PA owner work · task 157 · Make 048's restart test deterministic · reported"
-        );
-        assert_eq!(
-            labelled["residents"][1]["label"],
-            "resident supply · idle · last: Supply PA objective 51 · Implement provider teams in…"
+            "Supply PA · owner work · Make 048's restart test deterministic"
         );
 
-        // /api/rsi: a mission row carries its resident; a brief without a
-        // title takes the backlog's.
         let mut rsi = vec![json!({
             "id": 4, "text": "RSI: improve Spawn.", "sources": [SPAWN], "gate": "/g", "accept": "gate",
             "resident": {"name": "rsi", "agent_id": "agent_resident_rsi",
@@ -1203,11 +1336,11 @@ mod tests {
         );
         assert_eq!(
             rsi[0]["tasks"][0]["label"],
-            "Spawn RSI · objective 58 · Budget overrun keeps work · working"
+            "Spawn RSI · Budget overrun keeps work · objective 58"
         );
         assert_eq!(
             rsi[0]["resident"]["label"],
-            "Spawn RSI · objective 58 · Budget overrun keeps work · resident rsi · working"
+            "Spawn RSI · Budget overrun keeps work · objective 58"
         );
 
         let context = Context::from_board(&board(), &Titles::new());
@@ -1218,11 +1351,7 @@ mod tests {
         label_fleet(&mut agents, &context);
         assert_eq!(
             agents[0]["label"],
-            "Supply PA owner work · task 157 · Make 048's restart test deterministic · reported"
-        );
-        assert_eq!(
-            agents[0]["task_title"],
-            "Make 048's restart test deterministic"
+            "Supply PA · owner work · Make 048's restart test deterministic"
         );
         assert_eq!(agents[1]["label"], "cli · idle");
         assert_eq!(agents[1]["mission_name"], json!(null));
@@ -1239,17 +1368,62 @@ mod tests {
         label_attention(&mut answer, &context);
         assert_eq!(
             answer["pending"][0]["label"],
-            "Spawn owner work · task 141 · A report that is still a draft is not taken as… · reported"
+            "Spawn · owner work · A report that is still a draft is not taken as the task's report"
         );
         assert_eq!(answer["pending"][1]["label"], "host");
         assert_eq!(answer["told"][0]["label"], "missions");
         assert_eq!(
             answer["on_own_jobs"][0]["mission_name"],
-            "Supply PA owner work"
+            "Supply PA · owner work"
+        );
+        assert!(answer["supervisor"]["label"].as_str().is_some_and(|label| {
+            label.starts_with("supervisor · reviewing the report of task 162")
+        }));
+    }
+
+    /// Live first sentences longer than the bound (tasks 92 and 109).
+    #[test]
+    fn a_long_title_ends_at_a_clause_not_mid_phrase() {
+        let briefs = [
+            (
+                "Owner work on Spawn: implement objective 022 plus one gate saving, as owner work rather than a mission 4 objective, because both change the gate itself and the owner reviews such changes.",
+                "Implement objective 022 plus one gate saving, as owner work rather than a mission 4 objective",
+            ),
+            (
+                "Owner work on Spawn: the owner can type to an agent from the web page, and the page stops presenting the human as something the fleet waits on, everywhere it says so.",
+                "The owner can type to an agent from the web page",
+            ),
+        ];
+        for (brief, title) in briefs {
+            let got = task_title(brief, None, None);
+            assert_eq!(got, title);
+            assert!(!got.contains('…'));
+        }
+        assert_eq!(whole_clause("short", 10), "short");
+        assert_eq!(whole_clause("nocommas in this long text", 12), "nocommas…");
+    }
+
+    #[test]
+    fn a_digests_first_update_and_a_cancellation_are_read() {
+        assert_eq!(
+            first_update(
+                "Spawn dispatcher: 1 update for you. Check ... - session_a — completed, review it: x"
+            ),
+            Some((
+                "session_a".to_string(),
+                "completed, review it: x".to_string()
+            ))
         );
         assert_eq!(
-            answer["supervisor"]["label"],
-            "supervisor · reviewing 2 reports (missions 7, 8)"
+            first_update("Spawn dispatcher: 1 update for you. - host — disk space on this host"),
+            Some(("host".to_string(), "disk space on this host".to_string()))
         );
+        assert_eq!(first_update("Owner note: hello"), None);
+        assert_eq!(updates("Spawn dispatcher: 4 updates for you."), Some(4));
+        assert_eq!(
+            cancelled_task("[Task #149 was cancelled — this is not a new task]"),
+            Some(149)
+        );
+        assert_eq!(cancelled_task("New task #158 for mission #6"), None);
     }
 }
