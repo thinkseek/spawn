@@ -3,7 +3,9 @@
 //! The Observer says what state a worker is in; this decides what to do
 //! about it, on the decision ladder of docs/fleet-architecture.md §3:
 //!
-//! 1. Rules over facts decide fixed cases: a lost execution is resumed once.
+//! 1. Rules over facts decide fixed cases: a lost execution is resumed once,
+//!    and a session whose resume failed is escalated, never resumed again by
+//!    rule (the one-resume rule, `worker::resume_lost`).
 //! 2. One guarded nudge: when Jev judged that a worker stopped at an idle
 //!    prompt without needing anyone (WAITING, confident, `needs_human` and
 //!    `stuck` low), it gets `continue` typed in, once per episode and at most

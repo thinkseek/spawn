@@ -188,7 +188,7 @@ it, on the same ladder.
   Jev never chooses the action; its judgement is one input, and only within
   the limits of §2.1:
   1. *Facts and rules* decide fixed cases: a lost execution is resumed
-     once.
+     once (the one-resume rule, below).
   2. *A guarded nudge*: when the agent stopped without asking anything
      (Jev: WAITING, `needs_human` low, confidence high) and its task is not
      done, type `continue`, once per episode, rate-limited per agent.
@@ -198,14 +198,14 @@ it, on the same ladder.
 
   The code is `crates/spawn-cli/src/dispatch.rs`, principal `spawn-dispatch`.
   It acts only on a judgement that covers the session's latest fact; a lost
-  execution is resumed once; the nudge needs Jev's WAITING at an idle prompt
+  execution is resumed once (the one-resume rule); the nudge needs Jev's WAITING at an idle prompt
   with confidence ≥ 0.7, `needs_human` ≤ 0.2 and `stuck` < 0.5, once per
   episode (the latest non-dispatcher command) and three per agent-hour. Only
   a nudge that reached the worker counts: one refused before typing (a pane
   not ready) is sent again under `<key>-retry-<n>` on a judgement made after
   it, twice, then escalated as never typed. A worker idle at its prompt and
   not nudged, a nudge that did not help, a
-  failed resume (or one whose engine was lost again within a minute),
+  failed resume (the one-resume rule),
   attention, and a finished execution nobody stopped (its recorded end
   cause is not `stopped`) all escalate. A Stop or Discard that failed,
   whoever sent it (a model switch, a closed task's worker, a retired
@@ -224,6 +224,37 @@ it, on the same ladder.
   told. An approval or a human command (once finished, with its outcome: one
   that failed is reported as failed) is news until it was told, however
   long that takes.
+
+  **The one-resume rule.** A lost worker execution is resumed once
+  (`dispatch-resume-<execution>`); once that resume has failed, the session
+  is escalated (`resume failed`) and never resumed again by rule, until one
+  of its executions stays up. Failed is read from what the log records
+  about the session since its last execution that stayed up (it neither
+  died young, lost or exited non-zero within a minute of its start, nor
+  ended lost before its engine became ready), never from the key of its
+  latest execution: a resume that started an execution gave it a new id,
+  and no resume is ever sent under that key. Whichever comes first trips
+  it:
+
+  - a resume whose execution ended lost before its engine became ready
+    (the log has no Bridge `screen.observed` of it in state `ready`: its
+    ready wait failed and the start was abandoned), whatever its command's
+    outcome and however long its end took. The item carries the evidence,
+    the execution's end (`its start failed: pane never became ready, last
+    state <state>…`) or else the command's error, and is named by that
+    execution (`resume-<execution>`): a later execution that fails the same
+    way, a person's resume, is not told again;
+  - a resume whose command succeeded and whose engine was lost again (or
+    exited non-zero) within a minute;
+  - a resume whose command failed before it started an execution.
+
+  A resume whose engine became ready and stayed up did not fail: the
+  session's next loss is resumed once again. (Task 132: after the host
+  move of 2026-11-07, every resume of one session failed at its ready
+  wait, each ended lost, and none of these keys tripped, so it was resumed
+  every 20 s for ten minutes.) The facts are `failed_resume` and
+  `resumed_young` in `dispatch_facts`; the rule is `resume_lost` in
+  `dispatch/worker.rs`.
 
   **Stalls: no task waits silently.** A stall is the absence of an event,
   so the dispatcher also measures, for every open task, the step it waits
