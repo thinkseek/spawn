@@ -163,17 +163,19 @@ cleanup() {
         gpgconf --homedir "$GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
     fi
     if [ -n "$database_made" ]; then
-        # A scratch database a drill named and left behind goes too.
+        # A scratch database a drill named and left behind goes too, but only
+        # a name of this run's (it contains this run's id): candidate code may
+        # name any database in a backup.verified record, and a database a
+        # parallel gate is using is not this run's to drop.
         for left in $(psql -d "$SPAWN_DB_NAME" -tA -c "select distinct e.kind -> 'detail' -> 'record' ->> 'database'
                 from spawn_events e where e.session_id = 'session_control'
                  and e.kind -> 'detail' -> 'record' ->> 'type' = 'backup.verified'" 2>/dev/null); do
             case "$left" in
-            *[!A-Za-z0-9_]* | "" | "$SPAWN_DB_NAME" | postgres | template*) ;;
-            *) psql -d postgres -tA -c "drop database if exists $left with (force)" >/dev/null 2>&1 || true ;;
+            *"$run"*) sh "$controller/scripts/blackbox/scenario-db.sh" drop "$left" >/dev/null 2>&1 || true ;;
             esac
         done
-        psql -d postgres -tA -c "drop database if exists $SPAWN_DB_NAME with (force)" \
-            >/dev/null 2>&1 || true
+        # The database and the logins init-db made for it.
+        sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
     chmod -R u+rwX "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
@@ -206,6 +208,9 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT TERM
 
+# Logins of this scenario's databases that a run killed before its cleanup
+# left behind (scripts/blackbox/scenario-db.sh): this prefix only.
+sh "$controller/scripts/blackbox/scenario-db.sh" sweep "${SPAWN_DB_NAME%"$run"}" >/dev/null 2>&1 || true
 psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
     harness "cannot create the scenario database"
 database_made=1

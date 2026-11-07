@@ -671,7 +671,7 @@ function TaskRow({
         </span>
         <h3
           className="min-w-0 flex-1 truncate text-label font-medium text-foreground"
-          title={title ?? undefined}
+          title={task.label ?? title ?? undefined}
         >
           {title ?? "Untitled task"}
         </h3>

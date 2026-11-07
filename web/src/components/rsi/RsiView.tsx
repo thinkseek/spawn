@@ -361,6 +361,11 @@ function TaskCard({
       </div>
       {shown ? (
         <>
+          {shown.label && (
+            <p className="mt-1 line-clamp-2 text-label text-foreground" title={shown.label}>
+              {shown.label}
+            </p>
+          )}
           <div className="mt-2 flex items-center gap-3">
             <PhaseBadge phase={shown.state} size="md" />
             {shown.revisions > 0 && (

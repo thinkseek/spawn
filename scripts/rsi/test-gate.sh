@@ -903,7 +903,7 @@ expect "a miss: another base commit" "$(cat "$work/gate.out")" \
 gate_copy=$work/gate-copy/scripts
 mkdir -p "$gate_copy/rsi"
 cp "$(dirname "$gate")"/../*.sh "$gate_copy/"
-cp "$gate" "$gate_copy/rsi/gate.sh"
+cp "$gate" "$(dirname "$gate")/gate-pg.sh" "$gate_copy/rsi/"
 # The suite runs from a deployed controller too, a read-only tree whose
 # modes cp carries over: the copy is the suite's own, so it is made writable.
 chmod -R u+w "$gate_copy"
@@ -913,6 +913,13 @@ gate=$gate_copy/rsi/gate.sh
 judge "$good" "" "$keyed" >/dev/null
 gate=$saved_gate
 expect "a miss: gate.sh's blob changed" "$(cat "$work/gate.out")" \
+    'from the cache: none; run on the base: 007.sh 011.sh'
+cp "$gate" "$gate_copy/rsi/gate.sh"
+printf '# changed\n' >>"$gate_copy/rsi/gate-pg.sh"
+gate=$gate_copy/rsi/gate.sh
+judge "$good" "" "$keyed" >/dev/null
+gate=$saved_gate
+expect "a miss: the private server's script (gate-pg.sh) changed" "$(cat "$work/gate.out")" \
     'from the cache: none; run on the base: 007.sh 011.sh'
 
 # Another toolchain: a rustc that says another version, first on PATH.
@@ -1263,5 +1270,351 @@ printf '%s/gone\n' "$owner_inputs" >"$listed_inputs/bind"
 expect "a listed directory that is missing stops the gate" \
     "$(judge "$good" "" "$listed_inputs")" 'exit=3'
 rm -rf "$owner_inputs"
+
+# 16. Parallel runs (SPAWN_GATE_JOBS): the base's runs, then the
+# candidate's, N at a time, each block printed whole in the scenario order.
+# with_jobs <n> <cache name> <candidate> <scenarios> [<scenario>]: judge with
+# N at a time and a base cache of its own (so the base runs).
+with_jobs() {
+    (
+        export SPAWN_GATE_JOBS="$1" XDG_CACHE_HOME="$work/caches/$2"
+        judge "$3" "${5-}" "$4"
+    )
+}
+# normalized: the gate's log without its times and its parallelism.
+normalized() {
+    # Times, and the sockets the host has open (other processes' too).
+    sed -E -e 's/[0-9]+ms/Nms/g' -e 's/[0-9]+ s\b/N s/g' -e '/^\| (base|candidate) runs: /d' \
+        -e '/^\| gate time: /d' -e '/^\| sockets hidden from the sandbox: /d' "$work/gate.out"
+}
+# own_and_wall <phase>: the wall clock and the runs' own time the log names.
+wall_of() { sed -n "s/^| $1 runs: [0-9]* in \([0-9]*\) s, .*/\1/p" "$work/gate.out"; }
+own_of() { sed -n "s/^| $1 runs: .*their own time: \([0-9]*\) s)$/\1/p" "$work/gate.out"; }
+par=$work/parallel
+mkdir -p "$par"
+cp "$scenarios/protected" "$scenarios/build" "$par/"
+# 051 is the slowest and 054 the fastest: with four at a time they end in
+# the reverse of their order.
+for n in 1 2 3 4; do
+    printf '#!/bin/sh\necho "05%s starts"\nsleep %s\necho "05%s ends"\n' "$n" "$((4 - n))" "$n" >"$par/05$n.sh"
+done
+expect "one at a time" "$(with_jobs 1 par1 "$good" "$par")" 'exit=0 {"verdict":"accepted"}'
+normalized >"$work/serial.log"
+expect "four at a time: the same verdict" "$(with_jobs 4 par4 "$good" "$par")" 'exit=0 {"verdict":"accepted"}'
+normalized >"$work/parallel.log"
+expect "and the same log, block for block, in the scenario order" \
+    "$(diff "$work/serial.log" "$work/parallel.log" && echo same)" same
+expect "each block whole: its header, its output, its result" \
+    "$(grep -A3 '^| == base: 051.sh$' "$work/gate.out" | tr '\n' '/')" \
+    '| == base: 051.sh/| 051 starts/| 051 ends/| == base: 051.sh: solved/'
+expect "the runs overlapped: the base's wall clock is under their own time" \
+    "$([ "$(wall_of base)" -lt "$(own_of base)" ] && echo overlapped)" overlapped
+expect "and the candidate's" "$([ "$(wall_of candidate)" -lt "$(own_of candidate)" ] && echo overlapped)" overlapped
+expect "the log says how many ran at once" "$(cat "$work/gate.out")" '| base runs: 4 in '
+expect "the gate time line counts the runs" "$(cat "$work/gate.out")" '(4 scenario runs, 0 results from the cache)'
+expect "a bad SPAWN_GATE_JOBS is no verdict" "$(with_jobs 0 bad "$good" "$par")" 'exit=3 '
+expect "and says why" "$(cat "$work/gate.out")" 'SPAWN_GATE_JOBS is a whole number from 1'
+
+# 16b. A failing scenario among passing ones: the first failure in the
+# scenario order is the verdict, whichever ended first, and the runs after
+# it stop. 062 fails slowly, 063 at once, 064 would run for 29 s.
+pfail=$work/parallel-fail
+mkdir -p "$pfail"
+cp "$scenarios/protected" "$scenarios/build" "$pfail/"
+on_candidate() { # <name> <the candidate's commands>: passes on the base
+    printf '#!/bin/sh\n[ "$(cat value)" = one ] && exit 0\n%s\n' "$2" >"$pfail/$1"
+}
+on_candidate 061.sh 'sleep 2'
+on_candidate 062.sh 'sleep 3; echo "062 failed"; exit 1'
+on_candidate 063.sh 'echo "063 failed"; exit 1'
+on_candidate 064.sh 'sleep 29.25'
+started=$(date +%s)
+expect "the first failure in order is the verdict, not the first to end" \
+    "$(with_jobs 4 pfail "$good" "$pfail")" '"reason":"regression: 062.sh fails on the candidate"'
+expect "the runs after it were stopped, not waited for" "$([ $(($(date +%s) - started)) -lt 25 ] && echo early)" early
+refuse "and their blocks are not printed" "$(cat "$work/gate.out")" '== regression: 063.sh'
+refuse "nor is anything after them" "$(cat "$work/gate.out")" '== regression: 064.sh'
+expect "the blocks before it are" "$(cat "$work/gate.out")" '| == regression: 061.sh must still pass'
+sleep 1
+refuse "no run of the gate is left" "$(ps -eo args | grep -F 'sleep 29.25' | grep -v grep || true)" 'sleep'
+
+# 16c. A scenario on the serial list runs alone: each scenario marks itself
+# running in the tree, and one that sees a neighbour it must not have exits 2
+# (a harness error on the base: no verdict).
+alone=$work/alone
+mkdir -p "$alone"
+cp "$scenarios/protected" "$scenarios/build" "$alone/"
+for name in 071.sh 072.sh 073.sh; do
+    cat >"$alone/$name" <<EOF
+#!/bin/sh
+check() {
+    for other in running.*; do
+        [ -e "\$other" ] && [ "\$other" != running.$name ] || continue
+        case "$name \$other" in
+        "071.sh "* | *running.071.sh) echo "$name beside \$other"; exit 2 ;;
+        esac
+    done
+}
+touch running.$name
+check
+sleep 1
+check
+rm -f running.$name
+EOF
+done
+printf '# run alone\n071.sh\n' >"$alone/serial"
+expect "a scenario on the serial list runs alone, on the base and the candidate" \
+    "$(with_jobs 4 alone "$good" "$alone")" 'exit=0 {"verdict":"accepted"}'
+expect "the others ran side by side" "$([ "$(wall_of base)" -lt "$(own_of base)" ] && echo overlapped)" overlapped
+expect "the same results again: all from the cache" \
+    "$(with_jobs 4 alone "$good" "$alone" >/dev/null; cat "$work/gate.out")" \
+    '| base results from the cache: 071.sh 072.sh 073.sh; run on the base: none'
+printf '072.sh\n' >>"$alone/serial"
+expect "one put on the list is judged again, alone" \
+    "$(with_jobs 4 alone "$good" "$alone" >/dev/null; cat "$work/gate.out")" \
+    '| base results from the cache: 071.sh 073.sh; run on the base: 072.sh'
+rm "$alone/serial"
+expect "the control: without the list, 071 meets its neighbours" \
+    "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=4 '
+
+# 16d. The base phase ends before any candidate code runs: each base run
+# leaves a mark in the base tree, and each candidate run wants all of them.
+order=$work/order
+mkdir -p "$order"
+cp "$scenarios/protected" "$scenarios/build" "$order/"
+for n in 1 2 3 4 5; do
+    cat >"$order/08$n.sh" <<EOF
+#!/bin/sh
+if [ "\$(cat value)" = one ]; then
+    sleep $((n % 3))
+    touch base-done.08$n
+    [ $n -ne 5 ] || exit 1
+    exit 0
+fi
+for n in 1 2 3 4 5; do
+    [ -f "\$SPAWN_BASELINE_TREE/base-done.08\$n" ] || { echo "08\$n not done on the base"; exit 2; }
+done
+EOF
+done
+expect "every base run ended before the first candidate run" \
+    "$(with_jobs 4 order "$good" "$order")" 'exit=0 {"verdict":"accepted"}'
+expect "an unsolved objective still runs twice on the base, one run after the other" \
+    "$(cat "$work/gate.out")" '| == base: 085.sh again (unsolved needs two runs that agree)'
+
+# 16e. A harness error on the base aborts at once: the runs after it stop.
+abort=$work/abort
+mkdir -p "$abort"
+cp "$scenarios/protected" "$scenarios/build" "$abort/"
+printf '#!/bin/sh\nsleep 2\n' >"$abort/091.sh"
+printf '#!/bin/sh\nexit 3\n' >"$abort/092.sh"
+printf '#!/bin/sh\nsleep 29.5\n' >"$abort/093.sh"
+started=$(date +%s)
+expect "a harness error among parallel base runs aborts the gate" \
+    "$(with_jobs 4 abort "$good" "$abort")" 'exit=4 '
+expect "without waiting for the runs after it" "$([ $(($(date +%s) - started)) -lt 25 ] && echo early)" early
+expect "after the blocks before it" "$(cat "$work/gate.out")" '| == base: 091.sh: solved'
+expect "and says why" "$(cat "$work/gate.out")" '092.sh exited 3 on the base'
+sleep 1
+refuse "no run of the gate is left" "$(ps -eo args | grep -F 'sleep 29.5' | grep -v grep || true)" 'sleep'
+
+# 16f. The scenarios run a copy of the built binary, which no cargo command
+# writes: here one scenario links target/debug/spawn again, as check-tests'
+# `cargo test` does, while another runs SPAWN_BIN.
+bin_scenarios=$work/bin
+mkdir -p "$bin_scenarios"
+cp "$scenarios/protected" "$bin_scenarios/"
+printf '#!/bin/sh\nmkdir -p target/debug\nprintf "#!/bin/sh\\necho built\\n" >target/debug/spawn\nchmod 755 target/debug/spawn\n' \
+    >"$bin_scenarios/build"
+cat >"$bin_scenarios/check-relink.sh" <<'EOF'
+#!/bin/sh
+printf '#!/bin/sh\necho relinked\n' >target/debug/spawn.new
+chmod 755 target/debug/spawn.new
+mv target/debug/spawn.new target/debug/spawn
+EOF
+printf '#!/bin/sh\nsleep 2\n[ "$("$SPAWN_BIN")" = built ] || { echo "ran $SPAWN_BIN: $("$SPAWN_BIN")"; exit 1; }\n' \
+    >"$bin_scenarios/check-run.sh"
+cp "$bin_scenarios/check-run.sh" "$bin_scenarios/095.sh"
+expect "a binary linked again mid-gate is not the one the scenarios run" \
+    "$(with_jobs 4 bin "$good" "$bin_scenarios")" 'exit=0 {"verdict":"accepted"}'
+
+# 17. Base only (`--base-only`): the base phase alone, into the cache, with
+# no verdict; the next gate on that base takes every result from the cache.
+base_only() { # <scenarios>: the gate's exit status
+    status=0
+    SPAWN_GATE_VERDICT=$integrator/verdict sh "$gate" --base-only "$repo" "$base" "$1" \
+        >"$work/gate.out" 2>&1 || status=$?
+    echo "exit=$status"
+}
+rm -rf "$integrator"
+mkdir -m 700 "$integrator"
+expect "base only: exit 0" "$(export SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/warm"; base_only "$par")" 'exit=0'
+refuse "and no verdict, whatever SPAWN_GATE_VERDICT says" "$(ls -A "$integrator")" 'verdict'
+expect "it says where the results are" "$(cat "$work/gate.out")" \
+    "| base only: 4 results for the base $base are in the base cache $work/caches/warm/spawn/gate-base"
+refuse "and judges no candidate" "$(cat "$work/gate.out")" '== candidate: build'
+expect "the next gate on that base takes them all from the cache" \
+    "$(with_jobs 4 warm "$good" "$par" >/dev/null; cat "$work/gate.out")" \
+    '| base results from the cache: 051.sh 052.sh 053.sh 054.sh; run on the base: none'
+expect "base only takes three arguments" \
+    "exit=$(sh "$gate" --base-only "$repo" "$base" >/dev/null 2>&1 || echo $?)" 'exit=3'
+expect "a harness error in base only is exit 4" \
+    "$(export SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/warm-abort"; base_only "$abort")" 'exit=4'
+
+# 17b. A gate that starts while a base-only run judges the same key waits
+# for its result instead of judging it again (the key's lock).
+slow=$work/slow
+mkdir -p "$slow"
+cp "$scenarios/protected" "$scenarios/build" "$slow/"
+printf '#!/bin/sh\n[ "$(cat value)" = one ] && sleep 12\nexit 0\n' >"$slow/111.sh"
+(
+    export SPAWN_GATE_JOBS=2 XDG_CACHE_HOME="$work/caches/locked"
+    sh "$gate" --base-only "$repo" "$base" "$slow" >"$work/warm.out" 2>&1
+) &
+warming=$!
+waited=0
+until ls "$work/caches/locked/spawn/gate-base/"*.lock >/dev/null 2>&1 || [ "$waited" -ge 600 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+done
+expect "a gate started meanwhile" "$(with_jobs 2 locked "$good" "$slow")" 'exit=0 {"verdict":"accepted"}'
+expect "waits for the other run's result" "$(cat "$work/gate.out")" \
+    '| == base: 111.sh: solved (cached: another gate judged it meanwhile)'
+expect "and counts it from the cache" "$(cat "$work/gate.out")" \
+    '| base results from the cache: 111.sh; run on the base: none'
+wait "$warming"
+expect "the base-only run judged it" "$(cat "$work/warm.out")" '| == base: 111.sh: solved'
+
+# 18. A server of the gate's own (GitHub issue #6), run by the gate under its
+# scratch from the test server's programs: the host's (SPAWN_GATE_PG_BIN;
+# TEST_GATE_PG_BIN, by default the newest /usr/lib/postgresql/<major>/bin)
+# and a docker image's (SPAWN_GATE_PG_IMAGE; TEST_GATE_PG_IMAGE,
+# postgres:16-alpine by default, major TEST_GATE_PG_IMAGE_MAJOR, 16), each
+# when the host has it.
+pg_url_sh=$(cd "$(dirname "$gate")/.." && pwd)/pg-url.sh
+# q <sql>: one value, over the URL the sandbox got (libpq's variables).
+q_function="q() { . '$pg_url_sh' && pg_url_export \"\$SPAWN_TEST_DATABASE_URL\" &&
+    PGDATABASE=\$pg_url_database psql -XAtq -v ON_ERROR_STOP=1 -c \"\$1\"; }"
+# A socket of the host's the server may try to put in place of its own.
+python3 -c '
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen()
+time.sleep(1800)' "$work/decoy.sock" &
+background="$background $!"
+while [ ! -S "$work/decoy.sock" ]; do sleep 0.1; done
+# own_server_cases <variable> <value> <major> <kind>: the cases, with the
+# server's programs from <variable>=<value>. Each kind has its own
+# scenarios, caches and TMPDIR (where the gates' scratch, and so every
+# process of theirs, is named).
+own_server_cases() {
+    pg_var=$1 pg_source=$2 pg_major=$3 kind=$4
+    own=$work/own-pg-$kind
+    pgtmp=$work/pgtmp-$kind
+    mkdir -p "$own" "$pgtmp"
+    cp "$scenarios/protected" "$scenarios/build" "$own/"
+    cat >"$own/101.sh" <<EOF
+#!/bin/sh
+$q_function
+[ "\$(q 'select 1')" = 1 ] || exit 2
+[ "\$(q "select current_setting('max_connections')")" = 300 ] || exit 2
+[ "\$(q "select current_setting('server_version_num')::int / 10000")" = $pg_major ] || exit 2
+EOF
+    # Candidate code leaves a table; the next gate's server has none.
+    cat >"$own/check-leftover.sh" <<EOF
+#!/bin/sh
+$q_function
+[ "\$(q "select to_regclass('public.leftover') is null")" = t ] || { echo "a table of an earlier gate"; exit 1; }
+q 'create table leftover (x int)'
+EOF
+    # A superuser's COPY TO PROGRAM runs in the server's sandbox, which has
+    # nothing of the host: not the owner's files, not their home.
+    cat >"$own/check-escape.sh" <<EOF
+#!/bin/sh
+$q_function
+q "copy (select 1) to program 'cat $HOME/.config/spawn/secret >/var/lib/postgresql/data/leak 2>/dev/null; touch $HOME/pwned 2>/dev/null; true'"
+[ "\$(q "select pg_read_file('leak')")" = "" ] || { echo "the server read the owner's secret"; exit 1; }
+EOF
+    # It can replace the path of its own socket with a symlink to another
+    # socket of the host; the sandbox's link still names the server's.
+    cat >"$own/check-swap.sh" <<EOF
+#!/bin/sh
+$q_function
+q "copy (select 1) to program 'rm -f /run/postgresql/.s.PGSQL.5432; ln -s $work/decoy.sock /run/postgresql/.s.PGSQL.5432'"
+EOF
+    cat >"$own/check-zswap.sh" <<EOF
+#!/bin/sh
+$q_function
+[ "\$(PGCONNECT_TIMEOUT=5 q 'select 42')" = 42 ] || { echo "the sandbox's socket was swapped"; exit 1; }
+EOF
+    printf 'check-swap.sh\n' >"$own/serial"
+    with_pg() { # <scenarios> [<candidate>]
+        (
+            export "$pg_var=$pg_source" SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/own-$kind" TMPDIR="$pgtmp"
+            judge "${2:-$good}" "" "$1"
+        )
+    }
+    left() { ps -eo args | grep -F "$pgtmp/" | grep -v grep || true; }
+    expect "$kind: a gate on a server of its own" "$(with_pg "$own")" 'exit=0 {"verdict":"accepted"}'
+    expect "$kind: says so, and how big" "$(cat "$work/gate.out")" "| test database: a server of the gate's own, $pg_source ("
+    expect "$kind: with room for its scenarios" "$(cat "$work/gate.out")" 'max_connections 300; scenarios at once: 4'
+    expect "$kind: its version is in the base cache's key" "$(cat "$work/gate.out")" " server $pg_major"
+    [ ! -e "$HOME/pwned" ] || { echo "FAIL $kind: the server's program wrote $HOME/pwned"; exit 1; }
+    echo "ok   $kind: the server's programs reach nothing of the host"
+    expect "$kind: the next gate's server is a fresh one" "$(with_pg "$own")" 'exit=0 {"verdict":"accepted"}'
+    expect "$kind: and its base results come from the cache" "$(cat "$work/gate.out")" \
+        '| base results from the cache: 101.sh; run on the base: none'
+    refuse "$kind: no server is left" "$(left)" 'bwrap'
+    expect "$kind: a shared-server key is not a private one" \
+        "$(rm -rf "$work/own-shared"; cp -r "$own" "$work/own-shared"; rm "$work/own-shared/serial" "$work/own-shared/check-"*
+           printf '#!/bin/sh\nexit 0\n' >"$work/own-shared/101.sh"
+           with_pg "$work/own-shared" >/dev/null
+           (export XDG_CACHE_HOME="$work/caches/own-$kind" SPAWN_GATE_JOBS=1; judge "$good" "" "$work/own-shared") >/dev/null
+           cat "$work/gate.out")" \
+        '| base results from the cache: none; run on the base: 101.sh'
+    # A gate ended by a signal takes its server and its runs with it.
+    printf '#!/bin/sh\n[ "$(cat value)" = one ] || sleep 29.75\n' >"$own/check-long.sh"
+    rm -rf "$integrator"
+    mkdir -m 700 "$integrator"
+    (
+        export "$pg_var=$pg_source" SPAWN_GATE_JOBS=4 XDG_CACHE_HOME="$work/caches/own-$kind" TMPDIR="$pgtmp"
+        exec sh "$gate" "$repo" "$base" "$good" "$own" >"$work/gate.out" 2>&1
+    ) &
+    signalled=$!
+    waited=0
+    until ps -eo args | grep -F 'sleep 29.75' | grep -qv grep || [ "$waited" -ge 600 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    kill -TERM "$signalled"
+    wait "$signalled" || :
+    sleep 1
+    refuse "$kind: a gate ended by a signal leaves no run" "$(ps -eo args | grep -F 'sleep 29.75' | grep -v grep || true)" 'sleep'
+    refuse "$kind: and no server" "$(left)" 'bwrap'
+    rm -f "$own/check-long.sh"
+}
+pg_bin=${TEST_GATE_PG_BIN-}
+if [ -z "$pg_bin" ]; then
+    pg_bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -t/ -k5,5n | tail -n 1)
+fi
+if [ -n "$pg_bin" ] && [ -x "$pg_bin/postgres" ] && [ -x "$pg_bin/initdb" ]; then
+    own_server_cases SPAWN_GATE_PG_BIN "$pg_bin" \
+        "$("$pg_bin/postgres" --version | sed -n 's/^postgres (PostgreSQL) \([0-9]*\).*/\1/p')" programs
+    expect "programs: a SPAWN_GATE_PG_BIN without postgres is no verdict" \
+        "$(export SPAWN_GATE_PG_BIN="$work/no-such-bin"; judge "$good" "" "$par")" 'exit=3 '
+    expect "programs: and says why" "$(cat "$work/gate.out")" 'has no postgres and initdb'
+    expect "both a SPAWN_GATE_PG_IMAGE and a SPAWN_GATE_PG_BIN is no verdict" \
+        "$(export SPAWN_GATE_PG_BIN="$pg_bin" SPAWN_GATE_PG_IMAGE=postgres:16-alpine; judge "$good" "" "$par")" 'exit=3 '
+    expect "and says why" "$(cat "$work/gate.out")" 'are both set'
+else
+    echo "skip the gate's own test server from the host's programs: no postgres and initdb in '$pg_bin' (TEST_GATE_PG_BIN)"
+fi
+pg_image=${TEST_GATE_PG_IMAGE:-postgres:16-alpine}
+if command -v docker >/dev/null 2>&1 && docker image inspect "$pg_image" >/dev/null 2>&1; then
+    own_server_cases SPAWN_GATE_PG_IMAGE "$pg_image" "${TEST_GATE_PG_IMAGE_MAJOR:-16}" image
+    expect "image: an image docker does not have is no verdict" \
+        "$(export SPAWN_GATE_PG_IMAGE=spawn-no-such-image:0; judge "$good" "" "$par")" 'exit=3 '
+    expect "image: and says why" "$(cat "$work/gate.out")" 'docker has no such image'
+else
+    echo "skip the gate's own test server from a docker image: docker has no image $pg_image (TEST_GATE_PG_IMAGE)"
+fi
 
 echo "gate: all cases pass"
