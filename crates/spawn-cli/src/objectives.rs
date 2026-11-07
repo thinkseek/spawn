@@ -12,7 +12,9 @@
 //! No objective holds a slot for ever. A failed attempt is an outcome that
 //! says the work did not make it: a gate's `rejected`, `incompatible` or
 //! `conflict` (unless main could not be merged into the workspace, or merged
-//! cleanly: `merge` names how), or an abort over budget (`task.aborted`).
+//! cleanly: `merge` names how). An overrun over budget is not one: the work
+//! is kept and continued ([`Overrun`]), and a record from before an overrun
+//! was its own record (`task.aborted`) counts as it was written.
 //! The host's outcomes (`no_room`, `host_fault`, a gate `aborted`) are not
 //! the work's and count for nothing, as for the halt rules. Once an
 //! objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3) failed attempts since its
@@ -30,6 +32,21 @@
 //! stream ([`attempts`]), never from the integrator's memory. Before this
 //! (2026-11-07), three objectives whose tasks kept failing held mission 4's
 //! three slots for a day and ten objectives were never assigned.
+//!
+//! **A task over its budget keeps its work** (docs/fleet-architecture.md
+//! §10.4). The integrator stops it and records `task.over_budget`, which
+//! counts toward no halt; this module assigns the objective's next task
+//! once that work has reached the source's `spawn/<agent>` (the overrun's
+//! record names the branch, the commit and its `git diff --stat main`), its
+//! `task.assigned` names `continues` (the overrun task) and its brief names
+//! that task, the branch, the commit and the diff stat, so the work is
+//! continued, not redone. A second overrun of a task that continues one is
+//! not followed by a third task: the supervisor is told once (the
+//! dispatcher's digest, tag `host over-budget-<record>`) and the objective
+//! is held — no task for it — until the mission is configured again (a
+//! `mission.configured` record newer than the overrun's), while the
+//! mission's other objectives take the freed slot. A third overrun after
+//! such a configure is treated as a first.
 //!
 //! An objective assigned again after earlier tasks of it ended without
 //! landing (cancelled, aborted, yielded) gets their work in its brief: each
@@ -436,6 +453,7 @@ pub(crate) fn choose<'a>(
     landings: &[Landing],
     in_flight: &BTreeSet<u32>,
     attempts: &BTreeMap<u32, Attempts>,
+    held: &BTreeSet<u32>,
     free: usize,
 ) -> Vec<&'a Task> {
     let mut open: Vec<&Task> = backlog
@@ -443,6 +461,7 @@ pub(crate) fn choose<'a>(
         .filter(|task| {
             is_open(task, landings)
                 && !in_flight.contains(&task.id)
+                && !held.contains(&task.id)
                 && ordered(task, backlog, landings)
         })
         .collect();
@@ -462,6 +481,31 @@ pub(crate) struct Outcome {
     #[serde(rename = "type")]
     pub(crate) kind: String,
     pub(crate) objective: u32,
+    /// The task the outcome is about, and the record's event id and time
+    /// (the overrun's, for a continuation and its hold).
+    #[serde(default)]
+    pub(crate) task: i64,
+    #[serde(default)]
+    pub(crate) at_ms: Option<i64>,
+    /// A `task.over_budget`'s work: the task it continues (a second overrun
+    /// in a chain), the branch, its commit and the diff stat against main,
+    /// its tool calls, budget and reason.
+    #[serde(default)]
+    pub(crate) continues: Option<i64>,
+    #[serde(default)]
+    pub(crate) chain: Option<bool>,
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    #[serde(default)]
+    pub(crate) commit: Option<String>,
+    #[serde(default)]
+    pub(crate) diff: Option<String>,
+    #[serde(default)]
+    pub(crate) tool_calls: Option<i64>,
+    #[serde(default)]
+    pub(crate) budget: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
     #[serde(default)]
     pub(crate) verdict: Option<String>,
     /// For a conflict, how main went into the workspace (`main_merge`'s
@@ -498,6 +542,60 @@ impl Outcome {
     fn is_yield(&self) -> bool {
         self.kind == "task.cancelled" || (self.kind == "task.aborted" && self.yielded == Some(true))
     }
+}
+
+/// An objective's latest overrun (`task.over_budget`), and the work its next
+/// task continues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Overrun {
+    /// The overrun task.
+    pub(crate) task: i64,
+    /// The task it continues, for a second overrun of a chain.
+    pub(crate) continues: Option<i64>,
+    /// Whether it is a second overrun of a chain (no configure between): one
+    /// that holds its objective and goes to the supervisor.
+    pub(crate) chain: bool,
+    pub(crate) reason: String,
+    pub(crate) tool_calls: i64,
+    /// `spawn/<agent>`: where the work was kept.
+    pub(crate) branch: String,
+    /// The commit the branch holds, when the push made it there.
+    pub(crate) commit: Option<String>,
+    /// `git diff --stat main <commit>`, when there is a commit.
+    pub(crate) diff: Option<String>,
+    pub(crate) budget: Option<serde_json::Value>,
+    /// When the record was written: a `mission.configured` newer than it
+    /// ends the chain's hold.
+    pub(crate) at_ms: i64,
+}
+
+/// Every objective's latest overrun, from `outcomes` (oldest first).
+pub(crate) fn overruns(outcomes: &[Outcome]) -> BTreeMap<u32, Overrun> {
+    let mut overruns: BTreeMap<u32, Overrun> = BTreeMap::new();
+    for outcome in outcomes.iter().filter(|o| o.kind == "task.over_budget") {
+        overruns.insert(
+            outcome.objective,
+            Overrun {
+                task: outcome.task,
+                continues: outcome.continues,
+                chain: outcome.chain == Some(true),
+                reason: outcome.reason.clone().unwrap_or_default(),
+                tool_calls: outcome.tool_calls.unwrap_or_default(),
+                branch: outcome.branch.clone().unwrap_or_default(),
+                commit: outcome.commit.clone(),
+                diff: outcome.diff.clone(),
+                budget: outcome.budget.clone(),
+                at_ms: outcome.at_ms.unwrap_or_default(),
+            },
+        );
+    }
+    overruns
+}
+
+/// Whether an overrun holds its objective: it continues an overrun task of
+/// the same objective, and the mission was not configured since its record.
+pub(crate) fn holds(overrun: &Overrun, configured_ms: Option<i64>) -> bool {
+    overrun.chain && configured_ms.is_none_or(|at| at <= overrun.at_ms)
 }
 
 /// An objective's attempts, read from its tasks' outcomes.
@@ -600,6 +698,7 @@ pub(crate) fn yields(
 /// yield the slot. Without this the objective kept no yield and its
 /// failures, sorted ahead, and the next task for it yielded at once (rev-b
 /// on 226fa4a: objective 023, task 113 aborted with its fifth failure).
+#[cfg(test)]
 pub(crate) fn abort_yields(
     attempts: &BTreeMap<u32, Attempts>,
     task: i64,
@@ -618,33 +717,6 @@ pub(crate) fn abort_yields(
     })
 }
 
-/// The yield an abort of `task` over budget makes, read from the store:
-/// the fields its `task.aborted` record adds (`yielded`, `objective`,
-/// `failures`, `limit`, `yield_reason`), or none.
-pub(crate) fn abort_yield(
-    store: &PostgresStore,
-    mission: &Mission,
-    task: &crate::integrate::Task,
-) -> Result<Option<serde_json::Value>, String> {
-    let (Some(_), Some(objective)) = (&mission.objectives, task.objective) else {
-        return Ok(None);
-    };
-    let outcomes: Vec<Outcome> = serde_json::from_value(
-        store
-            .objective_outcomes(mission.id)
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("objective outcomes: {error}"))?;
-    let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
-    Ok(
-        abort_yields(&attempts(&outcomes), task.id, objective, limit).map(|slot| {
-            json!({"yielded": true, "objective": slot.objective,
-               "failures": slot.failures.len(), "limit": limit,
-               "yield_reason": slot.reason()})
-        }),
-    )
-}
-
 /// An objective mission's worker limit: `objectives ->> 'workers'`, 1 when
 /// absent (every mission configured before the limit existed).
 pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
@@ -656,6 +728,55 @@ pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
         .max(1)
 }
 
+/// What a continuation is told: the overrun task it continues, the branch,
+/// the commit and the diff stat its workspace holds, and its budget.
+pub(crate) fn continuation_note(over: &Overrun) -> String {
+    let mut note = format!(
+        "\nYour task continues task #{} of this objective, which went over its budget: {}. \
+         It made {} tool calls. Its work is safe on branch {}",
+        over.task,
+        cut(&over.reason, REASON_CHARS),
+        over.tool_calls,
+        over.branch
+    );
+    match (&over.commit, &over.diff) {
+        (Some(commit), diff) => {
+            let _ = write!(note, ", at commit {commit}");
+            match diff.as_deref().filter(|diff| !diff.trim().is_empty()) {
+                Some(diff) => {
+                    let _ = writeln!(
+                        note,
+                        "; against main it holds:\n{}\nThat work is in your workspace: \
+                         continue it, do not redo it.",
+                        diff.trim_end()
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        note,
+                        ".\nThat work is in your workspace: continue it, do not redo it."
+                    );
+                }
+            }
+        }
+        _ => {
+            let _ = writeln!(
+                note,
+                ", but its push failed: the log says so, and your workspace may not hold all \
+                 of it. The report of the task it continues says what it did."
+            );
+        }
+    }
+    if let Some(budget) = &over.budget {
+        let _ = writeln!(
+            note,
+            "Your budget is the mission's ({budget}); it may be raised once, for this task \
+             only, to at most twice that, by the owner's `spawn mission configure`."
+        );
+    }
+    note
+}
+
 /// The brief of an objective task: the objective, the working rules, the
 /// work earlier tasks of it left without landing, and what the gate said
 /// about earlier attempts.
@@ -664,6 +785,7 @@ pub(crate) fn brief(
     current: Option<f64>,
     prior: &[PriorWork],
     history: &[GateRecord],
+    continues: Option<&Overrun>,
 ) -> String {
     let mut brief = format!("Objective {}: {}\n\n{}\n", task.id, task.title, task.prompt);
     brief.push_str(
@@ -694,6 +816,9 @@ pub(crate) fn brief(
             let _ = write!(brief, " Target: {target} {}.", task.unit);
         }
         brief.push('\n');
+    }
+    if let Some(over) = continues {
+        brief.push_str(&continuation_note(over));
     }
     if !prior.is_empty() {
         brief.push_str(
@@ -784,6 +909,7 @@ pub(crate) fn assign_next(
     )
     .map_err(|error| format!("objective outcomes: {error}"))?;
     let mut attempts = attempts(&outcomes);
+    let overruns = overruns(&outcomes);
     let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
     let mut yielded = BTreeSet::new();
     for slot in yields(mission, &attempts, limit, settled) {
@@ -827,9 +953,26 @@ pub(crate) fn assign_next(
     )
     .map_err(|error| format!("objective landings: {error}"))?;
     let in_flight: BTreeSet<u32> = flying.iter().filter_map(|task| task.objective).collect();
+    // An overrun chain whose second overrun is not yet answered by a
+    // configure holds its objective: no task is issued for it, and the
+    // freed slot goes to the next open objective (the dispatcher tells the
+    // supervisor once; this only reads the records).
+    let held: BTreeSet<u32> = overruns
+        .iter()
+        .filter(|(_, overrun)| holds(overrun, mission.configured_ms))
+        .map(|(objective, _)| *objective)
+        .collect();
+    if !held.is_empty() {
+        println!(
+            "integrate: mission {}: objectives {:?} held after a second overrun, until the \
+             mission is configured again",
+            mission.id,
+            held.iter().collect::<Vec<_>>()
+        );
+    }
     let mut assigned = Vec::new();
-    for task in choose(&objectives, &landings, &in_flight, &attempts, free) {
-        match assign(store, mission, task, &landings) {
+    for task in choose(&objectives, &landings, &in_flight, &attempts, &held, free) {
+        match assign(store, mission, task, &landings, overruns.get(&task.id)) {
             Ok(id) => assigned.push(id),
             Err(error) if assigned.is_empty() => return Err(error),
             Err(error) => {
@@ -850,6 +993,7 @@ fn assign(
     mission: &Mission,
     task: &Task,
     landings: &[Landing],
+    continues: Option<&Overrun>,
 ) -> Result<i64, String> {
     let id = i32::try_from(task.id).map_err(|_| format!("objective {} is too large", task.id))?;
     let history: Vec<GateRecord> = serde_json::from_value(
@@ -866,14 +1010,40 @@ fn assign(
     .map_err(|error| format!("objective prior work: {error}"))?;
     let scenario = Path::new(&mission.gate).join(format!("{:03}.sh", task.id));
     let scenario = scenario.is_file().then(|| scenario.display().to_string());
-    let text = brief(task, landed_value(task, landings), &prior, &history);
-    let assigned = store
-        .objective_assign(mission.id, id, scenario.as_deref(), &text)
-        .map_err(|error| error.to_string())?;
-    println!(
-        "integrate: mission {} objective {} -> task {assigned}",
-        mission.id, task.id
+    let text = brief(
+        task,
+        landed_value(task, landings),
+        &prior,
+        &history,
+        continues,
     );
+    let assigned = store
+        .objective_assign_continuing(
+            mission.id,
+            id,
+            scenario.as_deref(),
+            &text,
+            continues.map(|overrun| overrun.task),
+        )
+        .map_err(|error| error.to_string())?;
+    match continues {
+        Some(overrun) => println!(
+            "integrate: mission {} objective {} -> task {assigned}, continuing task #{} on {} \
+             at {}",
+            mission.id,
+            task.id,
+            overrun.task,
+            overrun.branch,
+            overrun
+                .commit
+                .as_deref()
+                .unwrap_or("no commit (the push failed)")
+        ),
+        None => println!(
+            "integrate: mission {} objective {} -> task {assigned}",
+            mission.id, task.id
+        ),
+    }
     Ok(assigned)
 }
 
@@ -881,7 +1051,8 @@ fn assign(
 mod tests {
     use super::{
         Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
-        choose, load_backlog, metric_lines, next_open, order_problems, workers, yields,
+        choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns, workers,
+        yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -949,6 +1120,141 @@ mod tests {
         tasks.iter().map(|task| task.id).collect()
     }
 
+    /// An overrun outcome: `task.over_budget` with the work it kept.
+    fn overrun_outcome(
+        task: i64,
+        objective: u32,
+        continues: Option<i64>,
+        commit: Option<&str>,
+        diff: Option<&str>,
+    ) -> Outcome {
+        Outcome {
+            kind: "task.over_budget".to_string(),
+            objective,
+            task,
+            at_ms: Some(1_000),
+            continues,
+            chain: continues.map(|_| true),
+            branch: Some(format!("spawn/agent_worker_objective_{task}")),
+            commit: commit.map(str::to_string),
+            diff: diff.map(str::to_string),
+            tool_calls: Some(6),
+            budget: Some(json!({"tool_calls": 5})),
+            reason: Some("the task made more than 5 tool calls".to_string()),
+            verdict: None,
+            merge: None,
+            yielded: None,
+        }
+    }
+
+    /// The next task of an objective is told what it continues: the task,
+    /// the branch, the commit and that commit's diff stat, and that the work
+    /// is in its workspace to continue.
+    #[test]
+    fn a_continuation_is_told_the_task_the_branch_the_commit_and_its_diff() {
+        let outcome = overrun_outcome(
+            84,
+            17,
+            None,
+            Some("d44c6011aa22bb33cc44dd55ee66ff7700112233"),
+            Some(" big.txt | 120 ++++++\n 1 file changed, 120 insertions(+)"),
+        );
+        let overrun = overruns(&[outcome]).remove(&17).expect("the overrun");
+        let text = brief(&objective(17, false), None, &[], &[], Some(&overrun));
+        assert!(text.contains("continues task #84"), "{text}");
+        assert!(
+            text.contains("spawn/agent_worker_objective_84"),
+            "the branch: {text}"
+        );
+        assert!(
+            text.contains("d44c6011aa22bb33cc44dd55ee66ff7700112233"),
+            "the commit: {text}"
+        );
+        assert!(text.contains("big.txt"), "the diff: {text}");
+        assert!(text.contains("1 file changed, 120 insertions(+)"), "{text}");
+        assert!(text.contains("continue it, do not redo it"), "{text}");
+        assert!(text.contains("6 tool calls"), "{text}");
+        assert!(text.contains("{\"tool_calls\":5}"), "the budget: {text}");
+        // A push that failed is said so, and the branch is still named.
+        let lost = Outcome {
+            commit: None,
+            diff: None,
+            ..overrun_outcome(84, 17, None, None, None)
+        };
+        let lost = overruns(&[lost]).remove(&17).expect("the overrun");
+        let text = brief(&objective(17, false), None, &[], &[], Some(&lost));
+        assert!(text.contains("its push failed"), "{text}");
+        assert!(text.contains("spawn/agent_worker_objective_84"), "{text}");
+    }
+
+    /// A second overrun in a chain holds its objective until the mission is
+    /// configured again; a first overrun holds nothing.
+    #[test]
+    fn a_second_overrun_holds_its_objective_until_a_configure() {
+        let first = overrun_outcome(84, 17, None, Some("aa11bb22"), None);
+        let second = overrun_outcome(87, 17, Some(84), Some("aa11bb22"), None);
+        let outcomes = [first.clone(), second.clone()];
+        let latest = overruns(&outcomes);
+        let chain = latest.get(&17).expect("the latest overrun");
+        assert_eq!(chain.task, 87, "the latest overrun is the continuation's");
+        assert!(
+            holds(chain, None),
+            "a second overrun holds without a configure"
+        );
+        assert!(
+            holds(chain, Some(1_000)),
+            "a configure at the record's own time does not release it"
+        );
+        assert!(!holds(chain, Some(1_001)), "a newer configure releases it");
+        let first = overruns(&[first]).remove(&17).expect("the first overrun");
+        assert!(!holds(&first, None), "a first overrun holds nothing");
+    }
+
+    /// The first overrun of an objective is continued (not held); the
+    /// mission's next open objective takes the freed slot of a held one.
+    #[test]
+    fn the_next_open_objective_takes_the_slot_of_a_held_one() {
+        let backlog = [objective(17, false), objective(18, false)];
+        let first = overruns(&[overrun_outcome(84, 17, None, Some("aa11bb22"), None)]);
+        let held: BTreeSet<u32> = first
+            .iter()
+            .filter(|(_, overrun)| holds(overrun, None))
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(held.is_empty(), "the first overrun is continued");
+        let chained = overruns(&[overrun_outcome(87, 17, Some(84), Some("aa11bb22"), None)]);
+        let held: BTreeSet<u32> = chained
+            .iter()
+            .filter(|(_, overrun)| holds(overrun, None))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(held, BTreeSet::from([17]));
+        assert_eq!(
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &untried(),
+                &held,
+                2
+            )),
+            vec![18],
+            "the freed slot goes to the next open objective"
+        );
+        assert_eq!(
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &untried(),
+                &BTreeSet::new(),
+                2
+            )),
+            vec![17, 18],
+            "without the hold, both are open"
+        );
+    }
+
     #[test]
     fn free_slots_get_the_lowest_open_objectives_not_in_flight() {
         let backlog = [
@@ -959,7 +1265,14 @@ mod tests {
         ];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &untried(), 3)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                3
+            )),
             vec![1, 2, 3],
             "lowest first"
         );
@@ -967,15 +1280,29 @@ mod tests {
         let solved = [landing(1, None)];
         let flying = BTreeSet::from([2]);
         assert_eq!(
-            ids(&choose(&backlog, &solved, &flying, &untried(), 3)),
+            ids(&choose(
+                &backlog,
+                &solved,
+                &flying,
+                &untried(),
+                &BTreeSet::new(),
+                3
+            )),
             vec![3, 4]
         );
         // No free slot, nothing.
-        assert!(choose(&backlog, &[], &none, &untried(), 0).is_empty());
+        assert!(choose(&backlog, &[], &none, &untried(), &BTreeSet::new(), 0).is_empty());
         // Fewer open objectives than slots: only those.
         let three_solved = [landing(1, None), landing(2, None), landing(3, None)];
         assert_eq!(
-            ids(&choose(&backlog, &three_solved, &none, &untried(), 3)),
+            ids(&choose(
+                &backlog,
+                &three_solved,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                3
+            )),
             vec![4]
         );
     }
@@ -990,12 +1317,26 @@ mod tests {
         )];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &missed, &none, &untried(), 2)),
+            ids(&choose(
+                &backlog,
+                &missed,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                2
+            )),
             vec![1, 2]
         );
         let flying = BTreeSet::from([1]);
         assert_eq!(
-            ids(&choose(&backlog, &missed, &flying, &untried(), 2)),
+            ids(&choose(
+                &backlog,
+                &missed,
+                &flying,
+                &untried(),
+                &BTreeSet::new(),
+                2
+            )),
             vec![2]
         );
     }
@@ -1037,6 +1378,16 @@ mod tests {
         Outcome {
             kind: kind.to_string(),
             objective,
+            task: 0,
+            at_ms: None,
+            continues: None,
+            chain: None,
+            branch: None,
+            commit: None,
+            diff: None,
+            tool_calls: None,
+            budget: None,
+            reason: None,
             verdict: verdict.map(str::to_string),
             merge: merge.map(str::to_string),
             yielded: None,
@@ -1135,10 +1486,13 @@ mod tests {
         ]);
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &tried, 5)),
+            ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 5)),
             vec![25, 26, 21, 23, 19]
         );
-        assert_eq!(ids(&choose(&backlog, &[], &none, &tried, 1)), vec![25]);
+        assert_eq!(
+            ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 1)),
+            vec![25]
+        );
     }
 
     /// Three slots held by three objectives at the limit: the tasks being
@@ -1188,7 +1542,14 @@ mod tests {
         }
         let backlog: Vec<Task> = [19, 21, 23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &after, 3)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &after,
+                &BTreeSet::new(),
+                3
+            )),
             vec![25, 26, 19]
         );
 
@@ -1235,7 +1596,10 @@ mod tests {
             .map(|id| objective(id, false))
             .to_vec();
         let flying = BTreeSet::from([19, 21]);
-        assert_eq!(ids(&choose(&backlog, &[], &flying, &tried, 1)), vec![25]);
+        assert_eq!(
+            ids(&choose(&backlog, &[], &flying, &tried, &BTreeSet::new(), 1)),
+            vec![25]
+        );
         // Had 127 been sent back to revise, it would yield as well, and 026
         // take its slot.
         let sent_back = mission(3, &[(127, 19, "revise"), (106, 21, "reported")]);
@@ -1245,7 +1609,14 @@ mod tests {
             [127]
         );
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::from([21]), &tried, 2)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::from([21]),
+                &tried,
+                &BTreeSet::new(),
+                2
+            )),
             vec![25, 26]
         );
     }
@@ -1280,7 +1651,7 @@ mod tests {
                 report: Some("x".repeat(5000)),
             },
         ];
-        let text = brief(&objective(59, false), None, &prior, &[]);
+        let text = brief(&objective(59, false), None, &prior, &[], None);
         assert!(text.contains("Their reports below say what each did and found"));
         assert!(!text.contains("branch"), "{text}");
         assert!(text.contains(
@@ -1291,7 +1662,7 @@ mod tests {
         assert!(text.contains("- task 150: yielded; it recorded no checkpoint"));
         assert!(text.contains("… (cut)"), "a long report is cut");
         assert!(text.len() < 5000);
-        let first = brief(&objective(59, false), None, &[], &[]);
+        let first = brief(&objective(59, false), None, &[], &[], None);
         assert!(!first.contains("Earlier tasks"), "a first task has none");
     }
 
@@ -1333,7 +1704,14 @@ mod tests {
         );
         let backlog: Vec<Task> = [23, 25, 26].map(|id| objective(id, false)).to_vec();
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &tried, 3)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &tried,
+                &BTreeSet::new(),
+                3
+            )),
             vec![26, 23, 25],
             "the untried first, then the yielded"
         );
@@ -1361,14 +1739,38 @@ mod tests {
         let backlog = vec![objective(28, false), objective(29, false), later, gone];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &untried(), 4)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                4
+            )),
             vec![28, 29]
         );
         let one = [landing(28, None)];
-        assert_eq!(ids(&choose(&backlog, &one, &none, &untried(), 4)), vec![29]);
+        assert_eq!(
+            ids(&choose(
+                &backlog,
+                &one,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                4
+            )),
+            vec![29]
+        );
         let both = [landing(29, None), landing(28, None), landing(22, None)];
         assert_eq!(
-            ids(&choose(&backlog, &both, &none, &untried(), 4)),
+            ids(&choose(
+                &backlog,
+                &both,
+                &none,
+                &untried(),
+                &BTreeSet::new(),
+                4
+            )),
             vec![30, 32]
         );
 
