@@ -32,6 +32,17 @@
 //!   the turn's end: such a judgement is written again only when its verdict
 //!   changes (a model's answer is written for every new situation, and a
 //!   stale one waits for the next);
+//! - **a report that is still a draft is not taken.** A turn that stopped
+//!   and a file that exists say only that the worker wrote something; the
+//!   file is read first for the marks of a draft ([`unfinished`]: template
+//!   placeholders, a line that is only `(pending)`, `TBD` or `TODO`, an
+//!   Outcome that says draft or in progress). One with any is left where it
+//!   is and the task stays delivered; the first time a content is seen (per
+//!   revision), its worker is told which markers on which lines, in one
+//!   note keyed by the content's digest, and the check is recorded
+//!   (`task.report_unfinished`, naming the markers and the note). The same
+//!   file again changes nothing; a rewritten one is read like any other
+//!   ([`refuse_unfinished`]);
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
@@ -79,7 +90,9 @@ use spawn_core::observation::Ambiguity;
 use spawn_host::tree_path::TreePath;
 use spawn_postgres::PostgresStore;
 
-use crate::dispatch::{Escalation, Facts, Order, Why};
+use crate::dispatch::{Escalation, Facts, Order, Sent, Why};
+
+mod unfinished;
 
 /// Where a worker writes its report, relative to its workspace.
 pub(crate) const REPORT: &str = ".spawn/report.md";
@@ -931,8 +944,12 @@ fn report_contract() -> String {
     format!(
         "When the task is finished, or you cannot go on, write `{REPORT}` \
 at the root of your workspace with three sections: `## Outcome` (done, blocked or failed, in one \
-line), `## What changed` (files, commits, results) and `## Open issues`. Then stop and wait. Do not \
-start other work. If a person must decide something, say so in the report."
+line), `## What changed` (files, commits, results) and `## Open issues`. Write it once, at the \
+end, when everything (your checks and tests included) is done: Spawn takes the file as your report \
+as soon as your turn stops, so draft anywhere else (`.spawn/draft.md` is never committed), never \
+as a template in `{REPORT}`. A report with a placeholder (PENDING_ and capitals, a line that is \
+only (pending), TBD or TODO) or an Outcome that says draft or in progress is not taken. Then stop \
+and wait. Do not start other work. If a person must decide something, say so in the report."
     )
 }
 
@@ -966,7 +983,8 @@ pub(crate) fn task_prompt(task: &TaskRow) -> String {
 fn typed(task: &TaskRow) -> String {
     if task.is_revision() {
         format!(
-            "{}\nTask #{} was sent back by the supervisor: {}\nFix it, then rewrite `{REPORT}`.",
+            "{}\nTask #{} was sent back by the supervisor: {}\nFix it, then rewrite `{REPORT}` \
+             once, when everything is done (draft anywhere else).",
             revision_header(task.id),
             task.id,
             task.review_note.as_deref().unwrap_or("see the review")
@@ -1172,11 +1190,15 @@ fn report_due<'a>(task: &TaskRow, rows: &'a [Facts]) -> Option<&'a Facts> {
         .filter(|facts| facts.report_due())
 }
 
+/// A report with a mark of a draft ([`unfinished::markers`]) is not taken
+/// ([`refuse_unfinished`]). `now_ms` is this host's clock, for the wait
+/// before a note refused untyped goes again.
 pub(crate) fn collect_reports(
     store: &PostgresStore,
     work: &Work,
     rows: &[Facts],
     root: &Path,
+    now_ms: i64,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for task in work
@@ -1195,6 +1217,17 @@ pub(crate) fn collect_reports(
         if report.trim().is_empty() {
             continue;
         }
+        let markers = unfinished::markers(&report);
+        if !markers.is_empty() {
+            match refuse_unfinished(store, task, facts, &report, &markers, now_ms) {
+                Ok(line) => lines.extend(line),
+                Err(error) => lines.push(format!(
+                    "deliver: task #{} unfinished report: {error}",
+                    task.id
+                )),
+            }
+            continue;
+        }
         match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref()) {
             Ok(true) => {
                 put_aside(&workspace, task.id);
@@ -1206,6 +1239,144 @@ pub(crate) fn collect_reports(
         }
     }
     lines
+}
+
+/// Idempotency-key prefix of the note that tells a worker its report is not
+/// finished: `report-unfinished-<task>-<revision>-<digest>`, one per content
+/// of the file and revision of the task ([`refuse_unfinished`]).
+const UNFINISHED_KEY: &str = "report-unfinished-";
+
+/// The most markers a note names; the rest are counted.
+const NOTE_MARKERS: usize = 10;
+
+/// The key of the note about `task`'s report whose content has `digest`.
+fn unfinished_key(task: &TaskRow, digest: &str) -> String {
+    format!("{UNFINISHED_KEY}{}-{}-{digest}", task.id, task.revisions)
+}
+
+/// What a worker whose report is a draft is told: the markers and their
+/// lines, and to write the report once, at the end. It opens with a header
+/// no one can read as a new task or as the answer to a question.
+fn unfinished_note(task: i64, markers: &[unfinished::Marker]) -> String {
+    let mut named: Vec<String> = markers
+        .iter()
+        .take(NOTE_MARKERS)
+        .map(unfinished::Marker::describe)
+        .collect();
+    if markers.len() > NOTE_MARKERS {
+        named.push(format!("and {} more", markers.len() - NOTE_MARKERS));
+    }
+    format!(
+        "[Your report on task #{task} was not taken — this is not a new task]\n\
+Your report is not finished: {}; write `{REPORT}` once, when everything is done (draft anywhere \
+else, such as `.spawn/draft.md`). Spawn did not take it as task #{task}'s report: the task stays \
+with you.",
+        named.join("; ")
+    )
+}
+
+/// Not taking `task`'s report, which `markers` show is still a draft: the
+/// file stays and the task stays delivered. The first time this content
+/// (`report`, by its digest) is seen for the task's revision, its worker is
+/// told (one note, keyed by the digest, [`unfinished_key`]) and the check is
+/// recorded with the markers and the note (`task.report_unfinished`). The
+/// note goes first: a record that fails is written by a later pass, whose
+/// note is the same command. The same content again changes nothing, but a
+/// note refused before anything was typed goes again ([`note_retry`]).
+/// Returns the log line, when something was done.
+fn refuse_unfinished(
+    store: &PostgresStore,
+    task: &TaskRow,
+    facts: &Facts,
+    report: &str,
+    markers: &[unfinished::Marker],
+    now_ms: i64,
+) -> Result<Option<String>, String> {
+    let error = |error: spawn_core::port::StoreError| error.to_string();
+    let digest = format!("{:016x}", crate::sources::fnv(report));
+    let key = unfinished_key(task, &digest);
+    if store
+        .report_unfinished_recorded(task.id, &digest)
+        .map_err(error)?
+    {
+        let Some(retry) = note_retry(&key, facts, now_ms) else {
+            return Ok(None);
+        };
+        send_note(store, task, &retry, unfinished_note(task.id, markers))?;
+        return Ok(Some(format!(
+            "deliver: task #{}'s report is still unfinished; its note goes again ({retry})",
+            task.id
+        )));
+    }
+    let command = send_note(store, task, &key, unfinished_note(task.id, markers))?;
+    let records = markers.iter().map(unfinished::Marker::record).collect();
+    store
+        .task_report_unfinished(
+            task.id,
+            &digest,
+            &serde_json::Value::Array(records),
+            &key,
+            command,
+        )
+        .map_err(error)?;
+    let named: Vec<String> = markers.iter().map(unfinished::Marker::describe).collect();
+    Ok(Some(format!(
+        "deliver: task #{} report not taken, unfinished ({}); its worker told ({key})",
+        task.id,
+        one_line(&named.join("; "), 300)
+    )))
+}
+
+/// The key of the next attempt of the note `key` when its last attempt was
+/// refused before anything was typed (the pane not ready: the screen settles
+/// at the prompt after the turn's end reached the log) and
+/// [`NOT_READY_RETRY_MS`] has passed since: `<key>-retry-<n>`, at most
+/// [`NOT_READY_FREE`] times. None when the note reached the worker or may
+/// have, is in flight, or its tries are spent.
+fn note_retry(key: &str, facts: &Facts, now_ms: i64) -> Option<String> {
+    let retry = format!("{key}-retry-");
+    let attempts: Vec<&Sent> = facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key == key || sent.key.starts_with(&retry))
+        .collect();
+    let last = attempts.last()?;
+    if crate::dispatch::reached_with(last.succeeded, last.error.as_deref())
+        || attempts.len() > NOT_READY_FREE
+    {
+        return None;
+    }
+    let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+    (now_ms >= finished.saturating_add(NOT_READY_RETRY_MS))
+        .then(|| format!("{retry}{}", attempts.len()))
+}
+
+/// Submit the note `text` to `task`'s worker under `key`, as the dispatcher:
+/// the command's id. A key already used gives the command it named.
+fn send_note(
+    store: &PostgresStore,
+    task: &TaskRow,
+    key: &str,
+    text: String,
+) -> Result<i64, String> {
+    use spawn_core::command::Submission;
+    use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
+    use spawn_core::port::CommandQueue;
+    let invalid = |error: spawn_core::id::InvalidLabel| error.to_string();
+    let submission = Submission {
+        agent_id: AgentId::new(task.agent_id.clone()).map_err(invalid)?,
+        session_id: SessionId::new(task.session_id.clone()).map_err(invalid)?,
+        idempotency_key: IdempotencyKey::new(key.to_string()).map_err(invalid)?,
+        action: CommandAction::Input {
+            text,
+            tags: Vec::new(),
+        },
+    };
+    let principal = Principal::new(crate::dispatch::DISPATCHER).map_err(invalid)?;
+    let id = store
+        .submit(&principal, &submission)
+        .map_err(|error| error.to_string())?;
+    i64::try_from(id.0).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1636,6 +1807,13 @@ mod tests {
             panic!("typed");
         };
         assert!(text.contains("tests fail"));
+        assert!(
+            text.ends_with(
+                "Fix it, then rewrite `.spawn/report.md` once, when everything is done (draft \
+                 anywhere else)."
+            ),
+            "{text}"
+        );
         // Typed into a prompt that may hold an open question: it says first
         // that it is no answer.
         assert!(
@@ -2260,6 +2438,20 @@ mod tests {
     }
 
     #[test]
+    fn the_report_contract_says_to_draft_elsewhere_and_write_the_report_once_at_the_end() {
+        let contract = report_contract();
+        for words in [
+            "Write it once, at the end, when everything",
+            "draft anywhere else (`.spawn/draft.md` is never committed), never as a template in \
+             `.spawn/report.md`",
+            "an Outcome that says draft or in progress is not taken",
+        ] {
+            assert!(contract.contains(words), "{words:?} in {contract}");
+        }
+        assert!(task_prompt(&task(9, TaskState::Assigned, "ephemeral")).contains(&contract));
+    }
+
+    #[test]
     fn an_ephemeral_prompt_has_no_charter() {
         let mut one = task(9, TaskState::Assigned, "ephemeral");
         one.resident = None;
@@ -2452,5 +2644,381 @@ mod tests {
             text.contains("cancelled by the integrator (over budget: 5 hours)"),
             "{text}"
         );
+    }
+
+    /// A note about an unfinished report, attempt `key`, finished at
+    /// `finished`: typed, or refused with `error`.
+    fn note_sent(key: &str, finished: i64, error: Option<&str>) -> Sent {
+        sent(50, key, finished, error)
+    }
+
+    #[test]
+    fn a_note_refused_untyped_goes_again_after_its_wait_and_one_that_reached_does_not() {
+        use super::{NOT_READY_FREE, NOT_READY_RETRY_MS, note_retry};
+        use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
+        let key = "report-unfinished-7-0-00000000000000ab";
+        let mut facts = worker(true, true);
+        assert_eq!(
+            note_retry(key, &facts, 0),
+            None,
+            "never sent: nothing to retry"
+        );
+        let refused = format!("pane state Busy {PANE_NOT_READY}");
+        facts.dispatched = vec![note_sent(key, 1_000, Some(&refused))];
+        assert_eq!(
+            note_retry(key, &facts, 1_000 + NOT_READY_RETRY_MS - 1),
+            None,
+            "its wait has not passed"
+        );
+        assert_eq!(
+            note_retry(key, &facts, 1_000 + NOT_READY_RETRY_MS).as_deref(),
+            Some("report-unfinished-7-0-00000000000000ab-retry-1")
+        );
+        facts.dispatched = vec![note_sent(key, 1_000, None)];
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "typed: told once"
+        );
+        let maybe = format!("the text {MAY_HAVE_TYPED}");
+        facts.dispatched = vec![note_sent(key, 1_000, Some(&maybe))];
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "may have been typed"
+        );
+        facts.dispatched = (0..=NOT_READY_FREE)
+            .map(|n| {
+                let attempt = if n == 0 {
+                    key.to_string()
+                } else {
+                    format!("{key}-retry-{n}")
+                };
+                note_sent(&attempt, 1_000, Some(&refused))
+            })
+            .collect();
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "its tries are spent"
+        );
+        facts.dispatched = vec![note_sent(
+            "report-unfinished-7-0-ffffffffffffffff",
+            1_000,
+            Some(&refused),
+        )];
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "another content's note"
+        );
+    }
+
+    /// A schema of its own in the test database, dropped afterwards.
+    struct Db {
+        store: spawn_postgres::PostgresStore,
+        url: String,
+        schema: String,
+    }
+
+    impl Db {
+        fn new(case: &str) -> Self {
+            let url = std::env::var("SPAWN_TEST_DATABASE_URL").expect(
+                "SPAWN_TEST_DATABASE_URL must point at a disposable database; tests do not skip",
+            );
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let schema = format!("spawn_test_{}_{nanos:x}_{case}", std::process::id());
+            let store =
+                spawn_postgres::PostgresStore::connect_in_schema(&url, &schema).expect("connect");
+            Self { store, url, schema }
+        }
+
+        fn client(&self) -> postgres::Client {
+            let mut client =
+                postgres::Client::connect(&self.url, postgres::NoTls).expect("connection");
+            client
+                .batch_execute(&format!("set search_path to {}", self.schema))
+                .expect("schema");
+            client
+        }
+
+        /// The task's state and report.
+        fn task(&self, task: i64) -> (String, Option<String>) {
+            let row = self
+                .client()
+                .query_one(
+                    "select state, report from mission_tasks where id = $1",
+                    &[&task],
+                )
+                .expect("the task");
+            (row.get(0), row.get(1))
+        }
+
+        /// The dispatcher's notes into `session`: (id, key, text), oldest
+        /// first.
+        fn notes(&self, session: &str) -> Vec<(i64, String, String)> {
+            self.client()
+                .query(
+                    "select id, idempotency_key, action ->> 'text' from spawn_commands
+                      where session_id = $1 and principal = 'spawn-dispatch'
+                        and action ->> 'type' = 'input' order by id",
+                    &[&session],
+                )
+                .expect("the notes")
+                .iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect()
+        }
+
+        /// The task's control records of `kind`, oldest first.
+        fn records(&self, task: i64, kind: &str) -> Vec<serde_json::Value> {
+            self.client()
+                .query(
+                    "select kind -> 'detail' -> 'record' from spawn_events
+                      where session_id = 'session_control' and event_name = 'control.recorded'
+                        and kind -> 'detail' -> 'record' ->> 'id' = $1::text
+                        and kind -> 'detail' -> 'record' ->> 'type' = $2
+                      order by session_seq",
+                    &[&task.to_string(), &kind],
+                )
+                .expect("the records")
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+    }
+
+    impl Drop for Db {
+        fn drop(&mut self) {
+            if let Ok(mut client) = postgres::Client::connect(&self.url, postgres::NoTls) {
+                let _ =
+                    client.batch_execute(&format!("drop schema if exists {} cascade", self.schema));
+            }
+        }
+    }
+
+    /// The time of the passes below.
+    const NOW: i64 = 10_000_000;
+
+    /// A task of `db` delivered to an ephemeral worker whose turn ended at
+    /// its prompt (its report is due), with checkpoint `c1`: the task's row,
+    /// the worker's facts, and the root its workspace is under, with
+    /// `.spawn/` and no report yet.
+    fn delivered_task(db: &Db, label: &str) -> (TaskRow, Facts, std::path::PathBuf) {
+        let mission = db
+            .store
+            .mission_add("Payouts", &json!(["/tmp/source.git"]), "human")
+            .expect("mission");
+        let id = db
+            .store
+            .task_assign(mission, "ephemeral", label, "brief", "default")
+            .expect("task");
+        db.store.task_delivered(id, 1).expect("delivered");
+        let row = db
+            .client()
+            .query_one(
+                "select agent_id, session_id from mission_tasks where id = $1",
+                &[&id],
+            )
+            .expect("the task");
+        let mut row_task = task(id, TaskState::Delivered, "ephemeral");
+        row_task.mission_id = mission;
+        row_task.agent_id = row.get(0);
+        row_task.session_id = row.get(1);
+        row_task.resident = None;
+        row_task.charter = None;
+        let mut facts = worker(true, true);
+        facts.agent_id.clone_from(&row_task.agent_id);
+        facts.session_id.clone_from(&row_task.session_id);
+        facts.checkpoint = Some("c1".to_string());
+        assert!(facts.report_due(), "the report is due");
+        let root = std::env::temp_dir().join(format!(
+            "spawn-unfinished-{label}-{}-{}",
+            std::process::id(),
+            db.schema
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(&row_task.agent_id).join(".spawn")).expect("workspace");
+        (row_task, facts, root)
+    }
+
+    /// One pass of report collection over `task` with `facts`.
+    fn collect(db: &Db, task: &TaskRow, facts: &Facts, root: &std::path::Path) -> Vec<String> {
+        super::collect_reports(
+            &db.store,
+            &work(vec![task.clone()]),
+            std::slice::from_ref(facts),
+            root,
+            NOW,
+        )
+    }
+
+    /// Task 124's report (2026-11-07), written as a template before its
+    /// validation ended.
+    const TEMPLATE: &str = "## Outcome\n\ndone: the slice 10 owner contract is written.\n\n\
+## What changed\n\nOne change set.\n\n**Results.** PENDING_RESULTS\n\n## Open issues\n\n\
+PENDING_ISSUES\n";
+
+    #[test]
+    fn a_template_report_is_not_taken_and_its_worker_is_told_once() {
+        let db = Db::new("unfinished_once");
+        let (task, mut facts, root) = delivered_task(&db, "template");
+        let report = root.join(&task.agent_id).join(REPORT);
+        std::fs::write(&report, TEMPLATE).expect("report");
+
+        let lines = collect(&db, &task, &facts, &root);
+        assert!(
+            matches!(lines.as_slice(), [line] if line.contains(&format!("task #{} report not taken, unfinished", task.id))),
+            "{lines:?}"
+        );
+        assert_eq!(
+            db.task(task.id),
+            ("delivered".to_string(), None),
+            "not taken"
+        );
+        assert!(
+            report.is_file(),
+            "the draft stays where the worker wrote it"
+        );
+        let notes = db.notes(&task.session_id);
+        let [(command, key, text)] = notes.as_slice() else {
+            panic!("one note: {notes:?}");
+        };
+        assert!(
+            key.starts_with(&format!("report-unfinished-{}-0-", task.id)),
+            "{key}"
+        );
+        for words in [
+            "Your report is not finished: line 9: the placeholder PENDING_RESULTS («**Results.** \
+             PENDING_RESULTS»); line 13: the placeholder PENDING_ISSUES («PENDING_ISSUES»); write \
+             `.spawn/report.md` once, when everything is done",
+            &format!(
+                "[Your report on task #{} was not taken — this is not a new task]",
+                task.id
+            ),
+        ] {
+            assert!(text.contains(words), "{words:?} in {text}");
+        }
+        let records = db.records(task.id, "task.report_unfinished");
+        let [record] = records.as_slice() else {
+            panic!("one record of the check: {records:?}");
+        };
+        assert_eq!(record["revision"], 0);
+        assert_eq!(record["note"], key.as_str());
+        assert_eq!(record["command_id"], *command);
+        assert_eq!(
+            record["markers"],
+            json!([
+                {"line": 9, "kind": "placeholder", "marker": "PENDING_RESULTS",
+                 "text": "**Results.** PENDING_RESULTS"},
+                {"line": 13, "kind": "placeholder", "marker": "PENDING_ISSUES",
+                 "text": "PENDING_ISSUES"},
+            ])
+        );
+
+        // The note was typed, and the worker stopped again with the same file.
+        facts.dispatched = vec![note_sent(key, NOW - 1_000, None)];
+        assert_eq!(collect(&db, &task, &facts, &root), Vec::<String>::new());
+        // Facts that no longer hold the note (it is more than a day old).
+        facts.dispatched.clear();
+        assert_eq!(collect(&db, &task, &facts, &root), Vec::<String>::new());
+        assert_eq!(db.notes(&task.session_id).len(), 1, "told once");
+        assert_eq!(db.records(task.id, "task.report_unfinished").len(), 1);
+        assert_eq!(db.task(task.id).0, "delivered");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_same_file_unchanged_is_not_told_again_and_a_new_draft_is() {
+        let db = Db::new("unfinished_same");
+        let (task, mut facts, root) = delivered_task(&db, "same");
+        let report = root.join(&task.agent_id).join(REPORT);
+        std::fs::write(&report, TEMPLATE).expect("report");
+        collect(&db, &task, &facts, &root);
+        let first = db.notes(&task.session_id);
+        assert_eq!(first.len(), 1);
+        facts.dispatched = vec![note_sent(&first[0].1, NOW - 1_000, None)];
+
+        // Written again with the same content: the same file.
+        std::fs::write(&report, TEMPLATE).expect("the same report again");
+        assert_eq!(collect(&db, &task, &facts, &root), Vec::<String>::new());
+        assert_eq!(db.notes(&task.session_id), first, "not told again");
+
+        // Another draft: its own note, naming its own markers.
+        std::fs::write(
+            &report,
+            "## Outcome\nIn progress (draft)\n\n## What changed\n- x.rs\n\n### Results\n(pending)\n",
+        )
+        .expect("another draft");
+        let lines = collect(&db, &task, &facts, &root);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let notes = db.notes(&task.session_id);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_ne!(notes[0].1, notes[1].1, "one key per content");
+        assert!(
+            notes[1].2.contains(
+                "line 2: the Outcome says it is a draft or in progress («In progress (draft)»); \
+                 line 8: «(pending)» is only (pending)"
+            ),
+            "{}",
+            notes[1].2
+        );
+        assert_eq!(db.records(task.id, "task.report_unfinished").len(), 2);
+        assert_eq!(db.task(task.id).0, "delivered");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_finished_report_is_taken() {
+        let db = Db::new("unfinished_finished");
+        let (task, mut facts, root) = delivered_task(&db, "finished");
+        let workspace = root.join(&task.agent_id);
+        std::fs::write(workspace.join(REPORT), TEMPLATE).expect("the draft");
+        collect(&db, &task, &facts, &root);
+        let note = db.notes(&task.session_id)[0].1.clone();
+        facts.dispatched = vec![note_sent(&note, NOW - 1_000, None)];
+
+        let finished = TEMPLATE
+            .replace("PENDING_RESULTS", "cargo test: 812 passed.")
+            .replace("PENDING_ISSUES", "none");
+        std::fs::write(workspace.join(REPORT), &finished).expect("the report");
+        let lines = collect(&db, &task, &facts, &root);
+        assert_eq!(lines, [format!("deliver: task #{} reported", task.id)]);
+        assert_eq!(
+            db.task(task.id),
+            ("reported".to_string(), Some(finished.trim().to_string()))
+        );
+        let reported = db.records(task.id, "task.reported");
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0]["commit"], "c1");
+        assert!(!workspace.join(REPORT).exists(), "moved aside");
+        assert!(
+            workspace
+                .join(format!(".spawn/reports/task-{}.md", task.id))
+                .is_file()
+        );
+        assert_eq!(
+            db.notes(&task.session_id).len(),
+            1,
+            "a finished report adds no note"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_report_that_only_mentions_pending_in_a_sentence_is_taken() {
+        let db = Db::new("unfinished_sentence");
+        let (task, facts, root) = delivered_task(&db, "sentence");
+        let report = "## Outcome\ndone: the pending payout is settled once.\n\n## What changed\n\
+- payouts.ts: a payout still pending after a day is retried.\n\n## Open issues\nnone\n";
+        std::fs::write(root.join(&task.agent_id).join(REPORT), report).expect("report");
+        let lines = collect(&db, &task, &facts, &root);
+        assert_eq!(lines, [format!("deliver: task #{} reported", task.id)]);
+        assert_eq!(db.task(task.id).0, "reported");
+        assert!(db.notes(&task.session_id).is_empty());
+        assert!(db.records(task.id, "task.report_unfinished").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

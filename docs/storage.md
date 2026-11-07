@@ -318,7 +318,12 @@ commit with a key no agent holds cannot hang or fail a test.
   judgement with no model answer (no model judge, or the judge unavailable)
   may be older than the turn's end, since the Observer writes it again only
   when its verdict changes; a model's answer is written for every new
-  situation, so a stale one waits for the model's judgement of the turn. Its `task.reported`
+  situation, so a stale one waits for the model's judgement of the turn. A
+  report that is still a draft is not taken at all (a template placeholder,
+  a line that is only `(pending)`, `TBD` or `TODO`, an Outcome that says
+  draft or in progress): the file stays, the task stays delivered, and the
+  worker is told once per content (`task.report_unfinished`,
+  [fleet-architecture.md](fleet-architecture.md) §10.1). Its `task.reported`
   record names in `commit` the agent's latest checkpoint read with that
   turn's end (`spawn_task_reported(task, report, commit)`; null only when
   the agent has no checkpoint at all, and from the two-argument form). The
