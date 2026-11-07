@@ -1354,7 +1354,7 @@ fn window_files(archive: &Path, now_ms: i64, days: i64) -> Result<Vec<(String, u
 fn heads_of(source: &str) -> Result<BTreeMap<String, String>, String> {
     let (ok, stdout, stderr) = output(
         {
-            let mut command = Command::new("git");
+            let mut command = crate::sources::controller_git();
             command.args([
                 "-C",
                 source,
