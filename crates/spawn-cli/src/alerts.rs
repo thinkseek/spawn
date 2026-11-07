@@ -356,7 +356,6 @@ pub(crate) struct Monitor {
     backups: BTreeMap<&'static str, Backup>,
     commands_after: i64,
     logs: Vec<LogWatch>,
-    said: Vec<&'static str>,
 }
 
 impl Monitor {
@@ -385,7 +384,6 @@ impl Monitor {
             backups: BTreeMap::new(),
             commands_after: 0,
             logs,
-            said: Vec::new(),
         }
     }
 
