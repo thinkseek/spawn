@@ -407,7 +407,7 @@ settle_after_waiting() {
                         where session_id = '$session' and source = 'observer'
                           and event_name = 'observation.recorded' and session_seq > $stopped
                           and kind -> 'detail' -> 'observation' ->> 'state' = 'WAITING'")
-    : >"$WORK/settle.$1" || harness "cannot tell the engine to settle its screen"
+    touch "$WORK/settle.$1" || harness "cannot tell the engine to settle its screen"
     wait_for 30 engine_settled "$1" ||
         harness "premise: the engine did not settle its screen within 30 s of being told (turn that wrote $1; engine log: $(tail -n 3 "$WORK/engine.log" | tr '\n' ' '))"
     # The screen settled after the judgement: its reading is a fact the Bridge
