@@ -175,7 +175,10 @@ mod tests {
         assert_eq!(next_due(&twice), Some(200_000 + retry_wait_ms(2)));
         let spent = stopping(
             (0..=DELIVERY_RETRIES)
-                .map(|n| stop(i64::try_from(n).expect("small"), 100_000 + n as i64 * 1000, Some(false)))
+                .map(|n| {
+                    let n = i64::try_from(n).expect("a handful of retries");
+                    stop(n, 100_000 + n * 1000, Some(false))
+                })
                 .collect(),
         );
         assert_eq!(next_due(&spent), None, "the retries are spent: escalate");
