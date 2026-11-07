@@ -35,7 +35,8 @@ declare
     v_database text := coalesce(current_setting('spawn_logins.database', true), '');
     v_prefix text := coalesce(current_setting('spawn_logins.prefix', true), '');
     v_login record;
-    v_scope integer;
+    v_scope integer := 0;
+    v_lock_timeout text := current_setting('lock_timeout');
     v_dropped integer := 0;
 begin
     perform set_config('spawn_logins.result', 'skipped: did not finish', false);
@@ -55,41 +56,39 @@ begin
         perform set_config('spawn_logins.result', 'skipped: a migration holds the lock', false);
         return;
     end;
-    perform set_config('lock_timeout', '0', true);
+    perform set_config('lock_timeout', v_lock_timeout, true);
 
-    create temporary table if not exists pg_temp.spawn_logins_scope (oid oid, rolname text,
-                                                                    droppable boolean)
-        on commit drop;
-    truncate pg_temp.spawn_logins_scope;
-    insert into pg_temp.spawn_logins_scope
-    with bases(base) as (values ('spawn_supervisor'), ('spawn_reader'), ('spawn_human')),
-         databases(d, present) as (
-             select datname::text, true from pg_database
-             union all
-             select v_database, false where v_database <> ''),
-         -- spawn_login_role over each name.
-         logins(rolname, present) as (
-             select case when d ~ '^[a-z0-9_]+$' and length(base) + 1 + length(d) <= 63
-                         then base || '_' || d
-                         else left(base || '_' || regexp_replace(lower(d), '[^a-z0-9_]+', '_', 'g'), 54)
-                              || '_' || left(md5(d), 8) end,
-                    present
-               from databases cross join bases)
-    select r.oid, r.rolname::text,
-           not exists (select 1 from logins l where l.present and l.rolname = r.rolname)
-           and not exists (select 1 from pg_shdepend s
-                            where s.refclassid = 'pg_authid'::regclass and s.refobjid = r.oid)
-           and not exists (select 1 from pg_auth_members m where r.oid in (m.roleid, m.member))
-           and not exists (select 1 from pg_stat_activity a where a.usesysid = r.oid)
-      from pg_roles r
-     where r.rolname ~ '^spawn_(supervisor|reader|human)_[a-z0-9_]+$'
-       and case when v_database <> ''
-                then exists (select 1 from logins l where not l.present and l.rolname = r.rolname)
-                else starts_with(regexp_replace(r.rolname, '^spawn_(supervisor|reader|human)_', ''),
-                                 v_prefix) end;
-    select count(*) into v_scope from pg_temp.spawn_logins_scope;
-
-    for v_login in select rolname from pg_temp.spawn_logins_scope where droppable order by rolname loop
+    for v_login in
+        with bases(base) as (values ('spawn_supervisor'), ('spawn_reader'), ('spawn_human')),
+             databases(d, present) as (
+                 select datname::text, true from pg_database
+                 union all
+                 select v_database, false where v_database <> ''),
+             -- spawn_login_role over each name.
+             logins(rolname, present) as (
+                 select case when d ~ '^[a-z0-9_]+$' and length(base) + 1 + length(d) <= 63
+                             then base || '_' || d
+                             else left(base || '_' || regexp_replace(lower(d), '[^a-z0-9_]+', '_', 'g'), 54)
+                                  || '_' || left(md5(d), 8) end,
+                        present
+                   from databases cross join bases)
+        select r.rolname::text as rolname,
+               not exists (select 1 from logins l where l.present and l.rolname = r.rolname)
+               and not exists (select 1 from pg_shdepend s
+                                where s.refclassid = 'pg_authid'::regclass and s.refobjid = r.oid)
+               and not exists (select 1 from pg_auth_members m where r.oid in (m.roleid, m.member))
+               and not exists (select 1 from pg_stat_activity a where a.usesysid = r.oid)
+                   as droppable
+          from pg_roles r
+         where r.rolname ~ '^spawn_(supervisor|reader|human)_[a-z0-9_]+$'
+           and case when v_database <> ''
+                    then exists (select 1 from logins l where not l.present and l.rolname = r.rolname)
+                    else starts_with(regexp_replace(r.rolname, '^spawn_(supervisor|reader|human)_', ''),
+                                     v_prefix) end
+         order by r.rolname
+    loop
+        v_scope := v_scope + 1;
+        continue when not v_login.droppable;
         begin
             execute format('drop role %I', v_login.rolname);
             v_dropped := v_dropped + 1;
