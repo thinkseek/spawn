@@ -163,6 +163,7 @@ mod tests {
             model: ModelProfile::Default,
             resumed_young: 0,
             stops: Vec::new(),
+            charter: None,
             jobs,
         }
     }
