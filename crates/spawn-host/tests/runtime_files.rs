@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use spawn_core::id::{BranchName, WorkspaceId};
 use spawn_core::port::{BaseMerge, Commit, SetAside, WorkspaceStore};

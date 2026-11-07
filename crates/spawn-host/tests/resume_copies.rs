@@ -10,7 +10,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use spawn_core::bridge::{Bridge, BridgeConfig};
