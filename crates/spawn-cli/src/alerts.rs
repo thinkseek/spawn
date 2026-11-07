@@ -2103,3 +2103,675 @@ fn follow_stream(store: &PostgresStore, after: i64, json: bool) -> Result<i32, S
         std::thread::sleep(Duration::from_millis(250));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Crossing, Event, LIKELY, Monitor, Reading, Row, Settings, civil, crash_stamp, crossing,
+        days_from_civil, line, parse_span, scrub, scrub_value, time_text, window_ms,
+    };
+    use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
+
+    fn settings() -> Settings {
+        Settings {
+            check_ms: 30_000,
+            undelivered_ms: 300_000,
+            admission_ms: 600_000,
+            dump_max_age_ms: 7_200_000,
+            bundle_max_age_ms: 93_600_000,
+            memory_low_mb: 4096,
+            memory_ok_mb: 8192,
+            tmpfs_path: PathBuf::from("/tmp"),
+            tmpfs_high_mb: 8000,
+            tmpfs_ok_mb: 6000,
+            quiet_ms: 900_000,
+            window_ms: 86_400_000,
+            test_log: None,
+            live_log: None,
+        }
+    }
+
+    fn monitor() -> Monitor {
+        Monitor::with(settings())
+    }
+
+    /// What `flush` would record: the events whose key is not already there
+    /// (and the clearings of open alerts only).
+    fn decided(monitor: &Monitor, events: Vec<Event>) -> Vec<Event> {
+        events
+            .into_iter()
+            .filter(|event| match event {
+                Event::Fire { .. } => !monitor.known.contains_key(event.key()),
+                Event::Clear { .. } => monitor.is_open(event.key()),
+            })
+            .collect()
+    }
+
+    /// The store's side of a flush: the keys it now holds.
+    fn commit(monitor: &mut Monitor, events: &[Event]) {
+        for event in events {
+            match event {
+                Event::Fire {
+                    key,
+                    kind,
+                    subject,
+                    ..
+                } => {
+                    monitor.known.insert(
+                        key.clone(),
+                        Row {
+                            kind: (*kind).to_string(),
+                            subject: subject.clone(),
+                            state: "open".to_string(),
+                            evidence: Value::Null,
+                            fired_event_id: 1,
+                            fired_at_ms: 0,
+                        },
+                    );
+                }
+                Event::Clear { key, .. } => {
+                    if let Some(row) = monitor.known.get_mut(key) {
+                        row.state = "cleared".to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    fn feed(monitor: &mut Monitor, event_id: i64, at_ms: i64, record: Value) -> Vec<Event> {
+        let mut out = Vec::new();
+        monitor.feed(event_id, at_ms, &record, &mut out);
+        out
+    }
+
+    fn fires(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Fire { key, .. } => Some(key.as_str()),
+                Event::Clear { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_task_records_each_state_change_once_with_from_and_to() {
+        let mut monitor = monitor();
+        let assigned = feed(
+            &mut monitor,
+            10,
+            1000,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4,
+                   "agent_id": "agent_x", "objective": 26, "revision": 0}),
+        );
+        assert_eq!(fires(&assigned), ["task_state:7:10"]);
+        let Event::Fire { kind, subject, evidence, notice, .. } = &assigned[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(*kind, "task_state");
+        assert_eq!(subject, "task #7");
+        assert!(notice);
+        assert_eq!(evidence["from"], json!(null));
+        assert_eq!(evidence["to"], "assigned");
+        assert_eq!(evidence["record"], "task.assigned");
+        assert_eq!(evidence["event_id"], 10);
+        assert_eq!(evidence["mission"], 4);
+        commit(&mut monitor, &assigned);
+
+        let delivered = feed(
+            &mut monitor,
+            11,
+            2000,
+            json!({"type": "task.delivered", "id": 7, "command_id": 3}),
+        );
+        assert_eq!(fires(&delivered), ["task_state:7:11"]);
+        let Event::Fire { evidence, .. } = &delivered[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(evidence["from"], "assigned");
+        assert_eq!(evidence["to"], "delivered");
+        commit(&mut monitor, &delivered);
+
+        let again = feed(
+            &mut monitor,
+            11,
+            2000,
+            json!({"type": "task.delivered", "id": 7, "command_id": 3}),
+        );
+        assert!(decided(&monitor, again).is_empty(), "a replay records nothing");
+    }
+
+    #[test]
+    fn a_gating_that_leaves_the_task_is_no_notice_and_moves_the_missions_counters() {
+        let mut monitor = monitor();
+        feed(&mut monitor, 1, 0, json!({"type": "mission.added", "id": 4, "text": "m"}));
+        feed(
+            &mut monitor,
+            2,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4,
+                   "agent_id": "agent_x", "revision": 0}),
+        );
+        for (event, aborts) in [(3, 1), (4, 2), (5, 3)] {
+            let events = feed(
+                &mut monitor,
+                event,
+                0,
+                json!({"type": "task.gated", "id": 7, "verdict": "aborted", "revision": 0}),
+            );
+            assert!(
+                !fires(&events).iter().any(|key| key.starts_with("task_state:")),
+                "an aborted gating leaves the task as it was"
+            );
+            let notice = events
+                .iter()
+                .find(|event| matches!(event, Event::Fire { kind: "mission_state", .. }))
+                .expect("the mission's abort count moved");
+            let Event::Fire { evidence, .. } = notice else {
+                panic!("a fire");
+            };
+            assert_eq!(evidence["record"], "task.gated");
+            assert_eq!(evidence["after"]["gate_aborts"], aborts);
+            assert_eq!(evidence["before"]["gate_aborts"], aborts - 1);
+        }
+    }
+
+    #[test]
+    fn a_halt_is_a_notice_and_an_alert_and_a_resume_clears_it() {
+        let mut monitor = monitor();
+        feed(&mut monitor, 1, 0, json!({"type": "mission.added", "id": 4, "text": "m"}));
+        let halted = feed(
+            &mut monitor,
+            2,
+            0,
+            json!({"type": "mission.halted", "id": 4, "reason": "three rejections"}),
+        );
+        assert_eq!(fires(&halted), ["mission_state:4:2", "mission_halted:4:2"]);
+        let Event::Fire { evidence, notice, .. } = &halted[1] else {
+            panic!("a fire");
+        };
+        assert_eq!(evidence["reason"], "three rejections");
+        assert!(!notice);
+        commit(&mut monitor, &halted);
+
+        let resumed = feed(&mut monitor, 3, 0, json!({"type": "mission.resumed", "id": 4}));
+        let cleared = decided(&monitor, resumed);
+        assert_eq!(cleared.len(), 2, "{cleared:?}");
+        assert!(matches!(cleared[1], Event::Clear { ref key, .. } if key == "mission_halted:4:2"));
+        let Event::Clear { evidence, .. } = &cleared[1] else {
+            panic!("a clear");
+        };
+        assert_eq!(evidence["event_id"], 3);
+    }
+
+    #[test]
+    fn a_restarted_loop_reads_its_alerts_back_and_fires_nothing_twice() {
+        let mut monitor = monitor();
+        feed(&mut monitor, 1, 0, json!({"type": "mission.added", "id": 4, "text": "m"}));
+        let events = feed(
+            &mut monitor,
+            2,
+            0,
+            json!({"type": "mission.halted", "id": 4, "reason": "halted"}),
+        );
+        commit(&mut monitor, &decided(&monitor, events));
+        // The restart: the same records are read again with the keys the
+        // store holds; the decision may repeat, but nothing is recorded.
+        let replayed = feed(
+            &mut monitor,
+            2,
+            0,
+            json!({"type": "mission.halted", "id": 4, "reason": "halted"}),
+        );
+        assert!(decided(&monitor, replayed).is_empty());
+        // And the open alert is still known, so a quiet re-reading of a
+        // threshold does not fire it again.
+        assert!(monitor.is_open("mission_halted:4:2"));
+    }
+
+    #[test]
+    fn the_keys_name_the_occurrence() {
+        let mut monitor = monitor();
+        let events = feed(
+            &mut monitor,
+            12,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
+        assert_eq!(fires(&events), ["task_state:7:12"]);
+        feed(&mut monitor, 13, 0, json!({"type": "mission.added", "id": 4}));
+        let gated = feed(
+            &mut monitor,
+            14,
+            0,
+            json!({"type": "task.gated", "id": 7, "verdict": "host_fault",
+                   "evidence": "base_disagrees", "alert": true, "revision": 0,
+                   "scenario": "011.sh", "base_disagrees": 3}),
+        );
+        assert!(fires(&gated).contains(&"gate_base_disagrees:14"), "{gated:?}");
+        let drilled = feed(
+            &mut monitor,
+            15,
+            0,
+            json!({"type": "backup.verified", "key": "k", "ok": false, "reason": "r"}),
+        );
+        assert_eq!(fires(&drilled), ["drill_failed:15"]);
+        let auth = feed(
+            &mut monitor,
+            16,
+            0,
+            json!({"type": "execution.interrupted", "cause": "model_auth",
+                   "execution_id": "exec_1", "session_id": "session_x", "agent_id": "a"}),
+        );
+        assert_eq!(fires(&auth), ["model_auth:16"]);
+    }
+
+    #[test]
+    fn memory_and_tmpfs_do_not_flap_between_their_thresholds() {
+        // MemAvailable: fire under 4096, clear at 8192; 5000 in between is
+        // neither, whichever side it comes from.
+        assert_eq!(crossing(false, 2000, 4096, 8192, true), Crossing::Fire);
+        assert_eq!(crossing(true, 5000, 4096, 8192, true), Crossing::Nothing);
+        assert_eq!(crossing(true, 9000, 4096, 8192, true), Crossing::Clear);
+        assert_eq!(crossing(false, 9000, 4096, 8192, true), Crossing::Nothing);
+        assert_eq!(crossing(true, 4096, 4096, 8192, true), Crossing::Nothing);
+        // The filesystem: fire over 8000, clear under 6000.
+        assert_eq!(crossing(false, 9000, 8000, 6000, false), Crossing::Fire);
+        assert_eq!(crossing(true, 7000, 8000, 6000, false), Crossing::Nothing);
+        assert_eq!(crossing(true, 5000, 8000, 6000, false), Crossing::Clear);
+        assert_eq!(crossing(false, 5000, 8000, 6000, false), Crossing::Nothing);
+        // A threshold the host never crosses: both equal, the usual run's
+        // 1/1 and 100000000/100000000.
+        assert_eq!(crossing(false, 19_000, 1, 1, true), Crossing::Nothing);
+        assert_eq!(crossing(true, 19_000, 1, 1, true), Crossing::Clear);
+        assert_eq!(
+            crossing(false, 4000, 100_000_000, 100_000_000, false),
+            Crossing::Nothing
+        );
+    }
+
+    #[test]
+    fn a_command_failure_is_a_notice_and_an_owner_note_is_not() {
+        let mut monitor = monitor();
+        let commands = json!([
+            {"command": 5, "agent_id": "agent_a", "session_id": "session_a",
+             "principal": "h", "action": "input", "key": "k-5", "error": "no execution"},
+            {"command": 6, "agent_id": "owner", "session_id": "session_owner",
+             "principal": "owner", "action": "input", "key": "owner-note-1", "error": "sent"},
+        ]);
+        let mut out = Vec::new();
+        monitor.commands(&commands, &mut out);
+        assert_eq!(fires(&out), ["command_failed:5"]);
+        let Event::Fire { subject, evidence, notice, .. } = &out[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "command #5");
+        assert!(notice);
+        assert_eq!(evidence["error"], "no execution");
+        assert_eq!(evidence["principal"], "h");
+    }
+
+    #[test]
+    fn a_crash_line_is_parsed_with_utc_and_offset_stamps() {
+        let base = days_from_civil(2026, 11, 8) * 86_400_000
+            + (18 * 3600 + 25 * 60 + 0) * 1000
+            + 123;
+        let now = base + 5_000;
+        let (stamp, prefix) = crash_stamp(
+            "2026-11-08 18:25:00.123 UTC [1] LOG:  server process (PID 4242) was \
+terminated by signal 11: Segmentation fault",
+            now,
+        )
+        .expect("a crash stamp");
+        assert_eq!(stamp, base);
+        assert_eq!(prefix, "2026-11-08 18:25:00.123 UTC [1]");
+        // +08:00 is eight hours ahead of UTC.
+        let (stamp, prefix) = crash_stamp(
+            "2026-11-09 02:25:00.123 +08:00 [77] ERROR:  could not resize shared memory \
+segment \"/PostgreSQL.2051\" to 8388608 bytes: No space left on device",
+            now,
+        )
+        .expect("an offset stamp");
+        assert_eq!(stamp, base);
+        assert_eq!(prefix, "2026-11-09 02:25:00.123 +08:00 [77]");
+        // The third pattern, and a line that is not one at all.
+        assert!(
+            crash_stamp("2026-11-08 18:25:00.123 UTC [3] FATAL:  No space left on device", now)
+                .is_some()
+        );
+        assert!(crash_stamp("2026-11-08 18:25:00.123 UTC [3] LOG:  checkpoint complete", now).is_none());
+        assert!(crash_stamp("not a log line", now).is_none());
+        // Older than the day: history, not a reading.
+        assert!(
+            crash_stamp(
+                "2026-11-06 18:25:00.123 UTC [1] LOG:  terminated by signal 11",
+                now
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_crash_clears_at_the_ready_line_or_by_quiet() {
+        let mut monitor = monitor();
+        let now = 1_000_000;
+        let crash = "2026-11-08 18:25:00.123 UTC [1] LOG:  server process (PID 4242) was \
+terminated by signal 11: Segmentation fault\n";
+        let mut out = Vec::new();
+        monitor.lines_of_log(0, Path::new("/var/log/pg.log"), now, crash, &mut out);
+        assert_eq!(
+            fires(&out),
+            ["postgres_crash:test:2026-11-08 18:25:00.123 UTC [1]"]
+        );
+        commit(&mut monitor, &decided(&monitor, out));
+
+        // The same lines read again: nothing fires twice.
+        let mut again = Vec::new();
+        monitor.lines_of_log(0, Path::new("/var/log/pg.log"), now, crash, &mut again);
+        assert!(decided(&monitor, again).is_empty());
+
+        // Quiet: no ready line for the bound clears it, with the last line.
+        monitor.logs[0].last_match_ms = now;
+        let mut quiet = Vec::new();
+        monitor.quiet_crashes(now + settings().quiet_ms + 1, &mut quiet);
+        assert_eq!(quiet.len(), 1);
+        assert!(matches!(&quiet[0], Event::Clear { evidence, .. }
+            if evidence["quiet_secs"] == 900));
+
+        // A ready line clears it at once, quoting the line.
+        let ready = "2026-11-08 18:26:00.000 UTC [1] LOG:  database system is ready to accept \
+connections\n";
+        let mut cleared = Vec::new();
+        monitor.lines_of_log(0, Path::new("/var/log/pg.log"), now, ready, &mut cleared);
+        assert_eq!(cleared.len(), 1);
+        assert!(matches!(&cleared[0], Event::Clear { evidence, .. }
+            if evidence["line"].as_str().is_some_and(|line| line.contains("ready to accept"))));
+    }
+
+    #[test]
+    fn backup_ages_fire_without_a_record_not_at_all_and_again_after_the_new_one_ages() {
+        let mut monitor = monitor();
+        let mut out = Vec::new();
+        monitor.bounds(10_000_000, &mut out);
+        assert!(out.is_empty(), "no backup record at all is no alert");
+
+        let dumped = feed(
+            &mut monitor,
+            20,
+            1000,
+            json!({"type": "backup.dumped", "keys": ["postgres/hourly/a.dump"],
+                   "bytes": 1, "events": 2}),
+        );
+        assert!(dumped.is_empty(), "a fresh dump is no alert");
+        let mut early = Vec::new();
+        monitor.bounds(1000 + 7_199_999, &mut early);
+        assert!(early.is_empty(), "never before its age");
+
+        let mut due = Vec::new();
+        monitor.bounds(1000 + 7_200_000, &mut due);
+        assert_eq!(fires(&due), ["backup_stale:dump:20"]);
+        let Event::Fire { evidence, subject, .. } = &due[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "dump");
+        assert_eq!(evidence["age_secs"], 7200);
+        assert_eq!(evidence["max_age_secs"], 7200);
+        assert_eq!(evidence["key"], "postgres/hourly/a.dump");
+        commit(&mut monitor, &decided(&monitor, due));
+
+        let newer = feed(
+            &mut monitor,
+            21,
+            1000 + 7_200_000,
+            json!({"type": "backup.dumped", "keys": ["postgres/hourly/b.dump"], "bytes": 1}),
+        );
+        let cleared = decided(&monitor, newer);
+        assert_eq!(cleared.len(), 1);
+        assert!(matches!(&cleared[0], Event::Clear { key, evidence }
+            if key == "backup_stale:dump:20" && evidence["event_id"] == 21));
+        commit(&mut monitor, &cleared);
+
+        // The newer dump growing old is a new occurrence with its own key.
+        let mut later = Vec::new();
+        monitor.bounds(1000 + 2 * 7_200_000, &mut later);
+        assert_eq!(fires(&later), ["backup_stale:dump:21"]);
+    }
+
+    #[test]
+    fn a_budget_over_alert_fires_once_and_clears_under_it() {
+        let mut monitor = monitor();
+        let over = feed(
+            &mut monitor,
+            30,
+            1000,
+            json!({"type": "backup.dumped", "keys": ["k1"], "over_alert": true,
+                   "held_bytes": 8_100_000_000_i64, "written_bytes": 2_400_100_i64,
+                   "alert_bytes": 8_000_000_000_i64, "limit_bytes": 10_000_000_000_i64,
+                   "skipped": []}),
+        );
+        assert_eq!(fires(&over), ["backup_budget:30"]);
+        let Event::Fire { subject, evidence, .. } = &over[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "r2");
+        assert_eq!(evidence["held_bytes"], 8_100_000_000_i64);
+        assert_eq!(evidence["alert_bytes"], 8_000_000_000_i64);
+        commit(&mut monitor, &decided(&monitor, over));
+
+        let still = feed(
+            &mut monitor,
+            31,
+            2000,
+            json!({"type": "backup.dumped", "keys": ["k2"], "over_alert": true,
+                   "held_bytes": 8_200_000_000_i64}),
+        );
+        assert!(
+            !fires(&still).iter().any(|key| key.starts_with("backup_budget:")),
+            "one alert while it is open"
+        );
+
+        let under = feed(
+            &mut monitor,
+            32,
+            3000,
+            json!({"type": "backup.dumped", "keys": ["k3"], "over_alert": false,
+                   "held_bytes": 7_900_000_000_i64}),
+        );
+        let cleared = decided(&monitor, under);
+        assert!(cleared.iter().any(|event| matches!(event,
+            Event::Clear { key, evidence } if key == "backup_budget:30"
+                && evidence["event_id"] == 32)));
+    }
+
+    #[test]
+    fn a_base_disagreement_is_a_notice_only_when_its_record_says_alert() {
+        let mut monitor = monitor();
+        let record = json!({"type": "task.gated", "id": 7, "verdict": "host_fault",
+                            "evidence": "base_disagrees", "alert": true, "revision": 0,
+                            "scenario": "011.sh", "exits": [1, 0], "setup_s": 244,
+                            "base_disagrees": 3, "due_ms": 5});
+        let events = feed(&mut monitor, 40, 0, record.clone());
+        assert!(fires(&events).contains(&"gate_base_disagrees:40"));
+        let quiet = feed(
+            &mut monitor,
+            41,
+            0,
+            json!({"type": "task.gated", "id": 7, "verdict": "host_fault",
+                   "evidence": "base_disagrees", "revision": 0}),
+        );
+        assert!(
+            !fires(&quiet).iter().any(|key| key.starts_with("gate_base_disagrees:")),
+            "no alert without the record's own flag"
+        );
+    }
+
+    #[test]
+    fn an_admission_fires_after_its_bound_and_clears_at_its_admission() {
+        let mut monitor = monitor();
+        let waiting = feed(
+            &mut monitor,
+            50,
+            1000,
+            json!({"type": "admission.waiting", "kind": "execution",
+                   "agent_id": "agent_worker_bb_wait", "session_id": "s",
+                   "envelope_bytes": 6_442_450_944_i64, "measure": "host",
+                   "measured_bytes": 2_147_483_648_i64,
+                   "threshold_bytes": 6_442_450_944_i64}),
+        );
+        assert!(waiting.is_empty(), "a wait is not yet an alert");
+        let mut early = Vec::new();
+        monitor.bounds(1000 + 599_999, &mut early);
+        assert!(early.is_empty(), "never before its bound");
+        let mut due = Vec::new();
+        monitor.bounds(1000 + 600_000, &mut due);
+        assert_eq!(fires(&due), ["admission_wait:50"]);
+        let Event::Fire { subject, evidence, .. } = &due[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "agent_worker_bb_wait");
+        assert_eq!(evidence["measure"], "host");
+        commit(&mut monitor, &decided(&monitor, due));
+
+        let admitted = feed(
+            &mut monitor,
+            51,
+            1000 + 610_000,
+            json!({"type": "admission.admitted", "kind": "execution",
+                   "agent_id": "agent_worker_bb_wait", "waited_ms": 610_000}),
+        );
+        let cleared = decided(&monitor, admitted);
+        assert_eq!(cleared.len(), 1);
+        assert!(matches!(&cleared[0], Event::Clear { key, evidence }
+            if key == "admission_wait:50" && evidence["waited_ms"] == 610_000));
+    }
+
+    #[test]
+    fn a_stuck_judgement_fires_once_and_a_calm_one_clears_it() {
+        let mut monitor = monitor();
+        let stuck = json!([{"session_id": "session_resident_r1", "agent_id": "agent_resident_r1",
+                            "event_id": 60, "at_ms": 0,
+                            "observation": {"stuck": 0.9, "state": "WAITING", "judge": "jev"}}]);
+        let mut out = Vec::new();
+        monitor.observe(&stuck, &mut out);
+        assert_eq!(fires(&out), ["agent_stuck:session_resident_r1:60"]);
+        let Event::Fire { evidence, .. } = &out[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(evidence["stuck"], 0.9);
+        assert!(evidence["stuck"].as_f64().unwrap_or_default() >= LIKELY);
+        commit(&mut monitor, &decided(&monitor, out));
+
+        let still = json!([{"session_id": "session_resident_r1", "agent_id": "agent_resident_r1",
+                            "event_id": 61, "at_ms": 0,
+                            "observation": {"stuck": 0.8, "state": "WAITING", "judge": "jev"}}]);
+        let mut again = Vec::new();
+        monitor.observe(&still, &mut again);
+        assert!(decided(&monitor, again).is_empty(), "a later stuck fires nothing");
+
+        let calm = json!([{"session_id": "session_resident_r1", "agent_id": "agent_resident_r1",
+                           "event_id": 62, "at_ms": 0,
+                           "observation": {"stuck": 0.05, "state": "WAITING", "judge": "jev"}}]);
+        let mut cleared = Vec::new();
+        monitor.observe(&calm, &mut cleared);
+        let cleared = decided(&monitor, cleared);
+        assert!(matches!(&cleared[0], Event::Clear { evidence, .. }
+            if evidence["stuck"] == 0.05 && evidence["event_id"] == 62));
+    }
+
+    #[test]
+    fn a_model_login_that_expired_clears_when_its_execution_does() {
+        let mut monitor = monitor();
+        let interrupted = feed(
+            &mut monitor,
+            70,
+            0,
+            json!({"type": "execution.interrupted", "agent_id": "agent_worker_a",
+                   "session_id": "session_worker_a", "execution_id": "exec_auth",
+                   "cause": "model_auth",
+                   "evidence": {"error": "authentication_failed", "status": 401}}),
+        );
+        assert_eq!(fires(&interrupted), ["model_auth:70"]);
+        let Event::Fire { subject, evidence, .. } = &interrupted[0] else {
+            panic!("a fire");
+        };
+        assert_eq!(subject, "session_worker_a");
+        assert_eq!(evidence["execution_id"], "exec_auth");
+        commit(&mut monitor, &decided(&monitor, interrupted));
+
+        let cleared = feed(
+            &mut monitor,
+            71,
+            0,
+            json!({"type": "execution.cleared", "execution_id": "exec_auth",
+                   "session_id": "session_worker_a", "waited_ms": 9000}),
+        );
+        let cleared = decided(&monitor, cleared);
+        assert!(matches!(&cleared[0], Event::Clear { key, evidence }
+            if key == "model_auth:70" && evidence["waited_ms"] == 9000));
+    }
+
+    #[test]
+    fn evidence_never_holds_a_url_password() {
+        let secret = "postgres://spawn:pa55w0rd@db:5432/spawn_test";
+        let scrubbed = scrub(&format!("cannot connect to {secret}: refused"));
+        assert!(!scrubbed.contains("pa55w0rd"), "{scrubbed}");
+        assert!(scrubbed.contains("postgres://spawn:***@db:5432/spawn_test"));
+        let value = scrub_value(&json!({"error": format!("{secret} refused"), "n": 3}));
+        assert!(!value.to_string().contains("pa55w0rd"), "{value}");
+        assert_eq!(value["n"], 3);
+        // A URL without a password, and plain text, are left as they are.
+        assert_eq!(scrub("see postgres://db:5432/x"), "see postgres://db:5432/x");
+        assert_eq!(scrub("no url here"), "no url here");
+    }
+
+    #[test]
+    fn the_text_form_names_the_kind_and_the_subject_of_each_alert() {
+        let alerts = json!([
+            {"key": "mission_halted:4:9", "kind": "mission_halted", "subject": "mission #4",
+             "state": "open", "fired_at_ms": 1_760_000_000_000_i64,
+             "text": "mission #4 halted: three rejections"},
+            {"key": "task_state:7:10", "kind": "task_state", "subject": "task #7",
+             "state": "notice", "fired_at_ms": 1_760_000_000_000_i64,
+             "text": "task #7: none -> assigned (by task.assigned)"},
+        ]);
+        let lines: Vec<String> = alerts
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(line)
+            .collect();
+        assert!(lines[0].contains("mission_halted") && lines[0].contains("mission #4"));
+        assert!(lines[0].starts_with("open "));
+        assert!(lines[1].contains("task_state") && lines[1].contains("task #7"));
+        assert!(lines[1].starts_with("notice "));
+        // One line per alert, and the same array the API answers: both are
+        // `window`'s answer, shaped by the store's one method.
+        assert_eq!(lines.len(), alerts.as_array().unwrap().len());
+    }
+
+    #[test]
+    fn the_window_is_a_span_or_the_configured_default() {
+        assert_eq!(window_ms(Some("90s")), Ok(90_000));
+        assert_eq!(window_ms(Some("30m")), Ok(1_800_000));
+        assert_eq!(window_ms(Some("2h")), Ok(7_200_000));
+        assert_eq!(window_ms(Some("1d")), Ok(86_400_000));
+        assert_eq!(window_ms(Some("1500")), Ok(1500));
+        assert_eq!(parse_span("500ms"), Some(500));
+        assert!(window_ms(Some("soon")).is_err());
+    }
+
+    #[test]
+    fn a_time_is_rendered_in_utc() {
+        let (year, month, day, hour, minute, second) = civil(1_760_000_000_000);
+        assert_eq!((year, month, day), (2025, 10, 9));
+        assert_eq!((hour, minute, second), (8, 53, 20));
+        assert_eq!(time_text(0), "1970-01-01 00:00:00");
+    }
+
+    #[test]
+    fn a_reading_is_fire_clear_or_nothing() {
+        let _ = Reading::Nothing;
+        assert_eq!(crossing(true, 1, 2, 3, true), Crossing::Nothing);
+    }
+}
