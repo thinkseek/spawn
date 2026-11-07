@@ -37,6 +37,35 @@
 //! The `waiting` record is not activity: the stall layer and the
 //! dispatcher's staleness ignore it, and the Observer covers it like any
 //! command step.
+//!
+//! What a pass reads of a running engine, and when (docs/design.md §5, §6).
+//! A pass costs nothing per idle agent. The Bridge watches each live
+//! execution's transcript and its runner's exit status ([`FileWatch`]) and
+//! reads one only when it changed; where no watch can be set for an
+//! execution (an error, a filesystem without watches, the platform's
+//! limit) its files are read on every pass, as before, and the fallback is
+//! said once. The offset rule of [`Bridge::follow_output`] stays: a line
+//! written while a read is in progress is read at the next change or pass,
+//! never lost.
+//!
+//! A pane is captured on a pass only when it can matter: a command is in
+//! flight on the session (claimed and unfinished), or its transcript has
+//! held still for [`BridgeConfig::screen_quiet`] since it last grew and its
+//! screen was not read since — with readings repeated on the following
+//! passes until two in a row agree, the confirmation a fact needs — or once
+//! per [`BridgeConfig::screen_refresh`] as a backstop for a screen that
+//! changes with nothing in the transcript (a dialog, a crash to a shell).
+//! A busy screen is still recorded again every `screen_refresh` while a
+//! turn keeps it busy. An idle session with a quiet transcript and nothing
+//! in flight costs no capture between backstops, and no tmux call at all:
+//! the liveness question (`runner`) rides on the same decision.
+//!
+//! Causality (§14): a screen state is recorded from a capture, and a turn's
+//! end from the transcript's line. The absence of a capture, or of a
+//! transcript change, is never read as a state; a quiet transcript only
+//! says when to look at the screen again. So a screen change that decides a
+//! delivery (the worker at its prompt, its turn stopped) is recorded no
+//! later than the transcript's end of the turn is read.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
