@@ -4,19 +4,26 @@
 Run: python3 -I scripts/model-relay-test.py   (no network, no keys)
 
 Covers routing by model, header replacement (an allow-list toward DeepSeek),
-server-sent events arriving before the upstream finishes (the gateway's), a
-DeepSeek stream asked for again on a server error or silence before it starts and
-ending in an overloaded error when cut, upstream errors,
-an unreachable upstream, redirects passed back unfollowed, a stalled client
-timed out, and the request size cap.
+server-sent events arriving before the upstream finishes (the gateway's and
+DeepSeek's), and DeepSeek's faults, injected by the fake upstream: before
+the first event a server error (500, 429, 529), silence, keep-alives only or
+a stream ending are asked for again, within the attempts and the budget, the
+client seeing none of it; after it, a stream cut, ended or reset ends with
+an overloaded error, logged as DeepSeek's cut. Also a non-stream answer
+slower than the silence bound, upstream errors, an upstream that hangs up or
+cannot be reached, redirects passed back unfollowed, a stalled client timed
+out, and the request size cap.
 """
 
+import contextlib
 import http.client
-import socket
 import importlib.util
+import io
 import json
 import os
 import pathlib
+import socket
+import struct
 import threading
 import time
 import unittest
@@ -31,6 +38,10 @@ FAKE_KEY = "sk-test-deepseek"
 CLIENT_TOKEN = "Bearer client-gateway-token"
 # The fake upstream's whole stream.
 WHOLE = b"event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n"
+# DeepSeek's comment while a request waits.
+KEEP_ALIVE = b": keep-alive\n\n"
+# Text a model may write (editing this relay, say) that names the end event.
+STOP_TEXT = 'if not ends_whole(tail):  # no "event: message_stop" line\nevent: message_stop'
 
 
 class Upstream:
@@ -42,13 +53,22 @@ class Upstream:
         # Set by the test to let a held stream finish.
         self.release = threading.Event()
         self.finished = threading.Event()
-        # Streams still to cut, and how: "close" drops the connection
-        # partway, "end" ends the body cleanly without message_stop.
+        # Streams still to cut, and how. After the first event: "close" drops
+        # the connection, "end" ends the body cleanly without message_stop,
+        # "rst" resets the connection. Before any event, after the 200:
+        # "stall" sends keep-alive comments only (for up to 5 s, or until the
+        # relay hangs up), "keepalive_close" sends three, then closes. And
+        # "late_start" sends three keep-alives, then the whole stream.
         self.cuts = []
-        # Requests still to refuse with a 500, as a loaded DeepSeek does.
+        # Requests still to refuse with `failure_status`, as a loaded
+        # DeepSeek does.
         self.failures = 0
+        self.failure_status = 500
         # Requests still to hold, silent, for 3 s before dropping them.
         self.silences = 0
+        # Seconds a non-stream answer's body follows its headers: DeepSeek
+        # sends it only once done.
+        self.slow = 0
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -84,24 +104,31 @@ class Upstream:
                     self.end_headers()
                 elif request.get("unauthorized"):
                     self._json(401, {"type": "error", "error": {"type": "authentication_error"}})
+                elif request.get("hang_up"):
+                    # Closed before any response, as a server that drops a request.
+                    self.close_connection = True
                 elif request.get("stream") and upstream.silences:
                     upstream.silences -= 1
                     time.sleep(3)
                     self.close_connection = True
                 elif request.get("stream") and upstream.failures:
                     upstream.failures -= 1
-                    self._json(500, {"type": "error", "error": {"type": "api_error"}})
+                    self._json(upstream.failure_status, {"type": "error", "error": {"type": "x"}})
                 elif request.get("stream"):
                     self._stream()
                 else:
-                    self._json(200, {"model": request.get("model"), "from": upstream.name})
+                    reply = {"model": request.get("model"), "from": upstream.name}
+                    self._json(200, reply, upstream.slow)
 
-            def _json(self, status, value):
+            def _json(self, status, value, delay=0):
                 data = json.dumps(value).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
+                if delay:
+                    self.wfile.flush()
+                    time.sleep(delay)
                 self.wfile.write(data)
 
             def _stream(self):
@@ -114,9 +141,34 @@ class Upstream:
                     self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
                     self.wfile.flush()
 
+                cut = upstream.cuts.pop(0) if upstream.cuts else None
+                if cut in ("stall", "keepalive_close", "late_start"):
+                    for sent in range(25 if cut == "stall" else 3):
+                        try:
+                            chunk(KEEP_ALIVE)
+                        except OSError:  # the relay hung up
+                            return
+                        time.sleep(0.2)
+                    if cut != "late_start":
+                        self.close_connection = True
+                        return
                 chunk(b"event: message_start\ndata: {}\n\n")
-                if upstream.cuts:
-                    if upstream.cuts.pop(0) == "end":
+                if cut == "rst":
+                    time.sleep(0.2)
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    self.connection.close()
+                    self.close_connection = True
+                    return
+                if cut == "mention_end":
+                    # A delta whose text names the end event, then a clean end.
+                    delta = {"type": "content_block_delta", "delta": {"text": STOP_TEXT}}
+                    chunk(b"event: content_block_delta\ndata: " + json.dumps(delta).encode())
+                    chunk(b"\n\n")
+                    cut = "end"
+                if cut in ("close", "end"):
+                    if cut == "end":
                         self.wfile.write(b"0\r\n\r\n")
                         self.wfile.flush()
                     self.close_connection = True
@@ -341,10 +393,33 @@ class RelayTest(unittest.TestCase):
         )
         return connection, connection.getresponse()
 
+    def patch(self, name, value):
+        """Set the relay's `name` to `value` for this test."""
+        self.addCleanup(setattr, relay, name, getattr(relay, name))
+        setattr(relay, name, value)
+
     def fast_retries(self):
-        for name, value in (("STREAM_BACKOFF", (0, 0, 0, 0)), ("DEEPSEEK_SILENCE", 1)):
-            self.addCleanup(setattr, relay, name, getattr(relay, name))
-            setattr(relay, name, value)
+        self.patch("STREAM_BACKOFF", (0, 0, 0, 0))
+        self.patch("DEEPSEEK_SILENCE", 1)
+
+    @contextlib.contextmanager
+    def relay_log(self):
+        """The relay's log lines while the block runs."""
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            yield log
+
+    @staticmethod
+    def logged(log, text, seconds=5):
+        """The first line of `log` holding `text`, waited for: the relay logs
+        a request after its response is out."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            for line in log.getvalue().splitlines():
+                if text in line:
+                    return line
+            time.sleep(0.05)
+        raise AssertionError(f"no log line with {text!r} in {log.getvalue()!r}")
 
     def test_a_deepseek_stream_arrives_event_by_event(self):
         connection, response = self.stream()
@@ -410,6 +485,103 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(json.loads(response.read())["error"]["type"], "overloaded_error")
         connection.close()
         self.assertEqual(len(self.deepseek.requests), relay.STREAM_ATTEMPTS)
+
+    def test_a_deepseek_stream_reset_partway_ends_with_an_overloaded_error(self):
+        self.deepseek.cuts = ["rst"]
+        with self.relay_log() as log:
+            connection, response = self.stream()
+            self.assertEqual(response.status, 200)
+            # A whole chunked body: the relay ended it, not a dropped connection.
+            events = response.read()
+            connection.close()
+            line = self.logged(log, "-> deepseek")
+        start, error = events.split(b"event: error\ndata: ")
+        self.assertEqual(start, b"event: message_start\ndata: {}\n\n")
+        self.assertEqual(json.loads(error)["error"]["type"], "overloaded_error")
+        # DeepSeek's reset is its cut, not the client gone; the log names
+        # what the client got.
+        self.assertIn("-> deepseek 200 ", line)
+        self.assertIn("CUT deepseek cut: ConnectionResetError", line)
+        self.assertNotIn("client gone", line)
+        self.assertEqual(len(self.deepseek.requests), 1)
+
+    def test_a_cut_stream_whose_text_names_the_end_event_still_gets_the_error(self):
+        self.deepseek.cuts = ["mention_end"]
+        connection, response = self.stream()
+        events = response.read()
+        connection.close()
+        self.assertIn(b"message_stop", events)
+        self.assertTrue(events.endswith(b"\n\n"), events)
+        error = events.split(b"event: error\ndata: ")[1]
+        self.assertEqual(json.loads(error)["error"]["type"], "overloaded_error")
+
+    def test_a_deepseek_stream_with_no_event_before_it_stalls_or_ends_is_asked_again(self):
+        self.fast_retries()
+        self.deepseek.release.set()
+        for cut in ("stall", "keepalive_close"):
+            self.deepseek.requests.clear()
+            self.deepseek.cuts = [cut]
+            with self.relay_log() as log:
+                connection, response = self.stream()
+                self.assertEqual(response.status, 200)
+                # Nothing of the failed attempt reached the client, not even
+                # its keep-alives: the headers were held until an event.
+                self.assertEqual(response.read(), WHOLE, cut)
+                connection.close()
+                line = self.logged(log, "-> deepseek")
+            self.assertEqual(len(self.deepseek.requests), 2, cut)
+            self.assertIn("after 2 attempts (", line)
+            self.assertIn("no event in 1s" if cut == "stall" else "before an event", line)
+
+    def test_keep_alives_before_the_first_event_are_waited_through(self):
+        self.fast_retries()
+        self.patch("DEEPSEEK_SILENCE", 3)
+        self.deepseek.release.set()
+        self.deepseek.cuts = ["late_start"]
+        connection, response = self.stream()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.read(), KEEP_ALIVE * 3 + WHOLE)
+        connection.close()
+        self.assertEqual(len(self.deepseek.requests), 1)
+
+    def test_a_deepseek_stream_refused_with_429_or_529_is_asked_for_again(self):
+        self.fast_retries()
+        self.deepseek.release.set()
+        for status in (429, 529):
+            self.deepseek.requests.clear()
+            self.deepseek.failures, self.deepseek.failure_status = 2, status
+            connection, response = self.stream()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), WHOLE, status)
+            connection.close()
+            self.assertEqual(len(self.deepseek.requests), 3, status)
+
+    def test_no_attempt_at_a_deepseek_stream_starts_after_the_budget(self):
+        self.fast_retries()
+        self.patch("STREAM_BACKOFF", (0.6,) * 4)
+        self.patch("STREAM_BUDGET", 1.0)
+        self.deepseek.failures = relay.STREAM_ATTEMPTS
+        connection, response = self.stream()
+        self.assertEqual(response.status, 529)
+        self.assertEqual(json.loads(response.read())["error"]["type"], "overloaded_error")
+        connection.close()
+        # Attempts at about 0, 0.6 and 1.2 s; none after the budget, so
+        # fewer than STREAM_ATTEMPTS.
+        self.assertGreaterEqual(len(self.deepseek.requests), 2)
+        self.assertLess(len(self.deepseek.requests), relay.STREAM_ATTEMPTS)
+
+    def test_a_non_stream_deepseek_answer_may_take_longer_than_the_silence(self):
+        self.fast_retries()
+        self.deepseek.slow = 2
+        status, payload = self.post("/v1/messages", {"model": "deepseek-flash", "max_tokens": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["from"], "deepseek")
+
+    def test_an_upstream_that_hangs_up_before_answering_is_a_502(self):
+        for model in ("claude-x", "deepseek-flash"):
+            status, payload = self.post("/v1/messages", {"model": model, "hang_up": True})
+            self.assertEqual(status, 502, model)
+            self.assertIn("model relay", json.loads(payload)["error"]["message"])
 
     def test_deepseek_gets_only_the_messages_api_headers(self):
         extra = {"Cookie": "session=gateway", "X-Gateway-Tenant": "tenant-secret"}

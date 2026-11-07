@@ -21,21 +21,40 @@ by the `model` of its JSON body:
   none, and a redacted one becomes empty. Signed thinking blocks, tool calls
   and everything else pass as they are.
 
-Responses, server-sent events included, are passed on as they arrive.
-DeepSeek's streams get two mends (seen 2026-11-07, DeepSeek loaded):
-- Before anything reaches the client, a stream DeepSeek refuses with a server
-  error (SERVER_ERRORS: it answered 500 after 15 s to a quarter or more of
-  requests, and Claude Code's own ten tries ran out) or leaves silent for
-  DEEPSEEK_SILENCE seconds is asked for again, up to STREAM_ATTEMPTS times
-  within STREAM_BUDGET seconds; then the client gets a 529
-  `overloaded_error`, which Claude Code retries.
-- A stream DeepSeek cuts partway (keep-alive comments, then the connection
-  closed without `message_stop`, over HTTP/1.1 and HTTP/2 alike) ends with
-  an `overloaded_error` event instead of a dropped connection, which Claude
-  Code shows as "Connection lost mid-response" and ends its turn on.
-The stream itself passes as it arrives. Holding it back until whole (tried
-first) left the client without content for minutes on a long answer, and
-Claude Code gave up on it after 5 to 8 minutes, pings or not.
+Responses, server-sent events included, are passed on as they arrive, with
+one hold for DeepSeek's streams. Loaded, DeepSeek (seen 2026-11-07) answered
+500 after 15 s to a quarter or more of requests, held requests over 120 s
+without headers, sent a 200 and then only keep-alive comments, and closed
+streams partway without `message_stop`, over HTTP/1.1 and HTTP/2 alike:
+
+- Nothing reaches the client before the stream's first event (a line that
+  is neither blank nor a `:` comment such as DeepSeek's keep-alive). Until
+  then a failed attempt is asked for again: a SERVER_ERRORS status,
+  DEEPSEEK_SILENCE seconds without headers or without an event (keep-alives
+  are no progress), a stream that ends or breaks. Up to STREAM_ATTEMPTS
+  attempts, none started after STREAM_BUDGET seconds; then the client gets a
+  529 `overloaded_error`, which Claude Code retries as it does the API's.
+  This is the only real protection: the client never sees a failed attempt.
+- From the first event on, the stream passes as it arrives and a cut can no
+  longer be mended. A stream DeepSeek breaks off, or ends without
+  `message_stop`, ends with an `overloaded_error` event instead of a dropped
+  connection, which names the cause. It does not save the turn: once a
+  content block has finished and output is shown, Claude Code (checked in
+  2.1.319) keeps the partial output and ends the turn whatever the relay
+  sends ("Server error mid-response" after the event, "Connection lost
+  mid-response" after a dropped connection); before that it retries on
+  either.
+
+Holding a stream until whole (tried first) left the client without content
+for minutes on a long answer, and Claude Code gave up on it after 5 to 8
+minutes, pings or not. Waiting for the first event costs a retried request
+its place in DeepSeek's queue; STREAM_BUDGET keeps the wait well inside the
+client's patience.
+
+A request that is not streamed waits up to TIMEOUT for its answer, DeepSeek's
+too: DeepSeek sends a non-streamed body only once it is done, so a silence
+bound would cut every long answer (seen 2026-11-07 17:23), and Claude Code
+falls back to such a request when a stream fails.
 
 A redirect is passed back to the client, never followed: following it would
 send the request's credentials to whatever host it names.
@@ -64,9 +83,7 @@ Environment:
 
 import json
 import os
-import queue
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -102,13 +119,15 @@ CHUNK = 64 * 1024
 # told the upstream is overloaded; the waits between attempts, in seconds.
 STREAM_ATTEMPTS = 5
 STREAM_BACKOFF = (2, 4, 8, 16)
-STREAM_END = b"event: message_stop"
+# The bytes kept of a stream's end, to find its `message_stop` in.
+STREAM_TAIL = CHUNK + 64
 # Statuses of an upstream that could not serve this time: asked again.
 SERVER_ERRORS = {429, 500, 502, 503, 504, 529}
-# Seconds DeepSeek may send nothing at all (no headers, no event, not even
+# Seconds a DeepSeek stream may send nothing at all (no headers, not even
 # its keep-alive comment, which it sends every 10-15 s while a request
-# waits): then the attempt is over. Seen 2026-11-07: a request held over
-# 120 s without headers.
+# waits), and after its headers the seconds it may send no event, its
+# keep-alives not counting: then the attempt is over. Seen 2026-11-07: a
+# request held over 120 s without headers.
 DEEPSEEK_SILENCE = 60
 # Seconds after which no new attempt at a DeepSeek stream starts: the client
 # gets the overloaded error and asks again itself, well before its own
@@ -210,6 +229,35 @@ def error_body(message, kind="api_error"):
     ).encode()
 
 
+class ClientGone(Exception):
+    """A write to the client failed: it went away, or stopped reading for
+    longer than the client timeout. Only this counts as the client's; any
+    other error once a response has started is the upstream's."""
+
+
+def sse_lines(data):
+    """The whole lines in `data`, part of a server-sent event stream, without
+    their line ends."""
+    return [line.rstrip(b"\r") for line in data.split(b"\n")[:-1]]
+
+
+def has_event(data):
+    """Whether `data`, the start of a stream, holds a line of an event: one
+    that is neither blank nor a comment (DeepSeek's `: keep-alive`)."""
+    return any(line and not line.startswith(b":") for line in sse_lines(data))
+
+
+def ends_whole(tail):
+    """Whether `tail`, the end of a stream, holds its `message_stop` event.
+    Matched as a whole line: the same words inside an event's JSON data
+    (a model writing about this relay) are never a line of their own, since
+    a JSON string holds no raw newline."""
+    return any(
+        line.startswith(b"event:") and line[6:].strip() == b"message_stop"
+        for line in sse_lines(tail)
+    )
+
+
 def handler(settings):
     """A request handler class bound to `settings`."""
 
@@ -220,21 +268,36 @@ def handler(settings):
         # thread instead of holding it forever.
         timeout = settings["client_timeout"]
 
+        def _send(self, data=b"", headers=False):
+            """Write to the client the headers sent so far (with `headers`),
+            then `data`. Any failure is the client's: ClientGone."""
+            try:
+                if headers:
+                    self.end_headers()
+                if data:
+                    self.wfile.write(data)
+                self.wfile.flush()
+            except OSError as error:
+                raise ClientGone(repr(error)) from error
+
         def _reply(self, status, body, close=False):
+            self._status, self._sent = status, len(body)
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             if close:
                 self.send_header("Connection", "close")
                 self.close_connection = True
-            self.end_headers()
-            self.wfile.write(body)
+            self._send(body, headers=True)
 
         def _relay(self):
             started = time.monotonic()
             # Set once the response's status line is out: an error after it
             # can only cut the connection.
             self._started = False
+            # What the log reports: the status the client got (502 when the
+            # upstream failed before any) and the body bytes it was sent.
+            self._status, self._sent = 502, 0
             if self.path == "/healthz":
                 self._reply(200, b'{"ok":true}')
                 return
@@ -285,33 +348,34 @@ def handler(settings):
                 method=self.command,
                 headers=headers,
             )
-            sent = 0
-            status = 502
             # An error's first bytes, logged: the upstream's reason, never a
             # request's content.
             self._error_head = b""
             # Why a response stopped partway, if it did: the client sees only
             # a connection lost.
             cut = ""
-            attempts = 1
+            # The attempts at a DeepSeek stream, and why each failed one failed.
+            self._attempts, self._failures = 1, []
             try:
                 if route == "deepseek" and wants_stream(body):
-                    sent, attempts, status, cut = self._pass_deepseek_stream(request)
+                    cut = self._pass_deepseek_stream(request)
                 else:
-                    timeout = DEEPSEEK_SILENCE if route == "deepseek" else TIMEOUT
                     try:
-                        response = opener().open(request, timeout=timeout)
+                        response = opener().open(request, timeout=TIMEOUT)
                     except urllib.error.HTTPError as error:
                         response = error
                     status = response.status if hasattr(response, "status") else response.code
-                    sent = self._pass(response, status)
-            except (BrokenPipeError, ConnectionResetError) as error:
-                # The client went away; the upstream stream is dropped with it.
+                    self._pass(response, status)
+            except ClientGone as error:
+                # The client went away; the upstream response is dropped with it.
                 self.close_connection = True
-                cut = f"client gone: {error!r}"
-            except Exception as error:  # network, TLS, timeout
+                cut = f"client gone: {error}"
+            except Exception as error:  # the upstream: network, TLS, a timeout, a reset
                 if not self._started:
-                    self._reply(502, error_body(f"{route}: {error}"), close=True)
+                    try:
+                        self._reply(502, error_body(f"{route}: {error}"), close=True)
+                    except ClientGone as gone:
+                        cut = f"client gone: {gone}"
                 else:
                     self.close_connection = True
                     cut = f"{route} cut: {error!r}"
@@ -319,23 +383,28 @@ def handler(settings):
             sys.stderr.write(
                 f"model-relay: {self.command} {self.path.split('?')[0]} "
                 f"{model or '-'}{'' if sent_as == model else ' as ' + sent_as} "
-                f"-> {route} {status} {elapsed:.0f}ms "
-                f"{len(body)}B in {sent}B out"
+                f"-> {route} {self._status} {elapsed:.0f}ms "
+                f"{len(body)}B in {self._sent}B out"
                 + (
                     f" {self._error_head.decode('utf-8', 'replace')!r}"
                     if self._error_head
                     else ""
                 )
-                + (f" after {attempts} attempts" if attempts > 1 else "")
+                + (
+                    f" after {self._attempts} attempts ({'; '.join(self._failures)})"
+                    if self._attempts > 1
+                    else ""
+                )
                 + (f" CUT {cut}" if cut else "")
                 + "\n"
             )
 
         def _pass(self, response, status):
-            """Send `response` to the client as it arrives; returns the body
-            bytes sent."""
+            """Send `response` to the client as it arrives. An upstream error
+            while reading it propagates; a failed write is ClientGone."""
             with response:
                 self._started = True
+                self._status = status
                 self.send_response(status)
                 length = response.headers.get("Content-Length")
                 for name, value in response.headers.items():
@@ -345,9 +414,7 @@ def handler(settings):
                     self.send_header("Content-Length", length)
                 else:
                     self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
-                self.wfile.flush()
-                sent = 0
+                self._send(headers=True)
                 while True:
                     # read1 returns what has arrived, without waiting to fill
                     # the buffer: each event goes on as soon as it lands.
@@ -356,94 +423,120 @@ def handler(settings):
                         break
                     if status >= 400 and len(self._error_head) < 300:
                         self._error_head += chunk[: 300 - len(self._error_head)]
-                    sent += len(chunk)
+                    self._sent += len(chunk)
                     if length is None:
-                        self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                        self._chunk(chunk)
                     else:
-                        self.wfile.write(chunk)
-                    self.wfile.flush()
+                        self._send(chunk)
                 if length is None:
-                    self.wfile.write(b"0\r\n\r\n")
-                    self.wfile.flush()
-                elif sent != int(length):
+                    self._send(b"0\r\n\r\n")
+                elif self._sent != int(length):
                     self.close_connection = True
-                return sent
 
         def _chunk(self, data):
-            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-            self.wfile.flush()
+            self._send(f"{len(data):x}\r\n".encode() + data + b"\r\n")
 
         def _open(self, request):
-            """One attempt at a DeepSeek request: its response and status, or
-            (None, None) if DeepSeek was unreachable or silent."""
+            """One attempt at a DeepSeek request: its response, its status and
+            "", or None, None and why (unreachable, or silent for
+            DEEPSEEK_SILENCE seconds)."""
             try:
                 response = opener().open(request, timeout=DEEPSEEK_SILENCE)
             except urllib.error.HTTPError as error:
                 response = error
-            except Exception:
-                return None, None
-            return response, response.status if hasattr(response, "status") else response.code
+            except Exception as error:
+                return None, None, repr(error)[:120]
+            status = response.status if hasattr(response, "status") else response.code
+            return response, status, ""
+
+        def _first_event(self, response):
+            """Read DeepSeek's 200 stream up to its first event, keep-alive
+            comments before it being no progress. Returns the bytes read and
+            "", or None and why: the stream ended or broke first, or brought
+            no event for DEEPSEEK_SILENCE seconds. The response is then
+            closed. (The deadline is checked as bytes arrive, so a stall of
+            keep-alives ends within one keep-alive of it; total silence ends
+            at the socket's own timeout.)"""
+            deadline = time.monotonic() + DEEPSEEK_SILENCE
+            data = b""
+            try:
+                while not has_event(data):
+                    if time.monotonic() >= deadline:
+                        why = f"no event in {DEEPSEEK_SILENCE}s"
+                        break
+                    chunk = response.read1(CHUNK)
+                    if not chunk:
+                        why = "ended before an event"
+                        break
+                    data += chunk
+                else:
+                    return data, ""
+            except Exception as error:  # a reset, a timeout: nothing was sent yet
+                why = f"cut before an event: {error!r}"[:120]
+            response.close()
+            return None, why
 
         def _pass_deepseek_stream(self, request):
-            """DeepSeek's stream for `request`, mended (see the module's
-            notes); returns the body bytes sent, the attempts, the status to
-            log, and why the stream was cut, if it was."""
+            """DeepSeek's stream for `request`, held until its first event and
+            asked for again until then (see the module's notes). Records the
+            attempts and their failures; returns why the stream was cut after
+            it started, if it was."""
             budget = time.monotonic() + STREAM_BUDGET
-            attempts = 0
+            self._attempts = 0
             while True:
-                attempts += 1
-                response, status = self._open(request)
+                self._attempts += 1
+                response, status, why = self._open(request)
                 if response is not None and status == 200:
-                    break
-                if response is not None and status not in SERVER_ERRORS:
+                    start, why = self._first_event(response)
+                    if start is not None:
+                        return self._pass_live(response, start)
+                elif response is not None and status not in SERVER_ERRORS:
                     # A refusal of the request itself: asking again cannot mend it.
-                    return self._pass(response, status), attempts, status, ""
-                if response is not None:
+                    self._pass(response, status)
+                    return ""
+                elif response is not None:
                     response.close()
-                if attempts >= STREAM_ATTEMPTS or time.monotonic() >= budget:
+                    why = str(status)
+                self._failures.append(why)
+                if self._attempts >= STREAM_ATTEMPTS or time.monotonic() >= budget:
                     body = error_body(
-                        f"DeepSeek failed {attempts} times; try again", "overloaded_error"
+                        f"DeepSeek failed {self._attempts} times; try again", "overloaded_error"
                     )
                     self._reply(529, body)
-                    return len(body), attempts, 529, ""
-                time.sleep(STREAM_BACKOFF[min(attempts, len(STREAM_BACKOFF)) - 1])
-            sent, cut = self._pass_live(response)
-            return sent, attempts, 200, cut
+                    return ""
+                time.sleep(STREAM_BACKOFF[min(self._attempts, len(STREAM_BACKOFF)) - 1])
 
-        def _pass_live(self, response):
-            """Send DeepSeek's 200 stream as it arrives; one that ends without
-            `message_stop` gets an `overloaded_error` event. Returns the body
-            bytes sent and why the stream was cut, if it was."""
+        def _pass_live(self, response, start):
+            """Send DeepSeek's 200 stream from `start` (its bytes up to the
+            first event) as it arrives. A stream DeepSeek breaks off (a reset,
+            a timeout) or ends without `message_stop` gets an
+            `overloaded_error` event. Returns why it was cut, if it was; a
+            failed write to the client raises ClientGone."""
             with response:
                 self._started = True
+                self._status = 200
                 self.send_response(200)
                 for name, value in response.headers.items():
                     if name.lower() not in HOP:
                         self.send_header(name, value)
                 self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
-                self.wfile.flush()
-                sent, tail, cut = 0, b"", ""
-                try:
-                    while True:
+                self._send(headers=True)
+                chunk, tail, cut = start, b"", ""
+                while chunk:
+                    self._chunk(chunk)
+                    self._sent += len(chunk)
+                    tail = (tail + chunk)[-STREAM_TAIL:]
+                    try:
                         chunk = response.read1(CHUNK)
-                        if not chunk:
-                            break
-                        self._chunk(chunk)
-                        sent += len(chunk)
-                        tail = (tail + chunk)[-(len(STREAM_END) + CHUNK) :]
-                except (BrokenPipeError, ConnectionResetError):
-                    raise  # the client went away
-                except Exception as error:  # DeepSeek's side: a timeout, a reset
-                    cut = f"deepseek cut: {error!r}"
-                if STREAM_END not in tail:
+                    except Exception as error:  # DeepSeek's side only
+                        chunk, cut = b"", f"deepseek cut: {error!r}"
+                if not ends_whole(tail):
                     cut = cut or "deepseek ended the stream without message_stop"
                     message = "DeepSeek cut the stream partway; try again"
                     event = b"event: error\ndata: " + error_body(message, "overloaded_error")
                     self._chunk(event + b"\n\n")
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-                return sent, cut
+                self._send(b"0\r\n\r\n")
+                return cut
 
         do_POST = _relay
         do_GET = _relay
