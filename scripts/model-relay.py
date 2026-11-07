@@ -11,11 +11,15 @@ by the `model` of its JSON body:
 - Everything else goes unchanged to the upstream gateway, with the client's
   own auth headers. The relay never holds the gateway's token.
 - With `MODEL_RELAY_EVERY_MODEL_AS` set (a `deepseek-*` name), every other
-  model goes to DeepSeek too, as that model: the request's `model` is
-  rewritten and nothing else. For when the gateway cannot serve (its quota
-  spent), so engines keep working without a restart; unset it to send them
-  back. DeepSeek takes a history written by another model, signed thinking
-  blocks and tool calls included (checked 2026-11-07 with deepseek-v4-pro).
+  model goes to DeepSeek too, as that model. For when the gateway cannot
+  serve (its quota spent), so engines keep working without a restart; unset
+  it to send them back. The request's `model` is rewritten, and its history
+  made one DeepSeek takes (checked 2026-11-07 with deepseek-v4-pro):
+  DeepSeek always thinks, and refuses an assistant message without a
+  thinking block ("must be passed back") or with a `redacted_thinking` one.
+  So each assistant message gets an empty thinking block first where it has
+  none, and a redacted one becomes empty. Signed thinking blocks, tool calls
+  and everything else pass as they are.
 
 Responses, server-sent events included, are passed on as they arrive. A
 redirect is passed back to the client, never followed: following it would
@@ -129,10 +133,32 @@ def routed_model(body):
     return model if isinstance(model, str) else ""
 
 
+EMPTY_THINKING = {"type": "thinking", "thinking": "", "signature": ""}
+
+
 def as_model(body, model):
-    """`body` (a JSON object naming a model) naming `model` instead."""
+    """`body` (a JSON object naming a model) naming `model` instead, its
+    assistant messages each with a thinking block DeepSeek takes."""
     request = json.loads(body)
     request["model"] = model
+    for message in request.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}] if content else []
+        if not isinstance(content, list):
+            continue
+        content = [
+            dict(EMPTY_THINKING)
+            if isinstance(block, dict) and block.get("type") == "redacted_thinking"
+            else block
+            for block in content
+        ]
+        thinks = (isinstance(block, dict) and block.get("type") == "thinking" for block in content)
+        if not any(thinks):
+            content.insert(0, dict(EMPTY_THINKING))
+        message["content"] = content
     return json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
 
 
@@ -220,6 +246,9 @@ def handler(settings):
             )
             sent = 0
             status = 502
+            # An error's first bytes, logged: the upstream's reason, never a
+            # request's content.
+            self._error_head = b""
             try:
                 try:
                     response = opener().open(request, timeout=TIMEOUT)
@@ -240,7 +269,13 @@ def handler(settings):
                 f"model-relay: {self.command} {self.path.split('?')[0]} "
                 f"{model or '-'}{'' if sent_as == model else ' as ' + sent_as} "
                 f"-> {route} {status} {elapsed:.0f}ms "
-                f"{len(body)}B in {sent}B out\n"
+                f"{len(body)}B in {sent}B out"
+                + (
+                    f" {self._error_head.decode('utf-8', 'replace')!r}"
+                    if self._error_head
+                    else ""
+                )
+                + "\n"
             )
 
         def _pass(self, response, status):
@@ -266,6 +301,8 @@ def handler(settings):
                     chunk = response.read1(CHUNK)
                     if not chunk:
                         break
+                    if status >= 400 and len(self._error_head) < 300:
+                        self._error_head += chunk[: 300 - len(self._error_head)]
                     sent += len(chunk)
                     if length is None:
                         self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")

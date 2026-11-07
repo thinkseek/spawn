@@ -227,7 +227,7 @@ class RelayTest(unittest.TestCase):
             [body["model"] for body in sent],
             ["deepseek-v4-pro", "deepseek-v4-pro", "deepseek-flash"],
         )
-        # Only the model is rewritten.
+        # Only the model is rewritten here: no assistant message to mend.
         self.assertEqual(sent[0], {**request, "model": "deepseek-v4-pro"})
         for seen in self.deepseek.requests:
             self.assertEqual(seen["headers"]["x-api-key"], FAKE_KEY)
@@ -238,6 +238,43 @@ class RelayTest(unittest.TestCase):
         connection.getresponse().read()
         connection.close()
         self.assertEqual([seen["path"] for seen in self.gateway.requests], ["/v1/models"])
+
+    def test_assistant_messages_get_the_thinking_block_deepseek_needs(self):
+        empty = {"type": "thinking", "thinking": "", "signature": ""}
+        signed = {"type": "thinking", "thinking": "Run ls.", "signature": "sig"}
+        call = {
+            "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}
+        }
+        result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"}
+        request = {
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role": "user", "content": "List the files."},
+                {"role": "assistant", "content": [{"type": "text", "text": "Listing."}, call]},
+                {"role": "user", "content": [result]},
+                {"role": "assistant", "content": "Done."},
+                {"role": "user", "content": "Again."},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "redacted_thinking", "data": "x"}, call],
+                },
+                {"role": "user", "content": [result]},
+                {"role": "assistant", "content": [signed, call]},
+                {"role": "user", "content": [result]},
+            ],
+        }
+        sent = json.loads(relay.as_model(json.dumps(request).encode(), "deepseek-v4-pro"))
+        self.assertEqual(sent["model"], "deepseek-v4-pro")
+        messages = sent["messages"]
+        self.assertEqual(
+            messages[1]["content"], [empty, {"type": "text", "text": "Listing."}, call]
+        )
+        self.assertEqual(messages[3]["content"], [empty, {"type": "text", "text": "Done."}])
+        self.assertEqual(messages[5]["content"], [empty, call])
+        self.assertEqual(messages[7]["content"], [signed, call])
+        # The user's messages pass as they are.
+        for index in (0, 2, 4, 6, 8):
+            self.assertEqual(messages[index], request["messages"][index])
 
     def test_requests_without_a_model_go_to_the_gateway(self):
         connection = self.connect()
