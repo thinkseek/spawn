@@ -3470,6 +3470,7 @@ mod tests {
     };
     use crate::memory::{MemoryStore, MemoryWatch};
     use crate::port::{EventLog, Launch, TerminalError, TerminalHost};
+    use crate::screen::ScreenState;
     use crate::time::{ManualClock, Timestamp};
     use std::time::Duration;
 
@@ -3773,13 +3774,12 @@ mod tests {
         world.advance(500);
         assert_eq!(world.pass(), 1, "quiet for the bound: one reading");
         assert_eq!(
-            world.screens(),
-            Vec::<&str>::new(),
+            Vec::<ScreenState>::new(),
             "one reading is not a fact"
         );
         world.advance(500);
         assert_eq!(world.pass(), 1, "the second reading, which agrees");
-        assert_eq!(world.screens(), vec!["busy"]);
+        assert_eq!(world.screens(), vec![ScreenState::Busy]);
         world.advance(500);
         assert_eq!(world.pass(), 0, "and then nothing more");
     }
@@ -3796,7 +3796,7 @@ mod tests {
         world.advance(1_000);
         assert_eq!(world.pass(), 1, "the backstop reads it");
         assert_eq!(world.pass(), 1, "the reading waits for its twin");
-        assert_eq!(world.screens(), vec!["permission"]);
+        assert_eq!(world.screens(), vec![ScreenState::Permission]);
         assert_eq!(world.pass(), 0, "and then nothing until the next");
     }
 
@@ -3809,7 +3809,7 @@ mod tests {
         world.advance(30_000);
         world.pass();
         world.pass();
-        assert_eq!(world.screens(), vec!["busy"]);
+        assert_eq!(world.screens(), vec![ScreenState::Busy]);
         world.advance(30_000);
         world.pass();
         world.pass();
