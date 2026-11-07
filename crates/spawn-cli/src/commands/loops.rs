@@ -425,7 +425,6 @@ impl Fleet {
         failed: &mut bool,
     ) {
         if self.schedule.observer.runs(watermark, now) {
-            ran.push("observer");
             match self.observer.tick() {
                 Ok(_) => self
                     .schedule
@@ -443,7 +442,6 @@ impl Fleet {
                 .unwrap_or_else(|error| vec![format!("disk: {error}")]),
         );
         if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
-            ran.push("dispatch");
             match dispatch::step(
                 open,
                 self.supervised,
@@ -462,7 +460,6 @@ impl Fleet {
         // Under the disk floor no resident is revived (a new execution); the
         // supervisor still is, to act on the warning.
         if !self.disk.below_floor() && self.schedule.residents.runs(watermark, now) {
-            ran.push("residents");
             match supervise::keep_residents(open) {
                 Ok((more, due)) => {
                     lines.extend(more);
@@ -472,7 +469,6 @@ impl Fleet {
             }
         }
         if self.supervised && self.schedule.alive.runs(watermark, now) {
-            ran.push("alive");
             match supervise::keep_alive(open) {
                 Ok((line, due)) => {
                     lines.extend(line);
