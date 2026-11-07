@@ -894,7 +894,7 @@ pub(crate) fn base_disagrees_fields(
     let setup = setup_s.map_or_else(String::new, |seconds| {
         format!(", after a setup of {seconds} s")
     });
-    json!({
+    let mut fields = json!({
         "reason": format!(
             "host fault: the base disagrees with itself: {scenario} exited {}, then {} on the base\
              {setup}; not a verdict, judged again later",
@@ -909,31 +909,19 @@ pub(crate) fn base_disagrees_fields(
         "escalate": false,
         "base_disagrees": disagreements,
         "alert": disagreements == BASE_DISAGREES_ALERT_AT,
-    })
-    .tap_setup(setup_s)
+    });
+    // The setup's seconds only when the gate printed its timing line: the
+    // field is left out, not null.
+    if let Some(seconds) = setup_s {
+        fields["setup_s"] = json!(seconds);
+    }
+    fields
 }
 
 /// The evidence a `host_fault` record names when the base disagreed with
 /// itself (its own scenario failing and then passing, before any candidate
 /// code ran): objective 020's verdict with this objective's evidence.
 pub(crate) const BASE_DISAGREES: &str = "base_disagrees";
-
-/// Keep `setup_s` out of a record whose gate printed no timing line: the
-/// field is left out, not null.
-trait TapSetup {
-    fn tap_setup(self, setup_s: Option<u64>) -> Self;
-}
-
-impl TapSetup for Value {
-    fn tap_setup(mut self, setup_s: Option<u64>) -> Self {
-        if setup_s.is_none()
-            && let Some(fields) = self.as_object_mut()
-        {
-            fields.remove("setup_s");
-        }
-        self
-    }
-}
 
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
 /// reason with the free space and TMPDIR, the facts themselves, and
