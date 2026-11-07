@@ -491,6 +491,8 @@ pub(crate) struct Outcome {
     #[serde(default)]
     pub(crate) continues: Option<i64>,
     #[serde(default)]
+    pub(crate) chain: Option<bool>,
+    #[serde(default)]
     pub(crate) branch: Option<String>,
     #[serde(default)]
     pub(crate) commit: Option<String>,
@@ -548,6 +550,9 @@ pub(crate) struct Overrun {
     pub(crate) task: i64,
     /// The task it continues, for a second overrun of a chain.
     pub(crate) continues: Option<i64>,
+    /// Whether it is a second overrun of a chain (no configure between): one
+    /// that holds its objective and goes to the supervisor.
+    pub(crate) chain: bool,
     pub(crate) reason: String,
     pub(crate) tool_calls: i64,
     /// `spawn/<agent>`: where the work was kept.
@@ -571,6 +576,7 @@ pub(crate) fn overruns(outcomes: &[Outcome]) -> BTreeMap<u32, Overrun> {
             Overrun {
                 task: outcome.task,
                 continues: outcome.continues,
+                chain: outcome.chain == Some(true),
                 reason: outcome.reason.clone().unwrap_or_default(),
                 tool_calls: outcome.tool_calls.unwrap_or_default(),
                 branch: outcome.branch.clone().unwrap_or_default(),
@@ -587,7 +593,7 @@ pub(crate) fn overruns(outcomes: &[Outcome]) -> BTreeMap<u32, Overrun> {
 /// Whether an overrun holds its objective: it continues an overrun task of
 /// the same objective, and the mission was not configured since its record.
 pub(crate) fn holds(overrun: &Overrun, configured_ms: Option<i64>) -> bool {
-    overrun.continues.is_some() && configured_ms.is_none_or(|at| at <= overrun.at_ms)
+    overrun.chain && configured_ms.is_none_or(|at| at <= overrun.at_ms)
 }
 
 /// An objective's attempts, read from its tasks' outcomes.
@@ -1126,6 +1132,7 @@ mod tests {
             task,
             at_ms: Some(1_000),
             continues,
+            chain: continues.map(|_| true),
             branch: Some(format!("spawn/agent_worker_objective_{task}")),
             commit: commit.map(str::to_string),
             diff: diff.map(str::to_string),
@@ -1372,6 +1379,7 @@ mod tests {
             task: 0,
             at_ms: None,
             continues: None,
+            chain: None,
             branch: None,
             commit: None,
             diff: None,
