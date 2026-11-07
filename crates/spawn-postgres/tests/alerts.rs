@@ -125,8 +125,12 @@ fn only_the_owner_records_alerts() {
     let refused = supervisor
         .alert_record(&fired("memory_low:3", false))
         .expect_err("a restricted login records no alert");
+    // Either the function's grant (revoked from everyone but the owner) or
+    // its own caller check refuses it.
+    let message = refused.to_string();
     assert!(
-        refused.to_string().contains("may not record alerts"),
+        message.contains("permission denied for function spawn_alert_record")
+            || message.contains("may not record alerts"),
         "{refused}"
     );
     let alerts = supervisor.alerts(0).expect("read the alerts");
