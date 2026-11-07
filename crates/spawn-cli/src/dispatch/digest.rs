@@ -71,6 +71,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::BackgroundJob => "background job past its bound",
         Why::HoldExpired => "a source hold expired",
         Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
+        Why::ObjectiveOrder => "a backlog names an order no task can meet",
     }
 }
 
@@ -96,6 +97,7 @@ fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
             item.session_id != HOST_SESSION
                 && item.why != Why::HoldExpired
                 && item.why != Why::ObjectiveYielded
+                && item.why != Why::ObjectiveOrder
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
         }) {
@@ -220,6 +222,40 @@ pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
                      if it keeps failing."
                 ),
                 since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `missions` (`PostgresStore::objective_backlogs`):
+/// one per open objective mission whose backlog names an order that cannot
+/// be met ([`crate::objectives::order_problems`]), of session `missions`,
+/// id `objective-order-<mission>-<digest of the problems>`, so it is told
+/// once for each content and holds until the backlog is fixed. A backlog
+/// that cannot be read is the integrator's to report: no item.
+pub(crate) fn objective_order(missions: &[Value]) -> Vec<Escalation> {
+    missions
+        .iter()
+        .filter_map(|row| {
+            let mission = row["mission"].as_i64()?;
+            let backlog =
+                crate::objectives::load_backlog(std::path::Path::new(row["backlog"].as_str()?))
+                    .ok()?;
+            let problems = crate::objectives::order_problems(&backlog);
+            if problems.is_empty() {
+                return None;
+            }
+            let digest = crate::sources::fnv(&problems.join("\n"));
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("objective-order-{mission}-{digest:016x}"),
+                why: Why::ObjectiveOrder,
+                line: format!(
+                    "mission {mission}'s backlog names an order no task can meet: {}. Fix \
+                     `after` in the backlog.",
+                    problems.join("; ")
+                ),
+                since_ms: None,
             })
         })
         .collect()

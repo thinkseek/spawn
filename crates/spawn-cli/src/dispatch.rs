@@ -408,6 +408,9 @@ pub(crate) enum Why {
     /// An objective ran out of attempts and its task yielded the slot to
     /// the next objective ([`digest::objective_yields`]).
     ObjectiveYielded,
+    /// An objective mission's backlog names an order that cannot be met
+    /// ([`digest::objective_order`]): a condition until the backlog changes.
+    ObjectiveOrder,
 }
 
 impl Why {
@@ -669,6 +672,13 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
+    host.extend(digest::objective_order(
+        store
+            .objective_backlogs()
+            .map_err(|error| format!("objective backlogs: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
     host.extend(digest::hold_expiries(
         store
             .hold_expiries()
@@ -684,6 +694,14 @@ pub(crate) fn read_plan(
     }
     host.extend(jobs::items(&rows, bounds.job));
     let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    // An order no task can meet is said in the log until the supervisor
+    // was told of it.
+    lines.extend(
+        plan.pending
+            .iter()
+            .filter(|item| item.why == Why::ObjectiveOrder)
+            .map(|item| format!("dispatch: {}", item.line)),
+    );
     if let Some(deployed) = deployed.filter(|_| supervised) {
         charter::give(&mut plan, &rows, deployed);
     }
@@ -848,11 +866,10 @@ fn set_aside_before(
 /// under the delivery stall's 600); anything else is the default.
 pub(crate) fn fork_give_up_ms(text: Option<&str>) -> i64 {
     const DEFAULT: i64 = 300;
-    1_000
-        * text
-            .and_then(|text| text.trim().parse::<i64>().ok())
-            .filter(|seconds| *seconds > 0)
-            .unwrap_or(DEFAULT)
+    text.and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT)
+        .saturating_mul(1_000)
 }
 
 /// Fork the branch of the ephemeral objective task `order` starts from
@@ -887,6 +904,7 @@ pub(crate) fn fork_before_within(
     give_up_ms: i64,
 ) -> Result<Option<String>, String> {
     use crate::main_merge::Fork;
+    use std::fmt::Write as _;
     let CommandAction::Start { prompt, .. } = &mut order.action else {
         return Ok(None);
     };
@@ -917,11 +935,20 @@ pub(crate) fn fork_before_within(
                 prior.task, prior.commit
             )))
         }
-        Ok(Fork::NoWork) => Ok(Some(format!(
-            "deliver: task #{task}: task #{}'s checkpoint {} holds nothing main lacks; it \
-             starts from main",
-            prior.task, prior.commit
-        ))),
+        Ok(Fork::NoWork) => {
+            prompt.push_str("\n\n");
+            let _ = write!(
+                prompt,
+                "Task #{}'s last checkpoint (commit {}) holds nothing the source's main lacks: \
+                 its work is already in main, and your workspace starts from main.",
+                prior.task, prior.commit
+            );
+            Ok(Some(format!(
+                "deliver: task #{task}: task #{}'s checkpoint {} holds nothing main lacks; it \
+                 starts from main",
+                prior.task, prior.commit
+            )))
+        }
         Ok(Fork::NoSource) => Ok(None),
         Err(error) => {
             let age = store
@@ -1545,6 +1572,61 @@ mod tests {
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
         );
+    }
+
+    /// A backlog whose order no task can meet reaches the supervisor as
+    /// one `missions` item per mission and content of the problems: the
+    /// same problems keep their tag (told once), changed ones get a new
+    /// one, a fixed backlog none; the pass's log says it until it is told.
+    #[test]
+    fn a_backlog_order_no_task_can_meet_is_told_once_per_content() {
+        let dir = std::env::temp_dir().join(format!("spawn-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("backlog");
+        let write = |id: u32, after: &[u32]| {
+            std::fs::write(
+                dir.join(format!("{id:03}.json")),
+                serde_json::json!({"id": id, "prompt": "p", "after": after}).to_string(),
+            )
+            .expect("write");
+        };
+        write(28, &[30]);
+        write(30, &[28]);
+        let rows = [serde_json::json!({"mission": 4, "backlog": dir.to_string_lossy()})];
+        let items = super::digest::objective_order(&rows);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].why, Why::ObjectiveOrder);
+        assert!(
+            items[0].tag().starts_with("missions objective-order-4-")
+                && items[0]
+                    .line
+                    .starts_with("mission 4's backlog names an order no task can meet")
+                && items[0].line.contains("28 after 30 after 28"),
+            "{:?}",
+            items[0]
+        );
+        assert_eq!(
+            super::digest::objective_order(&rows)[0].tag(),
+            items[0].tag()
+        );
+        write(30, &[28, 99]);
+        let changed = super::digest::objective_order(&rows);
+        assert_ne!(changed[0].tag(), items[0].tag(), "new content, told again");
+        write(30, &[]);
+        assert!(super::digest::objective_order(&rows).is_empty(), "fixed");
+        assert!(!Why::ObjectiveOrder.is_news(), "a condition while it holds");
+        write(30, &[28]);
+        let rows_plan = [idle_supervisor()];
+        let plan = decide_with(&rows_plan, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(tags, &[items[0].tag()]);
+        assert!(
+            text.contains("- missions — a backlog names an order no task can meet: mission 4"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An objective that ran out of attempts and yielded its slot reaches
