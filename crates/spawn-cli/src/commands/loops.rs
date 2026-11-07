@@ -267,6 +267,7 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         disk: monitor,
         bounds,
         interval: loop_interval(),
+        steps_at: None,
         failures: 0,
     };
     loop {
@@ -301,6 +302,11 @@ struct Fleet {
     disk: disk::Monitor,
     bounds: dispatch::Bounds,
     interval: Duration,
+    /// When the steps last ran over the store. They run at most once a pass
+    /// interval, which is the resolution the loop always had: a burst of
+    /// notifications inside one interval is one pass's work, not one run per
+    /// event.
+    steps_at: Option<std::time::Instant>,
     /// Consecutive failed passes: the wait and the exit both grow with them.
     failures: u32,
 }
@@ -334,7 +340,11 @@ impl Fleet {
             },
             None => None,
         };
-        if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
+        let due = self
+            .steps_at
+            .is_none_or(|at| at.elapsed() >= self.interval);
+        if due && let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
+            self.steps_at = Some(std::time::Instant::now());
             let ran = self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
             if std::env::var_os("SPAWN_LOOP_TRACE").is_some() {
                 eprintln!("trace: wm={watermark} ran={ran:?} lines={}", lines.len());
