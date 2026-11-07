@@ -308,7 +308,7 @@ impl Active {
 /// The Bridge's own view of a running engine, rebuilt after a restart: read
 /// positions start at zero (event keys make a second read a no-op), and the
 /// last recorded screen is folded from the log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Follow {
     /// The watch on its files.
     watch: Watching,
@@ -380,29 +380,6 @@ impl Default for Watching {
             dirty: true,
             poll: false,
             said: false,
-        }
-    }
-}
-
-impl Default for Follow {
-    fn default() -> Self {
-        Self {
-            watch: Watching::default(),
-            unread_since: None,
-            again: false,
-            last_capture: None,
-            due_at: None,
-            offset: 0,
-            screen: None,
-            seen: None,
-            first_seen: None,
-            warned: false,
-            exit_warned: false,
-            end_failures: 0,
-            end_tried_at: None,
-            stale: None,
-            version: None,
-            evidence: None,
         }
     }
 }
