@@ -141,7 +141,7 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 监视 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl`（`SPAWN_CLAUDE_PROJECTS`）和 runner 的退出文件，文件变了才读新增整行，以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。
 
-**Bridge 读什么，什么时候读。** 监视走 `FileWatch` 端口：Linux 上是 inotify（`spawn_host::InotifyWatch`），一个描述符、每个文件一条目录监视；路径还不存在时监视它上面最深的已存在目录，目录随引擎出现时监视跟着往下走（transcript 在 `<projects>/<工作目录转义>/`，退出文件在 `<工作区>/.spawn/`，两者都由引擎稍后创建）。设不了监视的执行（系统调用出错、文件系统不支持、`max_user_watches` 到顶）退回每个 pass 都读，并在循环输出里告警一次。读的偏移规则不变：只读整行，读到一半的行留到下一次变化或下一个 pass，绝不丢；一次 checkpooint 没提交的行同样留到下一个 pass。
+**Bridge 读什么，什么时候读。** 监视走 `FileWatch` 端口：Linux 上是 inotify（`spawn_host::InotifyWatch`），一个描述符、每个文件一条目录监视；路径还不存在时监视它上面最深的已存在目录，目录随引擎出现时监视跟着往下走（transcript 在 `<projects>/<工作目录转义>/`，退出文件在 `<工作区>/.spawn/`，两者都由引擎稍后创建）。设不了监视的执行（系统调用出错、文件系统不支持、`max_user_watches` 到顶）退回每个 pass 都读，并在循环输出里告警一次。读的偏移规则不变：只读整行，读到一半的行留到下一次变化或下一个 pass，绝不丢；一次 checkpoint 没提交的行同样留到下一个 pass。
 
 一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不问 runner（一次 tmux `list-panes`）、不读文件。屏幕只在能改变决定时抓：
 
