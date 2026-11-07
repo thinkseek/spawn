@@ -1012,7 +1012,7 @@ controller. Missions, tasks, residents and landings are events in
   `source.released`, `source.hold_expired`, `task.assigned`,
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.held`, `task.landed`,
-  `task.aborted`, `resident.proposed`, `resident.approved`,
+  `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
   `resident.retired`, `legacy.imported`, `host.disk`,
   `source.push_requested`, `source.push_refused` (§10.3, "The owner's
   landings").
@@ -1034,7 +1034,8 @@ controller. Missions, tasks, residents and landings are events in
   ([design.md](design.md) §15).
 - **Who writes it:** only the checked mission functions, through
   `spawn_control_record`. The integrator's records (`task.gated`,
-  `task.landed`, `task.aborted`, `mission.halted`, and the outcomes of the
+  `task.landed`, `task.aborted`, `task.over_budget`, `mission.halted`, and
+  the outcomes of the
   owner's landings: `source.moved` naming a `request`,
   `source.push_refused`), `source.moved` (`spawn mission moved`), the
   owner's `source.push_requested` (`spawn mission push`; folded into no
@@ -1509,7 +1510,7 @@ record of what was judged (§14 of design.md).
   (`spawn_control_refold()`) gives the same tables and adds no record. A
   database from before this rule gets the missing record once, on
   migration. This covers each cancelled task whose last `task.%` record is
-  neither `task.cancelled` nor `task.aborted`. The
+  none of `task.cancelled`, `task.aborted` and `task.over_budget`. The
   integrator's selection uses the same rule, and no transition moves a task
   into a state the rule drops: a send-back is refused, a gate rejection
   cancels the task, and deliveries and reports are not recorded. A worker
