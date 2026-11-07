@@ -10,6 +10,32 @@
 //! gate, and every done one while the closure rule
 //! (`spawn_task_may_continue`) lets its work go on, one step:
 //!
+//! 0. next, still before any mission's step, the owner's landings
+//!    ([`owner`]): every pending `source.push_requested` (`spawn mission
+//!    push`, a request no `source.moved` or `source.push_refused` names yet),
+//!    oldest first, is applied for its source, between the integrator's own
+//!    steps. The owner's hold (3) stops task landings, not the owner's own:
+//!    a request on a held source is applied too. Under
+//!    the landing hold (the store's `spawn_landing_hold` lock, on a
+//!    connection of its own so a judging's [`land`] is never granted it
+//!    back, so no task landing's push and its record are ever split by it),
+//!    it reads the source's main M from the source (never
+//!    the mirror, which a judging may be using), moves main from M to the
+//!    commit when M is in its history, or to a merge commit (first parent M,
+//!    second the commit, by main's merge rules and the landing identity, its
+//!    message naming the owner's landing, the request and the commit's
+//!    subject), with a compare-and-swap (`update-ref <branch> <new> <M>` in
+//!    the source), and records, in the same hold, `source.moved` {source,
+//!    from M, to, request, by: human}: its fold moves the baselines of the
+//!    missions on the source that were at M (and gives the new main to those
+//!    with none yet), so no baseline check of the pass sees a main the owner
+//!    moved. A conflict, a commit the source does not have or a
+//!    compare-and-swap that fails twice records `source.push_refused`
+//!    {request, reason}: nothing moves, nothing halts. It waits for no gate,
+//!    on that source or any other: a judging in flight is never stopped,
+//!    and one of the same source finds main moved when it lands (`stale`,
+//!    judged again on the new main). The integrator is never stopped for an
+//!    owner's landing;
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row
 //!    (neither a `no_room` nor a `host_fault` counts toward either, and no
@@ -17,8 +43,12 @@
 //!    scenario count below its floor, a remote source (agents' branches
 //!    never reach it), or the source's main not where the last landing left
 //!    it. That last one is read only from a fetch that succeeded this pass,
-//!    and only while no other mission's landing on the source is unresolved
-//!    (its push may have moved main before its record);
+//!    only while no other mission's landing on the source is unresolved
+//!    (its push may have moved main before its record), and only while no
+//!    owner's landing on the source is pending after step 0 (one whose
+//!    landing failed may have moved main before its record; it is applied
+//!    or refused by a later pass). A main moved with no record at all (a
+//!    push behind Spawn's back) still halts;
 //! 2. a delivered task over its mission's budget is aborted and its worker
 //!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
 //!    session's events, readings (`screen.observed`,
@@ -243,7 +273,13 @@
 //!   run beside the others, still one per mission and per source.
 //!
 //! Every judging records its own outcome (`task.gated`, `task.landed`), as
-//! before; the pass reads those records, never the thread's result. A
+//! before; the pass reads those records, never the thread's result. An
+//! owner's landing (step 0) never touches a judging: one on another source
+//! goes on and lands by the usual rules; one on the same source finishes,
+//! its verdict is recorded as it comes, and when its landing's
+//! compare-and-swap finds main moved, [`land`] records `stale` and a later
+//! pass judges the task again against the new main (never discarded, never
+//! counted). A
 //! finished thread is reaped only at the start of a pass, before the
 //! missions are read, so no pass acts on a snapshot older than a judging's
 //! records. A judging that panics before any record of its own is recorded
@@ -280,6 +316,7 @@ use crate::{Flags, env_or, open_store};
 use crate::{main_merge, objectives, sources};
 
 mod host;
+pub(crate) mod owner;
 
 /// Rejections, or aborts, in a row that halt a mission.
 const HALT_AFTER: u32 = 3;
@@ -1306,6 +1343,23 @@ impl Integrator {
         // A hold past its bound ends by its record, before any mission's
         // step: nothing lands on its source until then.
         expire_holds(store)?;
+        // Step 0: the owner's landings, applied before any mission's step
+        // reads its source's main, so no baseline check sees a main the
+        // owner moved without its record. A source whose request is still
+        // pending has its halts by baseline held this pass.
+        let pending = owner::apply_pending(store)?;
+        self.steps(store, &pending)
+    }
+
+    /// Every mission's step, after the holds past their bound and step 0:
+    /// `pending` names the sources with an owner's landing still pending
+    /// (each with its oldest request), whose missions do not halt by
+    /// baseline this pass.
+    fn steps(
+        &self,
+        store: &Arc<PostgresStore>,
+        pending: &std::collections::HashMap<String, i64>,
+    ) -> Result<(), String> {
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
@@ -1322,7 +1376,7 @@ impl Integrator {
             if source.as_ref().is_some_and(|source| moved.contains(source)) {
                 continue;
             }
-            match self.mission(store, &missions, mission, &mut ready) {
+            match self.mission(store, &missions, mission, pending, &mut ready) {
                 Ok(true) => {
                     if let Some(source) = source {
                         moved.insert(source);
@@ -1341,12 +1395,14 @@ impl Integrator {
     /// moved). A ready task it may judge goes to `ready`; the gates are
     /// given out after every mission had its step ([`Self::start_ready`]).
     /// `missions` is every mission of the pass, for the landings on a
-    /// shared source.
+    /// shared source; `pending`, the sources with an owner's landing
+    /// pending.
     fn mission(
         &self,
         store: &Arc<PostgresStore>,
         missions: &[Mission],
         mission: &Mission,
+        pending: &std::collections::HashMap<String, i64>,
         ready: &mut Vec<Ready>,
     ) -> Result<bool, String> {
         if mission.halted.is_some() {
@@ -1392,34 +1448,10 @@ impl Integrator {
                     mission.id
                 );
             } else {
-                // A fetch that failed leaves the mirror's last copy of main,
-                // which is no reading of the source's main: no halt, no
-                // verdict by it.
-                match sources::refresh(&mirror, source).and_then(|()| {
-                    git(&[
-                        "--git-dir",
-                        &mirror.to_string_lossy(),
-                        "rev-parse",
-                        "refs/heads/main",
-                    ])
-                }) {
-                    Err(error) => eprintln!("integrate: mission {}: {error}", mission.id),
-                    Ok(main) => {
-                        if let Some(baseline) = &mission.baseline
-                            && *baseline != main
-                        {
-                            return halt(
-                                store,
-                                mission,
-                                &format!(
-                                    "the source's main is {main}, but the last landing left \
-                                     {baseline}"
-                                ),
-                            )
-                            .map(|()| false);
-                        }
-                        judgeable = Some((mirror, main));
-                    }
+                match read_main(store, mission, source, &mirror, pending)? {
+                    Reading::Judge(main) => judgeable = Some((mirror, main)),
+                    Reading::Nothing => {}
+                    Reading::Halted => return Ok(false),
                 }
             }
         }
@@ -2616,7 +2648,8 @@ fn land(
         .map(|()| Landing::Stale);
     };
     // Held until the landing is recorded: dropping the mission waits for it,
-    // and so does an owner's hold.
+    // and so does an owner's hold (an owner's landing takes the lock on a
+    // connection of its own).
     let Some(_lock) = store
         .landing_hold(task.id)
         .map_err(|error| error.to_string())?
@@ -2793,6 +2826,69 @@ fn expire_holds(store: &PostgresStore) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What a mission's step reads of its source's main.
+enum Reading {
+    /// Main, from a fetch that succeeded, where the last landing left it (or
+    /// the mission has no baseline yet): the mission may be judged against it.
+    Judge(String),
+    /// No reading this pass: the fetch failed, or main is not at the
+    /// baseline while an owner's landing on the source is pending.
+    Nothing,
+    /// Main moved with no record that explains it: the mission was halted.
+    Halted,
+}
+
+/// Fetch `source`'s main into `mirror` and check it against `mission`'s
+/// baseline. A fetch that failed leaves the mirror's last copy of main,
+/// which is no reading of the source's main: no halt, no verdict by it. A
+/// main not at the baseline halts the mission, unless an owner's landing on
+/// the source is pending (`pending`): it may have moved main before its record
+/// (an integrator stopped in between), so main says nothing until it is
+/// applied or refused, and nothing is judged against it.
+fn read_main(
+    store: &PostgresStore,
+    mission: &Mission,
+    source: &str,
+    mirror: &Path,
+    pending: &std::collections::HashMap<String, i64>,
+) -> Result<Reading, String> {
+    let main = match sources::refresh(mirror, source).and_then(|()| {
+        git(&[
+            "--git-dir",
+            &mirror.to_string_lossy(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+    }) {
+        Ok(main) => main,
+        Err(error) => {
+            eprintln!("integrate: mission {}: {error}", mission.id);
+            return Ok(Reading::Nothing);
+        }
+    };
+    let Some(baseline) = mission
+        .baseline
+        .as_deref()
+        .filter(|baseline| *baseline != main)
+    else {
+        return Ok(Reading::Judge(main));
+    };
+    if let Some(request) = pending.get(source) {
+        println!(
+            "integrate: mission {}: the source's main is {main}, its baseline {baseline}; no \
+             halt while the owner's landing (request {request}) is pending",
+            mission.id
+        );
+        return Ok(Reading::Nothing);
+    }
+    halt(
+        store,
+        mission,
+        &format!("the source's main is {main}, but the last landing left {baseline}"),
+    )?;
+    Ok(Reading::Halted)
 }
 
 /// Why a mission on `source` can never land, if it cannot: agents' branches
@@ -2988,6 +3084,50 @@ mod tests {
         let missing = base.join("missing/scenarios");
         assert_eq!(pinned(&missing), missing);
         std::fs::remove_dir_all(&base).expect("clean");
+    }
+
+    /// A request names its commit by its full hash only (SHA-1 or SHA-256),
+    /// never by an option or a revision expression.
+    #[test]
+    fn an_owner_request_names_its_commit_by_full_hash() {
+        use super::owner::{full_hash, owner_ref};
+        assert!(full_hash(&"a1".repeat(20)));
+        assert!(full_hash(&"0f".repeat(32)));
+        for bad in [
+            "HEAD",
+            "--all",
+            "main",
+            &"A1".repeat(20),
+            &"a1".repeat(19),
+            "",
+            &"g".repeat(40),
+        ] {
+            assert!(!full_hash(bad), "{bad}");
+        }
+        assert_eq!(owner_ref("abc"), "refs/spawn-owner/abc");
+    }
+
+    /// The merge that lands the owner's commit says it is the owner's
+    /// landing, names the request and the commit's subject (bounded), and
+    /// carries the request and the commit as trailers.
+    #[test]
+    fn an_owner_landing_merge_names_its_request_and_the_commits_subject() {
+        let message = super::owner::owner_message(42, "c0ffee", "ba5e", "owner: the contract\n");
+        assert!(
+            message.starts_with("Owner landing (request 42): owner: the contract\n\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("c0ffee") && message.contains("ba5e"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("\n\nSpawn-Owner-Request: 42\nSpawn-Owner-Commit: c0ffee\n"),
+            "{message}"
+        );
+        let long = super::owner::owner_message(1, "c", "m", &"x".repeat(500));
+        let first = long.lines().next().expect("a first line");
+        assert!(first.chars().count() < 140, "{first}");
     }
 
     /// Commit everything in the checkout `directory`.
@@ -8381,6 +8521,411 @@ mod database_tests {
         assert_eq!(source_main(&source), work);
         integrator.pass_on(&db.store).expect("another pass");
         assert_eq!(source_records(&db, "source.hold_expired").len(), 1, "once");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Objective 21: the owner's landings (`spawn mission push`), step 0.
+
+    /// A gated mission on `source` whose baseline is `baseline` (its first
+    /// verdict's base), with nothing left to judge.
+    fn mission_at_baseline(db: &Db, source: &str, scenarios: &Path, baseline: &str) -> i64 {
+        let mission = db.gated_mission(source, scenarios);
+        let task = db.reported_task(mission, "w");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "aborted", "base": baseline, "reason": "a gate that died"}));
+        db.store.task_cancel(task).expect("nothing left to judge");
+        assert_eq!(db.mission(mission)["baseline"], baseline);
+        mission
+    }
+
+    /// The owner's commit on `source`'s main as it is now (`file` holding
+    /// `text`, subject `subject`), put in the source at
+    /// `refs/spawn-owner/<commit>` as `spawn mission push` does: no branch
+    /// moves. The commit.
+    fn owner_commit(base: &Path, source: &str, file: &str, text: &str, subject: &str) -> String {
+        let clone = base.join(format!("owner-{file}-{}", text.len()));
+        let clone_path = clone.to_string_lossy().to_string();
+        let _ = std::fs::remove_dir_all(&clone);
+        git(&["clone", "-q", source, &clone_path]).expect("the owner's clone");
+        std::fs::write(clone.join(file), text).expect("write");
+        super::tests::commit_in(&clone_path, subject);
+        let commit = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("the commit");
+        let reference = super::owner::owner_ref(&commit);
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:{reference}"),
+        ])
+        .expect("into the source, no branch");
+        commit
+    }
+
+    /// The owner's request for `commit` on `source`: its event id.
+    fn owner_request(db: &Db, source: &str, commit: &str) -> i64 {
+        db.store
+            .source_push_request(source, commit, &super::owner::owner_ref(commit))
+            .expect("the owner's request")
+    }
+
+    /// The control records of `kind`, oldest first.
+    fn control_records(db: &Db, kind: &str) -> Vec<Value> {
+        db.admin()
+            .query(
+                "select kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = $1
+                  order by session_seq",
+                &[&kind],
+            )
+            .expect("records")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    fn halted(db: &Db, mission: i64) -> Value {
+        db.mission(mission)["halted"].clone()
+    }
+
+    /// A pending request is applied before the baseline check: main moves
+    /// from where the last landing left it to the owner's commit (a
+    /// fast-forward), one `source.moved` names the request with `from` and
+    /// `to`, the mission's baseline follows, and no pass halts it, although
+    /// the integrator's mirror still holds the old main when the pass begins.
+    #[test]
+    fn an_owner_landing_is_applied_before_the_baseline_check() {
+        let (base, source, scenarios, integrator) = world("owner-ff", "exit 1\n");
+        let db = Db::new("owner_ff");
+        let b0 = source_main(&source);
+        let mirror = mirror_of(&integrator, &source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
+        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        assert_eq!(source_main(&source), b0, "the request moves no branch");
+        let request = owner_request(&db, &source, &commit);
+
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(source_main(&source), commit, "a fast-forward to the commit");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(request));
+        assert_eq!(moved[0]["source"], source.as_str());
+        assert_eq!(moved[0]["from"], b0.as_str());
+        assert_eq!(moved[0]["to"], commit.as_str());
+        assert_eq!(moved[0]["by"], "human");
+        assert_eq!(moved[0]["missions"], json!([mission]));
+        assert_eq!(db.mission(mission)["baseline"], commit.as_str());
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        assert_eq!(
+            git(&["--git-dir", &mirror, "rev-parse", "refs/heads/main"]).expect("mirror main"),
+            commit,
+            "the mission's step read the new main after it moved"
+        );
+        assert_eq!(
+            db.store.source_pushes_pending().expect("pending"),
+            json!([])
+        );
+
+        for _ in 0..2 {
+            integrator.pass_on(&db.store).expect("another pass");
+        }
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        assert_eq!(
+            control_records(&db, "source.moved").len(),
+            1,
+            "applied once"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Main moved (a recorded move) since the owner's commit's base: the
+    /// landing is a merge commit, first parent main, second the commit, by
+    /// the landing identity, its message naming the owner's landing, the
+    /// request and the commit's subject; main moves to it, and the
+    /// `source.moved` naming the request moves the baseline. Nothing halts.
+    #[test]
+    fn an_owner_landing_on_a_main_that_moved_is_a_merge() {
+        let (base, source, scenarios, integrator) = world("owner-merge", "exit 1\n");
+        let db = Db::new("owner_merge");
+        let b0 = source_main(&source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
+        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        let b1 = main_moves(&base, &source, "landed.txt");
+        assert_eq!(db.store.source_moved(&source, &b0, &b1).expect("moved"), 1);
+        let request = owner_request(&db, &source, &commit);
+
+        integrator.pass_on(&db.store).expect("a pass");
+        let main = source_main(&source);
+        assert_eq!(parent(&[&source], &main, 1), b1, "first parent: main");
+        assert_eq!(parent(&[&source], &main, 2), commit, "second: the commit");
+        for file in ["CONTRACT.md", "landed.txt", "README.md"] {
+            git(&[
+                "--git-dir",
+                &source,
+                "cat-file",
+                "-e",
+                &format!("{main}:{file}"),
+            ])
+            .unwrap_or_else(|error| panic!("{file} in the merge: {error}"));
+        }
+        let message = git(&["--git-dir", &source, "log", "-1", "--format=%B", &main]).expect("log");
+        assert!(
+            message.starts_with(&format!(
+                "Owner landing (request {request}): owner: the contract"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("Spawn-Owner-Request: {request}")),
+            "{message}"
+        );
+        let who = git(&[
+            "--git-dir",
+            &source,
+            "log",
+            "-1",
+            "--format=%an <%ae> %cn <%ce>",
+            &main,
+        ])
+        .expect("log");
+        assert_eq!(
+            who,
+            "spawn-integrate <integrate@localhost> spawn-integrate <integrate@localhost>"
+        );
+        let moved: Vec<Value> = control_records(&db, "source.moved")
+            .into_iter()
+            .filter(|record| record["request"] == json!(request))
+            .collect();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["from"], b1.as_str());
+        assert_eq!(moved[0]["to"], main.as_str());
+        assert_eq!(db.mission(mission)["baseline"], main.as_str());
+        integrator.pass_on(&db.store).expect("another pass");
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A commit that conflicts with main is refused: `source.push_refused`
+    /// names the request and the reason, main and the baseline stay, no
+    /// `source.moved` names it, nothing halts, and the request is no longer
+    /// pending. So is a commit the source does not have.
+    #[test]
+    fn a_conflicting_owner_landing_is_refused_and_moves_nothing() {
+        let (base, source, scenarios, integrator) = world("owner-conflict", "exit 1\n");
+        let db = Db::new("owner_conflict");
+        let b0 = source_main(&source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
+        let commit = owner_commit(
+            &base,
+            &source,
+            "README.md",
+            "the owner's\n",
+            "owner: readme",
+        );
+        let b1 = main_moves(&base, &source, "README.md");
+        assert_eq!(db.store.source_moved(&source, &b0, &b1).expect("moved"), 1);
+        let request = owner_request(&db, &source, &commit);
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        let absent = owner_request(&db, &source, missing);
+
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(source_main(&source), b1, "main stays");
+        let refused = control_records(&db, "source.push_refused");
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(refused[0]["request"], json!(request));
+        assert!(
+            refused[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("conflicts")),
+            "{}",
+            refused[0]
+        );
+        assert_eq!(refused[1]["request"], json!(absent));
+        assert!(
+            refused[1]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not in the source")),
+            "{}",
+            refused[1]
+        );
+        assert!(
+            control_records(&db, "source.moved")
+                .iter()
+                .all(|record| record["request"].is_null()),
+            "no move names a refused request"
+        );
+        assert_eq!(db.mission(mission)["baseline"], b1.as_str());
+        integrator.pass_on(&db.store).expect("another pass");
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        assert_eq!(
+            db.store.source_pushes_pending().expect("pending"),
+            json!([])
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pass that finds a request pending for a source (recorded after step
+    /// 0 read the requests, or one whose landing failed after main moved)
+    /// holds every halt by baseline for that source, and for no other:
+    /// both mains moved behind Spawn's back, only B halts. Then the request
+    /// is applied, and the move behind Spawn's back, which no record
+    /// explains, still halts A.
+    #[test]
+    fn a_pending_owner_landing_holds_the_baseline_halt_of_its_source_only() {
+        let (base_a, source_a, scenarios, integrator) = world("owner-hold-a", "exit 1\n");
+        let (base_b, source_b, _, _) = world("owner-hold-b", "exit 1\n");
+        let db = Db::new("owner_hold");
+        let a = mission_at_baseline(&db, &source_a, &scenarios, &source_main(&source_a));
+        let b = mission_at_baseline(&db, &source_b, &scenarios, &source_main(&source_b));
+        main_moves(&base_a, &source_a, "behind-a.txt");
+        main_moves(&base_b, &source_b, "behind-b.txt");
+        let commit = owner_commit(&base_a, &source_a, "CONTRACT.md", "v1\n", "owner: contract");
+        let request = owner_request(&db, &source_a, &commit);
+
+        let held = super::owner::pending_by_source(&db.store).expect("pending");
+        assert_eq!(held.get(&source_a), Some(&request));
+        assert_eq!(held.len(), 1);
+        integrator.steps(&db.store, &held).expect("the steps");
+        assert!(halted(&db, a).is_null(), "held: {}", halted(&db, a));
+        assert!(
+            halted(&db, b)
+                .as_str()
+                .is_some_and(|reason| reason.contains("but the last landing left")),
+            "another source is not held: {}",
+            halted(&db, b)
+        );
+
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(source_main(&source_a), commit, "applied");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["missions"], json!([]), "A's baseline was not main");
+        assert!(
+            halted(&db, a)
+                .as_str()
+                .is_some_and(|reason| reason.contains("but the last landing left")),
+            "a move no record explains still halts: {}",
+            halted(&db, a)
+        );
+        for base in [base_a, base_b] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// The integrator stopped between an owner landing's move of main and
+    /// its record: the request is still pending and main already holds the
+    /// commit. The next pass records the move from where it began (the
+    /// missions' baseline), so nothing halts; a commit main held already
+    /// moves nothing.
+    #[test]
+    fn an_owner_landing_whose_record_was_lost_is_recorded_from_where_it_began() {
+        let (base, source, scenarios, integrator) = world("owner-lost", "exit 1\n");
+        let db = Db::new("owner_lost");
+        let b0 = source_main(&source);
+        let mission = mission_at_baseline(&db, &source, &scenarios, &b0);
+        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        let request = owner_request(&db, &source, &commit);
+        // The move went out; its record did not.
+        git(&[
+            "--git-dir",
+            &source,
+            "update-ref",
+            "refs/heads/main",
+            &commit,
+            &b0,
+        ])
+        .expect("moved");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(request));
+        assert_eq!(moved[0]["from"], b0.as_str());
+        assert_eq!(moved[0]["to"], commit.as_str());
+        assert_eq!(db.mission(mission)["baseline"], commit.as_str());
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+
+        // The same commit again: main holds it, nothing moves.
+        let again = owner_request(&db, &source, &commit);
+        integrator.pass_on(&db.store).expect("another pass");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 2, "{moved:?}");
+        assert_eq!(moved[1]["request"], json!(again));
+        assert_eq!(moved[1]["from"], commit.as_str());
+        assert_eq!(moved[1]["to"], commit.as_str());
+        assert_eq!(source_main(&source), commit);
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A judging of the same source is running when the owner's landing is
+    /// applied: the landing does not wait for it, and it is not touched. Its
+    /// gate finishes and its verdict is recorded (`accepted`); its landing's
+    /// compare-and-swap finds main moved and records `stale` (the existing
+    /// rule), so the task is judged again against the owner's main and
+    /// lands on top of it. The mission had no baseline yet: the owner's move
+    /// gives it the new main, so the verdict judged against the old one
+    /// does not halt it.
+    #[test]
+    fn a_judging_of_the_same_source_finds_main_moved_and_is_judged_again() {
+        let marks = fresh_marks("spawn-db-owner-stale");
+        let _release = Release(marks.clone());
+        let (base, source, scenarios, integrator) = world("owner-stale", &holding_gate(&marks));
+        let db = Db::new("owner_stale");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let pushed = push_work(&base, &source, &agent_of(&db, mission, task), "work.txt");
+        let b0 = source_main(&source);
+
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that starts the judging");
+        let first = wait_started(&marks, 1);
+        assert_eq!(first.len(), 1, "the gate started");
+        let commit = owner_commit(&base, &source, "CONTRACT.md", "v1\n", "owner: the contract");
+        let request = owner_request(&db, &source, &commit);
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass while the gate runs");
+        assert_eq!(source_main(&source), commit, "applied while the gate runs");
+        let moved = control_records(&db, "source.moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0]["request"], json!(request));
+        assert_eq!(moved[0]["from"], b0.as_str());
+        assert_eq!(moved[0]["without_baseline"], json!([mission]));
+        assert!(verdicts(&db, task).is_empty(), "the gate still runs");
+        assert_eq!(
+            integrator.running.borrow().len(),
+            1,
+            "the judging is untouched"
+        );
+
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), ["accepted", "stale"]);
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "reported");
+        assert_eq!(db.mission(mission)["baseline"], commit.as_str());
+
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass that judges again");
+        integrator.settle();
+        assert_eq!(verdicts(&db, task), ["accepted", "stale", "accepted"]);
+        let second = started(&marks);
+        assert_eq!(second.len(), 2, "{second:?}");
+        assert_eq!(
+            parent(&[&source], &second[1], 1),
+            commit,
+            "judged again against the owner's main"
+        );
+        let main = source_main(&source);
+        assert_eq!(parent(&[&source], &main, 1), commit, "landed on top of it");
+        assert_eq!(parent(&[&source], &main, 2), pushed);
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        integrator.pass_on(&db.store).expect("a pass after");
+        assert!(halted(&db, mission).is_null(), "{}", halted(&db, mission));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

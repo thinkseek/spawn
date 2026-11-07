@@ -86,7 +86,8 @@ function text(value: unknown): string | null {
 
 /** The node an event comes from: the agent that did it, or the control
  * place that recorded it (the dispatcher hands tasks out, the integrator
- * gates and lands them, anything else is the supervisor's decision). */
+ * gates and lands them and applies the owner's landings, anything else is
+ * the supervisor's decision). */
 export function emitter(event: LogEvent): NodeKey {
   const record = controlRecord(event);
   if (event.source !== "control" && record === null) return agentNode(event.agent_id);
@@ -96,7 +97,9 @@ export function emitter(event: LogEvent): NodeKey {
     type === "task.gated" ||
     type === "task.landed" ||
     type === "task.aborted" ||
-    type === "mission.halted"
+    type === "mission.halted" ||
+    type === "source.push_refused" ||
+    (type === "source.moved" && record?.request !== undefined)
   ) {
     return "integrator";
   }

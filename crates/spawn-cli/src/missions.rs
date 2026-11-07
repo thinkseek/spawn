@@ -32,6 +32,17 @@ const USAGE: &str = "usage:
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
                 resident takes one, per-task workers the rest)
   spawn mission resume --id N
+  spawn mission push --source <path> --commit <commit> [--repo <dir>] [--wait <seconds>]
+      (owner: land a commit on a mission source's main. <commit> is resolved in the git
+       repository of the current directory (--repo: another), or is already in the source;
+       it is put in the source at refs/spawn-owner/<hash>, no branch moves, and the request
+       is recorded (source.push_requested): prints {request, source, commit}. The running
+       integrator applies it between its own steps (on a held source too: a hold stops task
+       landings, not the owner's), under the landing lock: main moves to
+       the commit (a fast-forward) or to a merge of it, and one source.moved naming the
+       request moves the baselines; a conflict is source.push_refused. Nothing halts, no
+       gate is stopped, and spawn-integrate is never stopped for it. --wait: wait that long
+       for the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
   spawn mission hold --source <path> [--reason <text>]   (owner: no task lands on the source until
       a record ends the hold: its release, or its expiry SPAWN_SOURCE_HOLD_SECS after it (1 to
@@ -417,6 +428,7 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             store.mission_resume(mission).map_err(err)?;
             print(&json!({ "mission": mission, "resumed": true }));
         }
+        "push" => return push(&store, &flags),
         "moved" => {
             let source = text(&flags, "source")?;
             crate::sources::MissionSource::parse(&source)?;
@@ -466,6 +478,123 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         _ => return Err(USAGE.to_string()),
     }
     Ok(0)
+}
+
+/// `spawn mission push`: put the owner's commit in the source at
+/// `refs/spawn-owner/<hash>` and record the request the integrator applies
+/// (docs/fleet-architecture.md §10.3, "The owner's landings"). Exit 0, or,
+/// with `--wait`, 0 when applied, 1 when refused, 3 when still pending.
+fn push(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<i32, String> {
+    let source = text(flags, "source")?;
+    crate::sources::MissionSource::parse(&source)?;
+    if !source.starts_with('/') {
+        return Err(format!(
+            "its source {source} is remote: agents' branches reach only a directory on this \
+             host, so nothing lands on it"
+        ));
+    }
+    let wanted = text(flags, "commit")?;
+    let wait = flags
+        .get("wait")
+        .map(|text| {
+            text.parse::<u64>()
+                .map_err(|_| format!("--wait must be a number of seconds, not {text}"))
+        })
+        .transpose()?;
+    let repo = match directory(flags, "repo")? {
+        Some(repo) => repo,
+        None => std::env::current_dir()
+            .map_err(|error| format!("the current directory: {error}"))?
+            .display()
+            .to_string(),
+    };
+    let (commit, reference) = put_in_source(&source, &repo, &wanted)?;
+    let request = store
+        .source_push_request(&source, &commit, &reference)
+        .map_err(|error| error.to_string())?;
+    let mut answer = json!({ "request": request, "source": source, "commit": commit });
+    let Some(seconds) = wait else {
+        print(&answer);
+        return Ok(0);
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let outcome = loop {
+        let outcome = store
+            .source_push_outcome(request)
+            .map_err(|error| error.to_string())?;
+        if outcome.is_some() || std::time::Instant::now() >= deadline {
+            break outcome;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    let (state, code) = match outcome
+        .as_ref()
+        .and_then(|record| record.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("source.moved") => ("applied", 0),
+        Some(_) => ("refused", 1),
+        None => ("pending", 3),
+    };
+    answer["state"] = json!(state);
+    answer["outcome"] = outcome.unwrap_or(Value::Null);
+    print(&answer);
+    Ok(code)
+}
+
+/// Resolve `wanted` in the owner's repository `repo` (else in the source,
+/// which may have it already) and put it in `source` at
+/// `refs/spawn-owner/<hash>`, without touching any branch: `(hash, ref)`.
+fn put_in_source(source: &str, repo: &str, wanted: &str) -> Result<(String, String), String> {
+    use crate::integrate::owner::{full_hash, owner_ref};
+    use crate::sources::controller_git;
+
+    let resolve = |place: &[&str]| -> Option<String> {
+        let output = controller_git()
+            .args(place)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{wanted}^{{commit}}"),
+            ])
+            .output()
+            .ok()?;
+        let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (output.status.success() && full_hash(&hash)).then_some(hash)
+    };
+    if let Some(commit) = resolve(&["-C", repo]) {
+        let reference = owner_ref(&commit);
+        let pushed = controller_git()
+            .args([
+                "-C",
+                repo,
+                "push",
+                "--quiet",
+                "--",
+                source,
+                &format!("{commit}:{reference}"),
+            ])
+            .output()
+            .map_err(|error| format!("run git push: {error}"))?;
+        if !pushed.status.success() {
+            return Err(format!(
+                "git push of {commit} to {source} ({reference}): {}",
+                String::from_utf8_lossy(&pushed.stderr).trim()
+            ));
+        }
+        return Ok((commit, reference));
+    }
+    let Some(commit) = resolve(&["--git-dir", source]) else {
+        return Err(format!(
+            "{wanted} is not a commit in {repo} nor in the source {source}"
+        ));
+    };
+    let reference = owner_ref(&commit);
+    crate::sources::git(&["--git-dir", source, "update-ref", &reference, &commit])
+        .map_err(|error| error.to_string())?;
+    Ok((commit, reference))
 }
 
 /// `spawn task ...`
@@ -683,5 +812,93 @@ mod tests {
         );
         let refused = model(&flags(&["--model", "opus"])).expect_err("not a profile");
         assert!(refused.contains("default or cheap"), "{refused}");
+    }
+
+    /// Commit everything in the checkout `directory`, whatever the host's
+    /// git configuration.
+    fn commit_in(directory: &str, message: &str) {
+        let git = crate::sources::test_git;
+        git(&["-C", directory, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            directory,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--no-gpg-sign",
+            "-qm",
+            message,
+        ])
+        .expect("commit");
+    }
+
+    /// A scratch world: a bare source with one commit on main, and the
+    /// owner's clone of it. `(base, source, owner)`.
+    fn owner_world(tag: &str) -> (std::path::PathBuf, String, String) {
+        let git = crate::sources::test_git;
+        let base = std::env::temp_dir().join(format!("spawn-push-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("source");
+        let owner = base.join("owner").to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &owner]).expect("the owner's clone");
+        (base, source, owner)
+    }
+
+    /// `spawn mission push` resolves the commit where the owner works and
+    /// puts it in the source at `refs/spawn-owner/<hash>`, moving no branch;
+    /// a commit already in the source (by a name it knows) gets the same
+    /// ref; anything else is refused before any request is recorded.
+    #[test]
+    fn the_owners_commit_waits_in_the_source_and_no_branch_moves() {
+        let git = crate::sources::test_git;
+        let (base, source, owner) = owner_world("put");
+        let main = git(&["--git-dir", &source, "rev-parse", "refs/heads/main"]).expect("main");
+        std::fs::write(std::path::Path::new(&owner).join("CONTRACT.md"), "v1\n").expect("write");
+        commit_in(&owner, "owner: the contract");
+        let head = git(&["-C", &owner, "rev-parse", "HEAD"]).expect("head");
+
+        let (commit, reference) = super::put_in_source(&source, &owner, "HEAD").expect("put");
+        assert_eq!(commit, head, "resolved in the owner's repository");
+        assert_eq!(reference, format!("refs/spawn-owner/{head}"));
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", &reference]).expect("the ref"),
+            head
+        );
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", "refs/heads/main"]).expect("main"),
+            main,
+            "no branch moves"
+        );
+
+        // Already in the source, named as the source knows it, from a
+        // directory that is no repository.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("a directory");
+        let (known, known_ref) =
+            super::put_in_source(&source, &elsewhere.to_string_lossy(), &main).expect("known");
+        assert_eq!(known, main);
+        assert_eq!(
+            git(&["--git-dir", &source, "rev-parse", &known_ref]).expect("the ref"),
+            main
+        );
+
+        for wanted in [
+            "no-such-branch",
+            "--all",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            let refused = super::put_in_source(&source, &owner, wanted).expect_err(wanted);
+            assert!(refused.contains("is not a commit"), "{wanted}: {refused}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
