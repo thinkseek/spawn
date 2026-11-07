@@ -3020,6 +3020,89 @@ pub(crate) fn stop_worker(store: &PostgresStore, task: &Task, key: &str) -> Resu
         .map_err(|e| error(&e))
 }
 
+/// The work an overrun task keeps on its branch, once it reached the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The source's `spawn/<agent>` holds the checkpoint: the branch, the
+    /// commit and `git diff --stat main <commit>`.
+    Work {
+        branch: String,
+        commit: String,
+        diff: String,
+    },
+    /// The push has not happened yet: the next pass looks again.
+    Waiting,
+    /// The work never reached the branch (no checkpoint, no source, or the
+    /// push failed): the branch alone is named, and the next task is told so.
+    Lost { branch: String },
+}
+
+/// How long a Stop's final checkpoint may take to reach the source before
+/// the work counts as lost (the pusher pushes within its interval, and
+/// retries a failed push): `SPAWN_KEPT_WAIT_SECS`, a whole number of
+/// seconds from 1 up; anything else is 30.
+pub(crate) fn kept_wait_ms(text: Option<&str>) -> i64 {
+    const DEFAULT: i64 = 30;
+    text.and_then(|text| text.trim().parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT)
+        .saturating_mul(1_000)
+}
+
+/// Whether the source's `spawn/<agent>` holds `commit` (its ancestry), read
+/// from the source itself, never assumed.
+fn source_holds(source: &str, agent: &str, commit: &str) -> bool {
+    sources::git(&[
+        "--git-dir",
+        source,
+        "merge-base",
+        "--is-ancestor",
+        commit,
+        &format!("refs/heads/spawn/{agent}"),
+    ])
+    .is_ok()
+}
+
+/// `git diff --stat main <commit>` in the source, the work's shape for the
+/// task that continues it.
+fn diff_stat(source: &str, commit: &str) -> String {
+    sources::git(&["--git-dir", source, "diff", "--stat", "main", commit])
+        .map(|text| text.trim_end().to_string())
+        .unwrap_or_default()
+}
+
+/// The work `task` keeps on its branch: [`Kept`].
+fn kept_work(store: &PostgresStore, mission: &Mission, task: &Task) -> Result<Kept, String> {
+    let branch = format!("spawn/{}", task.agent_id);
+    let Some(source) = mission.source.as_deref() else {
+        return Ok(Kept::Lost { branch });
+    };
+    let wait_ms = kept_wait_ms(crate::config::env_value("SPAWN_KEPT_WAIT_SECS").as_deref());
+    let Some(checkpoint) = store
+        .checkpoint_at(&task.agent_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Kept::Lost { branch });
+    };
+    let commit = checkpoint["commit"].as_str().unwrap_or_default().to_string();
+    let at_ms = checkpoint["at_ms"].as_i64().unwrap_or_default();
+    if commit.is_empty() {
+        return Ok(Kept::Lost { branch });
+    }
+    if source_holds(source, &task.agent_id, &commit) {
+        return Ok(Kept::Work {
+            diff: diff_stat(source, &commit),
+            branch,
+            commit,
+        });
+    }
+    let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+    if now - at_ms >= wait_ms {
+        return Ok(Kept::Lost { branch });
+    }
+    Ok(Kept::Waiting)
+}
+
 /// A path through the controller's symlink (`controllers/<name>` in the
 /// live directory, switched by deploy/controller.sh), resolved once for a
 /// step: what counts the scenarios, the gate and its scenarios are then one
