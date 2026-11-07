@@ -178,7 +178,6 @@ function OnOwnJobs({
                   label={worker.label}
                   id={worker.agent_id || worker.session_id}
                   className="text-caption font-medium text-foreground"
-                  clamp={1}
                 />
               </span>
               <span className="min-w-0 flex-1 truncate font-mono text-caption text-muted-foreground">
@@ -551,7 +550,7 @@ function ItemRow({
             {item.why}
           </span>
           <span className="min-w-0 text-caption text-muted-foreground">
-            <LabeledId label={item.label} id={item.agent_id ?? item.session_id} clamp={1} />
+            <LabeledId label={item.label} id={item.agent_id ?? item.session_id} />
           </span>
           {when && (
             <span
@@ -700,7 +699,7 @@ function AttentionRow({
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
           <span className="min-w-0 text-label font-semibold text-foreground">
-            <LabeledId label={agent.label} id={agent.agent_id || agent.session_id} clamp={1} />
+            <LabeledId label={agent.label} id={agent.agent_id || agent.session_id} />
           </span>
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />

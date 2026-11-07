@@ -215,7 +215,7 @@ fn a_tasks_texts_read_in_full_and_a_missing_task_reads_none() {
 }
 
 #[test]
-fn the_label_facts_carry_each_missions_text_and_tasks_and_the_residents() {
+fn the_label_facts_carry_each_sessions_latest_task_and_the_open_ones() {
     let (store, _schema) = store("label_facts");
     let mission = store
         .mission_add(
@@ -228,9 +228,22 @@ fn the_label_facts_carry_each_missions_text_and_tasks_and_the_residents() {
         "Owner work on Spawn: a report that is still a draft is not taken.\n{}",
         "more\n".repeat(300)
     );
-    let task = store
+    // A worker's one task, closed: still its session's latest.
+    let closed = store
         .task_assign(mission, "ephemeral", "draft_report", &brief, "default")
         .expect("assign");
+    store.task_cancel(closed).expect("cancel");
+    // A resident's old task, closed, and its newer one, open: only the newer.
+    store.resident_propose("core", "Owns it").expect("propose");
+    store.resident_approve("core").expect("approve");
+    let old = store
+        .task_assign(mission, "resident", "core", "Old work.", "default")
+        .expect("assign");
+    store.task_cancel(old).expect("cancel");
+    let open = store
+        .task_assign(mission, "resident", "core", "New work.", "default")
+        .expect("assign");
+
     let facts = store.label_facts().expect("the facts read");
     let row = facts["missions"]
         .as_array()
@@ -245,18 +258,27 @@ fn the_label_facts_carry_each_missions_text_and_tasks_and_the_residents() {
     );
     assert_eq!(row["sources"], json!(["/x/spawn.git"]));
     assert_eq!(row["gate"], json!(null));
-    let tasks = row["tasks"].as_array().expect("tasks");
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["id"], task);
-    assert_eq!(tasks[0]["state"], "assigned");
-    assert_eq!(tasks[0]["objective"], json!(null));
-    let start = tasks[0]["brief"].as_str().expect("a brief");
+    let ids: Vec<i64> = row["tasks"]
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .filter_map(|task| task["id"].as_i64())
+        .collect();
+    assert_eq!(
+        ids,
+        [closed, open],
+        "the latest of each session, and the open one"
+    );
+    let task = &row["tasks"][0];
+    assert_eq!(task["state"], "cancelled");
+    let start = task["brief"].as_str().expect("a brief");
     assert!(brief.starts_with(start), "the brief's start");
     assert_eq!(start.chars().count(), 600, "only its start");
-    assert!(tasks[0]["session_id"].as_str().is_some());
     assert!(
-        tasks[0].get("report").is_none(),
+        task.get("report").is_none(),
         "no report: a label never reads it"
     );
-    assert!(facts["residents"].is_array());
+    let residents = facts["residents"].as_array().expect("residents");
+    assert!(residents.iter().any(|resident| resident["name"] == "core"));
+    assert!(facts["inputs"].is_array(), "the latest inputs");
 }

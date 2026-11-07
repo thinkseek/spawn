@@ -341,15 +341,29 @@ select jsonb_build_object(
 );
 
 /// What the dashboard's labels are made of (`spawn serve`, serve/labels.rs):
-/// every mission with its text's start and its tasks' briefs' start, and the
-/// resident roster, `{missions: [{id, text, sources, state, gate, accept,
-/// objectives, tasks: [{id, kind, agent_id, session_id, brief, state,
-/// objective, created_at_ms, updated_at_ms}]}], residents: [{name, agent_id,
-/// session_id, state}]}`, newest mission first, tasks by id. The shape of
-/// [`MISSION_BOARD`] without what a label never reads (stages, reports,
-/// review notes, holds), so the fleet board and the attention queue can name
-/// their agents without reading the whole board.
+/// every mission with its text's start, the tasks a label can name (each
+/// session's latest task, and every task still open: not landed or
+/// cancelled, nor accepted outside a gated mission), the resident roster,
+/// and the latest input of the supervisor and of each resident:
+/// `{missions: [{id, text, sources, state, gate, accept, objectives, tasks:
+/// [{id, kind, agent_id, session_id, brief, state, objective,
+/// created_at_ms, updated_at_ms}]}], residents: [{name, agent_id,
+/// session_id, state}], inputs: [{session_id, principal, text,
+/// created_at_ms}]}`, newest mission first, tasks by id. Bounded by the
+/// sessions and the open work, not by every task ever made; no stages,
+/// reports or review notes.
 pub(crate) const LABEL_FACTS: &str = r"
+with named as (
+  select distinct on (k.session_id) k.id
+    from mission_tasks k
+   where k.session_id is not null
+   order by k.session_id, k.id desc
+), shown as (
+  select k.* from mission_tasks k join mission_missions m on m.id = k.mission_id
+   where k.id in (select id from named)
+      or k.state not in ('landed', 'cancelled', 'accepted')
+      or (k.state = 'accepted' and m.gate is not null)
+)
 select jsonb_build_object(
   'missions', coalesce((select jsonb_agg(jsonb_build_object(
       'id', m.id, 'text', left(m.text, 400), 'sources', m.sources, 'state', m.state,
@@ -358,12 +372,21 @@ select jsonb_build_object(
           'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id, 'session_id', k.session_id,
           'brief', left(k.brief, 600), 'state', k.state, 'objective', k.objective,
           'created_at_ms', k.created_at_ms, 'updated_at_ms', k.updated_at_ms) order by k.id)
-        from mission_tasks k where k.mission_id = m.id), '[]'::jsonb)) order by m.id desc)
+        from shown k where k.mission_id = m.id), '[]'::jsonb)) order by m.id desc)
     from mission_missions m), '[]'::jsonb),
   'residents', coalesce((select jsonb_agg(jsonb_build_object(
       'name', r.name, 'agent_id', r.agent_id, 'session_id', r.session_id, 'state', r.state)
       order by r.name)
-    from mission_residents r), '[]'::jsonb)
+    from mission_residents r), '[]'::jsonb),
+  'inputs', coalesce((select jsonb_agg(jsonb_build_object(
+      'session_id', c.session_id, 'principal', c.principal,
+      'text', left(coalesce(c.action ->> 'text', c.action ->> 'prompt', ''), 600),
+      'created_at_ms', c.created_at_ms) order by c.session_id)
+    from (select distinct on (d.session_id) d.*
+            from spawn_commands d
+           where d.session_id = 'session_supervisor'
+              or d.session_id in (select session_id from mission_residents)
+           order by d.session_id, d.id desc) c), '[]'::jsonb)
 )";
 
 /// Every active owner's hold ([`MISSION_BOARD`]'s `holds`) and the

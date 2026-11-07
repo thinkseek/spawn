@@ -54,7 +54,7 @@ export function DoingIcon({ now, size = 12 }: { now: { tool: boolean; job: boole
 }
 
 const COLUMNS =
-  "lg:grid lg:grid-cols-[minmax(0,19rem)_minmax(0,1.8fr)_minmax(0,1fr)_6rem_5rem_5.5rem] lg:items-center lg:gap-4";
+  "lg:grid lg:grid-cols-[minmax(0,26rem)_minmax(0,1.8fr)_minmax(0,1fr)_6rem_5rem_5.5rem] lg:items-center lg:gap-4";
 
 /** The fleet below the always-on agents: on a task, idle, ended (folded,
  * remembered). The groups and their order come from ordering.ts, as the
