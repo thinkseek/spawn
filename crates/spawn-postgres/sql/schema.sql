@@ -1275,7 +1275,11 @@ create table if not exists mission_tasks (
     -- delivery spent without typing is cancelled and assigned again once,
     -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
     -- re-issued again.
-    reissue_of      bigint
+    reissue_of      bigint,
+    -- The task this one continues (its `task.assigned` names it): the
+    -- objective's task after one that went over its budget keeps that
+    -- task's work (`task.over_budget`, docs/fleet-architecture.md §10.4).
+    continues       bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1308,6 +1312,7 @@ alter table mission_tasks add column if not exists model text not null default '
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
 alter table mission_tasks add column if not exists reissue_of bigint;
+alter table mission_tasks add column if not exists continues bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1434,12 +1439,13 @@ begin
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
                                    created_by, objective, scenario, model, reissue_of,
-                                   created_at_ms, updated_at_ms)
+                                   continues, created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
                 p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
-                (p_record ->> 'reissue_of')::bigint, p_at, p_at);
+                (p_record ->> 'reissue_of')::bigint, (p_record ->> 'continues')::bigint,
+                p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -1623,6 +1629,21 @@ begin
          where id = v_id;
         update mission_missions set gate_aborts = gate_aborts + 1, updated_at_ms = p_at
          where id = (select mission_id from mission_tasks where id = v_id);
+        -- A task that leaves the gate ends its run of `no_room`.
+        update mission_missions set gate_room_task = null, gate_room_since_ms = null,
+                                    gate_room_last_ms = null, gate_room_waits = 0,
+                                    gate_room_escalated = false, updated_at_ms = p_at
+         where gate_room_task = v_id;
+    when 'task.over_budget' then
+        -- Over budget: the task is bigger than its budget, not a failed
+        -- gate. Its work is kept on its branch and its objective's next
+        -- task continues it (`task.assigned` naming `continues`), so the
+        -- task leaves flight and counts toward no halt: the mission's
+        -- gate_aborts and gate_rejections stay as they were
+        -- (docs/fleet-architecture.md §10.4).
+        update mission_tasks set state = 'cancelled', review_note = p_record ->> 'reason',
+                                 updated_at_ms = p_at
+         where id = v_id;
         -- A task that leaves the gate ends its run of `no_room`.
         update mission_missions set gate_room_task = null, gate_room_since_ms = null,
                                     gate_room_last_ms = null, gate_room_waits = 0,
@@ -2607,7 +2628,8 @@ begin
     if p_record ->> 'type' is null
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
                                       'task.held', 'source.hold_expired', 'task.cancelled',
-                                      'source.moved', 'source.push_refused') then
+                                      'source.moved', 'source.push_refused',
+                                      'task.over_budget') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
     -- The integrator cancels one kind of task: an objective's task in flight
@@ -2744,6 +2766,7 @@ begin
                               when 'task.landed' then array['landing']
                               when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
+                              when 'task.over_budget' then array['delivered']
                               when 'task.cancelled' then array['assigned', 'delivered', 'revise']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
