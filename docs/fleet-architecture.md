@@ -1140,6 +1140,18 @@ the tree's own:
   and objective scenarios (`<digits>.sh`) the base fails too. The checks are
   scenarios: `check-clippy`, `check-tests`, `check-e2e`, `check-blackbox`,
   `check-web`. The halt rule on the scenario count (§10.3) protects them.
+  check-tests runs first among the regressions (the most often decisive,
+  so its failure stops the rest early);
+- a check that fails on the candidate is run again there, as an
+  objective's "unsolved" needs two runs that agree: passing the second
+  time, it is a flake (said in the log) and the gate goes on; failing
+  twice, it is run on the base (built for it when every base result came
+  from the cache): passing there, it is a regression; failing there too, it
+  is a host or harness fault, no verdict (exit 4). That base run follows
+  candidate code on the shared test server, so it can only turn a
+  rejection into an abort, never into an acceptance. (2026-11-07: one e2e
+  run that failed under load rejected task 127's 85-minute gate; the same
+  tree passes it.)
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
   §4). The verdict is one JSON line that names the base and candidate
   commits it judged; the integrator believes only the verdict file it owns.
@@ -1181,7 +1193,8 @@ the tree's own:
   gate's `TMPDIR`), or the integrator could not create or use its private
   directory for the gate (it measures that directory's parent). Any other
   status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
-  `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored),
+  `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored,
+  or a check failed on the candidate twice and on the base),
   a timeout or a signal. The integrator measures the same floor, free
   memory and the test database itself before it starts the gate (§10.3,
   step 3), so a short host is found before a gate runs; the gate's own
