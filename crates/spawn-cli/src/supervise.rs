@@ -73,8 +73,7 @@ pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
         return Revive::Nothing;
     }
     if facts.failures > 0 {
-        let exponent = facts.failures.min(6);
-        let pause = BACKOFF_MS.saturating_mul(1 << exponent);
+        let pause = pause_ms(facts.failures);
         if facts
             .last_failure_ms
             .is_some_and(|failed| now_ms.saturating_sub(failed) < pause)
@@ -89,6 +88,33 @@ pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
         return Revive::Resume;
     }
     Revive::Start { handoff: true }
+}
+
+/// The pause after `failures` failed revivals: [`BACKOFF_MS`] doubled per
+/// failure, at most six doublings (the backoff [`decide`] applies).
+fn pause_ms(failures: u32) -> i64 {
+    BACKOFF_MS.saturating_mul(1 << failures.min(6))
+}
+
+/// When the rule next acts on a session it leaves alone for now, from the
+/// facts it read: the end of the backoff after a failed revival, on the
+/// database's clock. `None` while the rule waits for no clock — a running
+/// session, one with a command in flight, one whose stop ended it, one that
+/// has never failed. A due time in the past is due now, never later; a
+/// revival the loop cannot date is due now.
+pub(crate) fn next_due(facts: &LivenessFacts, now_ms: i64) -> Option<i64> {
+    if matches!(facts.last_kind.as_deref(), Some("stop" | "discard"))
+        || facts.open_command
+        || facts.live
+        || facts.failures == 0
+    {
+        return None;
+    }
+    let due = facts
+        .last_failure_ms
+        .map(|failed| failed.saturating_add(pause_ms(facts.failures)))
+        .unwrap_or(now_ms);
+    Some(due)
 }
 
 /// The supervisor's charter as this build and its environment write it: the
