@@ -2844,12 +2844,11 @@ begin
                 and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
                      or jsonb_typeof(p_record -> 'exits') is distinct from 'array'
                      or jsonb_array_length(p_record -> 'exits') <> 2
-                     or (p_record -> 'exits' ->> 0)::integer is distinct from 1
-                     or (p_record -> 'exits' ->> 1)::integer is distinct from 0
+                     or p_record -> 'exits' ->> 0 is distinct from '1'
+                     or p_record -> 'exits' ->> 1 is distinct from '0'
                      or jsonb_typeof(p_record -> 'base_disagrees') is distinct from 'number'
                      or jsonb_typeof(p_record -> 'alert') is distinct from 'boolean'
-                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'
-                     or (p_record -> 'escalate')::boolean
+                     or p_record ->> 'escalate' is distinct from 'false'
                      or (p_record ? 'setup_s'
                          and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))) then
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
