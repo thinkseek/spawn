@@ -568,6 +568,15 @@ The API is read-only: `/api/overview`, `/api/fleet` (with
 `/api/rsi` (with `/api/rsi/task/<id>` and `/api/rsi/pane`) and
 `/api/scorecard` (`crates/spawn-cli/src/serve.rs`; the answer of
 `/api/attention` is documented in `crates/spawn-cli/src/serve/attention.rs`).
+`/api/missions` and `/api/rsi` send what the lists show: a task's brief,
+report and review note come as their first lines with their whole length
+(`<field>_bytes`), and `/api/missions/task/<id>` answers the whole texts
+when a task is opened. Every answer carries a weak `ETag` and a read that
+sends it back (`If-None-Match`) gets 304 while nothing it shows changed; a
+read that says `Cache-Control: max-age=1`, as the page's polls do, may be
+given the answer computed for another reader up to a second ago, so one
+computation serves every open page (`crates/spawn-cli/src/serve/answers.rs`).
+The page polls only while it is visible and reads again the moment it shows.
 Humans talk to the supervisor
 through its pane, or `spawn submit --session session_supervisor --action
 '{"type":"input",...}'`.
