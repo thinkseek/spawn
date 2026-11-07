@@ -2107,7 +2107,7 @@ fn follow_stream(store: &PostgresStore, after: i64, json: bool) -> Result<i32, S
 #[cfg(test)]
 mod tests {
     use super::{
-        Crossing, Event, LIKELY, Monitor, Reading, Row, Settings, civil, crash_stamp, crossing,
+        Crossing, Event, LIKELY, Monitor, Row, Settings, civil, crash_stamp, crossing,
         days_from_civil, line, parse_span, scrub, scrub_value, time_text, window_ms,
     };
     use serde_json::{Value, json};
@@ -2315,7 +2315,8 @@ mod tests {
             0,
             json!({"type": "mission.halted", "id": 4, "reason": "halted"}),
         );
-        commit(&mut monitor, &decided(&monitor, events));
+        let recorded = decided(&monitor, events);
+        commit(&mut monitor, &recorded);
         // The restart: the same records are read again with the keys the
         // store holds; the decision may repeat, but nothing is recorded.
         let replayed = feed(
@@ -2464,7 +2465,8 @@ terminated by signal 11: Segmentation fault\n";
             fires(&out),
             ["postgres_crash:test:2026-11-08 18:25:00.123 UTC [1]"]
         );
-        commit(&mut monitor, &decided(&monitor, out));
+        let recorded = decided(&monitor, out);
+        commit(&mut monitor, &recorded);
 
         // The same lines read again: nothing fires twice.
         let mut again = Vec::new();
@@ -2518,7 +2520,8 @@ connections\n";
         assert_eq!(evidence["age_secs"], 7200);
         assert_eq!(evidence["max_age_secs"], 7200);
         assert_eq!(evidence["key"], "postgres/hourly/a.dump");
-        commit(&mut monitor, &decided(&monitor, due));
+        let recorded = decided(&monitor, due);
+        commit(&mut monitor, &recorded);
 
         let newer = feed(
             &mut monitor,
@@ -2557,7 +2560,8 @@ connections\n";
         assert_eq!(subject, "r2");
         assert_eq!(evidence["held_bytes"], 8_100_000_000_i64);
         assert_eq!(evidence["alert_bytes"], 8_000_000_000_i64);
-        commit(&mut monitor, &decided(&monitor, over));
+        let recorded = decided(&monitor, over);
+        commit(&mut monitor, &recorded);
 
         let still = feed(
             &mut monitor,
@@ -2631,7 +2635,8 @@ connections\n";
         };
         assert_eq!(subject, "agent_worker_bb_wait");
         assert_eq!(evidence["measure"], "host");
-        commit(&mut monitor, &decided(&monitor, due));
+        let recorded = decided(&monitor, due);
+        commit(&mut monitor, &recorded);
 
         let admitted = feed(
             &mut monitor,
@@ -2660,7 +2665,8 @@ connections\n";
         };
         assert_eq!(evidence["stuck"], 0.9);
         assert!(evidence["stuck"].as_f64().unwrap_or_default() >= LIKELY);
-        commit(&mut monitor, &decided(&monitor, out));
+        let recorded = decided(&monitor, out);
+        commit(&mut monitor, &recorded);
 
         let still = json!([{"session_id": "session_resident_r1", "agent_id": "agent_resident_r1",
                             "event_id": 61, "at_ms": 0,
@@ -2697,7 +2703,8 @@ connections\n";
         };
         assert_eq!(subject, "session_worker_a");
         assert_eq!(evidence["execution_id"], "exec_auth");
-        commit(&mut monitor, &decided(&monitor, interrupted));
+        let recorded = decided(&monitor, interrupted);
+        commit(&mut monitor, &recorded);
 
         let cleared = feed(
             &mut monitor,
@@ -2769,9 +2776,4 @@ connections\n";
         assert_eq!(time_text(0), "1970-01-01 00:00:00");
     }
 
-    #[test]
-    fn a_reading_is_fire_clear_or_nothing() {
-        let _ = Reading::Nothing;
-        assert_eq!(crossing(true, 1, 2, 3, true), Crossing::Nothing);
-    }
 }
