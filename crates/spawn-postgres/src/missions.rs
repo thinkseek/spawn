@@ -657,7 +657,7 @@ from (
          m.gate_rejections, m.gate_aborts, m.gate_room_task, m.gate_room_since_ms,
          m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
-         m.gate_host_due_ms, m.objectives, m.sources ->> 0 as source,
+         m.gate_host_due_ms, m.gate_base_disagrees, m.objectives, m.sources ->> 0 as source,
          (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
          (select max(e.recorded_at_ms) from spawn_events e
            where e.session_id = 'session_control' and e.event_name = 'control.recorded'
