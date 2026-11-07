@@ -31,6 +31,21 @@
 //! (2026-11-07), three objectives whose tasks kept failing held mission 4's
 //! three slots for a day and ten objectives were never assigned.
 //!
+//! **A task over its budget keeps its work** (docs/fleet-architecture.md
+//! §10.4). The integrator stops it and records `task.over_budget`, which
+//! counts toward no halt; this module assigns the objective's next task
+//! once that work has reached the source's `spawn/<agent>` (the overrun's
+//! record names the branch, the commit and its `git diff --stat main`), its
+//! `task.assigned` names `continues` (the overrun task) and its brief names
+//! that task, the branch, the commit and the diff stat, so the work is
+//! continued, not redone. A second overrun of a task that continues one is
+//! not followed by a third task: the supervisor is told once (the
+//! dispatcher's digest, tag `host over-budget-<record>`) and the objective
+//! is held — no task for it — until the mission is configured again (a
+//! `mission.configured` record newer than the overrun's), while the
+//! mission's other objectives take the freed slot. A third overrun after
+//! such a configure is treated as a first.
+//!
 //! An objective assigned again after earlier tasks of it ended without
 //! landing (cancelled, aborted, yielded) gets their work in its brief: each
 //! one's id, last checkpoint, last verdict or reason, and report, with the
@@ -462,6 +477,31 @@ pub(crate) struct Outcome {
     #[serde(rename = "type")]
     pub(crate) kind: String,
     pub(crate) objective: u32,
+    /// The task the outcome is about, and the record's event id and time
+    /// (the overrun's, for a continuation and its hold).
+    #[serde(default)]
+    pub(crate) task: i64,
+    #[serde(default)]
+    pub(crate) event_id: Option<i64>,
+    #[serde(default)]
+    pub(crate) at_ms: Option<i64>,
+    /// A `task.over_budget`'s work: the task it continues (a second overrun
+    /// in a chain), the branch, its commit and the diff stat against main,
+    /// its tool calls, budget and reason.
+    #[serde(default)]
+    pub(crate) continues: Option<i64>,
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    #[serde(default)]
+    pub(crate) commit: Option<String>,
+    #[serde(default)]
+    pub(crate) diff: Option<String>,
+    #[serde(default)]
+    pub(crate) tool_calls: Option<i64>,
+    #[serde(default)]
+    pub(crate) budget: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
     #[serde(default)]
     pub(crate) verdict: Option<String>,
     /// For a conflict, how main went into the workspace (`main_merge`'s
@@ -498,6 +538,56 @@ impl Outcome {
     fn is_yield(&self) -> bool {
         self.kind == "task.cancelled" || (self.kind == "task.aborted" && self.yielded == Some(true))
     }
+}
+
+/// An objective's latest overrun (`task.over_budget`), and the work its next
+/// task continues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Overrun {
+    /// The overrun task.
+    pub(crate) task: i64,
+    /// The task it continues, for a second overrun of a chain.
+    pub(crate) continues: Option<i64>,
+    pub(crate) reason: String,
+    pub(crate) tool_calls: i64,
+    /// `spawn/<agent>`: where the work was kept.
+    pub(crate) branch: String,
+    /// The commit the branch holds, when the push made it there.
+    pub(crate) commit: Option<String>,
+    /// `git diff --stat main <commit>`, when there is a commit.
+    pub(crate) diff: Option<String>,
+    pub(crate) budget: Option<serde_json::Value>,
+    /// When the record was written: a `mission.configured` newer than it
+    /// ends the chain's hold.
+    pub(crate) at_ms: i64,
+}
+
+/// Every objective's latest overrun, from `outcomes` (oldest first).
+pub(crate) fn overruns(outcomes: &[Outcome]) -> BTreeMap<u32, Overrun> {
+    let mut overruns: BTreeMap<u32, Overrun> = BTreeMap::new();
+    for outcome in outcomes.iter().filter(|o| o.kind == "task.over_budget") {
+        overruns.insert(
+            outcome.objective,
+            Overrun {
+                task: outcome.task,
+                continues: outcome.continues,
+                reason: outcome.reason.clone().unwrap_or_default(),
+                tool_calls: outcome.tool_calls.unwrap_or_default(),
+                branch: outcome.branch.clone().unwrap_or_default(),
+                commit: outcome.commit.clone(),
+                diff: outcome.diff.clone(),
+                budget: outcome.budget.clone(),
+                at_ms: outcome.at_ms.unwrap_or_default(),
+            },
+        );
+    }
+    overruns
+}
+
+/// Whether an overrun holds its objective: it continues an overrun task of
+/// the same objective, and the mission was not configured since its record.
+pub(crate) fn holds(overrun: &Overrun, configured_ms: Option<i64>) -> bool {
+    overrun.continues.is_some() && configured_ms.is_none_or(|at| at <= overrun.at_ms)
 }
 
 /// An objective's attempts, read from its tasks' outcomes.
