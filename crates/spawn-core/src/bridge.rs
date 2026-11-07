@@ -3586,6 +3586,8 @@ mod tests {
         /// Screens the log held once the start had settled: a test reads
         /// what was recorded after that.
         record: usize,
+        /// What the start's own tick reported.
+        first: Vec<String>,
     }
 
     impl World {
@@ -3643,7 +3645,7 @@ mod tests {
                     },
                 )
                 .expect("submit");
-            bridge.tick().expect("the start's tick");
+            let first = bridge.tick().expect("the start's tick").warnings;
             let path = store
                 .read_global(GlobalPosition(0), 100)
                 .expect("read")
@@ -3663,6 +3665,7 @@ mod tests {
                 bridge,
                 path,
                 record: 0,
+                first,
             };
             // Two readings in a row: the screen at the prompt is recorded.
             if settle {
@@ -3892,12 +3895,13 @@ mod tests {
     #[test]
     fn a_watch_that_cannot_be_set_falls_back_to_reading_every_pass_once() {
         let mut world = World::polled();
-        let warnings = world.tick();
         assert!(
-            warnings
+            world
+                .first
                 .iter()
                 .any(|warning| warning.contains("read on every pass")),
-            "the fallback is said: {warnings:?}"
+            "the fallback is said: {:?}",
+            world.first
         );
         world.set_pane(BUSY);
         assert_eq!(world.pass(), 1, "read on every pass");
