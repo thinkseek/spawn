@@ -156,6 +156,7 @@ spawn fleet
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |
+| `SPAWN_SCREEN_QUIET_MS` | `500` | 活跃执行的会话记录要静止多久才读一次屏（读的是会话记录说不了的：提示符回来了）。越短越早知道就绪，抓屏也越多 |
 | `SPAWN_STALL_DELIVERY_SECS` | `600` | 停滞上限（整秒，下同；不是非负整数时在 loop 日志里警告并用默认值）：待投递的任务多久没送达就升级给 supervisor。远长于第一次重试（60 s）和工人结束一轮所需的时间 |
 | `SPAWN_STALL_ACTIVITY_SECS` | `900` | 已投递的任务，会话多久没有新事实就升级。一次长构建或测试可以几分钟不写任何东西；工人回合已结束、而它启动的后台任务（会话记录里的 `job.started` 没有 `job.ended`）仍开着时算作活动，不升级 |
 | `SPAWN_STALL_REVIEW_SECS` | `1800` | 报告等 supervisor 审阅多久就升级：审阅要读报告、看代码，supervisor 可能正忙 |
