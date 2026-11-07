@@ -7141,7 +7141,10 @@ mod database_tests {
             brief.contains(&format!("continues task #{}", task.id)),
             "{brief}"
         );
-        assert!(!brief.contains("Earlier tasks"));
+        assert!(
+            brief.contains(&format!("- task {}: cancelled", task.id)),
+            "the overrun task is the work the brief says ended: {brief}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
