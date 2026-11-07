@@ -81,9 +81,21 @@ if ! pg_url_parse "$base_url"; then
   exit 1
 fi
 owner_password=$pg_url_password
+# e2e_psql <psql arguments>: psql on the test database with its connection
+# from PG* variables (pg_url_parse above), never a URL on its command line,
+# which every local user reads in /proc. In this run's schema unless
+# E2E_PSQL_SCHEMA is empty.
+e2e_psql() {
+  (
+    export PGHOST=$pg_url_host PGPORT=$pg_url_port PGUSER=$pg_url_user
+    export PGPASSWORD=$pg_url_password PGDATABASE=$pg_url_database
+    if [ -n "${E2E_PSQL_SCHEMA-$schema}" ]; then export PGOPTIONS="-csearch_path=$schema"; fi
+    psql -X "$@"
+  )
+}
 supervisor_url() {
   local login role salt password
-  login=$(psql -X -q -At "$url" -c "select r.rolname || ' ' || substring(
+  login=$(e2e_psql -q -At -c "select r.rolname || ' ' || substring(
             shobj_description(r.oid, 'pg_authid') from '^spawn login salt ([0-9a-f]{64})$')
             from pg_roles r where r.rolname = spawn_login_role('spawn_supervisor')")
   role=${login% *}
@@ -105,7 +117,7 @@ cleanup() {
   "$tmux" -L "$socket" kill-server 2>/dev/null || true
   rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$socket"
   if [ "${KEEP:-0}" != 1 ] && command -v psql >/dev/null; then
-    psql -q "$base_url" -c "drop schema if exists $schema cascade" >/dev/null 2>&1 || true
+    E2E_PSQL_SCHEMA='' e2e_psql -q -c "drop schema if exists $schema cascade" >/dev/null 2>&1 || true
   fi
   if [ "${KEEP:-0}" != 1 ]; then rm -rf "$work"; else echo "e2e: kept $work" >&2; fi
 }
