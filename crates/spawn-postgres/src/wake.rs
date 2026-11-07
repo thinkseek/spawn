@@ -119,16 +119,12 @@ mod tests {
             .map_or(0, |elapsed| elapsed.subsec_nanos());
         let schema = format!("spawn_test_wake_{}_{nanos:x}", std::process::id());
         let store = PostgresStore::connect_in_schema(&url, &schema).expect("migrate");
-        let before = store.watermark().expect("watermark");
         let mut listener = store.listen().expect("listen");
+        // The channel is the database's, not the schema's: another case's
+        // append may be waiting in it. Drain those first.
+        let _ = listener.wait(Duration::from_millis(500));
         let started = Instant::now();
-        assert_eq!(
-            listener.wait(Duration::from_millis(200)).expect("wait"),
-            0,
-            "an idle log sends nothing"
-        );
-        assert!(started.elapsed() >= Duration::from_millis(200));
-        let started = Instant::now();
+        let before = store.watermark().expect("watermark");
         let submission = spawn_core::command::Submission {
             agent_id: spawn_core::id::AgentId::new("agent_resident_wake").expect("agent"),
             session_id: spawn_core::id::SessionId::new("session_resident_wake").expect("session"),
@@ -144,7 +140,7 @@ mod tests {
         let received = listener.wait(Duration::from_secs(5)).expect("wait");
         assert!(received >= 1, "the append notified the listener");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_millis(2500),
             "the wait ended with the notification, not its timeout"
         );
         assert!(
