@@ -1860,7 +1860,7 @@ impl Bridge {
         // Another Bridge may have started the session since this tick read
         // the log; the log refuses a second start either way.
         self.catch_up()?;
-        if let Some(outcome) = self.started_before(claimed, prompt, native.is_none()) {
+        if let Some(outcome) = self.started_before(claimed, prompt) {
             return outcome;
         }
         let model = model.unwrap_or_else(|| {
@@ -1966,7 +1966,6 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
-        fresh: bool,
     ) -> Result<Outcome, StoreError> {
         // Nothing is typed into a terminal that does not host the runner.
         match self.terminals.runner(&active.terminal(), &active.workspace) {
@@ -2001,7 +2000,7 @@ impl Bridge {
                 format!("the prompt {MAY_HAVE_TYPED}"),
                 false,
             ),
-            Typing::Due => self.prompt_engine(claimed, active, prompt, fresh),
+            Typing::Due => self.prompt_engine(claimed, active, prompt),
         }
     }
 
@@ -2013,11 +2012,10 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         prompt: &str,
-        fresh: bool,
     ) -> Option<Result<Outcome, StoreError>> {
         if let Some(active) = self.running(&claimed.session_id) {
             if active.execution_id == ExecutionId::for_command(claimed.command_id) {
-                return Some(self.go_on_starting(claimed, &active, prompt, fresh));
+                return Some(self.go_on_starting(claimed, &active, prompt));
             }
             return Some(Ok(Outcome::Failed(format!(
                 "{} already runs an execution",
@@ -2177,21 +2175,20 @@ impl Bridge {
         if prompt.is_empty() {
             return Ok(Outcome::Succeeded);
         }
-        self.prompt_engine(claimed, active, prompt, native.is_none())
+        self.prompt_engine(claimed, active, prompt)
     }
 
-    /// Type a started engine's prompt (`fresh`: a new native session, whose
-    /// directory may be new to the engine). An engine that never got it must
-    /// not look alive (whoever started it would wait on it forever): it is
-    /// abandoned.
+    /// Type a started engine's prompt, answering the engine's trust dialog
+    /// first when it shows ([`Self::type_prompt`]). An engine that never got
+    /// it must not look alive (whoever started it would wait on it forever):
+    /// it is abandoned.
     fn prompt_engine(
         &mut self,
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
-        fresh: bool,
     ) -> Result<Outcome, StoreError> {
-        let outcome = self.type_prompt(claimed, active, prompt, fresh)?;
+        let outcome = self.type_prompt(claimed, active, prompt)?;
         if let Outcome::Failed(why) = outcome {
             let discard = self.never_typed(claimed, active)?;
             return self.abandon(claimed, active, why, discard);
@@ -2594,17 +2591,22 @@ impl Bridge {
         }
     }
 
+    /// Wait for the engine's input box, then type `prompt` into it. The
+    /// Bridge exported the workspace itself, for a fresh session and a
+    /// resume alike, so it answers the engine's trust dialog in both: trust
+    /// lives in the engine's own config (`~/.claude.json`), which can forget
+    /// a workspace its session ran in (a host move, a reset or rewritten
+    /// config, a workspace exported at a new path) while the transcript
+    /// survives. Nothing in the log says whether the engine still trusts it.
     fn type_prompt(
         &mut self,
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
-        fresh: bool,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
-        // Only a fresh session's directory can be new to the engine: a
-        // resume runs where its session ran, which was trusted then.
-        let mut trusted = !fresh;
+        // Whether this wait answered the trust dialog already.
+        let mut answered = false;
         // The trust dialog comes before the engine draws any prompt: once a
         // prompt was seen, nothing on the pane is that dialog any more.
         let mut prompt_seen = false;
@@ -2638,15 +2640,16 @@ impl Bridge {
                 };
             let reading = read_claude_screen(&pane);
             prompt_seen |= reading.state != ScreenState::Unknown;
-            // The Bridge exported this directory itself, so it trusts it.
-            // Answer once (a second answer would land in the input box), and
-            // only the dialog itself: on two equal reads, before any prompt.
-            if !trusted && !prompt_seen && is_trust_dialog(&pane) {
+            // The Bridge exported this directory itself, so it trusts it,
+            // whether the session is fresh or resumed. Answer once (a second
+            // answer would land in the input box), and only the dialog
+            // itself: on two equal reads, before any prompt.
+            if !answered && !prompt_seen && is_trust_dialog(&pane) {
                 if dialog.as_deref() != Some(pane.as_str()) {
                     dialog = Some(pane);
                     continue;
                 }
-                trusted = true;
+                answered = true;
                 if let Err(error) =
                     self.terminals
                         .send_keys(&active.terminal(), &active.workspace, &TRUST_KEYS)

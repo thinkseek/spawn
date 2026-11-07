@@ -322,12 +322,15 @@ const TRUST_FOOTER: [&str; 4] = [
 ///
 /// Claude Code asks once per directory whether it trusts the folder, before
 /// it draws the input box. `--settings` cannot silence it: trust lives in the
-/// user's global state, not in settings. The dialog is recognized only when
-/// its own last lines are the last lines of the pane: a line of history that
-/// quotes it (a file the agent printed, redrawn on a resume) is not the
-/// dialog. The caller answers only on a fresh start (a resume runs in a
-/// directory trusted when its session started), before any prompt was
-/// drawn, and only when two reads agree.
+/// user's global state (`~/.claude.json`), not in settings. That state can
+/// forget a directory whose session it ran (a host move, a reset or
+/// rewritten file, a workspace exported at a new path) while the session's
+/// transcript survives, so a resume can show the dialog as well as a fresh
+/// start. The dialog is recognized only when its own last lines are the last
+/// lines of the pane: a line of history that quotes it (a file the agent
+/// printed, redrawn on a resume) is not the dialog. The caller answers it on
+/// a fresh start and on a resume alike, before any prompt was drawn, only
+/// when two reads agree, and once.
 ///
 /// The dialog reads keystrokes, not pasted text: a bracketed paste of `y`
 /// gets "Please answer y or n". Answer it with [`TRUST_KEYS`].
