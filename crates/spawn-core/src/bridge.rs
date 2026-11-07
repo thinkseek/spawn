@@ -3456,3 +3456,429 @@ fn exit_file(active: &Active) -> String {
         active.execution_id
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use super::{Bridge, BridgeConfig};
+    use crate::command::{CommandAction, Submission};
+    use crate::event::{ENGINE, EventKind, GlobalPosition};
+    use crate::id::{
+        AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
+        WorkspaceId,
+    };
+    use crate::memory::{MemoryStore, MemoryWatch};
+    use crate::port::{CommandQueue, EventLog, FileWatch, Launch, TerminalError, TerminalHost};
+    use crate::time::{ManualClock, Timestamp};
+    use std::time::Duration;
+
+    /// A pane at the input box, as the screen reader draws it.
+    const READY: &str = "❯ \n  deepseek-ai/DeepSeek-V4.1-Flash · 余量未知 · 249 tok/s";
+
+    /// A pane of a turn that runs.
+    const BUSY: &str = "✽ Effecting… (esc to interrupt)\n❯ \n  model line";
+
+    /// A pane blocked on a permission dialog.
+    const DIALOG: &str = "Do you want to proceed?\n\
+                          1. Yes\n2. No\n\
+                          Enter to confirm · Esc to cancel\n❯ \n";
+
+    /// The memory terminal, counting the panes it is asked for.
+    struct Counted {
+        inner: Arc<MemoryStore>,
+        captures: Mutex<usize>,
+    }
+
+    impl Counted {
+        fn captures(&self) -> usize {
+            *self.captures.lock().expect("lock")
+        }
+    }
+
+    impl TerminalHost for Counted {
+        fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+            self.inner.start(launch)
+        }
+        fn stage_text(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            text: &str,
+        ) -> Result<(), TerminalError> {
+            self.inner.stage_text(terminal, workspace, text)
+        }
+        fn submit_staged(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.submit_staged(terminal, workspace)
+        }
+        fn send_keys(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            keys: &[&str],
+        ) -> Result<(), TerminalError> {
+            self.inner.send_keys(terminal, workspace, keys)
+        }
+        fn is_alive(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<bool, TerminalError> {
+            self.inner.is_alive(terminal, workspace)
+        }
+        fn runner(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<crate::port::Runner, TerminalError> {
+            self.inner.runner(terminal, workspace)
+        }
+        fn capture_tail(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+            lines: usize,
+        ) -> Result<String, TerminalError> {
+            *self.captures.lock().expect("lock") += 1;
+            self.inner.capture_tail(terminal, workspace, lines)
+        }
+        fn read_from(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            offset: u64,
+        ) -> Result<Option<Vec<u8>>, TerminalError> {
+            self.inner.read_from(workspace, path, offset)
+        }
+        fn write_new(
+            &self,
+            workspace: &WorkspaceId,
+            path: &str,
+            bytes: &[u8],
+        ) -> Result<bool, TerminalError> {
+            self.inner.write_new(workspace, path, bytes)
+        }
+        fn terminate(
+            &self,
+            terminal: &TerminalName,
+            workspace: &WorkspaceId,
+        ) -> Result<(), TerminalError> {
+            self.inner.terminate(terminal, workspace)
+        }
+    }
+
+    /// A Bridge over one memory store, its clock, and a watch the test
+    /// drives. One start command has run in it: a session whose engine waits
+    /// at its prompt, its transcript known and watched.
+    struct World {
+        store: Arc<MemoryStore>,
+        terminal: Arc<Counted>,
+        watch: Arc<MemoryWatch>,
+        clock: Arc<ManualClock>,
+        bridge: Bridge,
+        /// The session's transcript.
+        path: String,
+    }
+
+    impl World {
+        fn new() -> Self {
+            Self::with_watch(Arc::new(MemoryWatch::new()))
+        }
+
+        fn with_watch(watch: Arc<MemoryWatch>) -> Self {
+            let clock: Arc<ManualClock> = Arc::new(ManualClock::new(Timestamp(1_000)));
+            let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+            let terminal = Arc::new(Counted {
+                inner: store.clone(),
+                captures: Mutex::new(0),
+            });
+            let mut config = BridgeConfig::new("tester");
+            config.claude_projects = "/projects".to_string();
+            config.screen_quiet = Duration::from_millis(500);
+            config.screen_refresh = Duration::from_secs(30);
+            config.watch = Some(watch.clone());
+            let mut bridge = Bridge::new(
+                store.clone(),
+                store.clone(),
+                store.clone(),
+                terminal.clone(),
+                config,
+            )
+            .with_clock(clock.clone());
+            let execution = ExecutionId::for_command(CommandId(1));
+            store.set_pane(&TerminalName::for_execution(&execution), READY);
+            store
+                .submit(
+                    &Principal::new("tester").expect("principal"),
+                    &Submission {
+                        agent_id: AgentId::new("agent_one").expect("agent"),
+                        session_id: SessionId::new("session_one").expect("session"),
+                        idempotency_key: IdempotencyKey::new("start").expect("key"),
+                        action: CommandAction::Start {
+                            engine: ENGINE.to_string(),
+                            prompt: String::new(),
+                            parent_session_id: None,
+                            from: None,
+                            model: None,
+                            charter: None,
+                        },
+                    },
+                )
+                .expect("submit");
+            bridge.tick().expect("the start's tick");
+            let path = store
+                .read_global(GlobalPosition(0), 100)
+                .expect("read")
+                .into_iter()
+                .find_map(|record| match record.event.kind {
+                    EventKind::NativeSessionStarted {
+                        transcript_path, ..
+                    } => transcript_path,
+                    _ => None,
+                })
+                .expect("the start records the transcript's path");
+            let mut world = Self {
+                store,
+                terminal,
+                watch,
+                clock,
+                bridge,
+                path,
+            };
+            // Two readings in a row: the screen at the prompt is recorded.
+            world.settle();
+            world
+        }
+
+        fn tick(&mut self) -> Vec<String> {
+            self.bridge.tick().expect("tick").warnings
+        }
+
+        fn pass(&mut self) -> usize {
+            let before = self.terminal.captures();
+            self.tick();
+            self.terminal.captures() - before
+        }
+
+        /// Passes until nothing is captured any more.
+        fn settle(&mut self) {
+            for _ in 0..6 {
+                if self.pass() == 0 {
+                    return;
+                }
+            }
+            panic!("the Bridge kept capturing an idle session");
+        }
+
+        fn advance(&self, millis: u64) {
+            self.clock.advance(Duration::from_millis(millis));
+        }
+
+        /// Append whole lines of the engine's transcript, as the engine
+        /// would, and let the watch say so.
+        fn engine_writes(&mut self, lines: &str) {
+            self.store.append_file(&self.path, lines);
+            self.watch.changed(&self.path);
+        }
+
+        /// The engine's lines the log holds.
+        fn engine_events(&self) -> Vec<&'static str> {
+            self.store
+                .read_global(GlobalPosition(0), 500)
+                .expect("read")
+                .into_iter()
+                .filter(|record| {
+                    record.event.source == crate::event::Source::Claude
+                })
+                .map(|record| record.event.kind.name())
+                .collect()
+        }
+
+        fn screens(&self) -> Vec<&'static str> {
+            self.screen_states()
+        }
+
+        /// The screen states the Bridge recorded, with what each came from.
+        fn screen_states(&self) -> Vec<&'static str> {
+            let _ = &self.screens;
+            self.store
+                .read_global(GlobalPosition(0), 500)
+                .expect("read")
+                .into_iter()
+                .filter_map(|record| match record.event.kind {
+                    EventKind::ScreenObserved { state, .. } => Some(state.key()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn set_pane(&self, pane: &str) {
+            self.store
+                .set_pane(&TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))), pane);
+        }
+    }
+
+    /// A transcript line that ends a turn.
+    const TURN_END: &str = "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"durationMs\":1,\"uuid\":\"t1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\"}\n";
+
+    /// Something the engine wrote during the turn (no checkpoint of a turn's
+    /// end, so nothing is committed).
+    const TOOL_LINE: &str = "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}]}}\n";
+
+    /// A session whose command is in flight (an input waiting for its turn)
+    /// is captured on every pass: its screen is what the delivery waits for.
+    #[test]
+    fn a_session_with_a_command_in_flight_is_captured_every_pass() {
+        let mut world = World::new();
+        assert_eq!(world.pass(), 0, "an idle session costs no capture");
+        world.set_pane(BUSY);
+        world
+            .store
+            .submit(
+                &Principal::new("person").expect("principal"),
+                &Submission {
+                    agent_id: AgentId::new("agent_one").expect("agent"),
+                    session_id: SessionId::new("session_one").expect("session"),
+                    idempotency_key: IdempotencyKey::new("input").expect("key"),
+                    action: CommandAction::Input {
+                        text: "go on".to_string(),
+                        tags: Vec::new(),
+                    },
+                },
+            )
+            .expect("submit");
+        // The input finds the pane busy and waits for its turn.
+        world.tick();
+        let held = world.pass();
+        assert_eq!(held, 1, "the pass after the claim captures once");
+        assert_eq!(world.pass(), 1, "a waiting command keeps the pane read");
+        world.advance(500);
+        assert_eq!(world.pass(), 1);
+    }
+
+    /// A transcript that grew does not take the pane with it: the screen is
+    /// read once the transcript has held still, then again until two
+    /// readings agree, and then not again until the backstop.
+    #[test]
+    fn a_grown_transcript_waits_for_quiet_then_two_readings() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.engine_writes(TOOL_LINE);
+        world.advance(100);
+        assert_eq!(world.pass(), 0, "the transcript only just grew");
+        assert!(
+            world.engine_events().contains(&"tool.started"),
+            "the transcript is read as soon as it changed: {:?}",
+            world.engine_events()
+        );
+        world.advance(500);
+        assert_eq!(world.pass(), 1, "quiet for the bound: one reading");
+        assert_eq!(
+            world.screens(),
+            Vec::<&str>::new(),
+            "one reading is not a fact"
+        );
+        world.advance(500);
+        assert_eq!(world.pass(), 1, "the second reading, which agrees");
+        assert_eq!(world.screens(), vec!["busy"]);
+        world.advance(500);
+        assert_eq!(world.pass(), 0, "and then nothing more");
+    }
+
+    /// The backstop: a screen that changes with nothing in the transcript (a
+    /// dialog, a crash to a shell) is read once per `screen_refresh`.
+    #[test]
+    fn the_backstop_reads_a_screen_the_transcript_does_not_move() {
+        let mut world = World::new();
+        world.set_pane(DIALOG);
+        assert_eq!(world.pass(), 0, "not yet due");
+        world.advance(29_000);
+        assert_eq!(world.pass(), 0, "still short of the backstop");
+        world.advance(1_000);
+        assert_eq!(world.pass(), 1, "the backstop reads it");
+        assert_eq!(world.pass(), 1, "the reading waits for its twin");
+        assert_eq!(world.screens(), vec!["permission"]);
+        assert_eq!(world.pass(), 0, "and then nothing until the next");
+    }
+
+    /// A busy screen is recorded again every `screen_refresh` while the turn
+    /// keeps it busy, so the Observer keeps a current fact for a long turn.
+    #[test]
+    fn a_busy_screen_is_recorded_again_every_refresh() {
+        let mut world = World::new();
+        world.set_pane(BUSY);
+        world.advance(30_000);
+        world.pass();
+        world.pass();
+        assert_eq!(world.screens(), vec!["busy"]);
+        world.advance(30_000);
+        world.pass();
+        world.pass();
+        assert_eq!(
+            world.screens(),
+            vec!["busy", "busy"],
+            "a long turn keeps a current fact"
+        );
+    }
+
+    /// A change is read once, and a line written while a read is in progress
+    /// is read at the next pass: never lost to the moment it was written.
+    #[test]
+    fn a_transcript_change_is_read_once_and_a_half_written_line_next_pass() {
+        let mut world = World::new();
+        world.engine_writes(TOOL_LINE);
+        world.tick();
+        assert_eq!(world.engine_events(), vec!["tool.started"]);
+        world.tick();
+        assert_eq!(
+            world.engine_events(),
+            vec!["tool.started"],
+            "nothing read twice"
+        );
+        // Half a line, with no change reported afterwards: the read that
+        // took it left it half-written, so the next pass reads again.
+        world
+            .store
+            .append_file(&world.path, "{\"type\":\"user\",\"uuid\":\"u1\"");
+        world.watch.changed(&world.path);
+        world.tick();
+        assert_eq!(world.engine_events(), vec!["tool.started"]);
+        world
+            .store
+            .append_file(&world.path, ",\"timestamp\":\"2099-01-01T00:00:00.000Z\"}\n");
+        world.tick();
+        assert_eq!(
+            world.engine_events(),
+            vec!["tool.started", "turn.stopped"],
+            "the rest of the line is read at the next pass"
+        );
+    }
+
+    /// A session whose files cannot be watched is read on every pass, as
+    /// before, and the fallback is said once.
+    #[test]
+    fn a_watch_that_cannot_be_set_falls_back_to_reading_every_pass_once() {
+        let mut world = World::with_watch(Arc::new(MemoryWatch::refusing()));
+        let warnings = world.tick();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("read on every pass")),
+            "the fallback is said: {warnings:?}"
+        );
+        world.set_pane(BUSY);
+        assert_eq!(world.pass(), 1, "read on every pass");
+        assert_eq!(world.pass(), 1);
+        let warnings = world.tick();
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("read on every pass")),
+            "said once: {warnings:?}"
+        );
+    }
+}
