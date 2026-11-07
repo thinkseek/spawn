@@ -459,10 +459,9 @@ it, on the same ladder.
   supervisor at any time (the box at the top of the Fleet page, its pane, or
   `spawn submit`), and to any agent (the box in its detail drawer; both
   boxes are `POST /api/session/<id>/input`, §5); the supervisor reads that
-  as an instruction, which may reverse one
-  of its decisions, not as the answer to a question. Each human action is a
-  command with principal `human`; it is the event the whole system tries to
-  make rarer.
+  as an instruction, which may reverse one of its decisions, not as the
+  answer to a question. Each human action is a command with principal
+  `human`; it is the event the whole system tries to make rarer.
 - **Inputs to a busy session wait for its turn.** A person's or the
   supervisor's input (`spawn submit` or the web page's input box, any
   principal but `spawn-dispatch`, `spawn-integrate` and `spawn-liveness`)
