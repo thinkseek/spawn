@@ -254,7 +254,6 @@ struct Row {
     kind: String,
     subject: String,
     state: String,
-    #[allow(dead_code)]
     evidence: Value,
     fired_event_id: i64,
     fired_at_ms: i64,
