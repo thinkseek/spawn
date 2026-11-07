@@ -295,7 +295,7 @@ fn the_129_sequence_replayed_from_events_escalates() {
     );
     let failed = facts.failed_resume.as_ref().expect("the failed resume");
     assert_eq!(failed.execution_id, second.as_str());
-    assert_eq!(failed.command_id, Some(resume.0));
+    assert_eq!(failed.command_id, i64::try_from(resume.0).ok());
     assert!(
         plan.orders.is_empty(),
         "not resumed again: {:?}",
@@ -430,7 +430,7 @@ fn a_resume_that_succeeded_and_died_young_follows_the_young_death_rule_through_t
         .sent(&sent[0])
         .and_then(|sent| sent.id)
         .expect("the resume's command");
-    let terminal = World::terminal(CommandId(resume));
+    let terminal = World::terminal(CommandId(u64::try_from(resume).expect("an id")));
     world.host.set_pane(&terminal, READY);
     world.tick();
     let (rows, _) = world.db.plan();
