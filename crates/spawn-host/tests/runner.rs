@@ -218,8 +218,19 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
         .expect("start");
-    let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
-        panic!("a dead pane hosts no runner");
+    // tmux marks the pane dead when its terminal closes, and records the
+    // exit status when it reaps the process, a moment later on a loaded host
+    // ("exit status none" in between: an owner gate, 2026-11-07). Wait for
+    // the status, within the same bound.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let seen = loop {
+        let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
+            panic!("a dead pane hosts no runner");
+        };
+        if !seen.contains("exit status none") || Instant::now() > deadline {
+            break seen;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
     assert!(seen.contains("dead (exit status 3)"), "{seen}");
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
