@@ -1095,7 +1095,7 @@ fn decrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> 
 /// file to upload); the credentials are added here, on stdin, never argv.
 struct Response {
     status: u16,
-    body: String,
+    body: Vec<u8>,
     headers: String,
 }
 
@@ -1145,7 +1145,7 @@ max-time = \"600\"\nconnect-timeout = \"20\"\n{config}",
         .ok_or_else(|| format!("curl: no status in its output ({})", stdout.trim()))?;
     Ok(Response {
         status,
-        body: fs::read_to_string(&body_file).unwrap_or_default(),
+        body: fs::read(&body_file).unwrap_or_default(),
         headers: fs::read_to_string(&headers_file).unwrap_or_default(),
     })
 }
@@ -1181,10 +1181,11 @@ fn list_bucket(settings: &Settings) -> Result<(u64, Vec<(String, u64)>), String>
             return Err(format!(
                 "ListObjectsV2 answered {}: {}",
                 response.status,
-                first_line(&response.body)
+                first_line(&String::from_utf8_lossy(&response.body))
             ));
         }
-        let (page, next) = parse_listing(&response.body);
+        let text = String::from_utf8_lossy(&response.body).into_owned();
+        let (page, next) = parse_listing(&text);
         for (key, size) in &page {
             total = total.saturating_add(*size);
             keys.push((key.clone(), *size));
@@ -1241,7 +1242,7 @@ header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
         return Err(format!(
             "PUT {key} answered {}: {}",
             response.status,
-            first_line(&response.body)
+            first_line(&String::from_utf8_lossy(&response.body))
         ));
     }
     let etag = header_value(&response.headers, "etag").unwrap_or_default();
@@ -1919,18 +1920,9 @@ fn restore_and_compare(
 
 /// The object's bytes, as they are (not through a String), and its headers.
 fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<(Vec<u8>, String)>, String> {
-    let scratch = Scratch::new("fetch")?;
-    let output = scratch.join("object");
-    let options = format!(
-        "output = \"{}\"\n",
-        escape_config(&output.display().to_string())
-    );
-    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
+    let response = bucket_request(settings, &settings.r2.url(key), "")?;
     match response.status {
-        200 => Ok(Some((
-            fs::read(&output).map_err(|error| format!("{}: {error}", output.display()))?,
-            response.headers,
-        ))),
+        200 => Ok(Some((response.body, response.headers))),
         404 => Ok(None),
         status => Err(format!("GET {key} answered {status}")),
     }
