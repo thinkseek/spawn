@@ -1156,11 +1156,17 @@ record of what was judged (§14 of design.md).
     reports (`mission_news`) and `spawn_task_review` refuses them, because
     a review could send back the revision the gate is judging. Both stand
     until the Review point is built (§1.1, §9);
-  - budget: `--minutes` and `--tool-calls`. A delivered task over budget is
-    aborted (`task.aborted`) and its worker stopped (the Stop is submitted
-    before the record, so a failed record is retried with it; a Stop that
-    fails is pursued and escalated by the dispatcher); an abort counts
-    toward the abort halt, not as a rejection.
+  - budget: `--minutes` and `--tool-calls`. A delivered task over budget
+    keeps its work: its worker is stopped (the Stop is submitted before the
+    record, so a failed record is retried with it; a Stop that fails is
+    pursued and escalated by the dispatcher) and the overrun is its own
+    record, `task.over_budget`, written once the work reached the source's
+    `spawn/<agent>` so it names the branch, the commit and the commit's
+    diff stat; it counts toward no halt, and the objective's next task
+    continues that work (§10.4, "A task over its budget keeps its work").
+    `task.aborted` keeps its other meaning (a landing gone stale after its
+    mission was done); records from before this were overruns recorded as
+    aborts, and count toward the abort halt as they were written.
     The minutes are active time, never the wall clock (`integrate::active_ms`):
     from the delivery, through each event of the task's session, to now.
     Readings are no events here: the Bridge re-reads a busy pane every
@@ -1616,7 +1622,9 @@ record of what was judged (§14 of design.md).
     `incompatible`, or `conflict` when the worker got conflicts to resolve
     (the record's `merge` is `marked`, `unmarked` or `pending`, or absent on
     records from before it was named; not `not_mounted`, `busy`, `failed`
-    or a clean merge), or an abort over budget. The host's outcomes
+    or a clean merge). A budget overrun is not one: it says the task is
+    bigger than its budget, not that the work failed, and it is handled on
+    its own (below). The host's outcomes
     (`no_room`, `host_fault`, a gate `aborted`) count for nothing, as for
     the halt rules, and an `accepted` verdict ends the count. Once an
     objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3, a whole number from 1)
@@ -1629,12 +1637,11 @@ record of what was judged (§14 of design.md).
     any other cancel by the integrator). Its work is set aside like any
     cancel's, no halt counts it, the supervisor's digest tells it once
     (`missions objective-yielded-<event id>`), and a resident's cancel
-    notice gives the reason. An abort over budget that is the objective's
-    limit-th failed attempt is the yield itself: its `task.aborted` carries
-    `yielded`, the count and a `yield_reason`, and is told the same way
-    (otherwise the objective kept its failures and no yield, sorted ahead,
-    and its next task yielded at once). The objective goes to the back of
-    the queue. A task whose gate runs now, or that this pass
+    notice gives the reason, and records from before an overrun was its
+    own record still count as they were written (an abort over budget that
+    was its objective's limit-th failed attempt carried `yielded`, the
+    count and a `yield_reason`). The objective goes to the back of the
+    queue. A task whose gate runs now, or that this pass
     aborted, does not yield; the slot an abort frees is filled from the
     next pass on, fewest attempts first, so the aborted objective is not
     re-issued at once. Before this, on 2026-11-07, three objectives whose
@@ -1679,6 +1686,37 @@ record of what was judged (§14 of design.md).
     names no branch: a worker has no `.git` and cannot read one. The first
     prompt of a forked task (below) says its workspace already contains
     that work.
+  - **A task over its budget keeps its work.** The integrator stops a
+    delivered task over its mission's budget and records
+    `task.over_budget` {`reason`, `tool_calls`, `elapsed_ms`, `budget` (the
+    mission's, as it was), `branch`, `commit`, `diff`, and `continues` when
+    it continues an overrun}; the record is written once the Stop's final
+    checkpoint reached the source's `spawn/<agent>` (read from the source
+    after the Stop, never assumed), so `commit` and `diff` (`git diff
+    --stat main <commit>`) name the work; a push that failed is said so
+    instead (`pushed: false`, and in the log). It is never a `task.aborted`:
+    the mission's `gate_aborts` and `gate_rejections` stay as they were, no
+    run of either is broken or started, and the task leaves flight without
+    a report or a gate. The objective's next task is assigned once that
+    work is on the branch, its `task.assigned` names `continues` (the
+    overrun task) and its record carries `budget`, and its brief names the
+    overrun task (#id, its objective, the reason and the tool calls), the
+    branch, the commit and the commit's diff stat, and says the work is in
+    its workspace to continue, not to redo; the dispatcher forks its
+    workspace from that work, as for any earlier task's work, so a worker
+    that never started from main finds it. Its budget is the mission's; it
+    may be raised once, for that task only, to at most twice the budget.
+    A **second overrun** of a task that continues one is recorded the same
+    way and escalated to the supervisor once: a digest item tagged `host
+    over-budget-<record>`, naming both tasks (#id each), the objective, the
+    branch and its diff stat, the budget and the tool calls, and what can
+    be done (split the objective, raise the budget with `spawn mission
+    configure`, or take it over). The objective is then held: no task is
+    issued for it until the mission is configured again (a
+    `mission.configured` record newer than the overrun's), while the
+    mission's other objectives take the freed slot. A third overrun after
+    such a configure is treated as a first. Everything is read from the
+    records (§14), never from the integrator's memory.
   - **An ephemeral task starts from that work.** When the newest earlier
     task of its objective that ended without landing left work (a
     checkpoint of its own while it ran, before its set-aside if it was a
