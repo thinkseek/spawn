@@ -1280,7 +1280,12 @@ create table if not exists mission_tasks (
     -- The owner's hold this landing task last waited behind (`task.held`,
     -- the `source.held` record's event id): its `land()` pushed nothing
     -- under it. Set only by `task.held`; the hold's end does not clear it.
-    held_by         bigint
+    held_by         bigint,
+    -- The task this one re-issues (its `task.assigned` names it): a first
+    -- delivery spent without typing is cancelled and assigned again once,
+    -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
+    -- re-issued again.
+    reissue_of      bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1312,6 +1317,7 @@ alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
 alter table mission_tasks add column if not exists held_by bigint;
+alter table mission_tasks add column if not exists reissue_of bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1437,12 +1443,13 @@ begin
                    (select r.state from mission_residents r where r.agent_id = k.agent_id));
     when 'task.assigned' then
         insert into mission_tasks (id, mission_id, kind, agent_id, session_id, brief,
-                                   created_by, objective, scenario, model,
+                                   created_by, objective, scenario, model, reissue_of,
                                    created_at_ms, updated_at_ms)
         values (v_id, (p_record ->> 'mission_id')::bigint, p_record ->> 'kind',
                 p_record ->> 'agent_id', p_record ->> 'session_id', p_record ->> 'brief',
                 p_record ->> 'created_by', (p_record ->> 'objective')::integer,
-                p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'), p_at, p_at);
+                p_record ->> 'scenario', coalesce(p_record ->> 'model', 'default'),
+                (p_record ->> 'reissue_of')::bigint, p_at, p_at);
         update mission_missions set state = 'active', updated_at_ms = p_at
          where id = (p_record ->> 'mission_id')::bigint and state = 'open';
     when 'mission.configured' then
@@ -1683,6 +1690,11 @@ begin
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
+        null;
+    when 'task.fork_failed' then
+        -- The dispatcher could not fork an objective task's workspace from
+        -- its predecessor's work (spawn_task_fork_failed): read from the
+        -- log, folded into no table.
         null;
     when 'source.push_requested' then
         -- The owner asked for a commit on a source's main (`spawn mission
@@ -2046,6 +2058,41 @@ begin
     return true;
 end $$;
 
+-- The dispatcher's fork of an assigned objective task's workspace from its
+-- predecessor's work failed (crates/spawn-cli/src/main_merge.rs
+-- `fork_from_prior`). Recorded once per task, the first failure's error,
+-- the predecessor and its commit; returns how long ago that first failure
+-- was recorded (ms, the database's clock), from which the dispatcher stops
+-- holding the task's Start and starts it without the fork. A task that is
+-- not assigned records nothing (null).
+create or replace function spawn_task_fork_failed(p_task bigint, p_from bigint, p_commit text,
+                                                  p_error text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_first bigint;
+begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record forks', session_user using errcode = '42501';
+    end if;
+    if not exists (select 1 from mission_tasks where id = p_task and state = 'assigned') then
+        return null;
+    end if;
+    select min(e.recorded_at_ms) into v_first
+      from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'id' = p_task::text
+       and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.fork_failed';
+    if v_first is null then
+        perform spawn_control_record(jsonb_build_object(
+            'type', 'task.fork_failed', 'id', p_task, 'from', p_from, 'commit', p_commit,
+            'error', p_error));
+        return 0;
+    end if;
+    return spawn_now_ms() - v_first;
+end $$;
+
 -- Review a report: accept, or send it back with a note. `p_revision` names
 -- the revision of the report the reviewer read (`revisions` in the news and
 -- the board); a review of another revision is refused, so a decision on an
@@ -2107,6 +2154,75 @@ begin
     end if;
     perform spawn_control_record(jsonb_build_object('type', 'task.cancelled', 'id', p_task,
                                                     'by', spawn_task_cancel_by()));
+end $$;
+
+-- The dispatcher's re-issue, owner only (docs/fleet-architecture.md §3,
+-- "Deliveries"): a task waiting for its first delivery, whose retries are
+-- spent and none of whose attempts may have typed, is cancelled and
+-- assigned again, in this one transaction, so its objective (if any) has a
+-- task in flight throughout. `p_attempts` is every attempt of the spent
+-- delivery, in order (`command`, `key`, `error`), as the dispatcher read
+-- them from the queue: the `task.cancelled` record keeps them, names `by`
+-- `spawn-dispatch` and `reissued_as` the new task, whose `task.assigned`
+-- names `reissue_of` and copies the old task's mission, kind, worker (a
+-- resident's; an ephemeral task gets a new worker with the same label, as
+-- `spawn_task_assign` names it), brief, model, objective, scenario and
+-- `created_by`. Refused for a task that is not `assigned` at revision 0,
+-- one that is itself a re-issue, or one the closure rule holds. Returns the
+-- new task's id.
+create or replace function spawn_task_reissue(p_task bigint, p_attempts jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_old mission_tasks%rowtype;
+    v_id bigint;
+    v_agent text;
+    v_session text;
+    v_label text;
+begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not re-issue tasks', session_user using errcode = '42501';
+    end if;
+    select * into v_old from mission_tasks where id = p_task;
+    if v_old.id is null then
+        raise exception 'task % does not exist', p_task;
+    end if;
+    if v_old.state <> 'assigned' or v_old.revisions <> 0 then
+        raise exception 'task % is %, not waiting for its first delivery: it is not re-issued',
+            p_task, v_old.state;
+    end if;
+    if v_old.reissue_of is not null then
+        raise exception 'task % re-issues task % already: it is not re-issued again',
+            p_task, v_old.reissue_of;
+    end if;
+    if jsonb_typeof(p_attempts) is distinct from 'array' or jsonb_array_length(p_attempts) = 0 then
+        raise exception 'the re-issue of task % names no attempts of its delivery', p_task;
+    end if;
+    if not exists (select 1 from mission_missions
+                    where id = v_old.mission_id and state in ('open', 'active'))
+       or not spawn_task_may_move(p_task, 'cancelled') then
+        raise exception 'task % may not be assigned again (its mission or worker is closed)',
+            p_task;
+    end if;
+    v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
+    if v_old.kind = 'ephemeral' then
+        v_label := coalesce(substring(v_old.agent_id from '^agent_worker_(.+)_[0-9]+$'), 'task');
+        v_agent := format('agent_worker_%s_%s', v_label, v_id);
+        v_session := format('session_worker_%s_%s', v_label, v_id);
+    else
+        v_agent := v_old.agent_id;
+        v_session := v_old.session_id;
+    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'task.cancelled', 'id', p_task, 'by', 'spawn-dispatch', 'reissued_as', v_id,
+        'attempts', p_attempts));
+    perform spawn_control_record(jsonb_strip_nulls(jsonb_build_object(
+        'type', 'task.assigned', 'id', v_id, 'mission_id', v_old.mission_id,
+        'kind', v_old.kind, 'agent_id', v_agent, 'session_id', v_session,
+        'brief', v_old.brief, 'model', v_old.model, 'created_by', v_old.created_by,
+        'objective', v_old.objective, 'scenario', v_old.scenario, 'reissue_of', p_task)));
+    return v_id;
 end $$;
 
 -- A resident starts only after a human approves it.
@@ -2174,6 +2290,8 @@ drop function if exists spawn_mission_configure(bigint, text, text, jsonb);
 create or replace function spawn_mission_configure(p_mission bigint, p_gate text, p_accept text,
                                                    p_budget jsonb, p_objectives jsonb)
 returns void language plpgsql security definer as $$
+declare
+    v_landing bigint;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
@@ -2214,9 +2332,112 @@ begin
         raise exception 'mission % has a remote source: a gate lands only on a directory on this host',
                         p_mission;
     end if;
+    -- GitHub issue #9: a task in `landing` (accepted, not yet landed) is
+    -- landed by the integrator only while its mission has a gate it accepts
+    -- by; clearing the gate, or moving accept away from gate, would leave the
+    -- task where nothing lands it and `spawn task cancel` refuses it. So
+    -- neither goes through while a task of the mission is landing.
+    select k.id into v_landing
+      from mission_tasks k join mission_missions m on m.id = k.mission_id
+     where k.mission_id = p_mission and k.state = 'landing'
+       and ((m.gate is not null and p_gate is null)
+            or (m.accept = 'gate' and coalesce(p_accept, 'review') <> 'gate'))
+     order by k.id limit 1;
+    if v_landing is not null then
+        raise exception 'mission %: task % is landing; clearing the gate or moving accept away from gate waits until nothing lands',
+            p_mission, v_landing;
+    end if;
     perform spawn_control_record(jsonb_build_object(
         'type', 'mission.configured', 'id', p_mission, 'gate', p_gate,
         'accept', coalesce(p_accept, 'review'), 'budget', p_budget, 'objectives', p_objectives));
+end $$;
+
+-- Change some of a mission's settings and keep the rest (owner only;
+-- `spawn mission configure`, objective 027). `p_change` names only what
+-- changes: `gate` and `accept` replace theirs when present (a JSON null
+-- gate clears it); `budget` and `objectives` merge key by key into the
+-- current ones (a key set to null is removed, so `workers` falls back to
+-- its default 1; the whole setting set to null is cleared; one left empty
+-- is cleared). The result is computed from the mission's row read under
+-- the append lock that records it, so a concurrent change is never lost and
+-- no caller stores a configuration it did not read; `spawn_mission_configure`
+-- checks it and records it whole: `mission.configured` always carries every
+-- setting. A change that leaves the settings as they were records nothing.
+-- Returns `{mission, before, after}`, each `{gate, accept, budget,
+-- objectives}`.
+create or replace function spawn_mission_reconfigure(p_mission bigint, p_change jsonb)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_gate text;
+    v_accept text;
+    v_budget jsonb;
+    v_objectives jsonb;
+    v_before jsonb;
+    v_after jsonb;
+    v_key text;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only a human sets a mission''s gate' using errcode = '42501';
+    end if;
+    if jsonb_typeof(p_change) is distinct from 'object' then
+        raise exception 'a mission''s change is a JSON object, not %', p_change;
+    end if;
+    for v_key in select jsonb_object_keys(p_change) loop
+        if v_key not in ('gate', 'accept', 'budget', 'objectives') then
+            raise exception 'a mission has no setting %', v_key;
+        end if;
+    end loop;
+    select gate, accept, budget, objectives into v_gate, v_accept, v_budget, v_objectives
+      from mission_missions where id = p_mission and state in ('open', 'active');
+    if not found then
+        raise exception 'mission % is not open', p_mission;
+    end if;
+    -- The fold stores a setting recorded as null as JSON null: no setting.
+    v_budget := nullif(v_budget, 'null'::jsonb);
+    v_objectives := nullif(v_objectives, 'null'::jsonb);
+    v_before := jsonb_build_object('gate', v_gate, 'accept', v_accept, 'budget', v_budget,
+                                   'objectives', v_objectives);
+    if p_change ? 'gate' then
+        v_gate := p_change ->> 'gate';
+    end if;
+    if p_change ? 'accept' then
+        v_accept := p_change ->> 'accept';
+    end if;
+    v_budget := spawn_settings_merge(v_budget, p_change, 'budget');
+    v_objectives := spawn_settings_merge(v_objectives, p_change, 'objectives');
+    v_after := jsonb_build_object('gate', v_gate, 'accept', coalesce(v_accept, 'review'),
+                                  'budget', v_budget, 'objectives', v_objectives);
+    if v_after is distinct from v_before then
+        perform spawn_mission_configure(p_mission, v_gate, v_accept, v_budget, v_objectives);
+    end if;
+    return jsonb_build_object('mission', p_mission, 'before', v_before, 'after', v_after);
+end $$;
+
+-- One setting of `spawn_mission_reconfigure`: `p_current` with
+-- `p_change -> p_name` merged into it key by key. Absent from `p_change`:
+-- unchanged. A JSON null: cleared. A key set to null: removed. Empty after
+-- the merge: cleared (null).
+create or replace function spawn_settings_merge(p_current jsonb, p_change jsonb, p_name text)
+returns jsonb language plpgsql immutable as $$
+declare
+    v_change jsonb := p_change -> p_name;
+    v_merged jsonb;
+begin
+    if not p_change ? p_name then
+        return p_current;
+    end if;
+    if jsonb_typeof(v_change) = 'null' then
+        return null;
+    end if;
+    if jsonb_typeof(v_change) is distinct from 'object' then
+        raise exception 'a mission''s % is a JSON object, not %', p_name, v_change;
+    end if;
+    -- Only this level's nulls are removed (jsonb_strip_nulls is deep).
+    select coalesce(jsonb_object_agg(key, value), '{}'::jsonb) into v_merged
+      from jsonb_each(coalesce(p_current, '{}'::jsonb) || v_change)
+     where jsonb_typeof(value) <> 'null';
+    return case when v_merged = '{}'::jsonb then null else v_merged end;
 end $$;
 
 -- The integrator assigns one of an objective mission's open objectives
@@ -2299,7 +2520,11 @@ end $$;
 -- The owner moved a source's main forward outside the gate (a deploy): the
 -- missions whose baseline is `p_from` take `p_to` instead of halting. The
 -- caller checks that `p_to` descends from `p_from`; returns how many missions
--- moved. A mission without a baseline yet, or halted, is left alone.
+-- moved. A mission without a baseline yet, or halted, is left alone. The
+-- move is recorded for every deploy, also when it moves no mission
+-- (`missions` empty: the fold moves nothing then): a deploy is when a host
+-- fault may have gone, and the dispatcher tries every spent delivery once
+-- more after each `source.moved` record.
 create or replace function spawn_source_moved(p_source text, p_from text, p_to text)
 returns integer language plpgsql security definer as $$
 declare
@@ -2315,11 +2540,9 @@ begin
     select count(*), coalesce(jsonb_agg(id order by id), '[]'::jsonb) into v_count, v_missions
       from mission_missions
      where sources ->> 0 = p_source and baseline = p_from and halted is null;
-    if v_count > 0 then
-        perform spawn_control_record(jsonb_build_object(
-            'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
-            'missions', v_missions));
-    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'source.moved', 'source', p_source, 'from', p_from, 'to', p_to,
+        'missions', v_missions));
     return v_count;
 end $$;
 
@@ -2393,9 +2616,23 @@ begin
     end if;
     if p_record ->> 'type' is null
        or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
-                                      'task.held', 'source.hold_expired', 'source.moved',
-                                      'source.push_refused') then
+                                      'task.held', 'source.hold_expired', 'task.cancelled',
+                                      'source.moved', 'source.push_refused') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- The integrator cancels one kind of task: an objective's task in flight
+    -- whose objective ran out of attempts, which yields its slot
+    -- (spawn-cli objectives.rs). The cancel's fold sets its work aside and
+    -- counts toward no halt.
+    if p_record ->> 'type' = 'task.cancelled' then
+        if p_record ->> 'yielded' is distinct from 'true' or not exists (
+            select 1 from mission_tasks
+             where id = (p_record ->> 'id')::bigint and objective is not null
+               and state in ('assigned', 'delivered', 'revise')) then
+            raise exception 'the integrator cancels only an objective''s task in flight that yields its slot, not task %',
+                            p_record ->> 'id';
+        end if;
+        p_record := p_record || jsonb_build_object('by', 'spawn-integrate');
     end if;
     -- The outcome of an owner's landing names its request: a
     -- `source.push_requested` that has no outcome yet, so every request has
@@ -2517,6 +2754,7 @@ begin
                               when 'task.landed' then array['landing']
                               when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
+                              when 'task.cancelled' then array['assigned', 'delivered', 'revise']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
     end if;
@@ -2809,6 +3047,14 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
+-- The `source.moved` records (deploys), found without reading the rest of
+-- the stream: the dispatcher reads the latest on every step
+-- (`LATEST_SOURCE_MOVED`).
+create index if not exists spawn_events_source_moved
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'source.moved';
+
 -- The `no_room` gate records that escalate, found without reading the rest
 -- of the stream (the dispatcher reads them on every step).
 create index if not exists spawn_events_gate_room
@@ -2966,14 +3212,17 @@ begin
         'spawn_mission_add(text, jsonb, text)', 'spawn_mission_close(bigint, text, text)',
         'spawn_task_assign(bigint, text, text, text, text)',
         'spawn_task_review(bigint, boolean, text, integer)',
-        'spawn_task_cancel(bigint)', 'spawn_resident_propose(text, text)',
+        'spawn_task_cancel(bigint)', 'spawn_task_reissue(bigint, jsonb)',
+        'spawn_resident_propose(text, text)',
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
         'spawn_task_report_unfinished(bigint, text, jsonb, text, bigint)',
         'spawn_task_report_unfinished_recorded(bigint, text)',
+        'spawn_task_fork_failed(bigint, bigint, text, text)',
         'spawn_control_apply(jsonb, bigint, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
+        'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',

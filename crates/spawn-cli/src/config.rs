@@ -4,7 +4,7 @@
 //! Configuration is environment first, so a terminal started by the Bridge
 //! carries everything its hook and runner need.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use spawn_postgres::PostgresStore;
@@ -225,20 +225,41 @@ mod tests {
     }
 }
 
-/// `--name value` arguments, as every subcommand takes them.
+/// `--name value` arguments, as every subcommand takes them, and the
+/// value-less switches a subcommand declares (`--no-gate`).
 #[derive(Debug, Default)]
 pub(crate) struct Flags {
     values: HashMap<String, String>,
+    switches: HashSet<String>,
 }
 
 impl Flags {
     pub(crate) fn parse(arguments: &[String]) -> Result<Self, String> {
+        Self::parse_with_switches(arguments, &[])
+    }
+
+    /// As [`Flags::parse`], except that the names in `switches` take no
+    /// value: a switch followed by a word that is not a flag is refused
+    /// (`--no-gate x`), and every other flag still needs its value.
+    pub(crate) fn parse_with_switches(
+        arguments: &[String],
+        switches: &[&str],
+    ) -> Result<Self, String> {
         let mut flags = Self::default();
-        let mut rest = arguments.iter();
+        let mut rest = arguments.iter().peekable();
         while let Some(word) = rest.next() {
             let Some(name) = word.strip_prefix("--") else {
                 return Err(format!("unexpected argument {word}"));
             };
+            if switches.contains(&name) {
+                if let Some(next) = rest.peek()
+                    && !next.starts_with("--")
+                {
+                    return Err(format!("--{name} takes no value, found {next}"));
+                }
+                flags.switches.insert(name.to_string());
+                continue;
+            }
             let Some(next) = rest.next() else {
                 return Err(format!("--{name} needs a value"));
             };
@@ -250,8 +271,19 @@ impl Flags {
         Ok(flags)
     }
 
+    /// Whether the switch `name` was given.
+    pub(crate) fn switch(&self, name: &str) -> bool {
+        self.switches.contains(name)
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<String> {
         self.values.get(name).cloned()
+    }
+
+    /// The names of the flags given (values only, not switches), in no
+    /// order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.values.keys().map(String::as_str)
     }
 
     pub(crate) fn required(&self, name: &str) -> Result<String, String> {

@@ -156,6 +156,8 @@ spawn fleet
 | `SPAWN_JUDGE_URL` | 未设 | 判定服务根地址，未设时用内置规则 |
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |
+| `SPAWN_DELIVERY_RETRY_SECS` | `60` | 投递失败（什么也没打进去）后第一次计数重试前的等待（整秒，不是非负整数时在 loop 日志里警告并用默认值），之后每次加倍，至多 30 分钟；共重试 3 次（窗格未就绪的前 10 次拒绝不计） |
+| `SPAWN_REISSUE_AFTER_SECS` | `300` | 首次投递的重试用尽、且没有一次可能打进去时，从最后一次尝试结束到重发（取消并重新分派一次，`spawn_task_reissue`）的等待（整秒，同上）。给一次部署修好主机的时间；部署后（`source.moved`）每个用尽的投递会立即再试一次 |
 | `SPAWN_STALL_DELIVERY_SECS` | `600` | 停滞上限（整秒，下同；不是非负整数时在 loop 日志里警告并用默认值）：待投递的任务多久没送达就升级给 supervisor。远长于第一次重试（60 s）和工人结束一轮所需的时间 |
 | `SPAWN_STALL_ACTIVITY_SECS` | `900` | 已投递的任务，会话多久没有新事实就升级。一次长构建或测试可以几分钟不写任何东西；工人回合已结束、而它启动的后台任务（会话记录里的 `job.started` 没有 `job.ended`）仍开着时算作活动，不升级 |
 | `SPAWN_STALL_REVIEW_SECS` | `1800` | 报告等 supervisor 审阅多久就升级：审阅要读报告、看代码，supervisor 可能正忙 |

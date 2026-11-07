@@ -1909,6 +1909,108 @@ fn a_done_missions_running_task_is_still_held_to_its_budget() {
     );
 }
 
+/// One event of `session` at `at`, written straight into the log.
+fn session_event(
+    client: &mut Client,
+    session: &str,
+    at: i64,
+    name: &str,
+    detail: &serde_json::Value,
+) -> i64 {
+    client
+        .query_one(
+            "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+             values ('agent_budget', $1, 'test',
+                     jsonb_build_object('name', $2::text, 'detail', $3::jsonb),
+                     (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                       where session_id = $1),
+                     $4)
+             returning id",
+            &[&session, &name, detail, &at],
+        )
+        .expect("write an event")
+        .get(0)
+}
+
+/// What a task's active time reads: its session's events after delivery
+/// with their tool or job ids, and the fleet's silences between two events,
+/// each capped.
+#[test]
+fn a_tasks_activity_and_the_fleets_silences_are_read_from_the_log() {
+    let (store, schema) = store("control_budget_activity");
+    let mut client = admin(&schema);
+    let base = 1_000_000_000_000;
+    let min = 60_000;
+    session_event(
+        &mut client,
+        "s_task",
+        base - min,
+        "tool.started",
+        &json!({"tool_use_id": "early"}),
+    );
+    let start = session_event(
+        &mut client,
+        "s_task",
+        base + min,
+        "tool.started",
+        &json!({"tool_name": "Bash", "tool_use_id": "toolu_1"}),
+    );
+    // Other sessions keep the fleet alive for 40 minutes, then it stops
+    // for five hours.
+    for n in 1..=20 {
+        session_event(
+            &mut client,
+            "s_other",
+            base + min + n * 2 * min,
+            "screen.observed",
+            &json!({}),
+        );
+    }
+    session_event(
+        &mut client,
+        "s_task",
+        base + 45 * min,
+        "job.started",
+        &json!({"job_id": "j1"}),
+    );
+    let end = session_event(
+        &mut client,
+        "s_task",
+        base + 345 * min,
+        "tool.completed",
+        &json!({"tool_use_id": "toolu_1", "duration_ms": null}),
+    );
+
+    let events = store.session_activity("s_task", base).expect("activity");
+    let read: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                event.at_ms - base,
+                event.name.as_str(),
+                event.key.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (min, "tool.started", Some("toolu_1")),
+            (45 * min, "job.started", Some("j1")),
+            (345 * min, "tool.completed", Some("toolu_1")),
+        ]
+    );
+    assert_eq!(events[0].id, start);
+    // From the tool's start to its end: 40 minutes of 2-minute gaps, then
+    // the 4-minute gap to the job, then five hours capped at 5 minutes.
+    let alive = store.fleet_alive_ms(start, end, 5 * min).expect("alive");
+    assert_eq!(alive, 40 * min + 4 * min + 5 * min);
+    assert_eq!(
+        store.fleet_alive_ms(end, end, 5 * min).expect("one event"),
+        0
+    );
+}
+
 /// A gate-mode mission with one task reported at revision 0.
 fn gate_mode_task(store: &PostgresStore, source: &str) -> (i64, i64) {
     let mission = store
@@ -2832,6 +2934,209 @@ fn an_unfinished_report_is_recorded_once_per_content_and_revision_and_moves_noth
             "report_unfinished"
         ]
     );
+}
+
+/// The settings `mission_missions` holds for a mission, and those its latest
+/// `mission.configured` record carries.
+fn settings(client: &mut Client, mission: i64) -> (serde_json::Value, serde_json::Value) {
+    let row = client
+        .query_one(
+            "select jsonb_build_object('gate', gate, 'accept', accept, 'budget', budget,
+                                       'objectives', objectives)
+               from mission_missions where id = $1",
+            &[&mission],
+        )
+        .expect("the mission")
+        .get(0);
+    let record: serde_json::Value = client
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where session_id = 'session_control' and source = 'control'
+                and event_name = 'control.recorded'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
+                and (kind -> 'detail' -> 'record' ->> 'id')::bigint = $1
+              order by session_seq desc limit 1",
+            &[&mission],
+        )
+        .expect("its latest mission.configured")
+        .get(0);
+    let record = json!({"gate": record["gate"], "accept": record["accept"],
+                        "budget": record["budget"], "objectives": record["objectives"]});
+    (row, record)
+}
+
+/// `spawn mission configure --id 4 --tool-calls 600` (2026-11-08) replaced
+/// every setting of mission 4: a change keeps what it does not name, and
+/// only an explicit null clears.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_partial_configure_keeps_the_other_settings_and_only_a_null_clears() {
+    let (store, schema) = store("control_reconfigure");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("Supply", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    let objectives = json!({"backlog": "/controller/backlog", "resident": "supply", "workers": 2});
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/scenarios"),
+            "gate",
+            Some(&json!({"minutes": 90})),
+            Some(&objectives),
+        )
+        .expect("configure");
+    let full = json!({"gate": "/controller/scenarios", "accept": "gate",
+                      "budget": {"minutes": 90}, "objectives": objectives});
+    assert_eq!(settings(&mut client, mission), (full.clone(), full.clone()));
+
+    let after = store
+        .mission_reconfigure(mission, &json!({"budget": {"tool_calls": 600}}))
+        .expect("the tool-call limit alone");
+    let mut expected = full.clone();
+    expected["budget"] = json!({"minutes": 90, "tool_calls": 600});
+    assert_eq!(
+        after,
+        json!({"mission": mission, "before": full, "after": expected}),
+        "it says what the mission was and is"
+    );
+    assert_eq!(
+        settings(&mut client, mission),
+        (expected.clone(), expected.clone()),
+        "the record carries every setting, the fold keeps them"
+    );
+
+    store
+        .mission_reconfigure(
+            mission,
+            &json!({"objectives": {"workers": 4}, "accept": "review"}),
+        )
+        .expect("workers and accept");
+    expected["objectives"]["workers"] = json!(4);
+    expected["accept"] = json!("review");
+    assert_eq!(settings(&mut client, mission).0, expected);
+
+    store
+        .mission_reconfigure(
+            mission,
+            &json!({"budget": {"minutes": null}, "objectives": {"workers": null}}),
+        )
+        .expect("clear the minutes and the workers");
+    expected["budget"] = json!({"tool_calls": 600});
+    expected["objectives"] = json!({"backlog": "/controller/backlog", "resident": "supply"});
+    assert_eq!(
+        settings(&mut client, mission),
+        (expected.clone(), expected.clone())
+    );
+
+    // A change that sets nothing, or sets what the mission already has,
+    // changes and records nothing.
+    let before = control_types(&mut client).len();
+    let same = json!({"mission": mission, "before": expected, "after": expected});
+    assert_eq!(
+        store
+            .mission_reconfigure(mission, &json!({}))
+            .expect("nothing"),
+        same
+    );
+    assert_eq!(
+        store
+            .mission_reconfigure(mission, &json!({"budget": {"tool_calls": 600}}))
+            .expect("the same value"),
+        same
+    );
+    assert_eq!(control_types(&mut client).len(), before, "nothing recorded");
+
+    // The result is checked as a whole, and a refusal records nothing.
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"gate": null})))
+            .contains("objectives need a gate"),
+        "objectives keep needing a gate"
+    );
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"budgets": {}})))
+            .contains("no setting budgets")
+    );
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"budget": 5})))
+            .contains("is a JSON object")
+    );
+    assert!(
+        refusal(store.mission_reconfigure(mission, &json!({"accept": "vote"})))
+            .contains("review or gate")
+    );
+    assert_eq!(control_types(&mut client).len(), before, "nothing recorded");
+    assert_eq!(settings(&mut client, mission).0, expected);
+
+    store
+        .mission_reconfigure(
+            mission,
+            &json!({"gate": null, "objectives": null, "budget": {"tool_calls": null}}),
+        )
+        .expect("clear the gate, the objectives and the last budget key");
+    let cleared = json!({"gate": null, "accept": "review", "budget": null, "objectives": null});
+    assert_eq!(settings(&mut client, mission), (cleared.clone(), cleared));
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
+
+/// GitHub issue #9 (objective 027): clearing a gated mission's gate, or moving
+/// its accept away from gate, while one of its tasks is landing would leave
+/// that task where nothing lands it; it is refused, naming the task, and
+/// goes through once nothing is landing.
+#[test]
+fn a_gate_is_not_cleared_while_a_task_of_its_mission_is_landing() {
+    let (store, schema) = store("control_configure_landing");
+    let mut client = admin(&schema);
+    let mission = store
+        .mission_add("Landing", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = task_in(&store, mission, "ephemeral", "w", "landing");
+    assert_eq!(task_state(&mut client, task), "landing");
+
+    let before = control_types(&mut client).len();
+    for change in [
+        json!({"gate": null}),
+        json!({"accept": "review"}),
+        json!({"gate": null, "accept": "review"}),
+    ] {
+        let refused = refusal(store.mission_reconfigure(mission, &change));
+        assert!(
+            refused.contains(&format!("task {task} is landing")),
+            "{change}: {refused}"
+        );
+    }
+    assert!(
+        refusal(store.mission_configure(mission, None, "gate", None, None)).contains("is landing"),
+        "the full configure refuses it too"
+    );
+    assert_eq!(control_types(&mut client).len(), before, "nothing recorded");
+    // What keeps the task landable still goes through.
+    store
+        .mission_reconfigure(mission, &json!({"budget": {"minutes": 30}}))
+        .expect("a budget while landing");
+
+    store
+        .integrator_record(&json!({"type": "task.landed", "id": task, "from": "b",
+                                   "to": format!("c{task}")}))
+        .expect("landed");
+    let after = store
+        .mission_reconfigure(mission, &json!({"gate": null, "accept": "review"}))
+        .expect("nothing is landing");
+    assert_eq!(after["after"]["gate"], json!(null));
+    assert_eq!(after["after"]["accept"], "review");
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(tables(&mut client), live);
 }
 
 /// A gated mission on `source` whose first verdict left `baseline`.

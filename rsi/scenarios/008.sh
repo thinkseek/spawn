@@ -72,8 +72,8 @@ cleanup() {
     tmux -L "$SPAWN_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
     rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SPAWN_TMUX_SOCKET"
     if [ -n "$database_made" ]; then
-        psql -d postgres -tA -c "drop database if exists $SPAWN_DB_NAME with (force)" \
-            >/dev/null 2>&1 || true
+        # The database and the logins init-db made for it.
+        sh "$controller/scripts/blackbox/scenario-db.sh" drop "$SPAWN_DB_NAME" >/dev/null 2>&1 || true
     fi
     chmod -R u+rwX "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
@@ -90,6 +90,9 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT TERM
 
+# Logins of this scenario's databases that a run killed before its cleanup
+# left behind (scripts/blackbox/scenario-db.sh): this prefix only.
+sh "$controller/scripts/blackbox/scenario-db.sh" sweep "${SPAWN_DB_NAME%"$run"}" >/dev/null 2>&1 || true
 psql -d postgres -tA -c "create database $SPAWN_DB_NAME" >/dev/null 2>&1 ||
     harness "cannot create the scenario database"
 database_made=1
@@ -277,6 +280,7 @@ with_git "$WORK/git-2.42" env SPAWN_WORKSPACE_ROOT="$host" "$SPAWN_BIN" tick
 [ "$status" -ne 0 ] || fail "(a) spawn tick ran with git 2.42"
 assert_contains "$(err)$(out)" "2.43" "(a) spawn tick's refusal of git 2.42"
 with_git "$WORK/git-2.42" env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+    SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
     "$SPAWN_BIN" integrate --once --root "$integrator"
 [ "$status" -ne 0 ] || fail "(a) spawn integrate ran with git 2.42"
 assert_contains "$(err)$(out)" "2.43" "(a) spawn integrate's refusal of git 2.42"
@@ -284,6 +288,7 @@ assert_contains "$(err)$(out)" "2.43" "(a) spawn integrate's refusal of git 2.42
 with_git "$WORK/git-2.43" env SPAWN_WORKSPACE_ROOT="$host" "$SPAWN_BIN" tick
 [ "$status" -eq 0 ] || fail "(a) spawn tick refused git 2.43: $(err)"
 with_git "$WORK/git-2.43" env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+    SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
     "$SPAWN_BIN" integrate --once --root "$integrator"
 [ "$status" -eq 0 ] || fail "(a) spawn integrate refused git 2.43: $(err)"
 tick_on "$host"
@@ -328,7 +333,8 @@ command=$(q "select id from spawn_commands where idempotency_key = 'kx1'")
 [ "$(q "select spawn_task_reported($task, 'done')")" = t ] || harness "task $task not reported"
 
 with_git "$WORK/git-no-attr-source" env -u SPAWN_TEST_DATABASE_URL \
-    SPAWN_GATE="$WORK/fake-gate.sh" "$SPAWN_BIN" integrate --once --root "$integrator"
+    SPAWN_GATE="$WORK/fake-gate.sh" SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
+    "$SPAWN_BIN" integrate --once --root "$integrator"
 output="$(out) $(err)"
 assert_eq "$(gated_records)" 0 \
     "(b) gate verdicts recorded for task $task when git could not merge (integrate: $output)"
@@ -339,6 +345,7 @@ assert_contains "$output" "unknown option" "(b) what the integrator showed of gi
 assert_eq "$(src_ref refs/heads/main)" "$moved" "(b) the source's main after a failed merge"
 
 capture env -u SPAWN_TEST_DATABASE_URL SPAWN_GATE="$WORK/fake-gate.sh" \
+    SPAWN_GATE_MIN_FREE_GB=0 SPAWN_GATE_MIN_FREE_MEMORY_MB=1 \
     "$SPAWN_BIN" integrate --once --root "$integrator"
 assert_eq "$(task_state)" landed \
     "(b) task $task once git can merge again (integrate: $(out) $(err))"

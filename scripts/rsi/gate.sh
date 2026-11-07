@@ -3,6 +3,7 @@
 # (docs/fleet-architecture.md §10.2).
 #
 # usage: gate.sh <bare-repo> <base-commit> <candidate-commit> <scenarios-dir> [<scenario>]
+#        gate.sh --base-only <bare-repo> <base-commit> <scenarios-dir>
 #
 # Exports both commits to temporary directories and judges the candidate
 # with the controller's scenarios, never the trees' own: a candidate cannot
@@ -38,7 +39,10 @@
 # BEFORE any candidate code runs, since both share the test server and a
 # candidate could otherwise sabotage the base's run: 0 = solved, 1 (twice,
 # from two runs that agree) = unsolved, anything else aborts the gate (exit
-# 4, no verdict: the integrator records an abort, never a skip). Results are
+# 4, no verdict: the integrator records an abort, never a skip). The base's
+# runs all end before the candidate builds; within each phase, scenarios run
+# SPAWN_GATE_JOBS at a time, the log and the verdict still the serial
+# order's ("Parallel runs" below). Results are
 # cached in ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-base, keyed by everything
 # that decides them (the base commit, the scenario's blob, this file's, the
 # toolchain, and the files the scenario names: "The base cache" below),
@@ -121,11 +125,26 @@
 #                              socket URL (postgres://u:p@%2Fdir/db, or
 #                              ?host=/dir) or a TCP one, read by
 #                              scripts/pg-url.sh
+#   SPAWN_GATE_JOBS            scenarios run at once (default min(8, half the
+#                              cores); 1 on the shared test server)
+#   SPAWN_GATE_PG_IMAGE        the test server's docker image: the gate runs a
+#                              server of its own from it (GitHub issue #6),
+#                              and SPAWN_TEST_DATABASE_URL is not used
+#   SPAWN_GATE_PG_BIN          or, on a host without docker, the directory of
+#                              the test server's programs (postgres, initdb;
+#                              /usr/lib/postgresql/16/bin): the same, from
+#                              those
 #   SPAWN_GATE_VERDICT         a file in a directory the integrator owns; the
 #                              verdict is written there too, and the
 #                              integrator believes that file only, and only
 #                              when the gate exits 0. The directory is hidden
 #                              from the sandbox.
+#
+# Base only (`--base-only`): the base phase alone, for the base cache: the
+# results the next gates on that base take from it. deploy/deploy.sh starts
+# one in the background once it moved main. Exit 0 with no verdict (none is
+# written, whatever SPAWN_GATE_VERDICT says), 4 on a harness error, 3 as
+# below.
 #
 # Exit status: 0 with a verdict. 5 means no room to judge now: TMPDIR has
 # less than SPAWN_GATE_MIN_FREE_GB free (scripts/disk.sh gate_room). The
@@ -140,6 +159,22 @@
 # which the integrator records as an abort that counts.
 
 set -eu
+
+# Base-only (`gate.sh --base-only <bare-repo> <base-commit> <scenarios-dir>`):
+# the base phase alone, for the base cache (see "Base only" below). The
+# candidate is the base itself, so every check of the diff passes on an
+# empty one, and no verdict is written.
+base_only=""
+if [ "${1-}" = --base-only ]; then
+    shift
+    if [ $# -ne 3 ]; then
+        echo "usage: gate.sh --base-only <bare-repo> <base-commit> <scenarios-dir>" >&2
+        exit 3
+    fi
+    base_only=1
+    set -- "$1" "$2" "$2" "$3"
+    unset SPAWN_GATE_VERDICT
+fi
 
 repo=$1
 baseline=$2
@@ -414,12 +449,103 @@ cache_exposed() {
 # (postgres://u:p@%2Fdir:<port>/db?<other parameters>), whatever form the
 # owner gave. An unreadable URL or a missing socket is an infrastructure
 # error (exit 3), not a verdict.
+#
+# A server of the gate's own (GitHub issue #6): with SPAWN_GATE_PG_IMAGE set
+# (the test server's docker image, postgres:16-alpine), or SPAWN_GATE_PG_BIN
+# (the directory of the host's programs of the test server's version,
+# /usr/lib/postgresql/16/bin, on a host without docker), the gate starts a
+# disposable PostgreSQL of those programs under its scratch and hands the
+# sandbox its socket instead (scripts/rsi/gate-pg.sh), whatever
+# SPAWN_TEST_DATABASE_URL says: postgres://postgres:<password>@%2F<dir>:5432/
+# spawn_test, a superuser over a socket only the sandbox and the gate reach.
+# Base results are taken on a clean server, and what candidate code leaves on
+# it dies with the gate. It is sized for the scenarios that run at once
+# (max_connections 100 + 50 per job). One that does not start is an
+# infrastructure error (exit 3).
+#
+# Scenarios at once (see "Parallel runs" below): SPAWN_GATE_JOBS, a whole
+# number from 1; by default min(8, half the cores), or 1 on the shared test
+# server (SPAWN_TEST_DATABASE_URL without a server of the gate's own), whose
+# connections every agent's tests share.
 # shellcheck source=scripts/pg-url.sh
 . "$(dirname "$0")/../pg-url.sh"
+# shellcheck source=scripts/rsi/gate-pg.sh
+. "$(dirname "$0")/gate-pg.sh"
+gate_jobs=${SPAWN_GATE_JOBS-}
+if [ -z "$gate_jobs" ]; then
+    if [ -n "${SPAWN_TEST_DATABASE_URL-}" ] && [ -z "$gate_pg" ]; then
+        gate_jobs=1
+    else
+        gate_jobs=$(($(nproc 2>/dev/null || echo 2) / 2))
+        [ "$gate_jobs" -le 8 ] || gate_jobs=8
+        [ "$gate_jobs" -ge 1 ] || gate_jobs=1
+    fi
+fi
+case "$gate_jobs" in
+'' | *[!0-9]* | 0*)
+    echo "gate: SPAWN_GATE_JOBS is a whole number from 1, not '$gate_jobs'" >&2
+    exit 3
+    ;;
+esac
+# Whatever the gate started dies with it: its scenario runs, the private
+# server, the forwarder (below). A SIGKILL leaves none either: each runs
+# under bubblewrap's --die-with-parent or the parent-death signal.
+jobs_dir=$work/jobs
+jobs_stop_all() {
+    for stop_job in "$jobs_dir"/*/; do
+        if [ -d "$stop_job" ]; then job_stop "${stop_job%/}"; fi
+    done
+}
+# job_stop <job>: a scenario run of the gate's that is no longer needed. Its
+# subshell first (so it starts nothing more and writes no cache entry), then
+# the subshell bubblewrap is the child of, which ends the sandbox.
+job_stop() {
+    [ ! -e "$1/result" ] || return 0
+    for stop_pid in job.pid pid; do
+        [ ! -s "$1/$stop_pid" ] || kill -KILL "$(cat "$1/$stop_pid" 2>/dev/null)" 2>/dev/null || :
+    done
+    : >"$1/stopped" 2>/dev/null || :
+}
+db_forwarder=""
+# In the EXIT trap, under `set -e`: nothing here may fail, or the gate ends
+# with that status instead of its own.
+gate_stop_children() {
+    if [ -d "$jobs_dir" ]; then jobs_stop_all || :; fi
+    if [ -n "$db_forwarder" ]; then kill "$db_forwarder" 2>/dev/null || :; fi
+    gate_pg_stop || :
+}
+# The scratch, last. A run stopped early may still be ending, its /tmp (a
+# directory under $work, see sandbox) not yet still: one more try a second
+# later, and what is left is spawn-maintenance's (scratch older than a day).
+# Never a failure here, which would replace the gate's status.
+gate_remove_work() {
+    chmod -R u+w "$work" 2>/dev/null || :
+    rm -rf "$work" 2>/dev/null && return 0
+    sleep 1
+    chmod -R u+w "$work" 2>/dev/null || :
+    rm -rf "$work" 2>/dev/null || :
+}
+trap 'stage_close aborted; gate_times; gate_stop_children; gate_remove_work' EXIT
 db_socket=""
 db_forward=""
 sandbox_db_url=""
-if [ -n "${SPAWN_TEST_DATABASE_URL-}" ]; then
+if [ -n "$gate_pg" ]; then
+    gate_pg_start "$work/pg" "$gate_jobs" || exit 3
+    # A link of the gate's to the socket the server made at start: the
+    # server cannot change what it names (scripts/rsi/gate-pg.sh).
+    mkdir -m 700 "$work/test-db"
+    db_socket=$work/test-db/.s.PGSQL.5432
+    if ! ln -P "$gate_pg_socket" "$db_socket" || [ ! -S "$db_socket" ]; then
+        echo "gate: cannot link the private test server's socket into $work/test-db" >&2
+        exit 3
+    fi
+    sandbox_db_url="postgres://postgres:$gate_pg_password@$(pg_url_encode_host "$work/test-db"):5432/spawn_test"
+    echo "| test database: a server of the gate's own, $gate_pg" \
+        "($(printf '%s' "$gate_pg_id" | cut -c1-12)), up in $gate_pg_ms ms," \
+        "max_connections $((100 + 50 * gate_jobs)); scenarios at once: $gate_jobs"
+    (umask 077 && printf '%s\0' --setenv SPAWN_TEST_DATABASE_URL "$sandbox_db_url" \
+        >"$work/sandbox-db-args")
+elif [ -n "${SPAWN_TEST_DATABASE_URL-}" ]; then
     if ! pg_url_parse "$SPAWN_TEST_DATABASE_URL"; then
         echo "gate: SPAWN_TEST_DATABASE_URL is not a single-host postgres:// URL" >&2
         exit 3
@@ -461,7 +587,6 @@ fi
 # relays each connection to the test server's host and port. It dies with
 # the gate (the EXIT trap, and the parent-death signal if the gate is
 # killed).
-db_forwarder=""
 if [ -n "$db_forward" ]; then
     cat >"$work/test-db-forward.py" <<'EOF'
 import ctypes, os, socket, sys, threading
@@ -469,7 +594,7 @@ ctypes.CDLL(None).prctl(1, 15)  # PR_SET_PDEATHSIG: SIGTERM when the gate dies
 path, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 listener = socket.socket(socket.AF_UNIX)
 listener.bind(path)
-listener.listen(64)
+listener.listen(256)
 
 def pump(source, sink):
     try:
@@ -507,7 +632,6 @@ EOF
     # shellcheck disable=SC2086 # host and port
     python3 "$work/test-db-forward.py" "$db_socket" $db_forward </dev/null >/dev/null 2>"$work/test-db-forward.log" &
     db_forwarder=$!
-    trap 'stage_close aborted; gate_times; kill "$db_forwarder" 2>/dev/null; rm -rf "$work"' EXIT
     waited=0
     while [ ! -S "$db_socket" ]; do
         if ! kill -0 "$db_forwarder" 2>/dev/null || [ "$waited" -ge 100 ]; then
@@ -729,21 +853,231 @@ build() {
     }
 }
 
-# Run one scenario in a built tree, echoing its output prefixed with `| `.
-# Its stdout is also kept apart in run.out: the metric is read from there,
-# never from stderr.
-run_scenario() {
-    rm -f "$work/run.status"
+# Parallel runs. The base's scenario runs, and then the candidate's, run
+# SPAWN_GATE_JOBS at a time (above), the base's all done before any
+# candidate code runs. Each run is a sandbox of its own: its own /tmp (so its
+# own scratch, TMPDIR and tmux sockets), network namespace (its own ports:
+# `spawn serve`, the fake engines) and PID namespace; a scenario names its
+# databases bb_<n>_<name>_$$_<random>, and with a server of the gate's own
+# (SPAWN_GATE_PG_IMAGE or SPAWN_GATE_PG_BIN) the server is the gate's alone.
+# What runs of one tree share is the tree: cargo locks its target directory,
+# and `spawn` is a copy no cargo command writes (see snapshot_bin). A scenario named in `<scenarios-dir>/serial` (one file name
+# per line, `#` comments; read only by the gate, like `protected`) runs
+# alone: nothing else of the gate runs beside it. That is for a scenario that
+# takes a resource of the host every run shares; it is in that scenario's
+# base cache key.
+#
+# The log and the verdict are the serial gate's, whatever finishes first:
+# each run's block (its header, its output, its stage lines) is printed
+# whole, in the scenario order, once it and every block before it are done,
+# and the first failure in that order decides. Once one is known, the runs
+# after it are stopped and the rest never start. An objective's second base
+# run (an unsolved result needs two runs that agree) follows its first in the
+# same slot: runs at other times, beside other neighbours, are better
+# evidence of "unsolved" than two runs side by side, and a solved objective
+# (most of them) costs one run, not two. A phase's time in the gate time line
+# is its wall clock, and each phase says how many ran at once and the sum of
+# its runs' own times.
+#
+# A job: one objective on the base (its runs) or one scenario on the
+# candidate, in $jobs_dir/<phase>.<n>/: `scenario`, its runs' output
+# (`log.<run>`, stdout and stderr; `out.<run>`, stdout alone: the metric is
+# read from there, never from stderr; `status.<run>`), its block (`events`:
+# `text <file>` and `stage <ms> <result>|<name>`, replayed by job_print so
+# the stage lines go through stage_emit in order), and `result`, written
+# last: the job is done. `job.pid` is its subshell; `pid`, while a run is
+# going, the subshell bubblewrap is the child of (job_stop above).
+
+# job_run <job> <run> <tree> <scenario>: one run of the scenario in the
+# built tree, in the sandbox; returns its exit status.
+job_run() {
     {
         {
-            status=0
-            sandbox "$1" env SPAWN_BIN="$1/target/debug/spawn" SPAWN_BASELINE_TREE="$work/baseline" \
-                CARGO_TARGET_DIR="$1/target" sh "$2" || status=$?
-            echo "$status" >"$work/run.status"
-        } | tee "$work/run.out"
-    } >"$work/run.log" 2>&1
-    sed 's/^/| /' "$work/run.log" | tail -n 60
-    return "$(cat "$work/run.status" 2>/dev/null || echo 1)"
+            run_status=0
+            sandbox "$3" env SPAWN_BIN="$(spawn_bin "$3")" SPAWN_BASELINE_TREE="$work/baseline" \
+                CARGO_TARGET_DIR="$3/target" sh "$4" 8>&- &
+            printf '%s\n' "$!" >"$1/pid"
+            wait "$!" || run_status=$?
+            rm -f "$1/pid"
+            echo "$run_status" >"$1/status.$2"
+        } | tee "$1/out.$2"
+    } >"$1/log.$2" 2>&1
+    return "$(cat "$1/status.$2" 2>/dev/null || echo 1)"
+}
+# The job's block, written by the job ($job, $job_part): text, and a stage
+# line between two texts.
+job_say() { printf '%s\n' "$*" >>"$job/text.$job_part"; }
+job_output() { sed 's/^/| /' "$job/log.$1" | tail -n 60 >>"$job/text.$job_part"; }
+job_stage() { # <ms> <result> <name>
+    printf 'text %s\nstage %s %s|%s\n' "$job/text.$job_part" "$1" "$2" "$3" >>"$job/events"
+    job_part=$((job_part + 1))
+}
+job_done() { # <result...>
+    printf 'text %s\n' "$job/text.$job_part" >>"$job/events"
+    printf '%s\n' "$*" >"$job/result.new" && mv -f "$job/result.new" "$job/result"
+}
+# job_print <job>: its block, as the serial gate printed it. The time of its
+# runs is added up (phase_runs_ms, phase_runs) for the phase's line.
+job_print() {
+    while IFS= read -r event; do
+        case "$event" in
+        "text "*) [ ! -f "${event#text }" ] || cat -- "${event#text }" ;;
+        "stage "*)
+            event=${event#stage }
+            run_stage "${event#* }" "${event%% *}"
+            ;;
+        esac
+    done <"$1/events"
+}
+# run_stage <result>|<name> <ms>: the stage line of a run, counted.
+run_stage() {
+    phase_runs_ms=$((phase_runs_ms + $2))
+    phase_runs=$((phase_runs + 1))
+    stage_emit gate "${1%%|*}" "$2" "${1#*|}"
+}
+
+# snapshot_bin <tree>: the binary the scenarios run (SPAWN_BIN), copied
+# once the tree is built to target/gate/spawn, where no cargo command
+# writes: check-tests' `cargo test` links target/debug/spawn again (the
+# test profile's features) while other scenarios run it. Taken right before
+# the scenarios of the tree start, so it is the binary the serial gate's
+# scenarios ran (for the candidate, the one the test listing linked). Copied
+# inside the sandbox: the tree is the candidate's. A tree with no such binary
+# keeps the path its build would have made.
+snapshot_bin() {
+    sandbox "$1" sh -c '[ -f target/debug/spawn ] || exit 0
+        mkdir -p target/gate && cp target/debug/spawn target/gate/spawn.new &&
+        mv -f target/gate/spawn.new target/gate/spawn' >"$work/snapshot.log" 2>&1 || {
+        sed 's/^/| snapshot: /' "$work/snapshot.log" | tail -n 5
+        return 1
+    }
+}
+spawn_bin() {
+    if [ -f "$1/target/gate/spawn" ]; then
+        printf '%s' "$1/target/gate/spawn"
+    else
+        printf '%s' "$1/target/debug/spawn"
+    fi
+}
+
+serial_list=""
+if [ -f "$scenarios/serial" ]; then
+    serial_list=$(grep -v '^#' "$scenarios/serial" | grep . || true)
+fi
+# runs_alone <scenario>: 0 when the serial list names it.
+runs_alone() {
+    [ -n "$serial_list" ] && printf '%s\n' "$serial_list" | grep -qxF -- "$(basename "$1")"
+}
+
+# run_jobs <phase> <count> <start> <finished> <printed>: the jobs
+# $jobs_dir/<phase>.1 .. <count>, $gate_jobs at a time, in order. A job with
+# a result already (a cache hit) is not started. <start> <job> runs one, in
+# a background subshell; <finished> <job> <n> hears of each started job as
+# it ends and may lower jobs_stop (no job after it is needed); <printed>
+# <job> <n> prints each in order, and may end the gate.
+run_jobs() {
+    rj_phase=$1 rj_count=$2 rj_start=$3 rj_finished=$4 rj_printed=$5
+    jobs_stop=$rj_count
+    rj_next=1 rj_print=1 rj_running="" rj_busy=0 rj_alone=""
+    while [ "$rj_print" -le "$jobs_stop" ]; do
+        rj_changed=""
+        while [ "$rj_next" -le "$jobs_stop" ] && [ -z "$rj_alone" ]; do
+            rj_job=$jobs_dir/$rj_phase.$rj_next
+            if [ -e "$rj_job/result" ]; then
+                rj_next=$((rj_next + 1))
+                continue
+            fi
+            if [ -e "$rj_job/alone" ]; then
+                [ "$rj_busy" -eq 0 ] || break
+                rj_alone=$rj_next
+            elif [ "$rj_busy" -ge "$gate_jobs" ]; then
+                break
+            fi
+            # The gate's traps are not the job's; a failure inside it is
+            # its result (`error`), never a silent end.
+            (
+                trap - EXIT HUP INT TERM
+                "$rj_start" "$rj_job" || :
+                [ -e "$rj_job/result" ] || {
+                    job=$rj_job
+                    job_part=error
+                    job_say "| gate: the run of $(basename "$(cat "$rj_job/scenario")") ended without a result"
+                    job_done error
+                }
+            ) </dev/null >>"$rj_job/errors" 2>&1 &
+            printf '%s\n' "$!" >"$rj_job/job.pid"
+            phase_started=$((phase_started + 1))
+            rj_running="$rj_running $rj_next"
+            rj_busy=$((rj_busy + 1))
+            rj_next=$((rj_next + 1))
+            rj_changed=1
+        done
+        rj_still=""
+        for rj_i in $rj_running; do
+            rj_job=$jobs_dir/$rj_phase.$rj_i
+            # A subshell gone without a result (killed by someone else) is
+            # an error, not a wait forever.
+            if [ ! -e "$rj_job/result" ] && ! kill -0 "$(cat "$rj_job/job.pid")" 2>/dev/null &&
+                [ ! -e "$rj_job/result" ]; then
+                { echo "gate: the run of $(basename "$(cat "$rj_job/scenario")") was killed"; cat "$rj_job/errors"; } |
+                    sed 's/^/| /' >"$rj_job/text.killed"
+                printf 'text %s\n' "$rj_job/text.killed" >>"$rj_job/events"
+                echo error >"$rj_job/result"
+            fi
+            if [ -e "$rj_job/result" ]; then
+                "$rj_finished" "$rj_job" "$rj_i"
+                [ "$rj_alone" != "$rj_i" ] || rj_alone=""
+                rj_busy=$((rj_busy - 1))
+                rj_changed=1
+            else
+                rj_still="$rj_still $rj_i"
+            fi
+        done
+        rj_running=""
+        for rj_i in $rj_still; do
+            if [ "$rj_i" -gt "$jobs_stop" ]; then
+                job_stop "$jobs_dir/$rj_phase.$rj_i"
+                [ "$rj_alone" != "$rj_i" ] || rj_alone=""
+                rj_busy=$((rj_busy - 1))
+                rj_changed=1
+            else
+                rj_running="$rj_running $rj_i"
+            fi
+        done
+        while [ "$rj_print" -le "$jobs_stop" ] && [ -e "$jobs_dir/$rj_phase.$rj_print/result" ]; do
+            "$rj_printed" "$jobs_dir/$rj_phase.$rj_print" "$rj_print"
+            rj_print=$((rj_print + 1))
+            rj_changed=1
+        done
+        [ -n "$rj_changed" ] || sleep 0.2
+    done
+    for rj_i in $rj_running; do
+        job_stop "$jobs_dir/$rj_phase.$rj_i"
+    done
+}
+
+# phase_start: the clock of a phase's runs starts.
+phase_start() {
+    phase_at=$(stage_now)
+    phase_base_ms=$base_ms
+    phase_candidate_ms=$candidate_ms
+    phase_runs_ms=0
+    phase_runs=0
+    phase_started=0
+}
+# phase_time <base|candidate>: the phase's time is its wall clock, not the
+# sum of its runs' (the stage lines added those up); said once.
+phase_time() {
+    [ "$phase_started" -gt 0 ] || return 0
+    phase_started=0
+    phase_wall=$(($(stage_now) - phase_at))
+    case "$1" in
+    base) base_ms=$((phase_base_ms + phase_wall)) ;;
+    candidate) candidate_ms=$((phase_candidate_ms + phase_wall)) ;;
+    esac
+    [ "$phase_runs" -gt 0 ] || return 0
+    echo "| $1 runs: $phase_runs in $((phase_wall / 1000)) s, $gate_jobs at a time" \
+        "(their own time: $((phase_runs_ms / 1000)) s)"
 }
 
 # The changed paths, as they are: no rename detection (a move lists the old
@@ -1085,7 +1419,7 @@ fi
 # - the gate: this file's blob and that of the URL parser it sources (it
 #   shapes the sandbox's database URL);
 # - the scenarios directory's other files, but its scenarios and the lists
-#   only the gate reads (`protected`, `retired-tests`): the build hook, the
+#   only the gate reads (`protected`, `retired-tests`, `serial`): the build hook, the
 #   `bind` list's text, helpers a scenario runs from beside it;
 # - each directory the `bind` list names, by a fingerprint of what is
 #   installed there: the blobs of its `.modules.yaml` and `.pnpm/lock.yaml`
@@ -1115,13 +1449,25 @@ fi
 # gate used for 14 days (scripts/maintenance.sh). The log says which
 # results came from the cache.
 #
+# - whether the scenario runs alone (the `serial` list): a scenario put on
+#   it because it collides with its neighbours is judged again, alone;
+# - with a server of the gate's own, the id of its programs (the image's,
+#   or a hash of SPAWN_GATE_PG_BIN's), with the server's version: a result taken on a clean server is not one
+#   taken on the shared server.
+# A lock per key (flock on `<key>.lock` beside the entry, hidden with it)
+# makes a gate that misses wait while another gate of this host (the
+# deploy's base-only run) judges the same key, and then read its entry,
+# instead of judging it twice.
+#
 # Not keyed: the state candidate code leaves on the shared test server
-# (roles, databases, settings). A disposable test server per gate is
-# GitHub issue #6; until then one gate runs at a time (integrate.rs).
+# (roles, databases, settings), when the gate has no server of its own
+# (SPAWN_GATE_PG_IMAGE or SPAWN_GATE_PG_BIN); integrate.rs runs one such
+# gate at a time.
 blob() { git hash-object --no-filters -- "$1"; }
 gate_key="gate $(blob "$0")"
 [ -f "$(dirname "$0")/../pg-url.sh" ] && gate_key="$gate_key $(blob "$(dirname "$0")/../pg-url.sh")"
-scenarios_key=$(cd "$scenarios" && find . -type f ! -path './protected' ! -path './retired-tests' |
+[ -f "$(dirname "$0")/gate-pg.sh" ] && gate_key="$gate_key $(blob "$(dirname "$0")/gate-pg.sh")"
+scenarios_key=$(cd "$scenarios" && find . -type f ! -path './protected' ! -path './retired-tests' ! -path './serial' |
     grep -vE '^\./[^/]*\.sh$' | LC_ALL=C sort |
     while IFS= read -r file; do printf '%s %s\n' "$(blob "$file")" "$file"; done |
     sha256sum | cut -d' ' -f1)
@@ -1202,15 +1548,114 @@ toolchain() {
         else
             echo "server: unreadable"
         fi' toolchain "$(cd "$(dirname "$0")/.." && pwd)/pg-url.sh" >"$work/toolchain" 2>&1 || true
+    [ -z "$gate_pg_id" ] || echo "server: the gate's own, $gate_pg_kind $gate_pg_id" >>"$work/toolchain"
     toolchain_key=$(sha256sum <"$work/toolchain" | cut -d' ' -f1)
     echo "| base cache: toolchain $(sed -n 's/^release: /rustc /p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(cargo [^ ]*\).*/\1/p' "$work/toolchain" | head -n 1)" \
         "$(sed -n 's/^\(psql\) (PostgreSQL) \([^ ]*\).*/\1 \2/p' "$work/toolchain" | head -n 1)" \
         "server $(sed -n 's/^\([0-9]\{5,6\}\)$/\1/p' "$work/toolchain" | head -n 1 | grep . || echo none)"
 }
+# entry_result <entry>: solved or unsolved, as the entry holds it; nothing
+# for an entry that is missing, unreadable, or holds anything else.
+entry_result() {
+    entry_held=""
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        entry_held=$(cat -- "$1" 2>/dev/null) || entry_held=""
+    fi
+    case "$entry_held" in solved | unsolved) printf '%s' "$entry_held" ;; esac
+}
+# base_job <job>: the base's result for one objective, in the background,
+# under its key's lock (above); <job>/entry is its cache entry. A completed
+# run, and only one, writes the entry. One that cannot be written costs the
+# next gate a run, not this one its verdict.
+base_job() {
+    job=$1 job_part=0
+    objective=$(cat "$job/scenario")
+    entry=$(cat "$job/entry")
+    name=$(basename "$objective")
+    if command -v flock >/dev/null 2>&1 &&
+        { command exec 8>>"$entry.lock"; } 2>/dev/null; then
+        flock 8
+        result=$(entry_result "$entry")
+        if [ -n "$result" ]; then
+            touch -c -- "$entry" 2>/dev/null || :
+            job_say "| == base: $name: $result (cached: another gate judged it meanwhile)"
+            job_done cached "$result"
+            return 0
+        fi
+    fi
+    run_name="base: $name"
+    job_say "| == $run_name"
+    run_at=$(stage_now)
+    first=0
+    job_run "$job" 1 "$work/baseline" "$objective" || first=$?
+    job_output 1
+    result=""
+    case "$first" in
+    0) result=solved ;;
+    1)
+        job_stage "$(($(stage_now) - run_at))" "exit 1" "$run_name"
+        run_name="base: $name again (unsolved needs two runs that agree)"
+        job_say "| == $run_name"
+        run_at=$(stage_now)
+        again=0
+        job_run "$job" 2 "$work/baseline" "$objective" || again=$?
+        job_output 2
+        [ "$again" -eq 1 ] && result=unsolved
+        first="1, then $again"
+        ;;
+    esac
+    if [ -z "$result" ]; then
+        job_say "| $name exited $first on the base: a harness error, not a verdict; the gate aborts"
+        job_stage "$(($(stage_now) - run_at))" aborted "$run_name"
+        job_done abort
+        return 0
+    fi
+    if [ -d "$entry" ] && [ ! -L "$entry" ]; then rm -rf -- "$entry"; fi
+    if ! { printf '%s\n' "$result" >"$entry.$$" && mv -fT -- "$entry.$$" "$entry"; } 2>/dev/null; then
+        rm -f -- "$entry.$$"
+        job_say "| base cache: could not write the entry of $name"
+    fi
+    job_say "| == base: $name: $result"
+    job_stage "$(($(stage_now) - run_at))" "$result" "$run_name"
+    job_done "$result"
+}
+# base_finished <job> <n>: an abort needs no run after it.
+base_finished() {
+    case "$(cat "$1/result")" in abort | error) [ "$2" -ge "$jobs_stop" ] || jobs_stop=$2 ;; esac
+}
+# base_printed <job> <n>: its block, and its result on record.
+base_printed() {
+    job_print "$1"
+    printed_name=$(basename "$(cat "$1/scenario")")
+    # shellcheck disable=SC2046 # the result's words
+    set -- "$1" $(cat "$1/result")
+    case "$2" in
+    cached)
+        from_cache="$from_cache $printed_name"
+        result=$3
+        ;;
+    solved | unsolved)
+        run_on_base="$run_on_base $printed_name"
+        result=$2
+        ;;
+    *)
+        phase_time base
+        [ "$2" = abort ] || echo "| $printed_name: the gate could not run it on the base; the gate aborts"
+        exit 4
+        ;;
+    esac
+    printf '%s|%s\n' "$result" "$(cat "$1/scenario")" >>"$work/base-results"
+}
+
+# The base phase: every objective's key (and its result, when the cache
+# has it), then one build of the base for those it has not, then their runs.
 : >"$work/base-results"
 from_cache=""
 run_on_base=""
+mkdir -p "$jobs_dir"
+base_count=0
+base_misses=0
 for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     [ -f "$objective" ] || continue
     if [ "$objective" != "$scenario" ]; then
@@ -1224,66 +1669,45 @@ for objective in "$scenarios"/*.sh ${scenario:+"$scenario"}; do
     key=$( {
         printf 'base %s\nscenario %s\n%s\ntoolchain %s\nscenarios %s\nbinds %s\n' "$base_commit" \
             "$(blob "$objective")" "$gate_key" "$toolchain_key" "$scenarios_key" "$binds_key"
+        if runs_alone "$objective"; then printf 'runs alone\n'; fi
         depends_on "$objective"
     } | sha256sum | cut -d' ' -f1)
     entry=$base_cache/$key
-    result=""
-    if [ -e "$entry" ] || [ -L "$entry" ]; then
-        result=$(cat -- "$entry" 2>/dev/null) || result=""
-        case "$result" in
-        solved | unsolved) ;;
-        *)
-            echo "| == base: $objective_name: its cache entry cannot be read; judged again"
-            result=""
-            ;;
-        esac
+    base_count=$((base_count + 1))
+    job=$jobs_dir/base.$base_count
+    mkdir "$job"
+    printf '%s\n' "$objective" >"$job/scenario"
+    printf '%s\n' "$entry" >"$job/entry"
+    if runs_alone "$objective"; then : >"$job/alone"; fi
+    result=$(entry_result "$entry")
+    if [ -z "$result" ] && { [ -e "$entry" ] || [ -L "$entry" ]; }; then
+        echo "| == base: $objective_name: its cache entry cannot be read; judged again" >"$job/text.0"
     fi
     if [ -n "$result" ]; then
         # A used entry stays: maintenance removes the ones untouched.
         touch -c -- "$entry" 2>/dev/null || :
-        echo "| == base: $objective_name: $result (cached)"
-        from_cache="$from_cache $objective_name"
+        echo "| == base: $objective_name: $result (cached)" >"$job/text.0"
+        printf 'text %s\n' "$job/text.0" >"$job/events"
+        echo "cached $result" >"$job/result"
     else
-        if [ -z "${base_built-}" ]; then
-            section "base: build"
-            if ! build "$work/baseline"; then
-                verdict rejected "base does not build"
-                exit 0
-            fi
-            base_built=1
-        fi
-        section "base: $objective_name"
-        first=0
-        run_scenario "$work/baseline" "$objective" || first=$?
-        case "$first" in
-        0) result=solved ;;
-        1)
-            stage_close "exit 1"
-            section "base: $objective_name again (unsolved needs two runs that agree)"
-            again=0
-            run_scenario "$work/baseline" "$objective" || again=$?
-            [ "$again" -eq 1 ] && result=unsolved
-            first="1, then $again"
-            ;;
-        esac
-        if [ -z "$result" ]; then
-            echo "| $objective_name exited $first on the base: a harness error, not a verdict; the gate aborts"
-            stage_close aborted
-            exit 4
-        fi
-        # A completed run, and only one, writes its entry. One that cannot
-        # be written costs the next gate a run, not this one its verdict.
-        if [ -d "$entry" ] && [ ! -L "$entry" ]; then rm -rf -- "$entry"; fi
-        if ! { printf '%s\n' "$result" >"$entry.$$" && mv -fT -- "$entry.$$" "$entry"; } 2>/dev/null; then
-            rm -f -- "$entry.$$"
-            echo "| base cache: could not write the entry of $objective_name"
-        fi
-        echo "| == base: $objective_name: $result"
-        run_on_base="$run_on_base $objective_name"
-        stage_close "$result"
+        base_misses=$((base_misses + 1))
     fi
-    printf '%s|%s\n' "$result" "$objective" >>"$work/base-results"
 done
+if [ "$base_misses" -gt 0 ]; then
+    section "base: build"
+    if ! build "$work/baseline"; then
+        verdict rejected "base does not build"
+        exit 0
+    fi
+    if ! snapshot_bin "$work/baseline"; then
+        echo "gate: cannot copy the base's spawn for its scenarios" >&2
+        exit 3
+    fi
+    stage_close ok
+fi
+phase_start
+run_jobs base "$base_count" base_job base_finished base_printed
+phase_time base
 if [ -n "$from_cache$run_on_base" ]; then
     echo "| base results from the cache:${from_cache:- none}; run on the base:${run_on_base:- none}"
 fi
@@ -1293,6 +1717,15 @@ base_result() {
         $2 == want { print $1; found = 1; exit }
         END { if (!found) print "none" }' "$work/base-results"
 }
+
+# Base only: the base's results are in the cache, for the gates that judge
+# a candidate on this base next (the deploy starts one after it moves main:
+# deploy/deploy.sh). No candidate, no verdict.
+if [ -n "$base_only" ]; then
+    echo "| base only: $(grep -c . "$work/base-results" || true) results for the base $base_commit" \
+        "are in the base cache $base_cache"
+    exit 0
+fi
 
 if [ -n "$scenario" ] && [ "$(base_result "$scenario")" = solved ]; then
     verdict rejected "scenario already passes on the base"
@@ -1378,41 +1811,98 @@ if [ -f "$work/baseline/Cargo.toml" ] && [ -f "$work/candidate/Cargo.toml" ]; th
     fi
 fi
 
-if [ -n "$scenario" ]; then
-    section "candidate: $(basename "$scenario") must pass"
-    green=0
-    run_scenario "$work/candidate" "$scenario" || green=$?
-    # The metric is the scenario's: one line on its stdout. Stderr is never
-    # read, and two lines mean candidate code printed one too, so neither
-    # counts.
-    metrics=$(grep -E '^METRIC [A-Za-z0-9_]+( [a-z]+=[0-9.]+)*$' "$work/run.out" 2>/dev/null || true)
-    case "$(printf '%s' "$metrics" | grep -c . || true)" in
-    0) ;;
-    1) metric=$metrics ;;
-    *) echo "| two or more METRIC lines on the scenario's stdout: no metric" ;;
-    esac
-    if [ "$green" -ne 0 ]; then
-        verdict rejected "scenario fails on the candidate"
+# The candidate's scenarios, N at a time: the task scenario first, then
+# every other but the ratchets, in order. The first failure in that order
+# decides, as in the serial gate.
+# candidate_job <job>: one run, in the background.
+candidate_job() {
+    job=$1 job_part=0
+    job_say "| == $(cat "$job/section")"
+    run_at=$(stage_now)
+    run_status=0
+    job_run "$job" 1 "$work/candidate" "$(cat "$job/scenario")" || run_status=$?
+    job_output 1
+    echo "$(($(stage_now) - run_at))" >"$job/ms"
+    job_done "$run_status"
+}
+# decisive <job>: 0 when its failure is the verdict: the task scenario's, or
+# a regression's (an objective the base did not leave unsolved).
+decisive() {
+    [ "$(cat "$1/result")" != 0 ] || return 1
+    [ -e "$1/task" ] || [ "$(cat "$1/result")" = error ] ||
+        [ "$(base_result "$(cat "$1/scenario")")" != unsolved ]
+}
+candidate_finished() {
+    if decisive "$1"; then [ "$2" -ge "$jobs_stop" ] || jobs_stop=$2; fi
+}
+# candidate_printed <job> <n>: its block, then what it means.
+candidate_printed() {
+    job_print "$1"
+    printed_name=$(cat "$1/section")
+    printed_ms=$(cat "$1/ms" 2>/dev/null || echo 0)
+    printed_status=$(cat "$1/result")
+    printed_scenario=$(cat "$1/scenario")
+    if [ "$printed_status" = error ]; then
+        phase_time candidate
+        echo "gate: the gate could not run $(basename "$printed_scenario") on the candidate" >&2
+        exit 3
+    fi
+    if [ -e "$1/task" ]; then
+        # The metric is the scenario's: one line on its stdout. Stderr is
+        # never read, and two lines mean candidate code printed one too, so
+        # neither counts.
+        metrics=$(grep -E '^METRIC [A-Za-z0-9_]+( [a-z]+=[0-9.]+)*$' "$1/out.1" 2>/dev/null || true)
+        case "$(printf '%s' "$metrics" | grep -c . || true)" in
+        0) ;;
+        1) metric=$metrics ;;
+        *) echo "| two or more METRIC lines on the scenario's stdout: no metric" ;;
+        esac
+        if [ "$printed_status" -ne 0 ]; then
+            run_stage "rejected|$printed_name" "$printed_ms"
+            phase_time candidate
+            verdict rejected "scenario fails on the candidate"
+            exit 0
+        fi
+    elif [ "$printed_status" -ne 0 ]; then
+        # An objective scenario is a regression only if the base solved it,
+        # as judged before any candidate code ran.
+        if [ "$(base_result "$printed_scenario")" = unsolved ]; then
+            echo "| $(basename "$printed_scenario") fails on the base too: an unsolved objective, not a regression"
+            run_stage "unsolved|$printed_name" "$printed_ms"
+            return 0
+        fi
+        run_stage "rejected|$printed_name" "$printed_ms"
+        phase_time candidate
+        verdict rejected "regression: $(basename "$printed_scenario") fails on the candidate"
         exit 0
     fi
+    run_stage "ok|$printed_name" "$printed_ms"
+}
+candidate_count=0
+add_candidate_job() { # <scenario> <section>
+    candidate_count=$((candidate_count + 1))
+    job=$jobs_dir/candidate.$candidate_count
+    mkdir "$job"
+    printf '%s\n' "$1" >"$job/scenario"
+    printf '%s\n' "$2" >"$job/section"
+    if runs_alone "$1"; then : >"$job/alone"; fi
+}
+if [ -n "$scenario" ]; then
+    add_candidate_job "$scenario" "candidate: $(basename "$scenario") must pass"
+    : >"$job/task"
 fi
-
 for other in "$scenarios"/*.sh; do
     [ -f "$other" ] || continue
     [ "$other" = "$scenario" ] && continue
     grep -q '^# rsi: ratchet' "$other" && continue
-    section "regression: $(basename "$other") must still pass"
-    if run_scenario "$work/candidate" "$other"; then
-        continue
-    fi
-    # An objective scenario is a regression only if the base solved it, as
-    # judged before any candidate code ran.
-    if [ "$(base_result "$other")" = unsolved ]; then
-        echo "| $(basename "$other") fails on the base too: an unsolved objective, not a regression"
-        stage_close unsolved
-        continue
-    fi
-    verdict rejected "regression: $(basename "$other") fails on the candidate"
-    exit 0
+    add_candidate_job "$other" "regression: $(basename "$other") must still pass"
 done
+stage_close ok
+if [ "$candidate_count" -gt 0 ] && ! snapshot_bin "$work/candidate"; then
+    echo "gate: cannot copy the candidate's spawn for its scenarios" >&2
+    exit 3
+fi
+phase_start
+run_jobs candidate "$candidate_count" candidate_job candidate_finished candidate_printed
+phase_time candidate
 verdict accepted

@@ -3,6 +3,8 @@
 // crashing. Read-only: this module only ever issues GET requests.
 
 import { readApi } from "./api";
+import type { Labels } from "./label.ts";
+import { labels } from "./label.ts";
 import type { RsiSummary } from "./api";
 import { normalizeHolds } from "./attention";
 import type { SourceHold } from "./attention";
@@ -95,7 +97,7 @@ export interface Budget {
 
 export type ResidentState = "proposed" | "approved" | "retired" | "unknown";
 
-export interface MissionTask {
+export interface MissionTask extends Labels {
   id: number | null;
   kind: string | null;
   agent_id: string | null;
@@ -135,6 +137,8 @@ export interface MissionTask {
 export interface Mission {
   id: number | null;
   text: string | null;
+  /** Its name, from its text and source (the server's labels). */
+  mission_name: string | null;
   origin: string | null;
   sources: string[];
   state: string | null;
@@ -158,7 +162,7 @@ export interface Mission {
   tasks: MissionTask[];
 }
 
-export interface Resident {
+export interface Resident extends Labels {
   name: string | null;
   agent_id: string | null;
   session_id: string | null;
@@ -238,6 +242,7 @@ function normalizeStage(value: unknown): TaskStage | null {
 function normalizeTask(value: unknown): MissionTask | null {
   if (!isObject(value)) return null;
   return {
+    ...labels(value),
     id: optionalNumber(value.id),
     kind: optionalText(value.kind),
     agent_id: optionalText(value.agent_id),
@@ -282,6 +287,7 @@ function normalizeMission(value: unknown): Mission | null {
   return {
     id: optionalNumber(value.id),
     text: optionalText(value.text),
+    mission_name: labels(value).mission_name,
     origin: optionalText(value.origin),
     sources,
     state: optionalText(value.state),
@@ -312,6 +318,7 @@ function normalizeMission(value: unknown): Mission | null {
 function normalizeResident(value: unknown): Resident | null {
   if (!isObject(value)) return null;
   return {
+    ...labels(value),
     name: optionalText(value.name),
     agent_id: optionalText(value.agent_id),
     session_id: optionalText(value.session_id),

@@ -17,6 +17,9 @@
 //!   "pending": [{                  // the plan's escalations not told yet, in its order
 //!     "session_id": "session_worker_a" | "host" | "missions",
 //!     "agent_id": "agent_worker_a" | null,
+//!     "label": "...",              // what it is doing (serve/labels.rs), with
+//!     "task_title": "..." | null,  // its task's title and mission's name
+//!     "mission_name": "..." | null,
 //!     "why": "stalled",            // the digest's heading
 //!     "line": "...", "tag": "session_worker_a stall-7-activity-41",
 //!     "since_ms": 1793957000000 | null,  // when the record it rests on was written
@@ -28,7 +31,7 @@
 //!     "waiting": [12]              // the tasks waiting, oldest first
 //!   }],
 //!   "supervisor": null | {
-//!     "session_id", "agent_id", "live", "execution_id", "end_cause",
+//!     "session_id", "agent_id", "label", "live", "execution_id", "end_cause",
 //!     "busy",                      // a command into it is in flight
 //!     "turn_ended",                // its live execution's latest turn has ended
 //!     "judgement": null | {state, needs_human, stuck, ambiguity, confidence, judge,
@@ -43,6 +46,7 @@
 //!   },
 //!   "on_own_jobs": [{              // workers the rules hold as working on a
 //!     "session_id", "agent_id",    // background job of their own: not escalated
+//!     "label", "task_title", "mission_name",
 //!     "judged_at_ms": 1793957000000 | null,
 //!     "jobs": [{"id": "b8w03og7k", "kind": "bash" | "monitor",
 //!               "started_at_ms": ..., "age_ms": ...}]   // oldest first
@@ -116,9 +120,10 @@ pub(super) fn attention() -> Result<Value, String> {
     let store = super::open_store()?;
     let disk = store.host_disk().map_err(super::err)?;
     let (bounds, _) = dispatch::Bounds::from_env();
+    let (waits, _) = crate::deliver::Waits::from_env();
     let reading = dispatch::read_plan(
         &store,
-        dispatch::load(&store)?,
+        dispatch::load(&store, waits)?,
         |now| crate::disk::escalations(disk.as_array().map_or(&[][..], Vec::as_slice), now),
         &bounds,
         crate::config::supervised(),
@@ -186,6 +191,15 @@ pub(super) fn attention() -> Result<Value, String> {
     if let Some(fields) = view.as_object_mut() {
         fields.insert("holds".to_string(), holds);
     }
+    // Labels name the agents (serve/labels.rs); without their facts the
+    // items are labelled by their ids alone, and the view still answers.
+    let context = super::label_context(&store).unwrap_or_else(|error| {
+        if let Some(warnings) = view.get_mut("warnings").and_then(Value::as_array_mut) {
+            warnings.push(json!(format!("attention: labels: {error}")));
+        }
+        super::labels::Context::default()
+    });
+    super::labels::label_attention(&mut view, &context);
     Ok(view)
 }
 

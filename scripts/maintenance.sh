@@ -17,10 +17,19 @@
 #               newest); every other file there is left alone.
 #   3. cache    the gate's base cache, ${XDG_CACHE_HOME:-~/.cache}/spawn/
 #               gate-base (scripts/rsi/gate.sh): entries (files named by
-#               their 64-hex key, and `<key>.<pid>` a gate never finished
-#               writing) no gate used for SPAWN_MAINTENANCE_CACHE_AGE_DAYS
-#               (default 14). A gate touches an entry on every hit, so only
-#               the results of bases and keys nobody judges any more go.
+#               their 64-hex key, `<key>.<pid>` a gate never finished
+#               writing, and `<key>.lock`, the key's lock) no gate used for
+#               SPAWN_MAINTENANCE_CACHE_AGE_DAYS (default 14). A gate
+#               touches an entry on every hit, so only the results of bases
+#               and keys nobody judges any more go.
+#   4. servers  the templates (and exported images) of the gate's private
+#               test servers, ${XDG_CACHE_HOME:-~/.cache}/spawn/gate-pg/<id>
+#               (the image's id or the host programs' hash;
+#               scripts/rsi/gate-pg.sh), that no gate started a server from
+#               for SPAWN_MAINTENANCE_CACHE_AGE_DAYS (a gate touches `ready`
+#               at each start), with their locks, and a half-made one
+#               (`.<id>.XXXXXX`, a gate killed while it made it) older than
+#               a day.
 #
 # Every step runs even when an earlier one failed; the exit status is 1
 # when any did. SPAWN_MAINTENANCE_DRY_RUN=1 prints what would go and
@@ -106,7 +115,7 @@ days=${SPAWN_MAINTENANCE_CACHE_AGE_DAYS:-14}
 if whole SPAWN_MAINTENANCE_CACHE_AGE_DAYS "$days" && [ -d "$cache" ]; then
     expired=0
     for entry in $(find "$cache" -mindepth 1 -maxdepth 1 -type f -user "$(id -u)" \
-        -regextype posix-extended -regex '.*/[0-9a-f]{64}(\.[0-9]+)?' -mtime +"$days" | sort); do
+        -regextype posix-extended -regex '.*/[0-9a-f]{64}(\.[0-9]+|\.lock)?' -mtime +"$days" | sort); do
         if [ "$dry" = 1 ]; then
             say "cache: would remove $entry"
             continue
@@ -118,6 +127,39 @@ if whole SPAWN_MAINTENANCE_CACHE_AGE_DAYS "$days" && [ -d "$cache" ]; then
         fi
     done
     say "cache: removed $expired base results no gate used for $days days from $cache$note"
+fi
+
+# 4. the private test servers' templates (and exported images)
+servers=${XDG_CACHE_HOME:-$HOME/.cache}/spawn/gate-pg
+if whole SPAWN_MAINTENANCE_CACHE_AGE_DAYS "$days" 2>/dev/null && [ -d "$servers" ]; then
+    gone=0
+    # -type d without -L: a symlink named like a root is not followed.
+    for root in $(find "$servers" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" \
+        -regextype posix-extended -regex '.*/[0-9a-f]{64}' | sort) \
+        $(find "$servers" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" \
+            -regextype posix-extended -regex '.*/\.[0-9a-f]{64}\.[A-Za-z0-9]{6}' -mmin +1440 | sort); do
+        case "$root" in
+        */.*) ;;
+        *)
+            # In use within the age (`ready` touched at each start), or a
+            # gate is making it: it stays.
+            [ -f "$root/ready" ] && [ -z "$(find "$root/ready" -mtime +"$days")" ] && continue
+            [ -f "$root/ready" ] || continue
+            ;;
+        esac
+        if [ "$dry" = 1 ]; then
+            say "servers: would remove $root"
+            continue
+        fi
+        # An exported image holds read-only directories.
+        chmod -R u+w -- "$root" 2>/dev/null
+        if rm -rf -- "$root" && rm -f -- "$root.lock"; then
+            gone=$((gone + 1))
+        else
+            fail "servers: could not remove $root"
+        fi
+    done
+    say "servers: removed $gone private test server templates no gate used for $days days from $servers$note"
 fi
 
 exit "$failed"
