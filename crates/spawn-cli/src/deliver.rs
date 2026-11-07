@@ -560,7 +560,14 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
         .map(|facts| (facts.session_id.as_str(), facts))
         .collect();
     let mut due: Option<i64> = None;
-    let mut soon = |at: i64| due = Some(due.map_or(at, |known: i64| known.min(at)));
+    // A time already reached is not a wait: this pass either acted on it or
+    // found the worker not ready for it, and either way the records that
+    // change that are what moves the watermark.
+    let mut soon = |at: i64| {
+        if at > now_ms {
+            due = Some(due.map_or(at, |known: i64| known.min(at)));
+        }
+    };
     let next = next_up(work);
     for task in &work.tasks {
         if !matches!(task.state, TaskState::Assigned | TaskState::Revise) || !next.contains(&task.id)
@@ -607,7 +614,6 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
             let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
             soon(finished.saturating_add(NOT_READY_RETRY_MS));
         }
-        let _ = now_ms;
     }
     due
 }
