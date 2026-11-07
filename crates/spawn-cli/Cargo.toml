@@ -18,6 +18,8 @@ spawn-host.workspace = true
 spawn-jev.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The backups' sha256, computed as a record spells it.
+sha2.workspace = true
 tiny_http = "0.12.0"
 # SIGTERM ends `spawn loop` between passes, so its pending pushes are made.
 signal-hook = { version = "0.3", default-features = false }

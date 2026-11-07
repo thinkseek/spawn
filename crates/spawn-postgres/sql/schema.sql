@@ -1744,6 +1744,13 @@ begin
                 coalesce((p_record ->> 'notice')::boolean, false),
                 p_record ->> 'text', coalesce(p_record -> 'evidence', '{}'::jsonb),
                 p_event, p_at);
+    when 'backup.dumped', 'backup.bundled', 'backup.verified' then
+        -- What `spawn backup` did (crate backup.rs): read from the log by the
+        -- next run, folded into no table. What a copy holds is in its record
+        -- (its events, watermark and sha256), so the drill compares a
+        -- restore with the record and not with the live database
+        -- (docs/storage.md, "Where state lives").
+        null;
     when 'alert.cleared' then
         -- What cleared an alert, once: the row must be open (a notice never
         -- clears, and a cleared alert is cleared at most once).
@@ -3176,6 +3183,31 @@ begin
     return spawn_control_record(p_record);
 end $$;
 
+-- The backup records: the loop's `spawn backup dump|bundle|verify` writes
+-- them through `spawn_backup_record` (owner only); each names what a copy
+-- holds and what the run measured (docs/storage.md, "Where state lives").
+-- Folded into no table, like `host.disk`.
+create or replace function spawn_backup_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record backups', session_user using errcode = '42501';
+    end if;
+    if p_record ->> 'type' not in ('backup.dumped', 'backup.bundled', 'backup.verified') then
+        raise exception 'not a backup record: %', p_record ->> 'type';
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The backup records, found without reading the rest of the stream: a run
+-- reads the ones before it to decide its tiers and its bundle's base.
+create index if not exists spawn_events_backup
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type'
+          in ('backup.dumped', 'backup.bundled', 'backup.verified');
+
 -- The alert transitions, found without reading the rest of the stream.
 create index if not exists spawn_events_alert
     on spawn_events (session_seq)
@@ -3361,7 +3393,7 @@ begin
         'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
-        'spawn_alert_record(jsonb)',
+        'spawn_alert_record(jsonb)', 'spawn_backup_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',

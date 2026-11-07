@@ -606,6 +606,7 @@ dependencies = [
  "postgres",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "spawn-core",
  "spawn-host",
