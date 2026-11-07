@@ -20,8 +20,8 @@ use crate::id::{
 };
 use crate::port::{
     ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Hold, Launch,
-    READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive, WorkspaceError,
-    WorkspaceStore,
+    FileWatch, READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive,
+    WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};
 
@@ -953,6 +953,113 @@ impl TranscriptArchive for MemoryStore {
         }
         held.extend_from_slice(bytes);
         Ok(())
+    }
+}
+
+/// What a [`MemoryWatch`] has been told.
+#[derive(Debug, Default)]
+struct WatchState {
+    /// Every `(key, path)` watched.
+    watched: Vec<(String, String)>,
+    /// Paths whose watch is refused, as a platform with a watch limit or a
+    /// filesystem without watches answers.
+    refused: HashSet<String>,
+    /// Everything is refused when true.
+    refuse_all: bool,
+    /// Keys with a change no drain took yet.
+    pending: HashSet<String>,
+}
+
+/// A [`FileWatch`] a test drives by hand: it reports the change of a path
+/// when the test says so, and refuses the paths the test names.
+///
+/// A test that wants today's behaviour (a read on every pass) gives the
+/// Bridge no watch at all; one that wants the polling fallback refuses every
+/// watch here.
+#[derive(Debug, Default)]
+pub struct MemoryWatch {
+    state: Mutex<WatchState>,
+}
+
+impl MemoryWatch {
+    /// A watch with nothing watched and nothing refused.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A watch that refuses every path, as a platform without watches does.
+    pub fn refusing() -> Self {
+        let watch = Self::default();
+        watch.lock().refuse_all = true;
+        watch
+    }
+
+    fn lock(&self) -> MutexGuard<'_, WatchState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Refuse to watch `path`, as a platform at its watch limit does.
+    pub fn refuse(&self, path: &str) {
+        self.lock().refused.insert(path.to_string());
+    }
+
+    /// Report `path` as changed: every key watching it is due at the next
+    /// drain. Test helper.
+    pub fn changed(&self, path: &str) {
+        let mut state = self.lock();
+        let keys: Vec<String> = state
+            .watched
+            .iter()
+            .filter(|(_, watched)| watched == path)
+            .map(|(key, _)| key.clone())
+            .collect();
+        state.pending.extend(keys);
+    }
+
+    /// The paths watched under `key`. Test helper.
+    pub fn watched(&self, key: &str) -> Vec<String> {
+        self.lock()
+            .watched
+            .iter()
+            .filter(|(owner, _)| owner == key)
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
+    /// Whether `key` is still watched at all. Test helper.
+    pub fn watching(&self, key: &str) -> bool {
+        self.lock().watched.iter().any(|(owner, _)| owner == key)
+    }
+}
+
+impl FileWatch for MemoryWatch {
+    fn watch(&self, key: &str, path: &str) -> Result<(), WatchError> {
+        let mut state = self.lock();
+        if state.refuse_all || state.refused.contains(path) {
+            return Err(WatchError(format!("{path}: refused by the test")));
+        }
+        if !state
+            .watched
+            .iter()
+            .any(|(owner, watched)| owner == key && watched == path)
+        {
+            state.watched.push((key.to_string(), path.to_string()));
+        }
+        Ok(())
+    }
+
+    fn unwatch(&self, key: &str) {
+        let mut state = self.lock();
+        state.watched.retain(|(owner, _)| owner != key);
+        state.pending.remove(key);
+    }
+
+    fn drain(&self) -> Vec<String> {
+        let mut state = self.lock();
+        let pending = std::mem::take(&mut state.pending);
+        pending.into_iter().collect()
     }
 }
 
