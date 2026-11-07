@@ -1434,11 +1434,23 @@ impl Bridge {
         if self.config.watch.is_none() || follow.poll {
             return true;
         }
-        if follow.again || follow.fresh {
-            return follow.fresh_is_quiet(active, self.clock.now().0, self.config.screen_quiet);
+        if follow.again {
+            return true;
         }
+        let now = self.clock.now().0;
+        if follow.fresh {
+            // The transcript grew: wait until it has held still long enough
+            // for the screen to say what the transcript cannot (the prompt
+            // is back), then read it until two readings agree.
+            let quiet = i64::try_from(self.config.screen_quiet.as_millis()).unwrap_or(i64::MAX);
+            return follow
+                .growth
+                .is_none_or(|growth| now.saturating_sub(growth) >= quiet);
+        }
+        // The backstop: a screen that changes with nothing in the
+        // transcript (a dialog, a crash to a shell).
         follow.last_capture.is_none_or(|at| {
-            self.clock.now().0.saturating_sub(at)
+            now.saturating_sub(at)
                 >= i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX)
         })
     }
