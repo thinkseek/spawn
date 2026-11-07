@@ -3131,6 +3131,49 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
+-- The alert transitions: the loop's `alert.fired` and `alert.cleared`
+-- records (`spawn_alert_record`, owner only), each once per occurrence
+-- (docs/fleet-architecture.md, "Alerts"). The checked writer refuses a
+-- second `fired` for a key, a `cleared` without its `fired`, and a second
+-- `cleared`; the fold does the same, so the log and the table agree.
+create or replace function spawn_alert_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record alerts', session_user using errcode = '42501';
+    end if;
+    if v_type not in ('alert.fired', 'alert.cleared') then
+        raise exception 'not an alert record: %', v_type;
+    end if;
+    if nullif(p_record ->> 'key', '') is null or nullif(p_record ->> 'kind', '') is null
+       or nullif(p_record ->> 'subject', '') is null then
+        raise exception 'an alert record names a key, a kind and a subject: %', p_record;
+    end if;
+    if v_type = 'alert.fired' then
+        if exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was already fired', p_record ->> 'key';
+        end if;
+    else
+        if not exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was not fired', p_record ->> 'key';
+        end if;
+        if exists (select 1 from spawn_alerts
+                    where key = p_record ->> 'key' and state <> 'open') then
+            raise exception 'alert % is not open: nothing to clear', p_record ->> 'key';
+        end if;
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The alert transitions, found without reading the rest of the stream.
+create index if not exists spawn_events_alert
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' in ('alert.fired', 'alert.cleared');
+
 -- The `source.moved` records (deploys), found without reading the rest of
 -- the stream: the dispatcher reads the latest on every step
 -- (`LATEST_SOURCE_MOVED`).
