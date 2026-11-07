@@ -335,7 +335,10 @@ impl Fleet {
             None => None,
         };
         if let (Some(open), Some(watermark)) = (self.store.clone(), watermark) {
-            self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
+            let ran = self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
+            if std::env::var_os("SPAWN_LOOP_TRACE").is_some() {
+                eprintln!("trace: wm={watermark} ran={ran:?} lines={}", lines.len());
+            }
         }
         // The screens and transcripts the Bridge reads are not announced by
         // an append: this is what keeps them on the pass interval, and what
@@ -372,8 +375,10 @@ impl Fleet {
         lines: &mut Vec<String>,
         warnings: &mut Vec<String>,
         failed: &mut bool,
-    ) {
+    ) -> Vec<&'static str> {
+        let mut ran = Vec::new();
         if self.schedule.bridge.runs(watermark, now) {
+            ran.push("bridge");
             match self.bridge.work() {
                 Ok((report, more)) => {
                     warnings.extend(report.warnings);
@@ -394,6 +399,7 @@ impl Fleet {
             }
         }
         if self.schedule.observer.runs(watermark, now) {
+            ran.push("observer");
             match self.observer.tick() {
                 Ok(_) => self
                     .schedule
@@ -411,6 +417,7 @@ impl Fleet {
                 .unwrap_or_else(|error| vec![format!("disk: {error}")]),
         );
         if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
+            ran.push("dispatch");
             match dispatch::step(
                 open,
                 self.supervised,
@@ -429,6 +436,7 @@ impl Fleet {
         // Under the disk floor no resident is revived (a new execution); the
         // supervisor still is, to act on the warning.
         if !self.disk.below_floor() && self.schedule.residents.runs(watermark, now) {
+            ran.push("residents");
             match supervise::keep_residents(open) {
                 Ok((more, due)) => {
                     lines.extend(more);
@@ -438,6 +446,7 @@ impl Fleet {
             }
         }
         if self.supervised && self.schedule.alive.runs(watermark, now) {
+            ran.push("alive");
             match supervise::keep_alive(open) {
                 Ok((line, due)) => {
                     lines.extend(line);
@@ -446,6 +455,7 @@ impl Fleet {
                 Err(error) => Fleet::fail(failed, "supervise", &error),
             }
         }
+        ran
     }
 
     /// Log a failed step and mark the pass failed.
