@@ -1670,11 +1670,10 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
-<<<<<<< 086dd79f79512e065f02af8c386088e5654d11e2
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
-=======
+        null;
     when 'source.push_requested' then
         -- The owner asked for a commit on a source's main (`spawn mission
         -- push`): a request the integrator applies between its steps, read
@@ -1686,7 +1685,6 @@ begin
         -- The integrator could not apply an owner's request (a conflict, a
         -- commit not in the source, main moving under it twice): main and
         -- every baseline stay where they were.
->>>>>>> 16890fb0b5ac7879cc586ecb8cfba06cb6dc4960
         null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
