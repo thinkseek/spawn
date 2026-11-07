@@ -614,6 +614,28 @@ pub(crate) const INTEGRATOR_LOCK_KEY: i32 = 1_399_957_336;
 pub(crate) const TOOL_CALLS_SINCE: &str = "select count(*) from spawn_events
                   where session_id = $1 and event_name = 'tool.started' and recorded_at_ms > $2";
 
+/// A session's events after a time, in log order, with the tool call's or
+/// background job's id where they have one: what a task's active time is
+/// measured from (spawn-cli's `integrate::active_ms`).
+pub(crate) const SESSION_ACTIVITY: &str = "select id, recorded_at_ms, event_name,
+                        coalesce(kind -> 'detail' ->> 'tool_use_id',
+                                 kind -> 'detail' ->> 'job_id')
+                   from spawn_events
+                  where session_id = $1 and recorded_at_ms > $2
+                  order by id";
+
+/// How long the whole fleet was alive between two events of the log (ids
+/// `$1` and `$2`): the gaps between consecutive events of any session, in
+/// log order, each capped at `$3` ms. While the host is up, the fleet's
+/// sessions, loops and control stream leave a gap over a few minutes
+/// rarely; a stopped fleet or a frozen host writes nothing, so its outage
+/// adds at most one cap. Scanned by the primary key: ids follow the log's
+/// order.
+pub(crate) const FLEET_ALIVE: &str = "select coalesce(sum(least(greatest(gap, 0), $3)), 0)::bigint
+                   from (select recorded_at_ms - lag(recorded_at_ms) over (order by id) as gap
+                           from spawn_events
+                          where id between $1 and $2) gaps";
+
 /// The commit of an agent's latest checkpoint (or merge of main): its last
 /// `artifact.committed` event.
 pub(crate) const LATEST_CHECKPOINT: &str = "select kind -> 'detail' -> 'artifact' ->> 'commit'
@@ -681,6 +703,19 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
                   order by a.agent_id";
 
 // Delivery bookkeeping, run by the dispatcher as the owner.
+
+/// One event of a session, as a task's active time reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityEvent {
+    /// Its id in the log.
+    pub id: i64,
+    /// When it was recorded.
+    pub at_ms: i64,
+    /// Its event name (`tool.started`, `screen.observed`, ...).
+    pub name: String,
+    /// The tool call's `tool_use_id` or the background job's `job_id`.
+    pub key: Option<String>,
+}
 
 /// A landing held by [`PostgresStore::landing_hold`]; released when dropped
 /// (and with the connection, if the process dies first).
@@ -929,6 +964,33 @@ impl PostgresStore {
     /// database's clock ([`SOURCE_HOLDS`]).
     pub fn source_holds(&self) -> Result<Value, StoreError> {
         self.query_json(SOURCE_HOLDS, &[])
+    }
+
+    /// `session`'s events recorded after `since_ms`, in log order
+    /// ([`SESSION_ACTIVITY`]).
+    pub fn session_activity(
+        &self,
+        session: &str,
+        since_ms: i64,
+    ) -> Result<Vec<ActivityEvent>, StoreError> {
+        Ok(self
+            .query(SESSION_ACTIVITY, &[&session, &since_ms])?
+            .iter()
+            .map(|row| ActivityEvent {
+                id: row.get(0),
+                at_ms: row.get(1),
+                name: row.get(2),
+                key: row.get(3),
+            })
+            .collect())
+    }
+
+    /// Milliseconds the fleet was alive between the log's events `from_id`
+    /// and `to_id`, each silence capped at `gap_ms` ([`FLEET_ALIVE`]).
+    pub fn fleet_alive_ms(&self, from_id: i64, to_id: i64, gap_ms: i64) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(FLEET_ALIVE, &[&from_id, &to_id, &gap_ms])?
+            .get(0))
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.

@@ -81,7 +81,7 @@ mod row;
 mod scorecard;
 mod sessions;
 
-pub use missions::LandingHold;
+pub use missions::{ActivityEvent, LandingHold};
 pub use sessions::{
     ExecutionRow, Freshness, LivenessFacts, LogEntry, OpenTool, SessionState, TimelineEntry,
 };

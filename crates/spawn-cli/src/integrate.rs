@@ -20,7 +20,11 @@
 //!    and only while no other mission's landing on the source is unresolved
 //!    (its push may have moved main before its record);
 //! 2. a delivered task over its mission's budget is aborted and its worker
-//!    stopped;
+//!    stopped. Its minutes are active time ([`active_ms`]): each silence of
+//!    its session counts at most `SPAWN_BUDGET_GAP_SECS` (300 s), a gap
+//!    inside a tool or job that ended counts while the whole fleet was
+//!    alive, so no outage (the fleet stopped, a frozen host, a dead engine,
+//!    the model API down) can by itself put a task over budget;
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
@@ -263,7 +267,7 @@ use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
 use spawn_core::mission::TaskState;
 use spawn_core::port::CommandQueue;
 use spawn_host::GitWorkspace;
-use spawn_postgres::PostgresStore;
+use spawn_postgres::{ActivityEvent, PostgresStore};
 
 use crate::config::{loop_interval, workspace_root};
 use crate::gate::{self, GateFailure, RoomFailure, Shortfall};
@@ -323,6 +327,85 @@ fn wall_clock_minutes(text: Option<&str>) -> Duration {
         .filter(|minutes| *minutes > 0)
         .unwrap_or(DEFAULT_MINUTES);
     Duration::from_mins(minutes)
+}
+
+/// The most one silence adds to a task's active time, unless
+/// `SPAWN_BUDGET_GAP_SECS` says otherwise ([`active_ms`]).
+const BUDGET_GAP: Duration = Duration::from_mins(5);
+
+/// [`BUDGET_GAP`] from the setting's text: a whole number of seconds from 1
+/// up; anything else is the default.
+pub(crate) fn budget_gap(text: Option<&str>) -> Duration {
+    text.and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(BUDGET_GAP, Duration::from_secs)
+}
+
+/// Milliseconds a task delivered at `delivered_at_ms` could work by
+/// `now_ms`: what its minute budget measures. `events` are its session's
+/// events since delivery, in log order.
+///
+/// The points are the delivery, each event and now. Between two of them
+/// the task gets the gap, at most `gap_ms`: a worker at work leaves events
+/// (tool calls, screen readings, messages) far more often, and a silence
+/// past the cap is a worker that could not work (no live execution, the
+/// fleet stopped, the host frozen or rebooted, the model API down), which
+/// adds only the cap. One exception keeps a long tool counted: a gap inside
+/// a tool call or background job that later ended (its `tool.completed`,
+/// `tool.failed` or `job.ended` with the same id) gets the time the whole
+/// fleet was alive in it (`fleet_alive(from_id, to_id)`: the log's gaps
+/// between those two events, each capped at `gap_ms`), at least the cap and
+/// at most the gap. An outage stops the tool's engine (it never ends) or
+/// writes nothing anywhere (a frozen host), so it still adds at most one
+/// cap.
+///
+/// Why no outage can by itself put a task over budget: an outage is a
+/// silence, and every silence, whatever its length or cause, adds at most
+/// `gap_ms`.
+pub(crate) fn active_ms(
+    delivered_at_ms: i64,
+    now_ms: i64,
+    events: &[ActivityEvent],
+    gap_ms: i64,
+    mut fleet_alive: impl FnMut(i64, i64) -> Result<i64, String>,
+) -> Result<i64, String> {
+    let capped = |from: i64, to: i64| (to - from).clamp(0, gap_ms);
+    let (Some(first), Some(last)) = (events.first(), events.last()) else {
+        return Ok(capped(delivered_at_ms, now_ms));
+    };
+    // covered[k] > 0: the gap after events[k] lies inside a tool or job
+    // that ended.
+    let mut covered = vec![0i64; events.len()];
+    let mut open: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        let Some(key) = event.key.as_deref() else {
+            continue;
+        };
+        match event.name.as_str() {
+            "tool.started" | "job.started" => {
+                open.insert(key, index);
+            }
+            "tool.completed" | "tool.failed" | "job.ended" => {
+                if let Some(start) = open.remove(key) {
+                    covered[start] += 1;
+                    covered[index] -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut total = capped(delivered_at_ms, first.at_ms) + capped(last.at_ms, now_ms);
+    let mut inside = 0;
+    for (index, pair) in events.windows(2).enumerate() {
+        inside += covered[index];
+        let gap = (pair[1].at_ms - pair[0].at_ms).max(0);
+        total += if inside > 0 && gap > gap_ms {
+            fleet_alive(pair[0].id, pair[1].id)?.clamp(gap_ms, gap)
+        } else {
+            gap.min(gap_ms)
+        };
+    }
+    Ok(total)
 }
 
 /// Guard against runaway candidates.
@@ -749,12 +832,16 @@ pub(crate) fn short_of_room(
 }
 
 /// Whether a delivered task ran past its mission's budget
-/// (`{"minutes": n, "tool_calls": n}`, either optional).
-pub(crate) fn over_budget(budget: &Value, elapsed_ms: i64, tool_calls: i64) -> Option<String> {
+/// (`{"minutes": n, "tool_calls": n}`, either optional). `active_ms` is the
+/// time it could work ([`active_ms`]), never the wall clock.
+pub(crate) fn over_budget(budget: &Value, active_ms: i64, tool_calls: i64) -> Option<String> {
     if let Some(minutes) = budget.get("minutes").and_then(Value::as_i64)
-        && elapsed_ms > minutes.saturating_mul(60_000)
+        && active_ms > minutes.saturating_mul(60_000)
     {
-        return Some(format!("the task ran past its {minutes}-minute budget"));
+        return Some(format!(
+            "the task worked past its {minutes}-minute budget ({} minutes active)",
+            active_ms / 60_000
+        ));
     }
     if let Some(limit) = budget.get("tool_calls").and_then(Value::as_i64)
         && tool_calls > limit
@@ -1427,14 +1514,29 @@ impl Integrator {
         };
         let mut aborted = false;
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let gap_ms = budget_gap(crate::config::env_value("SPAWN_BUDGET_GAP_SECS").as_deref())
+            .as_millis()
+            .try_into()
+            .unwrap_or(i64::MAX);
         for task in &mission.tasks {
             let (TaskState::Delivered, Some(at)) = (task.state, task.delivered_at_ms) else {
                 continue;
             };
-            let calls = store
-                .tool_calls_since(&task.session_id, at)
+            let events = store
+                .session_activity(&task.session_id, at)
                 .map_err(|error| error.to_string())?;
-            if let Some(reason) = over_budget(budget, now - at, calls) {
+            let calls = events
+                .iter()
+                .filter(|event| event.name == "tool.started")
+                .count()
+                .try_into()
+                .unwrap_or(i64::MAX);
+            let active = active_ms(at, now, &events, gap_ms, |from, to| {
+                store
+                    .fleet_alive_ms(from, to, gap_ms)
+                    .map_err(|error| error.to_string())
+            })?;
+            if let Some(reason) = over_budget(budget, active, calls) {
                 // The Stop first, under its fixed key: if the record then
                 // fails, the next pass finds the task still delivered and
                 // over budget, and submits (a no-op) and records again.
@@ -2708,10 +2810,10 @@ fn task_scenario(scenarios: &Path, recorded: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Freshness, Mission, NO_TEST_DATABASE, aborted, freshness, halt_reason, markers_note,
-        merged_tree, needs_test_database, no_room, over_budget, pinned, report_freshness,
-        room_backoff, room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
-        withheld_without_test_database,
+        BUDGET_GAP, Freshness, Mission, NO_TEST_DATABASE, aborted, active_ms, budget_gap,
+        freshness, halt_reason, markers_note, merged_tree, needs_test_database, no_room,
+        over_budget, pinned, report_freshness, room_backoff, room_wait, short_of_room,
+        task_scenario, waits_for_gate, wall_clock_minutes, withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
@@ -4060,6 +4162,170 @@ mod tests {
         assert!(over_budget(&budget, 46 * 60_000, 0).is_some());
         assert!(over_budget(&budget, 0, 61).is_some());
         assert_eq!(over_budget(&json!({}), i64::MAX, i64::MAX), None);
+    }
+
+    const MIN: i64 = 60_000;
+    const GAP: i64 = 5 * MIN;
+
+    /// A session event at `at_ms` (its id follows its time), with a tool or
+    /// job id when it has one.
+    fn event(id: i64, at_ms: i64, name: &str, key: Option<&str>) -> spawn_postgres::ActivityEvent {
+        spawn_postgres::ActivityEvent {
+            id,
+            at_ms,
+            name: name.to_string(),
+            key: key.map(str::to_string),
+        }
+    }
+
+    /// Steady work from `from_ms` to `to_ms`: a tool call every 30 s.
+    fn steady(from_ms: i64, to_ms: i64, first_id: i64) -> Vec<spawn_postgres::ActivityEvent> {
+        let mut events = Vec::new();
+        let (mut at, mut id) = (from_ms, first_id);
+        while at <= to_ms {
+            let key = format!("t{id}");
+            events.push(event(id, at, "tool.started", Some(&key)));
+            events.push(event(id + 1, at + 5_000, "tool.completed", Some(&key)));
+            at += 30_000;
+            id += 2;
+        }
+        events
+    }
+
+    fn never_asked(_: i64, _: i64) -> Result<i64, String> {
+        panic!("no gap inside an ended tool is longer than the cap")
+    }
+
+    /// 2026-11-07 23:05:46: the fleet stopped 17:55-23:05, and the
+    /// integrator's first pass after the restart aborted task 159 (a
+    /// 90-minute budget, 13 minutes of work before the stop) and task 113
+    /// (240 minutes; it stopped inside a tool call that never ended). The
+    /// wall clock (main's rule) aborts both; their active time aborts
+    /// neither.
+    #[test]
+    fn a_fleet_stopped_for_five_hours_puts_no_task_over_its_budget() {
+        let delivered = 1_794_044_765_209;
+        let first_pass = 1_794_063_946_655;
+        let mut events = steady(delivered + 10_000, delivered + 13 * MIN, 1);
+        assert!(over_budget(&json!({"minutes": 90}), first_pass - delivered, 0).is_some());
+        let active = active_ms(delivered, first_pass, &events, GAP, never_asked).expect("active");
+        assert!(active < 13 * MIN + 2 * GAP, "{active}");
+        assert_eq!(over_budget(&json!({"minutes": 90}), active, 0), None);
+
+        // Task 113: a tool started before the stop never ends; the restart's
+        // first event comes five hours later.
+        let last = events.last().expect("events").clone();
+        events.push(event(
+            last.id + 1,
+            last.at_ms + 1_000,
+            "tool.started",
+            Some("cargo"),
+        ));
+        events.push(event(
+            last.id + 2,
+            first_pass - 2_000,
+            "command.accepted",
+            None,
+        ));
+        let active = active_ms(delivered, first_pass, &events, GAP, never_asked).expect("active");
+        assert!(active < 13 * MIN + 3 * GAP, "{active}");
+        assert_eq!(over_budget(&json!({"minutes": 240}), active, 0), None);
+    }
+
+    /// No silence of any length adds more than the cap: an outage alone
+    /// puts nothing over budget, at delivery, between events, or up to now.
+    #[test]
+    fn an_outage_of_any_length_adds_at_most_the_cap() {
+        let day = 24 * 60 * MIN;
+        assert_eq!(active_ms(0, 30 * day, &[], GAP, never_asked), Ok(GAP));
+        let events = [
+            event(1, 30 * day, "tool.started", Some("a")),
+            event(2, 60 * day, "tool.completed", Some("b")),
+        ];
+        assert_eq!(
+            active_ms(0, 90 * day, &events, GAP, never_asked),
+            Ok(3 * GAP)
+        );
+        // A clock that steps back counts nothing.
+        let back = [
+            event(1, 10 * MIN, "screen.observed", None),
+            event(2, MIN, "x", None),
+        ];
+        assert_eq!(active_ms(0, MIN, &back, GAP, never_asked), Ok(GAP));
+    }
+
+    #[test]
+    fn steady_work_runs_past_the_budget() {
+        let events = steady(0, 100 * MIN, 1);
+        let active = active_ms(0, 100 * MIN, &events, GAP, never_asked).expect("active");
+        // Every gap is short: all of it counts (to its last event, 5 s past now).
+        assert_eq!(active, 100 * MIN + 5_000);
+        assert!(over_budget(&json!({"minutes": 90}), active, 0).is_some());
+    }
+
+    /// A tool that runs an hour without an event of its session (a build, a
+    /// gate in the worker) counts while the fleet was alive, at most its
+    /// gap; a host frozen meanwhile counts only the cap. A job counts the
+    /// same way.
+    #[test]
+    fn a_long_tool_counts_while_the_fleet_was_alive() {
+        for (start, end, key) in [
+            ("tool.started", "tool.completed", "toolu_1"),
+            ("tool.started", "tool.failed", "toolu_1"),
+            ("job.started", "job.ended", "job_1"),
+        ] {
+            let events = [
+                event(10, MIN, start, Some(key)),
+                event(90, 61 * MIN, end, Some(key)),
+            ];
+            let mut asked = Vec::new();
+            let alive = active_ms(0, 61 * MIN, &events, GAP, |from, to| {
+                asked.push((from, to));
+                Ok(60 * MIN)
+            });
+            assert_eq!(alive, Ok(61 * MIN), "{start}");
+            assert_eq!(asked, [(10, 90)]);
+            let frozen = active_ms(0, 61 * MIN, &events, GAP, |_, _| Ok(MIN));
+            assert_eq!(frozen, Ok(MIN + GAP), "{start}");
+            // More than the gap is never credited.
+            let over = active_ms(0, 61 * MIN, &events, GAP, |_, _| Ok(500 * MIN));
+            assert_eq!(over, Ok(61 * MIN), "{start}");
+        }
+        // A tool still running counts the cap until it ends, and the fleet's
+        // answer is never needed for it.
+        let running = [event(1, 0, "tool.started", Some("t"))];
+        assert_eq!(active_ms(0, 60 * MIN, &running, GAP, never_asked), Ok(GAP));
+        // An end with another id, or one without an id, covers nothing.
+        let unpaired = [
+            event(1, 0, "tool.started", Some("t")),
+            event(2, 60 * MIN, "tool.completed", Some("u")),
+            event(3, 120 * MIN, "tool.completed", None),
+        ];
+        assert_eq!(
+            active_ms(0, 120 * MIN, &unpaired, GAP, never_asked),
+            Ok(2 * GAP)
+        );
+        // The fleet's error is the pass's.
+        let errs = active_ms(
+            0,
+            61 * MIN,
+            &[
+                event(1, 0, "tool.started", Some("t")),
+                event(2, 60 * MIN, "tool.completed", Some("t")),
+            ],
+            GAP,
+            |_, _| Err("down".to_string()),
+        );
+        assert_eq!(errs, Err("down".to_string()));
+    }
+
+    #[test]
+    fn the_budget_gap_is_a_whole_number_of_seconds() {
+        assert_eq!(budget_gap(None), BUDGET_GAP);
+        assert_eq!(budget_gap(Some(" 90 ")), std::time::Duration::from_secs(90));
+        for bad in ["", "0", "-5", "1.5", "2m", "ten"] {
+            assert_eq!(budget_gap(Some(bad)), BUDGET_GAP, "{bad:?}");
+        }
     }
 
     /// Objective 34: a task whose `task.held` names the active hold on its

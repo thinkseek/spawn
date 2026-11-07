@@ -1089,6 +1089,18 @@ record of what was judged (§14 of design.md).
     before the record, so a failed record is retried with it; a Stop that
     fails is pursued and escalated by the dispatcher); an abort counts
     toward the abort halt, not as a rejection.
+    The minutes are active time, never the wall clock (`integrate::active_ms`):
+    from the delivery, through each event of the task's session, to now,
+    each gap counts at most `SPAWN_BUDGET_GAP_SECS` (300 by default). A
+    silence longer than that (the fleet stopped, the host frozen or
+    rebooted, no live execution, the model API down) adds only the cap, so
+    no outage of any length can by itself put a task over budget
+    (2026-11-07 23:05: a five-hour stop aborted tasks 113 and 159 by the
+    wall clock). A gap inside a tool call or background job that later
+    ended (a build, a gate in the worker) counts the time the whole fleet
+    was alive in it: the log's gaps between those two events, each capped
+    the same way, since an outage either kills the tool's engine or writes
+    nothing anywhere.
 
   A gate needs a source that is a directory on the integrator's host:
   agents' branches reach no other (storage.md, "Landing"), so a gate on a
@@ -1473,7 +1485,7 @@ record of what was judged (§14 of design.md).
     mission that is always ready does not starve another's. A task whose base is
     no longer main lands as the merge by main's rules; two in-flight
     objectives on the same lines make the second a `conflict`.
-  - Budgets apply per task, from its delivery; the halt rules stay per
+  - Budgets apply per task, in active time from its delivery (§10.3); the halt rules stay per
     mission (three rejections in a row from any of its tasks halt it), and
     a halted mission gets no new task and no judging until a human resumes
     it.
