@@ -100,9 +100,15 @@ pub(crate) const NO_ROOM_EXIT: i32 = 5;
 /// ([`base_disagrees`]); with any other output it is an abort.
 pub(crate) const BASE_DISAGREES_EXIT: i32 = 4;
 
-/// The gate's `| gate time:` line, which may follow the base-disagreement
-/// pair and nothing else may.
+/// The gate's `| gate time:` line, one of the two it may end a
+/// base-disagreement with.
 const GATE_TIME_LINE: &str = "| gate time:";
+
+/// The gate's `| base runs:` line (scripts/rsi/gate.sh's `phase_time`), the
+/// other one: a gate run at 2026-11-08 05:02 printed it after the pair and
+/// before the timing line, where the 2026-11-06 14:43 one printed none, so
+/// both shapes are the gate's own.
+const BASE_RUNS_LINE: &str = "| base runs:";
 
 /// The tail of a base run's `exited` line
 /// (`| <name> exited 1, then 0 on the base: …`).
