@@ -176,15 +176,16 @@ pub(crate) struct Settings {
 fn number(name: &str, default: u64, warnings: &mut Vec<String>) -> u64 {
     match env_value(name) {
         None => default,
-        Some(text) => match text.trim().parse() {
-            Ok(value) => value,
-            Err(_) => {
+        Some(text) => {
+            if let Ok(value) = text.trim().parse() {
+                value
+            } else {
                 warnings.push(format!(
                     "{name}: {text:?} is not a number of seconds or megabytes; using {default}"
                 ));
                 default
             }
-        },
+        }
     }
 }
 
@@ -523,7 +524,9 @@ impl Monitor {
             return;
         };
         match kind {
-            "alert.fired" | "alert.cleared" => {}
+            "alert.fired" | "alert.cleared" => {
+                // The step's own records: nothing to decide from them.
+            }
             "task.assigned" | "task.delivered" | "task.reported" | "task.gated"
             | "task.reviewed" | "task.landed" | "task.aborted" | "task.over_budget"
             | "task.cancelled" => self.task_record(event_id, at_ms, record, out),
@@ -637,14 +640,14 @@ impl Monitor {
             .as_i64()
             .is_none_or(|revision| revision == task.revisions);
         if kind == "task.gated" && guarded {
-            self.gating(event_id, id, &task.mission, record, out);
+            self.gating(event_id, id, task.mission, record, out);
         }
         let after = task_state_after(record, accept_gate, task.revisions);
         if let Some(after) = after {
-            if bumps_revision(record) {
-                if let Some(entry) = self.tasks.get_mut(&id) {
-                    entry.revisions += 1;
-                }
+            if bumps_revision(record)
+                && let Some(entry) = self.tasks.get_mut(&id)
+            {
+                entry.revisions += 1;
             }
             if task.state.as_deref() != Some(after.as_str()) {
                 if let Some(entry) = self.tasks.get_mut(&id) {
@@ -671,16 +674,13 @@ impl Monitor {
             .tasks
             .get(&id)
             .is_some_and(|task| task.state.as_deref() != Some("assigned"))
+            && let Some(assigned) = task.assigned_event
+            && self.is_open(&format!("task_undelivered:{id}:{assigned}"))
         {
-            if let Some(assigned) = task.assigned_event {
-                let key = format!("task_undelivered:{id}:{assigned}");
-                if self.is_open(&key) {
-                    out.push(Event::Clear {
-                        key,
-                        evidence: json!({"event_id": event_id, "record": kind}),
-                    });
-                }
-            }
+            out.push(Event::Clear {
+                key: format!("task_undelivered:{id}:{assigned}"),
+                evidence: json!({"event_id": event_id, "record": kind}),
+            });
         }
     }
 
@@ -689,11 +689,11 @@ impl Monitor {
         &mut self,
         event_id: i64,
         task: i64,
-        mission_id: &i64,
+        mission_id: i64,
         record: &Value,
         out: &mut Vec<Event>,
     ) {
-        if let Some(mission) = self.missions.get_mut(mission_id) {
+        if let Some(mission) = self.missions.get_mut(&mission_id) {
             let before = snapshot(mission);
             apply_gating(mission, record);
             let after = snapshot(mission);
@@ -922,9 +922,10 @@ times in a row)",
             let stuck = judgement["stuck"].as_f64();
             let open = self.open_keys("agent_stuck", &session);
             let stopped = observation["ended_cause"].as_str() == Some("stopped");
-            if open.is_empty() {
-                if let Some(stuck) = stuck {
-                    if stuck >= LIKELY {
+            if open.is_empty()
+                && let Some(stuck) = stuck
+                && stuck >= LIKELY
+            {
                         out.push(Event::Fire {
                             key: format!("agent_stuck:{session}:{event_id}"),
                             kind: "agent_stuck",
