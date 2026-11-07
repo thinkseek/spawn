@@ -6,7 +6,7 @@ import { absoluteTitle } from "../../format";
 import type { AgentGroup, AgentGroupId, FleetContext, TaskRef } from "../../ordering";
 import { AGENT_GROUP_LABEL, heldTask, lastTask } from "../../ordering";
 import { useStoredChoice } from "../ViewToggle";
-import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, MiddleId, cx, sinceText } from "../ui";
+import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, LabeledId, cx, sinceText } from "../ui";
 import { FleetStateDot, JudgeBadge } from "./bits";
 
 /** One line for "what is it doing right now": its open tool; else, when the
@@ -54,7 +54,7 @@ export function DoingIcon({ now, size = 12 }: { now: { tool: boolean; job: boole
 }
 
 const COLUMNS =
-  "lg:grid lg:grid-cols-[minmax(0,15rem)_minmax(0,1.8fr)_minmax(0,1fr)_6rem_5rem_5.5rem] lg:items-center lg:gap-4";
+  "lg:grid lg:grid-cols-[minmax(0,19rem)_minmax(0,1.8fr)_minmax(0,1fr)_6rem_5rem_5.5rem] lg:items-center lg:gap-4";
 
 /** The fleet below the always-on agents: on a task, idle, ended (folded,
  * remembered). The groups and their order come from ordering.ts, as the
@@ -291,7 +291,8 @@ function AgentRow({
       <div className="flex w-full min-w-0 items-center gap-2 lg:w-auto">
         <FleetStateDot state={agent.state} />
         <div className="min-w-0">
-          <MiddleId
+          <LabeledId
+            label={agent.label}
             id={agent.agent_id || agent.session_id}
             className="text-label font-medium text-foreground"
           />

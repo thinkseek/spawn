@@ -90,9 +90,17 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
       header={
         <>
           <FleetStateDot state={agent.state} />
-          <h2 className="min-w-0 truncate text-title-sm font-semibold text-foreground">
-            {agent.agent_id || sessionId}
+          <h2
+            className="min-w-0 truncate text-title-sm font-semibold text-foreground"
+            title={agent.label ?? undefined}
+          >
+            {agent.label ?? (agent.agent_id || sessionId)}
           </h2>
+          {agent.label && (
+            <span className="min-w-0 shrink truncate select-all font-mono text-micro text-faint-foreground">
+              {agent.agent_id || sessionId}
+            </span>
+          )}
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />
           <LiveBadge live={agent.live} />

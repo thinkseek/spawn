@@ -36,6 +36,7 @@ function answer(): unknown {
       {
         session_id: "host",
         agent_id: null,
+        label: "host",
         why: "disk space on this host",
         line: "tmpdir /var/tmp has 5.0 GiB free",
         tag: "host disk-7",
@@ -115,6 +116,9 @@ test("normalizes the dispatcher's view field by field", () => {
   assert.equal(view.generated_at_ms, NOW);
   assert.equal(view.pending.length, 3);
   assert.deepEqual(view.pending[1], {
+    label: "host",
+    task_title: null,
+    mission_name: null,
     session_id: "host",
     agent_id: null,
     why: "disk space on this host",
@@ -160,6 +164,9 @@ test("a sparse or malformed answer gives empty values, not a crash", () => {
   });
   assert.equal(view.pending.length, 1);
   assert.deepEqual(view.pending[0], {
+    label: null,
+    task_title: null,
+    mission_name: null,
     session_id: "session_worker_a",
     agent_id: null,
     why: "escalation",
@@ -408,6 +415,9 @@ test("workers on their own background jobs are listed, never counted", () => {
     {
       session_id: "session_worker_gate_cache_92",
       agent_id: "agent_worker_gate_cache_92",
+      label: "Spawn owner work · task 92 · Implement objective 022 · working",
+      task_title: "Implement objective 022",
+      mission_name: "Spawn owner work",
       judged_at_ms: NOW - 30_000,
       jobs: [
         { id: "bys3gpa46", kind: "monitor", started_at_ms: NOW - 15 * 60_000, age_ms: 15 * 60_000 },
@@ -420,6 +430,9 @@ test("workers on their own background jobs are listed, never counted", () => {
   const attention = normalizeAttention(raw);
   assert.deepEqual(attention.on_own_jobs, [
     {
+      label: "Spawn owner work · task 92 · Implement objective 022 · working",
+      task_title: "Implement objective 022",
+      mission_name: "Spawn owner work",
       session_id: "session_worker_gate_cache_92",
       agent_id: "agent_worker_gate_cache_92",
       judged_at_ms: NOW - 30_000,
