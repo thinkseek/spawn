@@ -67,7 +67,8 @@ export interface RsiLanding {
 export interface RsiObjective {
   id: number;
   title: string;
-  /** The prompt's first lines (about 1 KB): what the page shows of it. */
+  /** The prompt's first lines (about 1 KB); the whole one is read when the
+   * objective is pointed at (`fetchWholePrompt`). */
   prompt: string;
   /** The whole prompt's length in bytes; null from an older server. */
   prompt_bytes?: number | null;
@@ -435,10 +436,29 @@ export async function fetchPane(
   return readApi(`/api/rsi/pane${query}`, signal, normalizePane);
 }
 
-/** An objective's prompt as a pointer's title shows it: its first lines,
- * marked when the rest was not sent. */
+/** An objective's prompt as a pointer's title shows it until the whole
+ * one is read: its first lines, marked when the rest was not sent. */
 export function promptTitle(objective: Pick<RsiObjective, "prompt" | "prompt_bytes">): string {
   return isCut(objective.prompt, objective.prompt_bytes ?? null)
     ? `${objective.prompt}…`
     : objective.prompt;
+}
+
+/** One objective's whole prompt (`/api/rsi/objective/<mission>/<id>`). */
+export interface WholePrompt {
+  prompt: string;
+  prompt_bytes: number | null;
+}
+
+export function normalizeWholePrompt(value: unknown): WholePrompt {
+  const raw = object(value);
+  return { prompt: text(raw.prompt), prompt_bytes: optionalNumber(raw.prompt_bytes) };
+}
+
+export async function fetchWholePrompt(
+  mission: number,
+  objective: number,
+  signal: AbortSignal,
+): Promise<WholePrompt> {
+  return readApi(`/api/rsi/objective/${mission}/${objective}`, signal, normalizeWholePrompt);
 }
