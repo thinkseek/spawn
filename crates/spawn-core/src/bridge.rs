@@ -3583,6 +3583,9 @@ mod tests {
         bridge: Bridge,
         /// The session's transcript.
         path: String,
+        /// Screens the log held once the start had settled: a test reads
+        /// what was recorded after that.
+        record: usize,
     }
 
     impl World {
@@ -3649,9 +3652,11 @@ mod tests {
                 clock,
                 bridge,
                 path,
+                record: 0,
             };
             // Two readings in a row: the screen at the prompt is recorded.
             world.settle();
+            world.record = world.all_screens().len();
             world
         }
 
@@ -3699,8 +3704,14 @@ mod tests {
                 .collect()
         }
 
-        /// The screen states the Bridge recorded, in order.
+        /// The screen states the Bridge recorded since the start settled.
         fn screens(&self) -> Vec<crate::screen::ScreenState> {
+            let mut screens = self.all_screens();
+            screens.drain(..self.record.min(screens.len()));
+            screens
+        }
+
+        fn all_screens(&self) -> Vec<crate::screen::ScreenState> {
             self.store
                 .read_global(GlobalPosition(0), 500)
                 .expect("read")
