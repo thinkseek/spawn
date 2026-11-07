@@ -3001,7 +3001,6 @@ mod tests {
         );
     }
 
-<<<<<<< 086dd79f79512e065f02af8c386088e5654d11e2
     /// A note about an unfinished report, attempt `key`, finished at
     /// `finished`: typed, or refused with `error`.
     fn note_sent(key: &str, finished: i64, error: Option<&str>) -> Sent {
@@ -3376,7 +3375,8 @@ PENDING_ISSUES\n";
         assert!(db.notes(&task.session_id).is_empty());
         assert!(db.records(task.id, "task.report_unfinished").is_empty());
         let _ = std::fs::remove_dir_all(&root);
-=======
+    }
+
     // --- spent deliveries: re-issued, escalated, tried after a deploy -------
 
     /// The host's refusal of task 66 on 2026-11-06, as the Bridge reports a
@@ -3704,6 +3704,5 @@ PENDING_ISSUES\n";
         );
         assert!(super::orders(&tasks, &rows, 60_000).is_empty());
         assert_eq!(super::reissues(&tasks, &rows, 60_000).len(), 1);
->>>>>>> c512a6f9bca28cf42f0fb3496a76672add568cb1
     }
 }
