@@ -15,6 +15,13 @@
 //! Approved residents are kept by the same rule ([`keep_residents`]).
 //! Idempotency keys derive from the facts, so a restarted loop never submits
 //! the same revival twice.
+//!
+//! A new native session's start records the hash of the charter it gives
+//! ([`Charter`], the start's `charter`). A resume, a restarted loop or a
+//! compaction keeps the native session and the charter it holds: when that
+//! is not the charter this build writes, the dispatcher types the new one
+//! in at the supervisor's next idle prompt, once
+//! ([`crate::dispatch`]'s `charter`).
 
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::ENGINE;
@@ -82,6 +89,32 @@ pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
         return Revive::Resume;
     }
     Revive::Start { handoff: true }
+}
+
+/// The supervisor's charter as this build and its environment write it: the
+/// text a new native session is given, and its hash, which the start records
+/// (`CommandAction::Start`'s `charter`) and the dispatcher compares with the
+/// charter the running native session holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Charter {
+    /// The text, [`charter`].
+    pub(crate) text: String,
+    /// FNV-1a of the text, 16 hex digits.
+    pub(crate) hash: String,
+}
+
+impl Charter {
+    /// The charter this process gives: `spawn` names the program, and
+    /// `SPAWN_MISSION_FILE` the standing mission, as everywhere else.
+    pub(crate) fn deployed(spawn: &str) -> Self {
+        Self::of(charter(spawn, &env_or("SPAWN_MISSION_FILE", "mission.md")))
+    }
+
+    /// The charter `text` and its hash.
+    pub(crate) fn of(text: String) -> Self {
+        let hash = format!("{:016x}", crate::sources::fnv(&text));
+        Self { text, hash }
+    }
 }
 
 /// The supervisor's standing instructions, given at every new native session.
@@ -199,14 +232,15 @@ Your last commands, newest first:\n{mine}\n\nStart with `mission list` and `flee
 
 /// One liveness step for one session: decide, and submit the revival.
 /// `resume` words the resume prompt from the facts; `start` builds the
-/// prompt of a new native session, given whether it is a handoff. Returns a
-/// line for the loop's log when it acted.
+/// prompt of a new native session, given whether it is a handoff, with the
+/// hash of the charter it gives, if it gives one (recorded on the start).
+/// Returns a line for the loop's log when it acted.
 fn revive(
     store: &PostgresStore,
     agent: &str,
     session: &str,
     resume: impl FnOnce(&LivenessFacts) -> String,
-    start: impl FnOnce(bool) -> String,
+    start: impl FnOnce(bool) -> (String, Option<String>),
 ) -> Result<Option<String>, String> {
     let error = |error: &dyn std::fmt::Display| error.to_string();
     let session_id = SessionId::new(session).map_err(|e| error(&e))?;
@@ -227,20 +261,24 @@ fn revive(
             },
             format!("{session}-resume-{execution}-{}", facts.failures),
         ),
-        Revive::Start { handoff } => (
-            CommandAction::Start {
-                engine: ENGINE.to_string(),
-                prompt: start(handoff),
-                parent_session_id: None,
-                from: None,
-                model: None,
-            },
-            format!(
-                "{session}-start-{execution}-{}-{}",
-                facts.failures,
-                if handoff { "handoff" } else { "first" }
-            ),
-        ),
+        Revive::Start { handoff } => {
+            let (prompt, charter) = start(handoff);
+            (
+                CommandAction::Start {
+                    engine: ENGINE.to_string(),
+                    prompt,
+                    parent_session_id: None,
+                    from: None,
+                    model: None,
+                    charter,
+                },
+                format!(
+                    "{session}-start-{execution}-{}-{}",
+                    facts.failures,
+                    if handoff { "handoff" } else { "first" }
+                ),
+            )
+        }
     };
     let submission = Submission {
         agent_id: AgentId::new(agent).map_err(|e| error(&e))?,
@@ -255,10 +293,10 @@ fn revive(
     Ok(Some(format!("liveness: {session} {decision:?} ({key})")))
 }
 
-/// Keep the supervisor alive.
+/// Keep the supervisor alive. A new native session is given the deployed
+/// charter, and its start records the charter's hash.
 pub(crate) fn keep_alive(store: &PostgresStore) -> Result<Option<String>, String> {
     let spawn = spawn_program();
-    let mission = env_or("SPAWN_MISSION_FILE", "mission.md");
     revive(
         store,
         SUPERVISOR_AGENT,
@@ -272,11 +310,12 @@ fleet` and continue supervising per your charter.",
             )
         },
         |with_handoff| {
-            let mut prompt = charter(&spawn, &mission);
+            let Charter { text, hash } = Charter::deployed(&spawn);
+            let mut prompt = text;
             if with_handoff {
                 prompt.push_str(&handoff(store));
             }
-            prompt
+            (prompt, Some(hash))
         },
     )
 }
@@ -305,9 +344,14 @@ pub(crate) fn keep_residents(store: &PostgresStore) -> Result<Vec<String>, Strin
                 },
                 |task| task_prompt(&task),
             );
-            format!(
-                "{prompt}\n\nYour previous native session could not be resumed, so this is a new \
-one; anything you learned before is in your workspace and its reports."
+            // A resident's charter is the approved record, not Spawn's code:
+            // no charter hash to record (docs/fleet-architecture.md §3).
+            (
+                format!(
+                    "{prompt}\n\nYour previous native session could not be resumed, so this is a \
+new one; anything you learned before is in your workspace and its reports."
+                ),
+                None,
             )
         };
         let resume = |facts: &LivenessFacts| {
@@ -325,8 +369,30 @@ task; when it is finished, write `{REPORT}`.",
 
 #[cfg(test)]
 mod tests {
-    use super::{Revive, charter, decide};
+    use super::{Charter, Revive, charter, decide};
     use spawn_postgres::LivenessFacts;
+
+    /// The hash a start records names the text it gave: the same text, the
+    /// same hash, on any host and build; any change to it (the program it
+    /// names included), another.
+    #[test]
+    fn the_charter_hash_names_its_text() {
+        let one = Charter::of(charter("spawn", "mission.md"));
+        assert_eq!(one.text, charter("spawn", "mission.md"));
+        assert_eq!(one, Charter::of(charter("spawn", "mission.md")));
+        assert_eq!(one.hash.len(), 16);
+        assert!(one.hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            Charter::of(String::new()).hash,
+            "cbf29ce484222325",
+            "FNV-1a, stable across builds"
+        );
+        assert_ne!(
+            one.hash,
+            Charter::of(charter("/opt/spawn", "mission.md")).hash
+        );
+        assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
+    }
 
     #[test]
     fn the_charter_says_when_a_task_runs_cheap() {

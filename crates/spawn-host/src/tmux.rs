@@ -302,8 +302,18 @@ fn write_private(
     Ok(path)
 }
 
-impl TerminalHost for TmuxHost {
-    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+/// How many `new-session` calls one [`TerminalHost::start`] makes when
+/// each reaches a server that shuts down ([`server_left`]). The client sees
+/// its connection drop only once the old server's socket is closed for
+/// good, so the next call finds no server and starts one: one shutdown
+/// costs one call. The rest cover another server coming and going
+/// meanwhile, without looping on a tmux that always fails this way.
+const START_ATTEMPTS: usize = 3;
+
+impl TmuxHost {
+    /// One `new-session` for `launch`, its environment file removed unless
+    /// a pane was started to remove it.
+    fn new_session(&self, launch: &Launch) -> Result<Run, TerminalError> {
         let mut arguments = vec![
             "new-session".to_string(),
             "-d".to_string(),
@@ -337,16 +347,33 @@ impl TerminalHost for TmuxHost {
         arguments.extend(launch.arguments.iter().cloned());
 
         let run = self.run(&arguments);
-        let run = match run {
-            Ok(run) if run.code == Some(0) => return Ok(()),
-            Ok(run) => run,
-            Err(error) => {
-                let _ = std::fs::remove_file(&file);
-                return Err(error);
+        if !matches!(&run, Ok(run) if run.code == Some(0)) {
+            // No pane ran to remove it.
+            let _ = std::fs::remove_file(&file);
+        }
+        run
+    }
+}
+
+impl TerminalHost for TmuxHost {
+    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+        let mut attempts = 1;
+        let run = loop {
+            let run = self.new_session(launch)?;
+            // The server this call reached was shutting down after its last
+            // session ended (another terminal was just killed or exited)
+            // and dropped the call unread: nothing was started, and a
+            // server that goes takes its sessions with it, so a new call
+            // cannot start the terminal twice.
+            if run.code != Some(0) && server_left(&run.stderr) && attempts < START_ATTEMPTS {
+                attempts += 1;
+                continue;
             }
+            break run;
         };
-        // No pane ran to remove it.
-        let _ = std::fs::remove_file(&file);
+        if run.code == Some(0) {
+            return Ok(());
+        }
         let stderr = run.stderr.trim();
         if stderr.contains("duplicate session") {
             return Err(TerminalError(format!("{} already exists", launch.terminal)));
@@ -638,9 +665,17 @@ fn write_local(path: &str, bytes: &[u8]) -> Result<bool, TerminalError> {
 fn gone(stderr: &str) -> bool {
     stderr.contains("can't find session")
         || stderr.contains("no server running")
-        // Asked while the server shuts down after its last session ended.
-        || stderr.contains("server exited unexpectedly")
+        || server_left(stderr)
         || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
+}
+
+/// Whether tmux's error says the call reached a server that went before it
+/// read the call: one shutting down after its last session ended. Its
+/// socket is still open (the server is exiting, or a pane it is forking
+/// holds a copy until it execs), so the client connects, and the server
+/// never accepts it.
+fn server_left(stderr: &str) -> bool {
+    stderr.contains("server exited unexpectedly")
 }
 
 /// At most [`READ_LIMIT`] bytes from `offset` of the file `relative` in
@@ -752,6 +787,70 @@ mod tests {
         for name in ["PATH", "HOME", "https_proxy", "LANG"] {
             assert!(!super::scrub(OsStr::new(name)), "{name}");
         }
+    }
+
+    /// tmux is given no locale (see the crate's documentation): it has no
+    /// translations, so what Spawn reads from it is the same on a host whose
+    /// locale is Chinese. Each answer that says a terminal is gone (no
+    /// socket, no server on it, no such session) is word for word the one
+    /// of the C locale, and read as gone.
+    #[test]
+    fn tmux_says_a_terminal_is_gone_alike_in_a_translated_locale() {
+        let dir = scratch("tmux-locale");
+        std::fs::write(dir.join("not-a-server"), b"").unwrap();
+        let answer = |locale: &str, language: Option<&str>, socket: &str, start: bool| {
+            let tmux = |arguments: &[&str]| {
+                let words: Vec<String> = ["tmux", "-S", socket, "-f", "/dev/null"]
+                    .iter()
+                    .chain(arguments)
+                    .map(ToString::to_string)
+                    .collect();
+                let mut command = super::command_of(&words);
+                command
+                    .env("LC_ALL", locale)
+                    .env("LANG", locale)
+                    .env("LC_MESSAGES", locale);
+                match language {
+                    Some(language) => command.env("LANGUAGE", language),
+                    None => command.env_remove("LANGUAGE"),
+                };
+                command.output().expect("tmux is installed")
+            };
+            if start {
+                let started = tmux(&["new-session", "-d", "-s", "spawn-locale-live"]);
+                assert!(started.status.success(), "{started:?}");
+            }
+            let asked = tmux(&["has-session", "-t", "=spawn-locale-none"]);
+            if start {
+                let _ = tmux(&["kill-server"]);
+            }
+            assert_eq!(asked.status.code(), Some(1), "{asked:?}");
+            let stderr = String::from_utf8_lossy(&asked.stderr).to_string();
+            assert!(super::gone(&stderr), "{locale}: {stderr}");
+            stderr
+        };
+        for (socket, start) in [
+            ("none/socket", false),
+            ("not-a-server", false),
+            // A server of its own per locale: one killed is not gone yet
+            // when the next would start on its socket.
+            ("live", true),
+        ] {
+            let at = |locale: &str| {
+                let name = if start {
+                    format!("{socket}-{locale}")
+                } else {
+                    socket.to_string()
+                };
+                dir.join(name).to_str().unwrap().to_string()
+            };
+            assert_eq!(
+                answer("zh_CN.UTF-8", Some("zh_CN:zh"), &at("zh"), start),
+                answer("C", None, &at("c"), start),
+                "{socket}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

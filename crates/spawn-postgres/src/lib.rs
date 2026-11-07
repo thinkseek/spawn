@@ -44,6 +44,33 @@ macro_rules! died_young {
     };
 }
 
+/// SQL: whether the `agent_executions` row aliased `$x` ended lost before
+/// its engine became ready: the log has no Bridge `screen.observed` of it
+/// in state `ready` (the ready wait of a start or resume records one keyed
+/// `<execution>:screen:ready` before it types; the Bridge's follow records
+/// others). A start whose ready wait failed is abandoned and ends so,
+/// whatever its duration.
+macro_rules! lost_before_ready {
+    ($x:literal) => {
+        concat!(
+            "(coalesce(",
+            $x,
+            ".cause, '') = 'lost' and not exists (select 1 from spawn_events r where \
+             r.session_id = ",
+            $x,
+            ".session_id and r.source = 'bridge' and r.source_event_id = ",
+            $x,
+            ".execution_id || ':screen:ready') and not exists (select 1 from spawn_events r \
+             where r.session_id = ",
+            $x,
+            ".session_id and r.event_name = 'screen.observed' and r.source = 'bridge' and \
+             r.execution_id = ",
+            $x,
+            ".execution_id and r.kind -> 'detail' ->> 'state' = 'ready'))"
+        )
+    };
+}
+
 mod command_queue;
 mod event_log;
 mod fleet;
@@ -93,10 +120,12 @@ pub struct PostgresStore {
     url: String,
 }
 
-/// The restricted logins, by the principal they act as; each database has
-/// its own role for each (`spawn_login_role`). Their passwords derive from
-/// the owner's ([`role_url`]) and are set on every migration.
-const LOGINS: [&str; 2] = ["spawn_supervisor", "spawn_reader"];
+/// The restricted logins, by their base name; each database has its own
+/// role for each (`spawn_login_role`). `spawn_supervisor` and `spawn_reader`
+/// act as the principals of their names, `spawn_human` (which may only call
+/// `spawn_human_input`) as `human`. Their passwords derive from the owner's
+/// ([`role_url`]) and are set on every migration.
+const LOGINS: [&str; 3] = ["spawn_supervisor", "spawn_reader", "spawn_human"];
 
 impl PostgresStore {
     /// Connect to the database in the URL.
@@ -389,8 +418,8 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
 }
 
 /// The owner's URL with its credentials replaced by one of the database's
-/// restricted logins (`spawn_supervisor`, `spawn_reader`: the role of that
-/// name for this database, see `spawn_login_role`). It reads the login's
+/// restricted logins (`spawn_supervisor`, `spawn_reader`, `spawn_human`: the
+/// role of that name for this database, see `spawn_login_role`). It reads the login's
 /// name and salt through the owner's URL, which must be the one that
 /// migrated (its search path finds the schema). The boundary is the
 /// login's privileges; its password keeps anyone who lacks the owner's
@@ -753,7 +782,8 @@ mod tests {
                 .expect("admin")
                 .query(
                     "select rolname::text, rolcanlogin, rolpassword is null from pg_authid
-                      where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1)
+                      where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
+                                        'spawn_human_' || $1)
                       order by 1",
                     &[&name],
                 )
@@ -764,6 +794,7 @@ mod tests {
             assert_eq!(
                 off,
                 [
+                    (format!("spawn_human_{name}"), false, true),
                     (format!("spawn_reader_{name}"), false, true),
                     (format!("spawn_supervisor_{name}"), false, true),
                 ]
@@ -799,11 +830,8 @@ mod tests {
             assert!(fixed.connect(NoTls).is_err());
         }));
         let _ = admin.batch_execute(&format!("drop database if exists {name} with (force)"));
-        for role in [
-            format!("spawn_supervisor_{name}"),
-            format!("spawn_reader_{name}"),
-        ] {
-            let _ = admin.batch_execute(&format!("drop role if exists {role}"));
+        for base in super::LOGINS {
+            let _ = admin.batch_execute(&format!("drop role if exists {base}_{name}"));
         }
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);

@@ -565,11 +565,21 @@ socket_masks=""
 # the test database's one socket file. Whatever other socket the host still
 # shows is found by a scan inside the sandbox before any candidate code
 # runs (`socket_masks` below), and hidden too.
+#
+# /tmp is a fresh, empty directory on the gate's own disk (under $work), not
+# a tmpfs. A tmpfs is sized by the host's memory (half of it), so a scenario
+# that measures the room in its TMPDIR, a nested integrator's floor
+# (SPAWN_GATE_MIN_FREE_GB, default 10), was judged by how much memory the
+# host has: on a 17 GB host it saw 8.8 GiB and scenario 014 aborted every
+# gate. What the tests write there took the host's memory besides. The
+# directory is removed when the command ends, and with $work at the gate's
+# exit.
 sandbox() {
     tree=$1
     shift
     count=$#
-    set -- "$@" bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run \
+    sandbox_tmp=$(mktemp -d "$work/sandbox-tmp.XXXXXX")
+    set -- "$@" bwrap --ro-bind / / --dev /dev --proc /proc --bind "$sandbox_tmp" /tmp --tmpfs /run \
         --unshare-pid --unshare-net --die-with-parent --new-session
     if [ -d /var/run ] && [ ! -L /var/run ]; then set -- "$@" --tmpfs /var/run; fi
     if [ -d /var/tmp ] && [ ! -L /var/tmp ]; then set -- "$@" --tmpfs /var/tmp; fi
@@ -649,11 +659,15 @@ sandbox() {
         shift
         count=$((count - 1))
     done
+    sandbox_status=0
     if [ -n "$sandbox_db_url" ]; then
-        "$@" </dev/null 9<"$work/sandbox-db-args"
+        "$@" </dev/null 9<"$work/sandbox-db-args" || sandbox_status=$?
     else
-        "$@" </dev/null
+        "$@" </dev/null || sandbox_status=$?
     fi
+    chmod -R u+w "$sandbox_tmp" 2>/dev/null || true
+    rm -rf "$sandbox_tmp"
+    return "$sandbox_status"
 }
 
 extract() {

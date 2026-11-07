@@ -672,6 +672,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 parent_session_id: None,
                 from: None,
                 model,
+                charter: None,
             },
         )),
     }
@@ -897,6 +898,11 @@ fn held(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<String> 
                 latest.state.key()
             ),
             (None, None) => "its worker has no judgement yet".to_string(),
+            (Some(current), _) if current.waits_on_own_job() => {
+                "its worker waits on a background job of its own and the task it last got is \
+                 still open"
+                    .to_string()
+            }
             (Some(current), _) if current.ambiguity != Some(Ambiguity::TurnStoppedIdle) => format!(
                 "its worker is not idle at its prompt (judged {})",
                 current.state.key()
@@ -1609,8 +1615,11 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            failed_resume: None,
             turn_ended: idle,
             checkpoint: None,
+            charter: None,
+            jobs: Vec::new(),
         }
     }
 

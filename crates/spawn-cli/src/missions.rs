@@ -19,8 +19,17 @@ const USAGE: &str = "usage:
                 resident takes one, per-task workers the rest)
   spawn mission resume --id N
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
+<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
+  spawn mission hold --source <path> [--reason <text>]   (owner: no task lands on the source until
+      a record ends the hold: its release, or its expiry SPAWN_SOURCE_HOLD_SECS after it (1 to
+      86400, default 10800); its gates still run and its accepted tasks wait; a hold on a held
+      source renews it. Prints the hold and the main it was taken at: gate against that main)
+  spawn mission release --source <path>   (owner: the waiting tasks land at the next pass; with
+      no hold it records nothing and prints `released` null)
+=======
       (recorded as source.moved for every deploy, also when no mission's baseline moves;
        after it every delivery whose retries are spent, having typed nothing, is tried once more)
+>>>>>>> 83c68eea2b7cc405677b80d6d87fdd20e7ca6fe0
   spawn mission list [--limit N]   (every task with its stages)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>
@@ -35,6 +44,74 @@ const USAGE: &str = "usage:
   spawn resident propose --name <name> --charter <text>
   spawn resident approve --name <name>
   spawn resident retire --name <name>";
+
+/// The bound of an owner's hold: `SPAWN_SOURCE_HOLD_SECS`, 3 h by default
+/// (longer than the slowest owner gate, 80 minutes, plus a deploy, and than
+/// the gate's default wall clock, 120 minutes).
+const HOLD_SECS_DEFAULT: i32 = 10_800;
+
+/// The longest bound a hold may have: a day.
+const HOLD_SECS_MAX: i32 = 86_400;
+
+/// The longest reason a hold may give.
+const HOLD_REASON_CHARS: usize = 500;
+
+/// A hold's bound in seconds from `SPAWN_SOURCE_HOLD_SECS` (unset or empty:
+/// the default): a whole number from 1 to [`HOLD_SECS_MAX`]. Any other value
+/// is refused, naming the variable, never replaced by the default.
+fn hold_bound(text: Option<&str>) -> Result<i32, String> {
+    let Some(text) = text else {
+        return Ok(HOLD_SECS_DEFAULT);
+    };
+    text.parse::<i32>()
+        .ok()
+        .filter(|secs| (1..=HOLD_SECS_MAX).contains(secs))
+        .ok_or_else(|| {
+            format!(
+                "SPAWN_SOURCE_HOLD_SECS is a whole number of seconds from 1 to {HOLD_SECS_MAX}, \
+                 not '{text}'"
+            )
+        })
+}
+
+/// `spawn mission hold --source <source> [--reason <text>]`, its bound from
+/// `SPAWN_SOURCE_HOLD_SECS` ([`hold_bound`]): the hold as printed.
+fn hold(store: &spawn_postgres::PostgresStore, flags: &Flags) -> Result<Value, String> {
+    let source = text(flags, "source")?;
+    let bound = hold_bound(crate::config::env_value("SPAWN_SOURCE_HOLD_SECS").as_deref())?;
+    let reason = flags.get("reason");
+    if let Some(reason) = &reason
+        && reason.chars().count() > HOLD_REASON_CHARS
+    {
+        return Err(format!(
+            "--reason is at most {HOLD_REASON_CHARS} characters, not {}",
+            reason.chars().count()
+        ));
+    }
+    hold_source(store, &source, bound, reason.as_deref())
+}
+
+/// Hold landings on `source` for `bound` seconds (`spawn mission hold`):
+/// under the integrator's landing lock, so a landing whose push has begun
+/// records its outcome first, the main read here is the one it left, and no
+/// landing starts before the hold is recorded. The hold as printed:
+/// `{hold, source, main, expires_ms, renews}`.
+pub(crate) fn hold_source(
+    store: &spawn_postgres::PostgresStore,
+    source: &str,
+    bound: i32,
+    reason: Option<&str>,
+) -> Result<Value, String> {
+    let lock = store
+        .source_hold_lock(source)
+        .map_err(|error| error.to_string())?;
+    let (_, main) = crate::integrate::source_head(source)?;
+    let held = store
+        .source_hold(source, &main, bound, reason)
+        .map_err(|error| error.to_string())?;
+    drop(lock);
+    Ok(held)
+}
 
 fn print(value: &Value) {
     println!(
@@ -237,6 +314,11 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
             let missions = store.source_moved(&source, &from, &to).map_err(err)?;
             print(&json!({ "source": source, "to": to, "missions": missions }));
         }
+        "hold" => print(&hold(&store, &flags)?),
+        "release" => {
+            let source = text(&flags, "source")?;
+            print(&store.source_release(&source).map_err(err)?);
+        }
         "list" => {
             let limit = flags
                 .get("limit")
@@ -326,8 +408,23 @@ pub(crate) fn resident(rest: &[String]) -> Result<i32, String> {
 mod tests {
     use spawn_core::event::ModelProfile;
 
-    use super::model;
+    use super::{hold_bound, model};
     use crate::Flags;
+
+    #[test]
+    fn a_holds_bound_is_one_second_to_a_day_three_hours_by_default() {
+        assert_eq!(hold_bound(None), Ok(10_800));
+        assert_eq!(hold_bound(Some("1")), Ok(1));
+        assert_eq!(hold_bound(Some("20")), Ok(20));
+        assert_eq!(hold_bound(Some("86400")), Ok(86_400));
+        for bad in ["0", "-5", "86401", "3h", " 20", "1.5", "99999999999"] {
+            let refused = hold_bound(Some(bad)).expect_err(bad);
+            assert!(
+                refused.contains("SPAWN_SOURCE_HOLD_SECS") && refused.contains(bad),
+                "{bad}: {refused}"
+            );
+        }
+    }
 
     fn flags(words: &[&str]) -> Flags {
         let words: Vec<String> = words.iter().map(ToString::to_string).collect();

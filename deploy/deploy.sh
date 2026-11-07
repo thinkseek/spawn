@@ -76,6 +76,20 @@
 # the next deploy completes it, or stops and says so when main is neither
 # the main it replaced nor its head.
 #
+# The owner's hold. Before the owner gate, deploy/hold.sh holds landings on
+# the missions repo (`spawn mission hold`), so no task lands while the gate
+# judges against a fixed main and the verdict's base stays the live main;
+# spawn-integrate keeps running (every gate, every other source, objective
+# assignment). Once it holds the deploy lock, this script releases that hold
+# (`spawn mission release`) on every exit path: after a success, once main
+# moved forward and `spawn mission moved` recorded it (the tasks that waited
+# land at the next pass, judged again on the new main), and after any
+# failure (after a pending deploy is completed and the services restarted).
+# A release with no hold records nothing, and a release that fails is said,
+# never the deploy's failure. A deploy refused by the lock leaves the hold to
+# the deploy that holds the lock. A hold left by a deploy killed outright
+# expires on its own (SPAWN_SOURCE_HOLD_SECS, 3 h by default).
+#
 # Rolling back. spawn.prev is the previous binary. Once the deployed binary
 # has written an event kind the previous one does not know (EventKind is a
 # closed enum: docs/upgrading.md, "Version-coupled boundaries"), the previous
@@ -99,16 +113,52 @@ cd "$repo"
 
 say() { printf 'deploy: %s\n' "$*"; }
 
-[ $# -eq 1 ] || die "usage: deploy/deploy.sh <verdict-file> (see the header)"
-verdict_file=$1
-[ -f "$verdict_file" ] || die "no verdict file $verdict_file"
-field() { jq -er --arg name "$1" '.[$name] // empty | strings' "$verdict_file"; }
-
 # One deploy at a time: two would share the export directory, the pending
 # record and the services. The lock is released when this process exits.
 [ -d "$live" ] || die "no live directory $live"
 exec 9>>"$live/deploy.lock"
 flock -n 9 || die "another deploy holds $live/deploy.lock"
+
+# release_hold: end the owner's hold on the missions repo, if one is active
+# (deploy/hold.sh). Never fails: a release that cannot run is said, and the
+# hold then expires on its own. Its own environment, so it runs on any exit.
+release_hold() {
+  local released hold
+  if released=$(set -a && . "$live/spawn.env" && set +a &&
+    "$live/bin/spawn" mission release --source "$missions" 2>&1); then
+    hold=$(printf '%s' "$released" | jq -r '.released // empty' 2>/dev/null) || hold=""
+    if [ -n "$hold" ]; then
+      say "released the owner's hold $hold on $missions (tasks waiting behind it: $(printf '%s' "$released" | jq -c '.waiting' 2>/dev/null || echo '?'))"
+    fi
+  else
+    printf 'deploy: could not release the owner'\''s hold on %s (%s); it expires on its own, or: spawn mission release --source %s\n' \
+      "$missions" "$(printf '%s' "$released" | head -c 300 | tr '\n' ' ')" "$missions" >&2
+  fi
+  return 0
+}
+
+# Every exit from here on: the export goes; after a failure with the
+# integrator stopped, a pending deploy is completed and the services
+# restart; then the owner's hold on the missions repo is released.
+export_dir=${TMPDIR:-/tmp}/spawn-deploy-export-$(id -u)
+stopped=0
+completing_at_start=0
+on_exit() {
+  local status=$?
+  rm -rf "$export_dir" "$live/bin/spawn.staged" "$live/web.staged"
+  if [ "$status" -ne 0 ] && [ "$stopped" = 1 ]; then
+    printf "deploy: failed (exit %s); restarting the services\n" "$status" >&2
+    [ "$completing_at_start" = 1 ] || (complete_pending) || printf "deploy: the pending deploy is not complete: %s\n" "$pending" >&2
+    restart || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
+  fi
+  release_hold
+}
+trap on_exit EXIT
+
+[ $# -eq 1 ] || die "usage: deploy/deploy.sh <verdict-file> (see the header)"
+verdict_file=$1
+[ -f "$verdict_file" ] || die "no verdict file $verdict_file"
+field() { jq -er --arg name "$1" '.[$name] // empty | strings' "$verdict_file"; }
 
 # The disk guard: a build that fills the disk takes the live fleet's
 # database and logs down with it.
@@ -169,22 +219,6 @@ install_build() {
   fi
   say "installed $("$live/bin/spawn" version 2>/dev/null || echo "$head") and the UI"
 }
-
-# Every exit: the export goes; after a failure with the integrator stopped,
-# a pending deploy is completed and the services restart.
-export_dir=${TMPDIR:-/tmp}/spawn-deploy-export-$(id -u)
-stopped=0
-completing_at_start=0
-on_exit() {
-  local status=$?
-  rm -rf "$export_dir" "$live/bin/spawn.staged" "$live/web.staged"
-  if [ "$status" -ne 0 ] && [ "$stopped" = 1 ]; then
-    printf "deploy: failed (exit %s); restarting the services\n" "$status" >&2
-    [ "$completing_at_start" = 1 ] || (complete_pending) || printf "deploy: the pending deploy is not complete: %s\n" "$pending" >&2
-    restart || printf "deploy: the restart failed too: systemctl --user status spawn-integrate\n" >&2
-  fi
-}
-trap on_exit EXIT
 
 if [ -f "$pending" ]; then
   say "a deploy is pending ($(cat "$pending")); completing it"

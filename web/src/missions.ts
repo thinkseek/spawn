@@ -2,8 +2,12 @@
 // server that omits one (or sends null) renders an empty value instead of
 // crashing. Read-only: this module only ever issues GET requests.
 
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
 import type { RsiSummary } from "./api";
+import { normalizeHolds } from "./attention";
+import type { SourceHold } from "./attention";
+
+export type { SourceHold } from "./attention";
 
 export const TASK_STATES = [
   "assigned",
@@ -47,7 +51,8 @@ export interface LastGate {
 /** One of a task's records in the control stream (`spawn task stages`). */
 export interface TaskStage {
   /** The record type without `task.`: assigned, delivered, reported,
-   * reviewed, gated, landed, aborted or cancelled. */
+   * reviewed, gated, held (waits behind the owner's hold), landed, aborted
+   * or cancelled. */
   stage: string;
   /** A gate's verdict, or a review's (`accepted`, `rejected`). */
   verdict: string | null;
@@ -102,6 +107,13 @@ export interface MissionTask {
   revisions: number;
   review_note: string | null;
   report: string | null;
+  /** Each text's whole length in bytes: the board sends a text's first
+   * lines (`brief`, `review_note`, `report`), and of a folded task (a
+   * closed mission's, a cancelled one) no report at all; the whole is
+   * `fetchTaskTexts`. Null from an older server, which sends them whole. */
+  brief_bytes?: number | null;
+  review_note_bytes?: number | null;
+  report_bytes?: number | null;
   /** The commit the integrator built for this task. */
   candidate: string | null;
   /** The backlog objective of an objective mission's task. */
@@ -113,6 +125,8 @@ export interface MissionTask {
   stages: TaskStage[];
   /** The models the worker runs on: "default", or "cheap" (all DeepSeek). */
   model: string | null;
+  /** The owner's hold its landing last waited behind, if any. */
+  held_by: number | null;
   created_by: string | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
@@ -136,6 +150,9 @@ export interface Mission {
   halted: string | null;
   /** Objective missions: the backlog and the resident that works it. */
   objectives: { backlog: string | null; resident: string | null } | null;
+  /** The owner's active hold on its source (its event id): no task lands
+   * there while it lasts. */
+  hold: number | null;
   created_at_ms: number | null;
   updated_at_ms: number | null;
   tasks: MissionTask[];
@@ -157,6 +174,8 @@ export interface Resident {
 export interface Missions {
   missions: Mission[];
   residents: Resident[];
+  /** Every active owner's hold, with the tasks waiting behind it. */
+  holds: SourceHold[];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -229,6 +248,9 @@ function normalizeTask(value: unknown): MissionTask | null {
     revisions: Math.max(0, optionalNumber(value.revisions) ?? 0),
     review_note: optionalText(value.review_note),
     report: optionalText(value.report),
+    brief_bytes: optionalNumber(value.brief_bytes),
+    review_note_bytes: optionalNumber(value.review_note_bytes),
+    report_bytes: optionalNumber(value.report_bytes),
     candidate: optionalText(value.candidate),
     objective: optionalNumber(value.objective),
     metric: optionalText(value.metric),
@@ -237,6 +259,7 @@ function normalizeTask(value: unknown): MissionTask | null {
       .map(normalizeStage)
       .filter((stage): stage is TaskStage => stage !== null),
     model: optionalText(value.model),
+    held_by: optionalNumber(value.held_by),
     created_by: optionalText(value.created_by),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
@@ -279,6 +302,7 @@ function normalizeMission(value: unknown): Mission | null {
           resident: optionalText(value.objectives.resident),
         }
       : null,
+    hold: optionalNumber(value.hold),
     created_at_ms: optionalNumber(value.created_at_ms),
     updated_at_ms: optionalNumber(value.updated_at_ms),
     tasks,
@@ -327,17 +351,37 @@ export function normalizeMissions(value: unknown): Missions {
         RESIDENT_RANK[left.state] - RESIDENT_RANK[right.state] ||
         (left.name ?? "").localeCompare(right.name ?? ""),
     );
-  return { missions, residents };
+  return { missions, residents, holds: normalizeHolds(raw.holds) };
 }
 
 export async function fetchMissions(signal: AbortSignal): Promise<Missions> {
-  const response = await fetch("/api/missions", {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) throw apiError(response.status);
-  return normalizeMissions(await response.json());
+  return readApi("/api/missions", signal, normalizeMissions);
+}
+
+/** A task's texts in full, as `/api/missions/task/<id>` answers them. */
+export interface TaskTexts {
+  id: number | null;
+  brief: string | null;
+  report: string | null;
+  review_note: string | null;
+  updated_at_ms: number | null;
+}
+
+export function normalizeTaskTexts(value: unknown): TaskTexts {
+  const raw = isObject(value) ? value : {};
+  return {
+    id: optionalNumber(raw.id),
+    brief: optionalText(raw.brief),
+    report: optionalText(raw.report),
+    review_note: optionalText(raw.review_note),
+    updated_at_ms: optionalNumber(raw.updated_at_ms),
+  };
+}
+
+/** GET /api/missions/task/<id>: a task's brief, report and review note in
+ * full, read when the task is opened. */
+export async function fetchTaskTexts(task: number, signal: AbortSignal): Promise<TaskTexts> {
+  return readApi(`/api/missions/task/${task}`, signal, normalizeTaskTexts);
 }
 
 /** How a task's record shows as a step: what it moved the task to.
@@ -368,6 +412,9 @@ export function stageStep(stage: TaskStage): StageStep {
             ? "back"
             : "forward",
       };
+    case "held":
+      // Its source is held by the owner: nothing was pushed, it waits.
+      return { label: "waits behind the owner's hold", tone: "forward" };
     case "aborted":
     case "cancelled":
       return { label: stage.stage, tone: "closed" };

@@ -58,6 +58,11 @@ pub enum WaitReason {
     WaitingForUserPermission,
     /// The engine waits for the next prompt.
     WaitingForUserInput,
+    /// The turn stopped at the prompt while a background job the agent
+    /// started still runs (a `job.started` of the running execution with no
+    /// `job.ended`): the engine wakes it when the job reports. Its state is
+    /// WORKING, settled by the rules.
+    WaitingForBackgroundJob,
     /// The judge failed or timed out; the agent may still be alive.
     JudgeUnavailable,
 }
@@ -210,6 +215,13 @@ pub struct Observation {
 }
 
 impl Observation {
+    /// Whether the rules settled this judgement as a worker at its prompt
+    /// waiting on a background job of its own
+    /// ([`WaitReason::WaitingForBackgroundJob`]): working, not idle.
+    pub fn waits_on_own_job(&self) -> bool {
+        self.reason == Some(WaitReason::WaitingForBackgroundJob)
+    }
+
     /// An observation with only the original fields set.
     pub fn basic(
         state: SemanticState,

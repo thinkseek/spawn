@@ -25,6 +25,8 @@ fn input() -> JudgeInput {
         last_end: None,
         exit_code: None,
         open_tools: 1,
+        open_jobs: 0,
+        oldest_job_ms: None,
         last_tool: Some("Bash".to_string()),
         permission_pending: false,
         screen: Some(spawn_core::screen::ScreenState::Busy),

@@ -1,4 +1,4 @@
-//! `GET /api/attention`: the UI's "Needs a human" queue, computed by the
+//! `GET /api/attention`: the UI's "Escalations" queue, computed by the
 //! dispatcher's own code.
 //!
 //! The escalations are the plan the dispatcher would make this moment,
@@ -23,6 +23,10 @@
 //!     "told": false, "told_at_ms": null
 //!   }],
 //!   "told": [ ...the same, "told": true, "told_at_ms": <first digest that carried it> | null ],
+//!   "holds": [{                    // the owner's holds with a task waiting behind them
+//!     "source", "hold", "main", "by", "reason", "held_at_ms", "expires_ms",
+//!     "waiting": [12]              // the tasks waiting, oldest first
+//!   }],
 //!   "supervisor": null | {
 //!     "session_id", "agent_id", "live", "execution_id", "end_cause",
 //!     "busy",                      // a command into it is in flight
@@ -37,9 +41,26 @@
 //!     },
 //!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null}]
 //!   },
+//!   "on_own_jobs": [{              // workers the rules hold as working on a
+//!     "session_id", "agent_id",    // background job of their own: not escalated
+//!     "judged_at_ms": 1793957000000 | null,
+//!     "jobs": [{"id": "b8w03og7k", "kind": "bash" | "monitor",
+//!               "started_at_ms": ..., "age_ms": ...}]   // oldest first
+//!   }],
 //!   "warnings": ["dispatch: stalls: ..."]   // what could not be read
 //! }
 //! ```
+//!
+//! `on_own_jobs` lists the workers whose current judgement is the rules'
+//! "waiting on its own background job" ([`Facts::waits_on_own_job`]), with
+//! their open jobs and each one's age on the database's clock: the reason
+//! they are in no queue. A job past its bound is an item of its own in
+//! `pending` or `told` (`background job past its bound`).
+//!
+//! `holds` is not among `pending` or `told`: the supervisor is told of a
+//! hold's expiry, never of a hold. It lists the owner's active holds on
+//! mission sources (`spawn mission hold`) that have at least one task waiting
+//! behind them, as the mission board shows them: work a person is holding.
 //!
 //! The supervisor's question is shown when its turn ended at its prompt
 //! and its judgement asks for a person: BLOCKED or WAITING with
@@ -103,6 +124,8 @@ pub(super) fn attention() -> Result<Value, String> {
         &bounds,
         crate::config::supervised(),
         &crate::config::spawn_program(),
+        // It submits nothing: no charter input to plan.
+        None,
     )?;
     let mut warnings = reading.lines;
     let tags: Vec<String> = reading.plan.told.iter().map(Escalation::tag).collect();
@@ -145,7 +168,14 @@ pub(super) fn attention() -> Result<Value, String> {
         .iter()
         .map(|(text, at_ms)| json!({ "text": text, "at_ms": at_ms }))
         .collect();
-    Ok(answer(
+    let holds = match store.source_holds() {
+        Ok(holds) => waiting_holds(&holds),
+        Err(error) => {
+            warnings.push(format!("attention: the owner's holds: {error}"));
+            Value::Array(Vec::new())
+        }
+    };
+    let mut view = answer(
         &reading.rows,
         &reading.plan,
         &told_at,
@@ -153,7 +183,29 @@ pub(super) fn attention() -> Result<Value, String> {
         &Value::Array(for_owner),
         &warnings,
         super::now_ms(),
-    ))
+    );
+    if let Some(fields) = view.as_object_mut() {
+        fields.insert("holds".to_string(), holds);
+    }
+    Ok(view)
+}
+
+/// The owner's holds of `holds` (`PostgresStore::source_holds`: `{now_ms,
+/// holds}`) that have at least one task waiting behind them.
+fn waiting_holds(holds: &Value) -> Value {
+    Value::Array(
+        holds["holds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|hold| {
+                hold["waiting"]
+                    .as_array()
+                    .is_some_and(|tasks| !tasks.is_empty())
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 /// The answer from what was read: `plan` as [`dispatch::decide_with`] made
@@ -196,8 +248,30 @@ fn answer(
         "pending": plan.pending.iter().map(|escalation| item(escalation, false)).collect::<Vec<_>>(),
         "told": plan.told.iter().map(|escalation| item(escalation, true)).collect::<Vec<_>>(),
         "supervisor": supervisor,
+        "on_own_jobs": on_own_jobs(rows),
         "warnings": warnings,
     })
+}
+
+/// The workers judged, on their latest fact, at their prompt waiting on a
+/// background job of their own, with those jobs: working, so in no queue.
+fn on_own_jobs(rows: &[Facts]) -> Vec<Value> {
+    rows.iter()
+        .filter(|facts| facts.session_id != SUPERVISOR_SESSION && facts.waits_on_own_job())
+        .map(|facts| {
+            json!({
+                "session_id": facts.session_id,
+                "agent_id": facts.agent_id,
+                "judged_at_ms": facts.observation_at_ms,
+                "jobs": facts.jobs.iter().map(|job| json!({
+                    "id": job.id,
+                    "kind": job.kind,
+                    "started_at_ms": job.started_at_ms,
+                    "age_ms": job.age_ms,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 /// The supervisor's liveness, its latest judgement, its `question` and its
@@ -419,7 +493,7 @@ fn line_time(line: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said};
+    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said, waiting_holds};
     use crate::deliver::Work;
     use crate::dispatch::{Escalation, Facts, Why, decide_with};
     use serde_json::{Value, json};
@@ -568,6 +642,104 @@ mod tests {
         assert_eq!(pending[1]["why"], "disk space on this host");
         assert_eq!(pending[1]["since_ms"], NOW - 600_000);
         assert_eq!(view["generated_at_ms"], NOW);
+    }
+
+    /// The live sequence of 2026-11-06 23:56: task 92's worker waited at
+    /// its prompt on a gate it ran in the background. The rules hold it as
+    /// working on that job: it is in no queue, and the view lists it with
+    /// its job and the job's age. Past the job's bound, the job is an item.
+    #[test]
+    fn a_worker_on_its_own_background_job_is_listed_as_working_not_queued() {
+        let (mut rows, mut work, host) = situation();
+        let on_job = json!({
+            "state": "WORKING", "reason": "WAITING_FOR_BACKGROUND_JOB", "based_on_seq": 50,
+            "confidence": 1.0, "judge": "rules",
+        });
+        let mut waiting = row(
+            "session_worker_gate_cache_92",
+            "agent_worker_gate_cache_92",
+            &on_job,
+            NOW - 30_000,
+        );
+        waiting["jobs"] = json!([{"id": "bys3gpa46", "kind": "monitor", "event_id": 512,
+                                  "started_at_ms": NOW - 900_000, "age_ms": 900_000}]);
+        rows.push(facts(&waiting));
+        work.tasks.extend(
+            serde_json::from_value::<Vec<crate::deliver::TaskRow>>(json!([{
+                "id": 92, "mission_id": 4, "kind": "ephemeral",
+                "agent_id": "agent_worker_gate_cache_92",
+                "session_id": "session_worker_gate_cache_92",
+                "brief": "b", "state": "delivered", "revisions": 0, "mission_text": "m",
+            }]))
+            .expect("task rows"),
+        );
+        let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
+        let view = answer(
+            &rows,
+            &plan,
+            &Value::Null,
+            &Value::Null,
+            &json!([]),
+            &[],
+            NOW,
+        );
+        let queued = |view: &Value| -> Vec<String> {
+            ["pending", "told"]
+                .iter()
+                .flat_map(|list| view[*list].as_array().expect("a list").clone())
+                .filter_map(|item| item["session_id"].as_str().map(str::to_string))
+                .collect()
+        };
+        assert!(
+            !queued(&view).contains(&"session_worker_gate_cache_92".to_string()),
+            "{view:#}"
+        );
+        assert_eq!(
+            view["on_own_jobs"],
+            json!([{
+                "session_id": "session_worker_gate_cache_92",
+                "agent_id": "agent_worker_gate_cache_92",
+                "judged_at_ms": NOW - 30_000,
+                "jobs": [{"id": "bys3gpa46", "kind": "monitor",
+                          "started_at_ms": NOW - 900_000, "age_ms": 900_000}],
+            }])
+        );
+
+        // Two hours on: the job is an item of its own, still not idle.
+        let last = rows.len() - 1;
+        rows[last].jobs[0].age_ms = 2 * 3_600_000 + 1;
+        let mut host = host;
+        host.extend(crate::dispatch::job_items(
+            &rows,
+            crate::dispatch::Bounds::default().job,
+        ));
+        let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
+        let view = answer(
+            &rows,
+            &plan,
+            &Value::Null,
+            &Value::Null,
+            &json!([]),
+            &[],
+            NOW,
+        );
+        let item = view["pending"]
+            .as_array()
+            .expect("pending")
+            .iter()
+            .find(|item| item["session_id"] == "session_worker_gate_cache_92")
+            .expect("the job's item");
+        assert_eq!(item["why"], "background job past its bound");
+        assert_eq!(
+            item["tag"],
+            "session_worker_gate_cache_92 job-exec_agent_worker_gate_cache_92-bys3gpa46-512"
+        );
+        assert!(
+            item["line"]
+                .as_str()
+                .is_some_and(|line| line.contains("monitor bys3gpa46"))
+        );
+        assert_eq!(view["on_own_jobs"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -923,5 +1095,24 @@ mod tests {
             observation.ambiguity = None;
         }
         assert!(asking(&working).is_none());
+    }
+
+    /// Objective 34: the attention view lists the owner's holds only while a
+    /// task waits behind them, beside `pending` and `told`, never among them.
+    #[test]
+    fn a_hold_is_listed_only_while_a_task_waits_behind_it() {
+        let holds = json!({"now_ms": 5, "holds": [
+            {"source": "/srv/a.git", "hold": 7, "main": "m", "by": "human", "reason": null,
+             "held_at_ms": 1, "expires_ms": 10_800_001_i64, "waiting": [12, 15]},
+            {"source": "/srv/b.git", "hold": 9, "main": "n", "by": "human",
+             "reason": "owner gate", "held_at_ms": 2, "expires_ms": 20_002, "waiting": []},
+        ]});
+        let listed = waiting_holds(&holds);
+        assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+        assert_eq!(listed[0]["source"], "/srv/a.git");
+        assert_eq!(listed[0]["hold"], 7);
+        assert_eq!(listed[0]["waiting"], json!([12, 15]));
+        assert_eq!(waiting_holds(&json!({"now_ms": 5, "holds": []})), json!([]));
+        assert_eq!(waiting_holds(&json!({})), json!([]));
     }
 }
