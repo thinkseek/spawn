@@ -1722,6 +1722,32 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
+    when 'alert.fired' then
+        -- An alert's one occurrence (spawn loop, crate alerts.rs): one row
+        -- per key, and a second `fired` for it is refused (also by
+        -- `spawn_alert_record`, the writer). A notice never clears.
+        if exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was already fired', p_record ->> 'key';
+        end if;
+        insert into spawn_alerts (key, kind, subject, state, notice, text, evidence,
+                                  fired_event_id, fired_at_ms)
+        values (p_record ->> 'key', p_record ->> 'kind', p_record ->> 'subject',
+                case when coalesce((p_record ->> 'notice')::boolean, false)
+                     then 'notice' else 'open' end,
+                coalesce((p_record ->> 'notice')::boolean, false),
+                p_record ->> 'text', coalesce(p_record -> 'evidence', '{}'::jsonb),
+                p_event, p_at);
+    when 'alert.cleared' then
+        -- What cleared an alert, once: the row must be open (a notice never
+        -- clears, and a cleared alert is cleared at most once).
+        if not exists (select 1 from spawn_alerts
+                        where key = p_record ->> 'key' and state = 'open') then
+            raise exception 'alert % is not open: nothing to clear', p_record ->> 'key';
+        end if;
+        update spawn_alerts
+           set state = 'cleared', cleared_event_id = p_event, cleared_at_ms = p_at,
+               cleared_evidence = coalesce(p_record -> 'evidence', '{}'::jsonb)
+         where key = p_record ->> 'key';
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
