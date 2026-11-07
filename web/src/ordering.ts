@@ -156,12 +156,15 @@ function capitalize(text: string): string {
  * Truncated to `max` characters; null when the task has no text.
  */
 export function taskTitle(
-  task: Pick<MissionTask, "brief">,
+  task: Pick<MissionTask, "brief"> & { task_title?: string | null },
   options: { objectiveTitle?: string | null; missionName?: string | null; max?: number } = {},
 ): string | null {
   const max = options.max ?? 120;
   const given = options.objectiveTitle?.trim();
   if (given && !PLACEHOLDER.test(given)) return clip(given, max);
+  // The server titles a task (serve/labels.rs); what follows is for one
+  // that does not.
+  if (task.task_title) return clip(task.task_title, max);
   const lines = (task.brief ?? "")
     .split("\n")
     .map((line) => line.trim().replace(/^#+\s*/, ""))
@@ -287,7 +290,12 @@ export function groupTasks<T>(
 // Missions
 
 /** A mission's short name: its text up to a colon, else its first words. */
-export function missionName(mission: Pick<Mission, "id" | "text">): string {
+export function missionName(
+  mission: Pick<Mission, "id" | "text"> & { mission_name?: string | null },
+): string {
+  // The server names a mission (serve/labels.rs); this is for one that
+  // does not.
+  if (mission.mission_name) return mission.mission_name;
   const text = (mission.text ?? "").trim().replace(/\s+/g, " ");
   if (!text) return mission.id !== null ? `Mission ${mission.id}` : "Mission";
   const colon = text.indexOf(":");
