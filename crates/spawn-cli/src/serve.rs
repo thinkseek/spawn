@@ -49,7 +49,12 @@
 //! The built UI's static files are served without it:
 //! they are the public build and hold no data, and a browser fetches them
 //! without headers.
+//!
+//! How a read is sent (validators and 304, the boards' answers shared for a
+//! second among the pages that poll, the lists' first lines) is
+//! [`answers`]'s.
 
+mod answers;
 mod attention;
 
 use std::net::SocketAddr;
@@ -653,38 +658,60 @@ fn handle(request: Request, shared: &Shared) -> Result<(), String> {
                 .map_err(|error| error.to_string());
         }
     }
-    let answer = match path {
-        "/api/overview" => overview(),
-        "/api/rsi" => rsi_overview(),
-        "/api/rsi/pane" => rsi_pane(query),
-        "/api/fleet" => fleet(),
-        "/api/attention" => attention::attention(),
-        "/api/missions" => missions(),
-        "/api/events" => events(query),
-        "/api/scorecard" => scorecard(query),
+    let Some(read) = reader(path, query) else {
+        return static_file(request, &shared.web, path);
+    };
+    // A board's answer may be one computed for another page this second
+    // (answers::SHARE_FOR), when the request accepts one that old; any
+    // other is read now. A malformed identifier is the caller's mistake
+    // (400), not the server's.
+    let compute = || answers::answer(path, read(), BAD_REQUEST);
+    let answer = if answers::shared(path) {
+        answers::ANSWERS.get(
+            &answers::key(path, query),
+            answers::accepted_age(header(&request, "Cache-Control")),
+            compute,
+        )
+    } else {
+        Arc::new(compute())
+    };
+    let if_none_match = header(&request, "If-None-Match").map(str::to_string);
+    answers::respond(request, &answer, if_none_match.as_deref())
+}
+
+/// One API read, not run yet.
+type Read<'a> = Box<dyn FnOnce() -> Result<Value, String> + 'a>;
+
+/// The read at `path` with `query`, or `None` when `path` is no API read
+/// (a static file, or a 404).
+fn reader<'a>(path: &'a str, query: &'a str) -> Option<Read<'a>> {
+    Some(match path {
+        "/api/overview" => Box::new(overview),
+        "/api/rsi" => Box::new(rsi_overview),
+        "/api/rsi/pane" => Box::new(move || rsi_pane(query)),
+        "/api/fleet" => Box::new(fleet),
+        "/api/attention" => Box::new(attention::attention),
+        "/api/missions" => Box::new(missions),
+        "/api/events" => Box::new(move || events(query)),
+        "/api/scorecard" => Box::new(move || scorecard(query)),
         _ => {
             if let Some(id) = path.strip_prefix("/api/session/") {
-                session(id, query)
+                Box::new(move || session(id, query))
             } else if let Some(task) = path.strip_prefix("/api/rsi/task/") {
-                rsi_task(task)
+                Box::new(move || rsi_task(task))
+            } else if let Some(rest) = path.strip_prefix("/api/rsi/objective/") {
+                Box::new(move || rsi_objective(rest))
+            } else if let Some(task) = path.strip_prefix("/api/missions/task/") {
+                Box::new(move || mission_task(task))
             } else if let Some(id) = path.strip_prefix("/api/pane/") {
-                pane(id, None)
+                Box::new(move || pane(id, None))
             } else if let Some(rest) = path.strip_prefix("/api/fleet/") {
-                fleet_session(rest, query)
+                Box::new(move || fleet_session(rest, query))
             } else {
-                return static_file(request, &shared.web, path);
+                return None;
             }
         }
-    };
-    let (status, body) = match answer {
-        Ok(body) => (200, body),
-        // A malformed identifier is the caller's mistake, not the server's.
-        Err(error) if error.starts_with(BAD_REQUEST) => (400, json!({ "error": error })),
-        Err(error) => (500, json!({ "error": error })),
-    };
-    request
-        .respond(json_response(status, &body))
-        .map_err(|error| error.to_string())
+    })
 }
 
 /// Answer a refused API request: 401 with a bearer challenge when a token
@@ -942,10 +969,17 @@ fn overview() -> Result<Value, String> {
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|state| {
+            // The list shows the judgement's state, reason, confidence and
+            // judge; its evidence (the screen it saw, most of the bytes) is
+            // the session's own read (`/api/session/<id>`, `/api/fleet`).
+            let mut observation = json!(state.observation);
+            if let Some(fields) = observation.as_object_mut() {
+                fields.remove("evidence");
+            }
             json!({
                 "session_id": state.session_id.as_str(),
                 "agent_id": state.agent_id.as_str(),
-                "observation": state.observation,
+                "observation": observation,
                 "session_seq": state.session_seq.0,
                 "recorded_at_ms": state.recorded_at.0,
             })
@@ -970,13 +1004,32 @@ fn now_ms() -> i64 {
 /// `/api/missions`: the board, each task with its stages from the store
 /// (`stages`: `[{stage, verdict?, at_ms, took_ms?}]`, oldest first) and its
 /// last gate verdict (`last_gate`: `{verdict, reason, metric, candidate,
-/// at_ms}` or null).
+/// at_ms}` or null). A task's `brief`, `review_note` and `report` are their
+/// first lines, each with its length in bytes (`brief_bytes`, ...); a
+/// closed mission's or a cancelled task's report is its length alone
+/// ([`answers::slim_board`]). The texts in full are
+/// `/api/missions/task/<id>`.
 fn missions() -> Result<Value, String> {
     let store = open_store()?;
     let mut board = store.mission_board(50).map_err(err)?;
     let gates = store.last_gates().map_err(err)?;
     with_last_gates(&mut board, &gates);
+    answers::slim_board(&mut board);
     Ok(board)
+}
+
+/// `/api/missions/task/<id>`: one task's brief, report and review note in
+/// full, `{id, mission_id, brief, report, review_note, updated_at_ms}`, as
+/// the Missions page asks when a task is opened.
+fn mission_task(task: &str) -> Result<Value, String> {
+    let id: i64 = task
+        .parse()
+        .map_err(|_| format!("{BAD_REQUEST}bad task {task}"))?;
+    let store = open_store()?;
+    store
+        .task_texts(id)
+        .map_err(err)?
+        .ok_or_else(|| format!("task {id} does not exist"))
 }
 
 /// Put each task's last gate verdict from `gates` (keyed by task id) on the
@@ -1051,19 +1104,30 @@ fn with_last_gates(board: &mut Value, gates: &Value) {
 /// }
 /// ```
 ///
+/// An objective's `prompt` is its first lines (about 1 KB), and a task's
+/// `brief` and `review_note` are null, their lengths in bytes beside them
+/// ([`answers::slim_rsi`]: `prompt_bytes`, `brief_bytes`,
+/// `review_note_bytes`).
+///
 /// `GET /api/rsi/task/<id>` answers one task: the fields above plus the full
 /// `brief`, `report`, `gate_log` (the latest), `mission_id`, and `log` on
 /// every gate verdict.
+///
+/// `GET /api/rsi/objective/<mission>/<id>` answers one objective's whole
+/// prompt, `{mission, id, title, prompt, prompt_bytes}`, as the page asks
+/// when the objective is pointed at.
 ///
 /// `GET /api/rsi/pane[?mission=<id>]` answers the live pane of the mission's
 /// resident (the first open objective mission by default), in the shape of
 /// `/api/pane/<session>` plus `session_id`.
 fn rsi_overview() -> Result<Value, String> {
     let store = open_store()?;
+    let mut missions = objective_missions(&store)?;
+    answers::slim_rsi(&mut missions);
     Ok(json!({
         "generated_at_ms": now_ms(),
         "halt_after": HALT_AFTER,
-        "missions": objective_missions(&store)?,
+        "missions": missions,
     }))
 }
 
@@ -1248,6 +1312,44 @@ fn rsi_task(task: &str) -> Result<Value, String> {
         .objective_task(id)
         .map_err(err)?
         .ok_or_else(|| format!("task {id} does not exist"))
+}
+
+/// `/api/rsi/objective/<mission>/<id>`: one objective's whole prompt, read
+/// from the backlog of that open objective mission (`/api/rsi` sends the
+/// prompt's first lines).
+fn rsi_objective(rest: &str) -> Result<Value, String> {
+    let bad = || format!("{BAD_REQUEST}bad objective {rest}");
+    let (mission, objective) = rest.split_once('/').ok_or_else(bad)?;
+    let mission: i64 = mission.parse().map_err(|_| bad())?;
+    let objective: u32 = objective.parse().map_err(|_| bad())?;
+    let store = open_store()?;
+    let missions = store.objective_missions().map_err(err)?;
+    objective_prompt(&missions, mission, objective)
+}
+
+/// Objective `objective` of mission `mission` among the open objective
+/// `missions`, with its whole prompt, from the mission's backlog.
+fn objective_prompt(missions: &Value, mission: i64, objective: u32) -> Result<Value, String> {
+    let backlog = missions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["id"].as_i64() == Some(mission))
+        .ok_or_else(|| format!("mission {mission} is not an open objective mission"))?
+        .pointer("/objectives/backlog")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("mission {mission} names no backlog"))?;
+    let found = load_backlog(Path::new(backlog))?
+        .into_iter()
+        .find(|task| task.id == objective)
+        .ok_or_else(|| format!("objective {objective} is not in mission {mission}'s backlog"))?;
+    Ok(json!({
+        "mission": mission,
+        "id": found.id,
+        "title": found.title,
+        "prompt_bytes": found.prompt.len(),
+        "prompt": found.prompt,
+    }))
 }
 
 /// The live pane of an objective mission's resident.
@@ -1592,10 +1694,27 @@ fn static_file(request: Request, web: &Path, path: &str) -> Result<(), String> {
             .respond(Response::empty(404))
             .map_err(|error| error.to_string());
     };
+    // A file's tag is its bytes'; the build's assets/ are named by their
+    // content and kept by the browser for good, the page asked again.
+    let etag = answers::file_etag(&bytes);
+    let tag = Header::from_bytes("ETag", etag.as_str()).expect("a hex tag is a valid header");
+    let cache = Header::from_bytes("Cache-Control", answers::file_cache_control(&relative))
+        .expect("static header is valid");
+    if answers::not_modified(header(&request, "If-None-Match"), &etag) {
+        let unchanged = Response::empty(304).with_header(tag).with_header(cache);
+        return request
+            .respond(unchanged)
+            .map_err(|error| error.to_string());
+    }
     let header = Header::from_bytes("Content-Type", content_type(&relative))
         .expect("static header is valid");
     request
-        .respond(Response::from_data(bytes).with_header(header))
+        .respond(
+            Response::from_data(bytes)
+                .with_header(header)
+                .with_header(tag)
+                .with_header(cache),
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -1618,9 +1737,9 @@ mod tests {
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_INPUT_BODY, MAX_INPUT_TEXT, MAX_LIMIT,
         ProcSocket, Shared, access_token, handle, is_json, is_loopback, local_exemption,
-        log_window, objective_json, open_network_request, open_networks, owner_uid, peer_uid,
-        proc_sockets, rsi_summary, same_origin, same_secret, serve_requests, server_hosts,
-        tokenless_request, typed_text, with_last_gates,
+        log_window, objective_json, objective_prompt, open_network_request, open_networks,
+        owner_uid, peer_uid, proc_sockets, rsi_objective, rsi_summary, same_origin, same_secret,
+        serve_requests, server_hosts, tokenless_request, typed_text, with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1647,6 +1766,43 @@ mod tests {
    0: 00000000000000000000000001000000:D433 00000000000000000000000001000000:2253 01 00000000:00000000 00:00000000 00000000  1001        0 77 1 0000000000000000 20 4 30 10 -1
    1: 0000000000000000FFFF00000100007F:D434 0000000000000000FFFF00000100007F:2253 01 00000000:00000000 00:00000000 00000000  1000        0 78 1 0000000000000000 20 4 30 10 -1
 ";
+
+    #[test]
+    fn an_objective_is_read_whole_from_its_missions_backlog() {
+        let dir = std::env::temp_dir().join(format!("spawn-serve-backlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // Longer than the first lines `/api/rsi` sends.
+        let prompt = format!(
+            "Make the gate faster.\n{}",
+            "Every line counts.\n".repeat(200)
+        );
+        let objective = json!({"id": 4, "title": "Faster gate", "prompt": prompt});
+        std::fs::write(dir.join("004.json"), objective.to_string()).expect("write");
+        let missions = json!([
+            {"id": 3, "objectives": {"backlog": "/nowhere"}},
+            {"id": 7, "objectives": {"backlog": dir.to_str()}},
+        ]);
+
+        let answer = objective_prompt(&missions, 7, 4).expect("the objective");
+        assert_eq!(answer["prompt"], json!(prompt), "the whole prompt");
+        assert_eq!(answer["prompt_bytes"], json!(prompt.len()));
+        assert_eq!(answer["title"], "Faster gate");
+        assert_eq!(answer["mission"], 7);
+        assert!(
+            objective_prompt(&missions, 7, 5).is_err(),
+            "not in the backlog"
+        );
+        assert!(
+            objective_prompt(&missions, 8, 4).is_err(),
+            "no such open mission"
+        );
+        // A malformed path is refused before the store is opened.
+        for rest in ["", "7", "7/", "x/4", "7/x", "7/4/1"] {
+            let error = rsi_objective(rest).expect_err("malformed");
+            assert!(error.starts_with(BAD_REQUEST), "{rest}: {error}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[cfg(target_endian = "little")]
     #[test]
@@ -2769,6 +2925,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&web);
         assert_eq!(status, Some(503));
         assert_eq!(freed, Some(400), "a freed slot serves again");
+    }
+
+    /// The whole answer to one GET of `path` with `headers` (CRLF-ended).
+    fn raw_get(port: u16, path: &str, headers: &str) -> String {
+        use std::io::{Read, Write};
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            client,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{headers}Connection: close\r\n\r\n"
+        )
+        .expect("send");
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).expect("read");
+        answer
+    }
+
+    /// The value of header `name` in a raw answer.
+    fn raw_header<'a>(answer: &'a str, name: &str) -> Option<&'a str> {
+        answer.split("\r\n\r\n").next()?.lines().find_map(|line| {
+            let (field, value) = line.split_once(':')?;
+            field.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    /// A file carries its tag; asked again with it, it is not sent again.
+    /// The build's assets are kept by the browser for good.
+    #[test]
+    fn a_file_is_tagged_and_an_unchanged_one_is_not_sent_again() {
+        let (port, web) = serving("etag", 4);
+        std::fs::write(web.join("index.html"), "<html>spawn</html>").expect("page");
+        std::fs::create_dir_all(web.join("assets")).expect("assets");
+        std::fs::write(web.join("assets/app-1a2b.js"), "1").expect("asset");
+        let first = raw_get(port, "/index.html", "");
+        let tag = raw_header(&first, "ETag").expect("a tag").to_string();
+        let page_cache = raw_header(&first, "Cache-Control").map(str::to_string);
+        let again = raw_get(port, "/index.html", &format!("If-None-Match: {tag}\r\n"));
+        let other = raw_get(port, "/index.html", "If-None-Match: W/\"0\"\r\n");
+        let asset = raw_get(port, "/assets/app-1a2b.js", "");
+        let _ = std::fs::remove_dir_all(&web);
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(first.ends_with("<html>spawn</html>"));
+        assert!(tag.starts_with("W/\""), "{tag}");
+        assert_eq!(page_cache.as_deref(), Some("no-cache"));
+        assert!(again.starts_with("HTTP/1.1 304"), "{again}");
+        assert_eq!(raw_header(&again, "ETag"), Some(tag.as_str()));
+        assert!(again.ends_with("\r\n\r\n"), "no body: {again}");
+        assert!(other.starts_with("HTTP/1.1 200"), "another tag: {other}");
+        assert_eq!(
+            raw_header(&asset, "Cache-Control"),
+            Some("public, max-age=31536000, immutable")
+        );
+    }
+
+    /// An API answer that failed carries no tag, so it is never "not
+    /// modified": a malformed id answers 400 whatever the request names.
+    #[test]
+    fn an_api_error_is_never_answered_not_modified() {
+        let (port, web) = serving("etag-error", 4);
+        let answer = raw_get(
+            port,
+            "/api/session/not%20a%20session",
+            "If-None-Match: *\r\n",
+        );
+        let _ = std::fs::remove_dir_all(&web);
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+        assert_eq!(raw_header(&answer, "ETag"), None);
+        assert_eq!(raw_header(&answer, "Cache-Control"), Some("no-cache"));
     }
 
     #[test]
