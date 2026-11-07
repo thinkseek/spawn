@@ -1042,9 +1042,9 @@ fn assign(
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempts, Landing, Outcome, Overrun, PriorWork, Task, abort_yields, attempt_limit, attempts,
-        brief, choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns,
-        workers, yields,
+        Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
+        choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns, workers,
+        yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1188,7 +1188,10 @@ mod tests {
         let latest = overruns(&outcomes);
         let chain = latest.get(&17).expect("the latest overrun");
         assert_eq!(chain.task, 87, "the latest overrun is the continuation's");
-        assert!(holds(chain, None), "a second overrun holds without a configure");
+        assert!(
+            holds(chain, None),
+            "a second overrun holds without a configure"
+        );
         assert!(
             holds(chain, Some(1_000)),
             "a configure at the record's own time does not release it"
@@ -1218,12 +1221,26 @@ mod tests {
             .collect();
         assert_eq!(held, BTreeSet::from([17]));
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &untried(), &held, 2)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &untried(),
+                &held,
+                2
+            )),
             vec![18],
             "the freed slot goes to the next open objective"
         );
         assert_eq!(
-            ids(&choose(&backlog, &[], &BTreeSet::new(), &untried(), &BTreeSet::new(), 2)),
+            ids(&choose(
+                &backlog,
+                &[],
+                &BTreeSet::new(),
+                &untried(),
+                &BTreeSet::new(),
+                2
+            )),
             vec![17, 18],
             "without the hold, both are open"
         );
