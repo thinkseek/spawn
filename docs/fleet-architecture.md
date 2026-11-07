@@ -67,26 +67,30 @@ No layer calls another layer's process directly; they meet in the log.
 ### 1.1 Synchronization points
 
 Work runs in parallel between synchronization points and joins only at
-them. A synchronization point is the one place where work changes hands:
-from whoever asks to the worker, from the worker to a reviewer, from a
-branch to `main`, from `main` to the live host, from `main` to the outside.
-Between two points no one waits on anyone. At a point nothing moves on until
-a record names exactly what it covers (the task, the commit, the criteria)
-and who checked it. A loop that moves on from inferred progress (a quiet
-pane, a file that exists, a status that looks done) instead of such a record
-is a defect, wherever it is.
+them. A synchronization point is where work changes hands: from whoever
+asks to the worker, from the worker to a reviewer, from a report to its
+mission, from a branch to `main`, from `main` to the live host, from the
+owner's checkout to its remote. Between two points no one waits on another's
+progress; all waiting happens at a point (a landing that waits for a hold to
+end or for its turn, §10.3, waits at the Gate). At a point nothing moves on
+until a record names exactly what it covers (the task, the report's
+revision, the commit) and who decided. A loop that moves on from inferred
+progress (a quiet pane, a file that exists, a status that looks done)
+instead of such a record is a defect, wherever it is.
 
-| Point | Joins | Moves on when | Record | Decided by |
-| --- | --- | --- | --- | --- |
-| Brief | asker → worker | the brief names the goal, inputs, done criteria and the base commit | `task.assigned` | supervisor |
-| Review | worker → reviewer | a verdict names the task, the report's revision and the commit it read, with completion quality and efficiency | review verdict | a review session that did not write the work |
-| Accept | reviewer → supervisor | accept or reject cites a review verdict on the same revision | `task.reviewed` (§10.2) | supervisor |
-| Gate | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit | `task.gated`, `task.landed` (§10.2, §10.3) | integrator, or the owner's gate |
-| Deploy | `main` → live | the deployed build is the verdict's commit: HEAD equals the candidate and the tree is clean | the deploy's log line | `deploy/deploy.sh` |
-| Publish | `main` → outside | the pushed commit is a verified one and passed a secret scan; for a product mission, the next contract is already published | the push and its contract | owner |
+| Point | Joins | Moves on when | Record | Decided by | Enforced today |
+| --- | --- | --- | --- | --- | --- |
+| Brief | asker → worker | the task names its goal, inputs and done criteria | `task.assigned` | supervisor, the integrator for objective tasks (§10.4), or the owner | the record; its base is the workspace's branch point ([storage.md](storage.md)), not a field of the record |
+| Review | worker → reviewer | a verdict names the task, the report's revision and the commit it read | review verdict | a ccd session that did not write the work | not in code: the lead runs it, outside the log (§9) |
+| Accept | report → mission | in a review-mode mission, the verdict names the revision it judged | `task.reviewed` (§10.3) | supervisor, or the owner | the revision check; citing a review verdict is not checked (§9) |
+| Gate | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit, by compare-and-swap | `task.gated`, `task.landed` (§10.2, §10.3) | integrator; the owner's gate for owner work | yes |
+| Deploy | `main` → live | HEAD is the candidate of a passing verdict and the tree is clean | the deploy's log line | `deploy/deploy.sh` | yes, by `deploy/deploy.sh` |
+| Publish | owner's checkout → remote | the pushed commit passed its gate and a secret scan | the push | owner | by the owner's procedure, not by code |
 
-**The review.** Every report gets a review before it is accepted. The
-reviewer is a separate Claude Code session, run interactively with
+**The review.** A report gets a review before it moves on: in a
+review-mode mission before it is accepted, in a gate-mode mission before
+its gate runs (the cheap check first, the gate after). The reviewer is a
+separate Claude Code session, run interactively with
 `claude --dangerously-skip-permissions` (a *ccd*; never print mode). It did
 not write the work, and it starts from the brief, the diff and the report,
 never from the author's conversation. It checks two things:
@@ -109,7 +113,9 @@ other: a report sent back and revised needs a new review. Several review
 sessions may run at once. The lead (the supervisor, or the owner's
 supervising session) works with them as peers, one subject per session. The
 lead's own commits pass the same point: a session other than the lead
-reviews them.
+reviews them. Today the lead runs reviews for owner work (missions 7 and 8)
+and for everything it merges, gates or deploys; for the fleet's other
+reports the Review point is not built (§9).
 
 ## 2. Observation: rules first, Jev on ambiguity
 
@@ -934,9 +940,11 @@ code in a bubblewrap sandbox under the same uid (see docs/rsi.md §4).
 - **Ladder health over long periods.** The UI's figures cover the last 24 h.
 - **The backlog, scenarios and gate versioned with the source**
   (docs/storage.md).
-- **The review verdict in the control stream** (§1.1). Review sessions are
-  run by the lead and their verdicts are kept outside the log; `spawn task
-  accept` does not yet require a verdict on the report's commit.
+- **The Review point in code** (§1.1). Review sessions are run by the lead
+  and their verdicts are kept outside the log. No record type holds a
+  verdict, `spawn task accept` does not require one on the report's
+  revision, and a gate-mode mission's integrator gates a report without
+  one.
 
 ## 10. One log, one landing path
 
