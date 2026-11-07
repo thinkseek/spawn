@@ -633,6 +633,11 @@ pub(crate) struct Mission {
     pub(crate) gate_host_due_ms: Option<i64>,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
+    /// When the mission was last configured (`mission.configured`), on the
+    /// database's clock: an overrun chain's hold ends with a configure newer
+    /// than its escalated record ([`crate::objectives`]).
+    #[serde(default)]
+    pub(crate) configured_ms: Option<i64>,
     #[serde(default)]
     pub(crate) source: Option<String>,
     /// The owner's active hold on its source (the `source.held` record's
@@ -686,6 +691,11 @@ pub(crate) struct Task {
     /// `task.held`), if any.
     #[serde(default)]
     pub(crate) held_by: Option<i64>,
+    /// The overrun task whose work this one continues (its `task.assigned`
+    /// names it), if any: a second overrun of such a task goes to the
+    /// supervisor and holds its objective.
+    #[serde(default)]
+    pub(crate) continues: Option<i64>,
 }
 
 impl Mission {
@@ -1623,12 +1633,15 @@ impl Integrator {
         Ok(())
     }
 
-    /// Abort delivered tasks over budget; the ids of those it aborted.
+    /// Stop the delivered tasks over budget and record each as its own
+    /// `task.over_budget`, with the work it keeps; the ids of those it
+    /// recorded. A task whose work has not reached its branch yet waits for
+    /// the push ([`kept_work`]) and is recorded by a later pass.
     fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
         let Some(budget) = &mission.budget else {
             return Ok(Vec::new());
         };
-        let mut aborted = Vec::new();
+        let mut over: Vec<i64> = Vec::new();
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         let gap_ms = budget_gap(crate::config::env_value("SPAWN_BUDGET_GAP_SECS").as_deref())
             .as_millis()
@@ -1652,31 +1665,52 @@ impl Integrator {
                     .fleet_alive_ms(from, to, gap_ms)
                     .map_err(|error| error.to_string())
             })?;
-            if let Some(reason) = over_budget(budget, active, calls) {
-                // The Stop first, under its fixed key: if the record then
-                // fails, the next pass finds the task still delivered and
-                // over budget, and submits (a no-op) and records again.
-                stop(store, task)?;
-                // An abort that is its objective's last failed attempt
-                // before the limit is the yield too: the task is gone, and
-                // nothing else would yield the slot.
-                let mut aborted_record =
-                    json!({"type": "task.aborted", "id": task.id, "reason": reason});
-                if let Some(yielded) = objectives::abort_yield(store, mission, task)?
-                    && let (Some(record), Some(fields)) =
-                        (aborted_record.as_object_mut(), yielded.as_object())
-                {
-                    record.extend(fields.clone());
-                }
-                record(store, &aborted_record)?;
-                println!("integrate: task {} aborted: {reason}", task.id);
-                if let Some(why) = aborted_record["yield_reason"].as_str() {
-                    println!("integrate: mission {}: {why}", mission.id);
-                }
-                aborted.push(task.id);
+            let Some(reason) = over_budget(budget, active, calls) else {
+                continue;
+            };
+            // The Stop first, under its fixed key: if the record then
+            // fails, the next pass finds the task still delivered and
+            // over budget, and submits (a no-op) and records again.
+            stop(store, task)?;
+            let (branch, commit, diff) = match kept_work(store, mission, task)? {
+                // Its work has not reached the source yet: the next pass
+                // records what the pusher's head will hold.
+                Kept::Waiting => continue,
+                Kept::Work {
+                    branch,
+                    commit,
+                    diff,
+                } => (branch, Some(commit), diff),
+                Kept::Lost { branch } => (branch, None, String::new()),
+            };
+            let mut overrun = json!({"type": "task.over_budget", "id": task.id,
+                                     "reason": reason, "tool_calls": calls,
+                                     "elapsed_ms": active, "budget": budget.clone(),
+                                     "branch": branch});
+            if let Some(commit) = &commit {
+                overrun["commit"] = json!(commit);
             }
+            if !diff.is_empty() {
+                overrun["diff"] = json!(diff);
+            }
+            if let Some(continues) = task.continues {
+                overrun["continues"] = json!(continues);
+            }
+            if commit.is_none() {
+                overrun["pushed"] = json!(false);
+            }
+            record(store, &overrun)?;
+            println!("integrate: task {} over its budget, its work kept on {branch}: {reason}", task.id);
+            if commit.is_none() {
+                eprintln!(
+                    "integrate: task {}: its work never reached {branch} (the push failed): its \
+                     next task is told so",
+                    task.id
+                );
+            }
+            over.push(task.id);
         }
-        Ok(aborted)
+        Ok(over)
     }
 }
 
