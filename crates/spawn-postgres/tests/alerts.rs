@@ -14,7 +14,10 @@ use spawn_postgres::{PostgresStore, role_url};
 
 fn alert(client: &mut Client, key: &str) -> Value {
     client
-        .query_opt("select to_jsonb(a) from spawn_alerts a where a.key = $1", &[&key])
+        .query_opt(
+            "select to_jsonb(a) from spawn_alerts a where a.key = $1",
+            &[&key],
+        )
         .expect("read the table")
         .map_or(Value::Null, |row| row.get(0))
 }
@@ -78,9 +81,7 @@ fn an_alert_fires_once_and_clears_once() {
         "a cleared without its fired is refused"
     );
 
-    let cleared_id = store
-        .alert_record(&cleared("memory_low:1"))
-        .expect("clear");
+    let cleared_id = store.alert_record(&cleared("memory_low:1")).expect("clear");
     let row = alert(&mut client, "memory_low:1");
     assert_eq!(row["state"], "cleared");
     assert_eq!(row["cleared_event_id"], cleared_id);
