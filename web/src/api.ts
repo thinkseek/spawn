@@ -50,6 +50,22 @@ export interface Overview {
   rsi: RsiSummary | null;
 }
 
+/** One alert Spawn raised (`/api/alerts`): the same array `spawn alerts
+ * --once --json` answers. */
+export interface Alert {
+  key: string;
+  kind: string;
+  subject: string;
+  state: "open" | "notice" | "cleared";
+  fired_event_id: number;
+  fired_at_ms: number;
+  evidence: unknown;
+  cleared_event_id: number | null;
+  cleared_at_ms: number | null;
+  cleared_evidence: unknown;
+  text: string;
+}
+
 export interface Execution {
   execution_id: string;
   engine: string;
@@ -209,6 +225,31 @@ export function normalizeOverview(value: unknown): Overview {
     }),
     rsi: normalizeRsi(raw.rsi),
   };
+}
+
+function alertState(value: unknown): Alert["state"] {
+  const key = typeof value === "string" ? value.toLowerCase() : "";
+  if (key === "open" || key === "notice" || key === "cleared") return key;
+  return "open";
+}
+
+export function normalizeAlerts(value: unknown): Alert[] {
+  return list(value).map((entry) => {
+    const alert = object(entry);
+    return {
+      key: text(alert.key),
+      kind: text(alert.kind, "alert"),
+      subject: text(alert.subject),
+      state: alertState(alert.state),
+      fired_event_id: number(alert.fired_event_id),
+      fired_at_ms: number(alert.fired_at_ms),
+      evidence: alert.evidence ?? null,
+      cleared_event_id: optionalNumber(alert.cleared_event_id),
+      cleared_at_ms: optionalNumber(alert.cleared_at_ms),
+      cleared_evidence: alert.cleared_evidence ?? null,
+      text: text(alert.text),
+    };
+  });
 }
 
 export function normalizeSession(value: unknown): SessionDetail {
@@ -400,6 +441,12 @@ export async function postInput(
     // Not JSON: the status says enough.
   }
   return { status: response.status, body: answer };
+}
+
+/** The alerts Spawn raised: open ones and the window's transitions, the
+ * array `spawn alerts --once --json` answers. */
+export async function fetchAlerts(signal: AbortSignal): Promise<Alert[]> {
+  return readApi("/api/alerts", signal, normalizeAlerts);
 }
 
 export async function fetchSession(

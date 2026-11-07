@@ -9,6 +9,7 @@
 //!
 //! - `event_log`: the [`EventLog`] port.
 //! - `command_queue`: the [`CommandQueue`] port.
+//! - `alerts`: the loop's alert transitions and the alerts they fold into.
 //! - `sessions`: per-session read side over the `agent_*` views.
 //! - `gateway`: grant-filtered reads and submissions for restricted logins.
 //! - `fleet`: the dashboard and dispatcher read model.
@@ -71,6 +72,7 @@ macro_rules! lost_before_ready {
     };
 }
 
+mod alerts;
 mod command_queue;
 mod event_log;
 mod fleet;
