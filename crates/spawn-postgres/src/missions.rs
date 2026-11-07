@@ -993,10 +993,10 @@ impl PostgresStore {
     }
 
     /// Change only the settings `change` names and keep the rest of the
-    /// mission's (owner only; `spawn_mission_reconfigure`): `gate` and
-    /// `accept` replace theirs, `budget` and `objectives` merge key by key, a
-    /// null clears. Returns the mission's settings after the change, as
-    /// `mission.configured` records them.
+    /// mission's (owner only; `spawn_mission_reconfigure`, objective 027):
+    /// `gate` and `accept` replace theirs, `budget` and `objectives` merge
+    /// key by key, a null clears. Returns `{mission, before, after}`; a
+    /// change that leaves the settings as they were records nothing.
     pub fn mission_reconfigure(&self, mission: i64, change: &Value) -> Result<Value, StoreError> {
         Ok(self
             .query_one(

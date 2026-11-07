@@ -1079,18 +1079,26 @@ record of what was judged (§14 of design.md).
 - **Mission settings** (`spawn mission configure`, owner only): a gate (a
   scenarios directory in the controller, the deployed tree), how tasks are accepted,
   an optional budget, and objectives (§10.4). `configure` changes only the
-  settings it is given and keeps the others: `spawn_mission_reconfigure`
-  merges the change into the mission's settings under the append lock (the
-  gate and accept replaced, the budget's and the objectives' keys one by
-  one), checks the result as `spawn_mission_configure` checks any, and
-  records it whole, so `mission.configured` always carries every setting.
-  A setting is cleared only by naming it: `--clear` with any of `gate`,
-  `budget`, `minutes`, `tool-calls`, `objectives`, `workers`. A flag it does
-  not know, no change at all, or a setting both given and cleared is
-  refused. (2026-11-08: `configure --id 4 --tool-calls 600` replaced every
-  setting of mission 4, dropping its gate, objectives and minutes, and
-  setting accept to review, until the owner restored them.) `spawn mission
-  add` takes the settings whole, for a mission that has none yet:
+  settings it is given and keeps every other as the mission has it
+  (objective 027): `spawn_mission_reconfigure` reads the mission's row
+  under the append lock, merges the change into it (the gate and accept
+  replaced, the budget's and the objectives' fields one by one), checks the
+  result as `spawn_mission_configure` checks any, and records it whole, so
+  `mission.configured` always carries every setting and two configures
+  never lose each other's change. A setting is cleared only by its own
+  switch, which takes no value: `--no-gate`, `--no-budget` (both fields),
+  `--no-minutes`, `--no-tool-calls`, `--no-objectives`, `--no-workers`
+  (back to the default 1). A switch and a value for the same setting, or a
+  flag configure does not know, are refused; a refused call changes
+  nothing. It prints `{mission, before, after}`; a call that leaves the
+  settings as they were (nothing given, or the values they already have)
+  records nothing. Clearing the gate, or moving accept away from `gate`,
+  is refused while a task of the mission is `landing`, naming it (GitHub
+  issue #9: nothing would land it, and `spawn task cancel` refuses
+  `landing`). (2026-11-08: before this, `configure --id 4 --tool-calls 600`
+  replaced every setting of mission 4, dropping its gate, objectives and
+  minutes, and setting accept to review, until the owner restored them.)
+  `spawn mission add` takes the settings whole, for a mission that has none yet:
   - `review`: the supervisor accepts, then the gate runs;
   - `gate`: the gate alone decides. The supervisor is not told of its
     reports (`mission_news`) and `spawn_task_review` refuses them, because
