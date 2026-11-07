@@ -872,7 +872,7 @@ showed an alert. `spawn loop` now raises its own, from records and readings
   their evidence and their clearing. The supervisor's charter names the
   command: its hand-run monitor retires, and the fleet's alerting is the
   record's.
-- **Causality (§14).** An alert rests on a named record (its `event_id``) or
+- **Causality (§14).** An alert rests on a named record (its `event_id`) or
   on a recorded reading (its measure and threshold); a clearing names what
   cleared it; nothing rests on the step's memory, on absence, or on time
   without a record. Evidence never holds a secret: no database URL with its
