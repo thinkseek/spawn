@@ -1677,6 +1677,52 @@ mod tests {
     /// an idle supervisor once, as an item of `missions` tagged
     /// `missions objective-yielded-<event id>`, its line naming the mission
     /// and the record's reason; two yields keep a line each.
+    /// A second overrun of an objective's chain is one digest item, tagging
+    /// the overrun's record, naming both tasks, and holding the objective.
+    #[test]
+    fn a_second_overrun_reaches_the_supervisor_once_naming_both_tasks() {
+        let records = [serde_json::json!({
+            "event_id": 903, "at_ms": 1_794_063_948_000_i64, "id": 87, "continues": 84,
+            "chain": true, "mission": 4, "objective": 17,
+            "branch": "spawn/agent_worker_objective_87",
+            "commit": "d44c6011aa22bb33cc44dd55ee66ff7700112233",
+            "diff": " big.txt | 120 ++++++\n 1 file changed, 120 insertions(+)",
+            "tool_calls": 151, "budget": {"tool_calls": 150},
+            "reason": "the task made more than 150 tool calls",
+        })];
+        let items = super::digest::over_budget_escalations(&records);
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.tag(), "host over-budget-903");
+        assert_eq!(item.why, Why::OverBudget);
+        assert_eq!(item.since_ms, Some(1_794_063_948_000));
+        assert!(
+            item.line.contains("#87") && item.line.contains("#84"),
+            "both tasks: {}",
+            item.line
+        );
+        assert!(
+            item.line.contains("spawn/agent_worker_objective_87")
+                && item
+                    .line
+                    .contains("d44c6011aa22bb33cc44dd55ee66ff7700112233")
+                && item.line.contains("big.txt"),
+            "the branch and its work: {}",
+            item.line
+        );
+        assert!(
+            item.line.contains("151 tool calls")
+                && item.line.contains("{\"tool_calls\":150}")
+                && item.line.contains("spawn mission configure"),
+            "the budget and what can be done: {}",
+            item.line
+        );
+        assert!(
+            super::digest::over_budget_escalations(&[serde_json::json!({"id": 5})]).is_empty(),
+            "a record without its event is no item"
+        );
+    }
+
     #[test]
     fn a_yielded_objective_reaches_an_idle_supervisor_once() {
         let reason = "objective 19 had 3 failed attempts since its last turn (conflict, \
