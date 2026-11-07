@@ -2461,8 +2461,15 @@ end $$;
 -- ephemeral, agent `agent_worker_objective_<task>`), as `spawn_task_assign`
 -- makes one: no approval, a fresh workspace from the source's main, stopped
 -- by the dispatcher once its task lands or is cancelled.
+drop function if exists spawn_objective_assign(bigint, integer, text, text);
+
+-- An objective's task, assigned by the integrator (owner only). `p_continues`
+-- names the overrun task whose work this one keeps (`task.over_budget`): the
+-- record says so, and the task's workspace starts from that work
+-- (`OBJECTIVE_FORK`). Returns the task's id.
 create or replace function spawn_objective_assign(p_mission bigint, p_objective integer,
-                                                  p_scenario text, p_brief text)
+                                                  p_scenario text, p_brief text,
+                                                  p_continues bigint)
 returns bigint language plpgsql security definer as $$
 declare
     v_id bigint;
@@ -2507,7 +2514,8 @@ begin
     perform spawn_control_record(jsonb_build_object(
         'type', 'task.assigned', 'id', v_id, 'mission_id', p_mission, 'kind', v_kind,
         'agent_id', v_agent, 'session_id', v_session, 'brief', p_brief,
-        'created_by', 'spawn-integrate', 'objective', p_objective, 'scenario', p_scenario));
+        'created_by', 'spawn-integrate', 'objective', p_objective, 'scenario', p_scenario)
+        || jsonb_strip_nulls(jsonb_build_object('continues', p_continues)));
     return v_id;
 end $$;
 
@@ -2645,6 +2653,15 @@ begin
                             p_record ->> 'id';
         end if;
         p_record := p_record || jsonb_build_object('by', 'spawn-integrate');
+    end if;
+    -- An overrun names what it measured: its reason, its tool calls and the
+    -- budget it ran past (the mission's, as it was). Its branch, commit and
+    -- diff stat say what work the objective's next task continues.
+    if p_record ->> 'type' = 'task.over_budget'
+       and (coalesce(p_record ->> 'reason', '') = ''
+            or jsonb_typeof(p_record -> 'tool_calls') is distinct from 'number'
+            or jsonb_typeof(p_record -> 'budget') is distinct from 'object') then
+        raise exception 'a task.over_budget names its reason, tool_calls and budget: %', p_record;
     end if;
     -- The outcome of an owner's landing names its request: a
     -- `source.push_requested` that has no outcome yet, so every request has
@@ -3238,7 +3255,7 @@ begin
         'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
-        'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
+        'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
         'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',
