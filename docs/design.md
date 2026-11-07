@@ -139,7 +139,19 @@ Claude Code 是唯一的引擎（`ENGINE` = `claude`）。`execution.started` �
 
 引擎模型（[fleet-architecture.md §3.3](fleet-architecture.md#33-engine-models)）：`Start`/`Resume` 的可选 `model` 是模型档位，`default` 或 `cheap`；不写就沿用该会话上一次执行的档位（从 `execution.started` 的 `model` 折叠，默认档位不写进记录），从没跑过的会话用 `default`。内联 `--settings` 由 `claude_settings(relay, profile)` 生成：Claude Code 把它合并在用户 settings 之上，键以内联为准，`env` 按名字逐个合并（2.1.318 实测：内联 `env` 只写基址和 haiku 槽位时，主模型和 `ANTHROPIC_AUTH_TOKEN` 仍来自 `~/.claude/settings.json`），所以网关 token 不经过 Spawn。配置了模型中继（`SPAWN_MODEL_RELAY`，跑 `spawn-model-relay` 的主机设为 `http://127.0.0.1:8791`；不设或 `off` 即不用中继，两档都不写 `env`，`cheap` 启动失败）时 `env` 写 `ANTHROPIC_BASE_URL` 指向中继、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 为小模型（`SPAWN_SMALL_MODEL`，默认 `deepseek-flash`）；`cheap` 另把 `ANTHROPIC_MODEL` 与 opus、sonnet 槽位设为 `SPAWN_CHEAP_MODEL`（默认 `deepseek-flash`）。每次启动前 Bridge 先连一下中继：连不上时 `default` 不写 `env`、照 Claude Code 自己的设置跑并在 tick 报告里警告，`cheap` 直接失败。
 
-不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 每个 tick 通过终端主机读取 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl` 的新增整行（`SPAWN_CLAUDE_PROJECTS`），以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。
+不注入 hook。新会话由 Bridge 用 `--session-id <uuid>` 命名并先记 `session.native_started`，恢复用 `--resume <uuid>`；Bridge 监视 `<Claude projects 目录>/<工作目录转义>/<uuid>.jsonl`（`SPAWN_CLAUDE_PROJECTS`）和 runner 的退出文件，文件变了才读新增整行，以引擎自带的 `uuid`、`tool_use_id` 作键去重。runner 把退出码写到 `SPAWN_EXIT_FILE`；终端里没有数据库登录。
+
+**Bridge 读什么，什么时候读。** 监视走 `FileWatch` 端口：Linux 上是 inotify（`spawn_host::InotifyWatch`），一个描述符、每个文件一条目录监视；路径还不存在时监视它上面最深的已存在目录，目录随引擎出现时监视跟着往下走（transcript 在 `<projects>/<工作目录转义>/`，退出文件在 `<工作区>/.spawn/`，两者都由引擎稍后创建）。设不了监视的执行（系统调用出错、文件系统不支持、`max_user_watches` 到顶）退回每个 pass 都读，并在循环输出里告警一次。读的偏移规则不变：只读整行，读到一半的行留到下一次变化或下一个 pass，绝不丢；一次 checkpooint 没提交的行同样留到下一个 pass。
+
+一个 pass 对空闲的 agent 不花钱。没有命令在飞（Bridge 拿着在等，`held`）、transcript 没有变化、屏幕知道得够新的执行，这个 pass 不抓屏、不问 runner（一次 tmux `list-panes`）、不读文件。屏幕只在能改变决定时抓：
+
+| 何时 | 出处 |
+| --- | --- |
+| 会话上有命令在飞（领取了没完成，或排队等它） | 投递等着它的读数 |
+| transcript 自上次增长以来静止满 `SPAWN_SCREEN_QUIET_MS`（默认 500 ms）而屏幕此后还没读过，之后的 pass 接着读，直到连续两次读数一致 | transcript 说不了的事：提示符回来了 |
+| 距上次抓屏满 `screen_refresh`（30 s）的兜底 | transcript 不动而屏幕变了：对话框、掉回 shell |
+
+忙碌的屏幕仍每 30 秒重记一次。兜底抓屏一个 pass 最多 `BACKSTOPS_PER_PASS`（2）个，同时到期的屏幕分摊到后面几个 pass：一个 pass 抓完整个舰队会把下一条命令挡在后面。因果（§14）：屏幕状态只从抓屏来、一轮的结束只从 transcript 的行来；没抓屏、transcript 没变化都不算状态，transcript 静止只说明什么时候该再看屏幕。
 
 启动参数超过 7 个时按 `Run { engine, native, prompt }` 结构体传引用，保持签名可读。
 
@@ -171,7 +183,7 @@ checkpoint 规则：工作区有改动才 commit，成功后写 `artifact.commit
 
 ## 6. 屏尾判定
 
-Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。会话记录给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。Bridge 每个 tick 读屏，两次读数一致才记录，忙碌状态每 30 秒重记一次。
+Claude 以 `--ax-screen-reader` 运行，屏幕是唯一可靠的完成信号来源。会话记录给结构化事件；屏尾只判两件事：能否输入、是否被阻塞。Bridge 不是每个 tick 都读屏（§5）：会话上有命令在飞、transcript 静止满 `SPAWN_SCREEN_QUIET_MS`、或距上次抓屏满 30 秒的兜底时才读，两次读数一致才记录；兜底读到的与已记录的一样时不重复记录，忙碌状态每 30 秒重记一次。
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
