@@ -94,6 +94,10 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
     }
     let mut failures: u32 = 0;
     loop {
+        // A pass takes its interval, the work included: the pause is what is
+        // left of it, so a command submitted just after a pass waits about
+        // one interval for its claim, not an interval plus the last pass.
+        let started = std::time::Instant::now();
         let mut failed = false;
         let mut fail = |what: &str, error: &str| {
             failed = true;
@@ -170,7 +174,8 @@ pub(crate) fn resident_loop(flags: &Flags) -> Result<i32, String> {
         }
         // ponytail: fixed backoff, cap at 30 intervals. A per-error-kind
         // schedule only matters once a failure class is slow to clear.
-        if pause_unless_stopped(backoff(interval, failures), &stopping) {
+        let pause = backoff(interval, failures).saturating_sub(started.elapsed());
+        if pause_unless_stopped(pause, &stopping) {
             eprintln!("spawn loop: stopping; pending pushes are made first");
             return Ok(0);
         }
