@@ -7012,7 +7012,10 @@ mod database_tests {
             let overrun = record(task);
             assert!(overrun["tool_calls"].as_i64().unwrap_or_default() > 0);
             assert_eq!(overrun["budget"], json!({"minutes": 60}));
-            assert_eq!(overrun["objective"].as_u64().map(|id| id as i64), objective_of(&db, task));
+            assert_eq!(
+                overrun["objective"].as_u64(),
+                objective_of(&db, task).and_then(|objective| u64::try_from(objective).ok())
+            );
         }
         let aborts: i64 = db
             .admin()

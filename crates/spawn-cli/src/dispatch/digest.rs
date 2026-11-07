@@ -252,7 +252,7 @@ pub(crate) fn over_budget_escalations(records: &[Value]) -> Vec<Escalation> {
             let branch = record["branch"].as_str().unwrap_or("its branch");
             let commit = record["commit"].as_str().map_or_else(
                 || "none (its push failed)".to_string(),
-                |commit| commit.to_string(),
+                str::to_string,
             );
             let diff = record["diff"]
                 .as_str()

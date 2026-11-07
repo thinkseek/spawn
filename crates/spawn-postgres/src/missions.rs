@@ -1123,6 +1123,18 @@ impl PostgresStore {
         objective: i32,
         scenario: Option<&str>,
         brief: &str,
+    ) -> Result<i64, StoreError> {
+        self.objective_assign_continuing(mission, objective, scenario, brief, None)
+    }
+
+    /// Objective `objective`'s task, continuing the overrun task `continues`
+    /// (its work is what the task starts from), or a first task when none.
+    pub fn objective_assign_continuing(
+        &self,
+        mission: i64,
+        objective: i32,
+        scenario: Option<&str>,
+        brief: &str,
         continues: Option<i64>,
     ) -> Result<i64, StoreError> {
         Ok(self
