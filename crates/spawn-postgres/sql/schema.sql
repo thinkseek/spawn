@@ -3242,6 +3242,17 @@ create index if not exists spawn_events_gate_host_fault
       and kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
       and kind -> 'detail' -> 'record' ->> 'escalate' = 'true';
 
+-- The `host_fault` gate records whose base disagreed with itself and that
+-- carry `alert` (the mission's third in a row, objective 033), found the
+-- same way: the dispatcher's digest takes each to the supervisor once.
+create index if not exists spawn_events_gate_base_disagrees
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
+      and kind -> 'detail' -> 'record' ->> 'verdict' = 'host_fault'
+      and kind -> 'detail' -> 'record' ->> 'evidence' = 'base_disagrees'
+      and kind -> 'detail' -> 'record' ->> 'alert' = 'true';
+
 -- A task's stages, oldest first: `[{stage, verdict?, at_ms, took_ms?}]`.
 -- `stage` is the record type without `task.`; `verdict` is a gate's verdict
 -- or a review's (`accepted`, `rejected`); `took_ms` is the time since the
