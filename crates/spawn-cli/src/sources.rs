@@ -1021,9 +1021,9 @@ mod tests {
                 .output()
                 .expect("git runs")
         };
-        let mut plain = std::process::Command::new("git");
-        plain.stdin(std::process::Stdio::null());
-        let _ = allowing(plain);
+        // A git without the controller's rule: the configuration given on
+        // the command (`GIT_CONFIG_*`, as a host's would be) lets it run.
+        let _ = allowing(spawn_host::test_git_command());
         assert!(marker.exists(), "the host's configuration would run it");
         std::fs::remove_file(&marker).expect("reset");
         let refused = allowing(super::controller_git());
@@ -1131,9 +1131,17 @@ mod tests {
         assert!(fetched.is_err(), "{fetched:?}");
         say(DECISION, format!("{fetched:?}"));
 
-        let plain = std::process::Command::new("git")
+        // git's own answer in this process's locale: a test's git, given
+        // back the locale `test_git_command` takes away.
+        let mut own = spawn_host::test_git_command();
+        for name in ["LC_ALL", "LANGUAGE"] {
+            match std::env::var_os(name) {
+                Some(value) => own.env(name, value),
+                None => own.env_remove(name),
+            };
+        }
+        let plain = own
             .args(["--git-dir", &gone, "rev-parse", "HEAD"])
-            .stdin(std::process::Stdio::null())
             .output()
             .expect("git runs");
         say(
