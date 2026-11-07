@@ -900,24 +900,19 @@ controller. Missions, tasks, residents and landings are events in
   no `EventKind` variant.
 - **Record types:** `mission.added`, `mission.configured`, `mission.closed`,
   `mission.halted`, `mission.resumed`, `source.moved`, `task.assigned`,
-<<<<<<< 086dd79f79512e065f02af8c386088e5654d11e2
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.landed`,
   `task.aborted`, `resident.proposed`, `resident.approved`,
-  `resident.retired`, `legacy.imported`, `host.disk`.
+  `resident.retired`, `legacy.imported`, `host.disk`,
+  `source.push_requested`, `source.push_refused` (§10.3, "The owner's
+  landings").
   `task.report_unfinished` is a delivered task's report the dispatcher read
   and did not take because it is still a draft: it names the task's
   `revision`, the content's `digest`, the `markers` (each with its `line`,
   `kind`, `marker` and `text`) and the note that told the worker (`note`,
   its idempotency key, and `command_id`); one per revision and content,
   folded into no table (the task stays delivered).
-=======
-  `task.delivered`, `task.reported`, `task.reviewed`, `task.cancelled`,
-  `task.gated`, `task.landed`, `task.aborted`, `resident.proposed`,
-  `resident.approved`, `resident.retired`, `legacy.imported`, `host.disk`,
-  `source.push_requested`, `source.push_refused` (§10.3, "The owner's
-  landings").
->>>>>>> 16890fb0b5ac7879cc586ecb8cfba06cb6dc4960
+
   `legacy.imported` carries one row of the mission tables as it stood
   before the control stream existed: a database with mission rows and no
   records imports them once, on migration. A `task.cancelled` names `by`,
