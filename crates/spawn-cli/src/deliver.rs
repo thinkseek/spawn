@@ -32,6 +32,17 @@
 //!   the turn's end: such a judgement is written again only when its verdict
 //!   changes (a model's answer is written for every new situation, and a
 //!   stale one waits for the next);
+//! - **a report that is still a draft is not taken.** A turn that stopped
+//!   and a file that exists say only that the worker wrote something; the
+//!   file is read first for the marks of a draft ([`unfinished`]: template
+//!   placeholders, a line that is only `(pending)`, `TBD` or `TODO`, an
+//!   Outcome that says draft or in progress). One with any is left where it
+//!   is and the task stays delivered; the first time a content is seen (per
+//!   revision), its worker is told which markers on which lines, in one
+//!   note keyed by the content's digest, and the check is recorded
+//!   (`task.report_unfinished`, naming the markers and the note). The same
+//!   file again changes nothing; a rewritten one is read like any other
+//!   ([`refuse_unfinished`]);
 //! - an ephemeral worker whose task was accepted or cancelled is stopped, and
 //!   so is a retired resident. In a mission with a gate, acceptance is not
 //!   the end: the worker's workspace is the candidate, so it stays (and its
@@ -79,7 +90,9 @@ use spawn_core::observation::Ambiguity;
 use spawn_host::tree_path::TreePath;
 use spawn_postgres::PostgresStore;
 
-use crate::dispatch::{Escalation, Facts, Order, Why};
+use crate::dispatch::{Escalation, Facts, Order, Sent, Why};
+
+mod unfinished;
 
 /// Where a worker writes its report, relative to its workspace.
 pub(crate) const REPORT: &str = ".spawn/report.md";
@@ -926,8 +939,12 @@ fn report_contract() -> String {
     format!(
         "When the task is finished, or you cannot go on, write `{REPORT}` \
 at the root of your workspace with three sections: `## Outcome` (done, blocked or failed, in one \
-line), `## What changed` (files, commits, results) and `## Open issues`. Then stop and wait. Do not \
-start other work. If a person must decide something, say so in the report."
+line), `## What changed` (files, commits, results) and `## Open issues`. Write it once, at the \
+end, when everything (your checks and tests included) is done: Spawn takes the file as your report \
+as soon as your turn stops, so draft anywhere else (`.spawn/draft.md` is never committed), never \
+as a template in `{REPORT}`. A report with a placeholder (PENDING_ and capitals, a line that is \
+only (pending), TBD or TODO) or an Outcome that says draft or in progress is not taken. Then stop \
+and wait. Do not start other work. If a person must decide something, say so in the report."
     )
 }
 
@@ -1167,11 +1184,15 @@ fn report_due<'a>(task: &TaskRow, rows: &'a [Facts]) -> Option<&'a Facts> {
         .filter(|facts| facts.report_due())
 }
 
+/// A report with a mark of a draft ([`unfinished::markers`]) is not taken
+/// ([`refuse_unfinished`]). `now_ms` is this host's clock, for the wait
+/// before a note refused untyped goes again.
 pub(crate) fn collect_reports(
     store: &PostgresStore,
     work: &Work,
     rows: &[Facts],
     root: &Path,
+    now_ms: i64,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for task in work
@@ -1190,6 +1211,17 @@ pub(crate) fn collect_reports(
         if report.trim().is_empty() {
             continue;
         }
+        let markers = unfinished::markers(&report);
+        if !markers.is_empty() {
+            match refuse_unfinished(store, task, facts, &report, &markers, now_ms) {
+                Ok(line) => lines.extend(line),
+                Err(error) => lines.push(format!(
+                    "deliver: task #{} unfinished report: {error}",
+                    task.id
+                )),
+            }
+            continue;
+        }
         match store.task_reported_with(task.id, report.trim(), facts.checkpoint.as_deref()) {
             Ok(true) => {
                 put_aside(&workspace, task.id);
@@ -1201,6 +1233,133 @@ pub(crate) fn collect_reports(
         }
     }
     lines
+}
+
+/// Idempotency-key prefix of the note that tells a worker its report is not
+/// finished: `report-unfinished-<task>-<revision>-<digest>`, one per content
+/// of the file and revision of the task ([`refuse_unfinished`]).
+const UNFINISHED_KEY: &str = "report-unfinished-";
+
+/// The most markers a note names; the rest are counted.
+const NOTE_MARKERS: usize = 10;
+
+/// The key of the note about `task`'s report whose content has `digest`.
+fn unfinished_key(task: &TaskRow, digest: &str) -> String {
+    format!("{UNFINISHED_KEY}{}-{}-{digest}", task.id, task.revisions)
+}
+
+/// What a worker whose report is a draft is told: the markers and their
+/// lines, and to write the report once, at the end. It opens with a header
+/// no one can read as a new task or as the answer to a question.
+fn unfinished_note(task: i64, markers: &[unfinished::Marker]) -> String {
+    let mut named: Vec<String> = markers
+        .iter()
+        .take(NOTE_MARKERS)
+        .map(unfinished::Marker::describe)
+        .collect();
+    if markers.len() > NOTE_MARKERS {
+        named.push(format!("and {} more", markers.len() - NOTE_MARKERS));
+    }
+    format!(
+        "[Your report on task #{task} was not taken — this is not a new task]\n\
+Your report is not finished: {}; write `{REPORT}` once, when everything is done (draft anywhere \
+else, such as `.spawn/draft.md`). Spawn did not take it as task #{task}'s report: the task stays \
+with you.",
+        named.join("; ")
+    )
+}
+
+/// Not taking `task`'s report, which `markers` show is still a draft: the
+/// file stays and the task stays delivered. The first time this content
+/// (`report`, by its digest) is seen for the task's revision, its worker is
+/// told (one note, keyed by the digest, [`unfinished_key`]) and the check is
+/// recorded with the markers and the note (`task.report_unfinished`). The
+/// note goes first: a record that fails is written by a later pass, whose
+/// note is the same command. The same content again changes nothing, but a
+/// note refused before anything was typed goes again ([`note_retry`]).
+/// Returns the log line, when something was done.
+fn refuse_unfinished(
+    store: &PostgresStore,
+    task: &TaskRow,
+    facts: &Facts,
+    report: &str,
+    markers: &[unfinished::Marker],
+    now_ms: i64,
+) -> Result<Option<String>, String> {
+    let error = |error: spawn_core::port::StoreError| error.to_string();
+    let digest = format!("{:016x}", crate::sources::fnv(report));
+    let key = unfinished_key(task, &digest);
+    if store
+        .report_unfinished_recorded(task.id, &digest)
+        .map_err(error)?
+    {
+        let Some(retry) = note_retry(&key, facts, now_ms) else {
+            return Ok(None);
+        };
+        send_note(store, task, &retry, unfinished_note(task.id, markers))?;
+        return Ok(Some(format!(
+            "deliver: task #{}'s report is still unfinished; its note goes again ({retry})",
+            task.id
+        )));
+    }
+    let command = send_note(store, task, &key, unfinished_note(task.id, markers))?;
+    let records = markers.iter().map(unfinished::Marker::record).collect();
+    store
+        .task_report_unfinished(task.id, &digest, &serde_json::Value::Array(records), &key, command)
+        .map_err(error)?;
+    let named: Vec<String> = markers.iter().map(unfinished::Marker::describe).collect();
+    Ok(Some(format!(
+        "deliver: task #{} report not taken, unfinished ({}); its worker told ({key})",
+        task.id,
+        one_line(&named.join("; "), 300)
+    )))
+}
+
+/// The key of the next attempt of the note `key` when its last attempt was
+/// refused before anything was typed (the pane not ready: the screen settles
+/// at the prompt after the turn's end reached the log) and
+/// [`NOT_READY_RETRY_MS`] has passed since: `<key>-retry-<n>`, at most
+/// [`NOT_READY_FREE`] times. None when the note reached the worker or may
+/// have, is in flight, or its tries are spent.
+fn note_retry(key: &str, facts: &Facts, now_ms: i64) -> Option<String> {
+    let retry = format!("{key}-retry-");
+    let attempts: Vec<&Sent> = facts
+        .dispatched
+        .iter()
+        .filter(|sent| sent.key == key || sent.key.starts_with(&retry))
+        .collect();
+    let last = attempts.last()?;
+    if crate::dispatch::reached_with(last.succeeded, last.error.as_deref())
+        || attempts.len() > NOT_READY_FREE
+    {
+        return None;
+    }
+    let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+    (now_ms >= finished.saturating_add(NOT_READY_RETRY_MS))
+        .then(|| format!("{retry}{}", attempts.len()))
+}
+
+/// Submit the note `text` to `task`'s worker under `key`, as the dispatcher:
+/// the command's id. A key already used gives the command it named.
+fn send_note(store: &PostgresStore, task: &TaskRow, key: &str, text: String) -> Result<i64, String> {
+    use spawn_core::command::Submission;
+    use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
+    use spawn_core::port::CommandQueue;
+    let invalid = |error: spawn_core::id::InvalidLabel| error.to_string();
+    let submission = Submission {
+        agent_id: AgentId::new(task.agent_id.clone()).map_err(invalid)?,
+        session_id: SessionId::new(task.session_id.clone()).map_err(invalid)?,
+        idempotency_key: IdempotencyKey::new(key.to_string()).map_err(invalid)?,
+        action: CommandAction::Input {
+            text,
+            tags: Vec::new(),
+        },
+    };
+    let principal = Principal::new(crate::dispatch::DISPATCHER).map_err(invalid)?;
+    let id = store
+        .submit(&principal, &submission)
+        .map_err(|error| error.to_string())?;
+    i64::try_from(id.0).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
