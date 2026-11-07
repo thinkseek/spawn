@@ -1450,6 +1450,50 @@ record of what was judged (§14 of design.md).
      the failures and the crash lines named in the record, the wait on the
      recorded `due_ms`, never on the reason's text alone or on time without
      a record (design.md §14).
+
+     **A base that disagrees with itself is the host's too, not an abort.**
+     The gate judges every objective scenario on the base before any
+     candidate code runs, and an unsolved result needs two runs that agree.
+     A first run that exits 1 and a second that exits 0 says nothing about
+     the candidate: no candidate code has run yet, and the base is code that
+     already landed. The gate states it itself and exits 4
+     (`BASE_DISAGREES_EXIT`) with its own pair of lines at the end of its
+     stdout: `| <name> exited 1, then 0 on the base: a harness error, not a
+     verdict; the gate aborts`, then `| stage gate aborted <ms>ms base:
+     <name> again (unsolved needs two runs that agree)`, with the same
+     `<name>` in both (a scenario's file name, no space, no `|`), the gate's
+     `| gate time:` line last when it printed one and nothing else after the
+     pair. That pair, with exit 4, is `host_fault` with the evidence
+     `base_disagrees`, not `aborted`: the task stays where it was, its
+     revisions and note do not move, nothing goes back to the worker, and
+     neither `gate_rejections` nor `gate_aborts` grows or resets. The record
+     names `base`, `candidate`, `revision`, `scenarios`, `reason`,
+     `log`, `evidence` `base_disagrees`, `scenario`, `exits` ([1, 0]),
+     `setup_s` (the whole seconds of the gate's `setup <n> s`, left out when
+     it printed no timing line), `host_faults`, `backoff_ms`, `due_ms`,
+     `base_disagrees` and `alert`. A base disagreement never carries
+     `escalate` (020's escalation at the second in a row stays for its own
+     evidence): the one that makes the mission's `gate_base_disagrees` 3
+     carries `alert` true, and every other one, the later ones of the same
+     run too, carries false. Until objective 030 exists that record is the
+     alert — named by its event id, no second record of it — and the
+     dispatcher's digest takes it to the supervisor once, as `host
+     gate-base-disagrees-<event>`, naming the task, the mission, the count in
+     a row, the scenario, `exited 1, then 0`, the setup time when known and
+     when the task is judged again; 030 raises its `gate_base_disagrees`
+     notice from the same record. The fold (`gate_base_disagrees`, beside
+     `gate_host_faults`) keeps the mission's run of them: + 1 on a
+     `host_fault` with that evidence, unchanged on `no_room` and `stale`, 0
+     on every other verdict (020's host faults included), on `task.landed`
+     and on `mission.resumed`. Both evidences share 020's run and backoff
+     (`gate_host_faults`, `due_ms`). Every other harness error on the base — a
+     first run that exits 2, `1, then 2`, `1, then 3`, the pair with any
+     other exit status (0, 1, 3, 5, a signal) — stays an abort and counts,
+     and so does a `| | …` line (a nested gate's, prefixed again) anywhere in
+     the log. The decision rests on the gate's recorded exit status and the
+     pair of lines named in the record (`scenario`, `exits`), never on the
+     reason's text, on time or on a scenario's name; the wait rests on the
+     recorded `due_ms`.
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
