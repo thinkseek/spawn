@@ -1491,10 +1491,15 @@ impl Bridge {
                 Wanted::Nothing
             };
         }
+        // The first look at an execution is not a backstop: nothing is
+        // known about its screen yet.
+        let Some(last) = follow.last_capture else {
+            return Wanted::Now;
+        };
         // The backstop: a screen that changes with nothing in the
         // transcript (a dialog, a crash to a shell).
         let refresh = i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX);
-        if follow.last_capture.is_none_or(|at| now.saturating_sub(at) >= refresh) {
+        if now.saturating_sub(last) >= refresh {
             Wanted::Backstop
         } else {
             Wanted::Nothing
@@ -3937,6 +3942,29 @@ mod tests {
             vec!["tool.started", "turn.stopped"],
             "the rest of the line is read at the next pass"
         );
+    }
+
+    /// A watch that can be set on one of an execution's files and not on
+    /// another falls back for the whole execution: both are read on every
+    /// pass, and the file that could not be watched is named once.
+    #[test]
+    fn a_watch_refused_for_one_file_falls_back_for_the_whole_execution() {
+        let watch = Arc::new(MemoryWatch::new());
+        // The first mount's exit file: the start command's execution.
+        let exit = "/workspaces/1/.spawn/exit-exec_1";
+        watch.refuse(exit);
+        let mut world = World::build(watch.clone(), false);
+        assert!(
+            world
+                .first
+                .iter()
+                .any(|warning| warning.contains(exit) && warning.contains("read on every pass")),
+            "the file that cannot be watched is named: {:?}",
+            world.first
+        );
+        world.set_pane(BUSY);
+        assert_eq!(world.pass(), 1, "its files are read on every pass");
+        assert_eq!(world.pass(), 1);
     }
 
     /// A session whose files cannot be watched is read on every pass, as
