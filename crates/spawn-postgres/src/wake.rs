@@ -64,6 +64,7 @@ impl PostgresStore {
     /// Every user table's scans in this database so far (`seq_scan` and
     /// `idx_scan`), for the loop's own accounting.
     pub fn scans(&self) -> Result<i64, StoreError> {
+        self.query("select pg_stat_clear_snapshot()::text", &[])?;
         Ok(self
             .query_one(
                 "select coalesce(sum(seq_scan + coalesce(idx_scan, 0)), 0)::bigint \
