@@ -2831,14 +2831,28 @@ begin
     -- each the host's, and, when the test database's log decided it, the
     -- crash lines stamped inside the gate's window; and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
-       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log')
-            or case when jsonb_typeof(p_record -> 'failures') = 'array'
-                    then jsonb_array_length(p_record -> 'failures') else 0 end = 0
+       and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
+                                                          'base_disagrees')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
-            or (p_record ->> 'evidence' = 'server_log'
-                and case when jsonb_typeof(p_record -> 'crash') = 'array'
-                         then jsonb_array_length(p_record -> 'crash') else 0 end = 0)) then
-        raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
+            or (p_record ->> 'evidence' in ('failures', 'server_log')
+                and (case when jsonb_typeof(p_record -> 'failures') = 'array'
+                          then jsonb_array_length(p_record -> 'failures') else 0 end = 0
+                     or (p_record ->> 'evidence' = 'server_log'
+                         and case when jsonb_typeof(p_record -> 'crash') = 'array'
+                                  then jsonb_array_length(p_record -> 'crash') else 0 end = 0)))
+            or (p_record ->> 'evidence' = 'base_disagrees'
+                and (coalesce(p_record ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+                     or jsonb_typeof(p_record -> 'exits') is distinct from 'array'
+                     or jsonb_array_length(p_record -> 'exits') <> 2
+                     or (p_record -> 'exits' ->> 0)::integer is distinct from 1
+                     or (p_record -> 'exits' ->> 1)::integer is distinct from 0
+                     or jsonb_typeof(p_record -> 'base_disagrees') is distinct from 'number'
+                     or jsonb_typeof(p_record -> 'alert') is distinct from 'boolean'
+                     or jsonb_typeof(p_record -> 'escalate') is distinct from 'boolean'
+                     or (p_record -> 'escalate')::boolean
+                     or (p_record ? 'setup_s'
+                         and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))) then
+        raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
                         p_record;
     end if;
     -- No room to judge names what it measured: the check that fell short
