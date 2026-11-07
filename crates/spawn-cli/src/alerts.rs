@@ -51,7 +51,8 @@
 //!   `mission_halted:<mission>:<its mission.halted event>`: clears at the
 //!   mission's `mission.resumed`.
 //! - `postgres_crash`, `test` or `live`, key
-//!   `postgres_crash:<subject>:<the line's stamp and [pid] as written>`: a
+//!   `postgres_crash:<subject>:<the line's stamp and [pid] as written, its
+//!   spaces folded out so the key is one word>`: a
 //!   log line holding `terminated by signal`, `No space left` or `could not
 //!   resize`, stamped within the day; clears at the first `database system
 //!   is ready to accept connections` line after it, or after
@@ -1777,8 +1778,9 @@ fn read_appended(path: &Path, log: &mut LogWatch) -> Result<Option<(String, bool
     Ok(Some((complete, truncated)))
 }
 
-/// The stamp and `[pid]` of a crash line stamped within the day, as written:
-/// `2026-11-08 18:25:00.123 UTC [1]`. `None` for any other line.
+/// The stamp and `[pid]` of a crash line stamped within the day, as written,
+/// with the stamp's spaces folded out so the key is one word:
+/// `2026-11-08T18:25:00.123UTC[1]`. `None` for any other line.
 fn crash_stamp(line: &str, now: i64) -> Option<(i64, String)> {
     if !CRASH_PATTERNS.iter().any(|pattern| line.contains(pattern)) {
         return None;
@@ -1826,7 +1828,14 @@ fn crash_stamp(line: &str, now: i64) -> Option<(i64, String)> {
     if !rest.get(1..end)?.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let prefix = line.get(..line.len() - rest.len() + end + 1)?.to_string();
+    let written = line.get(..line.len() - rest.len() + end + 1)?;
+    // The key is one word: the stamp's spaces are folded out, its text (the
+    // date, the time, the zone, the pid) as the line wrote it.
+    let prefix = format!(
+        "{}T{}",
+        written.get(..10)?,
+        written.get(11..)?.replace(' ', "")
+    );
     let stamp = days_from_civil(year, month, day)
         .checked_mul(86_400)?
         .checked_add(hour * 3600 + minute * 60 + second)?;
@@ -2486,7 +2495,7 @@ terminated by signal 11: Segmentation fault",
         )
         .expect("a crash stamp");
         assert_eq!(stamp, base);
-        assert_eq!(prefix, "2026-11-08 18:25:00.123 UTC [1]");
+        assert_eq!(prefix, "2026-11-08T18:25:00.123UTC[1]");
         // +08:00 is eight hours ahead of UTC.
         let (stamp, prefix) = crash_stamp(
             "2026-11-09 02:25:00.123 +08:00 [77] ERROR:  could not resize shared memory \
@@ -2495,7 +2504,7 @@ segment \"/PostgreSQL.2051\" to 8388608 bytes: No space left on device",
         )
         .expect("an offset stamp");
         assert_eq!(stamp, base);
-        assert_eq!(prefix, "2026-11-09 02:25:00.123 +08:00 [77]");
+        assert_eq!(prefix, "2026-11-09T02:25:00.123+08:00[77]");
         // The third pattern, and a line that is not one at all.
         assert!(
             crash_stamp(
@@ -2532,7 +2541,7 @@ terminated by signal 11: Segmentation fault\n";
         monitor.lines_of_log(0, Path::new("/var/log/pg.log"), now, crash, &mut out);
         assert_eq!(
             fires(&out),
-            ["postgres_crash:test:2026-11-08 18:25:00.123 UTC [1]"]
+            ["postgres_crash:test:2026-11-08T18:25:00.123UTC[1]"]
         );
         let recorded = decided(&monitor, out);
         commit(&mut monitor, &recorded);
