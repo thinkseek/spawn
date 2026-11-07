@@ -1442,6 +1442,34 @@ mod tests {
         };
         assert_eq!((scenario.as_str(), setup_s), ("011.sh", Some(244)));
 
+        // The gate's own `| base runs:` phase line may sit between the pair
+        // and its timing line: the gate printed one on 2026-11-08 05:02 and
+        // none on 2026-11-06 14:43, and both are its own.
+        let runs = "| base runs: 17 in 139 s, 5 at a time (their own time: 576 s)\n";
+        for trailing in [
+            format!("{runs}"),
+            format!("{runs}{GATE_TIME_LINE}"),
+            format!("{GATE_TIME_LINE}{runs}"),
+        ] {
+            let gate = printing_gate(&format!("{DISAGREES_PAIR}{trailing}"), "exit 4");
+            let Err(GateFailure::BaseDisagrees {
+                scenario, setup_s, ..
+            }) = gate.judge(&path_only())
+            else {
+                panic!("{trailing:?} is the gate's own trailing line");
+            };
+            assert_eq!(scenario, "011.sh");
+            assert_eq!(
+                setup_s,
+                if trailing.contains("gate time") {
+                    Some(244)
+                } else {
+                    None
+                },
+                "{trailing:?}"
+            );
+        }
+
         // Stderr lines after it say nothing about the pair.
         let gate = printing_gate(
             &format!("{DISAGREES_PAIR}{GATE_TIME_LINE}"),
