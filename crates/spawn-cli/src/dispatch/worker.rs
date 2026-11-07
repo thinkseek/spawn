@@ -84,7 +84,9 @@ fn nudgeable(observation: &Observation) -> bool {
 ///
 /// - a resume whose execution ended lost before its engine became ready
 ///   ([`Facts::failed_resume`], whatever its command's outcome: the ready
-///   wait failed, the start was abandoned), escalated with the evidence;
+///   wait failed, the start was abandoned), escalated with the evidence,
+///   once: the item is named by that execution, so a later execution that
+///   fails the same way (a person's resume) is not told again;
 /// - a resume whose engine was lost again within a minute
 ///   ([`Facts::resumed_young`]);
 /// - a resume whose command failed before it started an execution (the
@@ -94,7 +96,7 @@ fn resume_lost(facts: &Facts) -> Decision {
     if let Some(failed) = &facts.failed_resume {
         let mut escalation = Escalation::about(
             facts,
-            format!("resume-{execution}"),
+            format!("resume-{}", failed.execution_id),
             Why::ResumeFailed,
             format!(
                 "engine was lost and its automatic resume (command {}, execution {}) ended lost \
