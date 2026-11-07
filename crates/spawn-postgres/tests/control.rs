@@ -3138,3 +3138,257 @@ fn a_gate_is_not_cleared_while_a_task_of_its_mission_is_landing() {
     refold(&mut client);
     assert_eq!(tables(&mut client), live);
 }
+
+/// A gated mission on `source` whose first verdict left `baseline`.
+fn mission_at(store: &PostgresStore, source: &str, baseline: &str) -> i64 {
+    let mission = store
+        .mission_add("On the source", &json!([source]), "human")
+        .expect("add");
+    store
+        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    store
+        .integrator_record(
+            &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "aborted",
+                    "base": baseline, "reason": "a gate that died"}),
+        )
+        .expect("a first verdict sets the baseline");
+    mission
+}
+
+/// Objective 21: the owner's landing is a record, `source.push_requested`
+/// (`spawn mission push`), and its outcome another that names it, recorded
+/// by the integrator: `source.moved` or `source.push_refused`, one per
+/// request. The request and a refusal fold nothing; the move moves the
+/// baselines of the missions on its source that were at its `from` and are
+/// not halted (the store names them), as `spawn mission moved` does.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
+    let (store, schema) = store("control_owner_push");
+    let mut client = admin(&schema);
+    let (source, other) = ("/tmp/owner.git", "/tmp/owner-other.git");
+    let (c1, c2, c3) = ("1".repeat(40), "2".repeat(40), "3".repeat(64));
+    let owner_ref = |commit: &str| format!("refs/spawn-owner/{commit}");
+    let record_of = |client: &mut Client, event: i64| -> serde_json::Value {
+        client
+            .query_one(
+                "select kind -> 'detail' -> 'record' from spawn_events
+                  where id = $1 and session_id = 'session_control'",
+                &[&event],
+            )
+            .expect("the request's event")
+            .get(0)
+    };
+
+    assert!(
+        refusal(store.source_push_request(source, &c1, &owner_ref(&c1))).contains("no mission"),
+        "a source with no mission takes no request"
+    );
+    let on_source = mission_at(&store, source, "b0");
+    let halted = mission_at(&store, source, "b0");
+    let elsewhere = mission_at(&store, other, "b0");
+    // No verdict yet, so no baseline: the owner's move gives it its first.
+    let fresh = store
+        .mission_add("New on the source", &json!([source]), "human")
+        .expect("add");
+    store
+        .integrator_record(&json!({"type": "mission.halted", "id": halted, "reason": "stop"}))
+        .expect("halt");
+    for (bad_source, commit, reference, why) in [
+        (
+            "https://example.invalid/x.git",
+            c1.as_str(),
+            owner_ref(&c1),
+            "remote",
+        ),
+        (
+            "relative/x.git",
+            c1.as_str(),
+            owner_ref(&c1),
+            "not a mission source",
+        ),
+        (source, "HEAD", owner_ref("HEAD"), "full hash"),
+        (source, "--all", owner_ref("--all"), "full hash"),
+        (
+            source,
+            c1.as_str(),
+            "refs/heads/main".to_string(),
+            "refs/spawn-owner",
+        ),
+    ] {
+        let refused = refusal(store.source_push_request(bad_source, commit, &reference));
+        assert!(refused.contains(why), "{bad_source} {commit}: {refused}");
+    }
+    let before = tables(&mut client);
+
+    // The request: a record that folds nothing, pending until its outcome.
+    let request = store
+        .source_push_request(source, &c1, &owner_ref(&c1))
+        .expect("the owner's request");
+    let recorded = record_of(&mut client, request);
+    assert_eq!(recorded["type"], "source.push_requested");
+    assert_eq!(recorded["source"], source);
+    assert_eq!(recorded["commit"], c1.as_str());
+    assert_eq!(recorded["ref"], owner_ref(&c1).as_str());
+    assert_eq!(recorded["by"], "human");
+    assert_eq!(tables(&mut client), before, "a request folds nothing");
+    let pending = store.source_pushes_pending().expect("pending");
+    assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
+    assert_eq!(pending[0]["request"], json!(request));
+    assert_eq!(pending[0]["source"], source);
+    assert_eq!(pending[0]["commit"], c1.as_str());
+    assert_eq!(store.source_push_outcome(request).expect("outcome"), None);
+
+    // Refused: folds nothing, and is the request's only outcome.
+    for bad in [
+        json!({"type": "source.push_refused", "request": request}),
+        json!({"type": "source.push_refused", "reason": "conflict"}),
+        json!({"type": "source.push_refused", "request": request + 1000, "reason": "conflict"}),
+    ] {
+        assert!(store.integrator_record(&bad).is_err(), "refused: {bad}");
+    }
+    let refused = store
+        .integrator_record(
+            &json!({"type": "source.push_refused", "request": request, "reason": "conflict"}),
+        )
+        .expect("refused");
+    assert_eq!(tables(&mut client), before, "a refusal folds nothing");
+    assert_eq!(store.source_pushes_pending().expect("pending"), json!([]));
+    let outcome = store
+        .source_push_outcome(request)
+        .expect("outcome")
+        .expect("recorded");
+    assert_eq!(outcome["type"], "source.push_refused");
+    assert_eq!(outcome["event_id"], json!(refused));
+    assert_eq!(outcome["source"], source);
+    assert!(
+        refusal(
+            store.integrator_record(&json!({"type": "source.moved", "source": source,
+                "from": "b0", "to": "n1", "request": request, "by": "human"}))
+        )
+        .contains("outcome already"),
+        "one outcome per request"
+    );
+
+    // Applied: the move names the request, and moves the baselines at its
+    // `from` on its source, not a halted one's, not another source's.
+    let second = store
+        .source_push_request(source, &c2, &owner_ref(&c2))
+        .expect("a second request");
+    let third = store
+        .source_push_request(other, &c3, &owner_ref(&c3))
+        .expect("a request on the other source");
+    let pending = store.source_pushes_pending().expect("pending");
+    let ids: Vec<i64> = pending
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(|row| row["request"].as_i64())
+        .collect();
+    assert_eq!(ids, [second, third], "oldest first");
+    for bad in [
+        json!({"type": "source.moved", "source": source, "from": "b0", "to": "n1", "by": "human"}),
+        json!({"type": "source.moved", "source": source, "from": "b0", "to": "n1",
+               "request": third, "by": "human"}),
+        json!({"type": "source.moved", "source": source, "to": "n1", "request": second}),
+        json!({"type": "source.moved", "source": source, "from": "b0", "to": "n1",
+               "request": "drop table", "by": "human"}),
+    ] {
+        assert!(store.integrator_record(&bad).is_err(), "refused: {bad}");
+    }
+    let moved = store
+        .integrator_record(
+            &json!({"type": "source.moved", "source": source, "from": "b0",
+                                   "to": "n1", "request": second, "by": "human"}),
+        )
+        .expect("moved");
+    let recorded = record_of(&mut client, moved);
+    assert_eq!(recorded["missions"], json!([on_source]), "{recorded}");
+    assert_eq!(recorded["without_baseline"], json!([fresh]), "{recorded}");
+    assert_eq!(recorded["request"], json!(second));
+    assert_eq!(recorded["by"], "human");
+    let baselines: Vec<String> = client
+        .query(
+            "select baseline from mission_missions where id = any($1) order by id",
+            &[&vec![on_source, halted, elsewhere, fresh]],
+        )
+        .expect("baselines")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(baselines, ["n1", "b0", "b0", "n1"]);
+    let outcome = store
+        .source_push_outcome(second)
+        .expect("outcome")
+        .expect("recorded");
+    assert_eq!(outcome["type"], "source.moved");
+    assert_eq!(outcome["to"], "n1");
+    let pending = store.source_pushes_pending().expect("pending");
+    assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
+    assert_eq!(pending[0]["request"], json!(third));
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the log folds to the same tables"
+    );
+    let types = control_types(&mut client);
+    for kind in [
+        "source.push_requested",
+        "source.push_refused",
+        "source.moved",
+    ] {
+        assert!(types.iter().any(|seen| seen == kind), "{kind}: {types:?}");
+    }
+
+    let supervisor = common::login(&schema, "spawn_supervisor");
+    client
+        .batch_execute(&format!("set session authorization {supervisor}"))
+        .expect("become the supervisor");
+    assert!(
+        client
+            .query_one(
+                "select spawn_source_push_request($1, $2, $3)",
+                &[&source, &c1, &owner_ref(&c1)],
+            )
+            .is_err(),
+        "the supervisor asks for no owner landing"
+    );
+    assert!(
+        client
+            .query_one("select spawn_source_push_hold()", &[])
+            .is_err(),
+        "the supervisor holds no landing"
+    );
+}
+
+/// The owner's landing holds the landing hold's lock: no one else takes it
+/// meanwhile (a task landing, a mission's drop), and it is released with
+/// the hold.
+#[test]
+fn an_owner_landing_takes_the_landing_holds_lock() {
+    let (store, schema) = store("control_owner_hold");
+    let hold = store.source_push_hold().expect("hold");
+    let mut client = admin(&schema);
+    let taken: bool = client
+        .query_one("select pg_try_advisory_lock(1399957337)", &[])
+        .expect("try the lock")
+        .get(0);
+    assert!(!taken, "held by the owner's landing");
+    drop(hold);
+    // Other cases may hold it for a moment: wait, boundedly.
+    client
+        .batch_execute(
+            "set lock_timeout = '30s'; select pg_advisory_lock(1399957337);
+             select pg_advisory_unlock(1399957337);",
+        )
+        .expect("released with the hold");
+}
