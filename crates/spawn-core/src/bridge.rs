@@ -647,6 +647,11 @@ pub struct Bridge {
     touched: HashSet<String>,
     /// Backstop captures taken this pass ([`BACKSTOPS_PER_PASS`]).
     backstops: std::sync::atomic::AtomicUsize,
+    /// Whether each live terminal hosts its runner, asked once this pass
+    /// ([`TerminalHost::runners`]) when the fleet's files are watched: a
+    /// killed terminal is then seen on the next pass without a tmux call per
+    /// agent. `None` asks each terminal when the execution is advanced.
+    runners: Option<HashMap<TerminalName, Runner>>,
 }
 
 /// What [`Bridge::settle`] did with an open execution no runner runs.
@@ -691,6 +696,7 @@ impl Bridge {
             held: HashMap::new(),
             touched: HashSet::new(),
             backstops: std::sync::atomic::AtomicUsize::new(0),
+            runners: None,
         }
     }
 
@@ -925,6 +931,10 @@ impl Bridge {
             .as_ref()
             .map(|watch| watch.drain().into_iter().collect())
             .unwrap_or_default();
+        // One call for the fleet's liveness, its end detection included: a
+        // terminal killed from outside ends its execution as lost on the
+        // next pass, as before, without a tmux call per agent.
+        self.runners = self.fleet_runners();
         self.act(&mut report)?;
         self.catch_up()?;
         Ok(report)
