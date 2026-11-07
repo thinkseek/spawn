@@ -2601,7 +2601,7 @@ mod tests {
 
     /// Commit everything in the checkout `directory`.
     pub(super) fn commit_in(directory: &str, message: &str) {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         git(&["-C", directory, "add", "-A"]).expect("add");
         git(&[
             "-C",
@@ -2622,7 +2622,7 @@ mod tests {
     /// into its own ref, build the landing ([`super::landing_candidate`]),
     /// move the source's main and the mirror's as `land` does.
     fn land_as_the_integrator(mirror: &std::path::Path, source: &str, agent: &str, task: i64) {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let mirror_path = mirror.to_string_lossy().to_string();
         let tracking = format!("refs/spawn-integrate/{agent}");
         let pushed = crate::sources::fetch_pushed_into(mirror, source, agent, &tracking)
@@ -2655,7 +2655,7 @@ mod tests {
     #[test]
     fn a_landing_reaches_the_agents_pushed_branch_through_the_next_merge() {
         use crate::push::{Pushed, push_branch};
-        use crate::sources::{ensure_mirror, git};
+        use crate::sources::{ensure_mirror, test_git as git};
         use spawn_core::id::BranchName;
         use spawn_core::port::{BaseMerge, Commit, WorkspaceStore};
         use spawn_host::GitWorkspace;
@@ -2776,7 +2776,7 @@ mod tests {
         std::path::PathBuf,
         spawn_host::GitWorkspace,
     ) {
-        use crate::sources::{ensure_mirror, git};
+        use crate::sources::{ensure_mirror, test_git as git};
         let base = std::env::temp_dir().join(format!("spawn-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed");
@@ -2802,7 +2802,7 @@ mod tests {
         mirror: &std::path::Path,
         change: impl Fn(&std::path::Path),
     ) -> String {
-        use crate::sources::git;
+        use crate::sources::test_git as git;
         let clone = base.join(format!("clone-{}", fastrand_name()));
         let clone_path = clone.to_string_lossy().to_string();
         git(&["clone", "-q", source, &clone_path]).expect("clone");
@@ -2862,7 +2862,7 @@ mod tests {
         .expect("fetch")
         .expect("pushed");
         let main =
-            crate::sources::git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
+            crate::sources::test_git(&["--git-dir", &mirror_path, "rev-parse", "refs/heads/main"])
                 .expect("main");
         super::landing_candidate(&mirror_path, &main, &pushed, "Work (task 1)\n\nThe work.\n")
             .expect("candidate")
@@ -2878,7 +2878,7 @@ mod tests {
     fn a_conflict_verdict_leaves_markers_the_resolution_merges_main_and_lands() {
         use crate::main_merge::{Merge, conflict_note, into_workspace};
         use crate::push::{Pushed, push_branch};
-        use crate::sources::git;
+        use crate::sources::test_git as git;
         use spawn_core::port::{Commit, WorkspaceStore};
 
         let (base, source, root, mirror, store) = world("conflict-loop");
@@ -3085,7 +3085,7 @@ mod tests {
     #[test]
     fn a_delivery_to_a_stale_branch_merges_main_first() {
         use crate::main_merge::{Merge, delivery_note, into_workspace};
-        use crate::sources::git;
+        use crate::sources::test_git as git;
         use spawn_core::port::WorkspaceStore;
 
         let (base, source, root, mirror, store) = world("delivery-merge");
@@ -3311,7 +3311,7 @@ mod tests {
         uses: &str,
         head_on_main: bool,
     ) -> (std::path::PathBuf, String, String, String, String) {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let base =
             std::env::temp_dir().join(format!("spawn-semantic-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -3990,7 +3990,7 @@ mod tests {
     /// landing's own message), and the merge's when main moved.
     #[test]
     fn a_landing_is_one_two_parent_commit_on_main_with_its_message() {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let base = std::env::temp_dir().join(format!("spawn-land-shape-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed");
@@ -4097,7 +4097,7 @@ mod tests {
     #[test]
     #[ignore = "run by landing_commits_ignore_the_hosts_git_configuration"]
     fn landing_commits_are_by_the_integrator() {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let base = std::env::temp_dir().join(format!(
             "spawn-land-identity-{}-{}",
             std::process::id(),
@@ -4155,6 +4155,135 @@ mod tests {
             assert_eq!(who, format!("{expected}\n{expected}"));
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Under the git configuration of this process: a plain `git commit`
+    /// with the controller's git (the control: it must not get through
+    /// when signing is forced), then Spawn's own commits, a checkpoint (the
+    /// store's `commit-tree`) and a landing (the integrator's), neither of
+    /// them signed. The seed is made with the test's own git, which that
+    /// configuration does not reach. Run by
+    /// [`spawns_own_commits_ignore_forced_signing`].
+    #[test]
+    #[ignore = "run by spawns_own_commits_ignore_forced_signing"]
+    fn own_commits_under_forced_signing() {
+        use spawn_core::port::{Commit, WorkspaceStore};
+        let git = crate::sources::test_git;
+        let base =
+            std::env::temp_dir().join(format!("spawn-forced-signing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        commit_in(&seed_path, "base");
+        let main = git(&["-C", &seed_path, "rev-parse", "HEAD"]).expect("main");
+
+        std::fs::write(seed.join("control.txt"), "control\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        let control = crate::sources::controller_git()
+            .args([
+                "-C",
+                &seed_path,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+            ])
+            .args(["commit", "-qm", "control"])
+            .output()
+            .expect("git runs");
+        assert!(
+            !control.status.success(),
+            "signing is not forced here: {control:?}"
+        );
+
+        let mirror = format!("{seed_path}/.git");
+        let store = spawn_host::GitWorkspace::new(&mirror, base.join("work"));
+        let branch = spawn_core::id::BranchName::new("agent_signed").expect("valid branch");
+        store.ensure_branch(&branch, None).expect("branch");
+        let workspace = store.mount(&branch).expect("mount");
+        std::fs::write(
+            std::path::Path::new(workspace.path()).join("work.txt"),
+            "work\n",
+        )
+        .expect("write");
+        let Commit::Created(checkpoint) = store.commit(&workspace, "work").expect("a checkpoint")
+        else {
+            panic!("a change");
+        };
+        store.unmount(&workspace).expect("unmount");
+        let message = "Work (task 7)\n\nThe work.\n\nSpawn-Task: 7\n";
+        let landing = super::landing_candidate(&mirror, &main, checkpoint.as_str(), message)
+            .expect("a landing")
+            .expect("no conflict");
+        for commit in [checkpoint.as_str(), landing.as_str()] {
+            let raw = git(&["--git-dir", &mirror, "cat-file", "commit", commit]).expect("commit");
+            assert!(!raw.contains("gpgsig"), "{commit} is signed: {raw}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Spawn's own commits never sign, whatever the host's git
+    /// configuration says: with signing forced through the environment
+    /// (`GIT_CONFIG_COUNT`: `commit.gpgsign` and `tag.gpgsign` on,
+    /// `gpg.format=ssh`, a `user.signingkey` that does not exist), a
+    /// checkpoint commit and a landing commit are both made, unsigned,
+    /// within a bounded wait, where the controller's `git commit` fails. A
+    /// host whose `~/.gitconfig` signs with a key no agent holds made every
+    /// porcelain commit wait forever on `ssh-keygen -Y sign`.
+    #[test]
+    fn spawns_own_commits_ignore_forced_signing() {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        let program = std::env::current_exe().expect("the test binary");
+        let missing = std::env::temp_dir().join(format!(
+            "spawn-forced-signing-{}-no-such-key.pub",
+            std::process::id()
+        ));
+        let mut child = std::process::Command::new(&program)
+            .args([
+                "--exact",
+                "integrate::tests::own_commits_under_forced_signing",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("GIT_CONFIG_COUNT", "4")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+            .env("GIT_CONFIG_VALUE_1", "true")
+            .env("GIT_CONFIG_KEY_2", "gpg.format")
+            .env("GIT_CONFIG_VALUE_2", "ssh")
+            .env("GIT_CONFIG_KEY_3", "user.signingkey")
+            .env("GIT_CONFIG_VALUE_3", &missing)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the test binary");
+        let limit = Duration::from_mins(2);
+        let started = Instant::now();
+        while child
+            .try_wait()
+            .expect("wait for the test binary")
+            .is_none()
+        {
+            if started.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("a commit under forced signing hung for {limit:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().expect("its output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -4867,7 +4996,7 @@ mod database_tests {
     use spawn_postgres::PostgresStore;
 
     use super::Integrator;
-    use crate::sources::git;
+    use crate::sources::test_git as git;
 
     struct Db {
         store: Arc<PostgresStore>,

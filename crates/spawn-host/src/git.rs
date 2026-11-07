@@ -164,6 +164,67 @@ pub fn names_files_outside_git(message: &str) -> bool {
     })
 }
 
+/// The locale every git Spawn runs gets (`LC_ALL`): git's own, untranslated
+/// messages.
+const GIT_LOCALE: &str = "C";
+
+/// A command that runs `program` (the git to run) the way Spawn runs every
+/// git: in the C locale, `LC_ALL=C` and no `LANGUAGE`.
+/// Every git of [`GitWorkspace`] and of the controller (`spawn-cli`'s
+/// `controller_git`) is built here, so none can be left to the host's
+/// locale.
+///
+/// Spawn reads what git answers: a push's summary, a merge's conflict
+/// kinds, a listing, an exit code, and the error it quotes in a record or a
+/// note. Under a translated locale (`LANG=zh_CN.UTF-8`) git, and the
+/// `git-receive-pack` or hook it starts, writes its messages in that
+/// language; nothing Spawn decides may change with the host's language.
+/// `LC_ALL` wins over `LANG` and every `LC_*`; `LANGUAGE`, which gettext
+/// would otherwise read first, is removed. Paths, listings and commit
+/// messages are bytes to git in any locale.
+pub fn git_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.env("LC_ALL", GIT_LOCALE).env_remove("LANGUAGE");
+    command
+}
+
+/// A command that runs git the way a test runs its own (a seed's `init`,
+/// `add` and `commit`, a look at a ref or an index): [`git_command`],
+/// without the user's or the system's git configuration.
+///
+/// `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` leave out
+/// `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and `/etc/gitconfig`, and
+/// configuration inherited through the environment (`GIT_CONFIG_COUNT`,
+/// `GIT_CONFIG_PARAMETERS`) is removed. So a host whose configuration signs
+/// every commit (`commit.gpgsign` with a key no agent holds: `ssh-keygen -Y
+/// sign` waits forever), runs hooks (`core.hooksPath`) or refuses to guess
+/// an identity (`user.useConfigOnly`) neither hangs nor fails a test, and
+/// a configuration a test sets on the command itself still counts. It
+/// leaves out every setting, not just signing: no setting of the host's
+/// can reach a test's own git. Standard input is empty; the identity
+/// (`spawn-test`) is one a test may override with its own `-c`.
+///
+/// Never Spawn's own git: what Spawn runs must hold under the host's
+/// configuration, and a test runs it that way (`spawn-cli`'s
+/// `spawns_own_commits_ignore_forced_signing`).
+#[cfg(any(test, feature = "testing"))]
+pub fn test_git_command() -> Command {
+    let mut command = git_command("git");
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .stdin(Stdio::null())
+        .args([
+            "-c",
+            "user.name=spawn-test",
+            "-c",
+            "user.email=spawn@localhost",
+        ]);
+    command
+}
+
 /// Stdout of a git command exactly as written, bytes and all, or the
 /// failure as an error. A `-z` listing is read this way: a path may begin
 /// or end with whitespace, which trimming would cut off the first or the
@@ -290,8 +351,10 @@ impl GitWorkspace {
         self
     }
 
+    /// Every git this store runs: in the C locale ([`git_command`]), on its
+    /// repository.
     fn command(&self) -> Command {
-        let mut command = Command::new(&self.git);
+        let mut command = git_command(&self.git);
         command.arg(format!("--git-dir={}", self.repo.display()));
         // commit-tree needs a committer identity. Supplying it here keeps the
         // store independent of the host's git configuration.
@@ -2402,7 +2465,7 @@ mod tests {
     use super::GitWorkspace;
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = super::test_git_command()
             .arg("-C")
             .arg(directory)
             .args([
@@ -2461,7 +2524,7 @@ mod tests {
         assert_eq!(held, expected);
 
         let staged = |index: &Path| {
-            let listed = Command::new("git")
+            let listed = super::test_git_command()
                 .arg("-C")
                 .arg(&checkout)
                 .arg("ls-files")
@@ -2482,7 +2545,7 @@ mod tests {
         );
         // An index that holds two of them loses both.
         let full = base.join("full-index");
-        let added = Command::new("git")
+        let added = super::test_git_command()
             .arg("-C")
             .arg(&checkout)
             .args(["add", "-A"])
@@ -2530,7 +2593,7 @@ mod tests {
     fn other_writers_commit(checkout: &Path) -> String {
         let index = checkout.join(".git").join("other-writer-index");
         let with_index = |arguments: &[&str]| {
-            let output = Command::new("git")
+            let output = super::test_git_command()
                 .arg("-C")
                 .arg(checkout)
                 .args(arguments)
@@ -3023,5 +3086,247 @@ mod tests {
         let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
         assert_eq!(tree("agent_a"), tree(&start));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every git this store runs, and every git built on [`super::git_command`]
+    /// (the controller's), is in the C locale whatever the host's; this
+    /// module starts no other git.
+    #[test]
+    fn every_git_runs_in_the_c_locale() {
+        use std::ffi::OsStr;
+        let store = GitWorkspace::new("/nonexistent.git", std::env::temp_dir());
+        for command in [
+            super::git_command("git"),
+            super::test_git_command(),
+            store.command(),
+            store.command_in(Path::new("/work"), Path::new("/index")),
+        ] {
+            let envs: Vec<_> = command.get_envs().collect();
+            assert!(
+                envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))),
+                "{envs:?}"
+            );
+            assert!(envs.contains(&(OsStr::new("LANGUAGE"), None)), "{envs:?}");
+        }
+        let own = include_str!("git.rs");
+        let code = own.split("#[cfg(test)]\nmod tests").next().unwrap_or(own);
+        assert_eq!(
+            code.matches("Command::new(").count(),
+            2,
+            "git_command's, and tar's"
+        );
+        assert_eq!(code.matches("Command::new(\"tar\")").count(), 1);
+    }
+
+    /// Every git a test of this crate runs for itself is built by
+    /// [`super::test_git_command`], which no setting of the host's reaches:
+    /// no file of the crate, its tests included, starts git another way.
+    #[test]
+    fn every_test_git_is_built_by_test_git_command() {
+        use std::ffi::OsStr;
+        fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let command = super::test_git_command();
+        let envs: Vec<_> = command.get_envs().collect();
+        for expected in [
+            (
+                OsStr::new("GIT_CONFIG_GLOBAL"),
+                Some(OsStr::new("/dev/null")),
+            ),
+            (OsStr::new("GIT_CONFIG_NOSYSTEM"), Some(OsStr::new("1"))),
+            (OsStr::new("GIT_CONFIG_COUNT"), None),
+            (OsStr::new("GIT_CONFIG_PARAMETERS"), None),
+        ] {
+            assert!(envs.contains(&expected), "{expected:?} in {envs:?}");
+        }
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&crate_root.join("src"), &mut files);
+        sources(&crate_root.join("tests"), &mut files);
+        assert!(
+            files.iter().any(|file| file.ends_with("tests/branches.rs")),
+            "{files:?}"
+        );
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read a source");
+            assert!(
+                !text.contains("Command::new(\"git\")"),
+                "{} starts git without test_git_command",
+                file.display()
+            );
+            if file.starts_with(crate_root.join("tests")) {
+                assert!(
+                    !text
+                        .replace("test_git_command(", "")
+                        .contains("git_command("),
+                    "{} runs a test's git with the host's configuration",
+                    file.display()
+                );
+            }
+        }
+    }
+
+    /// A host whose `~/.gitconfig` signs every commit with a key that is
+    /// not there, runs a hook that refuses every commit and guesses no
+    /// identity: git with that configuration cannot commit, and a test's
+    /// own git ([`super::test_git_command`]) commits as if it were not.
+    #[test]
+    fn a_tests_git_ignores_the_hosts_git_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("spawn-git-hostile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let hooks = base.join("hooks");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&hooks).expect("hooks");
+        let refusing = hooks.join("pre-commit");
+        std::fs::write(&refusing, "#!/bin/sh\nexit 1\n").expect("hook");
+        std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!(
+                "[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n\
+                 [user]\n\tsigningkey = {}\n\tuseConfigOnly = true\n[core]\n\thooksPath = {}\n",
+                base.join("no-such-key.pub").display(),
+                hooks.display()
+            ),
+        )
+        .expect("write the hostile configuration");
+        let repo = base.join("repo").to_string_lossy().to_string();
+        let commit = |mut command: Command| {
+            command
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &home)
+                .args(["-C", &repo, "commit", "--allow-empty", "-qm", "work"])
+                .output()
+                .expect("git runs")
+        };
+        let init = super::test_git_command()
+            .args(["init", "-q", &repo])
+            .status()
+            .expect("git runs");
+        assert!(init.success());
+
+        let mut hosts = super::git_command("git");
+        hosts
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .stdin(std::process::Stdio::null());
+        let refused = commit(hosts);
+        assert!(
+            !refused.status.success(),
+            "the hostile configuration counts for a git with the host's: {refused:?}"
+        );
+        let committed = commit(super::test_git_command());
+        assert!(committed.status.success(), "{committed:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Marks a line of [`merge_decisions_in_this_locale`]'s output.
+    const DECISION: &str = "spawn-decision: ";
+
+    /// What this store makes of git in this process's locale, one line
+    /// each: a merge of `main` whose only conflict is in a file's lines
+    /// (markers written), one whose conflict markers cannot show
+    /// (modify/delete), and a git that fails. Run by
+    /// [`a_translated_locale_changes_no_merge_decision`] in one process per
+    /// locale; alone it only prints.
+    #[test]
+    #[ignore = "run by a_translated_locale_changes_no_merge_decision"]
+    fn merge_decisions_in_this_locale() {
+        let base = std::env::temp_dir().join(format!("spawn-git-locale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        std::fs::create_dir_all(&checkout).expect("create the repository");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write");
+        std::fs::write(checkout.join("gone.txt"), "kept\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let worked = |agent: &str, file: &str| {
+            let branch = BranchName::new(agent).expect("valid branch");
+            store.ensure_branch(&branch, None).expect("branch");
+            let workspace = store.mount(&branch).expect("mount");
+            std::fs::write(Path::new(workspace.path()).join(file), "mine\n").expect("write");
+            assert!(matches!(
+                store.commit(&workspace, "work").expect("commit"),
+                Commit::Created(_)
+            ));
+            workspace
+        };
+        let lines = worked("agent_a", "README.md");
+        let deleted = worked("agent_b", "gone.txt");
+        std::fs::write(checkout.join("README.md"), "theirs\n").expect("write on main");
+        git(&checkout, &["rm", "-q", "gone.txt"]);
+        git(&checkout, &["commit", "-qam", "landed"]);
+
+        let merged = store.merge_base(&lines);
+        assert!(
+            matches!(&merged, Ok(BaseMerge::Conflicted { marked: true, .. })),
+            "{merged:?}"
+        );
+        println!("{DECISION}{merged:?}");
+        let merged = store.merge_base(&deleted);
+        assert!(
+            matches!(&merged, Ok(BaseMerge::Conflicted { marked: false, .. })),
+            "{merged:?}"
+        );
+        println!("{DECISION}{merged:?}");
+        let failed = store.git_output(&["rev-parse", "--verify", "refs/heads/none"]);
+        assert!(failed.is_err(), "{failed:?}");
+        println!("{DECISION}{failed:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A merge of `main` comes to the same decision, the error a failed git
+    /// quotes included, in a process whose whole environment is Chinese
+    /// (`LC_ALL`, `LANG`, `LC_MESSAGES`, `LANGUAGE`) as in C: every git of
+    /// this store runs in the C locale ([`super::git_command`]). Without
+    /// it, the quoted error was git's Chinese. On a host without zh_CN or
+    /// git's Chinese messages nothing is translated, and the comparison
+    /// holds anyway.
+    #[test]
+    fn a_translated_locale_changes_no_merge_decision() {
+        let program = std::env::current_exe().expect("the test binary");
+        let run = |locale: &str, language: Option<&str>| {
+            let mut command = Command::new(&program);
+            command
+                .args([
+                    "--exact",
+                    "git::tests::merge_decisions_in_this_locale",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("LC_ALL", locale)
+                .env("LANG", locale)
+                .env("LC_MESSAGES", locale);
+            match language {
+                Some(language) => command.env("LANGUAGE", language),
+                None => command.env_remove("LANGUAGE"),
+            };
+            let output = command.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{locale}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix(DECISION))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let english = run("C", None);
+        assert_eq!(english.len(), 3, "{english:?}");
+        assert_eq!(run("zh_CN.UTF-8", Some("zh_CN:zh")), english);
     }
 }

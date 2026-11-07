@@ -12,8 +12,13 @@ spawn-core.workspace = true
 libc.workspace = true
 rustix.workspace = true
 
+[features]
+# The git a test runs for itself (`test_git_command`), for tests only.
+testing = []
+
 [dev-dependencies]
 spawn-core = { workspace = true, features = ["testing"] }
+spawn-host = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

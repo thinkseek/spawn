@@ -27,3 +27,4 @@ workspace = true
 
 [dev-dependencies]
 postgres.workspace = true
+spawn-host = { workspace = true, features = ["testing"] }
