@@ -3593,7 +3593,17 @@ mod tests {
             Self::with_watch(Arc::new(MemoryWatch::new()))
         }
 
+        /// A Bridge whose watch refuses every path: its files are read on
+        /// every pass, so it never settles.
+        fn polled() -> Self {
+            Self::build(Arc::new(MemoryWatch::refusing()), false)
+        }
+
         fn with_watch(watch: Arc<MemoryWatch>) -> Self {
+            Self::build(watch, true)
+        }
+
+        fn build(watch: Arc<MemoryWatch>, settle: bool) -> Self {
             let clock: Arc<ManualClock> = Arc::new(ManualClock::new(Timestamp(1_000)));
             let store = Arc::new(MemoryStore::new("shop", clock.clone()));
             let terminal = Arc::new(Counted {
@@ -3655,7 +3665,9 @@ mod tests {
                 record: 0,
             };
             // Two readings in a row: the screen at the prompt is recorded.
-            world.settle();
+            if settle {
+                world.settle();
+            }
             world.record = world.all_screens().len();
             world
         }
@@ -3879,7 +3891,7 @@ mod tests {
     /// before, and the fallback is said once.
     #[test]
     fn a_watch_that_cannot_be_set_falls_back_to_reading_every_pass_once() {
-        let mut world = World::with_watch(Arc::new(MemoryWatch::refusing()));
+        let mut world = World::polled();
         let warnings = world.tick();
         assert!(
             warnings
