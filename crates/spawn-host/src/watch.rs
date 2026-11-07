@@ -82,9 +82,7 @@ impl InotifyWatch {
     /// pass, as it did before watches.
     #[cfg(not(target_os = "linux"))]
     pub fn new() -> Result<Self, WatchError> {
-        Err(WatchError(
-            "no change watch on this platform".to_string(),
-        ))
+        Err(WatchError("no change watch on this platform".to_string()))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -118,7 +116,9 @@ impl InotifyWatch {
     fn carry(&self, state: &mut State, key: &str, path: &str) -> Result<(), WatchError> {
         let file = Path::new(path);
         let Some(anchor) = anchor(file) else {
-            return Err(WatchError(format!("no directory of {path} exists to watch")));
+            return Err(WatchError(format!(
+                "no directory of {path} exists to watch"
+            )));
         };
         let watched = state
             .dirs
@@ -159,10 +159,7 @@ impl InotifyWatch {
     /// Stop serving `key` from `dir` when it has moved to another and no
     /// other key of the watch uses it.
     fn release(&self, state: &mut State, key: &str, dir: &Path) {
-        let Some((descriptor, _)) = state
-            .dirs
-            .iter_mut()
-            .find(|(_, known)| known.path == dir)
+        let Some((descriptor, _)) = state.dirs.iter_mut().find(|(_, known)| known.path == dir)
         else {
             return;
         };
@@ -424,7 +421,9 @@ mod tests {
         let mine = scratch.path().join("mine.jsonl");
         let other = scratch.path().join("other.jsonl");
         let watch = InotifyWatch::new().expect("a watch");
-        watch.watch("mine", &mine.display().to_string()).expect("watch");
+        watch
+            .watch("mine", &mine.display().to_string())
+            .expect("watch");
         std::fs::write(&other, "not mine\n").expect("write");
         assert!(watch.drain().is_empty(), "another file is no change");
         std::fs::write(&mine, "mine\n").expect("write");
@@ -437,7 +436,9 @@ mod tests {
         let scratch = Scratch::new("unwatch");
         let file = scratch.path().join("exit-1");
         let watch = InotifyWatch::new().expect("a watch");
-        watch.watch("c", &file.display().to_string()).expect("watch");
+        watch
+            .watch("c", &file.display().to_string())
+            .expect("watch");
         watch.unwatch("c");
         std::fs::write(&file, "0").expect("write");
         assert!(watch.drain().is_empty(), "an unwatched key is quiet");

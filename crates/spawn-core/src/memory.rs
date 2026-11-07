@@ -19,8 +19,8 @@ use crate::id::{
     TerminalName, WorkspaceId,
 };
 use crate::port::{
-    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, ForkFrom, Hold, Launch,
-    FileWatch, READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive,
+    ArchiveError, BaseMerge, Branch, CommandQueue, Commit, EventLog, FileWatch, ForkFrom, Hold,
+    Launch, READ_LIMIT, Runner, StoreError, TerminalError, TerminalHost, TranscriptArchive,
     WatchError, WorkspaceError, WorkspaceStore,
 };
 use crate::time::{Clock, Timestamp};

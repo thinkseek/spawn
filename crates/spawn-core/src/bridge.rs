@@ -922,8 +922,7 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
-        self.backstops
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.backstops.store(0, std::sync::atomic::Ordering::SeqCst);
         // What changed in the engines' files since the last pass: a
         // transcript or an exit status is read when it is here, not on every
         // pass ([`Self::follow_output`]).
@@ -1260,7 +1259,10 @@ impl Bridge {
     ) -> Result<Option<(EndCause, Option<i32>)>, TerminalError> {
         let asked = match self.runners.as_ref() {
             Some(runners) => runners.get(&active.terminal()).cloned(),
-            None => Some(self.terminals.runner(&active.terminal(), &active.workspace)?),
+            None => Some(
+                self.terminals
+                    .runner(&active.terminal(), &active.workspace)?,
+            ),
         };
         let seen = match asked {
             // The fleet's answer has no terminal of that name.
@@ -1319,7 +1321,8 @@ impl Bridge {
                 // one set, it is not asked again every pass, only once at
                 // the grace that reports a transcript that never came.
                 active.follow.watch.dirty = false;
-                active.follow.due_at = (!active.follow.warned).then(|| since.saturating_add(60_001));
+                active.follow.due_at =
+                    (!active.follow.warned).then(|| since.saturating_add(60_001));
                 return Ok(());
             }
             Err(error) => {
@@ -1559,7 +1562,9 @@ impl Bridge {
             Wanted::Now => true,
             Wanted::Nothing => false,
             Wanted::Backstop => {
-                let taken = self.backstops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let taken = self
+                    .backstops
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 taken < BACKSTOPS_PER_PASS
             }
         }
@@ -3821,9 +3826,7 @@ mod tests {
                 .read_global(GlobalPosition(0), 500)
                 .expect("read")
                 .into_iter()
-                .filter(|record| {
-                    record.event.source == crate::event::Source::Claude
-                })
+                .filter(|record| record.event.source == crate::event::Source::Claude)
                 .map(|record| record.event.kind.name())
                 .collect()
         }
@@ -3848,8 +3851,10 @@ mod tests {
         }
 
         fn set_pane(&self, pane: &str) {
-            self.store
-                .set_pane(&TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))), pane);
+            self.store.set_pane(
+                &TerminalName::for_execution(&ExecutionId::for_command(CommandId(1))),
+                pane,
+            );
         }
     }
 
@@ -3970,10 +3975,9 @@ mod tests {
         // Half a line: the read that took it left it half-written, so the
         // next pass reads again even though no change is reported for the
         // rest (the write and the read raced).
-        world.store.append_file(
-            &world.path,
-            "{\"type\":\"system\",\"subtype\":\"turn_dur",
-        );
+        world
+            .store
+            .append_file(&world.path, "{\"type\":\"system\",\"subtype\":\"turn_dur");
         world.watch.changed(&world.path);
         world.tick();
         assert_eq!(world.engine_events(), vec!["tool.started"]);
