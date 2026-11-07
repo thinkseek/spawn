@@ -50,7 +50,11 @@ case "${1-}" in
   *) die "usage: $0 [--accept-drop | --init-key]" ;;
 esac
 
-need_tools docker pg_restore gpg curl flock sha256sum md5sum stat date awk
+need_tools pg_restore gpg curl flock sha256sum md5sum stat date awk
+# A host without docker names a native pg_dump of the live server's major
+# version (SPAWN_PG_DUMP, e.g. /usr/lib/postgresql/16/bin/pg_dump); otherwise
+# the dump runs in the live server's own image, as before.
+[ -n "${SPAWN_PG_DUMP-}" ] || need_tools docker
 load_live_url
 load_r2
 check_private "$SPAWN_BACKUP_KEY_FILE"
@@ -73,11 +77,17 @@ dump="$work/spawn-$ts.dump"
 enc="$dump.gpg"
 
 # 1. dump, with the server's own major version of pg_dump
-image=$(pg_image)
 pg_split "$LIVE_URL"
-docker run --rm -i --network host \
-  --env-file <(printf 'PGPASSWORD=%s\nPGCONNECT_TIMEOUT=10\n' "$PG_PASS") \
-  "$image" pg_dump -Fc -w -d "$PG_URL" > "$dump" || die "pg_dump (in $image) failed"
+if [ -n "${SPAWN_PG_DUMP-}" ]; then
+  image=$("$SPAWN_PG_DUMP" --version) || die "SPAWN_PG_DUMP $SPAWN_PG_DUMP does not run"
+  PGPASSWORD=$PG_PASS PGCONNECT_TIMEOUT=10 "$SPAWN_PG_DUMP" -Fc -w -d "$PG_URL" > "$dump" ||
+    die "pg_dump ($image) failed"
+else
+  image=$(pg_image)
+  docker run --rm -i --network host \
+    --env-file <(printf 'PGPASSWORD=%s\nPGCONNECT_TIMEOUT=10\n' "$PG_PASS") \
+    "$image" pg_dump -Fc -w -d "$PG_URL" > "$dump" || die "pg_dump (in $image) failed"
+fi
 dump_size=$(stat -c %s "$dump")
 
 # 2. it parses, and how much of the event log it holds
