@@ -201,6 +201,7 @@ export default function App() {
       <MobileNav
         view={view}
         attention={humanCount}
+        openAlerts={openAlerts}
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
