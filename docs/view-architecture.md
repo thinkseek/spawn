@@ -155,3 +155,17 @@
 | 分页 | keyset，按视图排序键，不用 offset |
 | 视图角色 | 只读；写入口是 `agent_commands` 触发器与四个函数 |
 | 命名 | 视图统一 `agent_*`，函数前缀 `spawn_` |
+
+## 12. 语义标签
+
+仪表盘（`spawn serve`）和读它 API 的 agent 看到的每个 agent、会话、执行、任务和升级项，都先给一行语义标签，说明它在做什么；原始 id 仍在旁边（小号等宽、可整段选中），因为 id 是 CLI 和 SQL 的键。实现在 [serve/labels.rs](../crates/spawn-cli/src/serve/labels.rs)，页面读法在 [web/src/label.ts](../web/src/label.ts)。
+
+| 字段 | 含义 | 来源 |
+| --- | --- | --- |
+| `mission_name` | 任务所属 mission 的名字 | mission 正文首行冒号前的短语（不超过 6 个词：`RSI: ...` 得 `RSI`，`Owner work on Supply PA: ...` 得 `Supply PA owner work`），否则正文首句；名字里没有源仓库的项目名时把它放在前面（`spawn.git` 得 `Spawn`，所以是 `Spawn RSI`）；最多 32 字符 |
+| `task_title` | 任务标题 | 目标任务取 backlog 的标题，即 brief 首行 `Objective <n>: <title>`（`objectives::brief` 照 backlog 写入）；标题只是 `Task <n>` 占位时取目标 prompt 的首句；brief 里没有这行时取已加载 backlog 的标题（`/api/rsi`）。其他任务取 brief 首行：去掉 markdown、括号、`Owner work on X:`/`Owner-protected work on X (...).`/`Goal:` 这类前缀，取第一句；最多 80 字符，在词边界截断 |
+| `label` | 一行，最多 90 字符，各段以 ` · ` 相连 | 任务：`<mission> · task <id>`（目标任务为 `objective <n>`）` · <title> · <状态>`，状态里 delivered 说成 `working`、revise 说成 `revising`、有门禁的 mission 里 accepted 说成 `awaiting gate`；标题结尾的 ` in <地点>` 若 mission 名已含就省去；标题可用不足 40 字符时先缩 mission 名（至少留 12 字符），再在词边界截标题。agent：所在会话最新任务的标签；resident 有进行中的任务时在状态前加 `resident <name>`，没有时是 `resident <name> · idle · last: <mission> <task> · <title>`；supervisor 是 `supervisor · reviewing <n> reports (missions 7, 8)`（review 模式 mission 里有 reported 任务时）或 `supervisor · <状态>`；其余 agent 是 id 去掉 `agent_` 前缀后的词加状态 |
+
+带标签的回答：`/api/fleet` 的每个 agent；`/api/missions` 的每个 mission（`mission_name`）、任务和 resident；`/api/rsi` 的每个 mission、任务和 resident；`/api/attention` 的 `pending`、`told`、`on_own_jobs` 每一项和 supervisor（关于整机或全部 mission 的项标签就是 `host`、`missions`）。没有任务的对象 `task_title`、`mission_name` 为 null。
+
+标签只在请求时由已有记录算出：mission 正文、任务 brief 与状态、resident 名册，读自 `PostgresStore::label_facts`（`/api/fleet` 与 `/api/attention`，与看板同形但不读阶段、报告和审查意见）或回答本身已读的看板。不存新状态，日志与 schema 里的 id 不改名。读不到标签事实时 `/api/attention` 仍回答，各项只以 id 为名，并在 `warnings` 里说明。页面在旧服务器（没有这些字段）上照旧显示 id，并用自己的推导（`ordering.ts` 的 `missionName`、`taskTitle`）。
