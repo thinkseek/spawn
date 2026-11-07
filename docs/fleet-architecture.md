@@ -72,9 +72,10 @@ execution runs, it classifies:
 | --- | --- | --- |
 | permission dialog on screen or permission notification | rules | BLOCKED (permission) |
 | a tool call is open, or the pane read busy less than 2 min ago | rules | WORKING |
+| turn stopped at its prompt while a background job the execution started is open (§2.2) | rules | WORKING (`WAITING_FOR_BACKGROUND_JOB`) |
 | execution ended by Stop | rules | COMPLETED |
 | no execution yet | rules | WAITING |
-| turn stopped, prompt idle: finished, asking a question, or waiting? | **Jev** | WAITING / BLOCKED / COMPLETED |
+| turn stopped, prompt idle, no background job open: finished, asking a question, or waiting? | **Jev** | WAITING / BLOCKED / COMPLETED |
 | execution live, no open tool, no fact for 2 min (or a tool open for 10 min with no transcript progress, however busy the screen looks): thinking or hung? | **Jev** | WORKING / WAITING / BLOCKED |
 | failed turn or an error on screen: progressing or stuck? | **Jev** | WORKING / WAITING / BLOCKED |
 | process exited on its own (a non-zero exit code makes BLOCKED the rules' guess and always asks for attention) | **Jev** | COMPLETED / BLOCKED |
@@ -177,6 +178,69 @@ some of the time. The layering keeps its errors cheap:
    system runs on rules alone and escalates what they cannot decide. Losing
    Jev costs more human attention, never correctness.
 
+### 2.2 Waiting on its own job
+
+Workers often end a turn while a job they started runs in the background: a
+test run or a gate started with Bash `run_in_background` (or a command the
+engine moved there when its timeout ran out), a Monitor watching a log, or
+an Agent launched in the background. Claude Code wakes the agent when the
+job reports. Such a worker is working, not idle, and that is a fact the
+rules settle from the transcript:
+
+- **The records.** The Bridge reads them from the transcript it already
+  follows (`ingest::claude_line`), as source `claude`. `job.started`
+  (`job_id`, `kind` `bash`, `monitor` or `agent`; when is the record's time)
+  comes from the tool result that started the job: its
+  `toolUseResult.backgroundTaskId` (Bash), `taskId` with `timeoutMs`
+  (Monitor), or `agentId` with `isAsync` and `status` `async_launched`
+  (Agent; also a Skill forked to the background, `status` `forked`,
+  `background`). A `SendMessage` whose result says it resumed a finished
+  Agent (`resumedAgentId`) starts that Agent again under its id: each run is
+  a start of its own, keyed by the job's id and the call that started it.
+  `job.ended` (`job_id`, `how`: `completed`, `failed`, `killed`, `stopped`,
+  `expired`) comes from the engine's `<task-notification>` with a
+  `<status>`, or a Monitor's `[Monitor expired …]` event, as the engine
+  gave it to the agent (mid-turn as a `queued_command` attachment, or as the
+  prompt of a turn of its own; the copies are the same bytes, and the end is
+  keyed by the job's id and a digest of the notification, so it is stored
+  once and a later run's end is another record), or from a `TaskStop` whose
+  result says it stopped the job. The engine's queue (`queue-operation`) is
+  not read: it also carries sub-agents' notifications (removed and handed to
+  the sub-agent, whose jobs are not the session's), and it can hold a quick
+  job's end before the line with the result that started it, so a start
+  read after it would open a job already ended. A Monitor's other events end
+  nothing; an Agent's notification that
+  says it `is waiting on its own background work` ends nothing (it paused
+  with work of its own and notifies again); a message only queued for a
+  running Agent starts nothing; a stop that failed ends nothing.
+- **Within its execution.** A job is open only in the execution that started
+  it, while its latest start has no later end: the execution's end (and so a
+  resume, a new execution) closes its open jobs, whatever the transcript
+  says later; an end for an id no start of the execution names closes
+  nothing.
+- **The rule.** A turn that stopped at its prompt (a `turn.stopped`, or a
+  ready screen) while at least one job of the running execution is open is
+  WORKING with reason `WAITING_FOR_BACKGROUND_JOB`, decided by the rules: no
+  Jev call, no attention, so no attention or idle escalation and no nudge,
+  and its task's `activity` step is not stalled. A failed turn with a job
+  open is still the judge's (`engine_error`), which sees `open_jobs`. A turn
+  that stops with no job open is judged exactly as before.
+- **The bound.** A job open for `SPAWN_STALL_JOB_SECS` (default 7200 s; a
+  Monitor expires by itself within an hour) is escalated once, heading
+  `background job past its bound`, line "a background job has run for
+  <duration>" with its kind, id, record and execution
+  (`dispatch/jobs.rs`, tag `<session> job-<execution>-<job>-<start record>`), its age on the
+  database's clock. Told once, it stays told while the job is open, and it
+  is the only item about the worker meanwhile: what to do (stop the job,
+  stop the worker, wait) is the supervisor's decision.
+- **Causality** (docs/design.md §14). Decided from these records alone. The
+  screen's "N shells still running" or "N monitors still running" footer is
+  evidence in Jev's view, never a rule.
+
+The attention view (`GET /api/attention`, `on_own_jobs`) lists the workers
+held this way with their jobs and each job's age, and the board shows such a
+worker's "doing now" as its background job and its age, and never as quiet.
+
 ## 3. Control: dispatcher, supervisor, human
 
 Observation says what state an agent is in. Control decides what to do about
@@ -207,7 +271,12 @@ it, on the same ladder.
   not nudged, a nudge that did not help, a
   failed resume (or one whose engine was lost again within a minute),
   attention, and a finished execution nobody stopped (its recorded end
-  cause is not `stopped`) all escalate. A Stop or Discard that failed,
+  cause is not `stopped`) all escalate. A worker the rules judged waiting
+  at its prompt on a background job of its own (§2.2) is not idle: it is
+  not nudged nor escalated, and gets no new work unless its last task has
+  closed (a revision, or a task after a closed one, is typed at its prompt
+  as for any stopped turn); only its job past its bound is escalated, once.
+  A Stop or Discard that failed,
   whoever sent it (a model switch, a closed task's worker, a retired
   resident, the integrator's budget abort, the supervisor, a person),
   leaves the worker running: the dispatcher reads the Stops of the live
@@ -251,11 +320,13 @@ it, on the same ladder.
   step of its own. A delivery whose retries are spent was escalated as
   `delivery failed`, which is its stall's escalation; one that may have
   typed the task is not retried, and its stall is escalated at its bound.
-  A worker at its prompt whose screen says background shells still run
-  (Claude Code's `· done … N shells still running`, read from the line the
-  engine draws right above its prompt) is treated as active: its `activity`
-  step is not escalated while that is its latest screen reading, since the
-  engine resumes the agent when the shells finish.
+  A worker waiting on a background job of its own is active (§2.2): while
+  its live execution has a job open (`job.started` without its `job.ended`)
+  and its latest turn has ended, its `activity` step is not escalated, since
+  the engine resumes the agent when the job reports. A job open past
+  `SPAWN_STALL_JOB_SECS` (7200) is escalated once on its own, and that is the
+  task's only item while the job runs. The screen's "N shells still running"
+  is no rule.
 
   The item, heading `stalled`, is one line naming `task #<id>`, the step,
   how long it stood still, the evidence (the record it is measured from and
@@ -381,10 +452,14 @@ it, on the same ladder.
   at most 10, from the end of its transcript): items to read, counted in no
   queue; an owner's message clears none of them, since nothing waits on
   them. Nothing waits on a person: a person reads the queue when they
-  choose. The owner can type to the supervisor at any time (the box at the
-  top of the Fleet page, its pane, or `spawn submit`), and to any agent (the
-  box in its detail drawer; both boxes are `POST /api/session/<id>/input`,
-  §5); the supervisor reads that as an instruction, which may reverse one
+  choose. Also apart, and counted in no queue: the workers working on a
+  background job of their own ("On their own background jobs",
+  `on_own_jobs`, §2.2), each with its jobs and their ages, so a person sees
+  why a worker at its prompt is in no queue. The owner can type to the
+  supervisor at any time (the box at the top of the Fleet page, its pane, or
+  `spawn submit`), and to any agent (the box in its detail drawer; both
+  boxes are `POST /api/session/<id>/input`, §5); the supervisor reads that
+  as an instruction, which may reverse one
   of its decisions, not as the answer to a question. Each human action is a
   command with principal `human`; it is the event the whole system tries to
   make rarer.

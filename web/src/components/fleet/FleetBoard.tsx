@@ -1,7 +1,7 @@
-import { Bot, Wrench } from "lucide-react";
+import { Bot, Hourglass, Wrench } from "lucide-react";
 
 import type { FleetAgent } from "../../fleet";
-import { FLEET_STATES, percent, stateLabelUpper } from "../../fleet";
+import { FLEET_STATES, jobsText, onOwnJob, percent, stateLabelUpper } from "../../fleet";
 import { absoluteTitle } from "../../format";
 import type { AgentGroup, AgentGroupId, FleetContext, TaskRef } from "../../ordering";
 import { AGENT_GROUP_LABEL, heldTask, lastTask } from "../../ordering";
@@ -9,30 +9,48 @@ import { useStoredChoice } from "../ViewToggle";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING_INSET, GroupHeader, MiddleId, cx, sinceText } from "../ui";
 import { FleetStateDot, JudgeBadge } from "./bits";
 
-/** One line for "what is it doing right now". */
+/** One line for "what is it doing right now": its open tool; else, when the
+ * rules judged it waiting at its prompt on a background job of its own, that
+ * job and its age (`job`); else its latest event. */
 export function doingNow(agent: FleetAgent): {
   label: string;
   tool: boolean;
+  job: boolean;
   at: number | null;
 } {
   const activity = agent.activity;
   if (activity.current_tool) {
-    return { label: activity.current_tool, tool: true, at: activity.last_event_at_ms };
+    return { label: activity.current_tool, tool: true, job: false, at: activity.last_event_at_ms };
+  }
+  const jobs = onOwnJob(agent) ? jobsText(activity.jobs) : null;
+  if (jobs) {
+    return { label: `background job: ${jobs}`, tool: false, job: true, at: activity.last_event_at_ms };
   }
   return {
     label: activity.last_event_name ?? "—",
     tool: false,
+    job: false,
     at: activity.last_event_at_ms,
   };
 }
 
 /** A live worker on a task this long without an event is quiet enough to
- * look at: the dispatcher's activity stall (SPAWN_STALL_ACTIVITY_SECS). */
+ * look at: the dispatcher's activity stall (SPAWN_STALL_ACTIVITY_SECS). One
+ * waiting at its prompt on its own background job is working, not quiet:
+ * the dispatcher does not stall it either. */
 export const QUIET_MS = 15 * 60_000;
 
 export function isQuiet(agent: FleetAgent, now = Date.now()): boolean {
+  if (onOwnJob(agent)) return false;
   const at = agent.activity.last_event_at_ms;
   return at !== null && now - at > QUIET_MS;
+}
+
+/** The icon of "doing now": a tool, or a background job. */
+export function DoingIcon({ now, size = 12 }: { now: { tool: boolean; job: boolean }; size?: number }) {
+  if (now.tool) return <Wrench size={size} className="shrink-0 text-success" />;
+  if (now.job) return <Hourglass size={size} className="shrink-0 text-success" />;
+  return null;
 }
 
 const COLUMNS =
@@ -299,12 +317,13 @@ function AgentRow({
 
       {/* Doing now */}
       <div className="flex w-full min-w-0 items-center gap-1.5 pl-4 text-caption lg:w-auto lg:pl-0">
-        {now.tool && <Wrench size={12} className="shrink-0 text-success" />}
+        <DoingIcon now={now} />
         <span
           className={cx(
             "min-w-0 truncate font-mono",
-            now.tool ? "text-foreground" : "text-muted-foreground",
+            now.tool || now.job ? "text-foreground" : "text-muted-foreground",
           )}
+          title={now.job ? "Its turn ended while a job it started still runs; the engine wakes it when the job reports" : undefined}
         >
           {now.label}
         </span>

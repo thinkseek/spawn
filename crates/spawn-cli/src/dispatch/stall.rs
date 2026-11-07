@@ -29,10 +29,14 @@
 //! mechanism sends it once, and a step that moved and stalled anew has a new
 //! record, so a new tag. A failed retry, a `stale` verdict, a nudge, a
 //! judgement or an input recorded `waiting` for the session's turn moves no
-//! step (the waiting step is not a fact: `stall_facts` skips it). A worker at its prompt whose screen says its
-//! background shells still run (Claude Code resumes it when they finish)
-//! is treated as active: its `activity` step is not escalated while that
-//! is its latest screen reading.
+//! step (the waiting step is not a fact: `stall_facts` skips it). A worker
+//! whose turn ended while a background job of its own is open (a
+//! `job.started` of its live execution with no `job.ended`, read from its
+//! transcript; Claude Code wakes it when the job reports) is working: its
+//! `activity` step is not escalated while it waits on the job. A job past
+//! its bound (`SPAWN_STALL_JOB_SECS`) is escalated once on its own
+//! ([`super::jobs`]), and that is the task's only item meanwhile. The
+//! screen's "N shells still running" is no rule (docs/design.md §14).
 //!
 //! This layer takes no action: it adds digest items, and says what Spawn
 //! already tried and still will (a retry due, or due and held, and why).
@@ -44,7 +48,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use spawn_core::mission::TaskState;
-use spawn_core::screen::shows_background_shells;
 
 use super::{Escalation, Facts, Why};
 use crate::deliver::{self, Work, one_line};
@@ -60,11 +63,14 @@ pub(crate) struct Bounds {
     pub(crate) landing: i64,
     pub(crate) stop: i64,
     pub(crate) halted: i64,
+    /// How long a background job may run before it is escalated
+    /// ([`super::jobs`]).
+    pub(crate) job: i64,
 }
 
 /// The variables, with their defaults in seconds (the reasons are in
 /// docs/architecture.md's environment table).
-const VARIABLES: [(&str, u64); 7] = [
+const VARIABLES: [(&str, u64); 8] = [
     ("SPAWN_STALL_DELIVERY_SECS", 600),
     ("SPAWN_STALL_ACTIVITY_SECS", 900),
     ("SPAWN_STALL_REVIEW_SECS", 1800),
@@ -72,6 +78,7 @@ const VARIABLES: [(&str, u64); 7] = [
     ("SPAWN_STALL_LANDING_SECS", 600),
     ("SPAWN_STALL_STOP_SECS", 300),
     ("SPAWN_STALL_HALTED_SECS", 0),
+    ("SPAWN_STALL_JOB_SECS", 7200),
 ];
 
 impl Default for Bounds {
@@ -88,7 +95,7 @@ impl Bounds {
         Self::read(crate::config::env_value)
     }
 
-    fn read(lookup: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
+    pub(super) fn read(lookup: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let mut values = [0_i64; VARIABLES.len()];
         for ((name, fallback), value) in VARIABLES.iter().zip(values.iter_mut()) {
@@ -105,7 +112,7 @@ impl Bounds {
                 .unwrap_or(i64::MAX / 1000)
                 .saturating_mul(1000);
         }
-        let [delivery, activity, review, gate, landing, stop, halted] = values;
+        let [delivery, activity, review, gate, landing, stop, halted, job] = values;
         (
             Self {
                 delivery,
@@ -115,6 +122,7 @@ impl Bounds {
                 landing,
                 stop,
                 halted,
+                job,
             },
             warnings,
         )
@@ -178,7 +186,7 @@ pub(crate) struct Verdict {
     pub(crate) at_ms: i64,
 }
 
-/// A session's latest fact and latest screen reading.
+/// A session's latest fact.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Latest {
     pub(crate) session_id: String,
@@ -188,9 +196,6 @@ pub(crate) struct Latest {
     pub(crate) event_name: Option<String>,
     #[serde(default)]
     pub(crate) at_ms: Option<i64>,
-    /// The evidence of its latest `screen.observed`.
-    #[serde(default)]
-    pub(crate) screen: Option<String>,
 }
 
 /// A halted mission with open tasks.
@@ -253,7 +258,7 @@ struct Measured {
 }
 
 /// `ms` as a short duration: `45s`, `3m05s`, `2h04m`.
-fn took(ms: i64) -> String {
+pub(super) fn took(ms: i64) -> String {
     let secs = ms.max(0) / 1000;
     match secs {
         0..60 => format!("{secs}s"),
@@ -388,8 +393,9 @@ fn judged_next(stalls: &Stalls) -> BTreeSet<i64> {
 }
 
 /// A delivered task's `activity` step: from the later of its delivery
-/// record and its session's latest fact; none while its screen shows
-/// background shells running.
+/// record and its session's latest fact; none while its worker's turn has
+/// ended with a background job of its own open (it works on that job; past
+/// the job's bound, [`super::jobs`] escalates it).
 fn activity(
     task: &OpenTask,
     record: &Record,
@@ -403,11 +409,8 @@ fn activity(
         .sessions
         .iter()
         .find(|latest| latest.session_id == task.session_id);
-    if latest
-        .and_then(|latest| latest.screen.as_deref())
-        .is_some_and(shows_background_shells)
-    {
-        // At its prompt with background shells running: active.
+    if facts.is_some_and(|facts| facts.live && facts.turn_ended && !facts.jobs.is_empty()) {
+        // At its prompt with a job of its own running: working.
         return None;
     }
     let fact =

@@ -37,9 +37,21 @@
 //!     },
 //!     "for_owner": [{"text": "deploy ffc9fe7", "at_ms": 1793957000000 | null}]
 //!   },
+//!   "on_own_jobs": [{              // workers the rules hold as working on a
+//!     "session_id", "agent_id",    // background job of their own: not escalated
+//!     "judged_at_ms": 1793957000000 | null,
+//!     "jobs": [{"id": "b8w03og7k", "kind": "bash" | "monitor",
+//!               "started_at_ms": ..., "age_ms": ...}]   // oldest first
+//!   }],
 //!   "warnings": ["dispatch: stalls: ..."]   // what could not be read
 //! }
 //! ```
+//!
+//! `on_own_jobs` lists the workers whose current judgement is the rules'
+//! "waiting on its own background job" ([`Facts::waits_on_own_job`]), with
+//! their open jobs and each one's age on the database's clock: the reason
+//! they are in no queue. A job past its bound is an item of its own in
+//! `pending` or `told` (`background job past its bound`).
 //!
 //! The supervisor's question is shown when its turn ended at its prompt
 //! and its judgement asks for a person: BLOCKED or WAITING with
@@ -197,8 +209,30 @@ fn answer(
         "pending": plan.pending.iter().map(|escalation| item(escalation, false)).collect::<Vec<_>>(),
         "told": plan.told.iter().map(|escalation| item(escalation, true)).collect::<Vec<_>>(),
         "supervisor": supervisor,
+        "on_own_jobs": on_own_jobs(rows),
         "warnings": warnings,
     })
+}
+
+/// The workers judged, on their latest fact, at their prompt waiting on a
+/// background job of their own, with those jobs: working, so in no queue.
+fn on_own_jobs(rows: &[Facts]) -> Vec<Value> {
+    rows.iter()
+        .filter(|facts| facts.session_id != SUPERVISOR_SESSION && facts.waits_on_own_job())
+        .map(|facts| {
+            json!({
+                "session_id": facts.session_id,
+                "agent_id": facts.agent_id,
+                "judged_at_ms": facts.observation_at_ms,
+                "jobs": facts.jobs.iter().map(|job| json!({
+                    "id": job.id,
+                    "kind": job.kind,
+                    "started_at_ms": job.started_at_ms,
+                    "age_ms": job.age_ms,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 /// The supervisor's liveness, its latest judgement, its `question` and its
@@ -569,6 +603,104 @@ mod tests {
         assert_eq!(pending[1]["why"], "disk space on this host");
         assert_eq!(pending[1]["since_ms"], NOW - 600_000);
         assert_eq!(view["generated_at_ms"], NOW);
+    }
+
+    /// The live sequence of 2026-11-06 23:56: task 92's worker waited at
+    /// its prompt on a gate it ran in the background. The rules hold it as
+    /// working on that job: it is in no queue, and the view lists it with
+    /// its job and the job's age. Past the job's bound, the job is an item.
+    #[test]
+    fn a_worker_on_its_own_background_job_is_listed_as_working_not_queued() {
+        let (mut rows, mut work, host) = situation();
+        let on_job = json!({
+            "state": "WORKING", "reason": "WAITING_FOR_BACKGROUND_JOB", "based_on_seq": 50,
+            "confidence": 1.0, "judge": "rules",
+        });
+        let mut waiting = row(
+            "session_worker_gate_cache_92",
+            "agent_worker_gate_cache_92",
+            &on_job,
+            NOW - 30_000,
+        );
+        waiting["jobs"] = json!([{"id": "bys3gpa46", "kind": "monitor", "event_id": 512,
+                                  "started_at_ms": NOW - 900_000, "age_ms": 900_000}]);
+        rows.push(facts(&waiting));
+        work.tasks.extend(
+            serde_json::from_value::<Vec<crate::deliver::TaskRow>>(json!([{
+                "id": 92, "mission_id": 4, "kind": "ephemeral",
+                "agent_id": "agent_worker_gate_cache_92",
+                "session_id": "session_worker_gate_cache_92",
+                "brief": "b", "state": "delivered", "revisions": 0, "mission_text": "m",
+            }]))
+            .expect("task rows"),
+        );
+        let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
+        let view = answer(
+            &rows,
+            &plan,
+            &Value::Null,
+            &Value::Null,
+            &json!([]),
+            &[],
+            NOW,
+        );
+        let queued = |view: &Value| -> Vec<String> {
+            ["pending", "told"]
+                .iter()
+                .flat_map(|list| view[*list].as_array().expect("a list").clone())
+                .filter_map(|item| item["session_id"].as_str().map(str::to_string))
+                .collect()
+        };
+        assert!(
+            !queued(&view).contains(&"session_worker_gate_cache_92".to_string()),
+            "{view:#}"
+        );
+        assert_eq!(
+            view["on_own_jobs"],
+            json!([{
+                "session_id": "session_worker_gate_cache_92",
+                "agent_id": "agent_worker_gate_cache_92",
+                "judged_at_ms": NOW - 30_000,
+                "jobs": [{"id": "bys3gpa46", "kind": "monitor",
+                          "started_at_ms": NOW - 900_000, "age_ms": 900_000}],
+            }])
+        );
+
+        // Two hours on: the job is an item of its own, still not idle.
+        let last = rows.len() - 1;
+        rows[last].jobs[0].age_ms = 2 * 3_600_000 + 1;
+        let mut host = host;
+        host.extend(crate::dispatch::job_items(
+            &rows,
+            crate::dispatch::Bounds::default().job,
+        ));
+        let plan = decide_with(&rows, &work, &host, true, NOW, "spawn");
+        let view = answer(
+            &rows,
+            &plan,
+            &Value::Null,
+            &Value::Null,
+            &json!([]),
+            &[],
+            NOW,
+        );
+        let item = view["pending"]
+            .as_array()
+            .expect("pending")
+            .iter()
+            .find(|item| item["session_id"] == "session_worker_gate_cache_92")
+            .expect("the job's item");
+        assert_eq!(item["why"], "background job past its bound");
+        assert_eq!(
+            item["tag"],
+            "session_worker_gate_cache_92 job-exec_agent_worker_gate_cache_92-bys3gpa46-512"
+        );
+        assert!(
+            item["line"]
+                .as_str()
+                .is_some_and(|line| line.contains("monitor bys3gpa46"))
+        );
+        assert_eq!(view["on_own_jobs"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]

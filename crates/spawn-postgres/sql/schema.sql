@@ -775,6 +775,40 @@ where s.event_name = 'tool.started'
         and x.execution_id = s.execution_id
   );
 
+-- Background jobs (a Bash `run_in_background`, a Monitor, a background
+-- Agent) an execution started and that have not ended, in executions the
+-- Bridge has not ended: an execution's end closes its jobs, and a resume is
+-- a new execution. The Bridge reads both records from the engine's
+-- transcript (`job.started`, `job.ended`). An Agent can run again under its
+-- id (resumed by a message), so a job is open when its latest start has no
+-- later end: the row is that start, with no later start or end of the id.
+create or replace view agent_open_jobs as
+select
+    s.session_id,
+    s.agent_id,
+    s.execution_id,
+    s.id as event_id,
+    s.kind -> 'detail' ->> 'job_id' as job_id,
+    s.kind -> 'detail' ->> 'kind'   as job_kind,
+    s.session_seq,
+    s.recorded_at_ms as started_at_ms
+from spawn_events s
+where s.event_name = 'job.started'
+  and not exists (
+      select 1 from spawn_events e
+      where e.session_id = s.session_id
+        and e.event_name in ('job.started', 'job.ended')
+        and e.kind -> 'detail' ->> 'job_id' = s.kind -> 'detail' ->> 'job_id'
+        and e.session_seq > s.session_seq
+  )
+  and not exists (
+      select 1 from spawn_events x
+      where x.session_id = s.session_id
+        and x.event_name = 'execution.ended'
+        and x.source = 'bridge'
+        and x.execution_id = s.execution_id
+  );
+
 -- Position of the log per session. This is not judgement lag; see
 -- docs/view-architecture.md section 4.1.
 create or replace view agent_freshness as
@@ -815,7 +849,7 @@ revoke all on spawn_events, spawn_commands, spawn_grants, spawn_session_state, s
     from public;
 revoke select on agent_state, agent_status, agent_timeline, agent_judgements, agent_tasks,
     agent_task_events, agent_executions, agent_artifacts, agent_relations,
-    agent_lineage, agent_open_tools, agent_freshness
+    agent_lineage, agent_open_tools, agent_open_jobs, agent_freshness
     from public;
 grant insert on agent_commands to public;
 -- No select, not even of `id` (older schemas granted it for RETURNING):

@@ -1378,6 +1378,7 @@ fn view_columns_match_the_snapshot() {
         "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
         "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
         "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",
+        "agent_open_jobs: session_id text, agent_id text, execution_id text, event_id bigint, job_id text, job_kind text, session_seq bigint, started_at_ms bigint",
         "agent_open_tools: session_id text, agent_id text, execution_id text, tool_use_id text, tool_name text, session_seq bigint, started_at_ms bigint",
         "agent_relations: session_id text, agent_id text, parent_session_id text, recorded_at_ms bigint",
         "agent_state: session_id text, agent_id text, state text, reason text, confidence double precision, based_on_seq bigint, judge text, session_seq bigint, recorded_at_ms bigint, event_id bigint, observation jsonb",
