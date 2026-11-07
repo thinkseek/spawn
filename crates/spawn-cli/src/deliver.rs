@@ -1800,6 +1800,13 @@ mod tests {
             panic!("typed");
         };
         assert!(text.contains("tests fail"));
+        assert!(
+            text.ends_with(
+                "Fix it, then rewrite `.spawn/report.md` once, when everything is done (draft \
+                 anywhere else)."
+            ),
+            "{text}"
+        );
         // Typed into a prompt that may hold an open question: it says first
         // that it is no answer.
         assert!(
