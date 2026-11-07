@@ -1197,67 +1197,81 @@ times in a row)",
 
     /// Read what the log `index` appended since the last reading.
     fn read_log(&mut self, index: usize, now: i64, out: &mut Vec<Event>, lines: &mut Vec<String>) {
-        let log = &mut self.logs[index];
-        let Some(path) = log.path.clone() else {
-            let name = if log.subject == "test" {
-                "SPAWN_TEST_DATABASE_LOG"
-            } else {
-                "SPAWN_DATABASE_LOG"
-            };
-            let message = if log.subject == "test" {
+        let subject = self.logs[index].subject;
+        let Some(path) = self.logs[index].path.clone() else {
+            let message = if subject == "test" {
                 "alerts: SPAWN_TEST_DATABASE_LOG names no log: the test database's crash lines are not read"
             } else {
                 "alerts: SPAWN_DATABASE_LOG names no log: the live database's crash lines are not read"
             };
-            if !log.said {
-                log.said = true;
-                let _ = name;
-                lines.push(message.to_string());
-            }
+            self.say_once(index, message, lines);
             return;
         };
-        let read = match read_appended(&path, log) {
-            Ok(read) => read,
+        let read = read_appended(&path, &mut self.logs[index]);
+        let (text, truncated) = match read {
+            Ok(Some(read)) => read,
+            Ok(None) => {
+                self.logs[index].said = false;
+                return;
+            }
             Err(error) => {
-                if !log.said {
-                    log.said = true;
-                    lines.push(format!("alerts: {path:?}: {error}"));
-                }
+                self.say_once(index, &format!("alerts: {}: {error}", path.display()), lines);
                 return;
             }
         };
-        log.said = false;
-        let Some((text, truncated)) = read else {
-            return;
-        };
-        let mut matching = Vec::new();
+        self.logs[index].said = false;
+        self.lines_of_log(index, &path, now, &text, out);
+        if truncated {
+            lines.push(format!(
+                "alerts: {} grew more than the step reads at once; the rest is read next time",
+                path.display()
+            ));
+        }
+    }
+
+    /// Say `message` once per log, until it reads again.
+    fn say_once(&mut self, index: usize, message: &str, lines: &mut Vec<String>) {
+        if !self.logs[index].said {
+            self.logs[index].said = true;
+            lines.push(message.to_string());
+        }
+    }
+
+    /// The crash lines of one reading: the occurrences that fire, and the
+    /// ready line that clears an open one.
+    fn lines_of_log(
+        &mut self,
+        index: usize,
+        path: &Path,
+        now: i64,
+        text: &str,
+        out: &mut Vec<Event>,
+    ) {
+        let subject = self.logs[index].subject;
+        let mut matching: Vec<String> = Vec::new();
         for line in text.lines() {
             if let Some((_stamp, prefix)) = crash_stamp(line, now) {
-                log.last_match_ms = now;
-                log.last_line = Some(line.to_string());
+                self.logs[index].last_match_ms = now;
+                self.logs[index].last_line = Some(line.to_string());
                 if matching.len() < CRASH_LINES && matching.last() != Some(&line.to_string()) {
                     matching.push(line.to_string());
                 }
-                let key = format!("postgres_crash:{}:{prefix}", log.subject);
+                let key = format!("postgres_crash:{subject}:{prefix}");
                 if !self.known.contains_key(&key) {
                     out.push(Event::Fire {
                         key,
                         kind: "postgres_crash",
-                        subject: log.subject.to_string(),
+                        subject: subject.to_string(),
                         evidence: json!({
                             "log": path.display().to_string(),
-                            "lines": matching.clone(),
+                            "lines": matching,
                         }),
-                        text: format!(
-                            "the {} database's log: {}",
-                            log.subject,
-                            line.trim()
-                        ),
+                        text: format!("the {subject} database's log: {}", line.trim()),
                         notice: false,
                     });
                 }
             } else if line.contains(READY_LINE) {
-                for key in self.open_keys("postgres_crash", log.subject) {
+                for key in self.open_keys("postgres_crash", subject) {
                     out.push(Event::Clear {
                         key,
                         evidence: json!({
@@ -1267,12 +1281,6 @@ times in a row)",
                     });
                 }
             }
-        }
-        if truncated {
-            lines.push(format!(
-                "alerts: {} grew more than the step reads at once; the rest is read next time",
-                path.display()
-            ));
         }
     }
 
@@ -1712,11 +1720,13 @@ fn read_appended(path: &Path, log: &mut LogWatch) -> Result<Option<(String, bool
     log.offset = log.offset.saturating_add(bytes.len() as u64);
     let truncated = log.offset < length;
     log.carry.push_str(&String::from_utf8_lossy(&bytes));
-    let carry = std::mem::take(&mut log.carry);
-    let tail = carry.rsplit_once('\n').map_or(("", carry.as_str()), |(done, rest)| (done, rest));
-    // A line cut by the reading waits for its end.
-    log.carry = tail.0.to_string();
-    Ok(Some((tail.1.to_string(), truncated)))
+    // A line the reading cut waits for its end in the next one.
+    let (complete, carry) = match log.carry.rfind('\n') {
+        Some(at) => (log.carry[..=at].to_string(), log.carry[at + 1..].to_string()),
+        None => (String::new(), std::mem::take(&mut log.carry)),
+    };
+    log.carry = carry;
+    Ok(Some((complete, truncated)))
 }
 
 /// The stamp and `[pid]` of a crash line stamped within the day, as written:
