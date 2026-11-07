@@ -26,7 +26,7 @@ $$;
 -- each database gets its own, named after it (`spawn_supervisor_<db>`), so
 -- two installs on one cluster neither share privileges nor set each other's
 -- passwords. Schemas of one database (test cases) share them.
--- `p_base` is `spawn_supervisor` or `spawn_reader`; a name that would not
+-- `p_base` is `spawn_supervisor`, `spawn_reader` or `spawn_human`; a name that would not
 -- fit, or a database name outside [a-z0-9_], gets a hash instead.
 create or replace function spawn_login_role(p_base text) returns text
 language sql stable as $$
@@ -39,14 +39,17 @@ $$;
 
 -- The principal the session's login acts as: this database's restricted
 -- logins act as `spawn_supervisor` and `spawn_reader`, the names grants,
--- commands and records carry; the logins of the same names from before
--- logins were per database act as nobody (null); any other login as itself.
+-- commands and records carry, and `spawn_human` (the web page's typing,
+-- `spawn_human_input`) as `human`, the principal `spawn submit --principal
+-- human` names; the logins of the same names from before logins were per
+-- database act as nobody (null); any other login as itself.
 -- `session_user` survives SECURITY DEFINER, so this names the real caller.
 create or replace function spawn_principal() returns text
 language sql stable as $$
     select case
              when session_user::text = spawn_login_role('spawn_supervisor') then 'spawn_supervisor'
              when session_user::text = spawn_login_role('spawn_reader') then 'spawn_reader'
+             when session_user::text = spawn_login_role('spawn_human') then 'human'
              when session_user::text in ('spawn_supervisor', 'spawn_reader', 'spawn_terminal')
                  then null
              else session_user::text end
@@ -78,6 +81,27 @@ create index if not exists spawn_events_session_name
 -- An agent's latest checkpoint, read by the integrator before it judges.
 create index if not exists spawn_events_agent_name
     on spawn_events (agent_id, event_name, id);
+
+-- The dashboard's reads (`spawn serve`; docs/view-architecture.md §8 has
+-- the plans). A session's judgements by time: when its current state began
+-- (the fleet board's `state_since_ms`) is the judgement after the latest one
+-- of another state, found newest first instead of by reading them all.
+create index if not exists spawn_events_observation_time
+    on spawn_events (session_id, recorded_at_ms)
+    where event_name = 'observation.recorded';
+
+-- A tool call's end by its `tool_use_id`: `agent_open_tools` (a live
+-- session's current tool) looks each start's end up instead of reading
+-- every end of the session for every start.
+create index if not exists spawn_events_tool_done
+    on spawn_events (session_id, (kind -> 'detail' ->> 'tool_use_id'))
+    where event_name in ('tool.completed', 'tool.failed');
+
+-- Events of one kind in a window, across sessions: the fleet's health (the
+-- last hour's tool calls and failures, the day's judgements and
+-- executions) reads the window, not the whole log.
+create index if not exists spawn_events_name_time
+    on spawn_events (event_name, recorded_at_ms);
 
 -- Projection: one row per session, written by `spawn_append` in the same
 -- transaction as the event, so `agent_state`, `agent_status` and
@@ -334,7 +358,7 @@ create or replace function spawn_append(
     out_inserted boolean
 ) language plpgsql security definer as $$
 begin
-    if coalesce(spawn_principal() in ('spawn_supervisor', 'spawn_reader'), true) then
+    if coalesce(spawn_principal() in ('spawn_supervisor', 'spawn_reader', 'human'), true) then
         raise exception '% may not write events', session_user using errcode = '42501';
     end if;
     return query
@@ -362,6 +386,10 @@ create table if not exists spawn_commands (
 create index if not exists spawn_commands_open
     on spawn_commands (session_id, id)
     where state <> 'finished';
+
+-- A session's latest commands, finished or not: the fleet board's task.
+create index if not exists spawn_commands_session
+    on spawn_commands (session_id, id);
 
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
@@ -772,6 +800,40 @@ where s.event_name = 'tool.started'
         and x.execution_id = s.execution_id
   );
 
+-- Background jobs (a Bash `run_in_background`, a Monitor, a background
+-- Agent) an execution started and that have not ended, in executions the
+-- Bridge has not ended: an execution's end closes its jobs, and a resume is
+-- a new execution. The Bridge reads both records from the engine's
+-- transcript (`job.started`, `job.ended`). An Agent can run again under its
+-- id (resumed by a message), so a job is open when its latest start has no
+-- later end: the row is that start, with no later start or end of the id.
+create or replace view agent_open_jobs as
+select
+    s.session_id,
+    s.agent_id,
+    s.execution_id,
+    s.id as event_id,
+    s.kind -> 'detail' ->> 'job_id' as job_id,
+    s.kind -> 'detail' ->> 'kind'   as job_kind,
+    s.session_seq,
+    s.recorded_at_ms as started_at_ms
+from spawn_events s
+where s.event_name = 'job.started'
+  and not exists (
+      select 1 from spawn_events e
+      where e.session_id = s.session_id
+        and e.event_name in ('job.started', 'job.ended')
+        and e.kind -> 'detail' ->> 'job_id' = s.kind -> 'detail' ->> 'job_id'
+        and e.session_seq > s.session_seq
+  )
+  and not exists (
+      select 1 from spawn_events x
+      where x.session_id = s.session_id
+        and x.event_name = 'execution.ended'
+        and x.source = 'bridge'
+        and x.execution_id = s.execution_id
+  );
+
 -- Position of the log per session. This is not judgement lag; see
 -- docs/view-architecture.md section 4.1.
 create or replace view agent_freshness as
@@ -812,7 +874,7 @@ revoke all on spawn_events, spawn_commands, spawn_grants, spawn_session_state, s
     from public;
 revoke select on agent_state, agent_status, agent_timeline, agent_judgements, agent_tasks,
     agent_task_events, agent_executions, agent_artifacts, agent_relations,
-    agent_lineage, agent_open_tools, agent_freshness
+    agent_lineage, agent_open_tools, agent_open_jobs, agent_freshness
     from public;
 grant insert on agent_commands to public;
 -- No select, not even of `id` (older schemas granted it for RETURNING):
@@ -990,7 +1052,7 @@ declare
     v_base text;
     v_role text;
 begin
-    foreach v_base in array array['spawn_supervisor', 'spawn_reader'] loop
+    foreach v_base in array array['spawn_supervisor', 'spawn_reader', 'spawn_human'] loop
         v_role := spawn_login_role(v_base);
         if not exists (select 1 from pg_roles where rolname = v_role) then
             execute format('create role %I nologin', v_role);
@@ -1021,12 +1083,14 @@ declare
     v_role text;
 begin
     foreach v_role in array array[spawn_login_role('spawn_supervisor'),
-                                  spawn_login_role('spawn_reader')] loop
+                                  spawn_login_role('spawn_reader'),
+                                  spawn_login_role('spawn_human')] loop
         execute format('alter role %I with nologin password null', v_role);
     end loop;
-    raise warning 'the database URL has no owner password: logins % and % are off (no login, '
+    raise warning 'the database URL has no owner password: logins %, % and % are off (no login, '
                   'no password) until a migration with the owner''s password',
-                  spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader');
+                  spawn_login_role('spawn_supervisor'), spawn_login_role('spawn_reader'),
+                  spawn_login_role('spawn_human');
 end $$;
 revoke execute on function spawn_logins_off() from public;
 
@@ -1046,6 +1110,64 @@ insert into spawn_grants (principal, agent_id, scope) values
     ('spawn_supervisor', '*', 'read'),
     ('spawn_supervisor', 'agent_worker_*', 'all')
 on conflict (principal, agent_id) do nothing;
+
+-- A person's input from the web page (`spawn serve`, `POST
+-- /api/session/<id>/input`): the command `spawn submit --principal human
+-- --agent <the session's agent> --session <id> --key <key> --action
+-- '{"type":"input","text":<text>}'` makes, through the same `spawn_submit`
+-- with the same idempotency rule (a repeated key of `human` returns the
+-- first command and makes none). Like every input of a person it waits for
+-- the session's turn (crates/spawn-core/src/bridge.rs). The agent is the one
+-- the session belongs to (`spawn_agent_sessions`): the caller cannot pair a
+-- session with another agent. Returns the command, or null when no agent
+-- has used the session. Only the `spawn_human` login may call it, and it may
+-- call nothing else: it reads nothing (no grant), appends no event, and
+-- submits no other action and as no other principal. The text is what a
+-- person types: not blank, at most 8192 bytes (serve.rs `MAX_INPUT_TEXT`),
+-- and no control character but tab and line ends (an escape or a C1 control
+-- would reach the engine's terminal as keys, not as text).
+create or replace function spawn_human_input(p_session text, p_key text, p_text text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_agent text;
+begin
+    if spawn_principal() is distinct from 'human' then
+        raise exception '% may not type as a person (only the spawn_human login does)',
+            session_user using errcode = '42501';
+    end if;
+    if coalesce(p_key, '') = '' or octet_length(p_key) > 256 or p_key ~ '[[:cntrl:]]' then
+        raise exception 'an input needs an idempotency key of 1 to 256 bytes, no control character'
+            using errcode = '22023';
+    end if;
+    if coalesce(btrim(p_text, E' \t\r\n'), '') = '' then
+        raise exception 'an input needs text' using errcode = '22023';
+    end if;
+    if octet_length(p_text) > 8192 then
+        raise exception 'an input is at most 8192 bytes, not %', octet_length(p_text)
+            using errcode = '22023';
+    end if;
+    if p_text ~ '[\x01-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]' then
+        raise exception 'an input holds no control character but tab and line ends'
+            using errcode = '22023';
+    end if;
+    select s.agent_id into v_agent from spawn_agent_sessions s where s.session_id = p_session;
+    if v_agent is null then
+        return null;
+    end if;
+    return (select s.out_id
+              from spawn_submit('human', p_key, v_agent, p_session,
+                                jsonb_build_object('type', 'input', 'text', p_text)) s);
+end $$;
+
+do $$
+begin
+    execute format('alter function spawn_human_input(text, text, text) set search_path = %I, pg_temp',
+                   current_schema());
+    execute 'revoke execute on function spawn_human_input(text, text, text) from public';
+    execute format('grant execute on function spawn_human_input(text, text, text) to %I',
+                   spawn_login_role('spawn_human'));
+end
+$$;
 
 -- Missions, tasks and residents (docs/fleet-architecture.md §3.2).
 --
@@ -1078,7 +1200,8 @@ create table if not exists mission_missions (
     gate_rejections integer not null default 0,
     gate_aborts     integer not null default 0,
     -- The gate's current run of `no_room` outcomes (TMPDIR short of room,
-    -- scripts/disk.sh) on one task, `gate_room_task`: when the first and
+    -- scripts/disk.sh, or a check the integrator makes before a gate:
+    -- disk, memory, the test database) on one task, `gate_room_task`: when the first and
     -- the latest were recorded, how many, and whether one of them escalated
     -- to the supervisor. No verdict on the work, so it counts toward no
     -- halt. A gate that judged (or aborted) ends the run, and so does its
@@ -1143,7 +1266,11 @@ create table if not exists mission_tasks (
     delivered_at_ms bigint,
     -- The models the task's worker runs on (docs/fleet-architecture.md,
     -- "Engine models"): `default`, or `cheap` for simple, well-specified work.
-    model           text   not null default 'default' check (model in ('default', 'cheap'))
+    model           text   not null default 'default' check (model in ('default', 'cheap')),
+    -- The owner's hold this landing task last waited behind (`task.held`,
+    -- the `source.held` record's event id): its `land()` pushed nothing
+    -- under it. Set only by `task.held`; the hold's end does not clear it.
+    held_by         bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1174,6 +1301,7 @@ alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
+alter table mission_tasks add column if not exists held_by bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1192,12 +1320,32 @@ $$;
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
 
+-- The owner's holds on mission sources (docs/fleet-architecture.md §10.3,
+-- "Landing: the owner's hold"): the fold of `source.held` (keyed by source:
+-- a source has at most one active hold, and a new one renews it) less the
+-- `source.released` or `source.hold_expired` naming its hold. While a source
+-- has a row here, no task lands on it: the integrator reads the row under
+-- the landing lock before any push. `hold` is the `source.held` record's
+-- event id, `main` the source's main when it was taken, `held_at_ms` its
+-- record's time and `expires_ms` that time plus its bound, written into the
+-- record by the store. Only a record ends a hold, never the clock.
+create table if not exists mission_source_holds (
+    source     text   primary key,
+    hold       bigint not null,
+    main       text   not null,
+    by         text   not null,
+    reason     text,
+    held_at_ms bigint not null,
+    expires_ms bigint not null
+);
+
 
 -- Who may call the mission functions: the owner (humans' CLI, the
--- controller) and the supervisor's login.
+-- controller) and the supervisor's login; not the reader's, and not the web
+-- page's typing login (`human`, which may only call `spawn_human_input`).
 create or replace function spawn_mission_caller() returns text
 language sql stable as $$
-    select case when x.p is null or x.p = 'spawn_reader' then null
+    select case when x.p is null or x.p in ('spawn_reader', 'human') then null
                 when x.p = 'spawn_supervisor' then 'spawn_supervisor'
                 else 'owner' end
       from (select spawn_principal() as p) x
@@ -1249,8 +1397,10 @@ $$;
 -- `spawn_control_apply`, in the same transaction as the event. The checked
 -- functions below validate against the tables, then record. Applying a
 -- record never validates: the log is the truth, and replaying it must give
--- the same tables.
-create or replace function spawn_control_apply(p_record jsonb, p_at bigint)
+-- the same tables. `p_at` is the record's time and `p_event` its event's id
+-- (a hold is named by its `source.held` event).
+drop function if exists spawn_control_apply(jsonb, bigint);
+create or replace function spawn_control_apply(p_record jsonb, p_at bigint, p_event bigint)
 returns void language plpgsql as $$
 declare
     v_type text := p_record ->> 'type';
@@ -1306,28 +1456,35 @@ begin
                                     updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
-        -- The owner moved a source's main on purpose: a deploy behind
-        -- Spawn's back (`spawn mission moved`), forward from where the last
-        -- landing left it, or the integrator's landing of the owner's
-        -- request (`spawn mission push`; the record names the `request`):
-        -- the missions on that source take the new main as their baseline
-        -- instead of halting at the next pass. The record names them (never
-        -- a halted one); a record from before it did moved every mission on
-        -- the source at that baseline.
+        -- The owner moved a source's main on purpose (a deploy), forward from
+        -- where the last landing left it: the missions on that source take
+        -- the new main as their baseline instead of halting at the next pass.
+        -- The record names them (never a halted one); a record from before
+        -- it did moved every mission on the source at that baseline.
         update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
          where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
-        -- An owner's landing also names the missions on the source with no
-        -- baseline yet (new, or resumed), not halted: they take the new main
-        -- as their first baseline, so a gate of theirs that was judging
-        -- against the old main when it landed does not leave them at it.
-        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
-         where sources ->> 0 = p_record ->> 'source' and baseline is null
-           and jsonb_typeof(p_record -> 'without_baseline') = 'array'
-           and id in (select m::bigint
-                        from jsonb_array_elements_text(p_record -> 'without_baseline') m);
+    when 'source.held' then
+        -- The owner holds landings on a source (spawn_source_hold): the
+        -- source's active hold is this one. A hold on a source already held
+        -- renews it: the previous one ends here, with no record of its own.
+        insert into mission_source_holds (source, hold, main, by, reason, held_at_ms, expires_ms)
+        values (p_record ->> 'source', p_event, p_record ->> 'main', p_record ->> 'by',
+                p_record ->> 'reason', p_at, (p_record ->> 'expires_ms')::bigint)
+        on conflict (source) do update
+           set hold = excluded.hold, main = excluded.main, by = excluded.by,
+               reason = excluded.reason, held_at_ms = excluded.held_at_ms,
+               expires_ms = excluded.expires_ms;
+    when 'source.released', 'source.hold_expired' then
+        -- The record that ends a hold: only the one naming the active hold.
+        delete from mission_source_holds
+         where source = p_record ->> 'source' and hold = (p_record ->> 'hold')::bigint;
+    when 'task.held' then
+        -- A landing that pushed nothing: its source is held. It stays
+        -- `landing`, waiting behind that hold.
+        update mission_tasks set held_by = (p_record ->> 'hold')::bigint where id = v_id;
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
                                  delivered_at_ms = p_at, updated_at_ms = p_at
@@ -1372,8 +1529,10 @@ begin
            set baseline = coalesce(baseline, p_record ->> 'base'),
                gate_rejections = case v_verdict when 'rejected' then gate_rejections + 1
                                                 when 'accepted' then 0 else gate_rejections end,
-               -- `no_room`: the gate found no room in TMPDIR to judge, a
-               -- fact about the host, not the work. It moves neither count.
+               -- `no_room`: no room to judge (TMPDIR's free space, the
+               -- host's memory or the test database, measured before the
+               -- gate or by the gate's own floor), a fact about the host,
+               -- not the work. It moves neither count.
                -- `host_fault`: the gate failed because the host did (the
                -- test database): neither count grows nor resets.
                gate_aborts = case v_verdict when 'aborted' then gate_aborts + 1
@@ -1499,18 +1658,6 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
-    when 'source.push_requested' then
-        -- The owner asked for a commit on a source's main (`spawn mission
-        -- push`): a request the integrator applies between its steps, read
-        -- from the log, folded into no table. Its outcome names it: a
-        -- `source.moved` (which moves the baselines) or a
-        -- `source.push_refused`.
-        null;
-    when 'source.push_refused' then
-        -- The integrator could not apply an owner's request (a conflict, a
-        -- commit not in the source, main moving under it twice): main and
-        -- every baseline stay where they were.
-        null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
         case p_record ->> 'table'
@@ -1560,7 +1707,15 @@ begin
            set kind = jsonb_set(kind, '{detail,record}', p_record)
          where id = v_id;
     end if;
-    perform spawn_control_apply(p_record, v_at);
+    -- An owner's hold expires `bound_s` after its own record, the same way.
+    if p_record ->> 'type' = 'source.held' and jsonb_typeof(p_record -> 'bound_s') = 'number' then
+        p_record := p_record || jsonb_build_object(
+            'expires_ms', v_at + (p_record ->> 'bound_s')::numeric::bigint * 1000);
+        update spawn_events
+           set kind = jsonb_set(kind, '{detail,record}', p_record)
+         where id = v_id;
+    end if;
+    perform spawn_control_apply(p_record, v_at, v_id);
     return v_id;
 end $$;
 
@@ -1572,16 +1727,17 @@ declare
     v_event record;
 begin
     perform pg_advisory_xact_lock(1399957335);
+    delete from mission_source_holds;
     delete from mission_tasks;
     delete from mission_residents;
     delete from mission_missions;
     for v_event in
-        select e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
+        select e.id, e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
           from spawn_events e
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
          order by e.session_seq
     loop
-        perform spawn_control_apply(v_event.record, v_event.recorded_at_ms);
+        perform spawn_control_apply(v_event.record, v_event.recorded_at_ms, v_event.id);
     end loop;
 end $$;
 
@@ -2084,130 +2240,47 @@ begin
     return v_count;
 end $$;
 
--- The owner asks for `p_commit` on a mission source's main (`spawn mission
--- push`, owner only): the commit already waits in the source at `p_ref`
--- (`refs/spawn-owner/<commit>`), and the integrator applies the request
--- between its own steps, under the landing hold, and records its outcome
--- (`source.moved` naming it, or `source.push_refused`). Nothing else moves:
--- no branch, no baseline, no gate. Returns the request's event id. The
--- source is one a gate lands on: a directory on this host with a mission.
-create or replace function spawn_source_push_request(p_source text, p_commit text, p_ref text)
-returns bigint language plpgsql security definer as $$
-begin
-    perform pg_advisory_xact_lock(1399957335);
-    if spawn_mission_caller() is distinct from 'owner' then
-        raise exception 'only the owner lands on a source' using errcode = '42501';
-    end if;
-    if not spawn_source_allowed(p_source) then
-        raise exception 'not a mission source: %', p_source;
-    end if;
-    if left(p_source, 1) <> '/' then
-        raise exception 'the source % is remote: agents'' branches reach only a directory on '
-                        'this host, so nothing lands on it', p_source;
-    end if;
-    if not exists (select 1 from mission_missions where sources ->> 0 = p_source) then
-        raise exception 'no mission is on the source %', p_source;
-    end if;
-    if p_commit is null or p_commit !~ '^[0-9a-f]{40}([0-9a-f]{24})?$' then
-        raise exception 'a commit is named by its full hash, not %', p_commit;
-    end if;
-    if p_ref is distinct from 'refs/spawn-owner/' || p_commit then
-        raise exception 'the owner''s commit waits at refs/spawn-owner/%, not %', p_commit, p_ref;
-    end if;
-    return spawn_control_record(jsonb_build_object(
-        'type', 'source.push_requested', 'source', p_source, 'commit', p_commit,
-        'ref', p_ref, 'by', 'human'));
-end $$;
-
--- The integrator's hold on an owner's landing (owner only): the landing
--- hold's lock (spawn_landing_hold), so no task landing's push and its
--- record are ever split by an owner landing, and dropping a mission waits
--- for it. Released by spawn_landing_release.
-create or replace function spawn_source_push_hold()
-returns void language plpgsql security definer as $$
-begin
-    if spawn_mission_caller() is distinct from 'owner' then
-        raise exception '% may not land work', session_user using errcode = '42501';
-    end if;
-    perform pg_advisory_lock(1399957337);
-end $$;
-
 -- The integrator's records (`spawn integrate`, owner only): gate verdicts,
--- landings, aborts over budget, halts, and the outcomes of the owner's
--- landing requests.
+-- landings, aborts over budget, halts, the landings an owner's hold keeps
+-- waiting (`task.held`) and the holds past their bound (`source.hold_expired`).
+-- Returns the record's event id; null for a `task.held` already recorded for
+-- the task and hold (it records nothing).
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
     v_mission bigint;
     v_stale bigint;
     v_recorded bigint;
-    v_request jsonb;
+    v_hold mission_source_holds;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' is null
-       or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
-                                      'source.moved', 'source.push_refused') then
+    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
+                                   'task.held', 'source.hold_expired') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
     end if;
-    -- The outcome of an owner's landing names its request: a
-    -- `source.push_requested` that has no outcome yet, so every request has
-    -- at most one. A move names the request's source, where main went from
-    -- and to, and is the owner's (`by`); the missions it moves are those on
-    -- the source whose baseline was its `from` and that are not halted, as
-    -- spawn_source_moved names them (`missions`), and those with no
-    -- baseline yet, not halted (`without_baseline`).
-    if p_record ->> 'type' in ('source.moved', 'source.push_refused') then
-        if coalesce(p_record ->> 'request', '') !~ '^[0-9]{1,18}$' then
-            raise exception 'an owner landing''s outcome names its request: %', p_record;
+    -- A hold past its bound ends by this record alone, and only the active
+    -- hold of its source, once the database's clock has reached its
+    -- `expires_ms`: a release or a renewal recorded first wins. The store
+    -- names the bound and the tasks waiting behind it, oldest first.
+    if p_record ->> 'type' = 'source.hold_expired' then
+        select * into v_hold from mission_source_holds where source = p_record ->> 'source';
+        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold' then
+            raise exception 'hold % is not the active hold of %', p_record ->> 'hold',
+                            p_record ->> 'source';
         end if;
-        select e.kind -> 'detail' -> 'record' into v_request
-          from spawn_events e
-         where e.id = (p_record ->> 'request')::bigint
-           and e.session_id = 'session_control' and e.event_name = 'control.recorded'
-           and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.push_requested';
-        if v_request is null then
-            raise exception 'no owner landing request %', p_record ->> 'request';
+        if spawn_now_ms() < v_hold.expires_ms then
+            raise exception 'hold % on % expires at %, not before', v_hold.hold, v_hold.source,
+                            v_hold.expires_ms;
         end if;
-        if exists (
-            select 1 from spawn_events o
-             where o.session_id = 'session_control' and o.event_name = 'control.recorded'
-               and o.kind -> 'detail' -> 'record' ->> 'type'
-                   in ('source.push_requested', 'source.push_refused', 'source.moved')
-               and o.kind -> 'detail' -> 'record' ->> 'request' = p_record ->> 'request') then
-            raise exception 'the owner landing request % has its outcome already',
-                            p_record ->> 'request';
-        end if;
-        if p_record ->> 'type' = 'source.moved' then
-            if p_record ->> 'source' is distinct from v_request ->> 'source'
-               or p_record ->> 'from' is null or p_record ->> 'to' is null then
-                raise exception 'a source.moved names the request''s source %, from and to: %',
-                                v_request ->> 'source', p_record;
-            end if;
-            p_record := p_record || jsonb_build_object('by', 'human', 'missions', (
-                select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
-                  from mission_missions m
-                 where m.sources ->> 0 = p_record ->> 'source'
-                   and m.baseline = p_record ->> 'from' and m.halted is null),
-                -- No baseline yet: a gate of theirs judging against the old
-                -- main would make it their first one, and halt them at the
-                -- next pass. They take the new main instead.
-                'without_baseline', (
-                select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
-                  from mission_missions m
-                 where m.sources ->> 0 = p_record ->> 'source'
-                   and m.baseline is null and m.halted is null));
-        else
-            if coalesce(p_record ->> 'reason', '') = '' then
-                raise exception 'a source.push_refused names its reason: %', p_record;
-            end if;
-            p_record := p_record || jsonb_build_object('source', v_request ->> 'source',
-                                                       'commit', v_request ->> 'commit');
-        end if;
-        return spawn_control_record(p_record);
+        return spawn_control_record(p_record || jsonb_build_object(
+            'expires_ms', v_hold.expires_ms,
+            'waiting', (select coalesce(jsonb_agg(k.id order by k.id), '[]'::jsonb)
+                          from mission_tasks k
+                         where k.state = 'landing' and k.held_by = v_hold.hold)));
     end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
@@ -2228,11 +2301,21 @@ begin
         raise exception 'a host_fault verdict names its evidence, failures and backoff_ms: %',
                         p_record;
     end if;
-    -- No room to judge names what it saw: the free space and the directory.
+    -- No room to judge names what it measured: the check that fell short
+    -- (`disk`, `memory` or `database`), its `measured` and its `threshold`
+    -- (the integrator's checks before a gate, docs/fleet-architecture.md
+    -- §10.3); a disk one, or one that names no check (the gate's own fact,
+    -- and records from before the checks), the free space and the directory.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'no_room'
-       and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
-            or p_record ->> 'tmpdir' is null) then
-        raise exception 'a no_room verdict names free_kb and tmpdir: %', p_record;
+       and ((p_record ? 'check'
+             and (coalesce(p_record ->> 'check', '') not in ('disk', 'memory', 'database')
+                  or coalesce(p_record ->> 'measured', '') = ''
+                  or coalesce(p_record ->> 'threshold', '') = ''))
+            or (coalesce(p_record ->> 'check', 'disk') = 'disk'
+                and (jsonb_typeof(p_record -> 'free_kb') is distinct from 'number'
+                     or p_record ->> 'tmpdir' is null))) then
+        raise exception 'a no_room verdict names its check, measured and threshold, and a disk one free_kb and tmpdir: %',
+                        p_record;
     end if;
     -- The gate runs for minutes: the task may have been closed meanwhile.
     -- A verdict only moves work that is still waiting for it.
@@ -2241,9 +2324,33 @@ begin
          where id = (p_record ->> 'id')::bigint
            and state = any (case p_record ->> 'type'
                               when 'task.landed' then array['landing']
+                              when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
+    end if;
+    -- A landing that waits behind the active hold of its mission's source
+    -- (the integrator read it under the landing lock and pushed nothing),
+    -- recorded once per task and hold: a second records nothing.
+    if p_record ->> 'type' = 'task.held' then
+        select h.* into v_hold
+          from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+          join mission_source_holds h on h.source = m.sources ->> 0
+         where k.id = (p_record ->> 'id')::bigint;
+        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold'
+           or v_hold.source is distinct from p_record ->> 'source' then
+            raise exception 'hold % is not the active hold on task %''s source %',
+                            p_record ->> 'hold', p_record ->> 'id', p_record ->> 'source';
+        end if;
+    end if;
+    if p_record ->> 'type' = 'task.held' and exists (
+        select 1 from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'id' = p_record ->> 'id'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.held'
+           and e.kind -> 'detail' -> 'record' ->> 'hold' = p_record ->> 'hold') then
+        return null;
     end if;
     -- A verdict names the revision of the report it judged (the task's
     -- `revisions` when the gate began). The gate runs for minutes: one on a
@@ -2344,20 +2451,136 @@ begin
     perform pg_advisory_unlock(1399957337);
 end $$;
 
+-- The owner's hold on a mission source (docs/fleet-architecture.md §10.3,
+-- "Landing: the owner's hold"): while a source is held no task lands on it
+-- (its gates still run, its accepted tasks wait), and everything else goes
+-- on. The hold and its end are records: `source.held`, then
+-- `source.released` (the owner) or `source.hold_expired` (the integrator,
+-- once the database's clock reached its `expires_ms`).
+--
+-- A source the owner may hold: one a mission names as its first source,
+-- whatever the mission's state, of a checked shape, and a directory on this
+-- host (nothing lands on a remote one). Raises otherwise, so a mistyped path
+-- never looks like a hold.
+create or replace function spawn_source_holdable(p_source text)
+returns void language plpgsql as $$
+begin
+    if not spawn_source_allowed(p_source) then
+        raise exception 'a source is an absolute path or an https:// or ssh:// URL, not %',
+            coalesce(p_source, 'null') using errcode = '22023';
+    end if;
+    if not exists (select 1 from mission_missions where sources ->> 0 = p_source) then
+        raise exception 'no mission names % as its source: nothing lands there to hold',
+            p_source using errcode = '22023';
+    end if;
+    if p_source not like '/%' then
+        raise exception '% is remote: nothing lands there to hold', p_source
+            using errcode = '22023';
+    end if;
+end $$;
+
+-- Take the integrator's landing lock (spawn_landing_hold's) for an owner's
+-- hold on `p_source` (owner only): a landing whose compare-and-swap push has
+-- begun records its outcome first, so the main the caller reads next is the
+-- one that landing left, and none starts until the hold is recorded. Released
+-- by spawn_landing_release (or with the connection).
+create or replace function spawn_source_hold_lock(p_source text)
+returns void language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner holds a source' using errcode = '42501';
+    end if;
+    perform spawn_source_holdable(p_source);
+    perform pg_advisory_lock(1399957337);
+end $$;
+
+-- Record the owner's hold on `p_source` (owner only, under the landing lock
+-- taken by spawn_source_hold_lock): `source.held` naming the source's main
+-- `p_main` as the caller read it under that lock, `by` human, `bound_s` and
+-- the `reason` when given (at most 500 characters); the store writes its
+-- `expires_ms` (its own time + `bound_s` x 1000). A hold on a source already
+-- held renews it: `renews` names the active hold, which ends with this
+-- record. Returns `{hold, source, main, expires_ms, renews}`.
+create or replace function spawn_source_hold(p_source text, p_main text, p_bound_s integer,
+                                             p_reason text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_renews bigint;
+    v_id bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner holds a source' using errcode = '42501';
+    end if;
+    perform spawn_source_holdable(p_source);
+    if not exists (select 1 from pg_locks
+                    where locktype = 'advisory' and pid = pg_backend_pid() and granted
+                      and classid = 0 and objid = 1399957337 and objsubid = 1) then
+        raise exception 'a hold is recorded under the landing lock (spawn_source_hold_lock)';
+    end if;
+    if coalesce(p_main, '') !~ '^[0-9a-f]{40}([0-9a-f]{24})?$' then
+        raise exception 'a hold names the source''s main as a full commit id, not %',
+            coalesce(p_main, 'null') using errcode = '22023';
+    end if;
+    if p_bound_s is null or p_bound_s < 1 or p_bound_s > 86400 then
+        raise exception 'SPAWN_SOURCE_HOLD_SECS is a whole number of seconds from 1 to 86400, not %',
+            coalesce(p_bound_s::text, 'null') using errcode = '22023';
+    end if;
+    if length(p_reason) > 500 then
+        raise exception 'a hold''s reason is at most 500 characters, not %', length(p_reason)
+            using errcode = '22023';
+    end if;
+    select hold into v_renews from mission_source_holds where source = p_source;
+    v_id := spawn_control_record(jsonb_build_object(
+        'type', 'source.held', 'source', p_source, 'main', p_main, 'by', 'human',
+        'bound_s', p_bound_s, 'renews', v_renews)
+        || case when p_reason is null then '{}'::jsonb
+                else jsonb_build_object('reason', p_reason) end);
+    return (select jsonb_build_object('hold', h.hold, 'source', h.source, 'main', h.main,
+                                      'expires_ms', h.expires_ms, 'renews', v_renews)
+              from mission_source_holds h where h.source = p_source and h.hold = v_id);
+end $$;
+
+-- The owner releases the active hold on `p_source` (owner only): records
+-- `source.released` naming it and returns `{source, released, waiting}`, the
+-- tasks waiting behind it, oldest first; they land at the integrator's next
+-- pass by the existing rules. With no active hold (never held, released or
+-- expired) it records nothing and returns `released` null, so a deploy that
+-- releases on every exit path never fails on it.
+create or replace function spawn_source_release(p_source text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_hold bigint;
+    v_waiting jsonb;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner releases a source' using errcode = '42501';
+    end if;
+    select hold into v_hold from mission_source_holds where source = p_source;
+    if v_hold is null then
+        return jsonb_build_object('source', p_source, 'released', null, 'waiting', '[]'::jsonb);
+    end if;
+    select coalesce(jsonb_agg(k.id order by k.id), '[]'::jsonb) into v_waiting
+      from mission_tasks k where k.state = 'landing' and k.held_by = v_hold;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'source.released', 'source', p_source, 'hold', v_hold, 'by', 'human'));
+    return jsonb_build_object('source', p_source, 'released', v_hold, 'waiting', v_waiting);
+end $$;
+
+-- The records that end a hold, by source, found without reading the rest of
+-- the stream: a landing's stall is measured from the latest one on its
+-- source (dispatch/stall.rs).
+create index if not exists spawn_events_hold_end
+    on spawn_events ((kind -> 'detail' -> 'record' ->> 'source'), session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' in ('source.released', 'source.hold_expired');
+
 -- A task's (or a mission's) records in the control stream, found without
 -- reading the rest: its stages, and the dispatcher's stall facts (`STALL_FACTS`).
 create index if not exists spawn_events_control_record
     on spawn_events ((kind -> 'detail' -> 'record' ->> 'id'), session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded';
-
--- The owner's landing requests and the records that can be their outcome,
--- found without reading the rest of the stream: the integrator reads the
--- pending ones on every pass.
-create index if not exists spawn_events_source_push
-    on spawn_events (session_seq)
-    where session_id = 'session_control' and event_name = 'control.recorded'
-      and kind -> 'detail' -> 'record' ->> 'type'
-          in ('source.push_requested', 'source.push_refused', 'source.moved');
 
 -- The loop's disk records (`host.disk`, owner only): free space on a path
 -- the fleet writes to fell under the warning threshold (`low`) or came back
@@ -2531,7 +2754,7 @@ begin
 end
 $$;
 
-revoke all on mission_missions, mission_residents, mission_tasks from public;
+revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -2547,13 +2770,14 @@ begin
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
-        'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
+        'spawn_control_apply(jsonb, bigint, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
-        'spawn_source_push_request(text, text, text)', 'spawn_source_push_hold()'] loop
+        'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
+        'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -2566,8 +2790,8 @@ begin
         execute format('grant execute on function %s to %I', v_function,
                        spawn_login_role('spawn_supervisor'));
     end loop;
-    execute format('grant select on mission_missions, mission_residents, mission_tasks to %I',
-                   spawn_login_role('spawn_supervisor'));
+    execute format('grant select on mission_missions, mission_residents, mission_tasks, '
+                   'mission_source_holds to %I', spawn_login_role('spawn_supervisor'));
 end
 $$;
 

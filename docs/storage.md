@@ -33,12 +33,31 @@ over a size cap stays out of git (below).
 ## Branching and merging
 
 A workspace snapshot is one git commit: its tree holds every file git would
-commit, each up to the size cap ("Files over the cap", below). The branch
-head alone is the whole workspace, so everything below is a git operation.
+commit, each up to the size cap ("Files over the cap", below), except build
+output, `.spawn/` and the engine's own runtime files ("The engine's runtime
+files", below). The branch head alone is the whole workspace, so everything
+below is a git operation.
+
+Every git Spawn runs, the store's and the controller's, runs in the C
+locale (`LC_ALL=C`, no `LANGUAGE`; `spawn_host::git_command`). Spawn reads
+what git answers (a push's summary, a merge's conflict kinds, listings, the
+error it quotes in a record or a note), and a host whose locale is
+translated (`LANG=zh_CN.UTF-8`) would otherwise get git's messages in its
+language. tmux is given no locale: it has no translations, and one given to
+the command that starts its server would reach every pane.
+
+Spawn's own commits never sign, whatever the host's git configuration says:
+a checkpoint is `commit-tree`, which ignores `commit.gpgSign`, and a landing
+passes `--no-gpg-sign` (a test forces signing and makes both). A test's own
+git (a seed's `init`, `add` and `commit`) runs through
+`spawn_host::test_git_command` (feature `testing`), without the user's or
+the system's git configuration, so a host whose `~/.gitconfig` signs every
+commit with a key no agent holds cannot hang or fail a test.
 
 - **Checkpoint** (every tool call, turn end, exit): the Bridge commits the
   tree against the kept index (a stat cache: only changed files are hashed).
-  Cost is proportional to what changed.
+  Cost is proportional to what changed. The same tree is built for the
+  workspace a set-aside keeps and for a stale workspace's snapshot.
 - **A turn's checkpoint is part of the turn's end.** When the Bridge reads a
   turn's end from the transcript, it commits the workspace and records the
   `artifact.committed` first, then the `turn.stopped` (or `turn.failed`),
@@ -77,10 +96,20 @@ head alone is the whole workspace, so everything below is a git operation.
   from a background pusher off the Bridge's loop: at most one push per
   branch every 5 s, carrying the head as it is then, failures retried with
   backoff, and what still waits pushed when the store drops (a one-shot
-  `spawn tick`, or `spawn loop` ending on SIGTERM after its pass). The
-  queue is in memory, so a new Bridge queues again the branch of every
-  agent with an open task: a push lost with a killed process is made after
-  the restart (a branch the source already has is a no-op push). Only a source that is a directory on this host receives
+  `spawn tick`, or `spawn loop` ending on SIGTERM after its pass). A process
+  has one pusher per source, for its whole life, and every store it builds
+  pushes through it: the Bridge's, and the one-shot stores the dispatcher
+  and the integrator build for a merge of main or a set-aside. So a source
+  has one queue and one pusher thread per process, however many merges it
+  sees. What a one-shot store changed is pushed at once, on the caller's
+  thread, never beside a push of the same branch; a push that fails there
+  stays queued and the pusher's thread retries it. The queue is in memory,
+  so a new Bridge queues again the branch of every agent with an open task,
+  and the integrator, when the pushed branch lacks the agent's latest
+  recorded checkpoint and this host's branch head is that checkpoint,
+  pushes it again before it judges the task `stale`: a push lost with a
+  killed process is made after the restart (a branch the source already
+  has is a no-op push). Only a source that is a directory on this host receives
   branches: a remote may be public, and every agent commit would leave the
   host.
 - **Main at a start or resume**: the Bridge merges main into an agent's
@@ -106,7 +135,18 @@ head alone is the whole workspace, so everything below is a git operation.
   into the agent's mounted workspace (`merge_base`, routed and refreshed by
   `MissionWorkspaces`, holding the branch's lock so no checkpoint reads the
   directory halfway) at two moments when the agent is idle between turns
-  (spawn-cli's `main_merge`):
+  (spawn-cli's `main_merge`). Both moments are chosen on facts read
+  earlier, so the store asks again, under the branch's lock, after the
+  fetch of main and right before it writes anything (`merge_base_when`), on
+  the dispatcher's facts read then: no command in flight in the session, no
+  stop under way, and a live worker stopped at its prompt, judged on its
+  latest fact (the rule a revision is typed in by). The Bridge types into
+  an engine under the same lock (`WorkspaceStore::hold`), so a turn typed in
+  meanwhile is seen. A worker that is not idle keeps its workspace as it is
+  and the merge waits: the integrator's `conflict` note says main is merged
+  when the revision is typed in (the dispatcher's merge below), and a
+  delivery whose merge finds the worker busy is not sent that pass and is
+  tried again on the next:
   - the integrator's `conflict` verdict, before the verdict is recorded, so
     its note names the files that now carry markers;
   - the dispatcher's delivery of a task typed into a live worker, so the
@@ -118,7 +158,8 @@ head alone is the whole workspace, so everything below is a git operation.
     retry's merge finds main already in.
 
   A clean merge is a merge commit recorded as `artifact.committed`
-  (`base_merged`, its files) and then pushed. A record whose append failed
+  (`base_merged`, its files) and then pushed at once (a push that fails
+  stays queued and is retried, above). A record whose append failed
   is written at the agent's next merge, read back from the branch head (a
   two-parent "spawn: merge main" commit; the record's key makes a repeat a
   no-op). A content conflict writes the merge
@@ -133,7 +174,11 @@ head alone is the whole workspace, so everything below is a git operation.
   each such file under `.spawn/main/` in the workspace, and the note or the
   task text tells the worker, who cannot run git, to make each file exactly
   `main`'s version (or delete it where `main` has none); recorded as
-  `merge.conflicted {files, marked: false}`. An agent with no workspace on
+  `merge.conflicted {files, marked: false}`. `.spawn/` is never committed and
+  a mount exports the workspace afresh, so the store records the copies
+  (`main`'s commit and the files) under `<root>/.main-copies/<agent>`, and
+  every mount (a resume after an engine was lost, a host restart) puts them
+  back until the branch contains that `main`. An agent with no workspace on
   the integrator's host gets no merge, and its note says so.
 - **Work set aside**: a resident keeps its branch from task to task, so the
   work of a task cancelled while it was delivered (by `spawn task cancel`,
@@ -190,6 +235,64 @@ head alone is the whole workspace, so everything below is a git operation.
   does not change that. `discard` (`{"type":"discard"}`, a person's or the
   supervisor's decision) tries the checkpoint once more and unmounts even if
   it fails, losing what was not committed.
+- **When an execution has ended** (issue #15): its runner wrote its exit
+  status (`exited`), or no runner the Bridge started runs it any more
+  (`lost`): its terminal is gone, or is there and hosts no runner. A
+  terminal of the execution's name can outlive its runner: a pane kept dead
+  by `remain-on-exit`, or a session a terminal manager (tmux-resurrect,
+  continuum) restored after a restart at a shell prompt. tmux's
+  `has-session` says yes to both, and the Bridge used to call such an
+  execution running forever, while the log's guard refused every start of
+  its session. Now the tmux host answers `TerminalHost::runner` from
+  `list-panes`: the pane alive (`pane_dead` 0) and started by this host's
+  launch (`pane_start_command` names the launch's environment file,
+  `spawn-launch-<terminal>-`; every launch has one). Anything else is
+  `lost`, and its `execution.ended` carries `evidence`: what the host saw
+  (the dead pane's status, or what the pane was started with and runs),
+  and which command found it. The end is the one above: final checkpoint,
+  terminal killed (the restored shell too: no untracked engine is ever
+  adopted), unmount, record. A start, a resume and an input settle such an
+  execution before they act (`Bridge::settle`), instead of failing on it
+  until a later tick: a start or resume then goes on, an input fails once
+  (it needs a running engine) so the normal resume path applies; a stop
+  ends it as `stopped`, with the same evidence. The Bridge's view of what
+  runs changes only by folding the log (an end it wrote is read back
+  before the execution leaves its view), and when that view runs nothing
+  for a session, a command asks the log for the session's open execution
+  (`EventLog::open_execution`, the guard's own rule: the latest
+  `execution.started` with no Bridge-written `execution.ended` after it)
+  and follows it again, with a warning: a view that missed a record cannot
+  answer "runs no execution" while the log refuses every start. At a
+  restart, a recorded mount whose start the view did not read is no
+  orphan when the log holds that execution open: it is kept and the
+  execution followed again.
+- **Workspace identity**: a workspace has one name, the one its engine
+  sees. tmux starts the pane in the workspace (`-c`), the kernel resolves
+  every symlink on the way, and Claude Code files its transcript under the
+  resolved working directory (every character but ASCII letters and digits
+  replaced by `-`). So the workspace root is resolved through its symlinks
+  once, where it is configured (`spawn_host::canonical_root`, from
+  spawn-cli's `workspace_root` and in `GitWorkspace::new`, the store that
+  mints workspace ids), and the mount, the pane's working directory, the
+  workspace id, the runner's exit file (`.spawn/exit-<execution>`) and the
+  transcript path all derive from that one id. A root reached through a
+  symlink (the reporter's `/home` -> `/data00/home`; on macOS `/tmp` and
+  `/var` are links to `/private/...`) used to give each workspace two
+  names, and the Bridge watched a transcript no engine wrote: no turn read,
+  no report collected. Everything else that names a workspace by path
+  (main merged into a workspace, set-aside, report collection, the
+  delivery marks, the mirrors under `.sources/`) builds it from the same
+  configured root, so the names agree. **Records from before**: an
+  `execution.started` or a mount step written by an earlier version names
+  the workspace under the root as configured. On a host whose root is no
+  link the two are the same string and nothing changes. On a host whose
+  root is reached through a link, `WorkspaceStore::canonical` maps such an
+  id onto the resolved root (its old root, the id's path minus the branch,
+  resolves to the store's root), the Bridge reads every execution's
+  workspace through it (so an execution started before the upgrade is
+  followed where its engine writes, its transcript read at the first tick
+  after the restart), and the git store's path check accepts it for a
+  checkpoint, a merge or an unmount.
 - **Landing**: text only, from what the agent published. The candidate is
   the source's `refs/heads/spawn/<agent>`, the branch the pusher publishes,
   fetched into the integrator's mirror as `refs/spawn-integrate/<agent>`,
@@ -311,6 +414,63 @@ head alone is the whole workspace, so everything below is a git operation.
   the trailer): its tree is not the whole workspace. The live fleet had no
   such commits when the store was removed.
 
+## The engine's runtime files
+
+The engine writes files for itself in its working directory, the
+workspace: Claude Code keeps its session's scheduler lock in
+`.claude/scheduled_tasks.lock`, its worktrees under `.claude/worktrees/`,
+and more. They are the engine's state, not the project's, and a checkpoint
+that took them landed them in `main` (Supply PA's `main` got
+`.claude/scheduled_tasks.lock` from `spawn checkpoint exec_212`, 5a386e2).
+
+- **The list** is the engine's own (`ENGINE_RUNTIME_FILES` in
+  `spawn_host::git`): the paths Claude Code (2.1.318) writes to a
+  checkout's `.git/info/exclude` under `# claude-code-runtime`, at any
+  depth: `.claude/scheduled_tasks.lock`, `.claude/scheduled_tasks.json`,
+  `.claude/routines/.state/`, `.claude/worktrees/`, `.claude/checkpoints/`,
+  `.claude/mailbox/`, `.claude/agent-registry.json`,
+  `.claude/agent-memory-local`, `.claude/first-run`,
+  `.claude/assistant-daemon-state.json`; and `.claude/settings.local.json`,
+  the local permissions Claude Code writes when a person allows a tool,
+  which a project never commits. A workspace has no `.git`, so
+  Claude Code writes those rules nowhere there. The live workspaces held
+  only the lock when the rule came in. A new engine version that writes
+  another file means a new entry. `.claude/scheduled_tasks.json` holds the
+  engine's durable schedule (`CronCreate` with `durable`), so such a
+  schedule lasts only as long as the workspace stays mounted.
+- **Never added.** Every staging (`git add -A`) excludes them by pathspec,
+  so no project rule decides it: a project with no `.gitignore` entry for
+  them, or one that re-includes one, commits none. Nothing is written into
+  the mirror or the workspace for it, so a workspace mounted before this
+  rule is covered at its next checkpoint, its kept index included (the
+  index's entries for them are reset from the checkpoint's parent, never
+  trusted). The rest of `.claude/` is the project's and is committed as
+  usual: `.claude/settings.json`, agents, commands, skills, and a file
+  that only looks like one (`.claude/worktrees.md`). The files stay in
+  the workspace (the engine holds them) and go with it at the unmount.
+- **A runtime file the project tracks**, one the branch and `main` both
+  hold, is committed like any tracked file, as git treats a tracked file
+  that an ignore rule names: the engine's edits to it, and its deletion.
+  Spawn never removes one from `main`: the owner does (`git rm --cached`
+  and an ignore rule, as for Supply PA, 37641e9). While a merge of `main`
+  waits on its markers, the branch counts with what that `main` changed
+  since the merge base, so a runtime file `main` added in the merge stays
+  and one it removed stays out.
+- **One only the branch holds** leaves the branch at its next checkpoint:
+  one a checkpoint from before this rule committed (`main` never had it),
+  or one the owner has since removed from `main`. The landing then changes
+  nothing in `main` for it and does not conflict on it (the owner's
+  removal against the engine's edits would be a modify/delete conflict).
+  The engine's file stays in the workspace.
+- **Cost.** One more git call per checkpoint: a listing
+  (`ls-files --with-tree=<parent>`) that finds neither the parent nor the
+  index holding a runtime file, after which nothing else runs (the reset
+  and the rest run only when one is held, or a merge waits on markers);
+  and 16 exclude pathspecs on the staging and the size check. Measured on
+  this repository's tree (321 files, release build, the store's own
+  `commit`): 17–18 ms per checkpoint instead of 13–15 ms with nothing
+  changed, 21–22 ms instead of 17–18 ms with one file edited.
+
 ## The transcript archive
 
 Claude Code's transcript of a native session (one JSONL file under its
@@ -380,8 +540,12 @@ state and wedges nothing:
   floor_bytes}`, and once as `state: "recovered"` when it is back 1 GiB above
   the threshold (so a path at the threshold does not flap). The latest
   record per path is read back from the log on start, so a restart records
-  nothing twice. Each record of the last day reaches the supervisor's digest
-  once ("disk space on this host"); the fleet view's health carries `disk`:
+  nothing twice. A path's latest record reaches the supervisor's digest
+  once: a `low` one ("disk space on this host") is a condition, kept in the
+  dispatcher's plan (and the attention queue) as told and unresolved until
+  the path's `recovered` record replaces it, however long that takes; a
+  `recovered` one of the last day ("disk space back on this host") is news,
+  resolved by being told. The fleet view's health carries `disk`:
   per path its free space now (read by `spawn serve`), the thresholds and
   its latest record, and the health strip shows it. A failure to read or
   record is a line in the loop's log, never a failed pass.

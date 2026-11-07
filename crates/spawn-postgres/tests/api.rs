@@ -62,6 +62,7 @@ fn start(submission_session: SessionId, key: &str) -> Submission {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     }
 }
@@ -424,6 +425,7 @@ fn an_execution_ends_on_the_bridge_event_not_the_runner_report() {
     let ended = |cause| EventKind::ExecutionEnded {
         cause,
         exit_code: Some(0),
+        evidence: None,
     };
     let row = |label: &str| {
         let row = admin(&schema)
@@ -548,6 +550,7 @@ fn two_connections_racing_to_start_one_session_record_one_execution() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Lost,
                 exit_code: None,
+                evidence: None,
             },
         ))
         .expect("the end of a lost execution");
@@ -596,6 +599,7 @@ fn open_tools_are_started_minus_finished_in_live_executions() {
             EventKind::ExecutionEnded {
                 cause: EndCause::Exited,
                 exit_code: Some(0),
+                evidence: None,
             },
         ))
         .expect("append succeeds");
@@ -1374,6 +1378,7 @@ fn view_columns_match_the_snapshot() {
         "agent_freshness: session_id text, agent_id text, last_session_seq bigint, last_event_id bigint, last_event_at_ms bigint, event_count bigint",
         "agent_judgements: session_id text, session_seq bigint, event_id bigint, agent_id text, state text, reason text, based_on_seq bigint, observation jsonb, recorded_at_ms bigint",
         "agent_lineage: session_id text, agent_id text, ancestor_session_id text, depth integer",
+        "agent_open_jobs: session_id text, agent_id text, execution_id text, event_id bigint, job_id text, job_kind text, session_seq bigint, started_at_ms bigint",
         "agent_open_tools: session_id text, agent_id text, execution_id text, tool_use_id text, tool_name text, session_seq bigint, started_at_ms bigint",
         "agent_relations: session_id text, agent_id text, parent_session_id text, recorded_at_ms bigint",
         "agent_state: session_id text, agent_id text, state text, reason text, confidence double precision, based_on_seq bigint, judge text, session_seq bigint, recorded_at_ms bigint, event_id bigint, observation jsonb",
@@ -1692,6 +1697,7 @@ impl Worker<'_> {
             EventKind::ExecutionEnded {
                 cause: EndCause::Stopped,
                 exit_code: None,
+                evidence: None,
             },
         );
     }
@@ -1952,6 +1958,300 @@ fn mission_news_reports_human_commands_with_their_outcome_until_told() {
     );
 }
 
+/// The attention view (`GET /api/attention`) reads when each told
+/// escalation first reached the supervisor: the earliest successful digest
+/// that filed its tag (a failed one told nothing), and nothing for a tag no
+/// digest carried.
+#[test]
+fn the_attention_view_reads_when_each_tag_was_first_told() {
+    let (store, schema) = store("told_at");
+    let supervisor = Worker {
+        store: &store,
+        agent: AgentId::new("agent_supervisor").expect("valid agent"),
+        session: SessionId::new("session_supervisor").expect("valid session"),
+    };
+    let digest = |key: &str, tags: &[&str], outcome: Outcome| {
+        supervisor.send(
+            "spawn-dispatch",
+            key,
+            CommandAction::Input {
+                text: "digest".to_string(),
+                tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            },
+            Some(outcome),
+        )
+    };
+    digest(
+        "digest-1",
+        &["session_worker_a 7"],
+        Outcome::Failed("pane state Busy does not accept input".to_string()),
+    );
+    let landed = digest(
+        "digest-2",
+        &["session_worker_a 7", "host disk-3"],
+        Outcome::Succeeded,
+    );
+    let again = digest("digest-3", &["host disk-3"], Outcome::Succeeded);
+    let mut admin = admin(&schema);
+    admin
+        .execute(
+            "update spawn_commands set finished_at_ms = 1000 where id = $1",
+            &[&landed],
+        )
+        .expect("date the first digest");
+    admin
+        .execute(
+            "update spawn_commands set finished_at_ms = 2000 where id = $1",
+            &[&again],
+        )
+        .expect("date the second digest");
+    let tags = [
+        "session_worker_a 7".to_string(),
+        "host disk-3".to_string(),
+        "missions mission-9".to_string(),
+    ];
+    assert_eq!(
+        store.told_at("session_supervisor", &tags).expect("told at"),
+        serde_json::json!({"session_worker_a 7": 1000, "host disk-3": 1000})
+    );
+    assert_eq!(
+        store.told_at("session_worker_a", &tags).expect("told at"),
+        serde_json::json!({}),
+        "another session's digests"
+    );
+}
+
+/// The attention view reads where the supervisor's engine writes its
+/// transcript (the latest `session.native_started` that names one) and when
+/// its latest turn ended, whether a turn started since or not.
+#[test]
+fn the_attention_view_reads_the_supervisors_transcript_and_latest_turn() {
+    let (store, schema) = store("latest_turn");
+    let supervisor = Worker {
+        store: &store,
+        agent: AgentId::new("agent_supervisor").expect("valid agent"),
+        session: SessionId::new("session_supervisor").expect("valid session"),
+    };
+    let none = store
+        .latest_turn("session_supervisor")
+        .expect("latest turn");
+    assert_eq!(
+        none,
+        serde_json::json!({"transcript": null, "workspace": null, "turn_ended_at_ms": null})
+    );
+    let start = supervisor.input("human", "start-1", None);
+    supervisor.started("exec_1", start);
+    let native = |key: &str, path: Option<&str>| {
+        supervisor.event(
+            "exec_1",
+            key,
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: "native-1".to_string(),
+                transcript_path: path.map(str::to_string),
+                engine_version: None,
+            },
+        );
+    };
+    native(
+        "native:1",
+        Some("/home/owner/.claude/projects/p/native-1.jsonl"),
+    );
+    native("native:2", None);
+    supervisor.event(
+        "exec_1",
+        "turn:1",
+        EventKind::TurnStopped {
+            input_tokens: None,
+            output_tokens: None,
+        },
+    );
+    supervisor.event("exec_1", "message:2", EventKind::MessageReceived);
+    let turn = store
+        .latest_turn("session_supervisor")
+        .expect("latest turn");
+    let stopped: i64 = admin(&schema)
+        .query_one(
+            "select recorded_at_ms from spawn_events
+              where session_id = 'session_supervisor' and event_name = 'turn.stopped'",
+            &[],
+        )
+        .expect("the turn's end")
+        .get(0);
+    assert_eq!(
+        turn,
+        serde_json::json!({
+            "transcript": "/home/owner/.claude/projects/p/native-1.jsonl",
+            "workspace": "1:/workspaces/1",
+            "turn_ended_at_ms": stopped,
+        })
+    );
+}
+
+/// Which charter the supervisor's running native session holds is read
+/// from records: the start of the execution that first named the native
+/// session (a resume names it again, a handoff names a new one) with the
+/// charter hash that start recorded, and the dispatcher's charter inputs
+/// since that start, with their outcomes. Other sessions carry none.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatch_facts_name_the_charter_the_supervisors_native_session_holds() {
+    let (store, _schema) = store("facts_charter");
+    let supervisor = Worker {
+        store: &store,
+        agent: AgentId::new("agent_supervisor").expect("valid agent"),
+        session: SessionId::new("session_supervisor").expect("valid session"),
+    };
+    let worker = Worker {
+        store: &store,
+        agent: AgentId::new("agent_worker_a").expect("valid agent"),
+        session: SessionId::new("session_worker_a").expect("valid session"),
+    };
+    let start = |key: &str, charter: Option<&str>| {
+        supervisor.send(
+            "spawn-liveness",
+            key,
+            CommandAction::Start {
+                engine: ENGINE.to_string(),
+                prompt: "charter".to_string(),
+                parent_session_id: None,
+                from: None,
+                model: None,
+                charter: charter.map(str::to_string),
+            },
+            Some(Outcome::Succeeded),
+        )
+    };
+    let native = |execution: &str, key: &str, id: &str| {
+        supervisor.event(
+            execution,
+            key,
+            EventKind::NativeSessionStarted {
+                engine: ENGINE.to_string(),
+                native_session_id: id.to_string(),
+                transcript_path: None,
+                engine_version: None,
+            },
+        );
+    };
+    let charter_input = |key: &str, hash: &str, outcome: Outcome| {
+        supervisor.send(
+            "spawn-dispatch",
+            key,
+            CommandAction::Input {
+                text: "Spawn dispatcher: your charter changed".to_string(),
+                tags: vec![format!("charter {hash}")],
+            },
+            Some(outcome),
+        )
+    };
+    let charter = || {
+        let facts = store.dispatch_facts().expect("facts");
+        let rows = facts.as_array().expect("rows");
+        let row = |session: &str| {
+            rows.iter()
+                .find(|row| row["session_id"] == session)
+                .cloned()
+                .expect("a row of the session")
+        };
+        assert!(row("session_worker_a")["charter"].is_null(), "a worker's");
+        row("session_supervisor")["charter"].clone()
+    };
+    worker.event("exec_w", "w:message", EventKind::MessageReceived);
+
+    // The first native session, given charter `aa`.
+    let first = start("supervisor-start-first", Some("aa"));
+    supervisor.started("exec_1", first);
+    native("exec_1", "exec_1:native", "native-1");
+    assert_eq!(
+        charter(),
+        serde_json::json!({"start": first, "given": "aa", "inputs": []})
+    );
+
+    // A digest (no charter tag), a person's input with a charter-like
+    // tag, a charter input refused before typing, then one typed.
+    supervisor.send(
+        "spawn-dispatch",
+        "dispatch-digest-1",
+        CommandAction::Input {
+            text: "Spawn dispatcher: 1 update".to_string(),
+            tags: vec!["session_worker_a 7".to_string()],
+        },
+        Some(Outcome::Succeeded),
+    );
+    supervisor.send(
+        "human",
+        "human-1",
+        CommandAction::Input {
+            text: "hello".to_string(),
+            tags: vec!["charter zz".to_string()],
+        },
+        Some(Outcome::Succeeded),
+    );
+    let refused = charter_input(
+        "dispatch-charter-bb-over-1",
+        "bb",
+        Outcome::Failed("the pane does not accept input".to_string()),
+    );
+    let typed = charter_input(
+        "dispatch-charter-bb-over-1-retry-1",
+        "bb",
+        Outcome::Succeeded,
+    );
+    // A resume of the same native session (its version record names it
+    // again): the same start began it.
+    let resume = supervisor.send(
+        "spawn-liveness",
+        "supervisor-resume-1",
+        CommandAction::Resume {
+            prompt: None,
+            model: None,
+        },
+        Some(Outcome::Succeeded),
+    );
+    supervisor.ended("exec_1");
+    supervisor.started("exec_2", resume);
+    native("exec_2", "exec_2:native-version", "native-1");
+    let read = charter();
+    assert_eq!(read["start"], first, "{read}");
+    assert_eq!(read["given"], "aa");
+    let inputs = read["inputs"].as_array().expect("inputs");
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (input["id"].as_i64(), input["hash"].as_str()))
+            .collect::<Vec<_>>(),
+        vec![(Some(refused), Some("bb")), (Some(typed), Some("bb"))],
+        "the dispatcher's charter inputs only: {read}"
+    );
+    assert_eq!(inputs[0]["succeeded"], false);
+    assert_eq!(inputs[0]["error"], "the pane does not accept input");
+    assert_eq!(inputs[0]["key"], "dispatch-charter-bb-over-1");
+    assert_eq!(inputs[1]["succeeded"], true);
+    assert!(inputs[1]["finished_at_ms"].is_i64());
+
+    // A handoff: a new native session, given `bb` by its start; the inputs
+    // typed into the one before are not its own.
+    supervisor.ended("exec_2");
+    let handoff = start("supervisor-start-handoff", Some("bb"));
+    supervisor.started("exec_3", handoff);
+    native("exec_3", "exec_3:native", "native-3");
+    assert_eq!(
+        charter(),
+        serde_json::json!({"start": handoff, "given": "bb", "inputs": []})
+    );
+
+    // A start that recorded no charter (a person's, or one from before).
+    supervisor.ended("exec_3");
+    let plain = start("human-start", None);
+    supervisor.started("exec_4", plain);
+    native("exec_4", "exec_4:native", "native-4");
+    assert_eq!(
+        charter(),
+        serde_json::json!({"start": plain, "given": null, "inputs": []})
+    );
+}
+
 #[test]
 fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
     let (store, _schema) = store("facts_model");
@@ -2005,6 +2305,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
                     EventKind::ExecutionEnded {
                         cause: EndCause::Stopped,
                         exit_code: None,
+                        evidence: None,
                     },
                 )
             })
@@ -2015,7 +2316,7 @@ fn dispatch_facts_carry_the_model_profile_of_the_latest_execution() {
 #[test]
 fn the_restricted_logins_have_derived_passwords_and_write_no_events() {
     let (_store, schema) = store("logins");
-    for base in ["spawn_supervisor", "spawn_reader"] {
+    for base in ["spawn_supervisor", "spawn_reader", "spawn_human"] {
         let role = common::login(&schema, base);
         assert_ne!(role, base, "the login is this database's own");
         let fixed = format!(
@@ -2189,6 +2490,7 @@ fn m15_a_revival_that_dies_at_once_counts_as_a_failure() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    evidence: None,
                 },
             ))
             .expect("ended");
@@ -2282,6 +2584,7 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
                 EventKind::ExecutionEnded {
                     cause: EndCause::Lost,
                     exit_code: None,
+                    evidence: None,
                 },
             ),
         ] {
@@ -2349,6 +2652,190 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
         serde_json::json!(0),
         "an engine that stayed up starts the count over"
     );
+}
+
+/// The dispatcher's facts name its latest resume whose execution ended lost
+/// before its engine became ready (`failed_resume`), whatever the command's
+/// outcome and however long the execution took to end, with the evidence;
+/// a resume whose engine became ready (by its ready wait's record or by a
+/// later reading) is not one, nor is anyone else's resume; an execution
+/// that stayed up starts over (task 132).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
+    /// How an execution's engine became ready, if it did.
+    #[derive(Clone, Copy)]
+    enum Ready {
+        Never,
+        /// The ready wait's own record, before the prompt was typed.
+        Waited,
+        /// A later reading of the Bridge's (a resume with no prompt).
+        Read,
+    }
+    let (store, schema) = store("facts_failed_resume");
+    let worker = AgentId::new("agent_worker_a").expect("valid agent");
+    let session = SessionId::new("session_worker_a").expect("valid session");
+    let append = |execution: &ExecutionId, key: Option<String>, kind: EventKind| {
+        store
+            .append(NewEvent {
+                agent_id: worker.clone(),
+                session_id: session.clone(),
+                execution_id: Some(execution.clone()),
+                source: Source::Bridge,
+                source_event_id: key,
+                kind,
+            })
+            .expect("append");
+    };
+    let ready = || EventKind::ScreenObserved {
+        state: spawn_core::screen::ScreenState::Ready,
+        evidence: "❯".to_string(),
+    };
+    let begin = |number: u64, command: CommandId, became: Ready| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        append(
+            &execution,
+            Some(format!("exec_{number}:started")),
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: WorkspaceId::new("1:/workspaces/1").expect("valid"),
+                command_id: command,
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        );
+        match became {
+            Ready::Never => {}
+            Ready::Waited => append(
+                &execution,
+                Some(format!("exec_{number}:screen:ready")),
+                ready(),
+            ),
+            Ready::Read => append(&execution, None, ready()),
+        }
+    };
+    let lose = |number: u64, evidence: &str| {
+        let execution = ExecutionId::new(format!("exec_{number}")).expect("valid execution");
+        append(
+            &execution,
+            Some(format!("exec_{number}:ended")),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Lost,
+                exit_code: None,
+                evidence: Some(evidence.to_string()),
+            },
+        );
+    };
+    let age = |ms: i64| {
+        admin(&schema)
+            .execute(
+                "update spawn_events set recorded_at_ms = recorded_at_ms - $1",
+                &[&ms],
+            )
+            .expect("age the log");
+    };
+    let send = |principal: &str, key: &str, outcome: Outcome| {
+        let command = store
+            .submit(
+                &Principal::new(principal).expect("valid principal"),
+                &Submission {
+                    agent_id: worker.clone(),
+                    action: CommandAction::Resume {
+                        prompt: Some("go on".to_string()),
+                        model: None,
+                    },
+                    ..start(session.clone(), key)
+                },
+            )
+            .expect("submit");
+        let claimed = store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("the command");
+        (command, claimed, outcome)
+    };
+    let finish = |(_, claimed, outcome): &(CommandId, spawn_core::command::Claimed, Outcome)| {
+        store.finish(claimed, outcome).expect("finish");
+    };
+    let row = || store.dispatch_facts().expect("facts")[0].clone();
+    let never_ready = || Outcome::Failed("pane never became ready, last state Unknown".to_string());
+    let abandoned = "its start failed: pane never became ready, last state Unknown";
+
+    // A task that ran half an hour, then was lost.
+    let first = send("human", "first", Outcome::Succeeded);
+    begin(1, first.0, Ready::Waited);
+    finish(&first);
+    age(1_800_000);
+    lose(1, "the engine's terminal is gone");
+    assert_eq!(
+        row()["failed_resume"],
+        serde_json::Value::Null,
+        "no resume yet"
+    );
+
+    // The dispatcher's resume: started, its pane never ready, abandoned.
+    let resume = send("spawn-dispatch", "dispatch-resume-exec_1", never_ready());
+    begin(2, resume.0, Ready::Never);
+    lose(2, abandoned);
+    finish(&resume);
+    let failed = row()["failed_resume"].clone();
+    assert_eq!(failed["execution_id"], "exec_2", "{failed}");
+    assert_eq!(failed["command_id"], serde_json::json!(resume.0.0));
+    assert_eq!(failed["evidence"], abandoned);
+    assert_eq!(
+        failed["error"],
+        "pane never became ready, last state Unknown"
+    );
+    assert_eq!(
+        row()["resumed_young"],
+        serde_json::json!(0),
+        "its command failed"
+    );
+
+    // A person's resume ends the same way: the dispatcher's is still the one.
+    let again = send("human", "again", never_ready());
+    begin(3, again.0, Ready::Never);
+    lose(3, abandoned);
+    finish(&again);
+    assert_eq!(row()["failed_resume"]["execution_id"], "exec_2");
+
+    // One whose engine became ready and stayed up two minutes starts over.
+    let fixed = send("human", "fixed", Outcome::Succeeded);
+    begin(4, fixed.0, Ready::Waited);
+    finish(&fixed);
+    age(120_000);
+    lose(4, "the engine's terminal is gone");
+    assert_eq!(
+        row()["failed_resume"],
+        serde_json::Value::Null,
+        "an engine that stayed up starts over"
+    );
+
+    // A resume whose engine became ready, read by the Bridge's follow, and
+    // was lost at once: the young-death count's, not a failed resume.
+    let resume = send(
+        "spawn-dispatch",
+        "dispatch-resume-exec_4",
+        Outcome::Succeeded,
+    );
+    begin(5, resume.0, Ready::Read);
+    finish(&resume);
+    lose(5, "the engine's terminal is gone");
+    assert_eq!(
+        row()["failed_resume"],
+        serde_json::Value::Null,
+        "it became ready"
+    );
+    assert_eq!(row()["resumed_young"], serde_json::json!(1));
+
+    // A resume lost before ready whose end took two minutes still counts.
+    let slow = send("spawn-dispatch", "dispatch-resume-exec_5", never_ready());
+    begin(6, slow.0, Ready::Never);
+    age(120_000);
+    lose(6, abandoned);
+    finish(&slow);
+    assert_eq!(row()["failed_resume"]["execution_id"], "exec_6");
 }
 
 #[test]

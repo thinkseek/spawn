@@ -15,7 +15,7 @@
 | 对外接口 | SQL | 视图查询状态，`spawn_submit` 下发命令 |
 | 终端 | tmux | 建会话、输入文本、抓取屏尾 |
 
-Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。`spawn serve` 只提供只读看板和事件查询（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`），不是控制面；所有写入仍只经 Bridge 和 `spawn_submit`。
+Spawn 不实现：Agent 框架、提示工程、文件系统、状态机引擎。`spawn serve` 提供看板和事件查询（默认绑 127.0.0.1，非回环地址必须设 `SPAWN_SERVE_TOKEN`；`SPAWN_SERVE_OPEN_NETWORKS` 列出的内网网段内、以该网段 IP 地址访问的客户端免 token），不是控制面；它唯一的写入是人对某个会话的输入（`POST /api/session/<id>/input`，以 `spawn_human` 登录调用 `spawn_human_input`，即经 `spawn_submit` 提交 principal 为 `human` 的 input）；所有写入仍只经 Bridge 和 `spawn_submit`。
 
 ## 2. crate 结构
 
@@ -54,7 +54,7 @@ spawn_submit(principal, key, agent, session, action)
   → tmux new-session          运行 spawn run -- claude --ax-screen-reader --session-id <uuid>
   → 屏尾判定 Ready            capture-pane 尾行解析
   → tmux send-keys            投递提示
-  → Claude transcript         Bridge 每轮读 <projects>/<工作区>/<uuid>.jsonl，claude_line 归一为统一事件
+  → Claude transcript         Bridge 每轮读 <projects>/<工作区解析后的路径>/<uuid>.jsonl，claude_line 归一为统一事件
   → 屏幕                      Bridge 每轮抓屏，两次读数一致才写 screen.observed
   → 退出文件                  spawn run 把退出码写入 .spawn/exit-<execution>，Bridge 读到后写 execution.ended
   → spawn_append              写 spawn_events，双序号
@@ -66,6 +66,10 @@ spawn_submit(principal, key, agent, session, action)
 两条链路互不依赖：数据链路是引擎到事件到 SQL，状态链路是事件到判定再回到事件。
 
 worker 的终端不持有数据库登录，引擎也不向 Spawn 汇报：会话 id 由 Bridge 用 `--session-id` 指定（由执行 id 派生的 UUID），因此引擎启动前 transcript 路径就已确定。
+
+工作区只有一个名字，即引擎进程看到的那个。tmux 用 `-c` 在工作区启动窗格，内核沿途解析所有符号链接，引擎的工作目录（`getcwd`、`pwd -P`）是解析后的路径，Claude Code 把 transcript 写在这个路径（除 ASCII 字母和数字外的字符都换成 `-`）对应的项目目录下。所以工作区根在配置处解析一次（`spawn_host::canonical_root`：`spawn-cli` 的 `workspace_root`，以及铸造工作区 id 的 `GitWorkspace::new`），mount、窗格的 `-c`、`WorkspaceId`、runner 的退出文件和 transcript 路径都出自这一个 id，不会分叉。根经由符号链接到达的主机（`/home -> /data00/home`；macOS 的 `/tmp`、`/var` 指向 `/private/...`）以前会让 Bridge 盯着一个永远收不到数据的目录（issue #15）。旧版本按配置原样记录的 id 仍指向同一目录：`WorkspaceStore::canonical` 把它映射到解析后的根下，Bridge 读日志里每个执行的工作区都经过它，`GitWorkspace` 的路径检查也接受它（docs/storage.md「Workspace identity」）。
+
+一个执行何时算结束：runner 写了退出文件（`exited`）；或者没有 Bridge 自己启动的 runner 在跑它（`lost`）：终端不在了，或者终端还在但不托管那个 runner（窗格已死、`remain-on-exit`，或重启后终端管理器恢复出来、停在 shell 提示符的同名会话）。tmux 适配器用 `list-panes` 读 `pane_dead` 和 `pane_start_command`，后者必须带上本次启动的环境文件名（`spawn-launch-<终端>-`）。`lost` 的 `execution.ended` 带 `evidence`，记下主机看到了什么。start、resume、input 在动手前先处理这种执行（`Bridge::settle`）：照常走结束流程（最终 checkpoint、杀终端、卸载、写结束事件）后，start/resume 继续，input 失败一次并提示 resume；stop 写下日志在等的结束（`stopped`，同样带 evidence）。Bridge 对“谁在运行”的视图只随折叠日志改变；视图为空时向日志查询该会话未结束的执行（`EventLog::open_execution`，与 `spawn_append_trusted` 的守卫同一规则），所以视图与日志即便分叉也会收敛。不会静默收编不受跟踪的引擎：它会被结束，终端被杀。
 
 ## 4. 终端接入：尾行解析
 
@@ -143,7 +147,7 @@ spawn fleet
 | --- | --- | --- |
 | `SPAWN_DATABASE_URL` | 必填 | PG 连接串 |
 | `SPAWN_GIT_REPO` | 必填 | 不属于任何任务的 agent（supervisor、临时 worker）用的裸仓库 |
-| `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录 |
+| `SPAWN_WORKSPACE_ROOT` | 必填 | 每个分支一份工作树的根目录；启动时解析符号链接一次，工作区 id 都在解析后的根下 |
 | `SPAWN_CLAUDE_PROGRAM` | `claude` | Claude 可执行文件 |
 | `SPAWN_CLAUDE_PROJECTS` | `$CLAUDE_CONFIG_DIR/projects`，否则 `~/.claude/projects` | Claude 写 transcript 的目录 |
 | `SPAWN_MAX_FILE_MB` | `100` | checkpoint 收录的单个文件上限（MiB）；更大的文件不进 checkpoint，并告知 agent 一次 |
@@ -153,16 +157,18 @@ spawn fleet
 | `SPAWN_WORKER` | `spawn-worker` | 租约中的 worker 名 |
 | `SPAWN_LOOP_INTERVAL_MS` | `500` | `spawn loop` 两轮之间的间隔 |
 | `SPAWN_STALL_DELIVERY_SECS` | `600` | 停滞上限（整秒，下同；不是非负整数时在 loop 日志里警告并用默认值）：待投递的任务多久没送达就升级给 supervisor。远长于第一次重试（60 s）和工人结束一轮所需的时间 |
-| `SPAWN_STALL_ACTIVITY_SECS` | `900` | 已投递的任务，会话多久没有新事实就升级。一次长构建或测试可以几分钟不写任何东西；屏幕显示后台 shell 仍在运行时算作活动 |
+| `SPAWN_STALL_ACTIVITY_SECS` | `900` | 已投递的任务，会话多久没有新事实就升级。一次长构建或测试可以几分钟不写任何东西；工人回合已结束、而它启动的后台任务（会话记录里的 `job.started` 没有 `job.ended`）仍开着时算作活动，不升级 |
 | `SPAWN_STALL_REVIEW_SECS` | `1800` | 报告等 supervisor 审阅多久就升级：审阅要读报告、看代码，supervisor 可能正忙 |
 | `SPAWN_STALL_GATE_SECS` | `3600` | 带门禁的任务等集成器判定多久就升级：门禁自己的墙钟是 45 分钟 |
 | `SPAWN_STALL_LANDING_SECS` | `600` | 门禁通过后多久没落地就升级：落地只是一次合并加推送，集成器下一趟就做 |
 | `SPAWN_STALL_STOP_SECS` | `300` | 关闭的临时任务，工人多久还在跑就升级：退役 Stop 在下一趟就发，失败的 Stop 一分钟后重发 |
 | `SPAWN_STALL_HALTED_SECS` | `0` | 停摆的任务（mission halted）多久后升级：停摆从一开始就在等人 |
+| `SPAWN_STALL_JOB_SECS` | `7200` | 工人的一个后台任务（Bash 后台命令、Monitor）开着多久后升级一次（“a background job has run for …”，带种类与 id）。在此之前，等着自己后台任务的工人算在工作：不问 Jev、不升级、不催、不算停滞。Monitor 一小时内自己到期；门禁一次约半小时 |
 | `SPAWN_GATE` | `scripts/rsi/gate.sh` | `spawn integrate` 的门禁脚本，输出一行 JSON 判定；线上指向控制器（部署的提交树）`~/.local/share/spawn-rsi/controllers/spawn/scripts/rsi/gate.sh`，从不指向所有者的检出：所有者的改动部署后才生效 |
 | `SPAWN_INTEGRATE_GATES` | `1` | `spawn integrate` 同时跑的门禁数（跨任务组；每个任务组至多一个；`--gates` 优先）。大于 1（至多 8）须设 `SPAWN_TEST_DATABASE_PER_GATE=1`：门禁目前共用一个测试数据库服务器。场景目录里有 `no-test-database` 文件的任务组（如 Supply PA，测试用 PGlite）拿不到测试库地址，其判定不占这个名额，可与 Spawn 的门禁并行 |
 | `SPAWN_TEST_DATABASE_LOG` | 未设 | 测试数据库服务器的日志（`log_line_prefix` `%m [%p] `）；`spawn integrate` 读它找门禁期间的崩溃：有崩溃时数据库错误也让 check-tests.sh 的失败算主机故障（`host_fault`）而非拒绝。未设时只有连接错误算 |
 | `SPAWN_GATE_HOST_FAULT_BACKOFF_SECS` | `300` | 连续第一次主机故障后，任务等多久再判；每多一次连续主机故障加倍，至多一小时 |
+| `SPAWN_SOURCE_HOLD_SECS` | `10800` | `spawn mission hold` 的上限（整秒，1 到 86400；其他值拒绝并报出变量名，不换成默认值）：暂停记录的 `expires_ms` 是它自己的时间加这么多，之后集成器记 `source.hold_expired` 结束它。3 小时长于最慢的所有者门禁（80 分钟）加一次部署，也长于门禁默认的墙钟（120 分钟） |
 
 ## 8. 验证
 

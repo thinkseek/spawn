@@ -56,7 +56,7 @@ use crate::id::{
 use crate::ingest::{claude_line, claude_version};
 use crate::port::WORKSPACE_STALE;
 use crate::port::{
-    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, StoreError,
+    BaseMerge, Branch, CommandQueue, Commit, EventLog, Launch, READ_LIMIT, Runner, StoreError,
     TerminalError, TerminalHost, TranscriptArchive, WorkspaceError, WorkspaceStore,
 };
 use crate::screen::{ScreenState, TAIL_LINES, TRUST_KEYS, is_trust_dialog, read_claude_screen};
@@ -215,6 +215,27 @@ struct Active {
 }
 
 impl Active {
+    /// An execution as its `execution.started` record has it.
+    fn started(
+        execution_id: ExecutionId,
+        workspace: WorkspaceId,
+        transcript_from: Option<u64>,
+    ) -> Self {
+        Self {
+            execution_id,
+            workspace,
+            checkpoint: None,
+            reported_end: None,
+            unmounting: false,
+            // The execution's lines are the ones after where the transcript
+            // ended when it started, after a restart too.
+            follow: Follow {
+                offset: transcript_from.unwrap_or(0),
+                ..Follow::default()
+            },
+        }
+    }
+
     /// The terminal that hosts the execution: always `spawn-<execution>`,
     /// so it is derived, never stored.
     fn terminal(&self) -> TerminalName {
@@ -256,6 +277,10 @@ struct Follow {
     /// The engine's version, once read from this execution's transcript
     /// and recorded.
     version: Option<String>,
+    /// What the Bridge saw when it found no runner of its own running the
+    /// execution (the terminal gone, or there and hosting no runner): the
+    /// end record's `evidence`.
+    evidence: Option<String>,
 }
 
 /// What the Bridge knows about one session.
@@ -517,6 +542,15 @@ pub struct Bridge {
     held: HashMap<CommandId, Claimed>,
 }
 
+/// What [`Bridge::settle`] did with an open execution no runner runs.
+enum Settled {
+    /// It ended now: what it was, for the command's report.
+    Ended(String),
+    /// Its end could not finish this tick (its final checkpoint failed): it
+    /// stays due, and the command fails with why.
+    Ending(String),
+}
+
 /// What handling a claimed command came to.
 enum Handled {
     /// It finished, with this outcome.
@@ -597,10 +631,12 @@ impl Bridge {
         let mut orphans = Vec::new();
         for (session, view) in &self.sessions {
             for (command, steps) in &view.steps {
+                // Compared as the store names them now (an execution's
+                // workspace is read that way): one directory, one name.
                 if let Some(workspace) = steps.mounted.as_ref()
                     && !steps.released
                     && !steps.started
-                    && !used.contains(workspace)
+                    && !used.contains(&self.workspaces.canonical(workspace))
                 {
                     orphans.push((
                         view.agent_id.clone(),
@@ -612,6 +648,23 @@ impl Bridge {
             }
         }
         for (agent_id, session, command, workspace) in orphans {
+            // A mount the log's open execution uses is no orphan, whatever
+            // this view missed: unmounting it would take the directory from
+            // under its engine. The execution is followed again instead.
+            if let Some(active) = self
+                .log
+                .open_execution(&session)?
+                .and_then(|record| self.track_from_log(&session, &record))
+                && (active.execution_id == ExecutionId::for_command(command)
+                    || active.workspace == self.workspaces.canonical(&workspace))
+            {
+                eprintln!(
+                    "spawn: {session}: the log holds execution {} open in {}, which this \
+                     Bridge's view had not read; it is followed again, its mount kept",
+                    active.execution_id, active.workspace
+                );
+                continue;
+            }
             if self.workspaces.unmount(&workspace).is_err() {
                 continue;
             }
@@ -813,19 +866,10 @@ impl Bridge {
             } => {
                 view.model = *model;
                 if let Some(execution_id) = event.execution_id.clone() {
-                    view.active = Some(Active {
-                        execution_id,
-                        workspace: workspace.clone(),
-                        checkpoint: None,
-                        reported_end: None,
-                        unmounting: false,
-                        // The execution's lines are the ones after where the
-                        // transcript ended when it started, after a restart too.
-                        follow: Follow {
-                            offset: transcript_from.unwrap_or(0),
-                            ..Follow::default()
-                        },
-                    });
+                    // As the store names it now: a record from before the
+                    // root was resolved names the same directory.
+                    let workspace = self.workspaces.canonical(workspace);
+                    view.active = Some(Active::started(execution_id, workspace, *transcript_from));
                 }
             }
             // After a restart, the last recorded screen. The Bridge's own
@@ -842,7 +886,9 @@ impl Bridge {
             }
             // An exit report of an old runner (engine-sourced; runners now
             // write SPAWN_EXIT_FILE): only old logs hold one.
-            EventKind::ExecutionEnded { cause, exit_code } if current => {
+            EventKind::ExecutionEnded {
+                cause, exit_code, ..
+            } if current => {
                 if let Some(active) = view.active.as_mut() {
                     active.reported_end = Some((*cause, *exit_code));
                 }
@@ -914,18 +960,24 @@ impl Bridge {
             let ended =
                 self.advance(&agent_id, &session, native.as_deref(), &mut active, report)?;
             if ended {
+                // The Bridge's view of what runs changes only by folding the
+                // log (the end just recorded, read back below): it never
+                // drops an execution the log still holds open, which the
+                // log's guard would refuse every start for while the Bridge
+                // saw nothing to end.
                 ended_now.push((session.clone(), active.execution_id.clone()));
+                continue;
             }
-            if let Some(view) = self.sessions.get_mut(&session) {
-                if ended {
-                    view.active = None;
-                } else if let Some(held) = view.active.as_mut() {
-                    // Cleared by `advance` only once committed: a failed
-                    // checkpoint stays due and is tried again next tick.
-                    held.checkpoint = active.checkpoint;
-                    held.reported_end = active.reported_end;
-                    held.follow = active.follow;
-                }
+            if let Some(held) = self
+                .sessions
+                .get_mut(&session)
+                .and_then(|view| view.active.as_mut())
+            {
+                // Cleared by `advance` only once committed: a failed
+                // checkpoint stays due and is tried again next tick.
+                held.checkpoint = active.checkpoint;
+                held.reported_end = active.reported_end;
+                held.follow = active.follow;
             }
         }
         if !ended_now.is_empty() {
@@ -968,25 +1020,20 @@ impl Bridge {
             .or_else(|| self.exit_status(session, active, report))
         {
             Some(end) => Some(end),
-            None => match self
-                .terminals
-                .is_alive(&active.terminal(), &active.workspace)
-            {
-                Ok(true) => {
+            // Running means a runner of the Bridge's own in the terminal, not
+            // a terminal of that name: one that outlived its runner (a dead
+            // pane, a shell restored after a restart) runs no engine of
+            // Spawn's, and would otherwise hold the execution open forever.
+            None => match self.not_running(session, active, report) {
+                Ok(None) => {
                     self.follow_screen(agent_id, session, active)?;
                     None
                 }
-                // The engine may have written its exit status and closed the
-                // pane between the read above and this check: read it again
-                // before calling the execution lost.
-                Ok(false) => Some(
-                    self.exit_status(session, active, report)
-                        .unwrap_or((EndCause::Lost, None)),
-                ),
+                Ok(Some(end)) => Some(end),
                 Err(error) => {
                     report
                         .warnings
-                        .push(format!("is_alive {}: {error}", active.terminal()));
+                        .push(format!("runner {}: {error}", active.terminal()));
                     None
                 }
             },
@@ -1045,6 +1092,34 @@ impl Bridge {
         };
         let text = String::from_utf8_lossy(&bytes);
         Some((EndCause::Exited, text.trim().parse().ok()))
+    }
+
+    /// How the execution ended when no runner of the Bridge's own runs it
+    /// any more ([`TerminalHost::runner`]), `None` while one does. The
+    /// engine may have written its exit status and closed the pane between
+    /// the read before this check and it, so the exit file is read again
+    /// first: an exit is an exit. Otherwise it is lost, and what the host
+    /// saw is kept for its end record (`follow.evidence`). An error says
+    /// nothing about the terminal: the execution is left as it is.
+    fn not_running(
+        &self,
+        session: &SessionId,
+        active: &mut Active,
+        report: &mut TickReport,
+    ) -> Result<Option<(EndCause, Option<i32>)>, TerminalError> {
+        let seen = match self
+            .terminals
+            .runner(&active.terminal(), &active.workspace)?
+        {
+            Runner::Running => return Ok(None),
+            Runner::Gone => format!("its terminal {} is gone", active.terminal()),
+            Runner::Untracked(seen) => seen,
+        };
+        if let Some(end) = self.exit_status(session, active, report) {
+            return Ok(Some(end));
+        }
+        active.follow.evidence = Some(format!("{seen}; its runner wrote no exit status"));
+        Ok(Some((EndCause::Lost, None)))
     }
 
     /// Append the events in what the engine wrote to its transcript since
@@ -1354,7 +1429,11 @@ impl Bridge {
             Some(&active.execution_id),
             Source::Bridge,
             Some(format!("{}:ended", active.execution_id)),
-            EventKind::ExecutionEnded { cause, exit_code },
+            EventKind::ExecutionEnded {
+                cause,
+                exit_code,
+                evidence: active.follow.evidence.clone(),
+            },
         )?;
         Ok(true)
     }
@@ -1566,6 +1645,27 @@ impl Bridge {
         // records. While the log refuses them the command is not handled
         // (the error ends the tick; the lease brings the command back).
         self.record_unrecorded_commit(&claimed.session_id)?;
+        // An execution the log holds open that nothing runs any more is
+        // ended first, so the command meets the session as it is.
+        let settled = match &action {
+            CommandAction::Start { .. }
+            | CommandAction::Resume { .. }
+            | CommandAction::Input { .. } => self.settle(claimed, report)?,
+            CommandAction::Stop | CommandAction::Discard => None,
+        };
+        match (&action, settled) {
+            (_, None) => {}
+            (_, Some(Settled::Ending(why))) => {
+                return Ok(Handled::Finished(Outcome::Failed(why)));
+            }
+            (CommandAction::Input { .. }, Some(Settled::Ended(what))) => {
+                return Ok(Handled::Finished(Outcome::Failed(format!(
+                    "{what}; an input needs a running engine: resume the session"
+                ))));
+            }
+            // A start or resume goes on, on a session that runs nothing.
+            (_, Some(Settled::Ended(what))) => report.warnings.push(what),
+        }
         let outcome = match action {
             CommandAction::Start {
                 engine: _,
@@ -1573,6 +1673,9 @@ impl Bridge {
                 parent_session_id,
                 from,
                 model,
+                // The control layer's record of the charter it gave: nothing
+                // the Bridge does depends on it.
+                charter: _,
             } => self.start(
                 claimed,
                 &Begin {
@@ -1598,6 +1701,149 @@ impl Bridge {
         self.sessions.get(session)?.active.clone()
     }
 
+    /// The session's open execution: the Bridge's view's, or, when that
+    /// runs none, the log's ([`EventLog::open_execution`]), taken back into
+    /// the view as its `execution.started` has it, with a warning. The view
+    /// follows the log, but one that missed a record would otherwise answer
+    /// "runs no execution" while the log refuses every start until an end
+    /// that nothing would write. Taking the record back adopts no engine:
+    /// what runs it is checked next ([`Self::settle`], the stop's end).
+    fn open(
+        &mut self,
+        claimed: &Claimed,
+        report: &mut TickReport,
+    ) -> Result<Option<Active>, StoreError> {
+        if let Some(active) = self.running(&claimed.session_id) {
+            return Ok(Some(active));
+        }
+        let Some(active) = self
+            .log
+            .open_execution(&claimed.session_id)?
+            .and_then(|record| self.track_from_log(&claimed.session_id, &record))
+        else {
+            return Ok(None);
+        };
+        report.warnings.push(format!(
+            "{}: the log holds execution {} open and this Bridge's view had none; it is \
+             followed again",
+            claimed.session_id, active.execution_id
+        ));
+        Ok(Some(active))
+    }
+
+    /// The open execution the log answered with (`record`, an
+    /// `execution.started`), put into the session's view as the fold would
+    /// have: the view follows the log again.
+    fn track_from_log(&mut self, session: &SessionId, record: &EventRecord) -> Option<Active> {
+        let EventKind::ExecutionStarted {
+            workspace,
+            transcript_from,
+            ..
+        } = &record.event.kind
+        else {
+            return None;
+        };
+        let active = Active::started(
+            record.event.execution_id.clone()?,
+            self.workspaces.canonical(workspace),
+            *transcript_from,
+        );
+        if let Some(view) = self.sessions.get_mut(session) {
+            view.active = Some(active.clone());
+        }
+        Some(active)
+    }
+
+    /// Before a start, a resume or an input acts on its session: the
+    /// session's open execution (the log's, which the Bridge's view
+    /// follows) is checked against what runs. One that no runner of the
+    /// Bridge's own runs any more (its terminal gone, or there and hosting
+    /// no runner: a dead pane, a shell restored after a restart) is ended
+    /// now, through the end every execution takes (final checkpoint,
+    /// terminal killed, unmount, `execution.ended`), as `exited` when its
+    /// runner left an exit status and as `lost` with what the host saw
+    /// otherwise. Without this the command would fail on an execution that
+    /// will never answer: a start or resume refused because the session
+    /// "already runs" one, an input refused at a pane that hosts no engine,
+    /// until a later tick ended it, or forever while the terminal stays.
+    ///
+    /// Nothing to settle (`None`): no open execution, a running one, an end
+    /// already under way (the normal path finishes it), the command's own
+    /// execution (a retried start goes on from it), or a host that cannot
+    /// tell. The engine in an untracked terminal is never adopted: it is
+    /// ended, and the terminal killed.
+    fn settle(
+        &mut self,
+        claimed: &Claimed,
+        tick: &mut TickReport,
+    ) -> Result<Option<Settled>, StoreError> {
+        let Some(mut active) = self.open(claimed, tick)? else {
+            return Ok(None);
+        };
+        if active.execution_id == ExecutionId::for_command(claimed.command_id)
+            || active.reported_end.is_some()
+            || active.unmounting
+        {
+            return Ok(None);
+        }
+        let mut report = TickReport::default();
+        let Ok(Some((cause, exit_code))) =
+            self.not_running(&claimed.session_id, &mut active, &mut report)
+        else {
+            return Ok(None);
+        };
+        let seen = active
+            .follow
+            .evidence
+            .clone()
+            .unwrap_or_else(|| format!("its runner exited ({exit_code:?})"));
+        if let Some(evidence) = active.follow.evidence.take() {
+            active.follow.evidence = Some(format!("{evidence}; found by {}", claimed.command_id));
+        }
+        let ended = self.end(
+            &claimed.agent_id,
+            &claimed.session_id,
+            &mut active,
+            cause,
+            exit_code,
+            false,
+            &mut report,
+        )?;
+        self.catch_up()?;
+        if ended {
+            // The command being handled is finished by the tick, with its
+            // own outcome; every other input waiting on the execution fails.
+            self.held.remove(&claimed.command_id);
+            self.fail_waiting(&claimed.session_id, Some(cause))?;
+            tick.warnings.append(&mut report.warnings);
+            return Ok(Some(Settled::Ended(format!(
+                "{}'s execution {} was not running ({seen}); it ended as {}",
+                claimed.session_id,
+                active.execution_id,
+                cause_name(cause)
+            ))));
+        }
+        // Its end stays due: each tick tries it again, as a stop's.
+        if let Some(held) = self
+            .sessions
+            .get_mut(&claimed.session_id)
+            .and_then(|view| view.active.as_mut())
+        {
+            held.reported_end = active.reported_end;
+            held.follow.end_failures = active.follow.end_failures;
+            held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.evidence = active.follow.evidence;
+        }
+        report.warnings.insert(
+            0,
+            format!(
+                "{}'s execution {} is not running ({seen}) and its end is not done yet",
+                claimed.session_id, active.execution_id
+            ),
+        );
+        Ok(Some(Settled::Ending(report.warnings.join("; "))))
+    }
+
     fn start(
         &mut self,
         claimed: &Claimed,
@@ -1614,7 +1860,7 @@ impl Bridge {
         // Another Bridge may have started the session since this tick read
         // the log; the log refuses a second start either way.
         self.catch_up()?;
-        if let Some(outcome) = self.started_before(claimed, prompt, native.is_none()) {
+        if let Some(outcome) = self.started_before(claimed, prompt) {
             return outcome;
         }
         let model = model.unwrap_or_else(|| {
@@ -1720,22 +1966,25 @@ impl Bridge {
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
-        fresh: bool,
     ) -> Result<Outcome, StoreError> {
-        match self
-            .terminals
-            .is_alive(&active.terminal(), &active.workspace)
-        {
-            Ok(true) => {}
-            Ok(false) => {
+        // Nothing is typed into a terminal that does not host the runner.
+        match self.terminals.runner(&active.terminal(), &active.workspace) {
+            Ok(Runner::Running) => {}
+            Ok(Runner::Gone) => {
                 return Ok(Outcome::Failed(format!(
                     "{}: the engine's terminal is gone; the execution ends as lost",
                     claimed.session_id
                 )));
             }
+            Ok(Runner::Untracked(seen)) => {
+                return Ok(Outcome::Failed(format!(
+                    "{}: {seen}; the execution ends as lost",
+                    claimed.session_id
+                )));
+            }
             Err(error) => {
                 return Ok(Outcome::Failed(format!(
-                    "is_alive {}: {error}",
+                    "runner {}: {error}",
                     active.terminal()
                 )));
             }
@@ -1751,7 +2000,7 @@ impl Bridge {
                 format!("the prompt {MAY_HAVE_TYPED}"),
                 false,
             ),
-            Typing::Due => self.prompt_engine(claimed, active, prompt, fresh),
+            Typing::Due => self.prompt_engine(claimed, active, prompt),
         }
     }
 
@@ -1763,11 +2012,10 @@ impl Bridge {
         &mut self,
         claimed: &Claimed,
         prompt: &str,
-        fresh: bool,
     ) -> Option<Result<Outcome, StoreError>> {
         if let Some(active) = self.running(&claimed.session_id) {
             if active.execution_id == ExecutionId::for_command(claimed.command_id) {
-                return Some(self.go_on_starting(claimed, &active, prompt, fresh));
+                return Some(self.go_on_starting(claimed, &active, prompt));
             }
             return Some(Ok(Outcome::Failed(format!(
                 "{} already runs an execution",
@@ -1852,31 +2100,40 @@ impl Bridge {
         } else {
             format!("{}\n\n{text}", notices.join("\n\n"))
         };
-        if let Err(error) = self
-            .terminals
-            .stage_text(&active.terminal(), &active.workspace, &text)
-        {
-            return Ok(Err(Untyped::Refused(error)));
-        }
-        self.step(
-            claimed,
-            Some(&active.execution_id),
-            CommandStep::Typing,
-            None,
-        )?;
-        let typed = self
-            .terminals
-            .submit_staged(&active.terminal(), &active.workspace);
-        if typed.is_ok() {
+        let typed = {
+            // A merge of main into the workspace waits while this types,
+            // and once it gets the workspace it finds the `typed` step
+            // recorded: no merge writes the workspace under the turn this
+            // starts ([`WorkspaceStore::merge_base_when`]).
+            let _held = self.workspaces.hold(&active.workspace);
+            if let Err(error) =
+                self.terminals
+                    .stage_text(&active.terminal(), &active.workspace, &text)
+            {
+                return Ok(Err(Untyped::Refused(error)));
+            }
             self.step(
                 claimed,
                 Some(&active.execution_id),
-                CommandStep::Typed,
+                CommandStep::Typing,
                 None,
             )?;
-            if !notices.is_empty() {
-                self.workspaces.notices_told(&active.workspace, &notices);
+            let typed = self
+                .terminals
+                .submit_staged(&active.terminal(), &active.workspace);
+            if typed.is_ok() {
+                self.step(
+                    claimed,
+                    Some(&active.execution_id),
+                    CommandStep::Typed,
+                    None,
+                )?;
             }
+            typed
+        };
+        // After the hold: telling the store takes the branch's lock too.
+        if typed.is_ok() && !notices.is_empty() {
+            self.workspaces.notices_told(&active.workspace, &notices);
         }
         Ok(typed.map_err(Untyped::Unknown))
     }
@@ -1918,21 +2175,20 @@ impl Bridge {
         if prompt.is_empty() {
             return Ok(Outcome::Succeeded);
         }
-        self.prompt_engine(claimed, active, prompt, native.is_none())
+        self.prompt_engine(claimed, active, prompt)
     }
 
-    /// Type a started engine's prompt (`fresh`: a new native session, whose
-    /// directory may be new to the engine). An engine that never got it must
-    /// not look alive (whoever started it would wait on it forever): it is
-    /// abandoned.
+    /// Type a started engine's prompt, answering the engine's trust dialog
+    /// first when it shows ([`Self::type_prompt`]). An engine that never got
+    /// it must not look alive (whoever started it would wait on it forever):
+    /// it is abandoned.
     fn prompt_engine(
         &mut self,
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
-        fresh: bool,
     ) -> Result<Outcome, StoreError> {
-        let outcome = self.type_prompt(claimed, active, prompt, fresh)?;
+        let outcome = self.type_prompt(claimed, active, prompt)?;
         if let Outcome::Failed(why) = outcome {
             let discard = self.never_typed(claimed, active)?;
             return self.abandon(claimed, active, why, discard);
@@ -2192,6 +2448,7 @@ impl Bridge {
     ) -> Result<Outcome, StoreError> {
         let mut report = TickReport::default();
         let mut ending = active.clone();
+        ending.follow.evidence = Some(format!("its start failed: {why}"));
         let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
@@ -2212,6 +2469,7 @@ impl Bridge {
                 held.reported_end = ending.reported_end;
                 held.follow.end_failures = ending.follow.end_failures;
                 held.follow.end_tried_at = ending.follow.end_tried_at;
+                held.follow.evidence = ending.follow.evidence;
             }
         }
         report.warnings.insert(0, why);
@@ -2333,17 +2591,22 @@ impl Bridge {
         }
     }
 
+    /// Wait for the engine's input box, then type `prompt` into it. The
+    /// Bridge exported the workspace itself, for a fresh session and a
+    /// resume alike, so it answers the engine's trust dialog in both: trust
+    /// lives in the engine's own config (`~/.claude.json`), which can forget
+    /// a workspace its session ran in (a host move, a reset or rewritten
+    /// config, a workspace exported at a new path) while the transcript
+    /// survives. Nothing in the log says whether the engine still trusts it.
     fn type_prompt(
         &mut self,
         claimed: &Claimed,
         active: &Active,
         prompt: &str,
-        fresh: bool,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
-        // Only a fresh session's directory can be new to the engine: a
-        // resume runs where its session ran, which was trusted then.
-        let mut trusted = !fresh;
+        // Whether this wait answered the trust dialog already.
+        let mut answered = false;
         // The trust dialog comes before the engine draws any prompt: once a
         // prompt was seen, nothing on the pane is that dialog any more.
         let mut prompt_seen = false;
@@ -2377,15 +2640,16 @@ impl Bridge {
                 };
             let reading = read_claude_screen(&pane);
             prompt_seen |= reading.state != ScreenState::Unknown;
-            // The Bridge exported this directory itself, so it trusts it.
-            // Answer once (a second answer would land in the input box), and
-            // only the dialog itself: on two equal reads, before any prompt.
-            if !trusted && !prompt_seen && is_trust_dialog(&pane) {
+            // The Bridge exported this directory itself, so it trusts it,
+            // whether the session is fresh or resumed. Answer once (a second
+            // answer would land in the input box), and only the dialog
+            // itself: on two equal reads, before any prompt.
+            if !answered && !prompt_seen && is_trust_dialog(&pane) {
                 if dialog.as_deref() != Some(pane.as_str()) {
                     dialog = Some(pane);
                     continue;
                 }
-                trusted = true;
+                answered = true;
                 if let Err(error) =
                     self.terminals
                         .send_keys(&active.terminal(), &active.workspace, &TRUST_KEYS)
@@ -2656,12 +2920,30 @@ impl Bridge {
         discard: bool,
         tick: &mut TickReport,
     ) -> Result<Outcome, StoreError> {
-        let Some(mut active) = self.running(&claimed.session_id) else {
+        // No execution open in the log: no end to wait for. One the log
+        // holds open is ended here even when this Bridge's view had lost it.
+        let Some(mut active) = self.open(claimed, tick)? else {
             return Ok(Outcome::Succeeded);
         };
         let mut report = TickReport::default();
         // A stop of an end already under way keeps its cause.
         let (cause, exit_code) = active.reported_end.unwrap_or((EndCause::Stopped, None));
+        // A stop that finds no runner of its own there (the terminal gone,
+        // or hosting no runner) still writes the end the log waits for, and
+        // says what it found.
+        if active.reported_end.is_none() && !active.unmounting && active.follow.evidence.is_none() {
+            let seen = match self.terminals.runner(&active.terminal(), &active.workspace) {
+                Ok(Runner::Gone) => Some(format!("its terminal {} is gone", active.terminal())),
+                Ok(Runner::Untracked(seen)) => Some(seen),
+                Ok(Runner::Running) | Err(_) => None,
+            };
+            active.follow.evidence = seen.map(|seen| {
+                format!(
+                    "{seen}: no runner was running when {} came",
+                    claimed.command_id
+                )
+            });
+        }
         let ended = self.end(
             &claimed.agent_id,
             &claimed.session_id,
@@ -2688,6 +2970,7 @@ impl Bridge {
             held.reported_end = active.reported_end;
             held.follow.end_failures = active.follow.end_failures;
             held.follow.end_tried_at = active.follow.end_tried_at;
+            held.follow.evidence = active.follow.evidence;
         }
         if report.warnings.is_empty() {
             report.warnings.push(format!(
@@ -2758,6 +3041,15 @@ pub const LOOP_PRINCIPALS: [&str; 3] = ["spawn-dispatch", "spawn-integrate", "sp
 /// refused while the pane cannot take it.
 pub fn waits(principal: &str) -> bool {
     !LOOP_PRINCIPALS.contains(&principal)
+}
+
+/// The wire name of an end's cause.
+fn cause_name(cause: EndCause) -> &'static str {
+    match cause {
+        EndCause::Exited => "exited",
+        EndCause::Stopped => "stopped",
+        EndCause::Lost => "lost",
+    }
 }
 
 /// The failure of an input that waited and was never typed, the session's

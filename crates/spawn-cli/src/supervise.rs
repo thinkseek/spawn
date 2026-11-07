@@ -15,6 +15,13 @@
 //! Approved residents are kept by the same rule ([`keep_residents`]).
 //! Idempotency keys derive from the facts, so a restarted loop never submits
 //! the same revival twice.
+//!
+//! A new native session's start records the hash of the charter it gives
+//! ([`Charter`], the start's `charter`). A resume, a restarted loop or a
+//! compaction keeps the native session and the charter it holds: when that
+//! is not the charter this build writes, the dispatcher types the new one
+//! in at the supervisor's next idle prompt, once
+//! ([`crate::dispatch`]'s `charter`).
 
 use spawn_core::command::{CommandAction, Submission};
 use spawn_core::event::ENGINE;
@@ -84,6 +91,32 @@ pub(crate) fn decide(facts: &LivenessFacts, now_ms: i64) -> Revive {
     Revive::Start { handoff: true }
 }
 
+/// The supervisor's charter as this build and its environment write it: the
+/// text a new native session is given, and its hash, which the start records
+/// (`CommandAction::Start`'s `charter`) and the dispatcher compares with the
+/// charter the running native session holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Charter {
+    /// The text, [`charter`].
+    pub(crate) text: String,
+    /// FNV-1a of the text, 16 hex digits.
+    pub(crate) hash: String,
+}
+
+impl Charter {
+    /// The charter this process gives: `spawn` names the program, and
+    /// `SPAWN_MISSION_FILE` the standing mission, as everywhere else.
+    pub(crate) fn deployed(spawn: &str) -> Self {
+        Self::of(charter(spawn, &env_or("SPAWN_MISSION_FILE", "mission.md")))
+    }
+
+    /// The charter `text` and its hash.
+    pub(crate) fn of(text: String) -> Self {
+        let hash = format!("{:016x}", crate::sources::fnv(&text));
+        Self { text, hash }
+    }
+}
+
 /// The supervisor's standing instructions, given at every new native session.
 fn charter(spawn: &str, mission: &str) -> String {
     format!(
@@ -98,7 +131,8 @@ You work for missions, not for repositories. Missions arrive in the inbox (human
 `spawn mission add`, or tell you in this pane: then add it yourself with `{spawn} mission add \
 --text ...`). A standing mission may also be in {mission}.
 
-How work flows: you decide, Spawn delivers. You never type into workers yourself.
+How work flows: you decide, Spawn delivers. Briefs and send-backs go through tasks; the only \
+input you type into a worker yourself is a nudge or a `continue` (see Tools).
 1. Plan: split a mission into tasks. Each task gets a self-contained brief: goal, inputs (paths, \
 repos, facts it needs), done criteria. Never paste your own conversation into a brief.
 2. Route each task, keeping every context about one concern:
@@ -107,7 +141,8 @@ charter;
    - otherwise to a new ephemeral worker (`--kind ephemeral --worker <short label>`), which exists \
 for that task only.
    If a concern keeps coming back and no resident owns it, propose one: `{spawn} resident propose \
---name <name> --charter <one paragraph>`. A human must approve it before you can use it.
+--name <name> --charter <one paragraph>`. Only the owner approves it: say so in a \"For the \
+owner:\" line and route the work to ephemeral workers meanwhile.
    Add `--model cheap` to run a task entirely on a cheaper model (DeepSeek) when it is simple and \
 fully specified: docs, mechanical edits, adding tests for behaviour the brief states. Keep the \
 default for design, concurrency, security, debugging, and anything a gate judges as hard.
@@ -122,10 +157,29 @@ work; if it rejects, the task comes back to its worker with the gate's output, a
 again. A mission that accepts by gate alone (an objective mission, such as RSI) gets its tasks \
 from the controller's backlog and its gate judges every report: you are not told of them, and a \
 review of one is refused. A halted mission (three rejections in \
-a row, or its source moved outside the gate) waits for a human: tell them with HUMAN:.
+a row, or its source moved outside the gate) waits for the owner, who alone resumes it: write one \
+\"For the owner:\" line about it and go on with other work.
 4. Close the mission when its goal is met: `{spawn} mission close --id N --state done --summary \
 ...` (or `--state dropped`). Work you accepted in a gated mission still lands after `done`; \
 `dropped` lets it go.
+
+Deciding: you never wait on a person.
+- Decide everything within your grants yourself, and act on it in the same turn: reviews (accept, \
+or send back with what to fix), assigning, routing and cancelling tasks, nudging a stalled worker, \
+a `continue` to a worker whose turn ended on a transient model API error (overloaded, rate \
+limited, a 5xx, a dropped connection), stopping a worker, proposing or retiring a resident, \
+closing a mission. When unsure, take the choice that is easiest to undo, and act.
+- Report each decision in the turn you make it, on its own line: \"Decided (the owner may \
+reverse): <what you did, and why>\".
+- What is outside your grants you neither do nor ask about: deploys, owner-protected files (in \
+Spawn: the gate, rsi/, scripts/, deploy/), money, deleting data, changing grants or \
+credentials (approving a resident, setting a mission's gate, resuming a halted mission). \
+Write it as one line, \"For the owner: <what, and why>\", do not wait for an answer, and move on \
+to other work.
+- Never end a turn on a question, or on a list of decisions for the owner to make: no \"HUMAN:\" \
+line, no \"Your decisions:\".
+- The owner can type to you at any time. Read an owner's message as an instruction (it may \
+reverse a decision of yours), never as the answer to a pending question: you leave none pending.
 
 Tools (run them with Bash; they go through your restricted login):
 - `{spawn} mission list` — missions with their tasks, states and reports; the resident roster.
@@ -134,20 +188,20 @@ Tools (run them with Bash; they go through your restricted login):
 - `{spawn} resident propose --name <name> --charter <text>`, `{spawn} resident retire --name <name>`
 - `{spawn} fleet` — every agent's state (rules or Jev), attention, needs_human, stuck.
 - `{spawn} tail --session <id>` — one agent's judgement, recent events, judgements and commands.
-- `{spawn} submit --agent <agent> --session <session> --key <unique> --action '{{\"type\":\"stop\"}}'` \
-— stop a worker if you must (input to workers goes through tasks). An agent whose `fleet` \
+- `{spawn} submit --agent <agent> --session <session> --key <unique> --action \
+'{{\"type\":\"input\",\"text\":\"continue\"}}'` — a `continue` after a transient model API \
+error, or a short nudge to a stalled worker; anything more goes through tasks. \
+`--action '{{\"type\":\"stop\"}}'` stops a worker if you must. An agent whose `fleet` \
 attention says `end_stalled` has ended but its final checkpoint keeps failing: its workspace \
-stays mounted and holds work that is on no branch. Fix the cause if you can (a full disk); `{{\"type\":\"discard\"}}` unmounts it and loses that work, so send it only \
-when the work may go.
+stays mounted and holds work that is on no branch. Fix the cause if you can (a full disk); \
+`{{\"type\":\"discard\"}}` unmounts it and loses that work, which is deleting data: that is a \
+\"For the owner:\" line, not yours to send.
 
 Boundaries:
 - Spawn's dispatcher delivers tasks one at a time per worker, nudges, resumes and sends you \
 digests. You cannot command yourself, set a mission's gate, or resume a halted mission.
 - Humans may write to any worker directly; you get a one-line note in your digest. Adjust your \
 plan to it.
-- When something truly needs a person (credentials, product decisions, irreversible actions, \
-approving a resident), end your turn with one clear question that starts with \"HUMAN:\". Then \
-wait.
 - No fixed fleet size: start what the mission needs, no more; idle residents cost little, idle \
 ephemeral workers should not exist.
 - Do not run git commands in your workspace; workers run in their own.
@@ -178,14 +232,15 @@ Your last commands, newest first:\n{mine}\n\nStart with `mission list` and `flee
 
 /// One liveness step for one session: decide, and submit the revival.
 /// `resume` words the resume prompt from the facts; `start` builds the
-/// prompt of a new native session, given whether it is a handoff. Returns a
-/// line for the loop's log when it acted.
+/// prompt of a new native session, given whether it is a handoff, with the
+/// hash of the charter it gives, if it gives one (recorded on the start).
+/// Returns a line for the loop's log when it acted.
 fn revive(
     store: &PostgresStore,
     agent: &str,
     session: &str,
     resume: impl FnOnce(&LivenessFacts) -> String,
-    start: impl FnOnce(bool) -> String,
+    start: impl FnOnce(bool) -> (String, Option<String>),
 ) -> Result<Option<String>, String> {
     let error = |error: &dyn std::fmt::Display| error.to_string();
     let session_id = SessionId::new(session).map_err(|e| error(&e))?;
@@ -206,20 +261,24 @@ fn revive(
             },
             format!("{session}-resume-{execution}-{}", facts.failures),
         ),
-        Revive::Start { handoff } => (
-            CommandAction::Start {
-                engine: ENGINE.to_string(),
-                prompt: start(handoff),
-                parent_session_id: None,
-                from: None,
-                model: None,
-            },
-            format!(
-                "{session}-start-{execution}-{}-{}",
-                facts.failures,
-                if handoff { "handoff" } else { "first" }
-            ),
-        ),
+        Revive::Start { handoff } => {
+            let (prompt, charter) = start(handoff);
+            (
+                CommandAction::Start {
+                    engine: ENGINE.to_string(),
+                    prompt,
+                    parent_session_id: None,
+                    from: None,
+                    model: None,
+                    charter,
+                },
+                format!(
+                    "{session}-start-{execution}-{}-{}",
+                    facts.failures,
+                    if handoff { "handoff" } else { "first" }
+                ),
+            )
+        }
     };
     let submission = Submission {
         agent_id: AgentId::new(agent).map_err(|e| error(&e))?,
@@ -234,10 +293,10 @@ fn revive(
     Ok(Some(format!("liveness: {session} {decision:?} ({key})")))
 }
 
-/// Keep the supervisor alive.
+/// Keep the supervisor alive. A new native session is given the deployed
+/// charter, and its start records the charter's hash.
 pub(crate) fn keep_alive(store: &PostgresStore) -> Result<Option<String>, String> {
     let spawn = spawn_program();
-    let mission = env_or("SPAWN_MISSION_FILE", "mission.md");
     revive(
         store,
         SUPERVISOR_AGENT,
@@ -251,11 +310,12 @@ fleet` and continue supervising per your charter.",
             )
         },
         |with_handoff| {
-            let mut prompt = charter(&spawn, &mission);
+            let Charter { text, hash } = Charter::deployed(&spawn);
+            let mut prompt = text;
             if with_handoff {
                 prompt.push_str(&handoff(store));
             }
-            prompt
+            (prompt, Some(hash))
         },
     )
 }
@@ -284,9 +344,14 @@ pub(crate) fn keep_residents(store: &PostgresStore) -> Result<Vec<String>, Strin
                 },
                 |task| task_prompt(&task),
             );
-            format!(
-                "{prompt}\n\nYour previous native session could not be resumed, so this is a new \
-one; anything you learned before is in your workspace and its reports."
+            // A resident's charter is the approved record, not Spawn's code:
+            // no charter hash to record (docs/fleet-architecture.md §3).
+            (
+                format!(
+                    "{prompt}\n\nYour previous native session could not be resumed, so this is a \
+new one; anything you learned before is in your workspace and its reports."
+                ),
+                None,
             )
         };
         let resume = |facts: &LivenessFacts| {
@@ -304,8 +369,30 @@ task; when it is finished, write `{REPORT}`.",
 
 #[cfg(test)]
 mod tests {
-    use super::{Revive, charter, decide};
+    use super::{Charter, Revive, charter, decide};
     use spawn_postgres::LivenessFacts;
+
+    /// The hash a start records names the text it gave: the same text, the
+    /// same hash, on any host and build; any change to it (the program it
+    /// names included), another.
+    #[test]
+    fn the_charter_hash_names_its_text() {
+        let one = Charter::of(charter("spawn", "mission.md"));
+        assert_eq!(one.text, charter("spawn", "mission.md"));
+        assert_eq!(one, Charter::of(charter("spawn", "mission.md")));
+        assert_eq!(one.hash.len(), 16);
+        assert!(one.hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            Charter::of(String::new()).hash,
+            "cbf29ce484222325",
+            "FNV-1a, stable across builds"
+        );
+        assert_ne!(
+            one.hash,
+            Charter::of(charter("/opt/spawn", "mission.md")).hash
+        );
+        assert_ne!(one.hash, Charter::of(format!("{}.", one.text)).hash);
+    }
 
     #[test]
     fn the_charter_says_when_a_task_runs_cheap() {
@@ -313,6 +400,46 @@ mod tests {
         assert!(text.contains("--model cheap"));
         assert!(text.contains("simple and fully specified"));
         assert!(text.contains("security"));
+    }
+
+    /// The owner, 2026-11-06: "no human but can input". The supervisor
+    /// decides what its grants allow and says so; what they do not allow is
+    /// a line for the owner it does not wait on; the owner's words are
+    /// instructions, never answers.
+    #[test]
+    fn the_charter_never_waits_on_a_person() {
+        let text = charter("spawn", "mission.md");
+        for sentence in [
+            "you never wait on a person.",
+            "Decide everything within your grants yourself, and act on it in the same turn",
+            "a `continue` to a worker whose turn ended on a transient model API error",
+            "\"Decided (the owner may reverse): <what you did, and why>\"",
+            "\"For the owner: <what, and why>\", do not wait for an answer, and move on to other \
+work.",
+            "deploys, owner-protected files",
+            "money, deleting data, changing grants",
+            "Never end a turn on a question, or on a list of decisions for the owner to make",
+            "Read an owner's message as an instruction",
+            "never as the answer to a pending question",
+            "'{\"type\":\"input\",\"text\":\"continue\"}'",
+        ] {
+            assert!(text.contains(sentence), "the charter says: {sentence}");
+        }
+        // Nothing left of the old rule: no question to end a turn on, no
+        // waiting, no HUMAN: line but the one it forbids.
+        for gone in [
+            "Then wait",
+            "tell them with HUMAN:",
+            "starts with \"HUMAN:\"",
+        ] {
+            assert!(!text.contains(gone), "the charter no longer says: {gone}");
+        }
+        assert_eq!(
+            text.matches("HUMAN:").count(),
+            1,
+            "only in `no \"HUMAN:\" line`"
+        );
+        assert!(text.contains("no \"HUMAN:\" line, no \"Your decisions:\""));
     }
 
     fn facts() -> LivenessFacts {

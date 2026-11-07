@@ -8,6 +8,7 @@ import type { MotionValue } from "motion/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { fetchEvents, fetchEventsSince } from "../../events";
+import { pageHidden } from "../../validated";
 import {
   admitMarks,
   controlRecord,
@@ -184,6 +185,12 @@ export function useShowFeed({
     const { signal } = controller;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let running: { stop: () => void } | undefined;
+    // Polls at once when the page shows again (it reads nothing hidden).
+    let pollNow: (() => void) | undefined;
+    const onVisibility = () => {
+      if (!pageHidden(document)) pollNow?.();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     setStatus("loading");
     setError(null);
     setSpan(null);
@@ -216,7 +223,13 @@ export function useShowFeed({
             seen.current = [...day.events, ...seen.current];
           })
           .catch(() => undefined);
+        let polling = false;
         const poll = async () => {
+          if (polling) return;
+          if (timer !== undefined) clearTimeout(timer);
+          // A hidden page reads nothing; it reads at once when it shows.
+          if (pageHidden(document)) return;
+          polling = true;
           try {
             const page = await fetchEvents({ after }, signal);
             after = page.next;
@@ -225,9 +238,12 @@ export function useShowFeed({
           } catch (caught) {
             if (signal.aborted) return;
             setError(caught instanceof Error ? caught.message : String(caught));
+          } finally {
+            polling = false;
           }
           if (!signal.aborted) timer = setTimeout(poll, POLL_MS);
         };
+        pollNow = () => void poll();
         timer = setTimeout(poll, POLL_MS);
       } catch (caught) {
         if (signal.aborted) return;
@@ -238,6 +254,7 @@ export function useShowFeed({
     return () => {
       controller.abort();
       if (timer !== undefined) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
       running?.stop();
     };
   }, [mode, clock, reset]);

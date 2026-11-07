@@ -6,9 +6,10 @@ import { clockTime, formatDuration, relativeTime, stageDuration } from "../../fo
 import { PHASE_LABEL } from "../../missionTimeline";
 import type { Lane, TaskBar } from "../../missionTimeline";
 import { stageStep } from "../../missions";
+import { taskTitle } from "../../ordering";
 import { VerdictBadge } from "../rsi/Phase";
 import { cx } from "../ui";
-import { Markdown } from "./Markdown";
+import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible } from "./parts";
 import { PHASE_COLOR, verdictColor } from "./timelineStyle";
 
@@ -38,6 +39,9 @@ export function TaskPanel({
   onZoom: () => void;
 }) {
   const task = bar.task;
+  // Opened, the task's texts are read in full (the board sends their first
+  // lines).
+  const texts = useTaskTexts(task, true);
   const lastVerdict = [...bar.verdicts].reverse().find((verdict) => verdict.by === "gated") ?? null;
   const reason = lastVerdict?.reason ?? task.last_gate?.reason ?? null;
   const total = (bar.end ?? now) - bar.start;
@@ -64,6 +68,11 @@ export function TaskPanel({
               </span>
             )}
           </h3>
+          {taskTitle(task, { missionName: lane.name }) && (
+            <p className="mt-1 line-clamp-2 text-label text-foreground">
+              {taskTitle(task, { missionName: lane.name })}
+            </p>
+          )}
           <div className="mt-1 flex min-w-0 items-center gap-2">
             <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
           </div>
@@ -133,7 +142,14 @@ export function TaskPanel({
               <RotateCcw size={12} />
               Review note
             </div>
-            <Markdown source={task.review_note} className="mt-1" />
+            <TaskText
+              what="note"
+              excerpt={task.review_note}
+              bytes={task.review_note_bytes}
+              full={texts.texts?.review_note}
+              read={texts}
+              className="mt-1"
+            />
           </section>
         )}
 
@@ -211,12 +227,24 @@ export function TaskPanel({
 
         {task.brief && (
           <Collapsible label="Brief">
-            <Markdown source={task.brief} />
+            <TaskText
+              what="brief"
+              excerpt={task.brief}
+              bytes={task.brief_bytes}
+              full={texts.texts?.brief}
+              read={texts}
+            />
           </Collapsible>
         )}
-        {task.report ? (
+        {task.report !== null || (task.report_bytes ?? 0) > 0 ? (
           <Collapsible label="Report" defaultOpen>
-            <Markdown source={task.report} />
+            <TaskText
+              what="report"
+              excerpt={task.report}
+              bytes={task.report_bytes}
+              full={texts.texts?.report}
+              read={texts}
+            />
           </Collapsible>
         ) : (
           <p className="text-caption text-faint-foreground">No report yet.</p>

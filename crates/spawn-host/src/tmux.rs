@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{TerminalName, WorkspaceId};
-use spawn_core::port::{Launch, READ_LIMIT, TerminalError, TerminalHost};
+use spawn_core::port::{Launch, READ_LIMIT, Runner, TerminalError, TerminalHost};
 
 /// Variables kept out of the tmux server's environment, besides every
 /// `SPAWN_*` one (see [`scrub`]).
@@ -216,7 +216,50 @@ fn write_environment(
         text.push_str(&spawn_core::shell::shell_quote(value));
         text.push('\n');
     }
-    write_private(terminal, "launch", "env", "the environment", &text)
+    write_private(terminal, LAUNCH, "env", "the environment", &text)
+}
+
+/// The kind of [`write_private`] file a launch's environment goes through
+/// ([`write_environment`]).
+const LAUNCH: &str = "launch";
+
+/// What the start command of a pane this host launched as `terminal` holds,
+/// and nothing else's does: the name of its environment file
+/// (`spawn-launch-<terminal>-<pid>-<nanos>.env`, [`write_private`]). The
+/// `-` after the name keeps `spawn-exec_1` from matching `spawn-exec_10`.
+fn launch_marker(terminal: &TerminalName) -> String {
+    format!("spawn-{LAUNCH}-{}-", terminal.as_str())
+}
+
+/// What a terminal hosts, from one `list-panes` line of
+/// `#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}`
+/// ([`TerminalHost::runner`]): the runner this host launched there, alive,
+/// or why not.
+fn runner_of(terminal: &TerminalName, line: &str) -> Runner {
+    let mut fields = line.splitn(4, '\t');
+    let dead = fields.next().unwrap_or_default();
+    let status = fields.next().unwrap_or_default();
+    let current = fields.next().unwrap_or_default();
+    let started = fields.next().unwrap_or_default();
+    if dead == "1" {
+        let status = if status.is_empty() { "none" } else { status };
+        return Runner::Untracked(format!(
+            "the pane of {terminal} is dead (exit status {status}): its runner is gone"
+        ));
+    }
+    if started.contains(&launch_marker(terminal)) {
+        return Runner::Running;
+    }
+    let started = if started.is_empty() {
+        "no command (a shell, as a session restored after a restart is)".to_string()
+    } else {
+        let shown: String = started.chars().take(160).collect();
+        format!("`{shown}`")
+    };
+    Runner::Untracked(format!(
+        "{terminal} does not host the runner Spawn started there: its pane was started with \
+         {started} and runs `{current}`"
+    ))
 }
 
 /// `text` in a new file only this uid reads (mode 600, created exclusively)
@@ -259,8 +302,18 @@ fn write_private(
     Ok(path)
 }
 
-impl TerminalHost for TmuxHost {
-    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+/// How many `new-session` calls one [`TerminalHost::start`] makes when
+/// each reaches a server that shuts down ([`server_left`]). The client sees
+/// its connection drop only once the old server's socket is closed for
+/// good, so the next call finds no server and starts one: one shutdown
+/// costs one call. The rest cover another server coming and going
+/// meanwhile, without looping on a tmux that always fails this way.
+const START_ATTEMPTS: usize = 3;
+
+impl TmuxHost {
+    /// One `new-session` for `launch`, its environment file removed unless
+    /// a pane was started to remove it.
+    fn new_session(&self, launch: &Launch) -> Result<Run, TerminalError> {
         let mut arguments = vec![
             "new-session".to_string(),
             "-d".to_string(),
@@ -276,41 +329,50 @@ impl TerminalHost for TmuxHost {
         // The environment (a database login among it) never goes on a
         // command line, which every local user reads in /proc: it goes
         // through a file only this uid reads, which the pane's shell sources
-        // and removes before it runs the program.
-        let mut environment_file = None;
-        if launch.environment.is_empty() {
-            arguments.push("--".to_string());
-        } else {
-            let file = write_environment(&launch.terminal, &launch.environment)?;
-            arguments.extend(
-                [
-                    "--",
-                    "/bin/sh",
-                    "-c",
-                    "set -a; . \"$0\"; rm -f -- \"$0\"; set +a; exec \"$@\"",
-                ]
-                .map(str::to_string),
-            );
-            arguments.push(file.to_string_lossy().into_owned());
-            environment_file = Some(file);
-        }
+        // and removes before it runs the program. Every launch has that file,
+        // empty or not: its name, on the pane's start command, is how
+        // `runner` tells this launch from anything else of the same name.
+        let file = write_environment(&launch.terminal, &launch.environment)?;
+        arguments.extend(
+            [
+                "--",
+                "/bin/sh",
+                "-c",
+                "set -a; . \"$0\"; rm -f -- \"$0\"; set +a; exec \"$@\"",
+            ]
+            .map(str::to_string),
+        );
+        arguments.push(file.to_string_lossy().into_owned());
         arguments.push(launch.program.clone());
         arguments.extend(launch.arguments.iter().cloned());
 
         let run = self.run(&arguments);
-        let run = match run {
-            Ok(run) if run.code == Some(0) => return Ok(()),
-            Ok(run) => run,
-            Err(error) => {
-                if let Some(file) = &environment_file {
-                    let _ = std::fs::remove_file(file);
-                }
-                return Err(error);
+        if !matches!(&run, Ok(run) if run.code == Some(0)) {
+            // No pane ran to remove it.
+            let _ = std::fs::remove_file(&file);
+        }
+        run
+    }
+}
+
+impl TerminalHost for TmuxHost {
+    fn start(&self, launch: &Launch) -> Result<(), TerminalError> {
+        let mut attempts = 1;
+        let run = loop {
+            let run = self.new_session(launch)?;
+            // The server this call reached was shutting down after its last
+            // session ended (another terminal was just killed or exited)
+            // and dropped the call unread: nothing was started, and a
+            // server that goes takes its sessions with it, so a new call
+            // cannot start the terminal twice.
+            if run.code != Some(0) && server_left(&run.stderr) && attempts < START_ATTEMPTS {
+                attempts += 1;
+                continue;
             }
+            break run;
         };
-        // No pane ran to remove it.
-        if let Some(file) = &environment_file {
-            let _ = std::fs::remove_file(file);
+        if run.code == Some(0) {
+            return Ok(());
         }
         let stderr = run.stderr.trim();
         if stderr.contains("duplicate session") {
@@ -442,6 +504,43 @@ impl TerminalHost for TmuxHost {
         }
     }
 
+    /// `list-panes`, not `display-message`, which answers a target that is
+    /// not there with empty fields and success.
+    fn runner(
+        &self,
+        terminal: &TerminalName,
+        _workspace: &WorkspaceId,
+    ) -> Result<Runner, TerminalError> {
+        // One tmux call, as `has-session` was: what the Bridge asks of every
+        // live execution each pass costs no more than before.
+        let run = self.run(&[
+            "list-panes".to_string(),
+            "-t".to_string(),
+            Self::pane(terminal),
+            "-F".to_string(),
+            "#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{pane_start_command}"
+                .to_string(),
+        ])?;
+        match run.code {
+            Some(0) => {}
+            Some(1) if gone(&run.stderr) => return Ok(Runner::Gone),
+            // Like `has-session`: a failing tmux says nothing about the
+            // terminal.
+            other => {
+                return Err(TerminalError(format!(
+                    "list-panes returned {other:?}: {}",
+                    run.stderr.trim()
+                )));
+            }
+        }
+        // A session with no pane left is being torn down.
+        Ok(run
+            .stdout
+            .lines()
+            .next()
+            .map_or(Runner::Gone, |line| runner_of(terminal, line)))
+    }
+
     fn capture_tail(
         &self,
         terminal: &TerminalName,
@@ -566,9 +665,17 @@ fn write_local(path: &str, bytes: &[u8]) -> Result<bool, TerminalError> {
 fn gone(stderr: &str) -> bool {
     stderr.contains("can't find session")
         || stderr.contains("no server running")
-        // Asked while the server shuts down after its last session ended.
-        || stderr.contains("server exited unexpectedly")
+        || server_left(stderr)
         || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
+}
+
+/// Whether tmux's error says the call reached a server that went before it
+/// read the call: one shutting down after its last session ended. Its
+/// socket is still open (the server is exiting, or a pane it is forking
+/// holds a copy until it execs), so the client connects, and the server
+/// never accepts it.
+fn server_left(stderr: &str) -> bool {
+    stderr.contains("server exited unexpectedly")
 }
 
 /// At most [`READ_LIMIT`] bytes from `offset` of the file `relative` in
@@ -627,8 +734,37 @@ fn read_local(path: &str, offset: u64) -> Result<Option<Vec<u8>>, TerminalError>
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_LIMIT, read_in_workspace, read_local};
+    use super::{READ_LIMIT, read_in_workspace, read_local, runner_of};
+    use spawn_core::id::TerminalName;
+    use spawn_core::port::Runner;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_pane_hosts_its_runner_only_when_this_host_launched_it_and_it_lives() {
+        let terminal = TerminalName::new("spawn-exec_1").expect("valid terminal");
+        let launched = "0\t\tspawn\t/bin/sh -c \"set -a; . \\\"$0\\\"; exec \\\"$@\\\"\" \
+                        /run/user/1000/spawn-launch-spawn-exec_1-42-7.env /bin/spawn run -- claude";
+        assert_eq!(runner_of(&terminal, launched), Runner::Running);
+        // The same launch of another terminal is not this one's runner.
+        let other = launched.replace("spawn-exec_1-", "spawn-exec_10-");
+        assert!(matches!(runner_of(&terminal, &other), Runner::Untracked(_)));
+        // A shell at its prompt, as a session restored after a restart is.
+        let Runner::Untracked(why) = runner_of(&terminal, "0\t\tbash\t") else {
+            panic!("a restored shell hosts no runner");
+        };
+        assert!(
+            why.contains("no command") && why.contains("`bash`"),
+            "{why}"
+        );
+        // A dead pane (remain-on-exit) hosts nothing, whatever it ran.
+        let dead = launched
+            .replacen('0', "1", 1)
+            .replacen("\t\t", "\t137\t", 1);
+        let Runner::Untracked(why) = runner_of(&terminal, &dead) else {
+            panic!("a dead pane hosts no runner");
+        };
+        assert!(why.contains("dead (exit status 137)"), "{why}");
+    }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("spawn-read-{name}-{}", std::process::id()));
@@ -651,6 +787,70 @@ mod tests {
         for name in ["PATH", "HOME", "https_proxy", "LANG"] {
             assert!(!super::scrub(OsStr::new(name)), "{name}");
         }
+    }
+
+    /// tmux is given no locale (see the crate's documentation): it has no
+    /// translations, so what Spawn reads from it is the same on a host whose
+    /// locale is Chinese. Each answer that says a terminal is gone (no
+    /// socket, no server on it, no such session) is word for word the one
+    /// of the C locale, and read as gone.
+    #[test]
+    fn tmux_says_a_terminal_is_gone_alike_in_a_translated_locale() {
+        let dir = scratch("tmux-locale");
+        std::fs::write(dir.join("not-a-server"), b"").unwrap();
+        let answer = |locale: &str, language: Option<&str>, socket: &str, start: bool| {
+            let tmux = |arguments: &[&str]| {
+                let words: Vec<String> = ["tmux", "-S", socket, "-f", "/dev/null"]
+                    .iter()
+                    .chain(arguments)
+                    .map(ToString::to_string)
+                    .collect();
+                let mut command = super::command_of(&words);
+                command
+                    .env("LC_ALL", locale)
+                    .env("LANG", locale)
+                    .env("LC_MESSAGES", locale);
+                match language {
+                    Some(language) => command.env("LANGUAGE", language),
+                    None => command.env_remove("LANGUAGE"),
+                };
+                command.output().expect("tmux is installed")
+            };
+            if start {
+                let started = tmux(&["new-session", "-d", "-s", "spawn-locale-live"]);
+                assert!(started.status.success(), "{started:?}");
+            }
+            let asked = tmux(&["has-session", "-t", "=spawn-locale-none"]);
+            if start {
+                let _ = tmux(&["kill-server"]);
+            }
+            assert_eq!(asked.status.code(), Some(1), "{asked:?}");
+            let stderr = String::from_utf8_lossy(&asked.stderr).to_string();
+            assert!(super::gone(&stderr), "{locale}: {stderr}");
+            stderr
+        };
+        for (socket, start) in [
+            ("none/socket", false),
+            ("not-a-server", false),
+            // A server of its own per locale: one killed is not gone yet
+            // when the next would start on its socket.
+            ("live", true),
+        ] {
+            let at = |locale: &str| {
+                let name = if start {
+                    format!("{socket}-{locale}")
+                } else {
+                    socket.to_string()
+                };
+                dir.join(name).to_str().unwrap().to_string()
+            };
+            assert_eq!(
+                answer("zh_CN.UTF-8", Some("zh_CN:zh"), &at("zh"), start),
+                answer("C", None, &at("c"), start),
+                "{socket}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

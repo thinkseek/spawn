@@ -11,11 +11,11 @@ import {
   Terminal,
   Users,
 } from "lucide-react";
-import { Suspense, lazy } from "react";
+import { Suspense, lazy, useState } from "react";
 import type { ReactNode } from "react";
 
-import { usePoll } from "../../api";
-import { relativeTime, stageDuration } from "../../format";
+import type { PollResult } from "../../api";
+import { absoluteTitle, relativeTime, stageDuration } from "../../format";
 import type {
   Mission,
   MissionTask,
@@ -26,15 +26,25 @@ import type {
 import {
   approveCommand,
   endedWell,
-  fetchMissions,
   pipelineOf,
   slowStages,
   stageStep,
 } from "../../missions";
+import type { TaskGroup, TaskSection } from "../../ordering";
+import {
+  SECTION_LABEL,
+  groupTasks,
+  missionClass,
+  missionName,
+  orderMissions,
+  taskTitle,
+} from "../../ordering";
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
-import { Card, CardHeader, EmptyState, LiveStatus, PageHeader, cx } from "../ui";
+import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
+import { HeldSources } from "./HeldSources";
 import { Markdown } from "./Markdown";
+import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible } from "./parts";
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
@@ -54,12 +64,12 @@ const MODE_OPTIONS: ReadonlyArray<ViewOption<Mode>> = [
 
 /**
  * Missions and the residents that work them. Strictly read-only: the only
- * request is GET /api/missions, and the only "actions" are links into the
+ * request is GET /api/missions (polled by App, which shares it with the
+ * sidebar and the fleet board), and the only "actions" are links into the
  * fleet view and commands a human copies into a terminal.
  */
-export function MissionsView() {
+export function MissionsView({ missions }: { missions: PollResult<Missions> }) {
   useNow(1_000);
-  const missions = usePoll<Missions>("missions", fetchMissions, 5_000);
   const data = missions.data;
 
   return (
@@ -111,6 +121,11 @@ export function MissionsBody({ data }: { data: Missions }) {
             <ApprovalQueue residents={data.residents} />
           </div>
         )}
+        {data.holds.length > 0 && (
+          <div className="shrink-0 px-3 pt-3 sm:px-4 sm:pt-4">
+            <SourceHolds data={data} />
+          </div>
+        )}
         {data.missions.length === 0 ? (
           <div className="flex flex-col">
             <div className="px-4 pt-2 sm:px-5">{toggle}</div>
@@ -133,6 +148,7 @@ export function MissionsBody({ data }: { data: Missions }) {
       <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
         <div>{toggle}</div>
         <ApprovalQueue residents={data.residents} />
+        <SourceHolds data={data} />
         <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="flex min-w-0 flex-col gap-3">
             {data.missions.length === 0 ? (
@@ -144,7 +160,7 @@ export function MissionsBody({ data }: { data: Missions }) {
                 />
               </Card>
             ) : (
-              data.missions.map((mission, index) => (
+              orderMissions(data.missions).map((mission, index) => (
                 <MissionCard
                   key={mission.id ?? `index-${index}`}
                   mission={mission}
@@ -161,6 +177,17 @@ export function MissionsBody({ data }: { data: Missions }) {
 
 // ---------------------------------------------------------------------------
 // Residents
+
+/** The owner's holds on mission sources: landings there wait. */
+function SourceHolds({ data }: { data: Missions }) {
+  return (
+    <HeldSources
+      holds={data.holds}
+      title="Sources held by the owner"
+      hint="no task lands there until the hold is released or expires; gates, assignment and other sources go on"
+    />
+  );
+}
 
 /** Proposed residents block on a human; they lead the page. */
 function ApprovalQueue({ residents }: { residents: Resident[] }) {
@@ -195,7 +222,7 @@ function ApprovalQueue({ residents }: { residents: Resident[] }) {
                 </span>
               )}
               <span className="tnum ml-auto text-micro text-faint-foreground">
-                {relativeTime(resident.created_at_ms)}
+                <Ago ms={resident.created_at_ms} />
               </span>
             </div>
             {resident.charter && (
@@ -350,18 +377,48 @@ function MissionCard({ mission }: { mission: Mission }) {
   const state = mission.state ?? "unknown";
   const title = firstLine(mission.text) ?? "Untitled mission";
   const counts = countStates(mission.tasks);
+  // Closed missions fold to their header; the rest open.
+  const [open, setOpen] = useState(() => missionClass(mission) !== "closed");
   return (
-    <Card className="min-w-0">
-      <header className="flex flex-wrap items-center gap-2 border-b border-surface-border px-4 py-2.5">
-        <span className="tnum font-mono text-caption text-faint-foreground">
-          #{mission.id ?? "?"}
-        </span>
-        <h2 className="min-w-0 flex-1 truncate text-label font-medium text-foreground">
-          {title}
-        </h2>
+    <Card className={cx("min-w-0", !open && "bg-surface/60")}>
+      <header
+        className={cx(
+          "flex flex-wrap items-center gap-2 px-4 py-2.5",
+          open && "border-b border-surface-border",
+        )}
+      >
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+          className={cx("flex min-w-0 flex-1 items-center gap-2 rounded text-left", FOCUS_RING)}
+        >
+          <ChevronRight
+            size={13}
+            aria-hidden="true"
+            className={cx(
+              "shrink-0 text-faint-foreground transition-transform duration-150 motion-reduce:transition-none",
+              open && "rotate-90",
+            )}
+          />
+          <span className="tnum font-mono text-caption text-faint-foreground">
+            #{mission.id ?? "?"}
+          </span>
+          <h2 className="min-w-0 flex-1 truncate text-label font-medium text-foreground">
+            {title}
+          </h2>
+        </button>
+        {!open && (
+          <span className="tnum text-caption text-muted-foreground">
+            {mission.tasks.length} task{mission.tasks.length === 1 ? "" : "s"}
+            {counts.landed + counts.accepted > 0 && ` · ${counts.landed + counts.accepted} landed or accepted`}
+          </span>
+        )}
         <Pill className={MISSION_STATE_STYLE[state.toLowerCase()]}>{state}</Pill>
       </header>
 
+      {open && (
+      <>
       <div className="space-y-3 px-4 py-3">
         <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4">
           <Fact label="Origin">{mission.origin ?? "—"}</Fact>
@@ -395,6 +452,20 @@ function MissionCard({ mission }: { mission: Mission }) {
                 Nothing lands until a human runs{" "}
                 <code className="font-mono">spawn mission resume --id {mission.id ?? "N"}</code>
               </div>
+            </div>
+          </div>
+        )}
+
+        {mission.hold !== null && (
+          <div className="flex items-start gap-2 rounded-md border border-border bg-surface/60 px-3 py-2">
+            <Hourglass size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 text-label">
+              <span className="font-medium text-foreground">Landings held</span>
+              <span className="text-foreground/85">
+                {" "}
+                — the owner holds its source (hold #{mission.hold}): its gates still run and an
+                accepted task waits to land until the hold is released or expires
+              </span>
             </div>
           </div>
         )}
@@ -481,22 +552,112 @@ function MissionCard({ mission }: { mission: Mission }) {
             No tasks dispatched yet.
           </p>
         ) : (
-          <ul className="divide-y divide-surface-border">
-            {mission.tasks.map((task, index) => (
-              <TaskRow
-                key={task.id ?? `index-${index}`}
-                task={task}
-                mission={mission}
-              />
-            ))}
-          </ul>
+          <TaskSections mission={mission} />
         )}
       </div>
+      </>
+      )}
     </Card>
   );
 }
 
-function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
+/** A mission's tasks in the shared sections (ordering.ts): in flight,
+ * landed or accepted, sent back, cancelled (folded). Retries of one
+ * objective show as one row, earlier attempts nested under it. */
+function TaskSections({ mission }: { mission: Mission }) {
+  const [toggled, setToggled] = useState<ReadonlySet<TaskSection>>(() => new Set());
+  const name = missionName(mission);
+  return (
+    <div className="pt-1">
+      {groupTasks(mission.tasks, (task) => task, mission).map(({ section, groups }) => {
+        const folded = (section === "cancelled") !== toggled.has(section);
+        return (
+          <section key={section} aria-label={SECTION_LABEL[section]}>
+            <GroupHeader
+              className="border-t border-surface-border bg-page-canvas/40 px-4 py-1.5 first:border-t-0"
+              label={SECTION_LABEL[section]}
+              count={groups.length}
+              expanded={!folded}
+              onToggle={() =>
+                setToggled((current) => {
+                  const next = new Set(current);
+                  if (next.has(section)) next.delete(section);
+                  else next.add(section);
+                  return next;
+                })
+              }
+            />
+            {!folded && (
+              <ul className="divide-y divide-surface-border border-t border-surface-border">
+                {groups.map((group) => (
+                  <TaskRow key={group.key} task={group.task} mission={mission} missionName={name} group={group} />
+                ))}
+              </ul>
+            )}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Earlier attempts at the row's objective, newest first, each with how it
+ * ended. */
+function EarlierAttempts({ group, missionName }: { group: TaskGroup<MissionTask>; missionName: string }) {
+  if (group.earlier.length === 0) return null;
+  return (
+    <div className="rounded-md border border-surface-border bg-page-canvas/40 px-3 py-2">
+      <SectionLabel>
+        Earlier attempt{group.earlier.length === 1 ? "" : "s"} · {group.earlier.length}
+      </SectionLabel>
+      <ul className="mt-1 space-y-1">
+        {group.earlier.map((attempt, index) => (
+          <li
+            key={attempt.task.id ?? `attempt-${index}`}
+            className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 border-l border-border-strong pl-2.5 text-caption"
+          >
+            <span className="tnum shrink-0 font-mono text-micro text-faint-foreground">
+              T{attempt.task.id ?? "?"}
+            </span>
+            <span
+              className={cx(
+                "shrink-0 font-medium",
+                attempt.outcome === "landed" || attempt.outcome === "accepted"
+                  ? "text-success"
+                  : attempt.outcome.startsWith("aborted")
+                    ? "text-destructive"
+                    : "text-warning",
+              )}
+            >
+              {attempt.outcome}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-muted-foreground">
+              {taskTitle(attempt.task, { missionName }) ?? ""}
+            </span>
+            <AgentLink sessionId={attempt.task.session_id} agentId={attempt.task.agent_id} />
+            <Ago ms={attempt.task.updated_at_ms} className="text-micro text-faint-foreground" />
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function TaskRow({
+  task,
+  mission,
+  missionName,
+  group,
+}: {
+  task: MissionTask;
+  mission: Mission;
+  missionName: string;
+  group: TaskGroup<MissionTask>;
+}) {
+  const title = taskTitle(task, { missionName });
+  // The board sends the texts' first lines; the whole is read when asked
+  // (the brief opened, a "show the whole" pressed), one GET for the three.
+  const texts = useTaskTexts(task, false);
   return (
     <li
       className={cx(
@@ -504,10 +665,27 @@ function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
         task.state === "cancelled" && "bg-muted/30",
       )}
     >
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="tnum font-mono text-caption text-faint-foreground">
-          task #{task.id ?? "?"}
+      <div className="flex min-w-0 items-baseline gap-2">
+        <span className="tnum shrink-0 font-mono text-caption text-faint-foreground">
+          T{task.id ?? "?"}
         </span>
+        <h3
+          className="min-w-0 flex-1 truncate text-label font-medium text-foreground"
+          title={title ?? undefined}
+        >
+          {title ?? "Untitled task"}
+        </h3>
+        {group.earlier.length > 0 && (
+          <span
+            className="flex shrink-0 items-center gap-1 text-caption text-warning"
+            title={`Attempt ${group.earlier.length + 1} at objective ${task.objective ?? "?"}`}
+          >
+            <RotateCcw size={11} aria-hidden="true" />
+            attempt {group.earlier.length + 1}
+          </span>
+        )}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
         {task.kind && (
           <Pill
             className={
@@ -525,9 +703,7 @@ function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
         <AgentLink sessionId={task.session_id} agentId={task.agent_id} />
         <span className="tnum ml-auto text-micro text-faint-foreground">
           {task.created_by && <>by {task.created_by} · </>}
-          <span title={absolute(task.updated_at_ms)}>
-            updated {relativeTime(task.updated_at_ms)}
-          </span>
+          updated <Ago ms={task.updated_at_ms} />
         </span>
       </div>
 
@@ -595,7 +771,14 @@ function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
             </span>
           </div>
           {task.review_note ? (
-            <Markdown source={task.review_note} className="mt-1" />
+            <TaskText
+              what="note"
+              excerpt={task.review_note}
+              bytes={task.review_note_bytes}
+              full={texts.texts?.review_note}
+              read={texts}
+                className="mt-1"
+            />
           ) : (
             <p className="mt-1 text-caption text-faint-foreground">
               No review note.
@@ -606,19 +789,40 @@ function TaskRow({ task, mission }: { task: MissionTask; mission: Mission }) {
       {task.review_note && task.state !== "revise" && task.revisions === 0 && (
         <div className="rounded-md border border-surface-border px-3 py-2">
           <SectionLabel>Review note</SectionLabel>
-          <Markdown source={task.review_note} className="mt-1" />
+          <TaskText
+            what="note"
+            excerpt={task.review_note}
+            bytes={task.review_note_bytes}
+            full={texts.texts?.review_note}
+            read={texts}
+            className="mt-1"
+          />
         </div>
       )}
 
+      <EarlierAttempts group={group} missionName={missionName} />
+
       {task.brief && (
-        <Collapsible label="Brief">
-          <Markdown source={task.brief} />
+        <Collapsible label="Brief" onToggle={(open) => open && texts.want()}>
+          <TaskText
+            what="brief"
+            excerpt={task.brief}
+            bytes={task.brief_bytes}
+            full={texts.texts?.brief}
+            read={texts}
+          />
         </Collapsible>
       )}
 
-      {task.report ? (
+      {task.report !== null || (task.report_bytes ?? 0) > 0 ? (
         <Collapsible label="Report" defaultOpen>
-          <Markdown source={task.report} />
+          <TaskText
+            what="report"
+            excerpt={task.report}
+            bytes={task.report_bytes}
+            full={texts.texts?.report}
+            read={texts}
+          />
         </Collapsible>
       ) : (
         <p className="text-caption text-faint-foreground">No report yet.</p>
@@ -903,6 +1107,5 @@ function budgetText(budget: Mission["budget"]): string {
 }
 
 function absolute(ms: number | null): string | undefined {
-  if (ms == null || ms <= 0) return undefined;
-  return new Date(ms).toLocaleString();
+  return absoluteTitle(ms);
 }

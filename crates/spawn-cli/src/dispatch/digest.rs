@@ -13,8 +13,13 @@ use spawn_core::observation::SemanticState;
 use super::{Escalation, Facts, Order, Why};
 use crate::supervise::{SUPERVISOR_AGENT, SUPERVISOR_SESSION};
 
-/// Escalations per digest; the rest wait for the next one.
+/// Lines per digest (each line one session and reason); the rest wait
+/// for the next one.
 const DIGEST_ITEMS: usize = 8;
+
+/// The words every digest opens with: a prompt in the supervisor's
+/// transcript that starts with them is a digest, not a person's answer.
+pub(crate) const OPENING: &str = "Spawn dispatcher:";
 
 /// Escalations the supervisor already received: the tags of the digests
 /// that reached its pane.
@@ -24,20 +29,27 @@ pub(super) fn told(supervisor: Option<&Facts>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Whether the supervisor can take a digest now: live, idle on its latest
-/// fact, nothing in flight.
-fn supervisor_idle(supervisor: &Facts) -> bool {
-    supervisor.live_and_free()
-        && supervisor.current_observation().is_some_and(|observation| {
-            matches!(
-                observation.state,
-                SemanticState::Waiting | SemanticState::Completed
-            )
-        })
+/// Whether the supervisor can take a digest now: live, nothing in flight,
+/// and idle on its latest fact. Idle is the turn stopped at its prompt
+/// (a fact the rules settle), whatever Jev made of it, or a judgement of
+/// WAITING or COMPLETED. A supervisor whose turn ended on a question for
+/// the human is judged BLOCKED but sits at its prompt all the same: if
+/// that verdict held digests back, one question would silence every
+/// escalation until a human answered it.
+pub(super) fn supervisor_idle(supervisor: &Facts) -> bool {
+    supervisor.turn_stopped_idle()
+        || (supervisor.live_and_free()
+            && supervisor.current_observation().is_some_and(|observation| {
+                matches!(
+                    observation.state,
+                    SemanticState::Waiting | SemanticState::Completed
+                )
+            }))
 }
 
-/// What the supervisor is asked to do about an item.
-fn heading(why: Why) -> &'static str {
+/// What the supervisor is asked to do about an item: the digest's heading,
+/// and the attention view's (`GET /api/attention`).
+pub(crate) fn heading(why: Why) -> &'static str {
     match why {
         Why::Attention => "attention",
         Why::NudgeFailed => "nudge did not help",
@@ -51,11 +63,60 @@ fn heading(why: Why) -> &'static str {
         Why::DeliveryFailed => "delivery failed",
         Why::StopFailed => "stop failed",
         Why::Disk => "disk space on this host",
+        Why::DiskRecovered => "disk space back on this host",
         Why::GateRoom => "no room for the gate on this host",
         Why::GateHostFault => "host faults at the gate (the host's, not the work's)",
         Why::Stalled => "stalled",
+        Why::Charter => "new charter not typed",
+        Why::BackgroundJob => "background job past its bound",
+        Why::HoldExpired => "a source hold expired",
     }
 }
+
+/// Escalations about one session for one reason, told as one line: a
+/// worker's repeated news of one kind (a human's notes that could not be
+/// delivered, retried every few seconds) is one thing to act on, and as
+/// separate lines it would fill every digest and starve the rest.
+struct Line<'a> {
+    first: &'a Escalation,
+    latest: &'a Escalation,
+    count: usize,
+}
+
+/// The pending escalations grouped by session and reason, in the order
+/// their first item is pending. Items about the host (session `host`: a
+/// disk place, a mission's gate room, a task's host faults) and expired
+/// holds (each another hold, with its own waiting tasks) are each about
+/// something else, and keep a line each.
+fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
+    let mut lines: Vec<(Line<'_>, Vec<String>)> = Vec::new();
+    for item in pending {
+        match lines.iter_mut().find(|(line, _)| {
+            item.session_id != HOST_SESSION
+                && item.why != Why::HoldExpired
+                && line.first.session_id == item.session_id
+                && line.first.why == item.why
+        }) {
+            Some((line, tags)) => {
+                line.latest = item;
+                line.count += 1;
+                tags.push(item.tag());
+            }
+            None => lines.push((
+                Line {
+                    first: item,
+                    latest: item,
+                    count: 1,
+                },
+                vec![item.tag()],
+            )),
+        }
+    }
+    lines
+}
+
+/// The session of escalations about the host rather than an agent.
+const HOST_SESSION: &str = "host";
 
 /// Crash lines and failures an escalation quotes at most.
 const HOST_FAULT_QUOTED: usize = 3;
@@ -123,6 +184,85 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      counted and nothing halts. Check the test database's host (its memory, \
                      /dev/shm, its log) or tell the owner."
                 ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The session of escalations about missions rather than an agent (a
+/// halted mission, an expired hold).
+const MISSIONS_SESSION: &str = "missions";
+
+/// The digest items for `records`, the integrator's `source.hold_expired`
+/// records that no delivered digest told yet
+/// (`PostgresStore::hold_expiries`). Each is an item of session `missions`,
+/// id `source-hold-expired-<event id>`, naming the source, the hold (its
+/// event id, its reason, when it was taken and its bound), when it expired,
+/// each task that waited behind it with its mission, and that landings on
+/// the source resumed: an owner verdict judged against the hold's main may
+/// be stale now. No time window: a record stays an item until a digest
+/// carrying its tag (`missions source-hold-expired-<event id>`) reaches the
+/// supervisor, so it is told once. A released hold makes no record, and is
+/// told to nobody.
+pub(crate) fn hold_expiries(records: &[Value]) -> Vec<Escalation> {
+    let time = |ms: Option<i64>| {
+        ms.map_or_else(
+            || "at an unknown time".to_string(),
+            crate::scorecard::time::format_rfc3339,
+        )
+    };
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let source = record["source"].as_str()?;
+            let hold = record["hold"]
+                .as_i64()
+                .map_or_else(|| "?".to_string(), |hold| hold.to_string());
+            let reason = record["reason"]
+                .as_str()
+                .map_or_else(String::new, |reason| {
+                    format!(" (\"{}\")", one_line(reason, 300))
+                });
+            let bound = record["bound_s"].as_i64().map_or_else(
+                || "its bound".to_string(),
+                |secs| format!("a bound of {secs} s"),
+            );
+            let main = record["main"].as_str().map_or_else(
+                || "its main".to_string(),
+                |main| format!("its main {}", main.chars().take(12).collect::<String>()),
+            );
+            let waiting: Vec<String> = record["waiting"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let task = entry["task"].as_i64()?;
+                    Some(entry["mission"].as_i64().map_or_else(
+                        || format!("task #{task}"),
+                        |mission| format!("task #{task} of mission {mission}"),
+                    ))
+                })
+                .collect();
+            let waited = if waiting.is_empty() {
+                "no task waited behind it".to_string()
+            } else {
+                format!("{} waited behind it", waiting.join(", "))
+            };
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("source-hold-expired-{id}"),
+                why: Why::HoldExpired,
+                line: format!(
+                    "the owner's hold {hold}{reason} on source {source}, taken {} with {bound}, \
+                     expired at {} and ended by record {id}: {waited}; landings on {source} \
+                     resumed. An owner verdict judged against {main} may be stale now: tell \
+                     the owner.",
+                    time(record["held_at_ms"].as_i64()),
+                    time(record["expires_ms"].as_i64()),
+                ),
+                since_ms: record["at_ms"].as_i64(),
             })
         })
         .collect()
@@ -145,17 +285,23 @@ fn one_line(text: &str, limit: usize) -> String {
 }
 
 /// The digest typed into the supervisor's pane.
-fn text(items: &[Escalation], spawn: &str) -> String {
+fn text(lines: &[Line<'_>], spawn: &str) -> String {
     let mut text = format!(
-        "Spawn dispatcher: {} update{} for you. Check a worker with `{spawn} tail --session \
+        "{OPENING} {} update{} for you. Check a worker with `{spawn} tail --session \
 <session>` before acting; missions and tasks with `{spawn} mission list`.\n",
-        items.len(),
-        if items.len() == 1 { "" } else { "s" },
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" },
     );
-    for item in items {
+    for line in lines {
+        let item = line.latest;
+        let repeated = if line.count > 1 {
+            format!(" ({} of them, the latest)", line.count)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             text,
-            "- {} — {}: {}",
+            "- {} — {}{repeated}: {}",
             item.session_id,
             heading(item.why),
             item.line
@@ -170,8 +316,9 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
     if pending.is_empty() || !supervisor_idle(supervisor) {
         return None;
     }
-    let items: Vec<Escalation> = pending.iter().take(DIGEST_ITEMS).cloned().collect();
-    let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+    let (lines, tags): (Vec<Line<'_>>, Vec<Vec<String>>) =
+        lines(pending).into_iter().take(DIGEST_ITEMS).unzip();
+    let tags: Vec<String> = tags.into_iter().flatten().collect();
     Some(Order {
         agent_id: SUPERVISOR_AGENT.to_string(),
         session_id: SUPERVISOR_SESSION.to_string(),
@@ -182,7 +329,7 @@ pub(super) fn order(supervisor: &Facts, pending: &[Escalation], spawn: &str) -> 
             crate::sources::fnv(&tags.join("\n"))
         ),
         action: CommandAction::Input {
-            text: text(&items, spawn),
+            text: text(&lines, spawn),
             tags,
         },
         task: None,

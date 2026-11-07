@@ -44,6 +44,33 @@ macro_rules! died_young {
     };
 }
 
+/// SQL: whether the `agent_executions` row aliased `$x` ended lost before
+/// its engine became ready: the log has no Bridge `screen.observed` of it
+/// in state `ready` (the ready wait of a start or resume records one keyed
+/// `<execution>:screen:ready` before it types; the Bridge's follow records
+/// others). A start whose ready wait failed is abandoned and ends so,
+/// whatever its duration.
+macro_rules! lost_before_ready {
+    ($x:literal) => {
+        concat!(
+            "(coalesce(",
+            $x,
+            ".cause, '') = 'lost' and not exists (select 1 from spawn_events r where \
+             r.session_id = ",
+            $x,
+            ".session_id and r.source = 'bridge' and r.source_event_id = ",
+            $x,
+            ".execution_id || ':screen:ready') and not exists (select 1 from spawn_events r \
+             where r.session_id = ",
+            $x,
+            ".session_id and r.event_name = 'screen.observed' and r.source = 'bridge' and \
+             r.execution_id = ",
+            $x,
+            ".execution_id and r.kind -> 'detail' ->> 'state' = 'ready'))"
+        )
+    };
+}
+
 mod command_queue;
 mod event_log;
 mod fleet;
@@ -93,10 +120,12 @@ pub struct PostgresStore {
     url: String,
 }
 
-/// The restricted logins, by the principal they act as; each database has
-/// its own role for each (`spawn_login_role`). Their passwords derive from
-/// the owner's ([`role_url`]) and are set on every migration.
-const LOGINS: [&str; 2] = ["spawn_supervisor", "spawn_reader"];
+/// The restricted logins, by their base name; each database has its own
+/// role for each (`spawn_login_role`). `spawn_supervisor` and `spawn_reader`
+/// act as the principals of their names, `spawn_human` (which may only call
+/// `spawn_human_input`) as `human`. Their passwords derive from the owner's
+/// ([`role_url`]) and are set on every migration.
+const LOGINS: [&str; 3] = ["spawn_supervisor", "spawn_reader", "spawn_human"];
 
 impl PostgresStore {
     /// Connect to the database in the URL.
@@ -389,8 +418,8 @@ fn pbkdf2_hex(owner_password: &str, salt: &str, role: &str) -> String {
 }
 
 /// The owner's URL with its credentials replaced by one of the database's
-/// restricted logins (`spawn_supervisor`, `spawn_reader`: the role of that
-/// name for this database, see `spawn_login_role`). It reads the login's
+/// restricted logins (`spawn_supervisor`, `spawn_reader`, `spawn_human`: the
+/// role of that name for this database, see `spawn_login_role`). It reads the login's
 /// name and salt through the owner's URL, which must be the one that
 /// migrated (its search path finds the schema). The boundary is the
 /// login's privileges; its password keeps anyone who lacks the owner's
@@ -493,6 +522,133 @@ pub fn cluster_identity(url: &str) -> Result<String, StoreError> {
         )
         .map_err(|error| backend(&error))?;
     row.try_get(0).map_err(|error| backend(&error))
+}
+
+/// A probe of a test database that failed: the probe, in words, and the
+/// error it met. Neither names the URL, so neither holds its password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeFailure {
+    pub probe: String,
+    pub error: String,
+}
+
+/// The rows the parallel probe counts.
+const PROBE_ROWS: i64 = 100_000;
+
+/// Whether the test database `url` can run what the workspace tests run:
+/// a connection within `limit`, then, in one transaction that changes
+/// nothing, a parallel query within `limit` (`debug_parallel_query`, or
+/// `force_parallel_mode` before PostgreSQL 16, with parallel plans made
+/// free): a Gather with a worker, so the server allocates the dynamic shared
+/// memory a parallel query needs (/dev/shm in a container). A server whose
+/// /dev/shm is too small fails it with "could not resize shared memory
+/// segment" instead of failing a gate's tests 25 minutes in.
+///
+/// Each step is bounded by `limit` whatever the server does: the probe runs
+/// on a thread of its own, abandoned if it does not answer in time.
+///
+/// # Errors
+///
+/// The step that failed and its error: a URL that does not parse, a
+/// connection refused or not made within `limit`, a query that errs or does
+/// not finish within `limit`.
+pub fn parallel_query_probe(url: &str, limit: std::time::Duration) -> Result<(), ProbeFailure> {
+    let seconds = limit.as_secs().max(1);
+    let connect = format!("connect within {seconds} s");
+    let query = format!(
+        "a parallel query within {seconds} s (one transaction: SET LOCAL \
+         max_parallel_workers_per_gather = 2, parallel_setup_cost = 0, parallel_tuple_cost = 0, \
+         debug_parallel_query = on (force_parallel_mode before PostgreSQL 16); SELECT count(*) \
+         FROM generate_series(1, {PROBE_ROWS}))"
+    );
+    let failure = |probe: &str, error: String| ProbeFailure {
+        probe: probe.to_string(),
+        error,
+    };
+    let mut config: postgres::Config = url.parse().map_err(|error: postgres::Error| {
+        failure(
+            "read SPAWN_TEST_DATABASE_URL as a postgres URL",
+            probe_error(&error),
+        )
+    })?;
+    config.connect_timeout(limit);
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<bool, String>>();
+    std::thread::Builder::new()
+        .name("test-database-probe".to_string())
+        .spawn(move || {
+            let mut client = match config.connect(NoTls) {
+                Ok(client) => client,
+                Err(error) => {
+                    let _ = sender.send(Err(probe_error(&error)));
+                    return;
+                }
+            };
+            if sender.send(Ok(false)).is_err() {
+                return;
+            }
+            let _ = sender.send(parallel_query(&mut client, limit).map(|()| true));
+        })
+        .map_err(|error| failure(&connect, format!("cannot start the probe: {error}")))?;
+    let late = |step: &str| format!("no answer within {seconds} s ({step})");
+    match receiver.recv_timeout(limit) {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return Err(failure(&connect, error)),
+        Err(_) => return Err(failure(&connect, late("connecting"))),
+    }
+    match receiver.recv_timeout(limit) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(failure(&query, error)),
+        Err(_) => Err(failure(&query, late("querying"))),
+    }
+}
+
+/// The probe's query on `client`: a parallel plan forced, counted, rolled
+/// back. The server cancels it after `limit` too.
+fn parallel_query(client: &mut Client, limit: std::time::Duration) -> Result<(), String> {
+    let error = |error: postgres::Error| probe_error(&error);
+    let mut transaction = client.transaction().map_err(error)?;
+    let version: i32 = transaction
+        .query_one("select current_setting('server_version_num')::integer", &[])
+        .map_err(error)?
+        .get(0);
+    // Renamed in PostgreSQL 16.
+    let force = if version >= 160_000 {
+        "debug_parallel_query"
+    } else {
+        "force_parallel_mode"
+    };
+    transaction
+        .batch_execute(&format!(
+            "set local statement_timeout = {}; \
+             set local max_parallel_workers_per_gather = 2; \
+             set local parallel_setup_cost = 0; \
+             set local parallel_tuple_cost = 0; \
+             set local {force} = on",
+            limit.as_millis().max(1)
+        ))
+        .map_err(error)?;
+    let count: i64 = transaction
+        .query_one(
+            &format!("select count(*) from generate_series(1, {PROBE_ROWS})"),
+            &[],
+        )
+        .map_err(error)?
+        .get(0);
+    transaction.rollback().map_err(error)?;
+    if count == PROBE_ROWS {
+        Ok(())
+    } else {
+        Err(format!("the query counted {count} rows, not {PROBE_ROWS}"))
+    }
+}
+
+/// A driver error in words: the server's own message and code when it sent
+/// one, else the driver's (which says what the connection met).
+fn probe_error(error: &postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(db) => format!("{}: {} ({})", db.severity(), db.message(), db.code().code()),
+        None => error.to_string(),
+    }
 }
 
 /// Statement parameters, as the driver takes them.
@@ -626,7 +782,8 @@ mod tests {
                 .expect("admin")
                 .query(
                     "select rolname::text, rolcanlogin, rolpassword is null from pg_authid
-                      where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1)
+                      where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
+                                        'spawn_human_' || $1)
                       order by 1",
                     &[&name],
                 )
@@ -637,6 +794,7 @@ mod tests {
             assert_eq!(
                 off,
                 [
+                    (format!("spawn_human_{name}"), false, true),
                     (format!("spawn_reader_{name}"), false, true),
                     (format!("spawn_supervisor_{name}"), false, true),
                 ]
@@ -672,11 +830,8 @@ mod tests {
             assert!(fixed.connect(NoTls).is_err());
         }));
         let _ = admin.batch_execute(&format!("drop database if exists {name} with (force)"));
-        for role in [
-            format!("spawn_supervisor_{name}"),
-            format!("spawn_reader_{name}"),
-        ] {
-            let _ = admin.batch_execute(&format!("drop role if exists {role}"));
+        for base in super::LOGINS {
+            let _ = admin.batch_execute(&format!("drop role if exists {base}_{name}"));
         }
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);

@@ -383,6 +383,137 @@ fn gate_verdicts_landings_and_halts_fold_into_the_mission() {
     );
 }
 
+/// Objective 018: a `no_room` the integrator records when a check before
+/// the gate falls short names `check` (`disk`, `memory`, `database`),
+/// `measured` and `threshold` (a disk one still `free_kb` and `tmpdir`).
+/// The store accepts it, refuses one that leaves its measure out, and folds
+/// it as every `no_room`: the task stays where it was, neither count
+/// moves, and the mission's run of them counts on; the escalation names the
+/// check.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_no_room_with_its_check_measure_and_threshold_folds_as_before() {
+    let (store, schema) = store("control_no_room_checks");
+    let mission = store
+        .mission_add("Gated", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            None,
+            None,
+        )
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    assert!(store.task_reported(task, "done").expect("reported"));
+    let mut client = admin(&schema);
+    let no_room = |fields: serde_json::Value| {
+        let mut record = json!({"type": "task.gated", "id": task, "revision": 0,
+                                "verdict": "no_room", "base": "b1", "scenarios": 7,
+                                "reason": "no room to judge now; not a verdict, judged again later",
+                                "log": "the gate did not run", "escalate": false});
+        record
+            .as_object_mut()
+            .expect("object")
+            .extend(fields.as_object().expect("object").clone());
+        store.integrator_record(&record)
+    };
+    let mission_row = |client: &mut Client| tables(client)["missions"][0].clone();
+
+    no_room(json!({"check": "memory", "measured": 1500, "threshold": 2048}))
+        .expect("a memory no_room names no free_kb or tmpdir");
+    let after = tables(&mut client);
+    assert_eq!(after["tasks"][0]["state"], "reported", "the task stays");
+    assert_eq!(after["tasks"][0]["gate_log"], "the gate did not run");
+    let row = &after["missions"][0];
+    assert_eq!(
+        (&row["gate_aborts"], &row["gate_rejections"]),
+        (&json!(0), &json!(0))
+    );
+    assert_eq!(
+        (&row["gate_room_task"], &row["gate_room_waits"]),
+        (&json!(task), &json!(1))
+    );
+    assert!(row["gate_room_since_ms"].is_number() && row["gate_room_last_ms"].is_number());
+    assert_eq!(row["gate_room_escalated"], false);
+
+    no_room(json!({"check": "database",
+                   "measured": "ERROR: could not resize shared memory segment (53100)",
+                   "threshold": "a parallel query within 10 s",
+                   "server": "/run/test-pg:5432/spawn_test", "escalate": true}))
+    .expect("a database no_room");
+    no_room(
+        json!({"check": "disk", "measured": 1024, "threshold": 10_485_760,
+                   "free_kb": 1024, "min_gb": 10, "tmpdir": "/tmp"}),
+    )
+    .expect("a disk no_room");
+    no_room(json!({"free_kb": 0, "min_gb": 10, "tmpdir": "/data/tmp"}))
+        .expect("the gate's own fact, as before, names no check");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (
+            &row["gate_room_task"],
+            &row["gate_room_waits"],
+            &row["gate_room_escalated"]
+        ),
+        (&json!(task), &json!(4), &json!(true)),
+        "one run, counted on"
+    );
+    assert_eq!(
+        (&row["gate_aborts"], &row["gate_rejections"]),
+        (&json!(0), &json!(0))
+    );
+
+    // A no_room that leaves out what it measured is refused, and moves nothing.
+    for refused in [
+        json!({"check": "disk", "measured": 1024, "threshold": 10_485_760}),
+        json!({"check": "memory", "threshold": 2048}),
+        json!({"check": "memory", "measured": 1500}),
+        json!({"check": "database", "measured": "", "threshold": "connect within 10 s"}),
+        json!({"check": "cpu", "measured": 1, "threshold": 2, "free_kb": 1, "tmpdir": "/t"}),
+        json!({"check": null, "measured": 1, "threshold": 2, "free_kb": 1, "tmpdir": "/t"}),
+        json!({}),
+    ] {
+        assert!(no_room(refused.clone()).is_err(), "{refused}");
+    }
+    assert_eq!(mission_row(&mut client)["gate_room_waits"], 4);
+
+    let escalations = store.gate_room_escalations().expect("escalations");
+    assert_eq!(
+        escalations.as_array().map(Vec::len),
+        Some(1),
+        "{escalations}"
+    );
+    assert_eq!(escalations[0]["check"], "database");
+    assert_eq!(escalations[0]["threshold"], "a parallel query within 10 s");
+    assert_eq!(escalations[0]["mission"], mission);
+
+    // A gate that judges ends the run, as before.
+    store
+        .integrator_record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                                   "verdict": "aborted", "reason": "the gate failed"}))
+        .expect("an abort");
+    let row = mission_row(&mut client);
+    assert_eq!(
+        (&row["gate_room_waits"], &row["gate_aborts"]),
+        (&json!(0), &json!(1))
+    );
+    assert!(row["gate_room_task"].is_null());
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+}
+
 /// Objective 16: `incompatible` (the head passes the gate alone and fails
 /// only merged with main) sends the task back like `conflict`: `revise`, one
 /// more revision, the note kept, `gate_rejections` where it was and
@@ -2592,258 +2723,4 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
         live,
         "the tables are the fold of the log"
     );
-}
-
-/// A gated mission on `source` whose first verdict left `baseline`.
-fn mission_at(store: &PostgresStore, source: &str, baseline: &str) -> i64 {
-    let mission = store
-        .mission_add("On the source", &json!([source]), "human")
-        .expect("add");
-    store
-        .mission_configure(mission, Some("/scenarios"), "gate", None, None)
-        .expect("configure");
-    let task = store
-        .task_assign(mission, "ephemeral", "w", "brief", "default")
-        .expect("assign");
-    store.task_delivered(task, 1).expect("delivered");
-    assert!(store.task_reported(task, "done").expect("reported"));
-    store
-        .integrator_record(
-            &json!({"type": "task.gated", "revision": 0, "id": task, "verdict": "aborted",
-                    "base": baseline, "reason": "a gate that died"}),
-        )
-        .expect("a first verdict sets the baseline");
-    mission
-}
-
-/// Objective 21: the owner's landing is a record, `source.push_requested`
-/// (`spawn mission push`), and its outcome another that names it, recorded
-/// by the integrator: `source.moved` or `source.push_refused`, one per
-/// request. The request and a refusal fold nothing; the move moves the
-/// baselines of the missions on its source that were at its `from` and are
-/// not halted (the store names them), as `spawn mission moved` does.
-#[test]
-#[allow(clippy::too_many_lines)]
-fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
-    let (store, schema) = store("control_owner_push");
-    let mut client = admin(&schema);
-    let (source, other) = ("/tmp/owner.git", "/tmp/owner-other.git");
-    let (c1, c2, c3) = ("1".repeat(40), "2".repeat(40), "3".repeat(64));
-    let owner_ref = |commit: &str| format!("refs/spawn-owner/{commit}");
-    let record_of = |client: &mut Client, event: i64| -> serde_json::Value {
-        client
-            .query_one(
-                "select kind -> 'detail' -> 'record' from spawn_events
-                  where id = $1 and session_id = 'session_control'",
-                &[&event],
-            )
-            .expect("the request's event")
-            .get(0)
-    };
-
-    assert!(
-        refusal(store.source_push_request(source, &c1, &owner_ref(&c1))).contains("no mission"),
-        "a source with no mission takes no request"
-    );
-    let on_source = mission_at(&store, source, "b0");
-    let halted = mission_at(&store, source, "b0");
-    let elsewhere = mission_at(&store, other, "b0");
-    // No verdict yet, so no baseline: the owner's move gives it its first.
-    let fresh = store
-        .mission_add("New on the source", &json!([source]), "human")
-        .expect("add");
-    store
-        .integrator_record(&json!({"type": "mission.halted", "id": halted, "reason": "stop"}))
-        .expect("halt");
-    for (bad_source, commit, reference, why) in [
-        (
-            "https://example.invalid/x.git",
-            c1.as_str(),
-            owner_ref(&c1),
-            "remote",
-        ),
-        (
-            "relative/x.git",
-            c1.as_str(),
-            owner_ref(&c1),
-            "not a mission source",
-        ),
-        (source, "HEAD", owner_ref("HEAD"), "full hash"),
-        (source, "--all", owner_ref("--all"), "full hash"),
-        (
-            source,
-            c1.as_str(),
-            "refs/heads/main".to_string(),
-            "refs/spawn-owner",
-        ),
-    ] {
-        let refused = refusal(store.source_push_request(bad_source, commit, &reference));
-        assert!(refused.contains(why), "{bad_source} {commit}: {refused}");
-    }
-    let before = tables(&mut client);
-
-    // The request: a record that folds nothing, pending until its outcome.
-    let request = store
-        .source_push_request(source, &c1, &owner_ref(&c1))
-        .expect("the owner's request");
-    let recorded = record_of(&mut client, request);
-    assert_eq!(recorded["type"], "source.push_requested");
-    assert_eq!(recorded["source"], source);
-    assert_eq!(recorded["commit"], c1.as_str());
-    assert_eq!(recorded["ref"], owner_ref(&c1).as_str());
-    assert_eq!(recorded["by"], "human");
-    assert_eq!(tables(&mut client), before, "a request folds nothing");
-    let pending = store.source_pushes_pending().expect("pending");
-    assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
-    assert_eq!(pending[0]["request"], json!(request));
-    assert_eq!(pending[0]["source"], source);
-    assert_eq!(pending[0]["commit"], c1.as_str());
-    assert_eq!(store.source_push_outcome(request).expect("outcome"), None);
-
-    // Refused: folds nothing, and is the request's only outcome.
-    for bad in [
-        json!({"type": "source.push_refused", "request": request}),
-        json!({"type": "source.push_refused", "reason": "conflict"}),
-        json!({"type": "source.push_refused", "request": request + 1000, "reason": "conflict"}),
-    ] {
-        assert!(store.integrator_record(&bad).is_err(), "refused: {bad}");
-    }
-    let refused = store
-        .integrator_record(
-            &json!({"type": "source.push_refused", "request": request, "reason": "conflict"}),
-        )
-        .expect("refused");
-    assert_eq!(tables(&mut client), before, "a refusal folds nothing");
-    assert_eq!(store.source_pushes_pending().expect("pending"), json!([]));
-    let outcome = store
-        .source_push_outcome(request)
-        .expect("outcome")
-        .expect("recorded");
-    assert_eq!(outcome["type"], "source.push_refused");
-    assert_eq!(outcome["event_id"], json!(refused));
-    assert_eq!(outcome["source"], source);
-    assert!(
-        refusal(
-            store.integrator_record(&json!({"type": "source.moved", "source": source,
-                "from": "b0", "to": "n1", "request": request, "by": "human"}))
-        )
-        .contains("outcome already"),
-        "one outcome per request"
-    );
-
-    // Applied: the move names the request, and moves the baselines at its
-    // `from` on its source, not a halted one's, not another source's.
-    let second = store
-        .source_push_request(source, &c2, &owner_ref(&c2))
-        .expect("a second request");
-    let third = store
-        .source_push_request(other, &c3, &owner_ref(&c3))
-        .expect("a request on the other source");
-    let pending = store.source_pushes_pending().expect("pending");
-    let ids: Vec<i64> = pending
-        .as_array()
-        .expect("a list")
-        .iter()
-        .filter_map(|row| row["request"].as_i64())
-        .collect();
-    assert_eq!(ids, [second, third], "oldest first");
-    for bad in [
-        json!({"type": "source.moved", "source": source, "from": "b0", "to": "n1", "by": "human"}),
-        json!({"type": "source.moved", "source": source, "from": "b0", "to": "n1",
-               "request": third, "by": "human"}),
-        json!({"type": "source.moved", "source": source, "to": "n1", "request": second}),
-        json!({"type": "source.moved", "source": source, "from": "b0", "to": "n1",
-               "request": "drop table", "by": "human"}),
-    ] {
-        assert!(store.integrator_record(&bad).is_err(), "refused: {bad}");
-    }
-    let moved = store
-        .integrator_record(
-            &json!({"type": "source.moved", "source": source, "from": "b0",
-                                   "to": "n1", "request": second, "by": "human"}),
-        )
-        .expect("moved");
-    let recorded = record_of(&mut client, moved);
-    assert_eq!(recorded["missions"], json!([on_source]), "{recorded}");
-    assert_eq!(recorded["without_baseline"], json!([fresh]), "{recorded}");
-    assert_eq!(recorded["request"], json!(second));
-    assert_eq!(recorded["by"], "human");
-    let baselines: Vec<String> = client
-        .query(
-            "select baseline from mission_missions where id = any($1) order by id",
-            &[&vec![on_source, halted, elsewhere, fresh]],
-        )
-        .expect("baselines")
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(baselines, ["n1", "b0", "b0", "n1"]);
-    let outcome = store
-        .source_push_outcome(second)
-        .expect("outcome")
-        .expect("recorded");
-    assert_eq!(outcome["type"], "source.moved");
-    assert_eq!(outcome["to"], "n1");
-    let pending = store.source_pushes_pending().expect("pending");
-    assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
-    assert_eq!(pending[0]["request"], json!(third));
-
-    let live = tables(&mut client);
-    refold(&mut client);
-    assert_eq!(
-        tables(&mut client),
-        live,
-        "the log folds to the same tables"
-    );
-    let types = control_types(&mut client);
-    for kind in [
-        "source.push_requested",
-        "source.push_refused",
-        "source.moved",
-    ] {
-        assert!(types.iter().any(|seen| seen == kind), "{kind}: {types:?}");
-    }
-
-    let supervisor = common::login(&schema, "spawn_supervisor");
-    client
-        .batch_execute(&format!("set session authorization {supervisor}"))
-        .expect("become the supervisor");
-    assert!(
-        client
-            .query_one(
-                "select spawn_source_push_request($1, $2, $3)",
-                &[&source, &c1, &owner_ref(&c1)],
-            )
-            .is_err(),
-        "the supervisor asks for no owner landing"
-    );
-    assert!(
-        client
-            .query_one("select spawn_source_push_hold()", &[])
-            .is_err(),
-        "the supervisor holds no landing"
-    );
-}
-
-/// The owner's landing holds the landing hold's lock: no one else takes it
-/// meanwhile (a task landing, a mission's drop), and it is released with
-/// the hold.
-#[test]
-fn an_owner_landing_takes_the_landing_holds_lock() {
-    let (store, schema) = store("control_owner_hold");
-    let hold = store.source_push_hold().expect("hold");
-    let mut client = admin(&schema);
-    let taken: bool = client
-        .query_one("select pg_try_advisory_lock(1399957337)", &[])
-        .expect("try the lock")
-        .get(0);
-    assert!(!taken, "held by the owner's landing");
-    drop(hold);
-    // Other cases may hold it for a moment: wait, boundedly.
-    client
-        .batch_execute(
-            "set lock_timeout = '30s'; select pg_advisory_lock(1399957337);
-             select pg_advisory_unlock(1399957337);",
-        )
-        .expect("released with the hold");
 }

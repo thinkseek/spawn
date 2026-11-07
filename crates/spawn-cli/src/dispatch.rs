@@ -3,7 +3,9 @@
 //! The Observer says what state a worker is in; this decides what to do
 //! about it, on the decision ladder of docs/fleet-architecture.md §3:
 //!
-//! 1. Rules over facts decide fixed cases: a lost execution is resumed once.
+//! 1. Rules over facts decide fixed cases: a lost execution is resumed once,
+//!    and a session whose resume failed is escalated, never resumed again by
+//!    rule (the one-resume rule, `worker::resume_lost`).
 //! 2. One guarded nudge: when Jev judged that a worker stopped at an idle
 //!    prompt without needing anyone (WAITING, confident, `needs_human` and
 //!    `stuck` low), it gets `continue` typed in, once per episode and at most
@@ -16,6 +18,17 @@
 //!
 //! A Stop that failed, whoever sent it, is sent again and then escalated
 //! ([`stops`]): until then the worker gets no task, no nudge.
+//!
+//! A changed charter reaches the running supervisor ([`charter`]): when the
+//! charter its native session holds (the hash its start recorded, or the
+//! one a later charter input typed) is not the one this build writes, the
+//! new one is typed in at its next idle prompt, once, in place of that
+//! pass's digest.
+//!
+//! A worker waiting on a background job of its own is working, not idle
+//! ([`jobs`]): the rules settle its stopped turn as WORKING, so it is not
+//! nudged nor escalated, and its task is not stalled; a job open past its
+//! bound (`SPAWN_STALL_JOB_SECS`) is escalated once.
 //!
 //! No task waits silently ([`stall`]): every open task is at one step
 //! (`delivery`, `activity`, `judgement`, `landing`, `stop`, or its mission
@@ -41,13 +54,22 @@
 //! escalations) and the step; [`worker`] is the per-worker ladder and
 //! [`digest`] the supervisor digest. Task delivery (the mission layer's
 //! rules) lives in [`crate::deliver`]; this module combines both into one
-//! [`Plan`] ([`decide_with`]) and submits it ([`step`]).
+//! [`Plan`] ([`decide_with`]), reads it from the store ([`read_plan`], which
+//! the UI's attention queue calls too: `GET /api/attention`) and submits it
+//! ([`step`]).
 
+mod charter;
 mod digest;
+mod jobs;
+#[cfg(test)]
+mod resume_replay;
 mod stall;
 mod stops;
 mod worker;
 
+pub(crate) use digest::{OPENING as DIGEST_OPENING, heading};
+#[cfg(test)]
+pub(crate) use jobs::items as job_items;
 pub(crate) use stall::Bounds;
 
 use std::collections::BTreeSet;
@@ -62,7 +84,7 @@ use spawn_core::port::CommandQueue;
 use spawn_postgres::PostgresStore;
 
 use crate::deliver::{self, Work};
-use crate::supervise::SUPERVISOR_SESSION;
+use crate::supervise::{Charter, SUPERVISOR_SESSION};
 
 /// One command the dispatcher sent.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -99,6 +121,56 @@ pub(crate) struct StopSent {
     pub(crate) succeeded: Option<bool>,
     #[serde(default)]
     pub(crate) error: Option<String>,
+}
+
+/// A background job the session's live execution started and that has not
+/// ended (`job.started` without its `job.ended`), as `dispatch_facts`
+/// reads it. The execution's end closes it, so only a live one has any.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct Job {
+    /// The engine's task id.
+    pub(crate) id: String,
+    /// `bash`, `monitor` or `agent`.
+    pub(crate) kind: String,
+    /// The `job.started` record's id.
+    pub(crate) event_id: i64,
+    /// When it started (the record's time).
+    pub(crate) started_at_ms: i64,
+    /// How long it has run when the facts were read, on the database's
+    /// clock.
+    pub(crate) age_ms: i64,
+}
+
+/// A resume that started an execution which ended lost before its engine
+/// became ready ([`Facts::failed_resume`]), with what the log says of it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub(crate) struct FailedResume {
+    /// The execution the resume started.
+    pub(crate) execution_id: String,
+    /// The resume command.
+    #[serde(default)]
+    pub(crate) command_id: Option<i64>,
+    #[serde(default)]
+    pub(crate) ended_at_ms: Option<i64>,
+    /// The `evidence` of the execution's end: for a start abandoned at its
+    /// ready wait, `its start failed: pane never became ready, last state
+    /// <state>…`.
+    #[serde(default)]
+    pub(crate) evidence: Option<String>,
+    /// The resume command's error.
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
+impl FailedResume {
+    /// What the log says of how it failed: the end's evidence, else the
+    /// command's error.
+    pub(crate) fn why(&self) -> &str {
+        self.evidence
+            .as_deref()
+            .or(self.error.as_deref())
+            .unwrap_or("no evidence recorded")
+    }
 }
 
 /// Facts about one session, as `dispatch_facts` returns them.
@@ -160,10 +232,31 @@ pub(crate) struct Facts {
     /// that stayed up.
     #[serde(default)]
     pub(crate) resumed_young: u32,
+    /// The latest execution one of the dispatcher's resumes started that
+    /// ended lost before its engine became ready (whatever its command's
+    /// outcome), since the session's last execution that stayed up: a
+    /// failed resume, read from the log rather than from the key of the
+    /// session's latest execution, which no resume was sent under.
+    #[serde(default)]
+    pub(crate) failed_resume: Option<FailedResume>,
     /// Every Stop and Discard sent into the session since its live
     /// execution started (none when it is not live), oldest first.
     #[serde(default)]
     pub(crate) stops: Vec<StopSent>,
+    /// For the supervisor: the records of the charter its current native
+    /// session holds ([`charter::Records`]); `None` for every other session.
+    #[serde(default)]
+    pub(crate) charter: Option<charter::Records>,
+    /// The live execution's open background jobs, oldest first.
+    #[serde(default)]
+    pub(crate) jobs: Vec<Job>,
+}
+
+/// Whether a judgement says the turn stopped at the prompt: the rules left
+/// it to the judge (`TurnStoppedIdle`), or settled it as waiting on a
+/// background job of its own. Either way the pane waits at its prompt.
+fn stopped_at_prompt(observation: &Observation) -> bool {
+    observation.ambiguity == Some(Ambiguity::TurnStoppedIdle) || observation.waits_on_own_job()
 }
 
 impl Facts {
@@ -199,16 +292,24 @@ impl Facts {
         self.live && !self.open_command
     }
 
-    /// Whether the worker sits idle at its prompt, judged on its latest
-    /// fact, with nothing in flight: the only moment typed input is safe.
-    /// The turn stopped and the pane waits at its prompt, whatever Jev made
-    /// of it: a fact the rules settle. A report written by then is the
-    /// worker's answer even when it asks a question (judged BLOCKED).
+    /// Whether the worker sits at its prompt, judged on its latest fact,
+    /// with nothing in flight: the only moment typed input is safe. The
+    /// turn stopped and the pane waits at its prompt, whatever Jev made of
+    /// it: a fact the rules settle. A report written by then is the
+    /// worker's answer even when it asks a question (judged BLOCKED). A
+    /// worker waiting on its own background job sits at its prompt too
+    /// (judged WORKING): input is safe, though it is not idle.
     pub(crate) fn turn_stopped_idle(&self) -> bool {
-        self.live_and_free()
-            && self.current_observation().is_some_and(|observation| {
-                observation.ambiguity == Some(Ambiguity::TurnStoppedIdle)
-            })
+        self.live_and_free() && self.current_observation().is_some_and(stopped_at_prompt)
+    }
+
+    /// Whether the rules judged the worker, on its latest fact, at its
+    /// prompt waiting on a background job of its own: working, not idle.
+    pub(crate) fn waits_on_own_job(&self) -> bool {
+        self.live
+            && self
+                .current_observation()
+                .is_some_and(Observation::waits_on_own_job)
     }
 
     /// Whether a report written in the worker's workspace may be collected
@@ -228,8 +329,7 @@ impl Facts {
     /// new situation, so a stale one waits for the model's judgement of the
     /// turn, as before.
     pub(crate) fn report_due(&self) -> bool {
-        let idle =
-            |observation: &Observation| observation.ambiguity == Some(Ambiguity::TurnStoppedIdle);
+        let idle = stopped_at_prompt;
         self.live_and_free()
             && self.turn_ended
             && match self.current_observation() {
@@ -279,16 +379,52 @@ pub(crate) enum Why {
     DeliveryFailed,
     /// A Stop of a live execution kept failing.
     StopFailed,
-    /// Free disk on this host crossed the warning threshold (crate::disk).
+    /// Free disk on this host fell under the warning threshold, and is not
+    /// back yet (crate::disk).
     Disk,
-    /// A mission's gate has had no room in TMPDIR for hours
-    /// ([`crate::disk::gate_room_escalations`]).
+    /// Free disk on this host is back above the warning threshold
+    /// (crate::disk): news, see [`Why::is_news`].
+    DiskRecovered,
+    /// A mission's gate has had no room in TMPDIR for hours, and its run of
+    /// `no_room` goes on ([`crate::disk::gate_room_escalations`]).
     GateRoom,
     /// A mission's gate failed twice in a row because the host did (the
     /// test database), not the work ([`digest::host_fault_escalations`]).
     GateHostFault,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
+    /// The deployed charter could not be typed into the supervisor's pane:
+    /// every attempt was refused before typing, and the retries are spent
+    /// ([`charter`]).
+    Charter,
+    /// A worker's background job has run longer than its bound ([`jobs`]).
+    BackgroundJob,
+    /// An owner's hold on a mission source reached its bound and the
+    /// integrator ended it by record ([`digest::hold_expiries`]): landings
+    /// there resumed, and an owner verdict judged against its main may be
+    /// stale.
+    HoldExpired,
+}
+
+impl Why {
+    /// Whether an item of this kind is news rather than a condition: told
+    /// once, it leaves nothing to resolve. A disk recovery, an approval, a
+    /// human's message, a pair of host faults at the gate (the integrator
+    /// judges again on its own) and an expired hold (its landings resumed
+    /// on their own) are news. Every other item is a
+    /// condition that holds while its facts do (a worker's state, a stall,
+    /// a path still low on disk, a gate still without room): told, it stays
+    /// in [`Plan::told`] until its facts change.
+    pub(crate) fn is_news(self) -> bool {
+        matches!(
+            self,
+            Self::DiskRecovered
+                | Self::Approved
+                | Self::Human
+                | Self::GateHostFault
+                | Self::HoldExpired
+        )
+    }
 }
 
 /// One escalation, identified so a digest can mark it delivered.
@@ -298,16 +434,24 @@ pub(crate) struct Escalation {
     pub(crate) id: String,
     pub(crate) why: Why,
     pub(crate) line: String,
+    /// When the record it rests on was written (the judgement of a
+    /// worker's state, the record a stall is measured from, a disk or gate
+    /// record), on the database's clock; `None` when the rows carry no
+    /// time. Only for showing its age (`GET /api/attention`): never in its
+    /// tag or a digest's text.
+    pub(crate) since_ms: Option<i64>,
 }
 
 impl Escalation {
-    /// An escalation about the session `facts` describe.
+    /// An escalation about the session `facts` describe, as of its latest
+    /// judgement.
     pub(crate) fn about(facts: &Facts, id: String, why: Why, line: String) -> Self {
         Self {
             session_id: facts.session_id.clone(),
             id,
             why,
             line,
+            since_ms: facts.observation_at_ms,
         }
     }
 
@@ -353,6 +497,11 @@ pub(crate) struct Plan {
     pub(crate) orders: Vec<Order>,
     /// Escalations not delivered yet, whether or not a digest goes out now.
     pub(crate) pending: Vec<Escalation>,
+    /// Escalations already delivered to the supervisor (their tag is in its
+    /// told set) whose condition still holds: left out of `pending`, so
+    /// never sent again. News ([`Why::is_news`]) is not among them: told,
+    /// it is resolved. The attention view shows these as unresolved.
+    pub(crate) told: Vec<Escalation>,
 }
 
 /// Principal the dispatcher submits as.
@@ -388,7 +537,7 @@ pub(crate) fn decide_with(
     let mut plan = Plan {
         delivered: deliver::delivered(work, rows),
         orders: deliver::orders(work, rows, now_ms),
-        pending: Vec::new(),
+        ..Plan::default()
     };
     let in_flight = work.in_flight();
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
@@ -410,8 +559,15 @@ pub(crate) fn decide_with(
         }
     }
     plan.pending.extend(deliver::news_items(work, rows));
+    plan.pending
+        .extend(supervisor.and_then(charter::escalation));
     plan.pending.extend_from_slice(host);
-    plan.pending.retain(|item| !told.contains(&item.tag()));
+    (plan.told, plan.pending) = std::mem::take(&mut plan.pending)
+        .into_iter()
+        .partition(|item| told.contains(&item.tag()));
+    // Every item here holds now (each source gives only what its facts
+    // still say); told news was resolved by the telling.
+    plan.told.retain(|item| !item.why.is_news());
     if let Some(supervisor) = supervisor.filter(|_| supervised) {
         plan.orders
             .extend(digest::order(supervisor, &plan.pending, spawn));
@@ -420,7 +576,7 @@ pub(crate) fn decide_with(
 }
 
 /// Facts and mission rows, read once.
-fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
+pub(crate) fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
     let rows: Vec<Facts> =
         serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
             .map_err(|error| format!("dispatch facts: {error}"))?;
@@ -453,10 +609,86 @@ fn submit(store: &PostgresStore, principal: &Principal, order: Order) -> Result<
     Ok(())
 }
 
+/// One pass's plan, read from the store before anything is submitted.
+pub(crate) struct Reading {
+    /// The facts the plan was made from.
+    pub(crate) rows: Vec<Facts>,
+    /// The mission rows the plan was made from.
+    pub(crate) work: Work,
+    pub(crate) plan: Plan,
+    /// Log lines: what could not be read (a stall read that failed).
+    pub(crate) lines: Vec<String>,
+}
+
+/// The plan for this moment, reading only: the host's news (the disk items
+/// `disk` gives for the moment's clock, the gate-room and gate host-fault
+/// records, the owner's holds that expired, the stalls past their `bounds`,
+/// [`stall`], and the background
+/// jobs past theirs, [`jobs`]) added to the facts and mission rows
+/// `loaded` ([`load`]), then [`decide_with`], then the input that gives the
+/// supervisor the `deployed` charter if it holds another ([`charter::give`];
+/// `None`: no input, as for a reader that submits nothing). [`step`]
+/// submits what it returns; `GET /api/attention` (crate::serve) shows it.
+/// One function for both, so the queue a person reads is the dispatcher's
+/// own.
+pub(crate) fn read_plan(
+    store: &PostgresStore,
+    loaded: (Vec<Facts>, Work),
+    disk: impl FnOnce(i64) -> Vec<Escalation>,
+    bounds: &Bounds,
+    supervised: bool,
+    spawn: &str,
+    deployed: Option<&Charter>,
+) -> Result<Reading, String> {
+    let (rows, work) = loaded;
+    let mut lines = Vec::new();
+    let now = now_ms();
+    let mut host = disk(now);
+    host.extend(crate::disk::gate_room_escalations(
+        store
+            .gate_room_escalations()
+            .map_err(|error| format!("gate room records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::host_fault_escalations(
+        store
+            .gate_host_fault_escalations()
+            .map_err(|error| format!("gate host fault records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::hold_expiries(
+        store
+            .hold_expiries()
+            .map_err(|error| format!("source hold records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    // A stall read that failed costs this pass its stall items, never its
+    // deliveries: the next pass measures the same stalls again.
+    match load_stalls(store) {
+        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
+        Err(error) => lines.push(format!("dispatch: stalls: {error}")),
+    }
+    host.extend(jobs::items(&rows, bounds.job));
+    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    if let Some(deployed) = deployed.filter(|_| supervised) {
+        charter::give(&mut plan, &rows, deployed);
+    }
+    Ok(Reading {
+        rows,
+        work,
+        plan,
+        lines,
+    })
+}
+
 /// Run one dispatcher step against the store: collect reports from idle
-/// workers under `root`, then submit the plan, with the stalls past their
-/// `bounds` among its escalations ([`stall`]), without its new executions
-/// while the disk is under its floor ([`crate::disk`]). Returns log lines.
+/// workers under `root`, then submit the plan ([`read_plan`]), with the
+/// stalls past their `bounds` among its escalations ([`stall`]), without
+/// its new executions while the disk is under its floor ([`crate::disk`]).
+/// Returns log lines.
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -473,29 +705,21 @@ pub(crate) fn step(
         // Collecting a report changed a task's state.
         (rows, work) = load(store)?;
     }
-    let now = now_ms();
-    let mut host = disk.escalations(now);
-    host.extend(crate::disk::gate_room_escalations(
-        store
-            .gate_room_escalations()
-            .map_err(|error| format!("gate room records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    host.extend(digest::host_fault_escalations(
-        store
-            .gate_host_fault_escalations()
-            .map_err(|error| format!("gate host fault records: {error}"))?
-            .as_array()
-            .map_or(&[][..], Vec::as_slice),
-    ));
-    // A stall read that failed costs this pass its stall items, never its
-    // deliveries: the next pass measures the same stalls again.
-    match load_stalls(store) {
-        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
-        Err(error) => lines.push(format!("dispatch: stalls: {error}")),
-    }
-    let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
+    let Reading {
+        work,
+        mut plan,
+        lines: read,
+        ..
+    } = read_plan(
+        store,
+        (rows, work),
+        |now| disk.escalations(now),
+        bounds,
+        supervised,
+        spawn,
+        Some(&Charter::deployed(spawn)),
+    )?;
+    lines.extend(read);
     if disk.below_floor() {
         let held = crate::disk::hold_new_executions(&mut plan.orders);
         if held > 0 {
@@ -528,9 +752,17 @@ pub(crate) fn step(
         }
         // A task typed into a live worker starts from the source's main:
         // merged into its idle workspace first, and the brief says what the
-        // merge did ([`crate::main_merge`]).
+        // merge did ([`crate::main_merge`]). A worker found busy at the
+        // merge gets nothing this pass: the delivery is tried again on the
+        // next, by the same rules.
         if let Some(root) = root {
-            lines.extend(merge_main_before(store, root, &mut order));
+            match merge_main_before(store, root, &mut order) {
+                Ok(line) => lines.extend(line),
+                Err(held) => {
+                    lines.push(held);
+                    continue;
+                }
+            }
         }
         let line = format!("dispatch: {} -> {}", order.key, order.session_id);
         // Before the command exists, so the worker's report for it comes
@@ -588,17 +820,27 @@ fn set_aside_before(
 /// Merge main into the workspace of the live worker `order` types a task
 /// into, and add what the merge did to the typed text. A start or resume
 /// mounts its workspace later; the Bridge merges main then, when it merges
-/// cleanly. Returns a log line when the merge did something.
-fn merge_main_before(
+/// cleanly. Returns a log line when the merge did something, and an error
+/// (the log line) when the order must not be sent this pass: the worker was
+/// not idle when the merge looked again ([`crate::main_merge::Merge::Busy`]).
+pub(crate) fn merge_main_before(
     store: &std::sync::Arc<PostgresStore>,
     root: &Path,
     order: &mut Order,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let CommandAction::Input { text, .. } = &mut order.action else {
-        return None;
+        return Ok(None);
     };
-    let task = order.task?;
+    let Some(task) = order.task else {
+        return Ok(None);
+    };
     let merge = crate::main_merge::merge_main(store, root, &order.agent_id, &order.session_id);
+    if let crate::main_merge::Merge::Busy(why) = &merge {
+        return Err(format!(
+            "deliver: task #{task} waits: main is not merged into its workspace while {why}; \
+             tried again next pass"
+        ));
+    }
     // What earlier merges changed and no typed delivery told yet, from
     // their records: this attempt's merge may find main already in.
     let untold = store
@@ -609,17 +851,17 @@ fn merge_main_before(
         text.push_str("\n\n");
         text.push_str(&note);
     }
-    match merge {
+    Ok(match merge {
         crate::main_merge::Merge::Current | crate::main_merge::Merge::NotMounted => None,
         other => Some(format!(
             "deliver: task #{task}: main into its workspace: {other:?}"
         )),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Escalation, Facts, Sent, Why, decide, decide_with};
+    use super::{Escalation, Facts, FailedResume, Sent, Why, decide, decide_with};
     use crate::deliver::Work;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
@@ -660,8 +902,11 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            failed_resume: None,
             turn_ended: true,
             checkpoint: None,
+            charter: None,
+            jobs: Vec::new(),
         }
     }
 
@@ -762,8 +1007,11 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            failed_resume: None,
             turn_ended: true,
             checkpoint: None,
+            charter: None,
+            jobs: Vec::new(),
         }
     }
 
@@ -864,13 +1112,21 @@ mod tests {
         assert_eq!(tags, &["session_worker_a 100"]);
         assert!(text.contains("needs_human 90%"));
 
-        // Once delivered, the same escalation is not sent again.
+        // Once delivered, the same escalation is not sent again; while it
+        // holds, the plan keeps it as told (the attention view shows it).
         let mut supervisor = idle_supervisor();
         delivered(&mut supervisor, digest);
         let rows = [rows[0].clone(), supervisor];
         let plan = decide(&rows, true, NOW, "spawn");
         assert!(plan.orders.is_empty());
         assert!(plan.pending.is_empty());
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["session_worker_a 100"]);
+        assert_eq!(
+            plan.told[0].since_ms,
+            Some(NOW - 1_000),
+            "as of its judgement"
+        );
     }
 
     #[test]
@@ -880,6 +1136,7 @@ mod tests {
             id: "disk-7".to_string(),
             why: Why::Disk,
             line: "tmpdir /tmp has 5.0 GiB free".to_string(),
+            since_ms: None,
         }];
         let rows = [idle_supervisor()];
         let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
@@ -893,6 +1150,175 @@ mod tests {
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
+        );
+        assert_eq!(
+            plan.told, host,
+            "told, and the path is still low: unresolved"
+        );
+    }
+
+    /// The live page of 2026-11-06 20:30: two disk recoveries told 8 h
+    /// earlier were listed as told and unresolved. A recovery is news: told
+    /// once, then resolved, while a low path stays unresolved until its
+    /// recovery replaces it (crate::disk::escalations).
+    #[test]
+    fn a_told_recovery_is_resolved_and_a_told_low_path_is_not() {
+        let record = |id: i64, path: &str, state: &str, free: u64| {
+            serde_json::json!({"type": "host.disk", "label": "tmpdir", "path": path,
+                               "state": state, "free_bytes": free << 30, "warn_bytes": 20_u64 << 30,
+                               "floor_bytes": 2_u64 << 30, "event_id": id,
+                               "at_ms": NOW - 8 * 3_600_000})
+        };
+        let host = crate::disk::escalations(
+            &[
+                record(7, "/data/tmp", "recovered", 43),
+                record(8, "/ws", "low", 5),
+            ],
+            NOW,
+        );
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &host, true, NOW, "spawn");
+        let pending: Vec<String> = plan.pending.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            pending,
+            ["host disk-7", "host disk-8"],
+            "both news until told"
+        );
+        let CommandAction::Input { text, .. } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert!(
+            text.contains(
+                "- host — disk space back on this host: tmpdir /data/tmp has 43.0 GiB free again\n"
+            ),
+            "{text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty(),
+            "told once"
+        );
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host disk-8"], "the recovery is not unresolved");
+    }
+
+    /// News of every kind is resolved by being told: a told approval, human
+    /// message or pair of host faults is never kept as unresolved, even if
+    /// its source still gives it.
+    #[test]
+    fn told_news_is_never_unresolved() {
+        let item = |why: Why, id: &str| Escalation {
+            session_id: "host".to_string(),
+            id: id.to_string(),
+            why,
+            line: String::new(),
+            since_ms: None,
+        };
+        let host = [
+            item(Why::Approved, "approved-core"),
+            item(Why::Human, "human-4"),
+            item(Why::GateHostFault, "gate-host-fault-9"),
+            item(Why::GateRoom, "gate-room-12"),
+        ];
+        let mut supervisor = idle_supervisor();
+        supervisor.told = host.iter().map(Escalation::tag).collect();
+        let plan = decide_with(&[supervisor], &Work::default(), &host, true, NOW, "spawn");
+        assert!(plan.pending.is_empty());
+        let told: Vec<String> = plan.told.iter().map(Escalation::tag).collect();
+        assert_eq!(told, ["host gate-room-12"], "only the condition holds");
+    }
+
+    /// The live sequence of 2026-11-06: 100 human notes to one worker could
+    /// not be delivered, each its own line, and they filled 16 digests in a
+    /// row while a report waited behind them. One session's items of one
+    /// kind are one line, every tag filed.
+    #[test]
+    fn repeated_items_about_one_session_are_one_digest_line() {
+        let human = |n: usize| Escalation {
+            session_id: "session_worker_b".to_string(),
+            id: format!("human-{n}"),
+            why: Why::Human,
+            line: format!("note {n} could not be delivered"),
+            since_ms: None,
+        };
+        let mut host: Vec<Escalation> = (1..=20).map(human).collect();
+        host.push(Escalation {
+            session_id: "session_worker_c".to_string(),
+            id: "report-9-0".to_string(),
+            why: Why::Report,
+            line: "task #9 reported".to_string(),
+            since_ms: None,
+        });
+        // Items about the host are each about something else.
+        for place in ["workspace", "tmpdir"] {
+            host.push(Escalation {
+                session_id: "host".to_string(),
+                id: format!("disk-{place}"),
+                why: Why::Disk,
+                line: format!("{place} is low"),
+                since_ms: None,
+            });
+        }
+        let plan = decide_with(
+            &[idle_supervisor()],
+            &Work::default(),
+            &host,
+            true,
+            NOW,
+            "spawn",
+        );
+        let [digest] = plan.orders.as_slice() else {
+            panic!("one digest: {:?}", plan.orders);
+        };
+        let CommandAction::Input { text, tags } = &digest.action else {
+            panic!("a typed digest");
+        };
+        assert!(text.starts_with("Spawn dispatcher: 4 updates"), "{text}");
+        assert!(
+            text.contains("workspace is low") && text.contains("tmpdir is low"),
+            "{text}"
+        );
+        assert!(
+            text.contains("human message (20 of them, the latest): note 20 could not"),
+            "{text}"
+        );
+        assert!(
+            text.contains("task #9 reported"),
+            "the report is not starved"
+        );
+        assert_eq!(tags.len(), 23, "every item it stands for is told");
+    }
+
+    /// The live sequence of 2026-11-06: the supervisor ended its turn on a
+    /// question for the human, Jev judged it BLOCKED at its prompt, and no
+    /// digest reached it for four hours while a worker sat idle.
+    #[test]
+    fn a_supervisor_that_asked_the_human_a_question_still_gets_digests() {
+        let mut blocked = judged(SemanticState::Blocked, 0.8);
+        blocked.attention = true;
+        let mut asking = idle_supervisor();
+        let mut question = judged(SemanticState::Blocked, 0.96);
+        question.attention = true;
+        question.needs_human = Some(0.87);
+        asking.observation = Some(question);
+        let plan = decide(
+            &[worker(blocked.clone()), asking.clone()],
+            true,
+            NOW,
+            "spawn",
+        );
+        assert_eq!(plan.orders.len(), 1, "the digest goes to the supervisor");
+        assert_eq!(plan.orders[0].session_id, "session_supervisor");
+
+        let mut working = asking;
+        working.observation = Some(judged(SemanticState::Blocked, 0.96));
+        working.observation.as_mut().expect("set").ambiguity = None;
+        let plan = decide(&[worker(blocked), working], true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty(),
+            "BLOCKED away from its prompt (a dialog, a running turn) is not idle"
         );
     }
 
@@ -986,6 +1412,99 @@ mod tests {
         );
     }
 
+    /// Objective 34: an owner's hold that reached its bound and was ended by
+    /// the integrator's `source.hold_expired` reaches an idle supervisor
+    /// once, as an item of `missions` tagged
+    /// `missions source-hold-expired-<event id>`, under its own heading, its
+    /// line naming the source, the hold (event id, reason, when taken, its
+    /// bound), when it expired, each waiting task with its mission, and that
+    /// landings resumed. Two expiries keep a line each.
+    #[test]
+    fn an_expired_hold_reaches_an_idle_supervisor_once_with_its_waiting_tasks() {
+        let records = [
+            serde_json::json!({"event_id": 88, "at_ms": 1_793_930_021_000_i64,
+                "source": "/srv/missions/spawn.git", "hold": 71,
+                "expires_ms": 1_793_930_020_000_i64, "reason": "owner gate ffc9fe7\nsecond line",
+                "held_at_ms": 1_793_919_220_000_i64, "bound_s": 10_800,
+                "main": "a3543c2e0f1b2c3d4e5f60718293a4b5c6d7e8f9",
+                "waiting": [{"task": 85, "mission": 4}, {"task": 91, "mission": 6}]}),
+            serde_json::json!({"event_id": 95, "at_ms": 1_793_930_030_000_i64,
+                "source": "/srv/missions/supply-pa.git", "hold": 90,
+                "expires_ms": 1_793_930_029_000_i64, "held_at_ms": 1_793_930_009_000_i64,
+                "bound_s": 20, "main": "b3543c2e0f1b2c3d4e5f60718293a4b5c6d7e8f9",
+                "waiting": []}),
+        ];
+        let items = super::digest::hold_expiries(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "missions source-hold-expired-88",
+                "missions source-hold-expired-95"
+            ]
+        );
+        assert!(items.iter().all(|item| item.why == Why::HoldExpired));
+        assert_eq!(items[0].since_ms, Some(1_793_930_021_000));
+        let line = &items[0].line;
+        for part in [
+            "the owner's hold 71 (\"owner gate ffc9fe7 second line\") on source \
+             /srv/missions/spawn.git",
+            "taken 2026-11-0",
+            "a bound of 10800 s",
+            "expired at 2026-11-0",
+            "ended by record 88",
+            "task #85 of mission 4, task #91 of mission 6 waited behind it",
+            "landings on /srv/missions/spawn.git resumed",
+            "against its main a3543c2e0f1b may be stale now: tell the owner",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+        assert!(
+            items[1].line.contains("no task waited behind it"),
+            "{}",
+            items[1].line
+        );
+        assert!(items.iter().all(|item| !item.line.contains('\n')));
+        assert!(
+            super::digest::hold_expiries(&[serde_json::json!({"source": "/srv/x.git"})]).is_empty(),
+            "a record without its event is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &[
+                "missions source-hold-expired-88",
+                "missions source-hold-expired-95"
+            ]
+        );
+        let line = text
+            .lines()
+            .find(|line| line.contains("task #85"))
+            .expect("the first expiry's line");
+        assert!(
+            line.starts_with("- missions — a source hold expired: the owner's hold 71")
+                && line.contains("/srv/missions/spawn.git"),
+            "{line}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("/srv/missions/supply-pa.git")),
+            "each expiry keeps its own line: {text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &items, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty() && plan.told.is_empty(),
+            "told once, and resolved by the telling"
+        );
+    }
+
     #[test]
     fn a_busy_or_absent_supervisor_leaves_escalations_pending() {
         let mut blocked = judged(SemanticState::Blocked, 0.8);
@@ -1042,6 +1561,138 @@ mod tests {
             plan.orders[0].key, "dispatch-resume-exec_6",
             "an execution that stayed up is resumed again"
         );
+    }
+
+    /// What the Bridge leaves of a resume it abandoned at its ready wait,
+    /// as the 129 sequence of 2026-11-07 did: command `command` started
+    /// `exec_<command>`, whose pane never became ready, so the execution
+    /// ended lost and the command failed.
+    fn abandoned_at_ready(command: i64, finished_at_ms: i64) -> FailedResume {
+        FailedResume {
+            execution_id: format!("exec_{command}"),
+            command_id: Some(command),
+            ended_at_ms: Some(finished_at_ms),
+            evidence: Some(
+                "its start failed: pane never became ready, last state Unknown".to_string(),
+            ),
+            error: Some("pane never became ready, last state Unknown".to_string()),
+        }
+    }
+
+    /// Task 132 (1): the Bridge abandons every resume at its ready wait (a
+    /// pane that never becomes ready, as after the host move of
+    /// 2026-11-07), and no resume is ever sent under the key of the
+    /// execution it started. Over many passes, the dispatcher resumes once
+    /// and escalates once, with the evidence; a second resume that ends the
+    /// same way in a row (a person's, after the escalation) neither brings a
+    /// dispatch nor a second escalation: the dispatcher sends nothing more.
+    #[test]
+    fn a_resume_lost_before_ready_twice_in_a_row_is_escalated_once_and_never_dispatched_again() {
+        let mut lost = worker(judged(SemanticState::Unknown, 0.5));
+        lost.live = false;
+        lost.end_cause = Some("lost".to_string());
+        let mut supervisor = idle_supervisor();
+        let mut resumes = Vec::new();
+        let mut digested = Vec::new();
+        for pass in 0..12_i64 {
+            let now = NOW + pass * 20_000;
+            if pass == 6 {
+                // Someone resumes it once more, outside the rule; the pane
+                // never becomes ready again.
+                lost.execution_id = Some("exec_940".to_string());
+            }
+            let plan = decide(&[lost.clone(), supervisor.clone()], true, now, "spawn");
+            for order in &plan.orders {
+                if order.session_id == supervisor.session_id {
+                    let CommandAction::Input { tags, .. } = &order.action else {
+                        panic!("a digest is typed input");
+                    };
+                    digested.extend(tags.iter().cloned());
+                    delivered(&mut supervisor, order);
+                    continue;
+                }
+                assert!(
+                    matches!(order.action, CommandAction::Resume { .. }),
+                    "{order:?}"
+                );
+                resumes.push(order.key.clone());
+                let command = 920 + i64::try_from(resumes.len()).expect("few");
+                let failed = abandoned_at_ready(command, now + 12_000);
+                lost.dispatched.push(Sent {
+                    id: Some(command),
+                    key: order.key.clone(),
+                    text: None,
+                    created_at_ms: now,
+                    finished_at_ms: failed.ended_at_ms,
+                    succeeded: Some(false),
+                    error: failed.error.clone(),
+                });
+                lost.execution_id = Some(failed.execution_id.clone());
+                lost.failed_resume = Some(failed);
+            }
+        }
+        assert_eq!(resumes, ["dispatch-resume-exec_5"], "resumed once, only");
+        assert_eq!(
+            digested,
+            ["session_worker_a resume-exec_921"],
+            "escalated once, about the resume that failed"
+        );
+        let plan = decide(&[lost, supervisor], true, NOW + 3_600_000, "spawn");
+        assert!(plan.orders.is_empty(), "{:?}", plan.orders);
+        assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+        let item = &plan.told[0];
+        assert_eq!(item.why, Why::ResumeFailed);
+        assert!(
+            item.line
+                .contains("its start failed: pane never became ready, last state Unknown")
+                && item.line.contains("command 921")
+                && item.line.contains("not resumed again"),
+            "{}",
+            item.line
+        );
+        assert_eq!(
+            item.since_ms,
+            Some(NOW + 12_000),
+            "as of the failed execution's end"
+        );
+    }
+
+    /// Task 132 (2): a resume that succeeded (its engine became ready and
+    /// took its prompt) and whose engine then died within the minute still
+    /// follows the young-death rule; one that stayed up is resumed again,
+    /// as before.
+    #[test]
+    fn a_resume_that_succeeded_and_died_young_still_follows_the_young_death_rule() {
+        let mut lost = worker(judged(SemanticState::Unknown, 0.5));
+        lost.live = false;
+        lost.end_cause = Some("lost".to_string());
+        lost.execution_id = Some("exec_6".to_string());
+        lost.dispatched.push(Sent {
+            id: Some(6),
+            key: "dispatch-resume-exec_5".to_string(),
+            text: None,
+            created_at_ms: NOW - 50_000,
+            finished_at_ms: Some(NOW - 45_000),
+            succeeded: Some(true),
+            error: None,
+        });
+        lost.resumed_young = 1;
+        let plan = decide(&[lost.clone()], false, NOW, "spawn");
+        assert!(plan.orders.is_empty(), "no second resume");
+        assert_eq!(plan.pending.len(), 1);
+        assert_eq!(plan.pending[0].why, Why::ResumeFailed);
+        assert_eq!(plan.pending[0].tag(), "session_worker_a resume-exec_6");
+        assert_eq!(
+            plan.pending[0].line,
+            "engine was lost again within a minute of its automatic resume"
+        );
+        lost.resumed_young = 0;
+        let plan = decide(&[lost], false, NOW, "spawn");
+        assert_eq!(
+            plan.orders[0].key, "dispatch-resume-exec_6",
+            "a resumed execution that stayed up is resumed again"
+        );
+        assert!(plan.pending.is_empty());
     }
 
     #[test]
@@ -1344,12 +1995,14 @@ mod tests {
             id: "report-7-1".to_string(),
             why: Why::Report,
             line: "task #7: done [spawn:esc missions mission-5] missions mission-5".to_string(),
+            since_ms: None,
         };
         let mission = Escalation {
             session_id: "missions".to_string(),
             id: "mission-5".to_string(),
             why: Why::Mission,
             line: "#5 from human: ship it".to_string(),
+            since_ms: None,
         };
         let rows = [idle_supervisor()];
         let plan = decide_with(

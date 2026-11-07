@@ -11,12 +11,16 @@
 //! | `activity` | delivered | the later of `task.delivered` and the session's latest fact | `SPAWN_STALL_ACTIVITY_SECS` (900) |
 //! | `judgement` | reported, under review | `task.reported` | `SPAWN_STALL_REVIEW_SECS` (1800) |
 //! | `judgement` | the task the integrator judges next in its gated mission | the later of the record that made it ready and the mission's latest verdict that is not `stale` | `SPAWN_STALL_GATE_SECS` (3600) |
-//! | `landing` | landing | its `task.gated` accepted | `SPAWN_STALL_LANDING_SECS` (600) |
+//! | `landing` | landing, its source not held by the owner | the later of its `task.gated` accepted and the record that ended the latest hold on its source | `SPAWN_STALL_LANDING_SECS` (600) |
 //! | `stop` | an ephemeral task closed whose worker still runs | the record that closed it | `SPAWN_STALL_STOP_SECS` (300) |
 //! | `halted` | a halted mission with open tasks | its `mission.halted` | `SPAWN_STALL_HALTED_SECS` (0) |
 //!
 //! A task queued behind another of its session, or behind the task its
 //! mission's gate judges next, is not escalated: the one ahead of it is.
+//! A landing on a source the owner holds (`spawn mission hold`) waits behind
+//! the hold, not for the integrator: it is no landing stall while the hold
+//! lasts, and once a record ends the hold (`source.released`,
+//! `source.hold_expired`) its step is measured from that record.
 //! The tasks of a halted mission waiting for the gate or a landing are the
 //! halt's: the escalation is about the mission, once per `mission.halted`.
 //! A failed command (a delivery attempt, a Stop, a resume) is the evidence
@@ -29,10 +33,14 @@
 //! mechanism sends it once, and a step that moved and stalled anew has a new
 //! record, so a new tag. A failed retry, a `stale` verdict, a nudge, a
 //! judgement or an input recorded `waiting` for the session's turn moves no
-//! step (the waiting step is not a fact: `stall_facts` skips it). A worker at its prompt whose screen says its
-//! background shells still run (Claude Code resumes it when they finish)
-//! is treated as active: its `activity` step is not escalated while that
-//! is its latest screen reading.
+//! step (the waiting step is not a fact: `stall_facts` skips it). A worker
+//! whose turn ended while a background job of its own is open (a
+//! `job.started` of its live execution with no `job.ended`, read from its
+//! transcript; Claude Code wakes it when the job reports) is working: its
+//! `activity` step is not escalated while it waits on the job. A job past
+//! its bound (`SPAWN_STALL_JOB_SECS`) is escalated once on its own
+//! ([`super::jobs`]), and that is the task's only item meanwhile. The
+//! screen's "N shells still running" is no rule (docs/design.md §14).
 //!
 //! This layer takes no action: it adds digest items, and says what Spawn
 //! already tried and still will (a retry due, or due and held, and why).
@@ -44,7 +52,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use spawn_core::mission::TaskState;
-use spawn_core::screen::shows_background_shells;
 
 use super::{Escalation, Facts, Why};
 use crate::deliver::{self, Work, one_line};
@@ -60,11 +67,14 @@ pub(crate) struct Bounds {
     pub(crate) landing: i64,
     pub(crate) stop: i64,
     pub(crate) halted: i64,
+    /// How long a background job may run before it is escalated
+    /// ([`super::jobs`]).
+    pub(crate) job: i64,
 }
 
 /// The variables, with their defaults in seconds (the reasons are in
 /// docs/architecture.md's environment table).
-const VARIABLES: [(&str, u64); 7] = [
+const VARIABLES: [(&str, u64); 8] = [
     ("SPAWN_STALL_DELIVERY_SECS", 600),
     ("SPAWN_STALL_ACTIVITY_SECS", 900),
     ("SPAWN_STALL_REVIEW_SECS", 1800),
@@ -72,6 +82,7 @@ const VARIABLES: [(&str, u64); 7] = [
     ("SPAWN_STALL_LANDING_SECS", 600),
     ("SPAWN_STALL_STOP_SECS", 300),
     ("SPAWN_STALL_HALTED_SECS", 0),
+    ("SPAWN_STALL_JOB_SECS", 7200),
 ];
 
 impl Default for Bounds {
@@ -88,7 +99,7 @@ impl Bounds {
         Self::read(crate::config::env_value)
     }
 
-    fn read(lookup: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
+    pub(super) fn read(lookup: impl Fn(&str) -> Option<String>) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let mut values = [0_i64; VARIABLES.len()];
         for ((name, fallback), value) in VARIABLES.iter().zip(values.iter_mut()) {
@@ -105,7 +116,7 @@ impl Bounds {
                 .unwrap_or(i64::MAX / 1000)
                 .saturating_mul(1000);
         }
-        let [delivery, activity, review, gate, landing, stop, halted] = values;
+        let [delivery, activity, review, gate, landing, stop, halted, job] = values;
         (
             Self {
                 delivery,
@@ -115,6 +126,7 @@ impl Bounds {
                 landing,
                 stop,
                 halted,
+                job,
             },
             warnings,
         )
@@ -162,6 +174,13 @@ pub(crate) struct OpenTask {
     pub(crate) record: Option<Record>,
     #[serde(default)]
     pub(crate) stale: Option<Stale>,
+    /// A landing whose source the owner holds now: it waits behind the hold.
+    #[serde(default)]
+    pub(crate) held: bool,
+    /// For a landing, the latest record that ended a hold on its source
+    /// (`source.released` or `source.hold_expired`).
+    #[serde(default)]
+    pub(crate) hold_end: Option<Record>,
 }
 
 /// A gated mission's latest verdict that is not `stale`.
@@ -178,7 +197,7 @@ pub(crate) struct Verdict {
     pub(crate) at_ms: i64,
 }
 
-/// A session's latest fact and latest screen reading.
+/// A session's latest fact.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Latest {
     pub(crate) session_id: String,
@@ -188,9 +207,6 @@ pub(crate) struct Latest {
     pub(crate) event_name: Option<String>,
     #[serde(default)]
     pub(crate) at_ms: Option<i64>,
-    /// The evidence of its latest `screen.observed`.
-    #[serde(default)]
-    pub(crate) screen: Option<String>,
 }
 
 /// A halted mission with open tasks.
@@ -253,7 +269,7 @@ struct Measured {
 }
 
 /// `ms` as a short duration: `45s`, `3m05s`, `2h04m`.
-fn took(ms: i64) -> String {
+pub(super) fn took(ms: i64) -> String {
     let secs = ms.max(0) / 1000;
     match secs {
         0..60 => format!("{secs}s"),
@@ -388,8 +404,9 @@ fn judged_next(stalls: &Stalls) -> BTreeSet<i64> {
 }
 
 /// A delivered task's `activity` step: from the later of its delivery
-/// record and its session's latest fact; none while its screen shows
-/// background shells running.
+/// record and its session's latest fact; none while its worker's turn has
+/// ended with a background job of its own open (it works on that job; past
+/// the job's bound, [`super::jobs`] escalates it).
 fn activity(
     task: &OpenTask,
     record: &Record,
@@ -403,11 +420,8 @@ fn activity(
         .sessions
         .iter()
         .find(|latest| latest.session_id == task.session_id);
-    if latest
-        .and_then(|latest| latest.screen.as_deref())
-        .is_some_and(shows_background_shells)
-    {
-        // At its prompt with background shells running: active.
+    if facts.is_some_and(|facts| facts.live && facts.turn_ended && !facts.jobs.is_empty()) {
+        // At its prompt with a job of its own running: working.
         return None;
     }
     let fact =
@@ -516,6 +530,41 @@ fn gate(
         },
     })
 }
+/// A landing's `landing` step, from its accepted verdict (`record`), or
+/// from the later record that ended the owner's hold on its source; none
+/// while its source is held (it waits behind the hold, not for the
+/// integrator).
+fn landing(task: &OpenTask, record: &Record, now: i64, bound_ms: i64) -> Option<Measured> {
+    if task.held {
+        return None;
+    }
+    let accepted = format!("the gate accepted it: {}", named(record, now));
+    Some(match &task.hold_end {
+        Some(end) if end.at_ms > record.at_ms => Measured {
+            step: Step::Landing,
+            n: end.id,
+            since_ms: end.at_ms,
+            bound_ms,
+            line: format!(
+                "{accepted}; the owner's hold on its source ended by {}; the integrator lands it \
+                 on its next pass of mission #{}",
+                named(end, now),
+                task.mission_id
+            ),
+        },
+        _ => Measured {
+            step: Step::Landing,
+            n: record.id,
+            since_ms: record.at_ms,
+            bound_ms,
+            line: format!(
+                "{accepted}; the integrator lands it on its next pass of mission #{}",
+                task.mission_id
+            ),
+        },
+    })
+}
+
 /// The step `task` waits on, measured, or none: it is queued, closed with
 /// no worker left, the halt's, or its delivery was given up.
 fn measure(
@@ -577,16 +626,7 @@ fn measure(
         TaskState::Reported | TaskState::Accepted if task.gated => {
             gate(task, record, context, bounds.gate)
         }
-        TaskState::Landing if !task.halted => Some(since_record(
-            Step::Landing,
-            bounds.landing,
-            format!(
-                "the gate accepted it: {}; the integrator lands it on its next pass of mission \
-                 #{}",
-                named(record, now),
-                task.mission_id
-            ),
-        )),
+        TaskState::Landing if !task.halted => landing(task, record, now, bounds.landing),
         TaskState::Accepted | TaskState::Landed | TaskState::Cancelled
             if task.kind == "ephemeral" && facts.is_some_and(|facts| facts.live) =>
         {
@@ -678,6 +718,7 @@ pub(crate) fn items(
                 ),
                 3000,
             ),
+            since_ms: Some(measured.since_ms),
         });
     }
     for halt in &stalls.halted {
@@ -706,6 +747,7 @@ pub(crate) fn items(
                 ),
                 3000,
             ),
+            since_ms: Some(record.at_ms),
         });
     }
     items

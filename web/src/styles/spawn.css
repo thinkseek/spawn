@@ -2,7 +2,7 @@
  *
  * tokens.css and base.css are copied verbatim from Multica (see NOTICE), so
  * the Spawn look lives here instead: this file is imported after them and
- * re-points the same custom properties at a dark operator palette. Color is
+ * re-points the same custom properties at a dimmed dark operator palette. Color is
  * reserved for meaning — phase, verdict, guard state — and everything else is
  * a neutral ramp. */
 
@@ -21,59 +21,68 @@
 :root {
   color-scheme: dark;
 
-  /* Neutral ramp, darkest to lightest. */
-  --app-shell: #0a0b0d;
-  --page-canvas: #0d0e11;
-  --surface: #131519;
-  --surface-raised: #181b20;
-  --surface-hover: #181b20;
-  --surface-selected: #1f2329;
-  --surface-border: rgb(255 255 255 / 0.075);
-  --border: rgb(255 255 255 / 0.075);
-  --border-strong: rgb(255 255 255 / 0.13);
-  --input: rgb(255 255 255 / 0.13);
-  --ring: oklch(0.72 0.12 245);
+  /* Neutral ramp, darkest to lightest: a dimmed dark, not a near-black one.
+   * Each step reads apart from the next (shell < canvas < surface < raised
+   * < selected), and every text and status token below keeps WCAG AA
+   * (4.5:1 for text, 3:1 for marks) on all of them, selected included. */
+  --app-shell: #1b1e24;
+  --page-canvas: #20242b;
+  --surface: #272b33;
+  --surface-raised: #2e333c;
+  --surface-hover: #2e333c;
+  --surface-selected: #363c46;
+  --surface-border: rgb(255 255 255 / 0.09);
+  --border: rgb(255 255 255 / 0.09);
+  --border-strong: rgb(255 255 255 / 0.15);
+  --input: rgb(255 255 255 / 0.15);
+  --ring: oklch(0.8 0.11 245);
+  --surface-shadow: 0 1px 2px rgb(0 0 0 / 0.18);
 
   --background: var(--page-canvas);
-  --foreground: #e6e8eb;
-  --muted: rgb(255 255 255 / 0.055);
-  --muted-foreground: #959ca6;
-  --faint-foreground: #646b75;
+  --foreground: #eef0f3;
+  --muted: rgb(255 255 255 / 0.07);
+  --muted-foreground: #c0c6ce;
+  --faint-foreground: #a3aab4;
   --surface-foreground: var(--foreground);
   --card: var(--surface);
   --card-foreground: var(--foreground);
 
-  --sidebar: #0a0b0d;
+  --sidebar: #1b1e24;
   --sidebar-foreground: var(--foreground);
-  --sidebar-border: rgb(255 255 255 / 0.065);
-  --sidebar-accent: rgb(255 255 255 / 0.06);
+  --sidebar-border: rgb(255 255 255 / 0.09);
+  --sidebar-accent: rgb(255 255 255 / 0.07);
 
   /* Meaning. */
-  --success: oklch(0.75 0.15 155);
-  --warning: oklch(0.81 0.14 78);
-  --destructive: oklch(0.69 0.19 24);
-  --info: oklch(0.73 0.12 245);
+  --success: oklch(0.78 0.15 155);
+  --warning: oklch(0.83 0.14 78);
+  --destructive: oklch(0.76 0.15 22);
+  --info: oklch(0.79 0.11 245);
   /* The model judge, so Jev's calls read apart from the rules' at a glance. */
-  --jev: oklch(0.74 0.13 300);
+  --jev: oklch(0.8 0.11 300);
 
   --chart-line: #c6cbd3;
 
   /* Trace span kinds: the first three categorical slots, in slot order
-   * (blue, orange, aqua), stepped for the dark surface and validated
-   * all-pairs against it. Commands stay neutral: they are the frame the
+   * (blue, orange, aqua), stepped for the dimmed surface (3:1 on every
+   * surface up to selected). Commands stay neutral: they are the frame the
    * rest hangs from. Failure is never one of these — it is --destructive. */
-  --trace-execution: #3987e5;
-  --trace-turn: #d95926;
-  --trace-tool: #199e70;
-  --trace-command: #8b929c;
-  --terminal: #08090b;
-  --terminal-foreground: #cfd3d9;
+  --trace-execution: #4a93ea;
+  --trace-turn: #e7703a;
+  --trace-tool: #22ab7b;
+  --trace-command: #949ba5;
+  /* Text drawn on a phase or span fill (a duration inside a bar). */
+  --bar-label: #14171c;
+  --terminal: #171a1f;
+  --terminal-foreground: #d4d8de;
 
-  --scrollbar-thumb: rgb(255 255 255 / 0.09);
-  --scrollbar-thumb-hover: rgb(255 255 255 / 0.18);
+  --tooltip: #121418;
+  --tooltip-shadow: 0 0 0 1px rgb(255 255 255 / 0.1), 0 8px 24px rgb(0 0 0 / 0.4);
+
+  --scrollbar-thumb: rgb(255 255 255 / 0.12);
+  --scrollbar-thumb-hover: rgb(255 255 255 / 0.22);
   --scrollbar-track: transparent;
 
-  --floating-shadow: 0 24px 64px rgb(0 0 0 / 0.55), 0 4px 14px rgb(0 0 0 / 0.35);
+  --floating-shadow: 0 24px 64px rgb(0 0 0 / 0.4), 0 4px 14px rgb(0 0 0 / 0.25);
 }
 
 ::selection {

@@ -211,6 +211,7 @@ impl Rig {
                 parent_session_id: None,
                 from: None,
                 model: None,
+                charter: None,
             },
         );
         self.bridge.tick().expect("tick");
@@ -396,7 +397,9 @@ fn a_start_whose_terminal_is_gone_fails_at_once() {
 }
 
 /// An input into a terminal that is gone fails at once, as a lost
-/// terminal, not as not ready.
+/// terminal, not as not ready: the execution it would type into is ended
+/// as lost first (issue #15), without a capture of a pane that is not
+/// there.
 #[test]
 fn an_input_whose_terminal_is_gone_fails_at_once() {
     let mut rig = Rig::new();
@@ -409,7 +412,11 @@ fn an_input_whose_terminal_is_gone_fails_at_once() {
     rig.input("key_input", "delete the old table");
     let (succeeded, error) = rig.finished(2);
     assert!(!succeeded);
-    assert!(error.contains("terminal disappeared"), "{error}");
+    assert!(
+        error.contains("is gone") && error.contains("ended as lost"),
+        "{error}"
+    );
     assert!(!error.contains(PANE_NOT_READY), "{error}");
-    assert_eq!(rig.host.captures.load(Ordering::SeqCst) - before, 1);
+    assert_eq!(rig.host.captures.load(Ordering::SeqCst) - before, 0);
+    assert!(rig.ended(), "the execution it would type into ended");
 }

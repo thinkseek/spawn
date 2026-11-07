@@ -75,7 +75,7 @@ fn script(name: &str, body: &str) -> String {
 }
 
 fn git(directory: &PathBuf, arguments: &[&str]) {
-    let status = Command::new("git")
+    let status = spawn_host::test_git_command()
         .arg("-C")
         .arg(directory)
         .args(["-c", "user.name=spawn-test"])
@@ -169,7 +169,7 @@ fn a_changed_workspace_advances_the_branch() {
         Commit::Created(id) => assert_eq!(id.as_str().len(), 40, "{id}"),
         Commit::Unchanged => panic!("a changed workspace must produce a commit"),
     }
-    let head = Command::new("git")
+    let head = spawn_host::test_git_command()
         .arg("--git-dir")
         .arg(&repo)
         .args(["show", &format!("{}:new.txt", branch())])
@@ -214,7 +214,7 @@ fn a_file_over_the_cap_stays_out_of_the_checkpoint_and_the_rest_goes_in() {
 }
 
 fn git_out(repo: &PathBuf, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = spawn_host::test_git_command()
         .arg("--git-dir")
         .arg(repo)
         .args(arguments)
@@ -364,7 +364,7 @@ fn a_file_over_the_cap_of_any_name_is_left_out_and_told_of() {
         store.commit(&workspace, "work").expect("commit succeeds"),
         Commit::Created(_)
     ));
-    let listed = Command::new("git")
+    let listed = spawn_host::test_git_command()
         .arg("--git-dir")
         .arg(&repo)
         .args(["ls-tree", "-r", "-z", "--name-only", &branch().to_string()])

@@ -73,6 +73,7 @@ fn start(store: &MemoryStore, from: Option<&str>) {
             parent_session_id: None,
             from: from.map(str::to_string),
             model: None,
+            charter: None,
         },
     );
 }
@@ -748,6 +749,7 @@ fn a_record_the_log_keeps_refusing_holds_up_only_its_session() {
                     parent_session_id: None,
                     from: None,
                     model: None,
+                    charter: None,
                 },
             },
         )
@@ -1231,5 +1233,42 @@ fn a_turn_end_waits_for_its_checkpoint_when_the_commit_fails() {
     assert_eq!(
         turn_and_checkpoints(&store),
         ["message.received", "artifact.committed", "turn.stopped"]
+    );
+}
+
+/// Issue #7: the Bridge types into an engine only while it holds the
+/// workspace (`WorkspaceStore::hold`), the prompt of a start and a later
+/// input alike: a merge of main that found the agent idle cannot write the
+/// workspace under the turn the typing starts, and one that waited for the
+/// typing finds it recorded.
+#[test]
+fn the_bridge_types_only_while_it_holds_the_workspace() {
+    let clock = Arc::new(ManualClock::new(Timestamp(1_000)));
+    let store = Arc::new(MemoryStore::new("shop", clock.clone()));
+    for command in 1..=4 {
+        let execution = ExecutionId::for_command(CommandId(command));
+        store.set_pane(&TerminalName::for_execution(&execution), READY);
+    }
+    let mut bridge = bridge(&store).with_clock(clock.clone());
+    start(&store, None);
+    quiet(&bridge.tick().expect("start"));
+    transcript(&store, &[prompt("1"), turn_end("1")]);
+    quiet(&bridge.tick().expect("read the turn"));
+    submit(
+        &store,
+        "key_input",
+        CommandAction::Input {
+            text: "more".to_string(),
+            tags: Vec::new(),
+        },
+    );
+    for _ in 0..3 {
+        quiet(&bridge.tick().expect("type"));
+        clock.advance(std::time::Duration::from_secs(1));
+    }
+    assert_eq!(
+        store.submitted_held(),
+        vec![true, true],
+        "the prompt and the input, each typed under the hold"
     );
 }

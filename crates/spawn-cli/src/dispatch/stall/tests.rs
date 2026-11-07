@@ -56,6 +56,9 @@ fn worker(state: SemanticState, idle: bool) -> Facts {
         last_delivery: None,
         model: ModelProfile::Default,
         resumed_young: 0,
+        charter: None,
+        jobs: Vec::new(),
+        failed_resume: None,
     }
 }
 
@@ -200,11 +203,20 @@ fn a_worker_idle_at_its_prompt_with_no_report_is_at_activity_too() {
 }
 
 /// Task 33: a resident ran clippy, the tests and the e2e in background
-/// shells for over 15 minutes, at its prompt, with no events. Its screen
-/// says the shells still run: that is activity.
+/// shells for over 15 minutes, at its prompt, with no events. Its transcript
+/// says the jobs it started have not ended: it works on them. The screen
+/// saying "shells still running" is no rule: without the records it stalls.
 #[test]
-fn a_worker_whose_screen_shows_background_shells_running_is_not_stalled() {
-    let facts = [worker(SemanticState::Waiting, true)];
+fn a_worker_at_its_prompt_with_a_background_job_open_is_not_stalled() {
+    let job = crate::dispatch::Job {
+        id: "b8w03og7k".to_string(),
+        kind: "bash".to_string(),
+        event_id: 130,
+        started_at_ms: NOW - 1_950_000,
+        age_ms: 1_950_000,
+    };
+    let mut waiting = worker(SemanticState::Working, true);
+    waiting.jobs = vec![job];
     let tasks = work(&[row(7, "delivered", SESSION)]);
     let found = stalls(json!({
         "tasks": [open(7, "delivered", (140, "task.delivered", 2_000_000))],
@@ -212,7 +224,17 @@ fn a_worker_whose_screen_shows_background_shells_running_is_not_stalled() {
                       "at_ms": NOW - 1_900_000,
                       "screen": "✻ Sautéed for 6s · done 11:27 PM · 3 shells still running"}],
     }));
-    assert!(items(&facts, &tasks, &found, &bounds()).is_empty());
+    assert!(items(&[waiting.clone()], &tasks, &found, &bounds()).is_empty());
+    // Its turn going again ends the wait: the step is measured as ever.
+    let mut running = waiting.clone();
+    running.turn_ended = false;
+    assert_eq!(items(&[running], &tasks, &found, &bounds()).len(), 1);
+    // No job open, whatever the screen says: stalled.
+    let idle = worker(SemanticState::Waiting, true);
+    assert_eq!(
+        only(&items(&[idle], &tasks, &found, &bounds())).id,
+        "stall-7-activity-20"
+    );
 }
 
 #[test]
@@ -303,6 +325,54 @@ fn a_landing_task_is_at_landing_and_a_closed_ephemeral_worker_still_running_at_s
     // Its worker gone: nothing to stop.
     running.live = false;
     assert!(items(&[running], &tasks, &found, &bounds()).is_empty());
+}
+
+/// A landing on a source the owner holds waits behind the hold, not for the
+/// integrator: no landing stall while the hold lasts, however long. Once a
+/// record ends the hold, the step is measured from the later of the
+/// accepted verdict and that record, which names the tag.
+#[test]
+fn a_landing_behind_the_owners_hold_is_no_stall_and_is_measured_from_the_holds_end() {
+    let facts = [worker(SemanticState::Waiting, true)];
+    let tasks = work(&[]);
+    let mut held = open(7, "landing", (190, "task.gated", 3_600_000));
+    held["held"] = json!(true);
+    let found = stalls(json!({"tasks": [held.clone()]}));
+    assert!(
+        items(&facts, &tasks, &found, &bounds()).is_empty(),
+        "held an hour, no stall"
+    );
+
+    // Released 5 minutes ago: the step starts again from the release.
+    let mut released = held.clone();
+    released["held"] = json!(false);
+    released["hold_end"] = json!({"id": 260, "type": "source.released",
+                                  "at_ms": NOW - 300_000, "age_ms": 300_000});
+    let found = stalls(json!({"tasks": [released.clone()]}));
+    assert!(
+        items(&facts, &tasks, &found, &bounds()).is_empty(),
+        "5 minutes since the release is within the 10-minute bound"
+    );
+    released["hold_end"] = json!({"id": 260, "type": "source.hold_expired",
+                                  "at_ms": NOW - 700_000, "age_ms": 700_000});
+    let found = stalls(json!({"tasks": [released.clone()]}));
+    let item = only(&items(&facts, &tasks, &found, &bounds())).clone();
+    assert_eq!(item.id, "stall-7-landing-260");
+    assert_eq!(item.since_ms, Some(NOW - 700_000));
+    assert!(
+        item.line.contains("source.hold_expired (record 260"),
+        "{}",
+        item.line
+    );
+
+    // A hold that ended before the gate accepted it changes nothing.
+    released["hold_end"] = json!({"id": 100, "type": "source.released",
+                                  "at_ms": NOW - 4_000_000, "age_ms": 4_000_000});
+    let found = stalls(json!({"tasks": [released]}));
+    assert_eq!(
+        only(&items(&facts, &tasks, &found, &bounds())).id,
+        "stall-7-landing-190"
+    );
 }
 
 /// One escalation per halt, about the mission, naming the reason and its
@@ -407,8 +477,13 @@ fn a_bound_that_is_not_a_whole_number_of_seconds_warns_and_keeps_its_default() {
         [600_000, 900_000, 1_800_000, 3_600_000]
     );
     assert_eq!(
-        [defaults.landing, defaults.stop, defaults.halted],
-        [600_000, 300_000, 0]
+        [
+            defaults.landing,
+            defaults.stop,
+            defaults.halted,
+            defaults.job
+        ],
+        [600_000, 300_000, 0, 7_200_000]
     );
 }
 

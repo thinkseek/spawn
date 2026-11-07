@@ -9,7 +9,7 @@ before it ages out.
 | What | Where |
 | --- | --- |
 | Bucket | `spawn-store`, account q1293822641@gmail.com, location APAC, Standard class, private (no r2.dev URL, no custom domain) |
-| Format | `pg_dump -Fc` by the live server's own major version (16, from its container image), then `gpg --symmetric` AES-256 (integrity-protected). pg_dump's compression only |
+| Format | `pg_dump -Fc` by the live server's own major version (16, from its container image, or the native `pg_dump` that `SPAWN_PG_DUMP` names on a host without docker), then `gpg --symmetric` AES-256 (integrity-protected). pg_dump's compression only |
 | Schedule | `spawn-backup.timer`: daily at 03:30 local + up to 45 min random delay; `Persistent=true` runs a missed day at next boot; a failed run is retried twice, 15 min apart (not a suspect one) |
 | Local copy | newest good dump, unencrypted, `~/.local/share/spawn-rsi/backups/spawn-auto-<ts>.dump` (mode 600, directory 700); older `spawn-auto-*` are removed, manual dumps there are not |
 | State | `~/.local/share/spawn-rsi/backups/pg-backup.state` (mode 600): the last good upload's key, `spawn_events` rows, size, ISO week, month |

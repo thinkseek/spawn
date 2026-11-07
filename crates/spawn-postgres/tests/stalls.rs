@@ -163,7 +163,10 @@ fn each_open_task_comes_with_its_steps_record_and_its_age_on_the_databases_clock
         latest["event_name"], "screen.observed",
         "the checkpoint after it is storage's, no fact: {latest:#}"
     );
-    assert_eq!(latest["screen"], shells);
+    assert!(
+        latest.get("screen").is_none(),
+        "the screen is no stall rule: {latest:#}"
+    );
     assert_eq!(
         latest["age_ms"].as_i64(),
         Some(facts["now_ms"].as_i64().expect("now") - latest["at_ms"].as_i64().expect("at"))

@@ -30,6 +30,13 @@ pub enum CommandAction {
         /// started with, or the default for a session that never ran.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelProfile>,
+        /// The hash of the standing instructions Spawn wrote into `prompt`
+        /// (the supervisor's charter), when it wrote any: the record of
+        /// which charter the native session this start begins was given
+        /// (docs/fleet-architecture.md §3, the supervisor). Never read by
+        /// the Bridge.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charter: Option<String>,
     },
     /// Type text into the running Claude session.
     Input {

@@ -18,6 +18,11 @@
 #      accepted; an ephemeral worker reports and is stopped once accepted; a
 #      human message to a worker reaches the supervisor; a resident killed is
 #      resumed, a resident stopped by the supervisor stays down.
+# The workspace root is reached through a symlink ($work/ws -> ws-real), as
+# /home is on some hosts and /tmp and /var are on macOS, and the scripted
+# engine files its transcript under its resolved working directory, as
+# Claude Code does: every hop that reads a transcript fails if the Bridge
+# names a workspace other than the engine sees it (issue #15).
 #
 # Usage: SPAWN_DATABASE_URL=postgres://... scripts/e2e.sh
 # With SPAWN_TIMING=adversarial it runs under perturbed timing
@@ -136,8 +141,13 @@ fail() {
 pass() { stage_mark e2e ok "$*"; }
 
 # wait_for <seconds> <description> <command...>
+# Every bound is an upper bound on a wait for something that must happen; a
+# passing run never reaches one. They are scaled (E2E_WAIT_SCALE, default 3)
+# because a gate runs this beside other gates and workers' suites on a shared
+# host, where a 60 s bound failed on load alone (owner gate b973097,
+# 2026-11-07: "a rules WORKING judgement", then "the breaking report").
 wait_for() {
-  local limit=$1 what=$2
+  local limit=$(( $1 * ${E2E_WAIT_SCALE:-3} )) what=$2
   shift 2
   local deadline=$((SECONDS + limit))
   until "$@" >/dev/null 2>&1; do
@@ -155,7 +165,8 @@ printf 'base\n' >"$seed/README.md"
 git -C "$seed" add -A
 git -C "$seed" -c user.name=e2e -c user.email=e2e@localhost commit -qm base
 git -C "$seed" push -q "$repo" main:main
-mkdir -p "$work/ws"
+mkdir -p "$work/ws-real"
+ln -s ws-real "$work/ws"
 
 # --- scripted engine ------------------------------------------------------
 # Draws a prompt, writes a Claude Code session transcript where the real
@@ -176,7 +187,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --resume | --session-id) native=$2 ;; esac
   shift
 done
-dir=$E2E_WORK/claude-projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+dir=$E2E_WORK/claude-projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')
 mkdir -p "$dir"
 transcript=$dir/$native.jsonl
 c=0
@@ -356,7 +367,9 @@ wait_for 30 "the supervisor's native session" grep -q '^session_supervisor' "$wo
 pass "supervisor started by the liveness rule"
 
 # --- 1+2. rules decide WORKING; Jev decides the idle prompt; digest ---------
-export E2E_TOOL_SECONDS=3
+# Long enough for the transcript's tool.started to be ingested and judged
+# while the tool still runs, on a loaded host too.
+export E2E_TOOL_SECONDS=15
 start_worker session_worker_a "E2E:WORK build the thing"
 judged_working_by_rules() {
   tail_of session_worker_a | jq -e '
