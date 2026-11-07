@@ -1460,9 +1460,9 @@ mod tests {
 
     use super::{
         Arc, BAD_REQUEST, DEFAULT_LIMIT, LogStart, MAX_LIMIT, ProcSocket, Shared, access_token,
-        handle, is_loopback, local_exemption, log_window, objective_json, open_network_request,
-        open_networks, owner_uid, peer_uid, proc_sockets, rsi_summary, same_secret, serve_requests,
-        server_hosts, tokenless_request, with_last_gates,
+        handle, is_loopback, local_exemption, log_window, objective_json, objective_prompt,
+        open_network_request, open_networks, owner_uid, peer_uid, proc_sockets, rsi_objective,
+        rsi_summary, same_secret, serve_requests, server_hosts, tokenless_request, with_last_gates,
     };
     use crate::objectives::Task;
     use std::net::SocketAddr;
@@ -1489,6 +1489,34 @@ mod tests {
    0: 00000000000000000000000001000000:D433 00000000000000000000000001000000:2253 01 00000000:00000000 00:00000000 00000000  1001        0 77 1 0000000000000000 20 4 30 10 -1
    1: 0000000000000000FFFF00000100007F:D434 0000000000000000FFFF00000100007F:2253 01 00000000:00000000 00:00000000 00000000  1000        0 78 1 0000000000000000 20 4 30 10 -1
 ";
+
+    #[test]
+    fn an_objective_is_read_whole_from_its_missions_backlog() {
+        let dir = std::env::temp_dir().join(format!("spawn-serve-backlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // Longer than the first lines `/api/rsi` sends.
+        let prompt = format!("Make the gate faster.\n{}", "Every line counts.\n".repeat(200));
+        let objective = json!({"id": 4, "title": "Faster gate", "prompt": prompt});
+        std::fs::write(dir.join("004.json"), objective.to_string()).expect("write");
+        let missions = json!([
+            {"id": 3, "objectives": {"backlog": "/nowhere"}},
+            {"id": 7, "objectives": {"backlog": dir.to_str()}},
+        ]);
+
+        let answer = objective_prompt(&missions, 7, 4).expect("the objective");
+        assert_eq!(answer["prompt"], json!(prompt), "the whole prompt");
+        assert_eq!(answer["prompt_bytes"], json!(prompt.len()));
+        assert_eq!(answer["title"], "Faster gate");
+        assert_eq!(answer["mission"], 7);
+        assert!(objective_prompt(&missions, 7, 5).is_err(), "not in the backlog");
+        assert!(objective_prompt(&missions, 8, 4).is_err(), "no such open mission");
+        // A malformed path is refused before the store is opened.
+        for rest in ["", "7", "7/", "x/4", "7/x", "7/4/1"] {
+            let error = rsi_objective(rest).expect_err("malformed");
+            assert!(error.starts_with(BAD_REQUEST), "{rest}: {error}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[cfg(target_endian = "little")]
     #[test]
