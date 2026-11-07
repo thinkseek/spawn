@@ -324,6 +324,34 @@ struct Follow {
     evidence: Option<String>,
 }
 
+impl Default for Follow {
+    fn default() -> Self {
+        Self {
+            // Nothing has been read yet: the first pass reads.
+            dirty: true,
+            poll: false,
+            watch_warned: false,
+            watched: false,
+            growth: None,
+            fresh: false,
+            again: false,
+            last_capture: None,
+            due_at: None,
+            offset: 0,
+            screen: None,
+            seen: None,
+            first_seen: None,
+            warned: false,
+            exit_warned: false,
+            end_failures: 0,
+            end_tried_at: None,
+            stale: None,
+            version: None,
+            evidence: None,
+        }
+    }
+}
+
 /// What the Bridge knows about one session.
 #[derive(Debug, Clone)]
 struct SessionView {
