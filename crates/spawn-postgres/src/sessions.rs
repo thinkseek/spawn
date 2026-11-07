@@ -407,7 +407,7 @@ impl PostgresStore {
         session: &SessionId,
         reviver: &str,
     ) -> Result<LivenessFacts, StoreError> {
-        let row = self.query_one(LIVENESS_FACTS, &[&session.as_str(), &reviver])?;
+        let row = self.query_one_prepared(LIVENESS_FACTS, &[&session.as_str(), &reviver])?;
         Ok(LivenessFacts {
             open_command: row.get("open_command"),
             execution_id: row.get("execution_id"),

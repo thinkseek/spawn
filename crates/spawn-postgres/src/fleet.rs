@@ -475,7 +475,7 @@ impl PostgresStore {
 
     /// Facts for the dispatcher, as JSON rows.
     pub fn dispatch_facts(&self) -> Result<Value, StoreError> {
-        self.query_json(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])
+        self.query_json_prepared(DISPATCH_FACTS, &[&spawn_core::bridge::MAY_HAVE_TYPED])
     }
 
     /// Every session with its judgement, task and activity, supervisor first.
