@@ -118,6 +118,10 @@ pub struct PostgresStore {
     /// The URL this store connected with, for the server-wide migration
     /// lock ([`PostgresStore::migrate`]).
     url: String,
+    /// The statements this connection has prepared, by the SQL they were
+    /// prepared from: the loop's fixed reads are parsed and planned once and
+    /// reused, not once per pass ([`PostgresStore::query_prepared`]).
+    prepared: Mutex<std::collections::HashMap<&'static str, postgres::Statement>>,
 }
 
 /// The restricted logins, by their base name; each database has its own
@@ -171,6 +175,7 @@ impl PostgresStore {
             client: Mutex::new(client),
             password: url_password(url),
             url: url.to_string(),
+            prepared: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
