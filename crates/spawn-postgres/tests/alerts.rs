@@ -16,8 +16,7 @@ fn alert(client: &mut Client, key: &str) -> Value {
     client
         .query_opt("select to_jsonb(a) from spawn_alerts a where a.key = $1", &[&key])
         .expect("read the table")
-        .map(|row| row.get(0))
-        .unwrap_or(Value::Null)
+        .map_or(Value::Null, |row| row.get(0))
 }
 
 fn control_types(client: &mut Client, key: &str) -> Vec<String> {
