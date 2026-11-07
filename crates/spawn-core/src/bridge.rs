@@ -1081,6 +1081,14 @@ impl Bridge {
     /// Record what the engine did since the last tick, commit a pending
     /// checkpoint, or end an execution whose process is gone. Returns
     /// whether the execution ended.
+    ///
+    /// An execution with nothing to say is left alone: its files are read
+    /// when the watch says they changed, and its pane captured when a
+    /// command is in flight on it, when its transcript has held still and
+    /// the screen was not read since (or a reading awaits its twin), or
+    /// every [`BridgeConfig::screen_refresh`] as a backstop. The liveness
+    /// question (`runner`: a tmux call) and the runner's exit file ride on
+    /// the same decision, so an idle fleet costs no call per agent per pass.
     fn advance(
         &self,
         agent_id: &AgentId,
@@ -1097,29 +1105,35 @@ impl Bridge {
             ));
             return Ok(false);
         }
+        self.register_watch(session, native, active, report);
         self.follow_output(agent_id, session, native, active, report)?;
-        let end = match active
-            .reported_end
-            .or_else(|| self.exit_status(session, active, report))
-        {
-            Some(end) => Some(end),
-            // Running means a runner of the Bridge's own in the terminal, not
-            // a terminal of that name: one that outlived its runner (a dead
-            // pane, a shell restored after a restart) runs no engine of
-            // Spawn's, and would otherwise hold the execution open forever.
-            None => match self.not_running(session, active, report) {
-                Ok(None) => {
-                    self.follow_screen(agent_id, session, active)?;
-                    None
-                }
-                Ok(Some(end)) => Some(end),
-                Err(error) => {
-                    report
-                        .warnings
-                        .push(format!("runner {}: {error}", active.terminal()));
-                    None
-                }
-            },
+        let end = if self.looked_at(session, active) {
+            match active
+                .reported_end
+                .or_else(|| self.exit_status(session, active, report))
+            {
+                Some(end) => Some(end),
+                // Running means a runner of the Bridge's own in the terminal,
+                // not a terminal of that name: one that outlived its runner
+                // (a dead pane, a shell restored after a restart) runs no
+                // engine of Spawn's, and would otherwise hold the execution
+                // open forever.
+                None => match self.not_running(session, active, report) {
+                    Ok(None) => {
+                        self.follow_screen(agent_id, session, active)?;
+                        None
+                    }
+                    Ok(Some(end)) => Some(end),
+                    Err(error) => {
+                        report
+                            .warnings
+                            .push(format!("runner {}: {error}", active.terminal()));
+                        None
+                    }
+                },
+            }
+        } else {
+            None
         };
         if let Some((cause, exit_code)) = end {
             // What the engine wrote last comes before its end.
