@@ -646,8 +646,9 @@ pub(crate) struct Reading {
 }
 
 /// The plan for this moment, reading only: the host's news (the disk items
-/// `disk` gives for the moment's clock, the gate-room and gate host-fault
-/// records, the owner's holds that expired, the stalls past their `bounds`,
+/// `disk` gives for the moment's clock, the gate-room, gate host-fault and
+/// base-disagreement records, the owner's holds that expired, the stalls past
+/// their `bounds`,
 /// [`stall`], and the background
 /// jobs past theirs, [`jobs`]) added to the facts and mission rows
 /// `loaded` ([`load`]), then [`decide_with`], then the input that gives the
