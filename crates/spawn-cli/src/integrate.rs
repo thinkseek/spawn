@@ -2601,7 +2601,7 @@ mod tests {
 
     /// Commit everything in the checkout `directory`.
     pub(super) fn commit_in(directory: &str, message: &str) {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         git(&["-C", directory, "add", "-A"]).expect("add");
         git(&[
             "-C",
@@ -2622,7 +2622,7 @@ mod tests {
     /// into its own ref, build the landing ([`super::landing_candidate`]),
     /// move the source's main and the mirror's as `land` does.
     fn land_as_the_integrator(mirror: &std::path::Path, source: &str, agent: &str, task: i64) {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let mirror_path = mirror.to_string_lossy().to_string();
         let tracking = format!("refs/spawn-integrate/{agent}");
         let pushed = crate::sources::fetch_pushed_into(mirror, source, agent, &tracking)
@@ -2655,7 +2655,7 @@ mod tests {
     #[test]
     fn a_landing_reaches_the_agents_pushed_branch_through_the_next_merge() {
         use crate::push::{Pushed, push_branch};
-        use crate::sources::{ensure_mirror, git};
+        use crate::sources::{ensure_mirror, test_git as git};
         use spawn_core::id::BranchName;
         use spawn_core::port::{BaseMerge, Commit, WorkspaceStore};
         use spawn_host::GitWorkspace;
@@ -2776,7 +2776,7 @@ mod tests {
         std::path::PathBuf,
         spawn_host::GitWorkspace,
     ) {
-        use crate::sources::{ensure_mirror, git};
+        use crate::sources::{ensure_mirror, test_git as git};
         let base = std::env::temp_dir().join(format!("spawn-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed");
@@ -2802,7 +2802,7 @@ mod tests {
         mirror: &std::path::Path,
         change: impl Fn(&std::path::Path),
     ) -> String {
-        use crate::sources::git;
+        use crate::sources::test_git as git;
         let clone = base.join(format!("clone-{}", fastrand_name()));
         let clone_path = clone.to_string_lossy().to_string();
         git(&["clone", "-q", source, &clone_path]).expect("clone");
@@ -2878,7 +2878,7 @@ mod tests {
     fn a_conflict_verdict_leaves_markers_the_resolution_merges_main_and_lands() {
         use crate::main_merge::{Merge, conflict_note, into_workspace};
         use crate::push::{Pushed, push_branch};
-        use crate::sources::git;
+        use crate::sources::test_git as git;
         use spawn_core::port::{Commit, WorkspaceStore};
 
         let (base, source, root, mirror, store) = world("conflict-loop");
@@ -3085,7 +3085,7 @@ mod tests {
     #[test]
     fn a_delivery_to_a_stale_branch_merges_main_first() {
         use crate::main_merge::{Merge, delivery_note, into_workspace};
-        use crate::sources::git;
+        use crate::sources::test_git as git;
         use spawn_core::port::WorkspaceStore;
 
         let (base, source, root, mirror, store) = world("delivery-merge");
@@ -3311,7 +3311,7 @@ mod tests {
         uses: &str,
         head_on_main: bool,
     ) -> (std::path::PathBuf, String, String, String, String) {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let base =
             std::env::temp_dir().join(format!("spawn-semantic-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -3990,7 +3990,7 @@ mod tests {
     /// landing's own message), and the merge's when main moved.
     #[test]
     fn a_landing_is_one_two_parent_commit_on_main_with_its_message() {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let base = std::env::temp_dir().join(format!("spawn-land-shape-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed");
@@ -4097,7 +4097,7 @@ mod tests {
     #[test]
     #[ignore = "run by landing_commits_ignore_the_hosts_git_configuration"]
     fn landing_commits_are_by_the_integrator() {
-        let git = crate::sources::git;
+        let git = crate::sources::test_git;
         let base = std::env::temp_dir().join(format!(
             "spawn-land-identity-{}-{}",
             std::process::id(),
@@ -4867,7 +4867,7 @@ mod database_tests {
     use spawn_postgres::PostgresStore;
 
     use super::Integrator;
-    use crate::sources::git;
+    use crate::sources::test_git as git;
 
     struct Db {
         store: Arc<PostgresStore>,

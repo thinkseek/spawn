@@ -176,6 +176,26 @@ pub(crate) fn git(arguments: &[&str]) -> Result<String, WorkspaceError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// [`git`] as a test runs its own (a seed's `init`, `add` and `commit`, a
+/// look at a ref): [`spawn_host::test_git_command`], which no setting of
+/// the host's git configuration reaches, so a host that signs every commit
+/// cannot hang a test. What Spawn itself runs stays on [`git`].
+#[cfg(test)]
+pub(crate) fn test_git(arguments: &[&str]) -> Result<String, WorkspaceError> {
+    let output = spawn_host::test_git_command()
+        .args(arguments)
+        .output()
+        .map_err(|error| unavailable(format!("run git: {error}")))?;
+    if !output.status.success() {
+        return Err(unavailable(format!(
+            "git {}: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// FNV-1a: a stable short hash for names and keys.
 pub(crate) fn fnv(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -644,7 +664,8 @@ impl Drop for MissionWorkspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        MissionSource, ensure_mirror, fetch_pushed_into, git, mirror_name, receives_branches,
+        MissionSource, ensure_mirror, fetch_pushed_into, mirror_name, receives_branches,
+        test_git as git,
     };
     use crate::push::{Pushed, Pusher, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
