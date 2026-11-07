@@ -906,6 +906,15 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             log: record(&run.stdout),
         });
     }
+    if run.status.code() == Some(BASE_DISAGREES_EXIT)
+        && let Some(fact) = base_disagrees(&run.stdout)
+    {
+        return Err(GateFailure::BaseDisagrees {
+            scenario: fact.scenario,
+            setup_s: fact.setup_s,
+            log: record(&run.stdout),
+        });
+    }
     if !run.status.success() {
         return Err(aborted(format!("the gate ended with {}", run.status)));
     }
