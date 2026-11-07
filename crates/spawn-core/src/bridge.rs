@@ -609,6 +609,10 @@ pub struct Bridge {
     /// restarted Bridge, which has none, fails them when it claims them
     /// next (the log says which wait and how the execution ended).
     held: HashMap<CommandId, Claimed>,
+    /// The watch keys whose files changed since the last pass, drained at
+    /// the start of a pass: what an execution whose files are quiet is left
+    /// alone for.
+    touched: HashSet<String>,
 }
 
 /// What [`Bridge::settle`] did with an open execution no runner runs.
@@ -651,6 +655,7 @@ impl Bridge {
             warned: std::sync::Mutex::default(),
             transcripts: None,
             held: HashMap::new(),
+            touched: HashSet::new(),
         }
     }
 
@@ -874,6 +879,15 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
+        // What changed in the engines' files since the last pass: a
+        // transcript or an exit status is read when it is here, not on every
+        // pass ([`Self::follow_output`]).
+        self.touched = self
+            .config
+            .watch
+            .as_ref()
+            .map(|watch| watch.drain().into_iter().collect())
+            .unwrap_or_default();
         self.act(&mut report)?;
         self.catch_up()?;
         Ok(report)
