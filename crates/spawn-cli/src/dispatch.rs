@@ -392,6 +392,10 @@ pub(crate) enum Why {
     /// A mission's gate failed twice in a row because the host did (the
     /// test database), not the work ([`digest::host_fault_escalations`]).
     GateHostFault,
+    /// A mission's base disagreed with itself three times in a row: a
+    /// scenario of the base exited 1 and then 0, before any candidate code
+    /// ran ([`digest::base_disagrees_alerts`], objective 033).
+    GateBaseDisagrees,
     /// An open task's step has not moved within its bound ([`stall`]).
     Stalled,
     /// The deployed charter could not be typed into the supervisor's pane:
