@@ -314,18 +314,17 @@ fn a_hold_expires_by_record_only_once_the_database_clock_reached_it() {
     let source = "/tmp/expired.git";
     let (mission, task) = landing_task(&store, source);
     let mut client = admin(&schema);
+    // Before its expires_ms (ten minutes after its record): refused.
+    let first = hold(&store, source, MAIN, 600, None);
+    let first_id = first["hold"].as_i64().expect("an id");
+    assert!(refusal(store.hold_expired(source, first_id)).contains("expires at"));
+    // Renewed with a bound of a second: the first is no longer the active
+    // hold, and its expiry is refused whatever the clock says.
     let held = hold(&store, source, MAIN, 1, None);
     let id = held["hold"].as_i64().expect("an id");
+    assert_eq!(held["renews"], first_id);
+    assert!(refusal(store.hold_expired(source, first_id)).contains("not the active hold"));
     store.task_held(task, id, source).expect("held");
-    // Before its expires_ms (a second after its record): refused.
-    let early = store.hold_expired(source, id);
-    let now: i64 = client
-        .query_one("select spawn_now_ms()", &[])
-        .expect("the clock")
-        .get(0);
-    if now < held["expires_ms"].as_i64().expect("expires") {
-        assert!(refusal(early).contains("expires at"));
-    }
     // A hold that is not the active one: refused.
     assert!(refusal(store.hold_expired(source, id + 1000)).contains("not the active hold"));
     assert!(refusal(store.hold_expired("/tmp/other.git", id)).contains("not the active hold"));
