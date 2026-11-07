@@ -3,7 +3,9 @@
 //! The Observer says what state a worker is in; this decides what to do
 //! about it, on the decision ladder of docs/fleet-architecture.md §3:
 //!
-//! 1. Rules over facts decide fixed cases: a lost execution is resumed once.
+//! 1. Rules over facts decide fixed cases: a lost execution is resumed once,
+//!    and a session whose resume failed is escalated, never resumed again by
+//!    rule (the one-resume rule, `worker::resume_lost`).
 //! 2. One guarded nudge: when Jev judged that a worker stopped at an idle
 //!    prompt without needing anyone (WAITING, confident, `needs_human` and
 //!    `stuck` low), it gets `continue` typed in, once per episode and at most
@@ -59,6 +61,8 @@
 mod charter;
 mod digest;
 mod jobs;
+#[cfg(test)]
+mod resume_replay;
 mod stall;
 mod stops;
 mod worker;
@@ -137,6 +141,38 @@ pub(crate) struct Job {
     pub(crate) age_ms: i64,
 }
 
+/// A resume that started an execution which ended lost before its engine
+/// became ready ([`Facts::failed_resume`]), with what the log says of it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub(crate) struct FailedResume {
+    /// The execution the resume started.
+    pub(crate) execution_id: String,
+    /// The resume command.
+    #[serde(default)]
+    pub(crate) command_id: Option<i64>,
+    #[serde(default)]
+    pub(crate) ended_at_ms: Option<i64>,
+    /// The `evidence` of the execution's end: for a start abandoned at its
+    /// ready wait, `its start failed: pane never became ready, last state
+    /// <state>…`.
+    #[serde(default)]
+    pub(crate) evidence: Option<String>,
+    /// The resume command's error.
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
+impl FailedResume {
+    /// What the log says of how it failed: the end's evidence, else the
+    /// command's error.
+    pub(crate) fn why(&self) -> &str {
+        self.evidence
+            .as_deref()
+            .or(self.error.as_deref())
+            .unwrap_or("no evidence recorded")
+    }
+}
+
 /// Facts about one session, as `dispatch_facts` returns them.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Facts {
@@ -196,6 +232,13 @@ pub(crate) struct Facts {
     /// that stayed up.
     #[serde(default)]
     pub(crate) resumed_young: u32,
+    /// The latest execution one of the dispatcher's resumes started that
+    /// ended lost before its engine became ready (whatever its command's
+    /// outcome), since the session's last execution that stayed up: a
+    /// failed resume, read from the log rather than from the key of the
+    /// session's latest execution, which no resume was sent under.
+    #[serde(default)]
+    pub(crate) failed_resume: Option<FailedResume>,
     /// Every Stop and Discard sent into the session since its live
     /// execution started (none when it is not live), oldest first.
     #[serde(default)]
@@ -800,7 +843,7 @@ pub(crate) fn merge_main_before(
 
 #[cfg(test)]
 mod tests {
-    use super::{Escalation, Facts, Sent, Why, decide, decide_with};
+    use super::{Escalation, Facts, FailedResume, Sent, Why, decide, decide_with};
     use crate::deliver::Work;
     use spawn_core::command::CommandAction;
     use spawn_core::event::{ModelProfile, SessionSeq};
@@ -841,6 +884,7 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            failed_resume: None,
             turn_ended: true,
             checkpoint: None,
             charter: None,
@@ -945,6 +989,7 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            failed_resume: None,
             turn_ended: true,
             checkpoint: None,
             charter: None,
@@ -1405,6 +1450,138 @@ mod tests {
             plan.orders[0].key, "dispatch-resume-exec_6",
             "an execution that stayed up is resumed again"
         );
+    }
+
+    /// What the Bridge leaves of a resume it abandoned at its ready wait,
+    /// as the 129 sequence of 2026-11-07 did: command `command` started
+    /// `exec_<command>`, whose pane never became ready, so the execution
+    /// ended lost and the command failed.
+    fn abandoned_at_ready(command: i64, finished_at_ms: i64) -> FailedResume {
+        FailedResume {
+            execution_id: format!("exec_{command}"),
+            command_id: Some(command),
+            ended_at_ms: Some(finished_at_ms),
+            evidence: Some(
+                "its start failed: pane never became ready, last state Unknown".to_string(),
+            ),
+            error: Some("pane never became ready, last state Unknown".to_string()),
+        }
+    }
+
+    /// Task 132 (1): the Bridge abandons every resume at its ready wait (a
+    /// pane that never becomes ready, as after the host move of
+    /// 2026-11-07), and no resume is ever sent under the key of the
+    /// execution it started. Over many passes, the dispatcher resumes once
+    /// and escalates once, with the evidence; a second resume that ends the
+    /// same way in a row (a person's, after the escalation) neither brings a
+    /// dispatch nor a second escalation: the dispatcher sends nothing more.
+    #[test]
+    fn a_resume_lost_before_ready_twice_in_a_row_is_escalated_once_and_never_dispatched_again() {
+        let mut lost = worker(judged(SemanticState::Unknown, 0.5));
+        lost.live = false;
+        lost.end_cause = Some("lost".to_string());
+        let mut supervisor = idle_supervisor();
+        let mut resumes = Vec::new();
+        let mut digested = Vec::new();
+        for pass in 0..12_i64 {
+            let now = NOW + pass * 20_000;
+            if pass == 6 {
+                // Someone resumes it once more, outside the rule; the pane
+                // never becomes ready again.
+                lost.execution_id = Some("exec_940".to_string());
+            }
+            let plan = decide(&[lost.clone(), supervisor.clone()], true, now, "spawn");
+            for order in &plan.orders {
+                if order.session_id == supervisor.session_id {
+                    let CommandAction::Input { tags, .. } = &order.action else {
+                        panic!("a digest is typed input");
+                    };
+                    digested.extend(tags.iter().cloned());
+                    delivered(&mut supervisor, order);
+                    continue;
+                }
+                assert!(
+                    matches!(order.action, CommandAction::Resume { .. }),
+                    "{order:?}"
+                );
+                resumes.push(order.key.clone());
+                let command = 920 + i64::try_from(resumes.len()).expect("few");
+                let failed = abandoned_at_ready(command, now + 12_000);
+                lost.dispatched.push(Sent {
+                    id: Some(command),
+                    key: order.key.clone(),
+                    text: None,
+                    created_at_ms: now,
+                    finished_at_ms: failed.ended_at_ms,
+                    succeeded: Some(false),
+                    error: failed.error.clone(),
+                });
+                lost.execution_id = Some(failed.execution_id.clone());
+                lost.failed_resume = Some(failed);
+            }
+        }
+        assert_eq!(resumes, ["dispatch-resume-exec_5"], "resumed once, only");
+        assert_eq!(
+            digested,
+            ["session_worker_a resume-exec_921"],
+            "escalated once, about the resume that failed"
+        );
+        let plan = decide(&[lost, supervisor], true, NOW + 3_600_000, "spawn");
+        assert!(plan.orders.is_empty(), "{:?}", plan.orders);
+        assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+        let item = &plan.told[0];
+        assert_eq!(item.why, Why::ResumeFailed);
+        assert!(
+            item.line
+                .contains("its start failed: pane never became ready, last state Unknown")
+                && item.line.contains("command 921")
+                && item.line.contains("not resumed again"),
+            "{}",
+            item.line
+        );
+        assert_eq!(
+            item.since_ms,
+            Some(NOW + 12_000),
+            "as of the failed execution's end"
+        );
+    }
+
+    /// Task 132 (2): a resume that succeeded (its engine became ready and
+    /// took its prompt) and whose engine then died within the minute still
+    /// follows the young-death rule; one that stayed up is resumed again,
+    /// as before.
+    #[test]
+    fn a_resume_that_succeeded_and_died_young_still_follows_the_young_death_rule() {
+        let mut lost = worker(judged(SemanticState::Unknown, 0.5));
+        lost.live = false;
+        lost.end_cause = Some("lost".to_string());
+        lost.execution_id = Some("exec_6".to_string());
+        lost.dispatched.push(Sent {
+            id: Some(6),
+            key: "dispatch-resume-exec_5".to_string(),
+            text: None,
+            created_at_ms: NOW - 50_000,
+            finished_at_ms: Some(NOW - 45_000),
+            succeeded: Some(true),
+            error: None,
+        });
+        lost.resumed_young = 1;
+        let plan = decide(&[lost.clone()], false, NOW, "spawn");
+        assert!(plan.orders.is_empty(), "no second resume");
+        assert_eq!(plan.pending.len(), 1);
+        assert_eq!(plan.pending[0].why, Why::ResumeFailed);
+        assert_eq!(plan.pending[0].tag(), "session_worker_a resume-exec_6");
+        assert_eq!(
+            plan.pending[0].line,
+            "engine was lost again within a minute of its automatic resume"
+        );
+        lost.resumed_young = 0;
+        let plan = decide(&[lost], false, NOW, "spawn");
+        assert_eq!(
+            plan.orders[0].key, "dispatch-resume-exec_6",
+            "a resumed execution that stayed up is resumed again"
+        );
+        assert!(plan.pending.is_empty());
     }
 
     #[test]

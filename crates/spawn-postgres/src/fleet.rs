@@ -173,7 +173,15 @@ select jsonb_build_object(
 /// (`told`: the escalations its digests carried, however long ago);
 /// `resumed_young` counts the executions its
 /// resumes started that died young (`died_young!`) since the session's last
-/// execution that did not; `stops` are the Stops and Discards anyone sent
+/// execution that did not; `failed_resume` is the latest execution one of
+/// its resumes (`dispatch-resume-%`, whatever its command's outcome) started
+/// that ended lost before its engine became ready (`lost_before_ready!`),
+/// since the session's last execution that stayed up (neither died young
+/// nor ended lost before ready), with its end's `evidence` and its
+/// command's `error`, or `null`: what the log records about the session,
+/// not the key of its latest execution, which a resume that started an
+/// execution and failed never sends (docs/fleet-architecture.md §3, the
+/// one-resume rule); `stops` are the Stops and Discards anyone sent
 /// during the live execution (after the command that started it, so the
 /// Bridge ran them on it), with their outcomes: a failed one is pursued.
 /// `turn_ended`: the live execution's latest turn event (`message.received`,
@@ -311,7 +319,32 @@ from (
                   where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
                     and c.action ->> 'type' = 'input' and t.hash is not null
                     and c.id > coalesce(born.command_id, 0)))
-    end as charter
+    end as charter,
+    (select jsonb_build_object(
+              'execution_id', x.execution_id,
+              'command_id', c.id,
+              'ended_at_ms', x.ended_at_ms,
+              'evidence', (select e.kind -> 'detail' ->> 'evidence' from spawn_events e
+                            where e.session_id = x.session_id
+                              and e.execution_id = x.execution_id
+                              and e.event_name = 'execution.ended' and e.source = 'bridge'
+                            order by e.id limit 1),
+              'error', c.error)
+       from agent_executions x
+       join spawn_commands c on c.id = x.command_id
+      where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
+        and c.idempotency_key like 'dispatch-resume-%'
+        and ",
+    lost_before_ready!("x"),
+    r"
+        and x.started_at_ms > (select coalesce(max(h.started_at_ms), 0)
+                                 from agent_executions h
+                                where h.session_id = s.session_id and not ",
+    died_young!("h"),
+    r" and not ",
+    lost_before_ready!("h"),
+    r")
+      order by x.started_at_ms desc, x.execution_id desc limit 1) as failed_resume
   from agent_status s
   join spawn_session_state p using (session_id)
   -- The supervisor's current native session (the one its latest

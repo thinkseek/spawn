@@ -75,11 +75,43 @@ fn nudgeable(observation: &Observation) -> bool {
         && observation.stuck.is_none_or(|value| value < NUDGE_STUCK)
 }
 
-/// Rule: a lost execution is resumed once; a failed resume escalates, and
-/// so does a resume whose engine was lost again within a minute (a resumed
-/// execution has a new id, so its own key would resume it again forever).
+/// The one-resume rule (docs/fleet-architecture.md §3): a lost execution is
+/// resumed once; a failed resume escalates, never resumed again by rule.
+/// Failed is read from what the log records about the session, since its
+/// last execution that stayed up, not from the key of its latest execution
+/// (a resumed execution has a new id, so its own key would resume it again
+/// forever):
+///
+/// - a resume whose execution ended lost before its engine became ready
+///   ([`Facts::failed_resume`], whatever its command's outcome: the ready
+///   wait failed, the start was abandoned), escalated with the evidence,
+///   once: the item is named by that execution, so a later execution that
+///   fails the same way (a person's resume) is not told again;
+/// - a resume whose engine was lost again within a minute
+///   ([`Facts::resumed_young`]);
+/// - a resume whose command failed before it started an execution (the
+///   current execution's key, `dispatch-resume-<execution>`, failed).
 fn resume_lost(facts: &Facts) -> Decision {
     let execution = facts.execution_id.as_deref().unwrap_or("none");
+    if let Some(failed) = &facts.failed_resume {
+        let mut escalation = Escalation::about(
+            facts,
+            format!("resume-{}", failed.execution_id),
+            Why::ResumeFailed,
+            format!(
+                "engine was lost and its automatic resume (command {}, execution {}) ended lost \
+                 before its engine became ready: {}; not resumed again",
+                failed
+                    .command_id
+                    .map_or_else(|| "-".to_string(), |id| id.to_string()),
+                failed.execution_id,
+                crate::deliver::one_line(failed.why(), 300)
+            ),
+        );
+        // It rests on that execution's end, not on a judgement.
+        escalation.since_ms = failed.ended_at_ms.or(escalation.since_ms);
+        return Decision::Escalate(escalation);
+    }
     if facts.resumed_young > 0 {
         return Decision::Escalate(Escalation::about(
             facts,

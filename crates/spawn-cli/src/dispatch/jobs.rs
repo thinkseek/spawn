@@ -162,6 +162,7 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            failed_resume: None,
             stops: Vec::new(),
             charter: None,
             jobs,
