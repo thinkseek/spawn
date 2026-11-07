@@ -1441,7 +1441,7 @@ impl Bridge {
             || active.follow.dirty
             || self.due_to_read(active)
             || self.in_flight(session)
-            || !matches!(self.screen_wanted(active), Wanted::Nothing)
+            || !matches!(self.screen_wanted(session, active), Wanted::Nothing)
     }
 
     /// Whether a command of this session is claimed and unfinished: the
@@ -1453,10 +1453,11 @@ impl Bridge {
     }
 
     /// Why this pass wants the pane read, if it does.
-    fn screen_wanted(&self, active: &Active) -> Wanted {
+    fn screen_wanted(&self, session: &SessionId, active: &Active) -> Wanted {
         let follow = &active.follow;
-        // No watch: read on every pass, as before watches.
-        if self.config.watch.is_none() || follow.poll {
+        // No watch: read on every pass, as before watches. A command in
+        // flight reads it too: its next move waits on what the pane says.
+        if self.config.watch.is_none() || follow.poll || self.in_flight(session) {
             return Wanted::Now;
         }
         if follow.again {
@@ -1491,8 +1492,8 @@ impl Bridge {
     /// flight is read at once, a backstop only within the passes' budget, so
     /// a fleet whose screens fall due together does not spend one pass
     /// capturing them all.
-    fn capture_due(&self, active: &Active) -> bool {
-        match self.screen_wanted(active) {
+    fn capture_due(&self, session: &SessionId, active: &Active) -> bool {
+        match self.screen_wanted(session, active) {
             Wanted::Now => true,
             Wanted::Nothing => false,
             Wanted::Backstop => {
@@ -1537,7 +1538,7 @@ impl Bridge {
         session: &SessionId,
         active: &mut Active,
     ) -> Result<(), StoreError> {
-        if !self.capture_due(active) {
+        if !self.capture_due(session, active) {
             return Ok(());
         }
         let Ok(pane) =
