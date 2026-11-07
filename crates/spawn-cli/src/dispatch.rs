@@ -59,6 +59,7 @@ mod worker;
 
 pub(crate) use digest::{OPENING as DIGEST_OPENING, heading};
 pub(crate) use stall::Bounds;
+pub(crate) use worker::reached_with;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -577,7 +578,8 @@ pub(crate) fn read_plan(
 }
 
 /// Run one dispatcher step against the store: collect reports from idle
-/// workers under `root`, then submit the plan ([`read_plan`]), with the
+/// workers under `root` (a draft is not taken: its worker is told instead,
+/// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
 /// stalls past their `bounds` among its escalations ([`stall`]), without
 /// its new executions while the disk is under its floor ([`crate::disk`]).
 /// Returns log lines.
@@ -591,7 +593,7 @@ pub(crate) fn step(
 ) -> Result<Vec<String>, String> {
     let (mut rows, mut work) = load(store)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
-        deliver::collect_reports(store, &work, &rows, root)
+        deliver::collect_reports(store, &work, &rows, root, now_ms())
     });
     if !lines.is_empty() {
         // Collecting a report changed a task's state.

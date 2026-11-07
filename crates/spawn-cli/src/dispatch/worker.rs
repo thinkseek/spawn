@@ -122,7 +122,7 @@ fn reached(sent: &Sent) -> bool {
 
 /// [`reached`], from a command's outcome: `succeeded` (`None` while in
 /// flight) and its `error`.
-pub(super) fn reached_with(succeeded: Option<bool>, error: Option<&str>) -> bool {
+pub(crate) fn reached_with(succeeded: Option<bool>, error: Option<&str>) -> bool {
     succeeded != Some(false) || error.is_some_and(|error| error.contains(MAY_HAVE_TYPED))
 }
 
