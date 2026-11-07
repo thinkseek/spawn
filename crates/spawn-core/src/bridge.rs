@@ -3480,10 +3480,10 @@ mod tests {
     /// A pane of a turn that runs.
     const BUSY: &str = "✽ Effecting… (esc to interrupt)\n❯ \n  model line";
 
-    /// A pane blocked on a permission dialog.
-    const DIALOG: &str = "Do you want to proceed?\n\
-                          1. Yes\n2. No\n\
-                          Enter to confirm · Esc to cancel\n❯ \n";
+    /// A pane the engine blocked on a question of its own: the choices sit
+    /// at the prompt position.
+    const DIALOG: &str = "claude: Which branch should I use?\n\
+                          ❯ 1. main\n  2. a new one\n";
 
     /// The memory terminal, counting the panes it is asked for.
     struct Counted {
