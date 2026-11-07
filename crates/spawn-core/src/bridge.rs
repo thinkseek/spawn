@@ -1494,15 +1494,17 @@ impl Bridge {
             self.terminals
                 .capture_tail(&active.terminal(), &active.workspace, TAIL_LINES)
         else {
+            // A pane that cannot be read says nothing: the reading is due
+            // again on the next pass, never read as a state (§14).
+            active.follow.again = self.config.watch.is_some() && !active.follow.poll;
             return Ok(());
         };
+        let now = self.clock.now().0;
+        active.follow.last_capture = Some(now);
+        active.follow.fresh = false;
         let reading = read_claude_screen(&pane);
         let confirmed = active.follow.seen == Some(reading.state);
         active.follow.seen = Some(reading.state);
-        if !confirmed || reading.state == ScreenState::Unknown {
-            return Ok(());
-        }
-        let now = self.clock.now().0;
         let due = match active.follow.screen {
             None => true,
             Some((state, _)) if state != reading.state => true,
@@ -1512,20 +1514,26 @@ impl Bridge {
                         >= i64::try_from(self.config.screen_refresh.as_millis()).unwrap_or(i64::MAX)
             }
         };
-        if due {
-            active.follow.screen = Some((reading.state, now));
-            self.append(
-                agent_id,
-                session,
-                Some(&active.execution_id),
-                Source::Bridge,
-                None,
-                EventKind::ScreenObserved {
-                    state: reading.state,
-                    evidence: reading.evidence,
-                },
-            )?;
+        // Unknown is never a fact, and one reading is not one either: what
+        // the log cannot say now is read again next pass.
+        let record = due && confirmed && reading.state != ScreenState::Unknown;
+        active.follow.again = due && !record;
+        if !record {
+            return Ok(());
         }
+        active.follow.screen = Some((reading.state, now));
+        active.follow.again = false;
+        self.append(
+            agent_id,
+            session,
+            Some(&active.execution_id),
+            Source::Bridge,
+            None,
+            EventKind::ScreenObserved {
+                state: reading.state,
+                evidence: reading.evidence,
+            },
+        )?;
         Ok(())
     }
 
