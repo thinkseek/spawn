@@ -17,9 +17,9 @@ fn record(kind: &str) -> Value {
         "type": kind,
         "keys": ["postgres/hourly/spawn-20261108-071500.dump.gpg"],
         "tiers": ["hourly", "daily"], "skipped": [],
-        "sha256": "a".repeat(64), "bytes": 1700000, "stored_bytes": 1700100,
+        "sha256": "a".repeat(64), "bytes": 1_700_000, "stored_bytes": 1_700_100,
         "events": 23868, "max_event_id": 24868,
-        "held_bytes": 0, "written_bytes": 1700100,
+        "held_bytes": 0, "written_bytes": 1_700_100,
         "alert_bytes": 8_000_000_000u64, "limit_bytes": 10_000_000_000u64,
         "over_alert": false, "dump_ms": 270, "upload_ms": 300,
     })
