@@ -347,10 +347,7 @@ impl Fleet {
             self.bridge_work(&open, watermark, now, &mut warnings, &mut failed);
             if due {
                 self.steps_at = Some(std::time::Instant::now());
-                let ran = self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
-                if std::env::var_os("SPAWN_LOOP_TRACE").is_some() {
-                    eprintln!("trace: wm={watermark} ran={ran:?} lines={}", lines.len());
-                }
+                self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
             }
         }
         // The screens and transcripts the Bridge reads are not announced by
@@ -426,20 +423,7 @@ impl Fleet {
         lines: &mut Vec<String>,
         warnings: &mut Vec<String>,
         failed: &mut bool,
-    ) -> Vec<&'static str> {
-        let mut ran = Vec::new();
-        let trace = std::env::var_os("SPAWN_LOOP_TRACE").is_some();
-        let mut at = if trace { open.scans().unwrap_or(0) } else { 0 };
-        macro_rules! mark {
-            ($name:literal) => {
-                if trace {
-                    let now_at = open.scans().unwrap_or(0);
-                    eprintln!("scans: {} {}", $name, now_at - at);
-                    at = now_at;
-                }
-            };
-        }
-        mark!("bridge");
+    ) {
         if self.schedule.observer.runs(watermark, now) {
             ran.push("observer");
             match self.observer.tick() {
@@ -450,7 +434,6 @@ impl Fleet {
                 Err(error) => Fleet::fail(failed, "observer", &error.to_string()),
             }
         }
-        mark!("observer");
         // The disk watch never fails a pass: a fleet must not stop because it
         // cannot record a warning. It reads free space on its own clock
         // ([`disk::CHECK_EVERY`]) and the log once.
@@ -459,7 +442,6 @@ impl Fleet {
                 .check(open)
                 .unwrap_or_else(|error| vec![format!("disk: {error}")]),
         );
-        mark!("disk");
         if self.dispatching && self.schedule.dispatch.runs(watermark, now) {
             ran.push("dispatch");
             match dispatch::step(
@@ -479,7 +461,6 @@ impl Fleet {
         }
         // Under the disk floor no resident is revived (a new execution); the
         // supervisor still is, to act on the warning.
-        mark!("dispatch");
         if !self.disk.below_floor() && self.schedule.residents.runs(watermark, now) {
             ran.push("residents");
             match supervise::keep_residents(open) {
@@ -490,7 +471,6 @@ impl Fleet {
                 Err(error) => Fleet::fail(failed, "residents", &error),
             }
         }
-        mark!("residents");
         if self.supervised && self.schedule.alive.runs(watermark, now) {
             ran.push("alive");
             match supervise::keep_alive(open) {
@@ -501,8 +481,6 @@ impl Fleet {
                 Err(error) => Fleet::fail(failed, "supervise", &error),
             }
         }
-        mark!("alive");
-        ran
     }
 
     /// Log a failed step and mark the pass failed.
