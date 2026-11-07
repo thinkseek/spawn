@@ -1255,13 +1255,15 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<Option<(EndCause, Option<i32>)>, TerminalError> {
-        let seen = match self
-            .terminals
-            .runner(&active.terminal(), &active.workspace)?
-        {
-            Runner::Running => return Ok(None),
-            Runner::Gone => format!("its terminal {} is gone", active.terminal()),
-            Runner::Untracked(seen) => seen,
+        let asked = match self.runners.as_ref() {
+            Some(runners) => runners.get(&active.terminal()).cloned(),
+            None => Some(self.terminals.runner(&active.terminal(), &active.workspace)?),
+        };
+        let seen = match asked {
+            // The fleet's answer has no terminal of that name.
+            None | Some(Runner::Gone) => format!("its terminal {} is gone", active.terminal()),
+            Some(Runner::Running) => return Ok(None),
+            Some(Runner::Untracked(seen)) => seen,
         };
         if let Some(end) = self.exit_status(session, active, report) {
             return Ok(Some(end));
@@ -1468,6 +1470,28 @@ impl Bridge {
             || self.due_to_read(active)
             || self.in_flight(session)
             || !matches!(self.screen_wanted(session, active), Wanted::Nothing)
+    }
+
+    /// The liveness of every live execution's terminal in one call, when the
+    /// fleet's files are watched ([`Self::advance`]); `None` when they are
+    /// not, so each execution asks its own terminal as it is advanced.
+    fn fleet_runners(&self) -> Option<HashMap<TerminalName, Runner>> {
+        self.config.watch.as_ref()?;
+        let terminals: Vec<(TerminalName, WorkspaceId)> = self
+            .sessions
+            .values()
+            .filter_map(|view| view.active.as_ref())
+            .map(|active| (active.terminal(), active.workspace.clone()))
+            .collect();
+        if terminals.is_empty() {
+            return Some(HashMap::new());
+        }
+        match self.terminals.runners(&terminals) {
+            Ok(states) => Some(states.into_iter().collect()),
+            // A failing terminal server says nothing about any execution: it
+            // is asked per terminal as it is advanced, as before.
+            Err(_) => None,
+        }
     }
 
     /// Whether a command of this session is claimed and unfinished: the
