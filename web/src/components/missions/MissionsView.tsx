@@ -42,6 +42,7 @@ import {
 import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
+import { HeldSources } from "./HeldSources";
 import { Markdown } from "./Markdown";
 import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible } from "./parts";
@@ -120,6 +121,11 @@ export function MissionsBody({ data }: { data: Missions }) {
             <ApprovalQueue residents={data.residents} />
           </div>
         )}
+        {data.holds.length > 0 && (
+          <div className="shrink-0 px-3 pt-3 sm:px-4 sm:pt-4">
+            <SourceHolds data={data} />
+          </div>
+        )}
         {data.missions.length === 0 ? (
           <div className="flex flex-col">
             <div className="px-4 pt-2 sm:px-5">{toggle}</div>
@@ -142,6 +148,7 @@ export function MissionsBody({ data }: { data: Missions }) {
       <div className="mx-auto flex max-w-[1600px] flex-col gap-3 p-3 sm:p-4">
         <div>{toggle}</div>
         <ApprovalQueue residents={data.residents} />
+        <SourceHolds data={data} />
         <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
           <div className="flex min-w-0 flex-col gap-3">
             {data.missions.length === 0 ? (
@@ -170,6 +177,17 @@ export function MissionsBody({ data }: { data: Missions }) {
 
 // ---------------------------------------------------------------------------
 // Residents
+
+/** The owner's holds on mission sources: landings there wait. */
+function SourceHolds({ data }: { data: Missions }) {
+  return (
+    <HeldSources
+      holds={data.holds}
+      title="Sources held by the owner"
+      hint="no task lands there until the hold is released or expires; gates, assignment and other sources go on"
+    />
+  );
+}
 
 /** Proposed residents block on a human; they lead the page. */
 function ApprovalQueue({ residents }: { residents: Resident[] }) {
@@ -434,6 +452,20 @@ function MissionCard({ mission }: { mission: Mission }) {
                 Nothing lands until a human runs{" "}
                 <code className="font-mono">spawn mission resume --id {mission.id ?? "N"}</code>
               </div>
+            </div>
+          </div>
+        )}
+
+        {mission.hold !== null && (
+          <div className="flex items-start gap-2 rounded-md border border-border bg-surface/60 px-3 py-2">
+            <Hourglass size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 text-label">
+              <span className="font-medium text-foreground">Landings held</span>
+              <span className="text-foreground/85">
+                {" "}
+                — the owner holds its source (hold #{mission.hold}): its gates still run and an
+                accepted task waits to land until the hold is released or expires
+              </span>
             </div>
           </div>
         )}

@@ -11,12 +11,16 @@
 //! | `activity` | delivered | the later of `task.delivered` and the session's latest fact | `SPAWN_STALL_ACTIVITY_SECS` (900) |
 //! | `judgement` | reported, under review | `task.reported` | `SPAWN_STALL_REVIEW_SECS` (1800) |
 //! | `judgement` | the task the integrator judges next in its gated mission | the later of the record that made it ready and the mission's latest verdict that is not `stale` | `SPAWN_STALL_GATE_SECS` (3600) |
-//! | `landing` | landing | its `task.gated` accepted | `SPAWN_STALL_LANDING_SECS` (600) |
+//! | `landing` | landing, its source not held by the owner | the later of its `task.gated` accepted and the record that ended the latest hold on its source | `SPAWN_STALL_LANDING_SECS` (600) |
 //! | `stop` | an ephemeral task closed whose worker still runs | the record that closed it | `SPAWN_STALL_STOP_SECS` (300) |
 //! | `halted` | a halted mission with open tasks | its `mission.halted` | `SPAWN_STALL_HALTED_SECS` (0) |
 //!
 //! A task queued behind another of its session, or behind the task its
 //! mission's gate judges next, is not escalated: the one ahead of it is.
+//! A landing on a source the owner holds (`spawn mission hold`) waits behind
+//! the hold, not for the integrator: it is no landing stall while the hold
+//! lasts, and once a record ends the hold (`source.released`,
+//! `source.hold_expired`) its step is measured from that record.
 //! The tasks of a halted mission waiting for the gate or a landing are the
 //! halt's: the escalation is about the mission, once per `mission.halted`.
 //! A failed command (a delivery attempt, a Stop, a resume) is the evidence
@@ -170,6 +174,13 @@ pub(crate) struct OpenTask {
     pub(crate) record: Option<Record>,
     #[serde(default)]
     pub(crate) stale: Option<Stale>,
+    /// A landing whose source the owner holds now: it waits behind the hold.
+    #[serde(default)]
+    pub(crate) held: bool,
+    /// For a landing, the latest record that ended a hold on its source
+    /// (`source.released` or `source.hold_expired`).
+    #[serde(default)]
+    pub(crate) hold_end: Option<Record>,
 }
 
 /// A gated mission's latest verdict that is not `stale`.
@@ -519,6 +530,41 @@ fn gate(
         },
     })
 }
+/// A landing's `landing` step, from its accepted verdict (`record`), or
+/// from the later record that ended the owner's hold on its source; none
+/// while its source is held (it waits behind the hold, not for the
+/// integrator).
+fn landing(task: &OpenTask, record: &Record, now: i64, bound_ms: i64) -> Option<Measured> {
+    if task.held {
+        return None;
+    }
+    let accepted = format!("the gate accepted it: {}", named(record, now));
+    Some(match &task.hold_end {
+        Some(end) if end.at_ms > record.at_ms => Measured {
+            step: Step::Landing,
+            n: end.id,
+            since_ms: end.at_ms,
+            bound_ms,
+            line: format!(
+                "{accepted}; the owner's hold on its source ended by {}; the integrator lands it \
+                 on its next pass of mission #{}",
+                named(end, now),
+                task.mission_id
+            ),
+        },
+        _ => Measured {
+            step: Step::Landing,
+            n: record.id,
+            since_ms: record.at_ms,
+            bound_ms,
+            line: format!(
+                "{accepted}; the integrator lands it on its next pass of mission #{}",
+                task.mission_id
+            ),
+        },
+    })
+}
+
 /// The step `task` waits on, measured, or none: it is queued, closed with
 /// no worker left, the halt's, or its delivery was given up.
 fn measure(
@@ -580,16 +626,7 @@ fn measure(
         TaskState::Reported | TaskState::Accepted if task.gated => {
             gate(task, record, context, bounds.gate)
         }
-        TaskState::Landing if !task.halted => Some(since_record(
-            Step::Landing,
-            bounds.landing,
-            format!(
-                "the gate accepted it: {}; the integrator lands it on its next pass of mission \
-                 #{}",
-                named(record, now),
-                task.mission_id
-            ),
-        )),
+        TaskState::Landing if !task.halted => landing(task, record, now, bounds.landing),
         TaskState::Accepted | TaskState::Landed | TaskState::Cancelled
             if task.kind == "ephemeral" && facts.is_some_and(|facts| facts.live) =>
         {

@@ -69,6 +69,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::Stalled => "stalled",
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
+        Why::HoldExpired => "a source hold expired",
     }
 }
 
@@ -84,13 +85,15 @@ struct Line<'a> {
 
 /// The pending escalations grouped by session and reason, in the order
 /// their first item is pending. Items about the host (session `host`: a
-/// disk place, a mission's gate room, a task's host faults) are each about
+/// disk place, a mission's gate room, a task's host faults) and expired
+/// holds (each another hold, with its own waiting tasks) are each about
 /// something else, and keep a line each.
 fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
     let mut lines: Vec<(Line<'_>, Vec<String>)> = Vec::new();
     for item in pending {
         match lines.iter_mut().find(|(line, _)| {
             item.session_id != HOST_SESSION
+                && item.why != Why::HoldExpired
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
         }) {
@@ -180,6 +183,84 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      host's, not the work's: {evidence}. It is judged again {due}; nothing is \
                      counted and nothing halts. Check the test database's host (its memory, \
                      /dev/shm, its log) or tell the owner."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The session of escalations about missions rather than an agent (a
+/// halted mission, an expired hold).
+const MISSIONS_SESSION: &str = "missions";
+
+/// The digest items for `records`, the integrator's `source.hold_expired`
+/// records that no delivered digest told yet
+/// (`PostgresStore::hold_expiries`). Each is an item of session `missions`,
+/// id `source-hold-expired-<event id>`, naming the source, the hold (its
+/// event id, its reason, when it was taken and its bound), when it expired,
+/// each task that waited behind it with its mission, and that landings on
+/// the source resumed: an owner verdict judged against the hold's main may
+/// be stale now. No time window: a record stays an item until a digest
+/// carrying its tag (`missions source-hold-expired-<event id>`) reaches the
+/// supervisor, so it is told once. A released hold makes no record, and is
+/// told to nobody.
+pub(crate) fn hold_expiries(records: &[Value]) -> Vec<Escalation> {
+    let time = |ms: Option<i64>| {
+        ms.map_or_else(
+            || "at an unknown time".to_string(),
+            crate::scorecard::time::format_rfc3339,
+        )
+    };
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let source = record["source"].as_str()?;
+            let hold = record["hold"]
+                .as_i64()
+                .map_or_else(|| "?".to_string(), |hold| hold.to_string());
+            let reason = record["reason"]
+                .as_str()
+                .map_or_else(String::new, |reason| {
+                    format!(" (\"{}\")", one_line(reason, 300))
+                });
+            let bound = record["bound_s"].as_i64().map_or_else(
+                || "its bound".to_string(),
+                |secs| format!("a bound of {secs} s"),
+            );
+            let main = record["main"].as_str().map_or_else(
+                || "its main".to_string(),
+                |main| format!("its main {}", main.chars().take(12).collect::<String>()),
+            );
+            let waiting: Vec<String> = record["waiting"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let task = entry["task"].as_i64()?;
+                    Some(entry["mission"].as_i64().map_or_else(
+                        || format!("task #{task}"),
+                        |mission| format!("task #{task} of mission {mission}"),
+                    ))
+                })
+                .collect();
+            let waited = if waiting.is_empty() {
+                "no task waited behind it".to_string()
+            } else {
+                format!("{} waited behind it", waiting.join(", "))
+            };
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("source-hold-expired-{id}"),
+                why: Why::HoldExpired,
+                line: format!(
+                    "the owner's hold {hold}{reason} on source {source}, taken {} with {bound}, \
+                     expired at {} and ended by record {id}: {waited}; landings on {source} \
+                     resumed. An owner verdict judged against {main} may be stale now: tell \
+                     the owner.",
+                    time(record["held_at_ms"].as_i64()),
+                    time(record["expires_ms"].as_i64()),
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })

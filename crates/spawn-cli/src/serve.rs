@@ -1004,7 +1004,9 @@ fn now_ms() -> i64 {
 /// `/api/missions`: the board, each task with its stages from the store
 /// (`stages`: `[{stage, verdict?, at_ms, took_ms?}]`, oldest first) and its
 /// last gate verdict (`last_gate`: `{verdict, reason, metric, candidate,
-/// at_ms}` or null). A task's `brief`, `review_note` and `report` are their
+/// at_ms}` or null), each mission with the owner's `hold` on its source (the
+/// active hold's event id, or null), and `holds`: every active hold
+/// (`{source, hold, main, by, reason, held_at_ms, expires_ms, waiting}`). A task's `brief`, `review_note` and `report` are their
 /// first lines, each with its length in bytes (`brief_bytes`, ...); a
 /// closed mission's or a cancelled task's report is its length alone
 /// ([`answers::slim_board`]). The texts in full are
