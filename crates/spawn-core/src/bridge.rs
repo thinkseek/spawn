@@ -3744,20 +3744,9 @@ mod tests {
         }
     }
 
-    /// A transcript line that ends a turn.
-    const TURN_END: &str = "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"durationMs\":1,\"uuid\":\"t1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\"}\n";
-
     /// Something the engine wrote during the turn (no checkpoint of a turn's
     /// end, so nothing is committed).
     const TOOL_LINE: &str = "{\"type\":\"assistant\",\"uuid\":\"a1\",\"timestamp\":\"2099-01-01T00:00:00.000Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}]}}\n";
-
-    #[test]
-    fn debug_print() {
-        let world = World::new();
-        println!("screens: {:?}", world.screens());
-        println!("watched: {:?}", world.watch.watched("execution:exec_1"));
-        println!("path: {}", world.path);
-    }
 
     /// A session whose command is in flight (an input waiting for its turn)
     /// is captured on every pass: its screen is what the delivery waits for.
