@@ -709,34 +709,6 @@ pub(crate) fn abort_yields(
     })
 }
 
-/// The yield an abort of `task` over budget makes, read from the store:
-/// the fields its `task.aborted` record adds (`yielded`, `objective`,
-/// `failures`, `limit`, `yield_reason`), or none.
-#[cfg(test)]
-pub(crate) fn abort_yield(
-    store: &PostgresStore,
-    mission: &Mission,
-    task: &crate::integrate::Task,
-) -> Result<Option<serde_json::Value>, String> {
-    let (Some(_), Some(objective)) = (&mission.objectives, task.objective) else {
-        return Ok(None);
-    };
-    let outcomes: Vec<Outcome> = serde_json::from_value(
-        store
-            .objective_outcomes(mission.id)
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("objective outcomes: {error}"))?;
-    let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
-    Ok(
-        abort_yields(&attempts(&outcomes), task.id, objective, limit).map(|slot| {
-            json!({"yielded": true, "objective": slot.objective,
-               "failures": slot.failures.len(), "limit": limit,
-               "yield_reason": slot.reason()})
-        }),
-    )
-}
-
 /// An objective mission's worker limit: `objectives ->> 'workers'`, 1 when
 /// absent (every mission configured before the limit existed).
 pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
