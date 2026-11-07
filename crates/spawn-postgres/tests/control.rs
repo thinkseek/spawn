@@ -1909,6 +1909,108 @@ fn a_done_missions_running_task_is_still_held_to_its_budget() {
     );
 }
 
+/// One event of `session` at `at`, written straight into the log.
+fn session_event(
+    client: &mut Client,
+    session: &str,
+    at: i64,
+    name: &str,
+    detail: &serde_json::Value,
+) -> i64 {
+    client
+        .query_one(
+            "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+             values ('agent_budget', $1, 'test',
+                     jsonb_build_object('name', $2::text, 'detail', $3::jsonb),
+                     (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                       where session_id = $1),
+                     $4)
+             returning id",
+            &[&session, &name, detail, &at],
+        )
+        .expect("write an event")
+        .get(0)
+}
+
+/// What a task's active time reads: its session's events after delivery
+/// with their tool or job ids, and the fleet's silences between two events,
+/// each capped.
+#[test]
+fn a_tasks_activity_and_the_fleets_silences_are_read_from_the_log() {
+    let (store, schema) = store("control_budget_activity");
+    let mut client = admin(&schema);
+    let base = 1_000_000_000_000;
+    let min = 60_000;
+    session_event(
+        &mut client,
+        "s_task",
+        base - min,
+        "tool.started",
+        &json!({"tool_use_id": "early"}),
+    );
+    let start = session_event(
+        &mut client,
+        "s_task",
+        base + min,
+        "tool.started",
+        &json!({"tool_name": "Bash", "tool_use_id": "toolu_1"}),
+    );
+    // Other sessions keep the fleet alive for 40 minutes, then it stops
+    // for five hours.
+    for n in 1..=20 {
+        session_event(
+            &mut client,
+            "s_other",
+            base + min + n * 2 * min,
+            "screen.observed",
+            &json!({}),
+        );
+    }
+    session_event(
+        &mut client,
+        "s_task",
+        base + 45 * min,
+        "job.started",
+        &json!({"job_id": "j1"}),
+    );
+    let end = session_event(
+        &mut client,
+        "s_task",
+        base + 345 * min,
+        "tool.completed",
+        &json!({"tool_use_id": "toolu_1", "duration_ms": null}),
+    );
+
+    let events = store.session_activity("s_task", base).expect("activity");
+    let read: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                event.at_ms - base,
+                event.name.as_str(),
+                event.key.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (min, "tool.started", Some("toolu_1")),
+            (45 * min, "job.started", Some("j1")),
+            (345 * min, "tool.completed", Some("toolu_1")),
+        ]
+    );
+    assert_eq!(events[0].id, start);
+    // From the tool's start to its end: 40 minutes of 2-minute gaps, then
+    // the 4-minute gap to the job, then five hours capped at 5 minutes.
+    let alive = store.fleet_alive_ms(start, end, 5 * min).expect("alive");
+    assert_eq!(alive, 40 * min + 4 * min + 5 * min);
+    assert_eq!(
+        store.fleet_alive_ms(end, end, 5 * min).expect("one event"),
+        0
+    );
+}
+
 /// A gate-mode mission with one task reported at revision 0.
 fn gate_mode_task(store: &PostgresStore, source: &str) -> (i64, i64) {
     let mission = store
