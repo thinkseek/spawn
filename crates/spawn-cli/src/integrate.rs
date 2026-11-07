@@ -4725,6 +4725,44 @@ mod host_fault_tests {
         );
     }
 
+    /// check-tests.sh prints what a suite run by one test says of its own
+    /// failures (the relay's Python unittest) as `  in <test>: <line>`,
+    /// before the FAILED lines. Those lines are never failures of their own,
+    /// whatever they say: the classification reads the FAILED lines alone.
+    #[test]
+    fn a_suites_own_lines_are_not_failures() {
+        let relay = "the_model_relay_passes_its_self_test";
+        let relay_failed =
+            format!("FAILED {relay}: crates/spawn-cli/tests/model_relay.rs:19:5: ..F");
+        let refused_in =
+            format!("  in {relay}: ConnectionRefusedError: [Errno 111] Connection refused");
+        let assertion_in = format!("  in {relay}: AssertionError: 2 != 3");
+        let reason = host::CHECK_TESTS_REGRESSION;
+        let no_log = || -> Vec<String> { panic!("connection errors need no log") };
+
+        // A real failure, whose suite also printed a connection error: only
+        // the FAILED line is read, and it stays a rejection.
+        let work = output_of(&[refused_in.clone(), assertion_in.clone(), relay_failed]);
+        assert_eq!(tests_of(&host::check_tests_failures(&work)), [relay]);
+        assert_eq!(host::host_fault(reason, &work, Vec::new), None);
+        // Connection errors only, beside a suite's assertion: still the
+        // host's.
+        let refused = output_of(&[
+            assertion_in,
+            refused_in,
+            format!("FAILED api::tests::claims_in_order: {REFUSED}"),
+            format!("FAILED control::tests::the_fold_replays: {REFUSED}"),
+        ]);
+        assert_eq!(
+            tests_of(&host::check_tests_failures(&refused)),
+            [
+                "api::tests::claims_in_order",
+                "control::tests::the_fold_replays"
+            ]
+        );
+        assert!(host::host_fault(reason, &refused, no_log).is_some());
+    }
+
     /// Today's form, one failure: the panic's test and its message, every
     /// line up to the note.
     #[test]
