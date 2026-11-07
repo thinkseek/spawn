@@ -260,14 +260,15 @@ Your last commands, newest first:\n{mine}\n\nStart with `mission list` and `flee
 /// `resume` words the resume prompt from the facts; `start` builds the
 /// prompt of a new native session, given whether it is a handoff, with the
 /// hash of the charter it gives, if it gives one (recorded on the start).
-/// Returns a line for the loop's log when it acted.
+/// Returns a line for the loop's log when it acted, and when the rule next
+/// acts if it left the session alone for a timer ([`next_due`]).
 fn revive(
     store: &PostgresStore,
     agent: &str,
     session: &str,
     resume: impl FnOnce(&LivenessFacts) -> String,
     start: impl FnOnce(bool) -> (String, Option<String>),
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, Option<i64>), String> {
     let error = |error: &dyn std::fmt::Display| error.to_string();
     let session_id = SessionId::new(session).map_err(|e| error(&e))?;
     let facts = store
@@ -277,7 +278,7 @@ fn revive(
     let decision = decide(&facts, now);
     let execution = facts.execution_id.as_deref().unwrap_or("none");
     let (action, key) = match decision {
-        Revive::Nothing => return Ok(None),
+        Revive::Nothing => return Ok((None, next_due(&facts, now))),
         Revive::Resume => (
             // No profile named: a revived session keeps the one it last
             // started with, so a resident keeps its models.
@@ -316,12 +317,13 @@ fn revive(
     store
         .submit(&principal, &submission)
         .map_err(|e| error(&e))?;
-    Ok(Some(format!("liveness: {session} {decision:?} ({key})")))
+    Ok((Some(format!("liveness: {session} {decision:?} ({key})")), None))
 }
 
 /// Keep the supervisor alive. A new native session is given the deployed
-/// charter, and its start records the charter's hash.
-pub(crate) fn keep_alive(store: &PostgresStore) -> Result<Option<String>, String> {
+/// charter, and its start records the charter's hash. Returns the log line,
+/// and when the rule next acts if it waits for a backoff to end.
+pub(crate) fn keep_alive(store: &PostgresStore) -> Result<(Option<String>, Option<i64>), String> {
     let spawn = spawn_program();
     revive(
         store,
