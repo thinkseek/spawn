@@ -235,7 +235,7 @@ it, on the same ladder.
   ended lost before its engine became ready), never from the key of its
   latest execution: a resume that started an execution gave it a new id,
   and no resume is ever sent under that key. Whichever comes first trips
-  it:
+  it, about the dispatcher's own resume:
 
   - a resume whose execution ended lost before its engine became ready
     (the log has no Bridge `screen.observed` of it in state `ready`: its
@@ -252,7 +252,8 @@ it, on the same ladder.
   A resume whose engine became ready and stayed up did not fail: the
   session's next loss is resumed once again. (Task 132: after the host
   move of 2026-11-07, every resume of one session failed at its ready
-  wait, each ended lost, and none of these keys tripped, so it was resumed
+  wait and ended lost, while the rule looked only at the young-death count
+  (successful resumes) and the latest execution's key, so it was resumed
   every 20 s for ten minutes.) The facts are `failed_resume` and
   `resumed_young` in `dispatch_facts`; the rule is `resume_lost` in
   `dispatch/worker.rs`.
