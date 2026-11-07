@@ -2100,6 +2100,31 @@ impl Judge {
                         }
                         gated("no_room", extra)
                     }
+                    Rejection::HeadBaseDisagrees {
+                        scenario,
+                        setup_s,
+                        log,
+                        head,
+                    } => {
+                        let faults = mission.gate_host_faults.saturating_add(1);
+                        let disagreements = mission.gate_base_disagrees.saturating_add(1);
+                        let backoff = host_fault_backoff(self.host.backoff, faults);
+                        let mut extra = base_disagrees_fields(
+                            &scenario,
+                            [1, 0],
+                            setup_s,
+                            faults,
+                            disagreements,
+                            backoff,
+                            &log,
+                        );
+                        if let (Some(target), Some(head)) =
+                            (extra.as_object_mut(), head.as_object())
+                        {
+                            target.extend(head.clone());
+                        }
+                        gated("host_fault", extra)
+                    }
                 }
             }
             // No room in TMPDIR: a fact about the host, never a count.
