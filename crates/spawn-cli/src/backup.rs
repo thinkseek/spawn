@@ -50,6 +50,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -1203,7 +1204,7 @@ fn percent_encode(text: &str) -> String {
         if c.is_ascii_alphanumeric() || "-_.~".contains(c) {
             out.push(c);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
@@ -1298,8 +1299,9 @@ fn window_files(archive: &Path, now_ms: i64, days: i64) -> Result<Vec<(String, u
             };
             let at_ms = modified
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-                .unwrap_or(0);
+                .map_or(0, |elapsed| {
+                    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+                });
             if at_ms < cutoff {
                 continue;
             }
@@ -1441,12 +1443,9 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let mut taken = BTreeSet::new();
     for (index, source) in sources.iter().enumerate() {
         let Some(source) = source.as_str() else { continue };
-        let heads = match heads_of(source) {
-            Ok(heads) => heads,
-            Err(_) => {
-                missing.push(source.to_string());
-                continue;
-            }
+        let Ok(heads) = heads_of(source) else {
+            missing.push(source.to_string());
+            continue;
         };
         let refs = heads.len();
         let base_repos = base
@@ -1871,8 +1870,7 @@ fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<(Vec<u8>, S
 fn spawn_unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
-        .unwrap_or(0)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
 }
 
 /// A psql run: `-X -q -tA`, its connection settings in the environment, and
@@ -1978,10 +1976,13 @@ pub(crate) fn without_transaction_timeout(sql: &str, major: u32) -> String {
     if major >= 17 {
         return sql.to_string();
     }
-    sql.lines()
-        .filter(|line| line.trim() != "SET transaction_timeout = 0;")
-        .map(|line| format!("{line}\n"))
-        .collect()
+    let mut kept = String::with_capacity(sql.len());
+    for line in sql.lines() {
+        if line.trim() != "SET transaction_timeout = 0;" {
+            let _ = writeln!(kept, "{line}");
+        }
+    }
+    kept
 }
 
 fn restore_into(
