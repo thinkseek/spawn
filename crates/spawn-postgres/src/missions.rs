@@ -488,7 +488,7 @@ select coalesce(jsonb_agg(jsonb_build_object(
          'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
          'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded',
          'event_id', o.event_id, 'at_ms', o.at_ms,
-         'continues', (o.r ->> 'continues')::bigint,
+         'continues', (o.r ->> 'continues')::bigint, 'chain', o.r -> 'chain',
          'branch', o.r ->> 'branch', 'commit', o.r ->> 'commit', 'diff', o.r ->> 'diff',
          'tool_calls', o.r -> 'tool_calls', 'budget', o.r -> 'budget',
          'reason', o.r ->> 'reason')
@@ -771,7 +771,7 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
   left join mission_tasks k on k.id = (r ->> 'id')::bigint
  where e.session_id = 'session_control' and e.event_name = 'control.recorded'
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
-   and e.kind -> 'detail' -> 'record' ->> 'continues' is not null
+   and e.kind -> 'detail' -> 'record' ->> 'chain' = 'true'
    and not exists (select 1 from told where tag = 'host over-budget-' || e.id)";
 
 /// The last `task.gated` record of every task, keyed by task id:
@@ -913,6 +913,15 @@ pub(crate) const FLEET_ALIVE: &str = "select coalesce(sum(least(greatest(gap, 0)
 
 /// The commit of an agent's latest checkpoint (or merge of main): its last
 /// `artifact.committed` event.
+/// When task `$1` went over its budget (`task.over_budget`), or no row: the
+/// chain of overruns a mission.configured resets.
+pub(crate) const OVERRUN_AT: &str = "select recorded_at_ms from spawn_events
+                   where session_id = 'session_control' and event_name = 'control.recorded'
+                     and kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
+                     and kind -> 'detail' -> 'record' ->> 'id' = $1
+                   order by id desc limit 1";
+
+/// An agent's latest checkpoint (`LATEST_CHECKPOINT`)
 pub(crate) const LATEST_CHECKPOINT: &str = "select kind -> 'detail' -> 'artifact' ->> 'commit'
                    from spawn_events
                   where agent_id = $1 and event_name = 'artifact.committed'
@@ -1427,6 +1436,13 @@ impl PostgresStore {
 
     /// The commit of the agent's latest `artifact.committed` event, if it
     /// has one: what its pushed branch must contain to be landed.
+    /// When task `task` went over its budget (`[`OVERRUN_AT`]`), or null.
+    pub fn overrun_at(&self, task: i64) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .query_opt(OVERRUN_AT, &[&task.to_string()])?
+            .map(|row| row.get(0)))
+    }
+
     /// An agent's latest checkpoint and when it was recorded
     /// ([`CHECKPOINT_AT`]), or null.
     pub fn checkpoint_at(&self, agent: &str) -> Result<Option<Value>, StoreError> {
