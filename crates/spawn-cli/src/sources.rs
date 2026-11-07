@@ -1053,9 +1053,10 @@ mod tests {
                 }
             }
         }
-        /// Whether `code` names the controller's `git`: a path that ends in
-        /// `::git`, or `git` alone in a `use` list (`test_git as git` is
-        /// the test's).
+        /// Whether `code` names the controller's `git`: by a path (`::`
+        /// then `git`, the needle is spelled apart so this file does not
+        /// name it), or alone in a `use` list (`test_git as git` is the
+        /// test's).
         fn names_git(code: &str) -> bool {
             let needle = concat!(":", ":git");
             let path = code.match_indices(needle).any(|(at, _)| {
