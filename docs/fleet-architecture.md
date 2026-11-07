@@ -198,8 +198,9 @@ it, on the same ladder.
 
   The code is `crates/spawn-cli/src/dispatch.rs`, principal `spawn-dispatch`.
   It acts only on a judgement that covers the session's latest fact; a lost
-  execution is resumed once (the one-resume rule); the nudge needs Jev's WAITING at an idle prompt
-  with confidence ≥ 0.7, `needs_human` ≤ 0.2 and `stuck` < 0.5, once per
+  execution is resumed once (the one-resume rule); the nudge needs Jev's
+  WAITING at an idle prompt with confidence ≥ 0.7, `needs_human` ≤ 0.2 and
+  `stuck` < 0.5, once per
   episode (the latest non-dispatcher command) and three per agent-hour. Only
   a nudge that reached the worker counts: one refused before typing (a pane
   not ready) is sent again under `<key>-retry-<n>` on a judgement made after
