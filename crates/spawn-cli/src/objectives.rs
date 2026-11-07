@@ -1182,8 +1182,8 @@ mod tests {
     /// configured again; a first overrun holds nothing.
     #[test]
     fn a_second_overrun_holds_its_objective_until_a_configure() {
-        let first = overrun_outcome(84, 17, None, Some("a").as_ref(), None);
-        let second = overrun_outcome(87, 17, Some(84), Some("a").as_ref(), None);
+        let first = overrun_outcome(84, 17, None, Some("aa11bb22"), None);
+        let second = overrun_outcome(87, 17, Some(84), Some("aa11bb22"), None);
         let outcomes = [first.clone(), second.clone()];
         let latest = overruns(&outcomes);
         let chain = latest.get(&17).expect("the latest overrun");
@@ -1203,14 +1203,14 @@ mod tests {
     #[test]
     fn the_next_open_objective_takes_the_slot_of_a_held_one() {
         let backlog = [objective(17, false), objective(18, false)];
-        let first = overruns(&[overrun_outcome(84, 17, None, Some("a").as_ref(), None)]);
+        let first = overruns(&[overrun_outcome(84, 17, None, Some("aa11bb22"), None)]);
         let held: BTreeSet<u32> = first
             .iter()
             .filter(|(_, overrun)| holds(overrun, None))
             .map(|(id, _)| *id)
             .collect();
         assert!(held.is_empty(), "the first overrun is continued");
-        let chained = overruns(&[overrun_outcome(87, 17, Some(84), Some("a").as_ref(), None)]);
+        let chained = overruns(&[overrun_outcome(87, 17, Some(84), Some("aa11bb22"), None)]);
         let held: BTreeSet<u32> = chained
             .iter()
             .filter(|(_, overrun)| holds(overrun, None))
