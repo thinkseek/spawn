@@ -483,10 +483,7 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
     // is not there.
     let missing = terminal("missing");
     let states = host
-        .runners(&[
-            (name.clone(), workspace()),
-            (missing.clone(), workspace()),
-        ])
+        .runners(&[(name.clone(), workspace()), (missing.clone(), workspace())])
         .expect("runners succeeds");
     assert_eq!(
         states,
