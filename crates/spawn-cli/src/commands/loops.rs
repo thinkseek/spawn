@@ -347,7 +347,7 @@ impl Fleet {
             self.bridge_work(&open, watermark, now, &mut warnings, &mut failed);
             if due {
                 self.steps_at = Some(std::time::Instant::now());
-                self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
+                self.steps(&open, watermark, now, &mut lines, &mut failed);
             }
         }
         // The screens and transcripts the Bridge reads are not announced by
@@ -411,17 +411,15 @@ impl Fleet {
         }
     }
 
-    /// The steps whose input is the store: the Bridge's reads of the log and
-    /// its claims of the queue, the Observer's judgements, the dispatcher,
-    /// the liveness rule. Each runs when the watermark moved or its own time
-    /// came, and records both.
+    /// The steps whose input is the store besides the Bridge's own reads:
+    /// the Observer's judgements, the dispatcher, the liveness rule. Each
+    /// runs when the watermark moved or its own time came, and records both.
     fn steps(
         &mut self,
         open: &std::sync::Arc<PostgresStore>,
         watermark: i64,
         now: i64,
         lines: &mut Vec<String>,
-        warnings: &mut Vec<String>,
         failed: &mut bool,
     ) {
         if self.schedule.observer.runs(watermark, now) {
