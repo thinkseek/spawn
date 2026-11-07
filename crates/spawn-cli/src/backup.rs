@@ -1092,80 +1092,118 @@ fn decrypt(settings: &Settings, input: &Path, output: &Path) -> Result<(), Strin
     gpg(settings, true, input, output)
 }
 
-/// A curl request against the bucket, its credentials on stdin.
-fn curl(&self_settings: &Settings, config: &str, args: &[&str]) -> Result<(u16, String), String> {
-    let settings = self_settings;
-    let mut secrets = String::new();
-    secrets.push_str("silent\nshow-error\n");
-    secrets.push_str(&format!(
+/// One exchange with the bucket. `options` is curl config (headers, the
+/// file to upload); the credentials are added here, on stdin, never argv.
+struct Response {
+    status: u16,
+    body: String,
+    headers: String,
+}
+
+fn bucket_request(settings: &Settings, url: &str, options: &str) -> Result<Response, String> {
+    let scratch = Scratch::new("curl")?;
+    let body_file = scratch.join("body");
+    let headers_file = scratch.join("headers");
+    let config = format!(
+        "url = \"{}\"\noutput = \"{}\"\ndump-header = \"{}\"\nwrite-out = \"%{{http_code}}\"\n{}",
+        escape_config(url),
+        body_file.display(),
+        headers_file.display(),
+        options
+    );
+    let mut secret = String::new();
+    secret.push_str("silent\nshow-error\n");
+    secret.push_str(&format!(
         "user = \"{}:{}\"\n",
         escape_config(&settings.r2.access_key),
         escape_config(&settings.r2.secret_key)
     ));
-    secrets.push_str("aws-sigv4 = \"aws:amz:auto:s3\"\n");
-    secrets.push_str("max-time = \"600\"\n");
-    secrets.push_str(config);
+    secret.push_str("aws-sigv4 = \"aws:amz:auto:s3\"\n");
+    secret.push_str("max-time = \"600\"\nconnect-timeout = \"20\"\n");
+    secret.push_str(&config);
     let mut command = Command::new("curl");
-    command.arg("--config").arg("-").args(args);
     command
+        .arg("--config")
+        .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("curl: {error}"))?;
+    let mut child = command.spawn().map_err(|error| format!("curl: {error}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
-            .write_all(secrets.as_bytes())
+            .write_all(secret.as_bytes())
             .map_err(|error| format!("curl: {error}"))?;
     }
     let out = child
         .wait_with_output()
         .map_err(|error| format!("curl: {error}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!("curl: {}", stderr.trim()));
     }
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let status = stdout
         .trim()
         .lines()
         .last()
         .and_then(|line| line.trim().parse::<u16>().ok())
-        .unwrap_or(0);
-    Ok((status, stderr))
+        .ok_or_else(|| format!("curl: no status in its output ({})", stdout.trim()))?;
+    Ok(Response {
+        status,
+        body: fs::read_to_string(&body_file).unwrap_or_default(),
+        headers: fs::read_to_string(&headers_file).unwrap_or_default(),
+    })
 }
 
 fn escape_config(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// The whole bucket's keys and bytes, every listing page.
-fn list_bucket(r2: &R2) -> Result<(u64, Vec<(String, u64)>), String> {
-    let settings = ();
-    let _ = settings;
-    let mut all = Vec::new();
+/// A response header's value, lower-cased name, trimmed.
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    headers.lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        (header.trim().eq_ignore_ascii_case(name)).then(|| value.trim().to_string())
+    })
+}
+
+/// The whole bucket: every key with its size (every listing page), and the
+/// bytes they add up to.
+fn list_bucket(settings: &Settings) -> Result<(u64, Vec<(String, u64)>), String> {
+    let mut total = 0u64;
+    let mut keys = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..10_000 {
         let url = match &token {
-            None => r2.url("?list-type=2&max-keys=1000"),
-            Some(token) => r2.url(&format!(
+            None => settings.r2.url("?list-type=2&max-keys=1000"),
+            Some(token) => settings.r2.url(&format!(
                 "?list-type=2&max-keys=1000&continuation-token={}",
                 percent_encode(token)
             )),
         };
-        let body = format!("url = \"{}\"\noutput = \"-\"\nwrite-out = \"%{{http_code}}\"\n", escape_config(&url));
-        let (status, _stderr) = curl_with(r2, &body, &[])?;
-        if status != 200 {
-            return Err(format!("ListObjectsV2 answered {status}"));
+        let response = bucket_request(settings, &url, "")?;
+        if response.status != 200 {
+            return Err(format!(
+                "ListObjectsV2 answered {}: {}",
+                response.status,
+                first_line(&response.body)
+            ));
         }
-        // The body and the code share stdout: the code is the last line.
-        let (xml, _) = split_body_code(&body);
-        let _ = xml;
-        unreachable!()
+        let (page, next) = parse_listing(&response.body);
+        for (key, size) in &page {
+            total = total.saturating_add(*size);
+            keys.push((key.clone(), *size));
+        }
+        match next {
+            Some(next) => token = Some(next),
+            None => return Ok((total, keys)),
+        }
     }
-    let _ = all;
-    unreachable!()
+    Err("ListObjectsV2 did not end".to_string())
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").chars().take(160).collect()
 }
 
 fn percent_encode(text: &str) -> String {
@@ -1181,21 +1219,469 @@ fn percent_encode(text: &str) -> String {
     out
 }
 
-fn split_body_code(_stdout: &str) -> (String, u16) {
-    (String::new(), 0)
-}
-
-fn curl_with(_r2: &R2, _config: &str, _args: &[&str]) -> Result<(u16, String), String> {
-    unreachable!()
-}
-
+/// Store one object, its ETag checked against the MD5 sent and its metadata
+/// naming the plaintext's sha256 and event count.
 fn put_object(
-    _r2: &R2,
-    _key: &str,
-    _file: &Path,
-    _sha256: &str,
-    _events: i64,
-    _scratch: &Scratch,
+    settings: &Settings,
+    key: &str,
+    file: &Path,
+    sha256: &str,
+    events: i64,
 ) -> Result<(), String> {
-    unreachable!()
+    let md5 = md5_file(file)?;
+    let options = format!(
+        "upload-file = \"{}\"\nheader = \"Content-Type: application/octet-stream\"\n\
+header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
+        escape_config(&file.display().to_string()),
+        sha256,
+        events
+    );
+    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
+    if response.status != 200 {
+        return Err(format!(
+            "PUT {key} answered {}: {}",
+            response.status,
+            first_line(&response.body)
+        ));
+    }
+    let etag = header_value(&response.headers, "etag").unwrap_or_default();
+    let etag = etag.trim_matches('"').to_ascii_lowercase();
+    if etag != md5 {
+        return Err(format!(
+            "PUT {key}: the ETag {etag:?} is not the MD5 sent {md5:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// One object's bytes (and the response's headers), or `None` when the
+/// bucket does not hold it.
+fn get_object(settings: &Settings, key: &str) -> Result<Option<Response>, String> {
+    let scratch = Scratch::new("fetch")?;
+    let output = scratch.join("object");
+    let options = format!(
+        "output = \"{}\"\n",
+        escape_config(&output.display().to_string())
+    );
+    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
+    if response.status == 404 {
+        return Ok(None);
+    }
+    if response.status != 200 {
+        return Err(format!(
+            "GET {key} answered {}: {}",
+            response.status,
+            first_line(&response.body)
+        ));
+    }
+    let body = fs::read_to_string(&output).unwrap_or_default();
+    Ok(Some(Response {
+        status: 200,
+        body,
+        headers: response.headers,
+    }))
+}
+
+/// `spawn backup dump`'s body is above; `bundle` and `verify` follow.
+///
+/// One `backup.bundled` record, as the run reads the earlier ones.
+struct BundleRecord {
+    event_id: i64,
+    at_ms: i64,
+    record: Value,
+}
+
+fn bundle_records(store: &PostgresStore, now_ms: i64) -> Result<Vec<BundleRecord>, String> {
+    let records = store
+        .backup_records("backup.bundled", now_ms.saturating_sub(400 * 86_400_000), 10_000)
+        .map_err(|error| error.to_string())?;
+    Ok(records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| BundleRecord {
+            event_id: entry["event_id"].as_i64().unwrap_or_default(),
+            at_ms: entry["at_ms"].as_i64().unwrap_or_default(),
+            record: entry["record"].clone(),
+        })
+        .collect())
+}
+
+/// The files of the transcript archive modified within `days` days, relative
+/// to the archive root, with their sizes, sorted.
+fn window_files(archive: &Path, now_ms: i64, days: i64) -> Result<Vec<(String, u64)>, String> {
+    let cutoff = now_ms.saturating_sub(days.saturating_mul(86_400_000));
+    let mut files = Vec::new();
+    let mut stack = vec![archive.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", directory.display())),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let at_ms = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            if at_ms < cutoff {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(archive) else {
+                continue;
+            };
+            files.push((
+                relative.display().to_string().replace('\\', "/"),
+                meta.len(),
+            ));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// A source's refs and their commits (`refs/heads` and `refs/tags`).
+fn heads_of(source: &str) -> Result<BTreeMap<String, String>, String> {
+    let (ok, stdout, stderr) = output(
+        {
+            let mut command = Command::new("git");
+            command.args(["-C", source, "for-each-ref", "--format=%(objectname) %(refname)",
+                          "refs/heads", "refs/tags"]);
+            command
+        },
+        "git for-each-ref",
+    )?;
+    if !ok {
+        return Err(stderr.trim().to_string());
+    }
+    let mut heads = BTreeMap::new();
+    for line in stdout.lines() {
+        if let Some((commit, name)) = line.split_once(' ') {
+            heads.insert(name.to_string(), commit.to_string());
+        }
+    }
+    Ok(heads)
+}
+
+/// Whether the source still holds a commit (`git cat-file -e`).
+fn holds(source: &str, commit: &str) -> bool {
+    Command::new("git")
+        .args(["-C", source, "cat-file", "-e", commit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// A file name for a source: its last path component, safe for a tar.
+fn source_name(source: &str, taken: &mut BTreeSet<String>, index: usize) -> String {
+    let base = source
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("source")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' })
+        .collect::<String>();
+    let base = if base.is_empty() { format!("source-{index}") } else { base };
+    let mut name = base.clone();
+    let mut suffix = 1;
+    while !taken.insert(name.clone()) {
+        name = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    name
+}
+
+/// `spawn backup bundle`: the mission sources and the transcript archive, a
+/// full bundle or an increment of its base.
+fn bundle(flags: &Flags) -> Result<i32, String> {
+    let started = Instant::now();
+    let settings = match Settings::from_env(flags) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("spawn backup bundle: {error}");
+            return Ok(2);
+        }
+    };
+    let _lock = Lock::acquire(&settings.root)?;
+    let store = open_store()?;
+    let now_ms = store.now_ms().map_err(|error| error.to_string())?;
+    let now = Stamp::at(now_ms);
+    let earlier = bundle_records(&store, now_ms)?;
+    let base = earlier.last();
+    let stamps: Vec<(Stamp, bool)> = earlier
+        .iter()
+        .filter_map(|entry| {
+            let key = entry.record["keys"].as_array()?.first()?.as_str()?;
+            let kind = entry.record["kind"].as_str()?;
+            Some((Stamp::parse(key)?, kind == "full"))
+        })
+        .collect();
+    let at_ms: Vec<i64> = earlier.iter().map(|entry| entry.at_ms).collect();
+    let full = full_bundle(now, &stamps, now_ms, &at_ms);
+    let sources = store
+        .mission_sources()
+        .map_err(|error| error.to_string())?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let archive = settings.root.join(".transcripts");
+    let window = window_files(&archive, now_ms, settings.transcript_days)?;
+    let scratch = Scratch::new("backup-bundle")?;
+    let staging = scratch.join("stage");
+    fs::create_dir_all(staging.join("repos"))
+        .map_err(|error| format!("{}: {error}", staging.display()))?;
+    fs::create_dir_all(staging.join("transcripts"))
+        .map_err(|error| format!("{}: {error}", staging.display()))?;
+
+    let mut transcript_entries: Vec<Value> = Vec::new();
+    let mut transp_bytes = 0u64;
+    let mut sizes = serde_json::Map::new();
+    for (path, size) in &window {
+        if let Some(sizes) = sizes.as_object_mut() {
+            sizes.insert(path.clone(), json!(size));
+        }
+        let base_size = base
+            .and_then(|base| base.record["transcripts"]["sizes"].get(path))
+            .and_then(Value::as_u64);
+        let offset = if full { 0 } else { transcript_offset(base_size, *size) };
+        if !full && offset >= *size {
+            continue;
+        }
+        let target = staging.join("transcripts").join(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        append_slice(&archive.join(path), &target, offset, *size)?;
+        transcript_entries.push(json!({
+            "path": path, "offset": offset, "bytes": size - offset, "size": size,
+        }));
+        transp_bytes = transp_bytes.saturating_add(size - offset);
+    }
+
+    let mut repos_record: Vec<Value> = Vec::new();
+    let mut repos_manifest: Vec<Value> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut taken = BTreeSet::new();
+    for (index, source) in sources.iter().enumerate() {
+        let Some(source) = source.as_str() else { continue };
+        let heads = match heads_of(source) {
+            Ok(heads) => heads,
+            Err(_) => {
+                missing.push(source.to_string());
+                continue;
+            }
+        };
+        let refs = heads.len();
+        let base_repos = base
+            .and_then(|base| base.record["repos"].as_array().cloned())
+            .unwrap_or_default();
+        let base_heads = base_repos
+            .iter()
+            .find(|repo| repo["source"].as_str() == Some(source))
+            .and_then(|repo| repo["heads"].as_object().cloned())
+            .unwrap_or_default();
+        let unchanged = !full
+            && base.is_some()
+            && base_heads.len() == heads.len()
+            && heads
+                .iter()
+                .all(|(name, commit)| base_heads.get(name).and_then(Value::as_str) == Some(commit.as_str()));
+        if unchanged {
+            repos_record.push(json!({
+                "source": source, "heads": heads, "refs": refs, "bytes": 0, "unchanged": true,
+            }));
+            repos_manifest.push(json!({
+                "source": source, "file": Value::Null, "heads": heads, "unchanged": true,
+            }));
+            continue;
+        }
+        let name = source_name(source, &mut taken, index);
+        let file = scratch.join(format!("{name}.bundle"));
+        let not: Vec<String> = if full {
+            Vec::new()
+        } else {
+            base_heads
+                .values()
+                .filter_map(Value::as_str)
+                .filter(|commit| holds(source, commit))
+                .map(str::to_string)
+                .collect()
+        };
+        git_bundle(source, &file, &not)?;
+        let bytes = fs::metadata(&file)
+            .map_err(|error| format!("{}: {error}", file.display()))?
+            .len();
+        let relative = format!("repos/{name}.bundle");
+        fs::copy(&file, staging.join(&relative))
+            .map_err(|error| format!("{}: {error}", file.display()))?;
+        repos_record.push(json!({
+            "source": source, "heads": heads, "refs": refs, "bytes": bytes,
+            "unchanged": false, "file": relative,
+        }));
+        repos_manifest.push(json!({
+            "source": source, "file": relative, "heads": heads, "unchanged": false,
+        }));
+    }
+
+    let manifest = json!({
+        "kind": if full { "full" } else { "incremental" },
+        "base_event_id": base.map(|base| base.event_id),
+        "transcripts": transcript_entries,
+        "repos": repos_manifest,
+        "created_at_ms": now_ms,
+    });
+    fs::write(
+        staging.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("manifest.json: {error}"))?;
+    let tar = scratch.join("bundle.tar");
+    let (ok, _stdout, stderr) = output(
+        {
+            let mut command = Command::new("tar");
+            command.arg("-C").arg(&staging).arg("-cf").arg(&tar).arg(".");
+            command
+        },
+        "tar",
+    )?;
+    if !ok {
+        return Err(format!("tar: {}", stderr.trim()));
+    }
+    let bytes = fs::metadata(&tar)
+        .map_err(|error| format!("{}: {error}", tar.display()))?
+        .len();
+    let sha256 = sha256_file(&tar)?;
+    let encrypted = scratch.join("bundle.gpg");
+    encrypt(&settings, &tar, &encrypted)?;
+    let stored_bytes = fs::metadata(&encrypted)
+        .map_err(|error| format!("{}: {error}", encrypted.display()))?
+        .len();
+    let back = scratch.join("bundle.back");
+    decrypt(&settings, &encrypted, &back)?;
+    if sha256_file(&back)? != sha256 {
+        return Err("the encrypted bundle does not decrypt to the tar".to_string());
+    }
+
+    let held = list_bucket(&settings)?.0;
+    let tier = if full { "full" } else { "incr" };
+    let key = format!(
+        "bundles/{}/spawn-bundle-{}.tar.gpg",
+        tier,
+        now.text()
+    );
+    let mut keys: Vec<String> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut written = 0u64;
+    if within_limit(held, written, stored_bytes, settings.limit_bytes) {
+        put_object(&settings, &key, &encrypted, &sha256, 0)?;
+        written = written.saturating_add(stored_bytes);
+        keys.push(key);
+    } else {
+        skipped.push(skip(tier, held, written, stored_bytes, &settings));
+    }
+    let over_alert = held.saturating_add(written) > settings.alert_bytes;
+    let record = json!({
+        "type": "backup.bundled",
+        "kind": if full { "full" } else { "incremental" },
+        "base_event_id": base.map(|base| base.event_id),
+        "keys": keys,
+        "tiers": [tier],
+        "skipped": skipped,
+        "sha256": sha256,
+        "bytes": bytes,
+        "stored_bytes": stored_bytes,
+        "repos": repos_record,
+        "missing": missing,
+        "transcripts": {
+            "files": transcript_entries.len(),
+            "bytes": transp_bytes,
+            "sizes": sizes,
+        },
+        "held_bytes": held,
+        "written_bytes": written,
+        "alert_bytes": settings.alert_bytes,
+        "limit_bytes": settings.limit_bytes,
+        "over_alert": over_alert,
+        "duration_ms": i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+    });
+    store
+        .backup_record(&record)
+        .map_err(|error| format!("backup.bundled: {error}"))?;
+    if over_alert {
+        println!(
+            "R2 holds {} bytes, over the alert at {}",
+            held.saturating_add(written),
+            settings.alert_bytes
+        );
+    }
+    println!(
+        "spawn backup bundle: {} {} bytes for {} transcript files ({} bytes), {} stored",
+        if full { "full" } else { "incremental" },
+        bytes,
+        transcript_entries.len(),
+        transp_bytes,
+        if keys.is_empty() { "nothing".to_string() } else { keys.join(", ") }
+    );
+    Ok(0)
+}
+
+/// Copy `size - offset` bytes from `offset` of `source` to `target`.
+fn append_slice(source: &Path, target: &Path, offset: u64, size: u64) -> Result<(), String> {
+    let mut file =
+        File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    let mut out = File::create(target).map_err(|error| format!("{}: {error}", target.display()))?;
+    if offset > 0 {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("{}: {error}", source.display()))?;
+    }
+    let mut left = size.saturating_sub(offset);
+    let mut buffer = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = usize::try_from(left.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file
+            .read(&mut buffer[..want])
+            .map_err(|error| format!("{}: {error}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&buffer[..read])
+            .map_err(|error| format!("{}: {error}", target.display()))?;
+        left -= read as u64;
+    }
+    Ok(())
+}
+
+/// A git bundle of every ref of `source`, but not `not`'s commits.
+fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command.args(["-C", source, "bundle", "create"]).arg(file).arg("--all");
+    if !not.is_empty() {
+        command.arg("--not");
+        for commit in not {
+            command.arg(commit);
+        }
+    }
+    let (ok, _stdout, stderr) = output(command, "git bundle create")?;
+    if !ok {
+        return Err(format!("git bundle create {source}: {}", stderr.trim()));
+    }
+    Ok(())
 }
