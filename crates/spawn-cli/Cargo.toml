@@ -27,3 +27,6 @@ workspace = true
 
 [dev-dependencies]
 postgres.workspace = true
+spawn-host = { workspace = true, features = ["testing"] }
+# The in-memory terminal host, under a real Bridge in the dispatcher's tests.
+spawn-core = { workspace = true, features = ["testing"] }

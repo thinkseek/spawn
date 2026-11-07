@@ -17,6 +17,15 @@
 //! it from the tree. The branch head alone is the whole workspace
 //! (docs/storage.md).
 //!
+//! The files the engine writes for itself in its working directory
+//! ([`ENGINE_RUNTIME_FILES`]: Claude Code's scheduler lock, worktrees and
+//! the rest of its own list) never enter a checkpoint, whatever the
+//! project's `.gitignore` says: they are excluded by pathspec at every
+//! staging, so a workspace mounted before this rule is covered at its next
+//! checkpoint. The rest of `.claude/` is the project's and is committed. A
+//! runtime file the project tracks (both the branch and `main` hold it) is
+//! committed like any tracked file; Spawn never removes it from `main`.
+//!
 //! Identifiers travel as `<branch>:<absolute directory>`. The branch is the
 //! part before the colon, so every call rebuilds the mapping from the
 //! identifier alone.
@@ -30,7 +39,8 @@ use std::process::{Command, Output, Stdio};
 use spawn_core::event::Fork;
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
 use spawn_core::port::{
-    BaseMerge, Branch, Commit, ForkFrom, SetAside, WORKSPACE_STALE, WorkspaceError, WorkspaceStore,
+    BaseMerge, Branch, Commit, ForkFrom, Hold, MERGE_WAITS, SetAside, WORKSPACE_STALE,
+    WorkspaceError, WorkspaceStore,
 };
 
 use crate::tree_path::{TreePath, nul_fields};
@@ -43,6 +53,73 @@ const BASE: &str = "main";
 
 /// Paths that never enter a commit.
 const BUILD_OUTPUT: [&str; 2] = ["target", ".spawn"];
+
+/// Files the engine writes for itself in its working directory, at any
+/// depth: its runtime state (a session's scheduler lock, its worktrees, its
+/// checkpoints, its mailbox), never the project's. No checkpoint adds one,
+/// whatever the project's `.gitignore` says; the rest of `.claude/` (the
+/// settings, agents and commands a project commits) is committed as usual
+/// ([`GitWorkspace::track_runtime_files`], docs/storage.md).
+///
+/// An entry that ends in `/` is a directory; any other is a file, or a
+/// directory, and everything under it. Claude Code is the only engine
+/// (`spawn_core::event::ENGINE`), and the list is its own: the paths it
+/// writes to a checkout's `.git/info/exclude` under `# claude-code-runtime`
+/// (Claude Code 2.1.318), plus `.claude/settings.local.json`, the local
+/// permissions it writes when a person allows a tool, which a project never
+/// commits. An exported workspace has no `.git`, so Claude Code writes none
+/// there.
+pub const ENGINE_RUNTIME_FILES: [&str; 11] = [
+    ".claude/scheduled_tasks.lock",
+    ".claude/settings.local.json",
+    ".claude/scheduled_tasks.json",
+    ".claude/routines/.state/",
+    ".claude/worktrees/",
+    ".claude/checkpoints/",
+    ".claude/mailbox/",
+    ".claude/agent-registry.json",
+    ".claude/agent-memory-local",
+    ".claude/first-run",
+    ".claude/assistant-daemon-state.json",
+];
+
+/// Pathspecs that match the engine's runtime files
+/// ([`ENGINE_RUNTIME_FILES`]) at any depth, each with `glob` magic and
+/// `magic` before it (`exclude`, or nothing). A glob pathspec never matches
+/// what is under a directory it names, so a directory gets `<path>/**`.
+fn runtime_pathspecs(magic: &str) -> Vec<OsString> {
+    let magic = if magic.is_empty() {
+        "glob".to_string()
+    } else {
+        format!("{magic},glob")
+    };
+    ENGINE_RUNTIME_FILES
+        .iter()
+        .flat_map(|entry| {
+            let (path, directory) = match entry.strip_suffix('/') {
+                Some(path) => (path, true),
+                None => (*entry, false),
+            };
+            let under = format!(":({magic})**/{path}/**");
+            if directory {
+                vec![under]
+            } else {
+                vec![format!(":({magic})**/{path}"), under]
+            }
+        })
+        .map(OsString::from)
+        .collect()
+}
+
+/// Where main's version of each file that conflicts with the branch in a
+/// way markers cannot show is copied, relative to the workspace (under
+/// `.spawn/`, never committed), for a worker that cannot run git. Every
+/// mount puts the copies back while the conflict is open
+/// ([`GitWorkspace::restore_main_copies`]).
+pub const MAIN_COPIES: &str = ".spawn/main";
+
+/// First field of the record of main's copies ([`GitWorkspace::main_copies`]).
+const COPIES_TAG: &str = "main-copies";
 
 /// The size cap of one file in a checkpoint, in MiB, when
 /// `SPAWN_MAX_FILE_MB` does not set one: git stores every version of a file
@@ -85,6 +162,67 @@ pub fn names_files_outside_git(message: &str) -> bool {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             })
     })
+}
+
+/// The locale every git Spawn runs gets (`LC_ALL`): git's own, untranslated
+/// messages.
+const GIT_LOCALE: &str = "C";
+
+/// A command that runs `program` (the git to run) the way Spawn runs every
+/// git: in the C locale, `LC_ALL=C` and no `LANGUAGE`.
+/// Every git of [`GitWorkspace`] and of the controller (`spawn-cli`'s
+/// `controller_git`) is built here, so none can be left to the host's
+/// locale.
+///
+/// Spawn reads what git answers: a push's summary, a merge's conflict
+/// kinds, a listing, an exit code, and the error it quotes in a record or a
+/// note. Under a translated locale (`LANG=zh_CN.UTF-8`) git, and the
+/// `git-receive-pack` or hook it starts, writes its messages in that
+/// language; nothing Spawn decides may change with the host's language.
+/// `LC_ALL` wins over `LANG` and every `LC_*`; `LANGUAGE`, which gettext
+/// would otherwise read first, is removed. Paths, listings and commit
+/// messages are bytes to git in any locale.
+pub fn git_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.env("LC_ALL", GIT_LOCALE).env_remove("LANGUAGE");
+    command
+}
+
+/// A command that runs git the way a test runs its own (a seed's `init`,
+/// `add` and `commit`, a look at a ref or an index): [`git_command`],
+/// without the user's or the system's git configuration.
+///
+/// `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` leave out
+/// `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` and `/etc/gitconfig`, and
+/// configuration inherited through the environment (`GIT_CONFIG_COUNT`,
+/// `GIT_CONFIG_PARAMETERS`) is removed. So a host whose configuration signs
+/// every commit (`commit.gpgsign` with a key no agent holds: `ssh-keygen -Y
+/// sign` waits forever), runs hooks (`core.hooksPath`) or refuses to guess
+/// an identity (`user.useConfigOnly`) neither hangs nor fails a test, and
+/// a configuration a test sets on the command itself still counts. It
+/// leaves out every setting, not just signing: no setting of the host's
+/// can reach a test's own git. Standard input is empty; the identity
+/// (`spawn-test`) is one a test may override with its own `-c`.
+///
+/// Never Spawn's own git: what Spawn runs must hold under the host's
+/// configuration, and a test runs it that way (`spawn-cli`'s
+/// `spawns_own_commits_ignore_forced_signing`).
+#[cfg(any(test, feature = "testing"))]
+pub fn test_git_command() -> Command {
+    let mut command = git_command("git");
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .stdin(Stdio::null())
+        .args([
+            "-c",
+            "user.name=spawn-test",
+            "-c",
+            "user.email=spawn@localhost",
+        ]);
+    command
 }
 
 /// Stdout of a git command exactly as written, bytes and all, or the
@@ -192,11 +330,14 @@ pub struct GitWorkspace {
 }
 
 impl GitWorkspace {
-    /// Store that keeps working trees on this machine.
+    /// Store that keeps working trees on this machine, under `root`
+    /// resolved through its symlinks once, here ([`crate::root`]): every
+    /// workspace id it mints names the directory as the engine's process
+    /// sees it.
     pub fn new(repo: impl AsRef<Path>, root: impl AsRef<Path>) -> Self {
         Self {
             repo: repo.as_ref().to_path_buf(),
-            root: root.as_ref().to_path_buf(),
+            root: crate::root::canonical_root(root.as_ref()),
             git: "git".to_string(),
             max_file_bytes: max_file_bytes(std::env::var("SPAWN_MAX_FILE_MB").ok().as_deref()),
         }
@@ -210,8 +351,10 @@ impl GitWorkspace {
         self
     }
 
+    /// Every git this store runs: in the C locale ([`git_command`]), on its
+    /// repository.
     fn command(&self) -> Command {
-        let mut command = Command::new(&self.git);
+        let mut command = git_command(&self.git);
         command.arg(format!("--git-dir={}", self.repo.display()));
         // commit-tree needs a committer identity. Supplying it here keeps the
         // store independent of the host's git configuration.
@@ -224,9 +367,17 @@ impl GitWorkspace {
     }
 
     /// Workspace directory, refused when it lies outside the store root.
+    /// An id recorded under another spelling of the root (before the root
+    /// was resolved through its symlinks) names the same directory under the
+    /// resolved root ([`crate::root::legacy_workspace`]).
     fn checked_path(&self, workspace: &WorkspaceId) -> Result<PathBuf, WorkspaceError> {
         let directory = PathBuf::from(workspace.path());
         if directory.starts_with(&self.root) {
+            return Ok(directory);
+        }
+        if let Some(directory) =
+            crate::root::legacy_workspace(&self.root, workspace.sandbox(), &directory)
+        {
             return Ok(directory);
         }
         Err(WorkspaceError::Unavailable(format!(
@@ -291,23 +442,35 @@ impl GitWorkspace {
         arguments: &[S],
         specs: &[OsString],
     ) -> Result<Vec<u8>, WorkspaceError> {
+        let mut with_input: Vec<&OsStr> = arguments.iter().map(AsRef::as_ref).collect();
+        with_input.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(OsStr::new));
+        self.listing_in_with_input(directory, index, &with_input, &nul_terminated(specs))
+    }
+
+    /// [`Self::listing_in`] for a command that reads `input` on standard
+    /// input.
+    fn listing_in_with_input<S: AsRef<OsStr>>(
+        &self,
+        directory: &Path,
+        index: &Path,
+        arguments: &[S],
+        input: &[u8],
+    ) -> Result<Vec<u8>, WorkspaceError> {
         let word = shown_arguments(arguments);
         let mut child = self
             .command_in(directory, index)
             .args(arguments)
-            .args(["--pathspec-from-file=-", "--pathspec-file-nul"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| WorkspaceError::Unavailable(format!("run {word}: {error}")))?;
         let stdin = child.stdin.take();
-        let input = nul_terminated(specs);
         // Written beside the read: a long answer must not block the input.
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 use std::io::Write;
-                stdin.map(|mut stdin| stdin.write_all(&input))
+                stdin.map(|mut stdin| stdin.write_all(input))
             });
             report_listing(child.wait_with_output(), &word)
         })
@@ -395,27 +558,33 @@ impl GitWorkspace {
         self.root.join(".index").join(branch)
     }
 
-    /// Tree of the work tree in `directory`, built against `index`, and the
-    /// files over the size cap ([`max_file_bytes`]) left out of it, with
-    /// their sizes.
+    /// Tree of the work tree in `directory` for a checkpoint of `branch`
+    /// whose parent is `head`, built against `index`, and the files over
+    /// the size cap ([`max_file_bytes`]) left out of it, with their sizes.
     ///
     /// Build output and files over the cap leave the index after `add -A`,
     /// so a `.gitignore` inside the tree cannot re-include them; a file over
-    /// the cap is excluded before it is hashed.
+    /// the cap is excluded before it is hashed. The engine's runtime files
+    /// are never added, and the ones the project tracks are taken as any
+    /// tracked file is ([`Self::track_runtime_files`]).
     ///
-    /// A file over the cap that git already holds as a blob in one of
-    /// `kept_in` (`main`, a pending merge's `main`) stays a blob: it came
-    /// from the source (main may get one from outside Spawn), and leaving it
-    /// out of the tree would delete it from `main` when the branch lands.
+    /// A file over the cap that git already holds as a blob in `main` or a
+    /// pending merge's `main` ([`Self::source_commits`]) stays a blob: it
+    /// came from the source (main may get one from outside Spawn), and
+    /// leaving it out of the tree would delete it from `main` when the
+    /// branch lands.
     fn tree_of(
         &self,
         directory: &Path,
         index: &Path,
-        kept_in: &[String],
+        branch: &str,
+        head: &str,
     ) -> Result<(String, Vec<(TreePath, u64)>), WorkspaceError> {
         clear_dead_lock(index);
+        let pending_main = self.pending_merge(branch).map(|pending| pending.main);
+        let kept_in = self.source_commits(pending_main.as_deref());
         let (mut oversized, special) = self.left_out_files(directory, index)?;
-        let blobs = self.blobs_in(kept_in, &oversized)?;
+        let blobs = self.blobs_in(&kept_in, &oversized)?;
         oversized.retain(|(path, _)| !blobs.contains(path));
         // A special file (a FIFO, a socket, a device) is never committed:
         // `git add` refuses one at a tracked path, which would fail every
@@ -423,12 +592,13 @@ impl GitWorkspace {
         let mut left_out = oversized.clone();
         left_out.extend(special);
         self.stage_all_but(directory, index, &left_out)?;
+        self.track_runtime_files(directory, index, head, pending_main.as_deref())?;
         self.unstage(directory, index, &left_out)?;
         let tree = self.output_in(directory, index, &["write-tree"])?;
         // A file that grew past the cap between the size check and `add`
         // was hashed anyway; it is left out all the same.
         let mut grown = self.oversized_blobs(&tree)?;
-        let blobs = self.blobs_in(kept_in, &grown)?;
+        let blobs = self.blobs_in(&kept_in, &grown)?;
         grown.retain(|(path, _)| !blobs.contains(path));
         if grown.is_empty() {
             return Ok((tree, oversized));
@@ -441,9 +611,11 @@ impl GitWorkspace {
         Ok((tree, oversized))
     }
 
-    /// `git add -A` of the work tree in `directory` except `left_out`, which
-    /// is never hashed. The paths go to git on standard input, so any number
-    /// of them fits.
+    /// `git add -A` of the work tree in `directory` except `left_out` and
+    /// the engine's runtime files ([`ENGINE_RUNTIME_FILES`]), which are
+    /// never hashed: an exclude pathspec, so no ignore rule of the project
+    /// (a `.gitignore` that re-includes one) brings one in. The paths go to
+    /// git on standard input, so any number of them fits.
     fn stage_all_but(
         &self,
         directory: &Path,
@@ -456,8 +628,129 @@ impl GitWorkspace {
                 .iter()
                 .map(|(path, _)| path.pathspec("exclude,literal")),
         );
+        add.extend(runtime_pathspecs("exclude"));
         self.listing_in_with_pathspecs(directory, index, &["add", "-A"], &add)
             .map(|_| ())
+    }
+
+    /// Make the index's entries for the engine's runtime files
+    /// ([`ENGINE_RUNTIME_FILES`]) exactly the ones the project tracks, each
+    /// as the work tree in `directory` holds it now.
+    ///
+    /// A runtime file is tracked when the branch holds it and so does
+    /// `main`: the project's own, committed on purpose or by mistake. The
+    /// branch is `head` (the checkpoint's parent), and, while a merge of
+    /// `main` waits on its markers (`pending_main`), `head` with what that
+    /// `main` changed since the merge base: the merge wrote those changes
+    /// into the directory. A tracked one is committed like any tracked
+    /// file, git's rule for a tracked file an ignore rule names: the
+    /// engine's edits to it, and its deletion. Spawn never takes one out
+    /// of `main` (the owner removes it). One only the branch holds (a
+    /// checkpoint from before this rule committed it), or one `main` no
+    /// longer holds (the owner removed it), leaves the branch: either way
+    /// the landing changes nothing in `main` for it, and does not conflict
+    /// on it. One the branch does not hold never enters the index
+    /// ([`Self::stage_all_but`]).
+    ///
+    /// The kept index is only a stat cache (a fresh one after a failure,
+    /// one that saw no merge of main, one written before this rule), so
+    /// its runtime entries are first reset from `head`, never trusted.
+    /// When neither `head` nor the index holds a runtime file and no merge
+    /// waits (nearly every checkpoint), one listing says so and nothing
+    /// else runs.
+    fn track_runtime_files(
+        &self,
+        directory: &Path,
+        index: &Path,
+        head: &str,
+        pending_main: Option<&str>,
+    ) -> Result<(), WorkspaceError> {
+        let specs = runtime_pathspecs("");
+        if pending_main.is_none() {
+            // `--with-tree`: the index's entries and `head`'s together.
+            let mut probe: Vec<OsString> =
+                ["ls-files", "-z", "--cached"].map(OsString::from).into();
+            probe.push(OsString::from(format!("--with-tree={head}")));
+            probe.push(OsString::from("--"));
+            probe.extend(specs.iter().cloned());
+            if self.listing_in(directory, index, &probe)?.is_empty() {
+                return Ok(());
+            }
+        }
+        let mut reset: Vec<OsString> = ["reset", "-q", "--no-refresh", head, "--"]
+            .map(OsString::from)
+            .into();
+        reset.extend(specs.iter().cloned());
+        self.listing_in(directory, index, &reset)?;
+        if let Some(main) = pending_main
+            && let Ok(base) = self.git_output(&["merge-base", head, main])
+        {
+            let mut changed: Vec<OsString> = [
+                "diff-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "--no-renames",
+                base.as_str(),
+                main,
+                "--",
+            ]
+            .map(OsString::from)
+            .into();
+            changed.extend(specs.iter().cloned());
+            let changed = listed_paths(&self.git_listing(&changed)?);
+            if !changed.is_empty() {
+                let literal: Vec<OsString> = changed
+                    .iter()
+                    .map(|path| path.pathspec("literal"))
+                    .collect();
+                self.listing_in_with_pathspecs(
+                    directory,
+                    index,
+                    &["reset", "-q", "--no-refresh", main],
+                    &literal,
+                )?;
+            }
+        }
+        let mut listing: Vec<OsString> = ["ls-files", "-z", "--cached", "--"]
+            .map(OsString::from)
+            .into();
+        listing.extend(specs);
+        let entries: Vec<(TreePath, u64)> =
+            listed_paths(&self.listing_in(directory, index, &listing)?)
+                .into_iter()
+                .map(|path| (path, 0))
+                .collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let in_main = match self.commit_id_of(&format!("refs/heads/{BASE}")) {
+            Ok(main) => self.blobs_in(&[main], &entries)?,
+            Err(_) => entries.iter().map(|(path, _)| path.clone()).collect(),
+        };
+        // git adds nothing beyond a symbolic link and refuses a directory or
+        // a special file: what is not a file there now is gone from the
+        // index, as `add -A` would have it.
+        let (present, gone): (Vec<TreePath>, Vec<TreePath>) = entries
+            .into_iter()
+            .map(|(path, _)| path)
+            .partition(|path| in_main.contains(path) && is_file_in(directory, path));
+        for (flag, paths) in [("--add", present), ("--force-remove", gone)] {
+            if paths.is_empty() {
+                continue;
+            }
+            let names: Vec<OsString> = paths
+                .iter()
+                .map(|path| path.as_path().as_os_str().to_os_string())
+                .collect();
+            self.listing_in_with_input(
+                directory,
+                index,
+                &["update-index", flag, "-z", "--stdin"],
+                &nul_terminated(&names),
+            )?;
+        }
+        Ok(())
     }
 
     /// Take build output and `paths` out of the index. Paths go to git as
@@ -518,17 +811,17 @@ impl GitWorkspace {
         Ok(found)
     }
 
-    /// The commits whose blobs over the cap a checkpoint of `branch` keeps
-    /// as blobs ([`Self::tree_of`]): `main`, and the `main` of a pending
-    /// merge. Not the branch head: a file the agent committed under the cap
-    /// and grew past it is left out like any other.
-    fn source_commits(&self, branch: &str) -> Vec<String> {
+    /// The commits whose blobs over the cap a checkpoint keeps as blobs
+    /// ([`Self::tree_of`]): `main`, and `pending_main`, the `main` of the
+    /// branch's pending merge. Not the branch head: a file the agent
+    /// committed under the cap and grew past it is left out like any other.
+    fn source_commits(&self, pending_main: Option<&str>) -> Vec<String> {
         let mut commits = Vec::new();
         if let Ok(main) = self.commit_id_of(&format!("refs/heads/{BASE}")) {
             commits.push(main);
         }
-        if let Some(pending) = self.pending_merge(branch) {
-            commits.push(pending.main);
+        if let Some(pending_main) = pending_main {
+            commits.push(pending_main.to_string());
         }
         commits.sort();
         commits.dedup();
@@ -550,23 +843,25 @@ impl GitWorkspace {
             .collect())
     }
 
-    /// Paths git would commit (tracked or untracked, ignore rules applied)
-    /// that a checkpoint leaves out: the files over the size cap, with their
-    /// sizes; then the paths that hold something other than a regular file,
-    /// a symlink or a directory (a FIFO, a socket, a device), which git
-    /// cannot add.
+    /// Paths git would commit (tracked or untracked, ignore rules applied,
+    /// the engine's runtime files aside) that a checkpoint leaves out: the
+    /// files over the size cap, with their sizes; then the paths that hold
+    /// something other than a regular file, a symlink or a directory (a
+    /// FIFO, a socket, a device), which git cannot add.
     fn left_out_files(&self, directory: &Path, index: &Path) -> Result<LeftOut, WorkspaceError> {
-        let listed = self.listing_in(
-            directory,
-            index,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-        )?;
+        let mut arguments: Vec<OsString> = [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+        ]
+        .map(OsString::from)
+        .into();
+        arguments.extend(runtime_pathspecs("exclude"));
+        let listed = self.listing_in(directory, index, &arguments)?;
         let mut oversized = Vec::new();
         let mut special = Vec::new();
         for path in listed_paths(&listed) {
@@ -902,6 +1197,20 @@ impl WorkspaceStore for GitWorkspace {
         }))
     }
 
+    /// An id under the resolved root is this store's own; one recorded
+    /// under another spelling of it names the same directory there.
+    fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
+        let directory = Path::new(workspace.path());
+        if directory.starts_with(&self.root) {
+            return workspace.clone();
+        }
+        crate::root::legacy_workspace(&self.root, workspace.sandbox(), directory)
+            .and_then(|directory| {
+                WorkspaceId::new(format!("{}:{}", workspace.sandbox(), directory.display())).ok()
+            })
+            .unwrap_or_else(|| workspace.clone())
+    }
+
     /// Export the branch head as the workspace. The whole new tree is built
     /// beside the workspace first ([`GitWorkspace::stage_mount`]): a mount
     /// that fails (no commit, a head that names files outside git) leaves the
@@ -934,6 +1243,9 @@ impl WorkspaceStore for GitWorkspace {
         }
         // A fresh export is the branch head: nothing stale is left.
         self.clear_stale(branch.as_str());
+        // `.spawn/` is never committed: main's copies for an open conflict
+        // markers cannot show come back from their record.
+        self.restore_main_copies(branch.as_str(), &directory);
 
         WorkspaceId::new(format!("{branch}:{}", directory.display()))
             .map_err(|error| WorkspaceError::Unavailable(error.to_string()))
@@ -963,7 +1275,7 @@ impl WorkspaceStore for GitWorkspace {
         }
         let reference = format!("refs/heads/{branch}");
         let parent = self.git_output(&["rev-parse", &reference])?;
-        let tree = self.tree_of(&directory, &index, &self.source_commits(&branch));
+        let tree = self.tree_of(&directory, &index, &branch, &parent);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
@@ -1019,7 +1331,22 @@ impl WorkspaceStore for GitWorkspace {
     }
 
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
-        self.merge_main(workspace)
+        self.merge_main(workspace, &|| Ok(()))
+    }
+
+    fn merge_base_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BaseMerge, WorkspaceError> {
+        self.merge_main(workspace, ready)
+    }
+
+    /// The branch's lock, which every merge into the workspace takes.
+    fn hold(&self, workspace: &WorkspaceId) -> Option<Hold> {
+        self.lock_branch(workspace.sandbox())
+            .ok()
+            .map(|lock| Box::new(lock) as Hold)
     }
 
     fn merge_main_clean(&self, branch: &BranchName) -> Result<BaseMerge, WorkspaceError> {
@@ -1127,8 +1454,19 @@ impl GitWorkspace {
     /// the second parent of the checkpoint that has them resolved (the way
     /// `git merge` leaves `MERGE_HEAD`). Until then no newer `main` is merged:
     /// markers never stack. A conflict markers cannot show (modify/delete,
-    /// renames, binary files) changes nothing.
-    fn merge_main(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+    /// renames, binary files) changes nothing but main's version of each
+    /// such file, copied to [`MAIN_COPIES`] and recorded beside the
+    /// workspace so every mount puts the copies back
+    /// ([`Self::restore_main_copies`]).
+    ///
+    /// Nothing is written unless `ready` agrees, asked under the lock right
+    /// before the first write ([`WorkspaceStore::merge_base_when`]); a
+    /// refusal is [`MERGE_WAITS`] with its reason, and changes nothing.
+    fn merge_main(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BaseMerge, WorkspaceError> {
         let branch = workspace.sandbox().to_string();
         let directory = self.checked_path(workspace)?;
         // The integrator commits this workspace too: no checkpoint reads the
@@ -1149,6 +1487,7 @@ impl GitWorkspace {
         let head = self.commit_id_of(&reference)?;
         let main = self.commit_id_of(&format!("refs/heads/{BASE}"))?;
         if self.is_ancestor(&main, &head)? {
+            self.clear_main_copies(&branch);
             return Ok(BaseMerge::Current);
         }
         // No shared history (a default repository reseeded under an older
@@ -1174,6 +1513,14 @@ impl GitWorkspace {
             .map_err(|error| WorkspaceError::Unavailable(format!("run {}: {error}", self.git)))?;
         let (merged, files, kinds) = merge_tree_output(&output.stdout);
         let head_tree = self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])?;
+        // The last moment before anything is written: an agent that is not
+        // idle keeps its workspace as it is, and the merge waits.
+        if matches!(output.status.code(), Some(0 | 1)) {
+            ready().map_err(|why| WorkspaceError::Refused {
+                code: MERGE_WAITS.to_string(),
+                message: why,
+            })?;
+        }
         match output.status.code() {
             Some(0) => {}
             Some(1) => {
@@ -1189,6 +1536,9 @@ impl GitWorkspace {
                         let _ = self.update_directory(&branch, &directory, &merged, &head_tree);
                         return Err(error);
                     }
+                    self.clear_main_copies(&branch);
+                } else {
+                    self.copy_mains_versions(&branch, &directory, &main, &files)?;
                 }
                 return Ok(BaseMerge::Conflicted {
                     files: shown_paths(&files),
@@ -1220,6 +1570,7 @@ impl GitWorkspace {
         if let Err(error) = self.git_output(&["update-ref", &reference, &commit, &head]) {
             return Err(self.follow_moved_branch(&branch, &directory, &merged, &error));
         }
+        self.clear_main_copies(&branch);
         Ok(BaseMerge::Merged {
             commit: CommitId::new(commit)
                 .map_err(|error| WorkspaceError::Unavailable(error.to_string()))?,
@@ -1269,7 +1620,7 @@ impl GitWorkspace {
                 })?;
             }
             let _ = std::fs::remove_file(&index);
-            let tree = self.tree_of(&directory, &index, &self.source_commits(branch));
+            let tree = self.tree_of(&directory, &index, branch, &head);
             let _ = std::fs::remove_file(&index);
             let (tree, _) = tree?;
             if tree != self.git_output(&["rev-parse", &format!("{head}^{{tree}}")])? {
@@ -1488,7 +1839,7 @@ impl GitWorkspace {
         let head = self.commit_id_of(&format!("refs/heads/{branch}"))?;
         let reference = stale_ref(branch);
         let previous = self.commit_id_of(&reference).ok();
-        let tree = self.tree_of(directory, &index, &self.source_commits(branch));
+        let tree = self.tree_of(directory, &index, branch, &head);
         if tree.is_err() {
             let _ = std::fs::remove_file(&index);
         }
@@ -1697,6 +2048,124 @@ impl GitWorkspace {
         let _ = std::fs::remove_file(self.pending_path(branch));
     }
 
+    /// Where the record of main's copies for `branch` lives, beside the
+    /// workspaces and outside every one, so no remount wipes it:
+    /// NUL-separated, [`COPIES_TAG`], `main`'s commit, then the files
+    /// copied.
+    fn copies_path(&self, branch: &str) -> PathBuf {
+        self.root.join(".main-copies").join(branch)
+    }
+
+    /// The open conflict markers cannot show of `branch`, as recorded when
+    /// main's versions were copied ([`MAIN_COPIES`]): main's commit and the
+    /// files copied (those main has), shown. `None`: none is recorded.
+    pub fn main_copies(&self, branch: &str) -> Option<(String, Vec<String>)> {
+        self.read_main_copies(branch)
+            .map(|(main, files)| (main, shown_paths(&files)))
+    }
+
+    fn read_main_copies(&self, branch: &str) -> Option<(String, Vec<TreePath>)> {
+        let bytes = std::fs::read(self.copies_path(branch)).ok()?;
+        let mut fields = nul_fields(&bytes);
+        if fields.next()? != COPIES_TAG.as_bytes() {
+            return None;
+        }
+        let main = fields.next()?;
+        if main.is_empty() || !main.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        Some((
+            String::from_utf8_lossy(main).into_owned(),
+            fields.map(TreePath::from_bytes).collect(),
+        ))
+    }
+
+    fn clear_main_copies(&self, branch: &str) {
+        let _ = std::fs::remove_file(self.copies_path(branch));
+    }
+
+    /// Main's version of `path` at `main`, if main has it as a file.
+    fn mains_version(&self, main: &str, path: &TreePath) -> Option<Vec<u8>> {
+        let mut spec = OsString::from(format!("{main}:"));
+        spec.push(OsStr::from_bytes(path.as_bytes()));
+        let output = self
+            .command()
+            .arg("cat-file")
+            .arg("blob")
+            .arg(spec)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
+    }
+
+    /// Write main's version of each of `files` that main has into
+    /// [`MAIN_COPIES`] in `directory`, then record what was copied, atomically,
+    /// so a mount can put the copies back ([`Self::restore_main_copies`]).
+    /// A record that cannot be written fails the merge: the note would
+    /// promise copies a remount loses.
+    fn copy_mains_versions(
+        &self,
+        branch: &str,
+        directory: &Path,
+        main: &str,
+        files: &[TreePath],
+    ) -> Result<(), WorkspaceError> {
+        let copied: Vec<&TreePath> = files
+            .iter()
+            .filter(|file| self.copy_mains_version(directory, main, file))
+            .collect();
+        let path = self.copies_path(branch);
+        let unavailable = |what: &str, error: std::io::Error| {
+            WorkspaceError::Unavailable(format!("{what} {}: {error}", path.display()))
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| unavailable("create", error))?;
+        }
+        let mut text = format!("{COPIES_TAG}\0{main}\0").into_bytes();
+        for file in copied {
+            text.extend_from_slice(file.as_bytes());
+            text.push(0);
+        }
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, text).map_err(|error| unavailable("write", error))?;
+        std::fs::rename(&temporary, &path).map_err(|error| unavailable("rename", error))
+    }
+
+    /// Copy main's version of `file` at `main` into [`MAIN_COPIES`] in
+    /// `directory` (never through a symlink the agent put there); whether it
+    /// was copied.
+    fn copy_mains_version(&self, directory: &Path, main: &str, file: &TreePath) -> bool {
+        let Some(bytes) = self.mains_version(main, file) else {
+            return false;
+        };
+        let mut copy = format!("{MAIN_COPIES}/").into_bytes();
+        copy.extend_from_slice(file.as_bytes());
+        crate::agent_files::replace_with(directory, &TreePath::from_bytes(copy), &bytes).is_ok()
+    }
+
+    /// At a mount: put main's copies of the branch's open conflict markers
+    /// cannot show back into the fresh `directory`, from their record, so
+    /// the note that names them still holds after the workspace was
+    /// exported again (an engine lost, a host restart, a resume). A branch
+    /// that contains the recorded main has no such conflict any more: the
+    /// record goes.
+    fn restore_main_copies(&self, branch: &str, directory: &Path) {
+        let Some((main, files)) = self.read_main_copies(branch) else {
+            return;
+        };
+        let contained = self
+            .commit_id_of(&format!("refs/heads/{branch}"))
+            .and_then(|head| self.is_ancestor(&main, &head));
+        if matches!(contained, Ok(true)) {
+            self.clear_main_copies(branch);
+            return;
+        }
+        for file in &files {
+            self.copy_mains_version(directory, &main, file);
+        }
+    }
+
     /// When a workspace's directory goes (unmount) or is exported afresh
     /// (mount): keep the pending merge only when the branch carries it. That
     /// is when a checkpoint was taken since the merge was written (the
@@ -1897,6 +2366,24 @@ fn unresolved(directory: &Path, files: &[(TreePath, usize)]) -> bool {
 /// ([`GitWorkspace::left_out_files`]).
 type LeftOut = (Vec<(TreePath, u64)>, Vec<(TreePath, u64)>);
 
+/// Whether `path` is a regular file or a symlink in `directory`, reached
+/// through directories only: git adds nothing beyond a symbolic link.
+fn is_file_in(directory: &Path, path: &TreePath) -> bool {
+    for prefix in path.prefixes() {
+        let Ok(metadata) = std::fs::symlink_metadata(directory.join(prefix.as_path())) else {
+            return false;
+        };
+        let kind = metadata.file_type();
+        if prefix == *path {
+            return kind.is_file() || kind.is_symlink();
+        }
+        if !kind.is_dir() {
+            return false;
+        }
+    }
+    false
+}
+
 /// Remove git's own lock beside `index` (`<index>.lock`), left by a git
 /// that died mid-command (killed, out of memory, a SIGBUS on a file the
 /// agent truncated while git mapped it): while it is there every git on
@@ -1978,7 +2465,7 @@ mod tests {
     use super::GitWorkspace;
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = super::test_git_command()
             .arg("-C")
             .arg(directory)
             .args([
@@ -2037,7 +2524,7 @@ mod tests {
         assert_eq!(held, expected);
 
         let staged = |index: &Path| {
-            let listed = Command::new("git")
+            let listed = super::test_git_command()
                 .arg("-C")
                 .arg(&checkout)
                 .arg("ls-files")
@@ -2058,7 +2545,7 @@ mod tests {
         );
         // An index that holds two of them loses both.
         let full = base.join("full-index");
-        let added = Command::new("git")
+        let added = super::test_git_command()
             .arg("-C")
             .arg(&checkout)
             .args(["add", "-A"])
@@ -2106,7 +2593,7 @@ mod tests {
     fn other_writers_commit(checkout: &Path) -> String {
         let index = checkout.join(".git").join("other-writer-index");
         let with_index = |arguments: &[&str]| {
-            let output = Command::new("git")
+            let output = super::test_git_command()
                 .arg("-C")
                 .arg(checkout)
                 .args(arguments)
@@ -2599,5 +3086,247 @@ mod tests {
         let tree = |commit: &str| git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]);
         assert_eq!(tree("agent_a"), tree(&start));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every git this store runs, and every git built on [`super::git_command`]
+    /// (the controller's), is in the C locale whatever the host's; this
+    /// module starts no other git.
+    #[test]
+    fn every_git_runs_in_the_c_locale() {
+        use std::ffi::OsStr;
+        let store = GitWorkspace::new("/nonexistent.git", std::env::temp_dir());
+        for command in [
+            super::git_command("git"),
+            super::test_git_command(),
+            store.command(),
+            store.command_in(Path::new("/work"), Path::new("/index")),
+        ] {
+            let envs: Vec<_> = command.get_envs().collect();
+            assert!(
+                envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))),
+                "{envs:?}"
+            );
+            assert!(envs.contains(&(OsStr::new("LANGUAGE"), None)), "{envs:?}");
+        }
+        let own = include_str!("git.rs");
+        let code = own.split("#[cfg(test)]\nmod tests").next().unwrap_or(own);
+        assert_eq!(
+            code.matches("Command::new(").count(),
+            2,
+            "git_command's, and tar's"
+        );
+        assert_eq!(code.matches("Command::new(\"tar\")").count(), 1);
+    }
+
+    /// Every git a test of this crate runs for itself is built by
+    /// [`super::test_git_command`], which no setting of the host's reaches:
+    /// no file of the crate, its tests included, starts git another way.
+    #[test]
+    fn every_test_git_is_built_by_test_git_command() {
+        use std::ffi::OsStr;
+        fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let command = super::test_git_command();
+        let envs: Vec<_> = command.get_envs().collect();
+        for expected in [
+            (
+                OsStr::new("GIT_CONFIG_GLOBAL"),
+                Some(OsStr::new("/dev/null")),
+            ),
+            (OsStr::new("GIT_CONFIG_NOSYSTEM"), Some(OsStr::new("1"))),
+            (OsStr::new("GIT_CONFIG_COUNT"), None),
+            (OsStr::new("GIT_CONFIG_PARAMETERS"), None),
+        ] {
+            assert!(envs.contains(&expected), "{expected:?} in {envs:?}");
+        }
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&crate_root.join("src"), &mut files);
+        sources(&crate_root.join("tests"), &mut files);
+        assert!(
+            files.iter().any(|file| file.ends_with("tests/branches.rs")),
+            "{files:?}"
+        );
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read a source");
+            assert!(
+                !text.contains("Command::new(\"git\")"),
+                "{} starts git without test_git_command",
+                file.display()
+            );
+            if file.starts_with(crate_root.join("tests")) {
+                assert!(
+                    !text
+                        .replace("test_git_command(", "")
+                        .contains("git_command("),
+                    "{} runs a test's git with the host's configuration",
+                    file.display()
+                );
+            }
+        }
+    }
+
+    /// A host whose `~/.gitconfig` signs every commit with a key that is
+    /// not there, runs a hook that refuses every commit and guesses no
+    /// identity: git with that configuration cannot commit, and a test's
+    /// own git ([`super::test_git_command`]) commits as if it were not.
+    #[test]
+    fn a_tests_git_ignores_the_hosts_git_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("spawn-git-hostile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let hooks = base.join("hooks");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&hooks).expect("hooks");
+        let refusing = hooks.join("pre-commit");
+        std::fs::write(&refusing, "#!/bin/sh\nexit 1\n").expect("hook");
+        std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!(
+                "[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n[gpg]\n\tformat = ssh\n\
+                 [user]\n\tsigningkey = {}\n\tuseConfigOnly = true\n[core]\n\thooksPath = {}\n",
+                base.join("no-such-key.pub").display(),
+                hooks.display()
+            ),
+        )
+        .expect("write the hostile configuration");
+        let repo = base.join("repo").to_string_lossy().to_string();
+        let commit = |mut command: Command| {
+            command
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &home)
+                .args(["-C", &repo, "commit", "--allow-empty", "-qm", "work"])
+                .output()
+                .expect("git runs")
+        };
+        let init = super::test_git_command()
+            .args(["init", "-q", &repo])
+            .status()
+            .expect("git runs");
+        assert!(init.success());
+
+        let mut hosts = super::git_command("git");
+        hosts
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .stdin(std::process::Stdio::null());
+        let refused = commit(hosts);
+        assert!(
+            !refused.status.success(),
+            "the hostile configuration counts for a git with the host's: {refused:?}"
+        );
+        let committed = commit(super::test_git_command());
+        assert!(committed.status.success(), "{committed:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Marks a line of [`merge_decisions_in_this_locale`]'s output.
+    const DECISION: &str = "spawn-decision: ";
+
+    /// What this store makes of git in this process's locale, one line
+    /// each: a merge of `main` whose only conflict is in a file's lines
+    /// (markers written), one whose conflict markers cannot show
+    /// (modify/delete), and a git that fails. Run by
+    /// [`a_translated_locale_changes_no_merge_decision`] in one process per
+    /// locale; alone it only prints.
+    #[test]
+    #[ignore = "run by a_translated_locale_changes_no_merge_decision"]
+    fn merge_decisions_in_this_locale() {
+        let base = std::env::temp_dir().join(format!("spawn-git-locale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let checkout = base.join("repo");
+        std::fs::create_dir_all(&checkout).expect("create the repository");
+        git(&checkout, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(checkout.join("README.md"), "base\n").expect("write");
+        std::fs::write(checkout.join("gone.txt"), "kept\n").expect("write");
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-qm", "base"]);
+        let store = GitWorkspace::new(checkout.join(".git"), base.join("work"));
+        let worked = |agent: &str, file: &str| {
+            let branch = BranchName::new(agent).expect("valid branch");
+            store.ensure_branch(&branch, None).expect("branch");
+            let workspace = store.mount(&branch).expect("mount");
+            std::fs::write(Path::new(workspace.path()).join(file), "mine\n").expect("write");
+            assert!(matches!(
+                store.commit(&workspace, "work").expect("commit"),
+                Commit::Created(_)
+            ));
+            workspace
+        };
+        let lines = worked("agent_a", "README.md");
+        let deleted = worked("agent_b", "gone.txt");
+        std::fs::write(checkout.join("README.md"), "theirs\n").expect("write on main");
+        git(&checkout, &["rm", "-q", "gone.txt"]);
+        git(&checkout, &["commit", "-qam", "landed"]);
+
+        let merged = store.merge_base(&lines);
+        assert!(
+            matches!(&merged, Ok(BaseMerge::Conflicted { marked: true, .. })),
+            "{merged:?}"
+        );
+        println!("{DECISION}{merged:?}");
+        let merged = store.merge_base(&deleted);
+        assert!(
+            matches!(&merged, Ok(BaseMerge::Conflicted { marked: false, .. })),
+            "{merged:?}"
+        );
+        println!("{DECISION}{merged:?}");
+        let failed = store.git_output(&["rev-parse", "--verify", "refs/heads/none"]);
+        assert!(failed.is_err(), "{failed:?}");
+        println!("{DECISION}{failed:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A merge of `main` comes to the same decision, the error a failed git
+    /// quotes included, in a process whose whole environment is Chinese
+    /// (`LC_ALL`, `LANG`, `LC_MESSAGES`, `LANGUAGE`) as in C: every git of
+    /// this store runs in the C locale ([`super::git_command`]). Without
+    /// it, the quoted error was git's Chinese. On a host without zh_CN or
+    /// git's Chinese messages nothing is translated, and the comparison
+    /// holds anyway.
+    #[test]
+    fn a_translated_locale_changes_no_merge_decision() {
+        let program = std::env::current_exe().expect("the test binary");
+        let run = |locale: &str, language: Option<&str>| {
+            let mut command = Command::new(&program);
+            command
+                .args([
+                    "--exact",
+                    "git::tests::merge_decisions_in_this_locale",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("LC_ALL", locale)
+                .env("LANG", locale)
+                .env("LC_MESSAGES", locale);
+            match language {
+                Some(language) => command.env("LANGUAGE", language),
+                None => command.env_remove("LANGUAGE"),
+            };
+            let output = command.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{locale}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix(DECISION))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let english = run("C", None);
+        assert_eq!(english.len(), 3, "{english:?}");
+        assert_eq!(run("zh_CN.UTF-8", Some("zh_CN:zh")), english);
     }
 }

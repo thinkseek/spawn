@@ -86,8 +86,7 @@ function text(value: unknown): string | null {
 
 /** The node an event comes from: the agent that did it, or the control
  * place that recorded it (the dispatcher hands tasks out, the integrator
- * gates and lands them and applies the owner's landings, anything else is
- * the supervisor's decision). */
+ * gates and lands them, anything else is the supervisor's decision). */
 export function emitter(event: LogEvent): NodeKey {
   const record = controlRecord(event);
   if (event.source !== "control" && record === null) return agentNode(event.agent_id);
@@ -97,9 +96,7 @@ export function emitter(event: LogEvent): NodeKey {
     type === "task.gated" ||
     type === "task.landed" ||
     type === "task.aborted" ||
-    type === "mission.halted" ||
-    type === "source.push_refused" ||
-    (type === "source.moved" && record?.request !== undefined)
+    type === "mission.halted"
   ) {
     return "integrator";
   }
@@ -331,7 +328,8 @@ export function landedToday(events: readonly LogEvent[], nowMs: number): number 
 }
 
 /** Verdicts that judge the work. `stale` (main moved on), `aborted` (the
- * gate itself did not finish), `no_room` (TMPDIR had no room to start) and
+ * gate itself did not finish), `no_room` (no room to judge: disk, memory or
+ * the test database, measured before the gate or by its own floor) and
  * `host_fault` (the host failed it: the test database) say nothing about
  * the candidate. */
 const JUDGING = new Set(["accepted", "rejected", "conflict", "incompatible"]);

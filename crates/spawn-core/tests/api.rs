@@ -91,6 +91,7 @@ fn events_round_trip_through_json() {
         EventKind::ExecutionEnded {
             cause: EndCause::Exited,
             exit_code: Some(0),
+            evidence: None,
         },
     ];
     for kind in kinds {
@@ -307,6 +308,7 @@ fn submit_start(store: &MemoryStore, prompt: &str) -> CommandId {
                     parent_session_id: None,
                     from: None,
                     model: None,
+                    charter: None,
                 },
             },
         )
@@ -380,6 +382,7 @@ fn bridge_lifecycle_survives_a_refold_per_tick() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     );
     tick_fresh(&store);
@@ -442,6 +445,7 @@ fn a_second_bridge_that_missed_the_start_is_refused_by_the_log() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     );
     let mut other = Bridge::new(
@@ -648,7 +652,9 @@ fn the_bridge_follows_the_transcript_the_screen_and_the_exit_without_hooks() {
         .expect("read")
         .into_iter()
         .find_map(|record| match record.event.kind {
-            EventKind::ExecutionEnded { cause, exit_code } => Some((cause, exit_code)),
+            EventKind::ExecutionEnded {
+                cause, exit_code, ..
+            } => Some((cause, exit_code)),
             _ => None,
         });
     assert_eq!(ended, Some((EndCause::Exited, Some(3))));
@@ -899,7 +905,9 @@ fn an_engine_that_exits_between_the_two_reads_is_exited_not_lost() {
         .expect("read")
         .into_iter()
         .find_map(|record| match record.event.kind {
-            EventKind::ExecutionEnded { cause, exit_code } => Some((cause, exit_code)),
+            EventKind::ExecutionEnded {
+                cause, exit_code, ..
+            } => Some((cause, exit_code)),
             _ => None,
         });
     assert_eq!(ended, Some((EndCause::Exited, Some(0))));
@@ -1204,6 +1212,7 @@ fn lease_ttl_expires_and_takes_the_command_again() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     };
     let id = store

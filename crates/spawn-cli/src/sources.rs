@@ -16,12 +16,18 @@
 //! Every checkpoint's branch is published, in the background
 //! ([`crate::push`]), to the source's `spawn/<agent>` when the source is a
 //! directory on this host ([`receives_branches`]); the integrator lands what
-//! was published there, never a mounted workspace. The pusher's queue is in
-//! memory: a process that ends cleanly pushes what waits ([`Drop`]), and a
+//! was published there, never a mounted workspace. Every store of a process
+//! pushes through the process's one pusher per source
+//! ([`crate::push::shared`]). Its queue is in memory: a process that ends
+//! cleanly pushes what waits ([`Drop`] of the store the Bridge runs on), a
 //! new one queues again the branch of every agent with an open task
-//! ([`MissionWorkspaces::republish`]), so a push lost with a killed process
-//! is made after the restart. A branch lives on this host: nothing is taken
-//! from the source but `main`.
+//! ([`MissionWorkspaces::republish`]), and the integrator pushes again a
+//! branch whose recorded checkpoint the source still lacks
+//! ([`push_recorded`]), so a push lost with a killed process is made after
+//! the restart. A one-shot store (a merge of main, a set-aside;
+//! [`MissionWorkspaces::one_shot`]) publishes what it changed itself
+//! ([`publish`]) and leaves the rest of the queue alone. A branch lives on
+//! this host: nothing is taken from the source but `main`.
 //!
 //! A source is git run as the owner, so it is checked before git sees it
 //! ([`MissionSource`]: an absolute path, `https://` or `ssh://`), and every
@@ -36,11 +42,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spawn_core::id::{BranchName, CommitId, WorkspaceId};
-use spawn_core::port::{BaseMerge, Branch, Commit, SetAside, WorkspaceError, WorkspaceStore};
+use spawn_core::port::{BaseMerge, Branch, Commit, Hold, SetAside, WorkspaceError, WorkspaceStore};
 use spawn_host::GitWorkspace;
 use spawn_postgres::PostgresStore;
 
-use crate::push::{Pusher, pushed_ref};
+use crate::push::{Pushed, Pusher, pushed_ref};
 
 /// Least time between two refreshes of one mirror's `main` at turn ends.
 pub(crate) const REFRESH_EVERY: Duration = Duration::from_secs(30);
@@ -57,7 +63,9 @@ pub(crate) struct MissionWorkspaces {
     mirrors: Mutex<HashMap<String, Routed>>,
     /// When each mirror's `main` was last fetched.
     refreshed: Mutex<HashMap<PathBuf, Instant>>,
-    pusher: Pusher,
+    /// A store for one change ([`Self::one_shot`]): it queues no push and
+    /// flushes nothing when dropped; its caller publishes what it changed.
+    one_shot: bool,
 }
 
 /// One agent's store and, for a mission with a source, where its mirror
@@ -77,12 +85,14 @@ fn unavailable(text: String) -> WorkspaceError {
 /// git itself, before any helper runs.
 pub(crate) const ALLOWED_PROTOCOLS: &str = "file:https:ssh";
 
-/// `git`, as every controller-side call runs it: only
-/// [`ALLOWED_PROTOCOLS`], whatever the installed git defaults to or the
-/// host's configuration allows (`GIT_ALLOW_PROTOCOL` overrides
-/// `protocol.*.allow`), and no standard input.
+/// `git`, as every controller-side call runs it: in the C locale
+/// ([`spawn_host::git_command`]), so what it answers reads the same on a
+/// host whose locale is translated; only [`ALLOWED_PROTOCOLS`], whatever
+/// the installed git defaults to or the host's configuration allows
+/// (`GIT_ALLOW_PROTOCOL` overrides `protocol.*.allow`); and no standard
+/// input.
 pub(crate) fn controller_git() -> Command {
-    let mut command = Command::new("git");
+    let mut command = spawn_host::git_command("git");
     command
         .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
         .env("GIT_PROTOCOL_FROM_USER", "0")
@@ -166,6 +176,26 @@ pub(crate) fn git(arguments: &[&str]) -> Result<String, WorkspaceError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// [`git`] as a test runs its own (a seed's `init`, `add` and `commit`, a
+/// look at a ref): [`spawn_host::test_git_command`], which no setting of
+/// the host's git configuration reaches, so a host that signs every commit
+/// cannot hang a test. What Spawn itself runs stays on [`git`].
+#[cfg(test)]
+pub(crate) fn test_git(arguments: &[&str]) -> Result<String, WorkspaceError> {
+    let output = spawn_host::test_git_command()
+        .args(arguments)
+        .output()
+        .map_err(|error| unavailable(format!("run git: {error}")))?;
+    if !output.status.success() {
+        return Err(unavailable(format!(
+            "git {}: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// FNV-1a: a stable short hash for names and keys.
 pub(crate) fn fnv(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -209,14 +239,31 @@ impl MissionWorkspaces {
             factory,
             mirrors: Mutex::new(HashMap::new()),
             refreshed: Mutex::new(HashMap::new()),
-            pusher: Pusher::new(),
+            one_shot: false,
         }
     }
 
-    /// Queue a push of an agent's branch, to a source that receives them.
+    /// A store for one change inside a process that goes on (a merge of
+    /// main, a set-aside): it queues no push of its own, so nothing is
+    /// published before its caller recorded the change; the caller then
+    /// publishes it ([`publish`], through the process's pusher for the
+    /// source), and dropping the store pushes nothing.
+    pub(crate) fn one_shot(
+        default: GitWorkspace,
+        root: &Path,
+        store: Arc<PostgresStore>,
+        factory: Factory,
+    ) -> Self {
+        let mut one_shot = Self::new(default, root, store, factory);
+        one_shot.one_shot = true;
+        one_shot
+    }
+
+    /// Queue a push of an agent's branch, to a source that receives them
+    /// (a one-shot store's caller publishes instead).
     fn mark(&self, mirror: &Path, source: &str, agent: &str) {
-        if receives_branches(source) {
-            self.pusher.mark(mirror, source, agent);
+        if !self.one_shot && receives_branches(source) {
+            crate::push::shared(source).mark(mirror, source, agent);
         }
     }
 
@@ -230,7 +277,7 @@ impl MissionWorkspaces {
             .store
             .publishing_agents()
             .map_err(|error| format!("agents to publish: {error}"))?;
-        Ok(republish(&self.pusher, &self.root, &agents))
+        Ok(republish(&self.root, &agents, crate::push::shared))
     }
 
     /// Fetch a mirror's `main` from its source, unless that happened less
@@ -335,10 +382,14 @@ pub(crate) fn ensure_mirror(root: &Path, source: Option<&str>) -> Result<PathBuf
 }
 
 /// Queue a push of each `(agent, source)` branch that this host's mirror
-/// of a source receiving branches holds. A branch the source already has
-/// is pushed as a no-op; one it lacks, or has behind, is published. Returns
-/// how many were queued.
-fn republish(pusher: &Pusher, root: &Path, agents: &[(String, Option<String>)]) -> usize {
+/// of a source receiving branches holds, on `pusher_of(source)`. A branch
+/// the source already has is pushed as a no-op; one it lacks, or has
+/// behind, is published. Returns how many were queued.
+fn republish(
+    root: &Path,
+    agents: &[(String, Option<String>)],
+    pusher_of: impl Fn(&str) -> Arc<Pusher>,
+) -> usize {
     let mut queued = 0;
     for (agent, source) in agents {
         let Some(source) = source.as_deref().filter(|source| receives_branches(source)) else {
@@ -346,11 +397,51 @@ fn republish(pusher: &Pusher, root: &Path, agents: &[(String, Option<String>)]) 
         };
         let mirror = root.join(".sources").join(mirror_name(source));
         if mirror.is_dir() && has_branch(&mirror, agent) {
-            pusher.mark(&mirror, source, agent);
+            pusher_of(source).mark(&mirror, source, agent);
             queued += 1;
         }
     }
     queued
+}
+
+/// Push `agent`'s branch from `mirror` to `source` now, through the
+/// process's pusher for `source` ([`Pusher::push_now`]): what a one-shot
+/// store changed (a merge of main) is published before its caller goes on.
+/// A push that failed is not dropped: the branch stays queued on that
+/// pusher, which retries it. `None`: `source` receives no branches.
+pub(crate) fn publish(mirror: &Path, source: &str, agent: &str) -> Option<Pushed> {
+    publish_with(&crate::push::shared(source), mirror, source, agent)
+}
+
+/// [`publish`] on `pusher`.
+pub(crate) fn publish_with(
+    pusher: &Pusher,
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+) -> Option<Pushed> {
+    receives_branches(source).then(|| pusher.push_now(mirror, source, agent))
+}
+
+/// Push `agent`'s branch from this host's mirror again when its head is
+/// `recorded`, the agent's latest recorded checkpoint, which the source
+/// lacks: a push queued in a process that died before it was made (a merge
+/// of main's, whose record is in the log) would otherwise leave the
+/// integrator judging the task `stale` on every pass, forever (issue #8). A
+/// head past the record is not pushed: its own record is due, and its push
+/// with it. `None`: nothing was pushed (another head, no branch, a source
+/// that receives none).
+pub(crate) fn push_recorded(
+    mirror: &Path,
+    source: &str,
+    agent: &str,
+    recorded: &str,
+) -> Option<Pushed> {
+    let head = ref_commit(mirror, &format!("refs/heads/{agent}"))?;
+    if head != recorded {
+        return None;
+    }
+    publish(mirror, source, agent)
 }
 
 /// Bring a mirror's `main` up to its source's default branch. A source that
@@ -471,6 +562,12 @@ impl WorkspaceStore for MissionWorkspaces {
         self.route(branch.as_str())?.store.mount(branch)
     }
 
+    /// Every mission's store keeps its workspaces under the one root, so
+    /// the default store names any of them; nothing is routed.
+    fn canonical(&self, workspace: &WorkspaceId) -> WorkspaceId {
+        self.default.canonical(workspace)
+    }
+
     fn commit(&self, workspace: &WorkspaceId, message: &str) -> Result<Commit, WorkspaceError> {
         let routed = self.route(workspace.sandbox())?;
         let commit = routed.store.commit(workspace, message)?;
@@ -485,15 +582,30 @@ impl WorkspaceStore for MissionWorkspaces {
     }
 
     fn merge_base(&self, workspace: &WorkspaceId) -> Result<BaseMerge, WorkspaceError> {
+        self.merge_base_when(workspace, &|| Ok(()))
+    }
+
+    /// Main is fetched first, then the routed store asks `ready` under the
+    /// branch's lock: the slow fetch is never between the question and the
+    /// merge.
+    fn merge_base_when(
+        &self,
+        workspace: &WorkspaceId,
+        ready: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BaseMerge, WorkspaceError> {
         let routed = self.route(workspace.sandbox())?;
         if let Some((repo, source)) = &routed.mirror {
             self.refresh_main(repo, source, false);
         }
-        let merged = routed.store.merge_base(workspace)?;
+        let merged = routed.store.merge_base_when(workspace, ready)?;
         if let (BaseMerge::Merged { .. }, Some((repo, source))) = (&merged, &routed.mirror) {
             self.mark(repo, source, workspace.sandbox());
         }
         Ok(merged)
+    }
+
+    fn hold(&self, workspace: &WorkspaceId) -> Option<Hold> {
+        self.route(workspace.sandbox()).ok()?.store.hold(workspace)
     }
 
     fn branch_head(&self, branch: &BranchName) -> Result<Option<CommitId>, WorkspaceError> {
@@ -540,21 +652,26 @@ impl WorkspaceStore for MissionWorkspaces {
 }
 
 impl Drop for MissionWorkspaces {
-    /// A process that ends (`spawn tick`) pushes what is still waiting.
+    /// A process that ends (`spawn tick`, `spawn loop` after SIGTERM) pushes
+    /// what is still waiting, its one-shot stores' failed pushes included.
     fn drop(&mut self) {
-        self.pusher.flush();
+        if !self.one_shot {
+            crate::push::flush_shared();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MissionSource, ensure_mirror, fetch_pushed_into, git, mirror_name, receives_branches,
+        MissionSource, ensure_mirror, fetch_pushed_into, mirror_name, receives_branches,
+        test_git as git,
     };
     use crate::push::{Pushed, Pusher, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
     use spawn_core::port::{Commit, WorkspaceStore};
     use spawn_host::GitWorkspace;
+    use std::ffi::OsStr;
     use std::path::Path;
 
     /// One host's checkpoint of `agent` in its mirror: a new file.
@@ -684,18 +801,125 @@ mod tests {
         );
 
         // The next process: its pusher starts empty.
-        let pusher = Pusher::new();
+        let pusher = std::sync::Arc::new(Pusher::new());
         let agents = [
             ("agent_x".to_string(), Some(source.clone())),
             ("agent_none".to_string(), Some(source.clone())),
             ("agent_scratch".to_string(), None),
         ];
-        assert_eq!(super::republish(&pusher, &root, &agents), 1);
-        pusher.flush();
+        assert_eq!(
+            super::republish(&root, &agents, |_| std::sync::Arc::clone(&pusher)),
+            1
+        );
+        assert_eq!(pusher.flush(), 0);
         assert_eq!(
             fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
             Some(head)
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A source with one commit on `main` under a new `base`, and this
+    /// host's mirror of it (under `<base>/host`), with `agent_x` checkpointed
+    /// once and published: `(source, mirror, host)`.
+    fn published_source(base: &Path) -> (String, std::path::PathBuf, GitWorkspace) {
+        let _ = std::fs::remove_dir_all(base);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).expect("seed directory");
+        let seed_path = seed.to_string_lossy().to_string();
+        git(&["init", "-q", "--initial-branch=main", &seed_path]).expect("init");
+        std::fs::write(seed.join("README.md"), "base\n").expect("write");
+        git(&["-C", &seed_path, "add", "-A"]).expect("add");
+        git(&[
+            "-C",
+            &seed_path,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .expect("commit");
+        let source = base.join("source.git").to_string_lossy().to_string();
+        git(&["clone", "-q", "--bare", &seed_path, &source]).expect("bare source");
+        let root = base.join("host");
+        let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
+        let host = GitWorkspace::new(&mirror, &root);
+        checkpoint(&host, "agent_x", "one.txt");
+        assert_eq!(push_branch(&mirror, &source, "agent_x"), Pushed::Done);
+        (source, mirror, host)
+    }
+
+    /// `agent_x` of `mirror` moved back to `main`, under the head the
+    /// source holds, and checkpointed again: a rewritten branch.
+    fn rewrite(mirror: &Path, host: &GitWorkspace) {
+        let path = mirror.to_string_lossy().to_string();
+        let main = git(&["--git-dir", &path, "rev-parse", "refs/heads/main"]).expect("main");
+        git(&[
+            "--git-dir",
+            &path,
+            "update-ref",
+            "refs/heads/agent_x",
+            &main,
+        ])
+        .expect("rewrite");
+        checkpoint(host, "agent_x", "three.txt");
+    }
+
+    /// Issue #8: a push that loses the source's ref lock to another push
+    /// (git says `[remote rejected]`) is a failure, retried until it lands;
+    /// only git's own refusal of a rewritten branch (`[rejected]`) is not
+    /// retried. Such a push used to count as refused, and was never made.
+    ///
+    /// The retry is waited for until it is settled, not until it leaves the
+    /// queue: a retry the background thread is making has left the queue
+    /// and not landed yet, and the fetch that followed it used to find the
+    /// old head (about one run in five, in any locale).
+    #[test]
+    fn a_push_that_loses_the_ref_lock_is_retried_and_a_rewritten_branch_is_refused() {
+        let base = std::env::temp_dir().join(format!("spawn-sources-lock-{}", std::process::id()));
+        let (source, mirror, host) = published_source(&base);
+        let landing = "refs/spawn-integrate/agent_x";
+        let head = checkpoint(&host, "agent_x", "two.txt");
+
+        // Another push holds the ref's lock.
+        let lock = Path::new(&source).join("refs/heads/spawn/agent_x.lock");
+        std::fs::write(&lock, "").expect("lock");
+        let pusher = Pusher::with(
+            Box::new(push_branch),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(50),
+        );
+        assert!(
+            matches!(
+                pusher.push_now(&mirror, &source, "agent_x"),
+                Pushed::Failed(_)
+            ),
+            "a lost lock is no refusal"
+        );
+        // While the lock is held no retry can land: the branch is owed its
+        // push, queued or being retried, however slow this host is.
+        assert!(pusher.waiting(&mirror, "agent_x"), "it waits for its retry");
+        std::fs::remove_file(&lock).expect("the other push ends");
+        assert!(
+            pusher.settled(&mirror, "agent_x", std::time::Duration::from_mins(2)),
+            "the retry ends"
+        );
+        assert_eq!(
+            fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
+            Some(head),
+            "the retry landed it"
+        );
+
+        // A branch rewritten under its published head is refused, not
+        // retried and not overwritten.
+        rewrite(&mirror, &host);
+        assert!(matches!(
+            push_branch(&mirror, &source, "agent_x"),
+            Pushed::Rejected(why) if why.contains("[rejected]")
+        ));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -797,9 +1021,9 @@ mod tests {
                 .output()
                 .expect("git runs")
         };
-        let mut plain = std::process::Command::new("git");
-        plain.stdin(std::process::Stdio::null());
-        let _ = allowing(plain);
+        // A git without the controller's rule: the configuration given on
+        // the command (`GIT_CONFIG_*`, as a host's would be) lets it run.
+        let _ = allowing(spawn_host::test_git_command());
         assert!(marker.exists(), "the host's configuration would run it");
         std::fs::remove_file(&marker).expect("reset");
         let refused = allowing(super::controller_git());
@@ -811,28 +1035,218 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Every git the controller runs is built by `controller_git`: no other
-    /// module of the CLI starts git itself (tests aside).
+    /// Every git the controller runs is built by `controller_git`, on
+    /// `spawn_host::git_command`, so it runs in the C locale; every git a
+    /// test runs for itself by `test_git` (`spawn_host::test_git_command`),
+    /// which no setting of the host's git configuration reaches. No file of
+    /// the CLI, its tests included, starts git itself, and no test runs its
+    /// own git through the controller's `git`.
     #[test]
     fn every_controller_git_is_built_in_one_place() {
-        for (name, text) in [
-            ("push.rs", include_str!("push.rs")),
-            ("integrate.rs", include_str!("integrate.rs")),
-            ("missions.rs", include_str!("missions.rs")),
-            ("config.rs", include_str!("config.rs")),
-            ("deliver.rs", include_str!("deliver.rs")),
-            ("supervise.rs", include_str!("supervise.rs")),
-            ("runtime.rs", include_str!("runtime.rs")),
-        ] {
-            let code = text.split("#[cfg(test)]").next().unwrap_or(text);
+        fn sources(directory: &Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        /// Whether `code` names the controller's `git`: by a path (`::`
+        /// then `git`, the needle is spelled apart so this file does not
+        /// name it), or alone in a `use` list (`test_git as git` is the
+        /// test's).
+        fn names_git(code: &str) -> bool {
+            let needle = concat!(":", ":git");
+            let path = code.match_indices(needle).any(|(at, _)| {
+                !code[at + needle.len()..]
+                    .starts_with(|next: char| next.is_alphanumeric() || next == '_')
+            });
+            let listed = code.match_indices("use ").any(|(at, _)| {
+                let line = code[..at].rfind('\n').map_or(0, |newline| newline + 1);
+                code[line..at].trim().is_empty()
+                    && code[at..]
+                        .split(';')
+                        .next()
+                        .and_then(|statement| statement.split_once('{'))
+                        .is_some_and(|(_, items)| {
+                            items
+                                .split([',', '{', '}'])
+                                .any(|item| item.trim() == "git")
+                        })
+            });
+            path || listed
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&root.join("src"), &mut files);
+        sources(&root.join("tests"), &mut files);
+        assert!(
+            files.iter().any(|file| file.ends_with("src/sources.rs")),
+            "{files:?}"
+        );
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read a source");
             assert!(
-                !code.contains("Command::new(\"git\")"),
-                "{name} starts git without controller_git"
+                !text.contains("Command::new(\"git\")"),
+                "{} starts git without controller_git or test_git",
+                file.display()
+            );
+            let tests = if file.starts_with(root.join("tests")) || file.ends_with("tests.rs") {
+                text.as_str()
+            } else {
+                text.split_once("#[cfg(test)]\nmod ")
+                    .map_or("", |(_, tests)| tests)
+            };
+            assert!(
+                !names_git(tests),
+                "{} runs a test's own git through the controller's git, not test_git",
+                file.display()
             );
         }
+        assert!(names_git(concat!("let git = crate::sources:", ":git;")));
+        assert!(names_git("    use crate::sources::{ensure_mirror, git};"));
+        assert!(!names_git(
+            "    use crate::sources::{ensure_mirror, test_git as git};"
+        ));
+        assert!(!names_git("let git = crate::sources::test_git;"));
         let own = include_str!("sources.rs");
-        let code = own.split("#[cfg(test)]").next().unwrap_or(own);
-        assert_eq!(code.matches("Command::new(\"git\")").count(), 1);
+        let code = own.split("#[cfg(test)]\nmod ").next().unwrap_or(own);
+        assert_eq!(code.matches("spawn_host::git_command(\"git\")").count(), 1);
+        let command = super::controller_git();
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))));
+        assert!(envs.contains(&(OsStr::new("LANGUAGE"), None)));
+    }
+
+    /// Marks a line of [`decisions_in_this_locale`]'s output.
+    const DECISION: &str = "spawn-decision: ";
+
+    /// Marks the line of [`decisions_in_this_locale`]'s output that shows
+    /// git's own answer, outside Spawn.
+    const PLAIN: &str = "plain-git: ";
+
+    /// What Spawn makes of git in this process's locale, one line each, the
+    /// run's scratch directory written `<base>`: a push that lost the ref
+    /// lock, a push of a rewritten branch, a fetch from a source that is
+    /// gone. Then, outside Spawn, what a plain git says about a missing
+    /// repository. Run by
+    /// [`a_translated_locale_changes_nothing_spawn_reads_from_git`] in one
+    /// process per locale; alone it only prints.
+    #[test]
+    #[ignore = "run by a_translated_locale_changes_nothing_spawn_reads_from_git"]
+    fn decisions_in_this_locale() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-locale-{}", std::process::id()));
+        let shown = base.to_string_lossy().to_string();
+        let say = |mark: &str, decision: String| {
+            println!("{mark}{}", decision.replace(&shown, "<base>"));
+        };
+        let (source, mirror, host) = published_source(&base);
+        checkpoint(&host, "agent_x", "two.txt");
+
+        // Another push holds the ref's lock: a failure, retried.
+        let lock = Path::new(&source).join("refs/heads/spawn/agent_x.lock");
+        std::fs::write(&lock, "").expect("lock");
+        let pushed = push_branch(&mirror, &source, "agent_x");
+        assert!(
+            matches!(&pushed, Pushed::Failed(why) if why.contains("[remote rejected]")),
+            "{pushed:?}"
+        );
+        say(DECISION, format!("{pushed:?}"));
+        std::fs::remove_file(&lock).expect("the other push ends");
+
+        // A rewritten branch: refused.
+        rewrite(&mirror, &host);
+        let pushed = push_branch(&mirror, &source, "agent_x");
+        assert!(
+            matches!(&pushed, Pushed::Rejected(why) if why.contains("[rejected]")),
+            "{pushed:?}"
+        );
+        say(DECISION, format!("{pushed:?}"));
+
+        // A source that is gone: an error, not "nothing published".
+        let gone = base.join("gone.git").to_string_lossy().to_string();
+        let fetched = fetch_pushed_into(&mirror, &gone, "agent_x", "refs/spawn-integrate/x");
+        assert!(fetched.is_err(), "{fetched:?}");
+        say(DECISION, format!("{fetched:?}"));
+
+        // git's own answer in this process's locale: a test's git, given
+        // back the locale `test_git_command` takes away.
+        let mut own = spawn_host::test_git_command();
+        for name in ["LC_ALL", "LANGUAGE"] {
+            match std::env::var_os(name) {
+                Some(value) => own.env(name, value),
+                None => own.env_remove(name),
+            };
+        }
+        let plain = own
+            .args(["--git-dir", &gone, "rev-parse", "HEAD"])
+            .output()
+            .expect("git runs");
+        say(
+            PLAIN,
+            String::from_utf8_lossy(&plain.stderr)
+                .trim()
+                .replace('\n', " "),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every git the controller runs is in the C locale
+    /// ([`super::controller_git`]), so a host whose locale is translated
+    /// changes nothing Spawn reads from git: the same pushes and fetch, made
+    /// in a process whose whole environment is Chinese (`LC_ALL`, `LANG`,
+    /// `LC_MESSAGES`, `LANGUAGE`), come to the same decisions, the texts
+    /// they quote included, as in C. Before, the texts were git's Chinese.
+    /// On a host without zh_CN (`locale -a`) or git's Chinese messages,
+    /// nothing is translated and the comparison holds anyway.
+    #[test]
+    fn a_translated_locale_changes_nothing_spawn_reads_from_git() {
+        let program = std::env::current_exe().expect("the test binary");
+        let run = |locale: &str, language: Option<&str>| {
+            let mut command = std::process::Command::new(&program);
+            command
+                .args([
+                    "--exact",
+                    "sources::tests::decisions_in_this_locale",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("LC_ALL", locale)
+                .env("LANG", locale)
+                .env("LC_MESSAGES", locale);
+            match language {
+                Some(language) => command.env("LANGUAGE", language),
+                None => command.env_remove("LANGUAGE"),
+            };
+            let output = command.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{locale}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let marked = |mark: &str| -> Vec<String> {
+                stdout
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(mark))
+                    .map(str::to_string)
+                    .collect()
+            };
+            (marked(DECISION), marked(PLAIN))
+        };
+        let (english, plain_english) = run("C", None);
+        assert_eq!(english.len(), 3, "{english:?}");
+        let (translated, plain_translated) = run("zh_CN.UTF-8", Some("zh_CN:zh"));
+        if plain_translated == plain_english {
+            eprintln!("this host does not translate git ({plain_translated:?}): nothing to prove");
+        }
+        assert_eq!(
+            translated, english,
+            "git's answer here: {plain_translated:?}"
+        );
     }
 
     #[test]

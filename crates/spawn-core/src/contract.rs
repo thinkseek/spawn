@@ -148,6 +148,7 @@ pub fn one_execution(tag: &str, log: &dyn EventLog) {
             EventKind::ExecutionEnded {
                 cause,
                 exit_code: None,
+                evidence: None,
             },
         )
     };
@@ -189,6 +190,7 @@ pub fn command_queue(tag: &str, queue: &dyn CommandQueue, log: &dyn EventLog) {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     };
     let id = queue

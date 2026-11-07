@@ -53,7 +53,10 @@ select jsonb_build_object(
              'delivered_at_ms', x.r -> 'row' -> 'delivered_at_ms'))
              order by e.session_seq), '[]'::jsonb)
       from spawn_events e
-     cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+     -- `offset 0` keeps the record a value of its own: inlined, each of the
+     -- thirty `x.r` above would take it out of the event's `kind` (a gate's
+     -- log, a brief) again, which took most of the statement's time.
+     cross join lateral (select e.kind -> 'detail' -> 'record' as r offset 0) x
      where e.session_id = 'session_control' and e.event_name = 'control.recorded'
        and e.recorded_at_ms < $1
        and x.r ->> 'type' in ('mission.added', 'mission.configured', 'mission.resumed',

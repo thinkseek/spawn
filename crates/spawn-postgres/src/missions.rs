@@ -121,15 +121,18 @@ from (
 ///   review or verdict that sent it back (`rejected`, `conflict` or
 ///   `incompatible`); `task.delivered`; `task.reported`;
 ///   the review that accepted it; the gate's `accepted`; the record that
-///   closed it), and `stale`, the latest `stale` verdict on it, which moves
-///   no step;
+///   closed it), `stale`, the latest `stale` verdict on it, which moves
+///   no step, and, for a landing, `held` (its mission's source has an
+///   active owner's hold: it waits behind it) and `hold_end` (the latest
+///   `source.released` or `source.hold_expired` on its source);
 /// - `verdicts`: per gated mission with a task waiting for the gate, the
 ///   latest verdict on any of its tasks that is not `stale`;
 /// - `sessions`: per session with a delivered task, its latest fact (a
 ///   record that is neither the Observer's nor storage's, nor the Bridge's
 ///   `waiting` step of an input, which says nothing the worker did, as
-///   [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `evidence_seq`) and
-///   the evidence of its latest screen reading;
+///   [`DISPATCH_FACTS`](crate::fleet::DISPATCH_FACTS)'s `evidence_seq`);
+///   whether its worker waits on a background job of its own is read from
+///   that query's `jobs`, never from the screen;
 /// - `halted`: every halted mission with open tasks, its latest
 ///   `mission.halted` record and those tasks.
 pub(crate) const STALL_FACTS: &str = r"
@@ -137,7 +140,8 @@ with now as (select spawn_now_ms() as ms),
 open as (
   select k.id, k.mission_id, k.kind, k.session_id, k.state, k.revisions,
          m.gate is not null as gated, coalesce(m.accept, 'review') as accept,
-         m.halted is not null as halted
+         m.halted is not null as halted, m.sources ->> 0 as source,
+         exists (select 1 from mission_source_holds h where h.source = m.sources ->> 0) as held
     from mission_tasks k
     join mission_missions m on m.id = k.mission_id
    where k.state in ('assigned', 'delivered', 'reported', 'revise', 'landing')
@@ -150,7 +154,8 @@ select jsonb_build_object(
   'tasks', coalesce((select jsonb_agg(jsonb_build_object(
       'id', o.id, 'mission_id', o.mission_id, 'kind', o.kind, 'session_id', o.session_id,
       'state', o.state, 'revisions', o.revisions, 'gated', o.gated, 'accept', o.accept,
-      'halted', o.halted, 'record', rec.record, 'stale', st.stale) order by o.id)
+      'halted', o.halted, 'record', rec.record, 'stale', st.stale,
+      'held', o.state = 'landing' and o.held, 'hold_end', he.record) order by o.id)
     from open o
     left join lateral (
       select jsonb_build_object('id', e.id, 'type', x.r ->> 'type', 'at_ms', e.recorded_at_ms,
@@ -182,7 +187,17 @@ select jsonb_build_object(
          and e.kind -> 'detail' -> 'record' ->> 'id' = o.id::text
          and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
          and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'stale'
-       order by e.session_seq desc limit 1) st on true), '[]'::jsonb),
+       order by e.session_seq desc limit 1) st on true
+    left join lateral (
+      select jsonb_build_object('id', e.id, 'type', e.kind -> 'detail' -> 'record' ->> 'type',
+                                'at_ms', e.recorded_at_ms,
+                                'age_ms', (select ms from now) - e.recorded_at_ms) as record
+        from spawn_events e
+       where o.state = 'landing'
+         and e.session_id = 'session_control' and e.event_name = 'control.recorded'
+         and e.kind -> 'detail' -> 'record' ->> 'type' in ('source.released', 'source.hold_expired')
+         and e.kind -> 'detail' -> 'record' ->> 'source' = o.source
+       order by e.session_seq desc limit 1) he on true), '[]'::jsonb),
   'verdicts', coalesce((select jsonb_agg(v order by v.mission_id) from (
       select distinct on (k.mission_id) k.mission_id, e.id,
              e.kind -> 'detail' -> 'record' ->> 'verdict' as verdict,
@@ -199,19 +214,15 @@ select jsonb_build_object(
        order by k.mission_id, e.session_seq desc) v), '[]'::jsonb),
   'sessions', coalesce((select jsonb_agg(jsonb_build_object(
       'session_id', s.session_id, 'seq', f.session_seq, 'event_name', f.event_name,
-      'at_ms', f.recorded_at_ms, 'age_ms', (select ms from now) - f.recorded_at_ms,
-      'screen', sc.evidence) order by s.session_id)
+      'at_ms', f.recorded_at_ms, 'age_ms', (select ms from now) - f.recorded_at_ms)
+      order by s.session_id)
     from (select distinct session_id from open where state = 'delivered') s
     left join lateral (
       select e.session_seq, e.event_name, e.recorded_at_ms from spawn_events e
        where e.session_id = s.session_id and e.source <> 'observer'
          and e.event_name not in ('artifact.committed', 'merge.conflicted')
          and coalesce(e.kind -> 'detail' ->> 'step', '') <> 'waiting'
-       order by e.session_seq desc limit 1) f on true
-    left join lateral (
-      select e.kind -> 'detail' ->> 'evidence' as evidence from spawn_events e
-       where e.session_id = s.session_id and e.event_name = 'screen.observed'
-       order by e.id desc limit 1) sc on true), '[]'::jsonb),
+       order by e.session_seq desc limit 1) f on true), '[]'::jsonb),
   'halted', coalesce((select jsonb_agg(jsonb_build_object(
       'mission_id', m.id, 'reason', m.halted, 'record', h.record, 'tasks', t.ids) order by m.id)
     from mission_missions m
@@ -278,13 +289,37 @@ select jsonb_build_object(
                                  where tag = c.session_id || ' human-' || c.id)), '[]'::jsonb)
 )";
 
+/// Every active owner's hold on a mission source, by source:
+/// `[{source, hold, main, by, reason, held_at_ms, expires_ms, waiting}]`,
+/// `waiting` the tasks waiting behind it (`landing`, `held_by` the hold),
+/// oldest first. Read from the fold alone, so the supervisor's login reads
+/// it too.
+macro_rules! active_holds {
+    () => {
+        r"coalesce((select jsonb_agg(jsonb_build_object(
+      'source', h.source, 'hold', h.hold, 'main', h.main, 'by', h.by, 'reason', h.reason,
+      'held_at_ms', h.held_at_ms, 'expires_ms', h.expires_ms,
+      'waiting', coalesce((select jsonb_agg(k.id order by k.id) from mission_tasks k
+                            where k.state = 'landing' and k.held_by = h.hold), '[]'::jsonb))
+      order by h.source)
+    from mission_source_holds h), '[]'::jsonb)"
+    };
+}
+
 /// The board of missions with their tasks, newest first; each task carries
-/// its stages ([`PostgresStore::task_stages`]).
-pub(crate) const MISSION_BOARD: &str = r"
+/// its stages ([`PostgresStore::task_stages`]) and each mission the `hold`
+/// on its source (the active hold's event id, or null); `holds` is every
+/// active hold ([`SOURCE_HOLDS`]).
+pub(crate) const MISSION_BOARD: &str = concat!(
+    r"
 select jsonb_build_object(
+  'holds', ",
+    active_holds!(),
+    r",
   'missions', coalesce((select jsonb_agg(row_to_json(x) order by x.id desc) from (
       select m.id, m.text, m.origin, m.sources, m.state, m.summary,
              m.gate, m.accept, m.budget, m.baseline, m.halted, m.objectives,
+             (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
              m.created_at_ms, m.updated_at_ms,
              coalesce((select jsonb_agg(jsonb_build_object(
                  'id', k.id, 'kind', k.kind, 'agent_id', k.agent_id,
@@ -293,6 +328,7 @@ select jsonb_build_object(
                  'review_note', k.review_note, 'report', k.report,
                  'candidate', k.candidate, 'objective', k.objective, 'metric', k.metric,
                  'model', k.model, 'stages', spawn_task_stages(k.id),
+                 'held_by', k.held_by,
                  'created_by', k.created_by, 'created_at_ms', k.created_at_ms,
                  'updated_at_ms', k.updated_at_ms) order by k.id)
                from mission_tasks k where k.mission_id = m.id), '[]'::jsonb) as tasks
@@ -301,7 +337,59 @@ select jsonb_build_object(
   'residents', coalesce((select jsonb_agg(row_to_json(r) order by r.name) from (
       select name, agent_id, session_id, charter, state, proposed_by, approved_by,
              created_at_ms, updated_at_ms from mission_residents) r), '[]'::jsonb)
-)";
+)"
+);
+
+/// Every active owner's hold ([`MISSION_BOARD`]'s `holds`) and the
+/// database's clock: `{now_ms, holds}`. The integrator ends a hold whose
+/// `expires_ms` that clock reached, by record; the attention view shows the
+/// ones with tasks waiting.
+pub(crate) const SOURCE_HOLDS: &str = concat!(
+    r"
+select jsonb_build_object('now_ms', spawn_now_ms(), 'holds', ",
+    active_holds!(),
+    ")"
+);
+
+/// The `source.hold_expired` records the supervisor was not told of yet,
+/// oldest first: `{event_id, at_ms, source, hold, expires_ms, reason,
+/// held_at_ms, bound_s, main, waiting: [{task, mission}]}`, the hold's own
+/// fields read from its `source.held` record. Told is a record, as for
+/// [`GATE_HOST_FAULT_ESCALATIONS`]: a digest that reached the supervisor
+/// carrying the tag `missions source-hold-expired-<event_id>`, however long
+/// ago.
+pub(crate) const HOLD_EXPIRIES: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(jsonb_build_object(
+         'event_id', e.id, 'at_ms', e.recorded_at_ms, 'source', x.r ->> 'source',
+         'hold', x.r -> 'hold', 'expires_ms', x.r -> 'expires_ms',
+         'reason', held.r ->> 'reason', 'held_at_ms', held.at_ms, 'bound_s', held.r -> 'bound_s',
+         'main', held.r ->> 'main',
+         'waiting', coalesce((
+            select jsonb_agg(jsonb_build_object('task', w.id::bigint, 'mission', k.mission_id)
+                             order by w.n)
+              from jsonb_array_elements_text(
+                     case when jsonb_typeof(x.r -> 'waiting') = 'array'
+                          then x.r -> 'waiting' else '[]'::jsonb end) with ordinality w(id, n)
+              left join mission_tasks k on k.id = w.id::bigint), '[]'::jsonb))
+         order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join lateral (
+    select h.kind -> 'detail' -> 'record' as r, h.recorded_at_ms as at_ms
+      from spawn_events h
+     where h.id = (x.r ->> 'hold')::bigint and h.session_id = 'session_control') held on true
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and e.kind -> 'detail' -> 'record' ->> 'type' in ('source.released', 'source.hold_expired')
+   and x.r ->> 'type' = 'source.hold_expired'
+   and not exists (select 1 from told where tag = 'missions source-hold-expired-' || e.id)";
 
 // Checked decisions, one SQL function each.
 
@@ -335,7 +423,8 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
 /// the integrator may judge, land, or hold to its budget, with the brief and
-/// the report a landing's message is written from.
+/// the report a landing's message is written from. Each names `hold`, the
+/// active owner's hold on its source (or null), and each task `held_by`.
 pub(crate) const GATED: &str = r"
 select coalesce(jsonb_agg(row_to_json(x) order by x.id), '[]'::jsonb)
 from (
@@ -344,6 +433,7 @@ from (
          m.gate_room_last_ms,
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
          m.gate_host_due_ms, m.objectives, m.sources ->> 0 as source,
+         (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -353,7 +443,7 @@ from (
                'candidate', k.candidate, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
-               'updated_at_ms', k.updated_at_ms)
+               'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -365,12 +455,15 @@ from (
 ) x";
 
 /// The `no_room` gate records that carry `escalate` (the mission's gate
-/// went without room past the integrator's limit) and that the supervisor
-/// was not told of yet, oldest first, each with its `event_id`, `at_ms` and
-/// `mission`. Told is a record, not a window: a digest that reached the
+/// went without room past the integrator's limit), oldest first, each with
+/// its `event_id`, `at_ms` and `mission`: those the supervisor was not told
+/// of yet, and those it was told of whose run of `no_room` still goes on
+/// (the mission's `gate_room_*` name the record's task, escalated, since
+/// the record or before), which the dispatcher keeps as told and
+/// unresolved. Told is a record, not a window: a digest that reached the
 /// supervisor carrying the tag `host gate-room-<event_id>` (as
-/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was away
-/// for days is still told once.
+/// [`MISSION_NEWS`]'s `told`, however long ago). So a supervisor that was
+/// away for days is still told once.
 pub(crate) const GATE_ROOM_ESCALATIONS: &str = r"
 with told as (
   select distinct tag
@@ -390,7 +483,11 @@ select coalesce(jsonb_agg(r || jsonb_build_object('event_id', e.id, 'at_ms', e.r
    and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.gated'
    and e.kind -> 'detail' -> 'record' ->> 'verdict' = 'no_room'
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
-   and not exists (select 1 from told where tag = 'host gate-room-' || e.id)";
+   and (not exists (select 1 from told where tag = 'host gate-room-' || e.id)
+        or exists (select 1 from mission_missions m
+                    where m.id = k.mission_id and m.gate_room_escalated
+                      and m.gate_room_task = (r ->> 'id')::bigint
+                      and m.gate_room_since_ms <= e.recorded_at_ms))";
 
 /// The `host_fault` gate records that carry `escalate` (the mission's second
 /// host fault in a row) and that the supervisor was not told of yet, oldest
@@ -498,6 +595,15 @@ select (select jsonb_build_object(
                 and r ->> 'id' = k.id::text), '[]'::jsonb))
           from mission_tasks k where k.id = $1)";
 
+/// One task's texts in full, as the board's list sends only their first
+/// lines: `{id, mission_id, brief, report, review_note, updated_at_ms}`;
+/// null when there is no such task. `$1` task.
+pub(crate) const TASK_TEXTS: &str = r"
+select (select jsonb_build_object(
+          'id', k.id, 'mission_id', k.mission_id, 'brief', k.brief, 'report', k.report,
+          'review_note', k.review_note, 'updated_at_ms', k.updated_at_ms)
+          from mission_tasks k where k.id = $1)";
+
 /// The integrator's advisory lock: one integrator per store (database and
 /// schema). The two-key form pairs this class with the schema's name, so
 /// stores in other schemas of the same database (tests, the e2e) never
@@ -574,47 +680,18 @@ pub(crate) const PUBLISHING_AGENTS: &str = "select a.agent_id,
                                                       where k.agent_id = a.agent_id))
                   order by a.agent_id";
 
-/// The owner's landing requests (`source.push_requested`, `spawn mission
-/// push`) that have no outcome yet (a `source.moved` or a
-/// `source.push_refused` naming them), oldest first: `[{request, source,
-/// commit, ref, at_ms}]`, `request` the request's event id. Read through the
-/// `spawn_events_source_push` index.
-pub(crate) const SOURCE_PUSHES_PENDING: &str = r"
-with owner as (
-  select e.id, e.session_seq, e.recorded_at_ms, e.kind -> 'detail' -> 'record' as r
-    from spawn_events e
-   where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-     and e.kind -> 'detail' -> 'record' ->> 'type'
-         in ('source.push_requested', 'source.push_refused', 'source.moved'))
-select coalesce(jsonb_agg(jsonb_build_object('request', q.id, 'source', q.r ->> 'source',
-                                             'commit', q.r ->> 'commit', 'ref', q.r ->> 'ref',
-                                             'at_ms', q.recorded_at_ms)
-                          order by q.session_seq), '[]'::jsonb)
-  from owner q
- where q.r ->> 'type' = 'source.push_requested'
-   and not exists (select 1 from owner o where o.r ->> 'request' = q.id::text)";
-
-/// The outcome of the owner's landing request `$1` (its event id): the
-/// `source.moved` or `source.push_refused` record naming it, with its own
-/// `event_id` and `at_ms`; no row while it is pending.
-pub(crate) const SOURCE_PUSH_OUTCOME: &str = r"
-select e.kind -> 'detail' -> 'record' || jsonb_build_object('event_id', e.id,
-                                                            'at_ms', e.recorded_at_ms)
-  from spawn_events e
- where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-   and e.kind -> 'detail' -> 'record' ->> 'type'
-       in ('source.push_requested', 'source.push_refused', 'source.moved')
-   and e.kind -> 'detail' -> 'record' ->> 'request' = ($1::bigint)::text
- order by e.session_seq
- limit 1";
-
 // Delivery bookkeeping, run by the dispatcher as the owner.
 
-/// A landing held by [`PostgresStore::landing_hold`] or
-/// [`PostgresStore::source_push_hold`]; released when dropped
+/// A landing held by [`PostgresStore::landing_hold`]; released when dropped
 /// (and with the connection, if the process dies first).
 pub struct LandingHold<'store> {
     store: &'store PostgresStore,
+}
+
+impl std::fmt::Debug for LandingHold<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LandingHold")
+    }
 }
 
 impl Drop for LandingHold<'_> {
@@ -746,54 +823,82 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// Ask for `commit` on `source`'s main (`spawn mission push`, owner
-    /// only): the commit waits in the source at `reference`
-    /// (`refs/spawn-owner/<commit>`). Records `source.push_requested` and
-    /// returns its event id; the integrator applies it.
-    pub fn source_push_request(
+    /// Record a gate verdict, a landing, an abort or a halt (owner only).
+    /// A record the store declines as already made (a second `task.held`
+    /// for one task and hold: [`Self::task_held`]) is an error here.
+    pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
+        self.query_one("select spawn_integrator_record($1)", &[record])?
+            .get::<_, Option<i64>>(0)
+            .ok_or_else(|| StoreError::Rejected(format!("already recorded: {record}")))
+    }
+
+    /// Take the integrator's landing lock for an owner's hold on `source`
+    /// (owner only; a source no mission names, or a remote one, is
+    /// refused): a landing whose push has begun records its outcome first.
+    /// Read the source's main while the guard lives, then record the hold
+    /// with [`Self::source_hold`].
+    pub fn source_hold_lock(&self, source: &str) -> Result<LandingHold<'_>, StoreError> {
+        self.execute("select spawn_source_hold_lock($1)", &[&source])?;
+        Ok(LandingHold { store: self })
+    }
+
+    /// Record the owner's hold on `source` at `main` (read under
+    /// [`Self::source_hold_lock`]) for `bound_s` seconds, with a `reason`:
+    /// `{hold, source, main, expires_ms, renews}`. Owner only.
+    pub fn source_hold(
         &self,
         source: &str,
-        commit: &str,
-        reference: &str,
-    ) -> Result<i64, StoreError> {
+        main: &str,
+        bound_s: i32,
+        reason: Option<&str>,
+    ) -> Result<Value, StoreError> {
         Ok(self
             .query_one(
-                "select spawn_source_push_request($1, $2, $3)",
-                &[&source, &commit, &reference],
+                "select spawn_source_hold($1, $2, $3, $4)",
+                &[&source, &main, &bound_s, &reason],
             )?
             .get(0))
     }
 
-    /// The owner's landing requests without an outcome yet, oldest first
-    /// ([`SOURCE_PUSHES_PENDING`]).
-    pub fn source_pushes_pending(&self) -> Result<Value, StoreError> {
-        self.query_json(SOURCE_PUSHES_PENDING, &[])
+    /// Release the active hold on `source`, if there is one:
+    /// `{source, released, waiting}` (`released` null: nothing recorded).
+    /// Owner only.
+    pub fn source_release(&self, source: &str) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one("select spawn_source_release($1)", &[&source])?
+            .get(0))
     }
 
-    /// The outcome of the owner's landing request `request`, `None` while it
-    /// is pending ([`SOURCE_PUSH_OUTCOME`]).
-    pub fn source_push_outcome(&self, request: i64) -> Result<Option<Value>, StoreError> {
+    /// The active hold on `source` (its `source.held` event id), read from
+    /// the fold now: the integrator reads it under the landing lock, right
+    /// before a push.
+    pub fn active_hold(&self, source: &str) -> Result<Option<i64>, StoreError> {
         Ok(self
-            .query_opt(SOURCE_PUSH_OUTCOME, &[&request])?
+            .query_opt(
+                "select hold from mission_source_holds where source = $1",
+                &[&source],
+            )?
             .map(|row| row.get(0)))
     }
 
-    /// Hold an owner's landing (owner only): the lock of
-    /// [`Self::landing_hold`], so no task landing's push and its record are
-    /// split by it. Take it before reading the source's main and keep it
-    /// until the outcome is recorded.
-    pub fn source_push_hold(&self) -> Result<LandingHold<'_>, StoreError> {
-        self.execute("select spawn_source_push_hold()", &[])?;
-        Ok(LandingHold { store: self })
+    /// Record that `task`'s landing waits behind `hold` on `source` and
+    /// pushed nothing (owner only): the event id, or `None` when one was
+    /// recorded for this task and hold already (nothing is recorded).
+    pub fn task_held(&self, task: i64, hold: i64, source: &str) -> Result<Option<i64>, StoreError> {
+        let record = serde_json::json!({"type": "task.held", "id": task, "hold": hold,
+                                        "source": source});
+        Ok(self
+            .query_one("select spawn_integrator_record($1)", &[&record])?
+            .get(0))
     }
 
-    /// Record a gate verdict, a landing, an abort or a halt, or the outcome
-    /// of an owner's landing request (`source.moved` naming its `request`,
-    /// `source.push_refused`) (owner only).
-    pub fn integrator_record(&self, record: &Value) -> Result<i64, StoreError> {
-        Ok(self
-            .query_one("select spawn_integrator_record($1)", &[record])?
-            .get(0))
+    /// Record that `hold`, the active hold on `source`, reached its
+    /// `expires_ms` on the database's clock (owner only); the store names
+    /// its bound and the tasks waiting behind it, and refuses it before then
+    /// or for a hold that is not active. The record's event id.
+    pub fn hold_expired(&self, source: &str, hold: i64) -> Result<i64, StoreError> {
+        self.integrator_record(&serde_json::json!({"type": "source.hold_expired",
+                                                   "source": source, "hold": hold}))
     }
 
     /// Missions with a gate and the tasks the integrator may act on: open
@@ -803,7 +908,7 @@ impl PostgresStore {
     }
 
     /// The `no_room` gate records that escalate and were not told to the
-    /// supervisor yet ([`GATE_ROOM_ESCALATIONS`]).
+    /// supervisor yet, or were and still hold ([`GATE_ROOM_ESCALATIONS`]).
     pub fn gate_room_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_ROOM_ESCALATIONS, &[])
     }
@@ -812,6 +917,18 @@ impl PostgresStore {
     /// supervisor yet ([`GATE_HOST_FAULT_ESCALATIONS`]).
     pub fn gate_host_fault_escalations(&self) -> Result<Value, StoreError> {
         self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
+    }
+
+    /// The `source.hold_expired` records not told to the supervisor yet,
+    /// with their holds and waiting tasks ([`HOLD_EXPIRIES`]).
+    pub fn hold_expiries(&self) -> Result<Value, StoreError> {
+        self.query_json(HOLD_EXPIRIES, &[])
+    }
+
+    /// Every active owner's hold with the tasks waiting behind it, and the
+    /// database's clock ([`SOURCE_HOLDS`]).
+    pub fn source_holds(&self) -> Result<Value, StoreError> {
+        self.query_json(SOURCE_HOLDS, &[])
     }
 
     /// Tool calls `session` started after `since_ms`: a task's budget.
@@ -917,6 +1034,12 @@ impl PostgresStore {
     /// `None` when there is no such task.
     pub fn objective_task(&self, task: i64) -> Result<Option<Value>, StoreError> {
         Ok(self.query_one(OBJECTIVE_TASK, &[&task])?.get(0))
+    }
+
+    /// One task's brief, report and review note in full ([`TASK_TEXTS`]);
+    /// `None` when there is no such task.
+    pub fn task_texts(&self, task: i64) -> Result<Option<Value>, StoreError> {
+        Ok(self.query_one(TASK_TEXTS, &[&task])?.get(0))
     }
 
     /// Tasks the dispatcher has to deliver, watch or wind down.

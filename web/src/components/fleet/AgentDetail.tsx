@@ -4,7 +4,6 @@ import {
   History,
   Send,
   Sparkles,
-  Wrench,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -29,8 +28,9 @@ import {
   stateLabelUpper,
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
+import { freshAt } from "../../validated";
 import { LiveBadge, TerminalBlock, TerminalPanel } from "../Terminal";
-import { Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
+import { Ago, Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
 import {
   Fact,
   FleetStateBadge,
@@ -40,7 +40,8 @@ import {
   RoleBadge,
   SectionLabel,
 } from "./bits";
-import { doingNow } from "./FleetBoard";
+import { DoingIcon, doingNow } from "./FleetBoard";
+import { InputBox } from "./InputBox";
 
 interface AgentDetailProps {
   agent: FleetAgent;
@@ -95,6 +96,14 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />
           <LiveBadge live={agent.live} />
+          {agent.attention && (
+            <span
+              className="text-caption font-medium text-warning"
+              title="In the dispatcher's Escalations, at the top of the Fleet page"
+            >
+              escalated
+            </span>
+          )}
           <span className="ml-auto" />
           <Button onClick={() => onOpenTimeline(sessionId)} title="Open the event timeline">
             <span className="hidden sm:inline">Session timeline</span>
@@ -106,6 +115,14 @@ export function AgentDetail({ agent, onClose, onOpenTimeline }: AgentDetailProps
     >
       <div className="min-h-0 flex-1 overflow-y-auto bg-app-shell">
         <AgentSummary agent={agent} />
+        <div className="border-b border-surface-border bg-page-canvas px-4 py-2.5 sm:px-5">
+          <InputBox
+            sessionId={sessionId}
+            to={agent.agent_id || sessionId}
+            stopped={!agent.live}
+            commands={commands.data}
+          />
+        </div>
         <div className="grid gap-3 p-3 sm:p-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
           <div className="flex min-w-0 flex-col gap-3">
             <JevPanel
@@ -153,12 +170,12 @@ function AgentSummary({ agent }: { agent: FleetAgent }) {
       <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-8">
         <Fact label="Doing now" mono>
           <span className="inline-flex items-center gap-1">
-            {now.tool && <Wrench size={11} className="text-success" />}
+            <DoingIcon now={now} size={11} />
             {now.label}
           </span>
         </Fact>
-        <Fact label="Last event">{relativeTime(activity.last_event_at_ms)}</Fact>
-        <Fact label="In state since">{relativeTime(agent.state_since_ms)}</Fact>
+        <Fact label="Last event"><Ago ms={activity.last_event_at_ms} /></Fact>
+        <Fact label="In state since"><Ago ms={agent.state_since_ms} /></Fact>
         <Fact label="Engine · execution" mono>
           {[agent.engine, agent.execution_id].filter(Boolean).join(" · ") || "—"}
         </Fact>
@@ -229,9 +246,7 @@ function JevPanel({
                 Back to latest
               </button>
             )}
-            <span className="tnum" title={at ? new Date(at).toLocaleString() : undefined}>
-              {relativeTime(at)}
-            </span>
+            <Ago ms={at} />
           </>
         }
       />
@@ -250,6 +265,17 @@ function JevPanel({
             </span>
           )}
         </div>
+
+        {judgement.attention && (
+          <p
+            className="text-caption text-muted-foreground"
+            title="The judge's opinion only. What is escalated is the dispatcher's view: the Escalations at the top of the Fleet page."
+          >
+            <span className="font-medium text-foreground">The judge asks for attention</span>
+            {judgement.attention_reason && <> · {reasonText(judgement.attention_reason)}</>}
+            <span className="text-faint-foreground"> · its opinion, not the dispatcher's escalations</span>
+          </p>
+        )}
 
         {reason && (
           <div
@@ -486,6 +512,7 @@ function LivePane({ sessionId }: { sessionId: string }) {
     `pane:${sessionId}`,
     (signal) => fetchAgentPane(sessionId, signal),
     3_000,
+    { checked: true },
   );
   const data = pane.data;
   return (
@@ -510,7 +537,7 @@ function LivePane({ sessionId }: { sessionId: string }) {
           </span>
           {data?.captured_at_ms ? (
             <span className="tnum text-caption text-faint-foreground">
-              {relativeTime(data.captured_at_ms)}
+              {relativeTime(freshAt(data.captured_at_ms, pane.checkedAt))}
             </span>
           ) : null}
           <LiveBadge live={data?.live === true} known={data !== null} />
@@ -642,6 +669,16 @@ function CommandOutcome({ record }: { record: CommandRecord }) {
   }
   if (record.succeeded === false) {
     return <span className="text-destructive">failed</span>;
+  }
+  if (record.waiting) {
+    return (
+      <span
+        className="text-warning"
+        title="The agent is in a turn: the Bridge types it when the turn ends"
+      >
+        waiting for its turn
+      </span>
+    );
   }
   return <span className="text-muted-foreground">{record.state ?? "pending"}</span>;
 }

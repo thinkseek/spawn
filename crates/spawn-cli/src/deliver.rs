@@ -517,6 +517,7 @@ fn delivery(task: &TaskRow, found: Option<&Facts>, settled: bool, key: String) -
                 parent_session_id: None,
                 from: None,
                 model,
+                charter: None,
             },
         )),
     }
@@ -670,6 +671,11 @@ fn held(task: &TaskRow, found: Option<&Facts>, settled: bool) -> Option<String> 
                 latest.state.key()
             ),
             (None, None) => "its worker has no judgement yet".to_string(),
+            (Some(current), _) if current.waits_on_own_job() => {
+                "its worker waits on a background job of its own and the task it last got is \
+                 still open"
+                    .to_string()
+            }
             (Some(current), _) if current.ambiguity != Some(Ambiguity::TurnStoppedIdle) => format!(
                 "its worker is not idle at its prompt (judged {})",
                 current.state.key()
@@ -1022,6 +1028,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 mission.origin,
                 one_line(&mission.text, 300)
             ),
+            since_ms: None,
         });
     }
     for report in &news.reports {
@@ -1043,6 +1050,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 id = report.id,
                 revision = report.revisions,
             ),
+            since_ms: None,
         });
     }
     for resident in &news.approved {
@@ -1054,6 +1062,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             line: format!(
                 "a human approved resident `{name}`; assign it tasks with --kind resident --worker {name}"
             ),
+            since_ms: None,
         });
     }
     for message in &news.human {
@@ -1062,6 +1071,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
             id: format!("human-{}", message.command_id),
             why: Why::Human,
             line: message.line(),
+            since_ms: None,
         });
     }
     for (task, attempts) in waiting_attempts(work, rows) {
@@ -1071,6 +1081,7 @@ pub(crate) fn news_items(work: &Work, rows: &[Facts]) -> Vec<Escalation> {
                 id: task.delivery_key(),
                 why: Why::DeliveryFailed,
                 line: format!("task #{} {why}", task.id),
+                since_ms: None,
             });
         }
     }
@@ -1263,8 +1274,11 @@ mod tests {
             last_delivery: None,
             model: ModelProfile::Default,
             resumed_young: 0,
+            failed_resume: None,
             turn_ended: idle,
             checkpoint: None,
+            charter: None,
+            jobs: Vec::new(),
         }
     }
 

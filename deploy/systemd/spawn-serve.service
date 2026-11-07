@@ -1,5 +1,5 @@
 [Unit]
-Description=Spawn: read-only UI and API on the LAN (port 8787)
+Description=Spawn: UI and API on the LAN (port 8787): reads, and a person's input to a session
 After=docker.service
 
 [Service]
