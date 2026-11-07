@@ -1096,14 +1096,20 @@ record of what was judged (§14 of design.md).
     also while Claude Code only retries a model API that is down. A gap
     counts at most `SPAWN_BUDGET_GAP_SECS` (300 by default), and only if it
     ends in the model's progress: a tool call or background job starting
-    or ending, a message, a turn stopping. A gap that ends in a failed turn,
-    a command (a delivery, a nudge, a resume) or the engine's own events
-    counts nothing; the gap to now counts at most the cap. So a silence of
-    any length or cause (the fleet stopped, the host frozen or rebooted, no
-    live execution, the model API down) adds at most one cap, and no outage
-    can by itself put a task over budget (2026-11-07 23:05: a five-hour stop
-    aborted tasks 113 and 159 by the wall clock). The safe side: a model
-    answer streaming longer than the cap without a tool call counts the cap.
+    or ending, a turn stopping. A gap that ends in a failed turn, a prompt
+    arriving (`message.received`: a delivery, a nudge, a job's
+    notification), a command (a delivery, a nudge, a resume) or the
+    engine's own events counts nothing: the worker waited. The gap to now
+    counts at most the cap. So a silence of any length or cause (the fleet
+    stopped, the host frozen or rebooted, no live execution, the model API
+    down) adds at most one cap, and no outage can by itself put a task over
+    budget (2026-11-07 23:05: a five-hour stop aborted tasks 113 and 159 by
+    the wall clock). One bound is not the cap: a subagent's job open across
+    a model API outage retries out of the log's sight and, once it fails,
+    ends; its gap counts the fleet's alive time, so up to Claude Code's
+    retry window for a subagent, not the outage's length. The safe side: a
+    model that thinks or streams longer than the cap without a tool call
+    counts the cap.
     A gap inside a tool call or background job that later
     ended (a build, a gate in the worker) counts the time the whole fleet
     was alive in it: the log's gaps between those two events, each capped
@@ -1473,11 +1479,38 @@ record of what was judged (§14 of design.md).
   tasks may be in flight at once. A task is in flight from `task.assigned`
   until it lands or is cancelled (assigned, delivered, revise, reported,
   accepted, landing).
-  - Each integrator pass fills the free slots with the lowest open
-    objectives that have no task in flight: an objective never has two
-    tasks in flight. `spawn_objective_assign` checks both rules again under
-    the append lock, so a second integrator or a stale read cannot
+  - Each integrator pass fills the free slots with the open objectives
+    that have no task in flight (an objective never has two), fewest
+    attempts first: fewest yields, then fewest failed attempts since the
+    last yield, then the lowest id. With no failures this is the lowest open
+    objective, as before. `spawn_objective_assign` checks both rules again
+    under the append lock, so a second integrator or a stale read cannot
     oversubscribe.
+  - **No objective holds a slot for ever.** A failed attempt is an outcome
+    that says the work did not make it: the gate's `rejected`,
+    `incompatible`, or `conflict` when the worker got conflicts to resolve
+    (the record's `merge` is `marked`, `unmarked` or `pending`, or absent on
+    records from before it was named; not `not_mounted`, `busy`, `failed`
+    or a clean merge), or an abort over budget. The host's outcomes
+    (`no_room`, `host_fault`, a gate `aborted`) count for nothing, as for
+    the halt rules, and an `accepted` verdict ends the count. Once an
+    objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3, a whole number from 1)
+    failed attempts since its last yield, its task yields the slot as soon
+    as it is being worked again (assigned, delivered or `revise`; a
+    reported task waits for its gate, whose verdict may land it): the
+    integrator stops its worker (`integrate-yield-<task>`) and records
+    `task.cancelled` with `yielded`, `objective`, `failures`, `limit` and a
+    one-line `reason` (the store adds `by: spawn-integrate` and refuses
+    any other cancel by the integrator). Its work is set aside like any
+    cancel's, no halt counts it, and the supervisor's digest tells it once
+    (`missions objective-yielded-<event id>`). The objective goes to the
+    back of the queue. A task whose gate runs now, or that this pass
+    aborted, does not yield; the slot an abort frees is filled from the
+    next pass on, fewest attempts first, so the aborted objective is not
+    re-issued at once. Before this, on 2026-11-07, three objectives whose
+    tasks kept failing held mission 4's three slots for a day (an abort was
+    followed by a new task for the same objective five seconds later), and
+    objectives 025 to 034 were never assigned.
   - Who gets which task: the resident takes a task whenever it has none
     open in the mission; every other task goes to a new per-task worker
     (kind `ephemeral`, agent `agent_worker_objective_<task>`, session
@@ -1497,8 +1530,17 @@ record of what was judged (§14 of design.md).
     mission (three rejections in a row from any of its tasks halt it), and
     a halted mission gets no new task and no judging until a human resumes
     it.
-  - The brief is the objective, the working rules, and the gate verdicts of
-    its recent attempts, read from the log.
+  - The brief is the objective, the working rules, the work its earlier
+    tasks left without landing, and the gate verdicts of its recent
+    attempts, all read from the log at assignment. For each of the last
+    three tasks of the objective that were cancelled, aborted or yielded:
+    its id, its outcome and reason (its last gate verdict, abort or
+    cancel), its branch and last checkpoint (the latest `artifact.committed`
+    of its session while it ran, not a set-aside), and its report, with the
+    instruction to start from that work and not redo it (task 161 rebuilt
+    2264 lines that task 155 had mostly written). A worker's workspace is an
+    export without `.git`, so the brief names the work; it does not put the
+    files in the new workspace.
   - The task's scenario is `rsi/scenarios/<id>.sh`.
   - A one-shot objective is solved once a task for it lands. A recurring one
     (`recurring`, `metric`, `target`) stays open until the metric of its

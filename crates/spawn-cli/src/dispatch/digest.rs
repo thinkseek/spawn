@@ -70,6 +70,7 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
         Why::HoldExpired => "a source hold expired",
+        Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
     }
 }
 
@@ -94,6 +95,7 @@ fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
         match lines.iter_mut().find(|(line, _)| {
             item.session_id != HOST_SESSION
                 && item.why != Why::HoldExpired
+                && item.why != Why::ObjectiveYielded
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
         }) {
@@ -183,6 +185,39 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
                      host's, not the work's: {evidence}. It is judged again {due}; nothing is \
                      counted and nothing halts. Check the test database's host (its memory, \
                      /dev/shm, its log) or tell the owner."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `records`, the integrator's yields (`task.cancelled`
+/// naming `yielded`) that no delivered digest told yet
+/// (`PostgresStore::objective_yields`). Each is an item of session
+/// `missions`, id `objective-yielded-<event id>`: the task, its mission and
+/// objective, and the record's one-line reason, told once.
+pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let task = record["id"].as_i64()?;
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            let reason = record["reason"].as_str().map_or_else(
+                || format!("task #{task} yielded its slot"),
+                |reason| one_line(reason, 400),
+            );
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("objective-yielded-{id}"),
+                why: Why::ObjectiveYielded,
+                line: format!(
+                    "{mission}: {reason}. It is tried again after the other open objectives; \
+                     nothing halts. Split the objective, sharpen its brief, or raise its budget \
+                     if it keeps failing."
                 ),
                 since_ms: record["at_ms"].as_i64(),
             })

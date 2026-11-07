@@ -405,6 +405,9 @@ pub(crate) enum Why {
     /// there resumed, and an owner verdict judged against its main may be
     /// stale.
     HoldExpired,
+    /// An objective ran out of attempts and its task yielded the slot to
+    /// the next objective ([`digest::objective_yields`]).
+    ObjectiveYielded,
 }
 
 impl Why {
@@ -656,6 +659,13 @@ pub(crate) fn read_plan(
         store
             .gate_host_fault_escalations()
             .map_err(|error| format!("gate host fault records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::objective_yields(
+        store
+            .objective_yields()
+            .map_err(|error| format!("objective yield records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
@@ -1411,6 +1421,75 @@ mod tests {
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
+        );
+    }
+
+    /// An objective that ran out of attempts and yielded its slot reaches
+    /// an idle supervisor once, as an item of `missions` tagged
+    /// `missions objective-yielded-<event id>`, its line naming the mission
+    /// and the record's reason; two yields keep a line each.
+    #[test]
+    fn a_yielded_objective_reaches_an_idle_supervisor_once() {
+        let reason = "objective 19 had 3 failed attempts since its last turn (conflict, \
+                      conflict, rejected); task #127 yields its slot to the next objective, its \
+                      work set aside";
+        let records = [
+            serde_json::json!({"event_id": 901, "at_ms": 1_794_063_946_000_i64, "id": 127,
+                "mission": 4, "objective": 19, "failures": 3, "limit": 3, "reason": reason}),
+            serde_json::json!({"event_id": 902, "at_ms": 1_794_063_947_000_i64, "id": 106,
+                "mission": 4, "objective": 21, "failures": 3, "limit": 3}),
+        ];
+        let items = super::digest::objective_yields(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "missions objective-yielded-901",
+                "missions objective-yielded-902"
+            ]
+        );
+        assert!(items.iter().all(|item| item.why == Why::ObjectiveYielded));
+        assert_eq!(items[0].since_ms, Some(1_794_063_946_000));
+        assert!(
+            items[0]
+                .line
+                .starts_with("mission 4: objective 19 had 3 failed attempts")
+                && items[0].line.contains("task #127 yields its slot")
+                && items[0].line.contains("nothing halts"),
+            "{}",
+            items[0].line
+        );
+        assert!(
+            items[1].line.contains("task #106 yielded its slot"),
+            "{}",
+            items[1].line
+        );
+        assert!(
+            super::digest::objective_yields(&[serde_json::json!({"id": 5})]).is_empty(),
+            "a record without its event is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &[
+                "missions objective-yielded-901",
+                "missions objective-yielded-902"
+            ]
+        );
+        assert!(
+            text.lines().any(|line| line.starts_with(
+                "- missions — an objective ran out of attempts and yielded its slot: mission 4"
+            ) && line.contains("task #127")),
+            "{text}"
+        );
+        assert!(
+            text.lines().any(|line| line.contains("task #106")),
+            "each yield keeps its own line: {text}"
         );
     }
 

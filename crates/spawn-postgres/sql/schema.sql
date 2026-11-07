@@ -2308,8 +2308,22 @@ begin
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
     if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
-                                   'task.held', 'source.hold_expired') then
+                                   'task.held', 'source.hold_expired', 'task.cancelled') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- The integrator cancels one kind of task: an objective's task in flight
+    -- whose objective ran out of attempts, which yields its slot
+    -- (spawn-cli objectives.rs). The cancel's fold sets its work aside and
+    -- counts toward no halt.
+    if p_record ->> 'type' = 'task.cancelled' then
+        if p_record ->> 'yielded' is distinct from 'true' or not exists (
+            select 1 from mission_tasks
+             where id = (p_record ->> 'id')::bigint and objective is not null
+               and state in ('assigned', 'delivered', 'revise')) then
+            raise exception 'the integrator cancels only an objective''s task in flight that yields its slot, not task %',
+                            p_record ->> 'id';
+        end if;
+        p_record := p_record || jsonb_build_object('by', 'spawn-integrate');
     end if;
     -- A hold past its bound ends by this record alone, and only the active
     -- hold of its source, once the database's clock has reached its
@@ -2375,6 +2389,7 @@ begin
                               when 'task.landed' then array['landing']
                               when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
+                              when 'task.cancelled' then array['assigned', 'delivered', 'revise']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
     end if;
