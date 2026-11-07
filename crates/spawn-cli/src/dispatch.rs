@@ -701,9 +701,6 @@ pub(crate) fn read_plan(
     if let Some(at) = deliver::next_due(&work, &rows, now) {
         soon(at);
     }
-    if let Some(left) = disk_due(bounds.disk_news_ms, now) {
-        soon(left);
-    }
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
         if let Some(at) = stops::next_due(facts) {
             soon(at);
@@ -839,6 +836,15 @@ pub(crate) fn step(
         submit(store, &principal, order)?;
         lines.push(line);
     }
+    // A `recovered` disk record stops being a digest item after its day
+    // without a record of its own: that moment is a time this step waits for.
+    let at = now_ms();
+    let due_ms = match disk.due_in(at) {
+        Some(left) if left > 0 => Some(due_ms.map_or(at.saturating_add(left), |due| {
+            due.min(at.saturating_add(left))
+        })),
+        _ => due_ms,
+    };
     Ok((lines, due_ms))
 }
 
