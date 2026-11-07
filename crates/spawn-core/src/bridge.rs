@@ -262,8 +262,33 @@ impl Active {
 /// The Bridge's own view of a running engine, rebuilt after a restart: read
 /// positions start at zero (event keys make a second read a no-op), and the
 /// last recorded screen is folded from the log.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Follow {
+    /// Its files changed since the last read (or no watch says otherwise).
+    /// A session read on every pass keeps it set, so a read that left a line
+    /// half-written or a checkpoint uncommitted tries again next pass.
+    dirty: bool,
+    /// No watch could be set on its files: they are read on every pass, as
+    /// before watches, and [`Follow::watch_warned`] says so once.
+    poll: bool,
+    /// The fallback to reading on every pass was reported.
+    watch_warned: bool,
+    /// The watch on its files is set.
+    watched: bool,
+    /// When its transcript last grew, by the Bridge's clock, if it has.
+    growth: Option<i64>,
+    /// Its transcript grew and its screen has not been read since: the pane
+    /// is due once the transcript has held still for
+    /// [`BridgeConfig::screen_quiet`].
+    fresh: bool,
+    /// Its last capture could not be recorded (one reading is not a fact, or
+    /// it read [`ScreenState::Unknown`]): capture again next pass.
+    again: bool,
+    /// When its pane was last captured.
+    last_capture: Option<i64>,
+    /// When to read its files next although nothing was watched: the grace
+    /// after which a transcript that never appeared is reported.
+    due_at: Option<i64>,
     /// Bytes of the transcript read so far.
     offset: u64,
     /// The last screen state recorded, and when.
