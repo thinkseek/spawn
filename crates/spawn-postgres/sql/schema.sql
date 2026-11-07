@@ -1456,16 +1456,28 @@ begin
                                     updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
-        -- The owner moved a source's main on purpose (a deploy), forward from
-        -- where the last landing left it: the missions on that source take
-        -- the new main as their baseline instead of halting at the next pass.
-        -- The record names them (never a halted one); a record from before
-        -- it did moved every mission on the source at that baseline.
+        -- The owner moved a source's main on purpose: a deploy behind
+        -- Spawn's back (`spawn mission moved`), forward from where the last
+        -- landing left it, or the integrator's landing of the owner's
+        -- request (`spawn mission push`; the record names the `request`):
+        -- the missions on that source take the new main as their baseline
+        -- instead of halting at the next pass. The record names them (never
+        -- a halted one); a record from before it did moved every mission on
+        -- the source at that baseline.
         update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
          where sources ->> 0 = p_record ->> 'source' and baseline = p_record ->> 'from'
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
+        -- An owner's landing also names the missions on the source with no
+        -- baseline yet (new, or resumed), not halted: they take the new main
+        -- as their first baseline, so a gate of theirs that was judging
+        -- against the old main when it landed does not leave them at it.
+        update mission_missions set baseline = p_record ->> 'to', updated_at_ms = p_at
+         where sources ->> 0 = p_record ->> 'source' and baseline is null
+           and jsonb_typeof(p_record -> 'without_baseline') = 'array'
+           and id in (select m::bigint
+                        from jsonb_array_elements_text(p_record -> 'without_baseline') m);
     when 'source.held' then
         -- The owner holds landings on a source (spawn_source_hold): the
         -- source's active hold is this one. A hold on a source already held
@@ -1661,6 +1673,18 @@ begin
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
+        null;
+    when 'source.push_requested' then
+        -- The owner asked for a commit on a source's main (`spawn mission
+        -- push`): a request the integrator applies between its steps, read
+        -- from the log, folded into no table. Its outcome names it: a
+        -- `source.moved` (which moves the baselines) or a
+        -- `source.push_refused`.
+        null;
+    when 'source.push_refused' then
+        -- The integrator could not apply an owner's request (a conflict, a
+        -- commit not in the source, main moving under it twice): main and
+        -- every baseline stay where they were.
         null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
@@ -2289,17 +2313,67 @@ begin
     return v_count;
 end $$;
 
+-- The owner asks for `p_commit` on a mission source's main (`spawn mission
+-- push`, owner only): the commit already waits in the source at `p_ref`
+-- (`refs/spawn-owner/<commit>`), and the integrator applies the request
+-- between its own steps, under the landing hold, and records its outcome
+-- (`source.moved` naming it, or `source.push_refused`). Nothing else moves:
+-- no branch, no baseline, no gate. Returns the request's event id. The
+-- source is one a gate lands on: a directory on this host with a mission.
+create or replace function spawn_source_push_request(p_source text, p_commit text, p_ref text)
+returns bigint language plpgsql security definer as $$
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner lands on a source' using errcode = '42501';
+    end if;
+    if not spawn_source_allowed(p_source) then
+        raise exception 'not a mission source: %', p_source;
+    end if;
+    if left(p_source, 1) <> '/' then
+        raise exception 'the source % is remote: agents'' branches reach only a directory on '
+                        'this host, so nothing lands on it', p_source;
+    end if;
+    if not exists (select 1 from mission_missions where sources ->> 0 = p_source) then
+        raise exception 'no mission is on the source %', p_source;
+    end if;
+    if p_commit is null or p_commit !~ '^[0-9a-f]{40}([0-9a-f]{24})?$' then
+        raise exception 'a commit is named by its full hash, not %', p_commit;
+    end if;
+    if p_ref is distinct from 'refs/spawn-owner/' || p_commit then
+        raise exception 'the owner''s commit waits at refs/spawn-owner/%, not %', p_commit, p_ref;
+    end if;
+    return spawn_control_record(jsonb_build_object(
+        'type', 'source.push_requested', 'source', p_source, 'commit', p_commit,
+        'ref', p_ref, 'by', 'human'));
+end $$;
+
+-- The integrator's hold on an owner's landing (owner only): the landing
+-- hold's lock (spawn_landing_hold), so no task landing's push and its
+-- record are ever split by an owner landing, and dropping a mission waits
+-- for it. Released by spawn_landing_release.
+create or replace function spawn_source_push_hold()
+returns void language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not land work', session_user using errcode = '42501';
+    end if;
+    perform pg_advisory_lock(1399957337);
+end $$;
+
 -- The integrator's records (`spawn integrate`, owner only): gate verdicts,
 -- landings, aborts over budget, halts, the landings an owner's hold keeps
--- waiting (`task.held`) and the holds past their bound (`source.hold_expired`).
--- Returns the record's event id; null for a `task.held` already recorded for
--- the task and hold (it records nothing).
+-- waiting (`task.held`), the holds past their bound (`source.hold_expired`),
+-- and the outcomes of the owner's landing requests (`source.moved` naming its
+-- `request`, `source.push_refused`). Returns the record's event id; null for
+-- a `task.held` already recorded for the task and hold (it records nothing).
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
     v_mission bigint;
     v_stale bigint;
     v_recorded bigint;
+    v_request jsonb;
     v_hold mission_source_holds;
 begin
     -- Check and record under the append lock, so no other change interleaves.
@@ -2307,9 +2381,67 @@ begin
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
-                                   'task.held', 'source.hold_expired') then
+    if p_record ->> 'type' is null
+       or p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
+                                      'task.held', 'source.hold_expired', 'source.moved',
+                                      'source.push_refused') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- The outcome of an owner's landing names its request: a
+    -- `source.push_requested` that has no outcome yet, so every request has
+    -- at most one. A move names the request's source, where main went from
+    -- and to, and is the owner's (`by`); the missions it moves are those on
+    -- the source whose baseline was its `from` and that are not halted, as
+    -- spawn_source_moved names them (`missions`), and those with no
+    -- baseline yet, not halted (`without_baseline`).
+    if p_record ->> 'type' in ('source.moved', 'source.push_refused') then
+        if coalesce(p_record ->> 'request', '') !~ '^[0-9]{1,18}$' then
+            raise exception 'an owner landing''s outcome names its request: %', p_record;
+        end if;
+        select e.kind -> 'detail' -> 'record' into v_request
+          from spawn_events e
+         where e.id = (p_record ->> 'request')::bigint
+           and e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'source.push_requested';
+        if v_request is null then
+            raise exception 'no owner landing request %', p_record ->> 'request';
+        end if;
+        if exists (
+            select 1 from spawn_events o
+             where o.session_id = 'session_control' and o.event_name = 'control.recorded'
+               and o.kind -> 'detail' -> 'record' ->> 'type'
+                   in ('source.push_requested', 'source.push_refused', 'source.moved')
+               and o.kind -> 'detail' -> 'record' ->> 'request' = p_record ->> 'request') then
+            raise exception 'the owner landing request % has its outcome already',
+                            p_record ->> 'request';
+        end if;
+        if p_record ->> 'type' = 'source.moved' then
+            if p_record ->> 'source' is distinct from v_request ->> 'source'
+               or p_record ->> 'from' is null or p_record ->> 'to' is null then
+                raise exception 'a source.moved names the request''s source %, from and to: %',
+                                v_request ->> 'source', p_record;
+            end if;
+            p_record := p_record || jsonb_build_object('by', 'human', 'missions', (
+                select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
+                  from mission_missions m
+                 where m.sources ->> 0 = p_record ->> 'source'
+                   and m.baseline = p_record ->> 'from' and m.halted is null),
+                -- No baseline yet: a gate of theirs judging against the old
+                -- main would make it their first one, and halt them at the
+                -- next pass. They take the new main instead.
+                'without_baseline', (
+                select coalesce(jsonb_agg(m.id order by m.id), '[]'::jsonb)
+                  from mission_missions m
+                 where m.sources ->> 0 = p_record ->> 'source'
+                   and m.baseline is null and m.halted is null));
+        else
+            if coalesce(p_record ->> 'reason', '') = '' then
+                raise exception 'a source.push_refused names its reason: %', p_record;
+            end if;
+            p_record := p_record || jsonb_build_object('source', v_request ->> 'source',
+                                                       'commit', v_request ->> 'commit');
+        end if;
+        return spawn_control_record(p_record);
     end if;
     -- A hold past its bound ends by this record alone, and only the active
     -- hold of its source, once the database's clock has reached its
@@ -2631,6 +2763,15 @@ create index if not exists spawn_events_control_record
     on spawn_events ((kind -> 'detail' -> 'record' ->> 'id'), session_seq)
     where session_id = 'session_control' and event_name = 'control.recorded';
 
+-- The owner's landing requests and the records that can be their outcome,
+-- found without reading the rest of the stream: the integrator reads the
+-- pending ones on every pass.
+create index if not exists spawn_events_source_push
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type'
+          in ('source.push_requested', 'source.push_refused', 'source.moved');
+
 -- The loop's disk records (`host.disk`, owner only): free space on a path
 -- the fleet writes to fell under the warning threshold (`low`) or came back
 -- (`recovered`). One record per crossing; the loop reads the latest per path
@@ -2828,7 +2969,8 @@ begin
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
-        'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)'] loop
+        'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)',
+        'spawn_source_push_request(text, text, text)', 'spawn_source_push_hold()'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
