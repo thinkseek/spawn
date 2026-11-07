@@ -3113,10 +3113,6 @@ PENDING_ISSUES\n";
         assert!(db.records(task.id, "task.report_unfinished").is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
-    use super::{
-        NOT_READY_RETRY_MS, TaskState, Work, next_due, retry_wait_ms, sent_of, task_of, worker_of,
-    };
-
     /// The timers the mission layer waits for are the waits its own rules
     /// name: a delivery refused because the pane was not ready goes again
     /// after [`NOT_READY_RETRY_MS`], one that failed after `retry_wait_ms` of
@@ -3132,7 +3128,7 @@ PENDING_ISSUES\n";
             Some("pane state Busy does not accept input"),
         )];
         let tasks = Work {
-            tasks: vec![task(7, TaskState::Assigned)],
+            tasks: vec![task(7, TaskState::Assigned, "resident")],
             ..Work::default()
         };
         assert_eq!(
@@ -3172,7 +3168,7 @@ PENDING_ISSUES\n";
     #[test]
     fn a_delivery_with_nothing_to_retry_waits_for_no_time() {
         let tasks = Work {
-            tasks: vec![task(7, TaskState::Assigned)],
+            tasks: vec![task(7, TaskState::Assigned, "resident")],
             ..Work::default()
         };
         let mut fresh = worker(true, true);
