@@ -150,15 +150,21 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
 }
 
 /// What `runner` answers once it stops answering `Running` or `limit`
-/// passes.
+/// passes. A dead pane's `pane_dead` flag and its `pane_dead_status` are two
+/// moments of tmux's own: a pane can read dead while its exit status is
+/// still unset, so "dead (exit status none)" is not a settled answer.
 fn settled(host: &TmuxHost, limit: Duration) -> Runner {
     let deadline = Instant::now() + limit;
     loop {
         let runner = host.runner(&terminal(), &workspace()).expect("runner");
-        if runner != Runner::Running || Instant::now() > deadline {
+        let transient = matches!(
+            &runner,
+            Runner::Untracked(why) if why.contains("dead (exit status none)")
+        );
+        if (!transient && runner != Runner::Running) || Instant::now() > deadline {
             return runner;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
