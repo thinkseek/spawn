@@ -113,7 +113,10 @@ export function VerdictList({
                       active ? "bg-surface-selected" : "hover:bg-surface-hover",
                     )}
                   >
-                    <span className="tnum font-mono text-label text-muted-foreground">
+                    <span
+                      className="tnum font-mono text-label text-muted-foreground"
+                      title={verdict.label ?? undefined}
+                    >
                       T{verdict.task}
                     </span>
                     <span className="flex min-w-0 items-center gap-2 sm:contents">

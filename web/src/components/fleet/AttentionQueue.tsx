@@ -40,7 +40,7 @@ import {
 } from "../../fleet";
 import { clockTime, formatDuration } from "../../format";
 import { HeldSources } from "../missions/HeldSources";
-import { cx } from "../ui";
+import { LabeledId, cx } from "../ui";
 import { FleetStateBadge, JudgeBadge, RoleBadge } from "./bits";
 
 /**
@@ -173,8 +173,13 @@ function OnOwnJobs({
               onClick={() => onSelect(worker.session_id)}
               className="flex w-full items-baseline gap-3 py-1.5 text-left enabled:hover:bg-surface-hover"
             >
-              <span className="min-w-0 truncate text-caption font-medium text-foreground">
-                {worker.agent_id || worker.session_id}
+              <span className="min-w-0 max-w-[60%] shrink-0">
+                <LabeledId
+                  label={worker.label}
+                  id={worker.agent_id || worker.session_id}
+                  className="text-caption font-medium text-foreground"
+                  clamp={1}
+                />
               </span>
               <span className="min-w-0 flex-1 truncate font-mono text-caption text-muted-foreground">
                 {jobsText(worker.jobs) ?? "—"}
@@ -545,8 +550,8 @@ function ItemRow({
           >
             {item.why}
           </span>
-          <span className="truncate text-caption text-muted-foreground">
-            {item.agent_id ?? item.session_id}
+          <span className="min-w-0 text-caption text-muted-foreground">
+            <LabeledId label={item.label} id={item.agent_id ?? item.session_id} clamp={1} />
           </span>
           {when && (
             <span
@@ -694,8 +699,8 @@ function AttentionRow({
     >
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-          <span className="truncate text-label font-semibold text-foreground">
-            {agent.agent_id || agent.session_id}
+          <span className="min-w-0 text-label font-semibold text-foreground">
+            <LabeledId label={agent.label} id={agent.agent_id || agent.session_id} clamp={1} />
           </span>
           <RoleBadge role={agent.role} />
           <FleetStateBadge state={agent.state} />

@@ -60,15 +60,30 @@ export function TaskPanel({
           <div className="truncate text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
             {lane.name}
           </div>
-          <h3 className="mt-1 flex items-center gap-2 text-title-sm font-semibold text-foreground">
+          {task.label && (
+            <h3
+              className="mt-1 line-clamp-2 text-title-sm font-semibold text-foreground"
+              title={task.label}
+            >
+              {task.label}
+            </h3>
+          )}
+          <div
+            className={cx(
+              "flex items-center gap-2",
+              task.label
+                ? "mt-0.5 select-all font-mono text-micro text-faint-foreground"
+                : "mt-1 text-title-sm font-semibold text-foreground",
+            )}
+          >
             Task #{task.id ?? "?"}
             {task.objective !== null && (
-              <span className="text-label font-normal text-muted-foreground">
+              <span className={cx(!task.label && "text-label font-normal text-muted-foreground")}>
                 objective {task.objective}
               </span>
             )}
-          </h3>
-          {taskTitle(task, { missionName: lane.name }) && (
+          </div>
+          {!task.label && taskTitle(task, { missionName: lane.name }) && (
             <p className="mt-1 line-clamp-2 text-label text-foreground">
               {taskTitle(task, { missionName: lane.name })}
             </p>

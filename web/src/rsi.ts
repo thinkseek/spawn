@@ -6,6 +6,8 @@
 
 import { readApi } from "./api";
 import { isCut } from "./validated";
+import type { Labels } from "./label.ts";
+import { labels } from "./label.ts";
 
 export type Direction = "lower" | "higher";
 
@@ -27,9 +29,11 @@ export interface TaskVerdict extends GateVerdict {
   objective: number | null;
   /** Position of this verdict among the task's verdicts, from 1. */
   round: number;
+  /** The task's label (serve/labels.rs), null from an older server. */
+  label: string | null;
 }
 
-export interface RsiTask {
+export interface RsiTask extends Labels {
   id: number;
   kind: string | null;
   agent_id: string | null;
@@ -86,7 +90,7 @@ export interface RsiObjective {
   landings: RsiLanding[];
 }
 
-export interface RsiResident {
+export interface RsiResident extends Labels {
   name: string;
   agent_id: string | null;
   session_id: string | null;
@@ -96,6 +100,8 @@ export interface RsiResident {
 export interface RsiMission {
   id: number;
   text: string | null;
+  /** Its name, from its text and source (the server's labels). */
+  mission_name: string | null;
   state: string | null;
   sources: string[];
   gate: string | null;
@@ -202,6 +208,7 @@ function normalizeGate(value: unknown): GateVerdict {
 function normalizeTask(value: unknown): RsiTask {
   const raw = object(value);
   return {
+    ...labels(raw),
     id: number(raw.id),
     kind: optionalText(raw.kind),
     agent_id: optionalText(raw.agent_id),
@@ -270,6 +277,7 @@ function normalizeResident(value: unknown): RsiResident | null {
   if (!isObject(value)) return null;
   const raw = object(value);
   return {
+    ...labels(raw),
     name: text(raw.name, "resident"),
     agent_id: optionalText(raw.agent_id),
     session_id: optionalText(raw.session_id),
@@ -291,6 +299,7 @@ function normalizeMission(value: unknown): RsiMission {
   return {
     id: number(raw.id),
     text: optionalText(raw.text),
+    mission_name: labels(raw).mission_name,
     state: optionalText(raw.state),
     sources: list(raw.sources).filter(
       (source): source is string => typeof source === "string",
@@ -366,6 +375,7 @@ export function verdictsOf(mission: RsiMission): TaskVerdict[] {
         task: task.id,
         objective: task.objective,
         round: index + 1,
+        label: task.label,
       })),
     )
     .sort((left, right) => right.at_ms - left.at_ms || right.task - left.task);
