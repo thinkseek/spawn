@@ -103,6 +103,10 @@ fn the_dispatch_facts_do_not_scan_the_command_table() {
         !scans.iter().any(|node| node == "Seq Scan on spawn_commands"),
         "the dispatch facts read the command table: {scans:#?}"
     );
+    assert!(
+        scans.iter().any(|node| node.contains("on spawn_commands")),
+        "the plan never reads the command table at all: {scans:#?}"
+    );
 }
 
 /// Every plan node of an `EXPLAIN (FORMAT JSON)` document, as
