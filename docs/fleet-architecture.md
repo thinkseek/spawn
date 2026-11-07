@@ -1693,8 +1693,10 @@ record of what was judged (§14 of design.md).
     it continues an overrun}; the record is written once the Stop's final
     checkpoint reached the source's `spawn/<agent>` (read from the source
     after the Stop, never assumed), so `commit` and `diff` (`git diff
-    --stat main <commit>`) name the work; a push that failed is said so
-    instead (`pushed: false`, and in the log). It is never a `task.aborted`:
+    --stat main <commit>`) name the work; the wait lasts at most
+    `SPAWN_KEPT_WAIT_SECS` (30, a whole number of seconds) after the
+    checkpoint, and a push that failed is said so instead (`pushed: false`,
+    in the log and in the next task's brief). It is never a `task.aborted`:
     the mission's `gate_aborts` and `gate_rejections` stay as they were, no
     run of either is broken or started, and the task leaves flight without
     a report or a gate. The objective's next task is assigned once that
