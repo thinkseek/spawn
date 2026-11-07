@@ -572,6 +572,78 @@ pub(crate) enum GateFailure {
         tmpdir: String,
         log: String,
     },
+    /// The base disagreed with itself: one of its scenarios exited 1 and then
+    /// 0, before any candidate code ran (exit [`BASE_DISAGREES_EXIT`] and the
+    /// gate's own pair of lines). A fact about the host, not the work.
+    BaseDisagrees {
+        /// The scenario's file name, as the gate named it.
+        scenario: String,
+        /// The whole seconds of the gate's `setup <n> s`, when it printed
+        /// its `| gate time:` line.
+        setup_s: Option<u64>,
+        log: String,
+    },
+}
+
+/// A base that disagreed with itself, as the gate's own pair of lines says
+/// it: the scenario and, when the gate printed its `| gate time:` line, the
+/// setup's seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaseDisagrees {
+    pub(crate) scenario: String,
+    pub(crate) setup_s: Option<u64>,
+}
+
+/// Read the gate's own account of a base that disagreed with itself from
+/// its stdout: the last two lines are its pair
+/// (`| <name> exited 1, then 0 on the base: …`, then `| stage gate aborted
+/// <ms>ms base: <name> again (…)`), with the same `<name>` in both, a
+/// scenario's file name (no space, no `|`), optionally followed by its
+/// `| gate time:` line and nothing else. Anywhere else in the log, with
+/// another prefix (`| | …`: a nested gate's line, prefixed again), with
+/// other exits, or with anything after the pair it says nothing.
+fn base_disagrees(stdout: &str) -> Option<BaseDisagrees> {
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    let setup_s = match lines.last().and_then(|line| line.strip_prefix(GATE_TIME_LINE)) {
+        Some(times) => {
+            lines.pop();
+            setup_seconds(times)
+        }
+        None => None,
+    };
+    let stage = lines.pop()?;
+    let exited = lines.pop()?;
+    let name = exited
+        .strip_prefix("| ")?
+        .strip_suffix(BASE_EXITED_SAID)?
+        .strip_suffix(BASE_EXITED_TAIL)?;
+    let scenario = name
+        .chars()
+        .all(|char| !char.is_whitespace() && char != '|')
+        .then_some(name)?;
+    if scenario.is_empty() {
+        return None;
+    }
+    let staged = stage
+        .strip_prefix(BASE_STAGE_HEAD)?
+        .split_once("ms ")?
+        .1
+        .strip_prefix("base: ")?
+        .strip_suffix(BASE_STAGE_SAID)?;
+    (staged == scenario).then(|| BaseDisagrees {
+        scenario: scenario.to_string(),
+        setup_s,
+    })
+}
+
+/// The whole seconds of `setup <n> s` in the gate's `| gate time:` line.
+fn setup_seconds(times: &str) -> Option<u64> {
+    let (_, after) = times.split_once("setup ")?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// The gate's environment, read through `lookup`: the [`GATE_ENV`]
