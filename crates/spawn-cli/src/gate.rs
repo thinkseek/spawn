@@ -819,6 +819,56 @@ pub(crate) fn gate_env(lookup: impl Fn(&str) -> Option<String>) -> Vec<(String, 
         .collect()
 }
 
+/// Where the integrator writes its gate environment for the deploy
+/// (`deploy/deploy.sh`, warm_base_cache): set in spawn-integrate's unit to
+/// `%h/.config/spawn/gate-env`. Unset, nothing is written.
+pub(crate) const GATE_ENV_FILE: &str = "SPAWN_GATE_ENV_FILE";
+
+/// Writes `env` (the integrator's [`gate_env`]) to `path` for the deploy's
+/// base-only gate, which must compute the same cache key as the
+/// integrator's gates. The deploy read it from `/proc/<pid>/environ`
+/// before the integrator was made not dumpable; this file is what it reads
+/// now, and it holds the gates' test URL, so: mode 0600 from its creation,
+/// under `~/.config/spawn` (denied to engines), written whole (a file
+/// beside it, renamed over it).
+///
+/// The format is `/proc/<pid>/environ`'s, `NAME=value` records each ended
+/// by a NUL, with a first record `SPAWN_INTEGRATE_PID=<pid>` so the deploy
+/// knows the file is the running integrator's and not a previous one's.
+pub(crate) fn write_gate_env(
+    path: &Path,
+    pid: u32,
+    env: &[(String, String)],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut records = format!("SPAWN_INTEGRATE_PID={pid}\0").into_bytes();
+    for (name, value) in env {
+        records.extend_from_slice(format!("{name}={value}\0").as_bytes());
+    }
+    let staged = path.with_file_name(format!(
+        ".{}.{pid}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("gate-env")
+    ));
+    let _ = std::fs::remove_file(&staged);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged)?;
+    let written = file.write_all(&records).and_then(|()| file.sync_all());
+    drop(file);
+    match written.and_then(|()| std::fs::rename(&staged, path)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            Err(error)
+        }
+    }
+}
+
 /// The decisive pass over [`gate_env`]'s result: SPAWN_TEST_DATABASE_URL
 /// stays only when the owner's server and the test server both answer with
 /// their identity (`identity`, `spawn_postgres::cluster_identity` in the
@@ -1300,8 +1350,8 @@ pub(crate) fn count_scenarios(directory: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in,
-        on_shared_server, run_bounded, withhold_owners_cluster,
+        BaseDisagrees, Cpu, GateFailure, PrivateDirectory, gate_env, judge, judge_in, on_shared_server, run_bounded,
+        withhold_owners_cluster, write_gate_env,
     };
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1424,6 +1474,103 @@ mod tests {
             ("SPAWN_GATE_PG_IMAGE", "postgres:16-alpine")
         ])));
         assert!(!on_shared_server(&env(&[])));
+    /// The file the integrator writes is read by the deploy (through
+    /// deploy/gate-env.sh, which deploy.sh sources) as exactly the
+    /// environment the integrator's gates get: the deploy's base-only gate
+    /// computes the same cache key from it.
+    #[test]
+    fn the_deploy_reads_the_integrators_gate_environment_from_its_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let host = [
+            ("PATH", "/home/o/.cargo/bin:/usr/bin:/bin"),
+            ("HOME", "/home/o"),
+            ("LANG", "C.UTF-8"),
+            ("TMPDIR", "/var/tmp/spawn"),
+            ("CARGO_HOME", "/home/o/.cargo"),
+            ("RUSTUP_HOME", "/home/o/.rustup"),
+            ("SPAWN_GATE_MIN_FREE_GB", "10"),
+            ("SPAWN_GATE_JOBS", ""),
+            ("SPAWN_GATE_PG_BIN", "/usr/lib/postgresql/16/bin"),
+            (
+                "SPAWN_TEST_DATABASE_URL",
+                "postgres://gate:p%40ss@%2Fvar%2Frun%2Fpostgresql:5433/spawn_test",
+            ),
+            (
+                "SPAWN_DATABASE_URL",
+                "postgres://spawn:pw@127.0.0.1:15433/spawn",
+            ),
+            ("SPAWN_SERVE_TOKEN", "never-in-the-file"),
+        ];
+        let env = gate_env(|name| {
+            host.iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| (*value).to_string())
+        });
+        let directory = PrivateDirectory::create().expect("directory");
+        let file = directory.path().join("gate-env");
+        write_gate_env(&file, 4242, &env).expect("written");
+        let mode = std::fs::metadata(&file)
+            .expect("the file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let bytes = std::fs::read(&file).expect("read");
+        assert!(bytes.starts_with(b"SPAWN_INTEGRATE_PID=4242\0"));
+        let text = String::from_utf8(bytes).expect("utf-8");
+        assert!(!text.contains("never-in-the-file") && !text.contains("15433"));
+        // Written whole: nothing staged is left beside it.
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["gate-env"]);
+
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/gate-env.sh");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(
+                r#"set -eu; . "$1"; keep=(); own=""; test_url=""; home=""
+                gate_env_read "$2"
+                printf '%s\0' "${keep[@]}" "own=$own" "test_url=$test_url" "home=$home""#,
+            )
+            .arg("bash")
+            .arg(&helper)
+            .arg(&file)
+            .output()
+            .expect("bash runs");
+        assert!(output.status.success(), "{output:?}");
+        let read: Vec<String> = String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .split_terminator('\0')
+            .map(str::to_string)
+            .collect();
+        let mut expected: Vec<String> = env
+            .iter()
+            .filter(|(name, _)| name != "SPAWN_TEST_DATABASE_URL")
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        expected.push("own=/usr/lib/postgresql/16/bin".to_string());
+        expected.push(format!(
+            "test_url={}",
+            "postgres://gate:p%40ss@%2Fvar%2Frun%2Fpostgresql:5433/spawn_test"
+        ));
+        expected.push("home=/home/o".to_string());
+        assert_eq!(read, expected);
+        // An empty value is not the gate's (gate_env drops it), nor the
+        // deploy's any more.
+        assert!(
+            !read
+                .iter()
+                .any(|assignment| assignment == "SPAWN_GATE_JOBS=")
+        );
+
+        // Written again by the next integrator: replaced whole.
+        write_gate_env(&file, 4343, &env[..1]).expect("rewritten");
+        let bytes = std::fs::read(&file).expect("read");
+        assert_eq!(
+            bytes,
+            format!("SPAWN_INTEGRATE_PID=4343\0{}={}\0", env[0].0, env[0].1).into_bytes()
+        );
     }
 
     fn shell(script: &str) -> Command {
