@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spawn_core::bridge::{Bridge, BridgeConfig};
-use spawn_core::command::{CommandAction, Outcome, Submission};
+use spawn_core::command::{Claimed, CommandAction, Outcome, Submission};
 use spawn_core::event::{CommandStep, ENGINE, EndCause, EventKind, ModelProfile, NewEvent, Source};
 use spawn_core::id::{
     AgentId, CommandId, ExecutionId, IdempotencyKey, Principal, SessionId, TerminalName,
@@ -115,27 +115,6 @@ impl Db {
             })
             .collect()
     }
-
-    /// One record of the Bridge's.
-    fn record(
-        &self,
-        agent: &AgentId,
-        session: &SessionId,
-        execution: Option<&ExecutionId>,
-        key: String,
-        kind: EventKind,
-    ) {
-        self.store
-            .append(NewEvent {
-                agent_id: agent.clone(),
-                session_id: session.clone(),
-                execution_id: execution.cloned(),
-                source: Source::Bridge,
-                source_event_id: Some(key),
-                kind,
-            })
-            .expect("append");
-    }
 }
 
 impl Drop for Db {
@@ -143,6 +122,93 @@ impl Drop for Db {
         if let Ok(mut client) = postgres::Client::connect(&self.url, postgres::NoTls) {
             let _ = client.batch_execute(&format!("drop schema if exists {} cascade", self.schema));
         }
+    }
+}
+
+/// Records of one worker session, written as the Bridge writes them.
+struct Replay<'a> {
+    db: &'a Db,
+    agent: AgentId,
+    session: SessionId,
+    workspace: WorkspaceId,
+}
+
+impl Replay<'_> {
+    fn record(&self, execution: Option<&ExecutionId>, key: String, kind: EventKind) {
+        self.db
+            .store
+            .append(NewEvent {
+                agent_id: self.agent.clone(),
+                session_id: self.session.clone(),
+                execution_id: execution.cloned(),
+                source: Source::Bridge,
+                source_event_id: Some(key),
+                kind,
+            })
+            .expect("append");
+    }
+
+    /// The Bridge claims the next command, mounts its workspace and starts
+    /// its execution.
+    fn mount_and_start(&self) -> (Claimed, ExecutionId) {
+        let claimed = self
+            .db
+            .store
+            .claim("bridge", Duration::from_mins(1))
+            .expect("claim")
+            .expect("a command");
+        let command = claimed.command_id;
+        let execution = ExecutionId::for_command(command);
+        self.record(
+            None,
+            format!("{}:mounted", command.0),
+            EventKind::CommandStepped {
+                command_id: command,
+                step: CommandStep::Mounted,
+                workspace: Some(self.workspace.clone()),
+            },
+        );
+        self.record(
+            Some(&execution),
+            format!("{execution}:started"),
+            EventKind::ExecutionStarted {
+                engine: ENGINE.to_string(),
+                workspace: self.workspace.clone(),
+                command_id: command,
+                fork: None,
+                model: ModelProfile::Default,
+                transcript_from: None,
+            },
+        );
+        (claimed, execution)
+    }
+
+    /// The start's ready wait saw the pane ready.
+    fn ready(&self, execution: &ExecutionId) {
+        self.record(
+            Some(execution),
+            format!("{execution}:screen:ready"),
+            EventKind::ScreenObserved {
+                state: ScreenState::Ready,
+                evidence: "❯".to_string(),
+            },
+        );
+    }
+
+    fn ended_lost(&self, execution: &ExecutionId, evidence: &str) {
+        self.record(
+            Some(execution),
+            format!("{execution}:ended"),
+            EventKind::ExecutionEnded {
+                cause: EndCause::Lost,
+                exit_code: None,
+                evidence: Some(evidence.to_string()),
+            },
+        );
+    }
+
+    fn finish(&self, claimed: &Claimed, outcome: &Outcome) {
+        self.db.store.finish(claimed, outcome).expect("finish");
     }
 }
 
@@ -174,75 +240,25 @@ fn only(rows: &[Facts]) -> &Facts {
 #[test]
 fn the_129_sequence_replayed_from_events_escalates() {
     let db = Db::new("resume_129");
-    let agent = AgentId::new("agent_worker_objective_129").expect("agent");
-    let session = SessionId::new("session_worker_objective_129").expect("session");
-    let workspace = WorkspaceId::new("1:/ws/agent_worker_objective_129").expect("workspace");
-    let started = |command: CommandId| EventKind::ExecutionStarted {
-        engine: ENGINE.to_string(),
-        workspace: workspace.clone(),
-        command_id: command,
-        fork: None,
-        model: ModelProfile::Default,
-        transcript_from: None,
-    };
-    let mounted = |command: CommandId| EventKind::CommandStepped {
-        command_id: command,
-        step: CommandStep::Mounted,
-        workspace: Some(workspace.clone()),
+    let replay = Replay {
+        db: &db,
+        agent: AgentId::new("agent_worker_objective_129").expect("agent"),
+        session: SessionId::new("session_worker_objective_129").expect("session"),
+        workspace: WorkspaceId::new("1:/ws/agent_worker_objective_129").expect("workspace"),
     };
     // Its task: started, ready, typed; half an hour later the host moved.
-    let task = db.submit(
+    db.submit(
         "spawn_supervisor",
-        &agent,
-        &session,
+        &replay.agent,
+        &replay.session,
         "task-129",
         start("objective 129"),
     );
-    let claimed = db
-        .store
-        .claim("bridge", Duration::from_mins(1))
-        .expect("claim")
-        .expect("the start");
-    let first = ExecutionId::for_command(task);
-    db.record(
-        &agent,
-        &session,
-        None,
-        format!("{}:mounted", task.0),
-        mounted(task),
-    );
-    db.record(
-        &agent,
-        &session,
-        Some(&first),
-        format!("{first}:started"),
-        started(task),
-    );
-    db.record(
-        &agent,
-        &session,
-        Some(&first),
-        format!("{first}:screen:ready"),
-        EventKind::ScreenObserved {
-            state: ScreenState::Ready,
-            evidence: "❯".to_string(),
-        },
-    );
-    db.store
-        .finish(&claimed, &Outcome::Succeeded)
-        .expect("typed");
+    let (claimed, first) = replay.mount_and_start();
+    replay.ready(&first);
+    replay.finish(&claimed, &Outcome::Succeeded);
     db.age(1_800_000);
-    db.record(
-        &agent,
-        &session,
-        Some(&first),
-        format!("{first}:ended"),
-        EventKind::ExecutionEnded {
-            cause: EndCause::Lost,
-            exit_code: None,
-            evidence: Some("the engine's terminal is gone".to_string()),
-        },
-    );
+    replay.ended_lost(&first, "the engine's terminal is gone");
 
     let (_, plan) = db.plan();
     assert!(plan.pending.is_empty(), "{:?}", plan.pending);
@@ -250,41 +266,9 @@ fn the_129_sequence_replayed_from_events_escalates() {
     assert_eq!(sent, [format!("dispatch-resume-{first}")], "resumed once");
 
     // Accepted (by the submission), mounted, started, ended lost.
-    let claimed = db
-        .store
-        .claim("bridge", Duration::from_mins(1))
-        .expect("claim")
-        .expect("the resume");
-    let resume = claimed.command_id;
-    let second = ExecutionId::for_command(resume);
-    db.record(
-        &agent,
-        &session,
-        None,
-        format!("{}:mounted", resume.0),
-        mounted(resume),
-    );
-    db.record(
-        &agent,
-        &session,
-        Some(&second),
-        format!("{second}:started"),
-        started(resume),
-    );
-    db.record(
-        &agent,
-        &session,
-        Some(&second),
-        format!("{second}:ended"),
-        EventKind::ExecutionEnded {
-            cause: EndCause::Lost,
-            exit_code: None,
-            evidence: Some(format!("its start failed: {NEVER_READY}")),
-        },
-    );
-    db.store
-        .finish(&claimed, &Outcome::Failed(NEVER_READY.to_string()))
-        .expect("the resume failed");
+    let (claimed, second) = replay.mount_and_start();
+    replay.ended_lost(&second, &format!("its start failed: {NEVER_READY}"));
+    replay.finish(&claimed, &Outcome::Failed(NEVER_READY.to_string()));
 
     let (rows, plan) = db.plan();
     let facts = only(&rows);
@@ -295,7 +279,7 @@ fn the_129_sequence_replayed_from_events_escalates() {
     );
     let failed = facts.failed_resume.as_ref().expect("the failed resume");
     assert_eq!(failed.execution_id, second.as_str());
-    assert_eq!(failed.command_id, i64::try_from(resume.0).ok());
+    assert_eq!(failed.command_id, i64::try_from(claimed.command_id.0).ok());
     assert!(
         plan.orders.is_empty(),
         "not resumed again: {:?}",
@@ -304,7 +288,7 @@ fn the_129_sequence_replayed_from_events_escalates() {
     assert_eq!(plan.pending.len(), 1, "{:?}", plan.pending);
     let item = &plan.pending[0];
     assert_eq!(item.why, Why::ResumeFailed);
-    assert_eq!(item.tag(), format!("{session} resume-{second}"));
+    assert_eq!(item.tag(), format!("{} resume-{second}", replay.session));
     assert!(
         item.line
             .contains(&format!("its start failed: {NEVER_READY}")),
