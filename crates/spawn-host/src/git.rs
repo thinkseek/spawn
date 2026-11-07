@@ -3123,6 +3123,16 @@ mod tests {
     /// no file of the crate, its tests included, starts git another way.
     #[test]
     fn every_test_git_is_built_by_test_git_command() {
+        fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
         use std::ffi::OsStr;
         let command = super::test_git_command();
         let envs: Vec<_> = command.get_envs().collect();
@@ -3136,16 +3146,6 @@ mod tests {
             (OsStr::new("GIT_CONFIG_PARAMETERS"), None),
         ] {
             assert!(envs.contains(&expected), "{expected:?} in {envs:?}");
-        }
-        fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
-            for entry in std::fs::read_dir(directory).expect("a source directory") {
-                let path = entry.expect("an entry").path();
-                if path.is_dir() {
-                    sources(&path, found);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    found.push(path);
-                }
-            }
         }
         let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
