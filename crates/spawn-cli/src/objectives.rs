@@ -1042,8 +1042,9 @@ fn assign(
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
-        choose, load_backlog, metric_lines, next_open, order_problems, workers, yields,
+        Attempts, Landing, Outcome, Overrun, PriorWork, Task, abort_yields, attempt_limit, attempts,
+        brief, choose, holds, load_backlog, metric_lines, next_open, order_problems, overruns,
+        workers, yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1109,6 +1110,123 @@ mod tests {
 
     fn ids(tasks: &[&Task]) -> Vec<u32> {
         tasks.iter().map(|task| task.id).collect()
+    }
+
+    /// An overrun outcome: `task.over_budget` with the work it kept.
+    fn overrun_outcome(
+        task: i64,
+        objective: u32,
+        continues: Option<i64>,
+        commit: Option<&str>,
+        diff: Option<&str>,
+    ) -> Outcome {
+        Outcome {
+            kind: "task.over_budget".to_string(),
+            objective,
+            task,
+            at_ms: Some(1_000),
+            continues,
+            branch: Some(format!("spawn/agent_worker_objective_{task}")),
+            commit: commit.map(str::to_string),
+            diff: diff.map(str::to_string),
+            tool_calls: Some(6),
+            budget: Some(json!({"tool_calls": 5})),
+            reason: Some("the task made more than 5 tool calls".to_string()),
+            verdict: None,
+            merge: None,
+            yielded: None,
+        }
+    }
+
+    /// The next task of an objective is told what it continues: the task,
+    /// the branch, the commit and that commit's diff stat, and that the work
+    /// is in its workspace to continue.
+    #[test]
+    fn a_continuation_is_told_the_task_the_branch_the_commit_and_its_diff() {
+        let outcome = overrun_outcome(
+            84,
+            17,
+            None,
+            Some("d44c6011aa22bb33cc44dd55ee66ff7700112233"),
+            Some(" big.txt | 120 ++++++\n 1 file changed, 120 insertions(+)"),
+        );
+        let overrun = overruns(&[outcome]).remove(&17).expect("the overrun");
+        let text = brief(&objective(17, false), None, &[], &[], Some(&overrun));
+        assert!(text.contains("continues task #84"), "{text}");
+        assert!(
+            text.contains("spawn/agent_worker_objective_84"),
+            "the branch: {text}"
+        );
+        assert!(
+            text.contains("d44c6011aa22bb33cc44dd55ee66ff7700112233"),
+            "the commit: {text}"
+        );
+        assert!(text.contains("big.txt"), "the diff: {text}");
+        assert!(text.contains("1 file changed, 120 insertions(+)"), "{text}");
+        assert!(text.contains("continue it, do not redo it"), "{text}");
+        assert!(text.contains("6 tool calls"), "{text}");
+        assert!(text.contains("{\"tool_calls\":5}"), "the budget: {text}");
+        // A push that failed is said so, and the branch is still named.
+        let lost = Outcome {
+            commit: None,
+            diff: None,
+            ..overrun_outcome(84, 17, None, None, None)
+        };
+        let lost = overruns(&[lost]).remove(&17).expect("the overrun");
+        let text = brief(&objective(17, false), None, &[], &[], Some(&lost));
+        assert!(text.contains("its push failed"), "{text}");
+        assert!(text.contains("spawn/agent_worker_objective_84"), "{text}");
+    }
+
+    /// A second overrun in a chain holds its objective until the mission is
+    /// configured again; a first overrun holds nothing.
+    #[test]
+    fn a_second_overrun_holds_its_objective_until_a_configure() {
+        let first = overrun_outcome(84, 17, None, Some("a").as_ref(), None);
+        let second = overrun_outcome(87, 17, Some(84), Some("a").as_ref(), None);
+        let outcomes = [first.clone(), second.clone()];
+        let latest = overruns(&outcomes);
+        let chain = latest.get(&17).expect("the latest overrun");
+        assert_eq!(chain.task, 87, "the latest overrun is the continuation's");
+        assert!(holds(chain, None), "a second overrun holds without a configure");
+        assert!(
+            holds(chain, Some(1_000)),
+            "a configure at the record's own time does not release it"
+        );
+        assert!(!holds(chain, Some(1_001)), "a newer configure releases it");
+        let first = overruns(&[first]).remove(&17).expect("the first overrun");
+        assert!(!holds(&first, None), "a first overrun holds nothing");
+    }
+
+    /// The first overrun of an objective is continued (not held); the
+    /// mission's next open objective takes the freed slot of a held one.
+    #[test]
+    fn the_next_open_objective_takes_the_slot_of_a_held_one() {
+        let backlog = [objective(17, false), objective(18, false)];
+        let first = overruns(&[overrun_outcome(84, 17, None, Some("a").as_ref(), None)]);
+        let held: BTreeSet<u32> = first
+            .iter()
+            .filter(|(_, overrun)| holds(overrun, None))
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(held.is_empty(), "the first overrun is continued");
+        let chained = overruns(&[overrun_outcome(87, 17, Some(84), Some("a").as_ref(), None)]);
+        let held: BTreeSet<u32> = chained
+            .iter()
+            .filter(|(_, overrun)| holds(overrun, None))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(held, BTreeSet::from([17]));
+        assert_eq!(
+            ids(&choose(&backlog, &[], &BTreeSet::new(), &untried(), &held, 2)),
+            vec![18],
+            "the freed slot goes to the next open objective"
+        );
+        assert_eq!(
+            ids(&choose(&backlog, &[], &BTreeSet::new(), &untried(), &BTreeSet::new(), 2)),
+            vec![17, 18],
+            "without the hold, both are open"
+        );
     }
 
     #[test]
