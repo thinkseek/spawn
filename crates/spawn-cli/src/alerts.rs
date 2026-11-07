@@ -1929,7 +1929,7 @@ fn scrub(text: &str) -> String {
             .unwrap_or(after.len());
         out.push_str(&rest[..start]);
         out.push_str(&redact(&rest[start..index + end]));
-        rest = &rest[start + end..];
+        rest = &rest[index + end..];
     }
     out.push_str(rest);
     out
@@ -2591,6 +2591,12 @@ connections\n";
     #[test]
     fn a_base_disagreement_is_a_notice_only_when_its_record_says_alert() {
         let mut monitor = monitor();
+        feed(
+            &mut monitor,
+            39,
+            0,
+            json!({"type": "task.assigned", "id": 7, "mission_id": 4, "agent_id": "a"}),
+        );
         let record = json!({"type": "task.gated", "id": 7, "verdict": "host_fault",
                             "evidence": "base_disagrees", "alert": true, "revision": 0,
                             "scenario": "011.sh", "exits": [1, 0], "setup_s": 244,
