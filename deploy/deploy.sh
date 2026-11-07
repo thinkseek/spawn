@@ -220,7 +220,6 @@ install_build() {
   say "installed $("$live/bin/spawn" version 2>/dev/null || echo "$head") and the UI"
 }
 
-
 if [ -f "$pending" ]; then
   say "a deploy is pending ($(cat "$pending")); completing it"
   stopped=1 completing_at_start=1
