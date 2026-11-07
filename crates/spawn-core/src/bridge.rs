@@ -825,10 +825,8 @@ impl Bridge {
                 self.queue.release(claimed, self.config.input_wait_retry)?;
             }
         }
-        Ok((
-            report,
-            report.commands >= self.config.max_commands_per_tick,
-        ))
+        let left = report.commands >= self.config.max_commands_per_tick;
+        Ok((report, left))
     }
 
     /// What the Bridge reads on its own clock, never from the log: each
