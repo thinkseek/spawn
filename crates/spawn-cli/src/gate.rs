@@ -47,8 +47,9 @@
 //! gate says so itself, and exits [`BASE_DISAGREES_EXIT`] with its own pair
 //! of lines at the end of stdout (`| <name> exited 1, then 0 on the base: a
 //! harness error, not a verdict; the gate aborts`, then `| stage gate aborted
-//! <ms>ms base: <name> again (unsolved needs two runs that agree)`), the
-//! gate's `| gate time:` line last when it printed one. That pair, with exit
+//! <ms>ms base: <name> again (unsolved needs two runs that agree)`), its own
+//! trailing lines last when it printed them (its `| base runs:` phase line
+//! and its `| gate time:` line) and nothing else. That pair, with exit
 //! 4, is [`GateFailure::BaseDisagrees`]: the integrator records it
 //! `host_fault` (objective 020's verdict) with the evidence `base_disagrees`,
 //! never a count toward a halt. Every other harness error on the base (a
