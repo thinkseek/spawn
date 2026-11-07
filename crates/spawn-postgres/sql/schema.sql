@@ -2504,9 +2504,13 @@ begin
             p_mission, v_open, v_workers;
     end if;
     v_id := nextval(pg_get_serial_sequence('mission_tasks', 'id'));
-    if exists (select 1 from mission_tasks
-                where mission_id = p_mission and agent_id = v_agent
-                  and state not in ('landed', 'cancelled')) then
+    -- A continuation of an overrun always starts on a per-task worker: its
+    -- workspace is made from the overrun's work (OBJECTIVE_FORK), which a
+    -- resident's own branch no longer holds (its cancel set the work aside).
+    if p_continues is not null
+       or exists (select 1 from mission_tasks
+                   where mission_id = p_mission and agent_id = v_agent
+                     and state not in ('landed', 'cancelled')) then
         v_kind := 'ephemeral';
         v_agent := format('agent_worker_objective_%s', v_id);
         v_session := format('session_worker_objective_%s', v_id);

@@ -1702,9 +1702,11 @@ record of what was judged (§14 of design.md).
     overrun task) and its record carries `budget`, and its brief names the
     overrun task (#id, its objective, the reason and the tool calls), the
     branch, the commit and the commit's diff stat, and says the work is in
-    its workspace to continue, not to redo; the dispatcher forks its
-    workspace from that work, as for any earlier task's work, so a worker
-    that never started from main finds it. Its budget is the mission's; it
+    its workspace to continue, not to redo; it goes to a new per-task
+    worker, whose workspace the dispatcher forks from that work as for any
+    earlier task's work (a resident's own branch no longer holds it: its
+    cancel set the work aside), so the worker starts on the work, not on
+    main. Its budget is the mission's; it
     may be raised once, for that task only, to at most twice the budget.
     A **second overrun** of a task that continues one is recorded the same
     way and escalated to the supervisor once: a digest item tagged `host
