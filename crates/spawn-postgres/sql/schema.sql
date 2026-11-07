@@ -1619,6 +1619,17 @@ begin
                                     when 'host_fault' then (p_record ->> 'due_ms')::bigint
                                     when 'no_room' then gate_host_due_ms
                                     when 'stale' then gate_host_due_ms end,
+               -- The mission's base disagreements in a row (objective 033):
+               -- + 1 on a host fault with that evidence, kept by `no_room`
+               -- and `stale`, ended by every other verdict (020's host faults
+               -- included), a landing and a resume. The record that makes it
+               -- 3 carries `alert`.
+               gate_base_disagrees = case
+                   when v_verdict = 'host_fault'
+                        and p_record ->> 'evidence' = 'base_disagrees'
+                       then gate_base_disagrees + 1
+                   when v_verdict in ('no_room', 'stale') then gate_base_disagrees
+                   else 0 end,
                -- The run is this task's: a `no_room` on another task starts
                -- a new one (no inherited backoff or age).
                gate_room_task = case v_verdict when 'no_room' then v_id
