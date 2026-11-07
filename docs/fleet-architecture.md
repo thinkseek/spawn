@@ -1090,13 +1090,21 @@ record of what was judged (§14 of design.md).
     fails is pursued and escalated by the dispatcher); an abort counts
     toward the abort halt, not as a rejection.
     The minutes are active time, never the wall clock (`integrate::active_ms`):
-    from the delivery, through each event of the task's session, to now,
-    each gap counts at most `SPAWN_BUDGET_GAP_SECS` (300 by default). A
-    silence longer than that (the fleet stopped, the host frozen or
-    rebooted, no live execution, the model API down) adds only the cap, so
-    no outage of any length can by itself put a task over budget
-    (2026-11-07 23:05: a five-hour stop aborted tasks 113 and 159 by the
-    wall clock). A gap inside a tool call or background job that later
+    from the delivery, through each event of the task's session, to now.
+    Readings are no events here: the Bridge re-reads a busy pane every
+    30 s (`screen.observed`, and the observer's `observation.recorded`),
+    also while Claude Code only retries a model API that is down. A gap
+    counts at most `SPAWN_BUDGET_GAP_SECS` (300 by default), and only if it
+    ends in the model's progress: a tool call or background job starting
+    or ending, a message, a turn stopping. A gap that ends in a failed turn,
+    a command (a delivery, a nudge, a resume) or the engine's own events
+    counts nothing; the gap to now counts at most the cap. So a silence of
+    any length or cause (the fleet stopped, the host frozen or rebooted, no
+    live execution, the model API down) adds at most one cap, and no outage
+    can by itself put a task over budget (2026-11-07 23:05: a five-hour stop
+    aborted tasks 113 and 159 by the wall clock). The safe side: a model
+    answer streaming longer than the cap without a tool call counts the cap.
+    A gap inside a tool call or background job that later
     ended (a build, a gate in the worker) counts the time the whole fleet
     was alive in it: the log's gaps between those two events, each capped
     the same way, since an outage either kills the tool's engine or writes
