@@ -1290,6 +1290,14 @@ pub(crate) fn integrate(rest: &[String]) -> Result<i32, String> {
              the gate does not get it"
         );
     }
+    if let Some(path) = crate::config::env_value(gate::GATE_ENV_FILE)
+        && let Err(error) = gate::write_gate_env(Path::new(&path), std::process::id(), &gate_env)
+    {
+        eprintln!(
+            "integrate: {}: {error}; a deploy does not warm the gate's base cache",
+            gate::GATE_ENV_FILE
+        );
+    }
     let gates = gate_slots(
         flags.get("gates"),
         crate::config::env_value("SPAWN_INTEGRATE_GATES"),

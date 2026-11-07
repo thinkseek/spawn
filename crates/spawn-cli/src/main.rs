@@ -75,6 +75,19 @@ fn main() {
     std::process::exit(code);
 }
 
+/// What a long-lived process (`loop`, `serve`, `integrate`) does first: it
+/// holds the owner's database URL and tokens in its environment, and the
+/// engines run as the same user, so it makes itself not dumpable
+/// ([`spawn_host::undumpable`]): its `/proc/<pid>/environ` is then
+/// unreadable to them. The programs it starts (engines, gates, git) are
+/// dumpable again from their exec. Where the kernel refuses, it says so and
+/// goes on.
+fn long_lived() {
+    if let Err(error) = spawn_host::undumpable() {
+        eprintln!("spawn: {error}; this process's environment stays readable to its user");
+    }
+}
+
 pub(crate) fn dispatch() -> Result<i32, String> {
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
@@ -89,10 +102,19 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         }
         "submit" => queue::submit(&Flags::parse(&rest)?),
         "tick" => loops::tick(&Flags::parse(&rest)?),
-        "loop" => loops::resident_loop(&Flags::parse(&rest)?),
-        "serve" => serve::serve(&Flags::parse(&rest)?),
+        "loop" => {
+            long_lived();
+            loops::resident_loop(&Flags::parse(&rest)?)
+        }
+        "serve" => {
+            long_lived();
+            serve::serve(&Flags::parse(&rest)?)
+        }
         "scorecard" => scorecard::command(&rest),
-        "integrate" => integrate::integrate(&rest),
+        "integrate" => {
+            long_lived();
+            integrate::integrate(&rest)
+        }
         "mission" => missions::mission(&rest),
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),

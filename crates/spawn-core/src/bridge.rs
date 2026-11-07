@@ -171,6 +171,20 @@ pub struct BridgeConfig {
     pub screen_refresh: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
+    /// Environment decided again at every engine launch, after
+    /// `environment` and before `session_environment`: the fleet's test
+    /// database, given only once it is known not to be the gates' server or
+    /// the live one.
+    pub launch_environment: Option<Arc<dyn LaunchEnvironment>>,
+}
+
+/// Environment an engine gets only when it is safe at its launch (see
+/// [`BridgeConfig::launch_environment`]). Asked at every launch, so what
+/// was withheld at one is given at a later one once it checks out.
+pub trait LaunchEnvironment: Send + Sync + std::fmt::Debug {
+    /// The variables to add now; none when they are withheld (the
+    /// implementation says why where the owner reads it).
+    fn environment(&self) -> Vec<(String, String)>;
 }
 
 impl BridgeConfig {
@@ -191,6 +205,7 @@ impl BridgeConfig {
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
             model_relay: None,
+            launch_environment: None,
         }
     }
 }
@@ -2560,6 +2575,12 @@ impl Bridge {
         ];
         arguments.extend(claude_arguments(native, resume, settings));
         let mut environment = self.config.environment.clone();
+        if let Some(launch) = &self.config.launch_environment {
+            for (name, value) in launch.environment() {
+                environment.retain(|(known, _)| *known != name);
+                environment.push((name, value));
+            }
+        }
         for (session, overrides) in &self.config.session_environment {
             if session != claimed.session_id.as_str() {
                 continue;
@@ -3095,6 +3116,120 @@ fn files_digest(files: &[String]) -> u64 {
     }
     hash
 }
+
+/// Claude Code permission rules that keep an engine out of the host's
+/// credentials and the tools that hold them:
+///
+/// - Files: the loop's environment (`~/.local/share/spawn-rsi/*.env*`,
+///   `env.sh`) and its backups, the fleet's test cluster's files
+///   (`fleet-pg`), `~/.config/spawn` (database, R2, backup key, relay and
+///   API keys), `~/.config/cloudflare`, `~/.hermes`, all of `~/.claude`
+///   (Claude Code's settings and login, and the transcripts, which hold
+///   whatever a session ever printed) and `~/.claude.json`, `~/.ssh`,
+///   `~/.gnupg`, the ccd sessions' directories and their test cluster
+///   (`/data/tmp/ccd`, `/data/tmp/ccd-pg`).
+/// - Programs that read them for whoever runs them: the owner's helpers
+///   in `/var/tmp/spawn` (`*.sh`; the fleet's `TMPDIR` is that directory,
+///   so not the directory itself), and in every checkout of Spawn
+///   `deploy/hold.sh`, `deploy/deploy.sh`, `deploy/test-deploy.sh`,
+///   `deploy/cutover-controller.sh` and `deploy/backup` (`lib.sh`, which
+///   `pg-backup.sh` and `pg-restore-drill.sh` source).
+/// - Another process's environment (`/proc/<pid>/environ`, `ps e`): the
+///   long-lived spawn processes are also not dumpable
+///   (`spawn_host::undumpable`), which is what keeps their environment
+///   from the same user.
+///
+/// Claude Code's own files under `~/.claude` are its internal writes, not
+/// tool calls: a session, its transcript and a resume work with all of it
+/// denied (checked, below).
+///
+/// Checked with Claude Code 2.1.319 in throwaway interactive sessions
+/// started as the Bridge starts engines (bypass mode, these keys inline),
+/// on a scratch canary file:
+///
+/// - Deny rules apply in bypass mode ("bypassPermissions auto-approves
+///   every tool call (except explicit deny rules)").
+/// - A `Read` rule also stops the Read, Grep and Glob tools and the Bash
+///   commands Claude Code reads as reads of the path: cat, head, tail,
+///   grep, sed, awk, cp, base64, od and a `<` redirect. It does not stop
+///   `source`, `.`, `less`, `xargs cat`, `bash -c` or an interpreter
+///   (python3 `open()`).
+/// - A `Bash(*<path>*)` rule denies every command whose text names the
+///   path, those included.
+///
+/// So each path has both. What remains open is a command that spells the
+/// path without naming it (a variable, a glob, a `cd` then a relative path
+/// to an interpreter), a program that reads a file the command does not
+/// name, and the environment the engine itself gets. Rules, not a
+/// boundary: the boundary would be Claude Code's sandbox, which on Linux
+/// needs bubblewrap and socat. The Bash rules also deny ordinary commands
+/// that name these files, e.g. `git diff deploy/deploy.sh`; the Read tool
+/// still reads the checkout's scripts.
+pub const CREDENTIAL_DENY: &[&str] = &[
+    "Read(~/.local/share/spawn-rsi/*.env*)",
+    "Read(~/.local/share/spawn-rsi/env.sh)",
+    "Read(~/.local/share/spawn-rsi/backups/**)",
+    "Read(~/.local/share/spawn-rsi/fleet-pg/**)",
+    "Read(~/.config/spawn/**)",
+    "Read(~/.config/cloudflare/**)",
+    "Read(~/.hermes/**)",
+    "Read(~/.claude/**)",
+    "Read(~/.claude.json*)",
+    "Read(~/.ssh/**)",
+    "Read(~/.gnupg/**)",
+    "Read(//data/tmp/ccd/**)",
+    "Read(//data/tmp/ccd-pg/**)",
+    "Read(//var/tmp/spawn/**/*.sh)",
+    "Edit(~/.local/share/spawn-rsi/*.env*)",
+    "Edit(~/.local/share/spawn-rsi/env.sh)",
+    "Edit(~/.local/share/spawn-rsi/backups/**)",
+    "Edit(~/.local/share/spawn-rsi/fleet-pg/**)",
+    "Edit(~/.config/spawn/**)",
+    "Edit(~/.config/cloudflare/**)",
+    "Edit(~/.hermes/**)",
+    "Edit(~/.claude/**)",
+    "Edit(~/.claude.json*)",
+    "Edit(~/.ssh/**)",
+    "Edit(~/.gnupg/**)",
+    "Edit(//data/tmp/ccd/**)",
+    "Edit(//data/tmp/ccd-pg/**)",
+    "Edit(//var/tmp/spawn/**/*.sh)",
+    // The workspaces live under spawn-rsi too, so these name files, not
+    // the directory.
+    "Bash(*spawn.env*)",
+    "Bash(*spawn-rsi/env.sh*)",
+    "Bash(*spawn-rsi/backups*)",
+    "Bash(*fleet-pg*)",
+    "Bash(*.config/spawn*)",
+    "Bash(*test-database.url*)",
+    "Bash(*model-relay.env*)",
+    "Bash(*typesafe.env*)",
+    "Bash(*backup.key*)",
+    "Bash(*r2.env*)",
+    "Bash(*.config/cloudflare*)",
+    "Bash(*.hermes*)",
+    "Bash(*.claude/*)",
+    "Bash(*.claude.json*)",
+    "Bash(*/.ssh*)",
+    "Bash(*.gnupg*)",
+    "Bash(*/data/tmp/ccd*)",
+    "Bash(*/var/tmp/spawn/*.sh*)",
+    "Bash(*livepsql*)",
+    "Bash(*pgenv*)",
+    "Bash(*/hold.sh*)",
+    "Bash(* hold.sh*)",
+    "Bash(*/deploy.sh*)",
+    "Bash(* deploy.sh*)",
+    "Bash(*test-deploy.sh*)",
+    "Bash(*cutover-controller*)",
+    "Bash(*pg-backup*)",
+    "Bash(*pg-restore-drill*)",
+    "Bash(*backup/lib.sh*)",
+    "Bash(*/environ*)",
+    "Bash(*ps *eww*)",
+    "Bash(*ps *axe*)",
+    "Bash(*ps *auxe*)",
+];
 
 /// Settings passed to Claude Code for an engine on `profile`, through
 /// `relay` when there is one.
