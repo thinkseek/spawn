@@ -14,6 +14,8 @@
 //!   record alone (docs/design.md §15).
 //! - `fleet` prints every session with its judgement; `tail` one session's
 //!   judgement, events, judgements and commands.
+//! - `alerts` prints the alerts Spawn raised, once or as they are recorded
+//!   (docs/fleet-architecture.md, "Alerts").
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
 //! - `version` prints `spawn <crate version>`.
@@ -25,6 +27,7 @@
 //! in [`commands`], environment and store access in [`config`], and the
 //! Bridge/Observer assembly in [`runtime`].
 
+mod alerts;
 mod commands;
 mod config;
 mod context;
@@ -56,7 +59,7 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 
 /// The commands the contract's line does not hold, each on a line of its own
 /// after it.
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]";
+const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]";
 
 fn main() {
     let code = match dispatch() {
@@ -91,6 +94,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "task" => missions::task(&rest),
         "resident" => missions::resident(&rest),
         "fleet" => inspect::fleet(),
+        "alerts" => alerts::command(&rest),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
         "run" => engine::run(&rest),
         "version" => {
@@ -107,6 +111,19 @@ pub(crate) fn dispatch() -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::{MORE_USAGE, USAGE};
+
+    #[test]
+    fn the_usage_names_the_alerts_command() {
+        assert!(
+            MORE_USAGE.contains("spawn alerts --once")
+                && MORE_USAGE.contains("spawn alerts --follow"),
+            "{MORE_USAGE}"
+        );
+        assert!(
+            !USAGE.contains("alerts"),
+            "the contract's line stays as it was"
+        );
+    }
 
     #[test]
     fn the_usage_names_the_scorecard_on_a_line_of_its_own() {
