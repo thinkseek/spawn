@@ -2586,6 +2586,225 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
     );
 }
 
+/// libpq's variables for the test server, from its URL, as a scenario hands
+/// the server to psql (scripts/pg-url.sh pg_url_export): never a URL on a
+/// command line.
+fn libpq_env(command: &mut std::process::Command) {
+    use postgres::config::Host;
+    let config: postgres::Config = url().parse().expect("a database URL");
+    for name in [
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGDATABASE",
+        "PGSERVICE",
+        "PGOPTIONS",
+        "SPAWN_PSQL",
+    ] {
+        command.env_remove(name);
+    }
+    match config.get_hosts().first() {
+        Some(Host::Tcp(host)) => {
+            command.env("PGHOST", host);
+        }
+        Some(Host::Unix(directory)) => {
+            command.env("PGHOST", directory);
+        }
+        None => {}
+    }
+    if let Some(port) = config.get_ports().first() {
+        command.env("PGPORT", port.to_string());
+    }
+    if let Some(user) = config.get_user() {
+        command.env("PGUSER", user);
+    }
+    if let Some(password) = config.get_password() {
+        command.env("PGPASSWORD", String::from_utf8_lossy(password).as_ref());
+    }
+}
+
+/// `sh scripts/blackbox/scenario-db.sh sweep <prefix>` on the test server,
+/// with SPAWN_SCENARIO_DB_SWEEP_MINUTES `minutes` (None: unset, its
+/// default): whether it exited 0, and what it said on stdout and stderr.
+fn scenario_db_sweep(prefix: &str, minutes: Option<&str>) -> (bool, String) {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/blackbox/scenario-db.sh");
+    let mut command = std::process::Command::new("sh");
+    command.arg(&script).args(["sweep", prefix]);
+    libpq_env(&mut command);
+    match minutes {
+        Some(minutes) => command.env("SPAWN_SCENARIO_DB_SWEEP_MINUTES", minutes),
+        None => command.env_remove("SPAWN_SCENARIO_DB_SWEEP_MINUTES"),
+    };
+    let output = command.output().expect("run scenario-db.sh");
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+/// Wait (30 s at most) until `connected` sessions are open on `database`.
+fn wait_for_sessions(maintenance: &mut Client, database: &str, connected: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let open: bool = maintenance
+            .query_one(
+                "select exists (select 1 from pg_stat_activity where datname = $1)",
+                &[&database],
+            )
+            .expect("the sessions")
+            .get(0);
+        if open == connected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sessions open on {database} after 30 s: {open}, waiting for {connected}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A psql session on `database`, killed with SIGKILL (std's kill) once the
+/// server has it: a run killed with kill -9, whose cleanup never runs.
+/// Returns once the server has ended the session.
+fn kill_a_session_on(maintenance: &mut Client, database: &str) {
+    let mut session = std::process::Command::new("psql");
+    session
+        .args(["-X", "-q", "-d", database])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    libpq_env(&mut session);
+    let mut session = session.spawn().expect("a psql session (psql on PATH)");
+    wait_for_sessions(maintenance, database, true);
+    session.kill().expect("kill -9 the session");
+    let _ = session.wait();
+    wait_for_sessions(maintenance, database, false);
+}
+
+fn database_exists(client: &mut Client, name: &str) -> bool {
+    client
+        .query_one(
+            "select exists (select 1 from pg_database where datname = $1)",
+            &[&name],
+        )
+        .expect("the databases")
+        .get(0)
+}
+
+/// How many of `name`'s three logins the server has.
+fn logins_of(client: &mut Client, name: &str) -> i64 {
+    client
+        .query_one(
+            "select count(*) from pg_roles
+              where rolname in ('spawn_supervisor_' || $1, 'spawn_reader_' || $1,
+                                'spawn_human_' || $1)",
+            &[&name],
+        )
+        .expect("the logins")
+        .get(0)
+}
+
+/// The start-of-run sweep (scripts/blackbox/scenario-db.sh) drops a
+/// scenario's leftover databases, but only once they are older than
+/// SPAWN_SCENARIO_DB_SWEEP_MINUTES: "nothing is connected" alone also holds
+/// for a live run between two connections, which a parallel copy's sweep
+/// took (a live 007 lost its database and failed: review of task 154).
+#[test]
+fn a_sweep_drops_a_leftover_database_only_once_it_is_older_than_its_setting() {
+    let base = url();
+    let (server, _) = base.rsplit_once('/').expect("a database URL");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let prefix = format!("spawn_dbsweep_{}_{nanos:x}_", std::process::id());
+    let mut databases = Databases {
+        maintenance: format!("{server}/postgres"),
+        names: Vec::new(),
+        roles: Vec::new(),
+    };
+    let mut maintenance =
+        Client::connect(&databases.maintenance, NoTls).expect("maintenance connection");
+    // Killed: a run killed with kill -9 before its cleanup (its database,
+    // its logins as a migration leaves them, its session gone with it).
+    // Quiet: a live run between two connections. Busy: a live run with a
+    // session open.
+    let killed = format!("{prefix}killed");
+    let quiet = format!("{prefix}quiet");
+    let busy = format!("{prefix}busy");
+    for name in [&killed, &quiet, &busy] {
+        maintenance
+            .batch_execute(&format!("create database {name}"))
+            .expect("create a database");
+        databases.names.push(name.clone());
+    }
+    for login in ["spawn_supervisor", "spawn_reader", "spawn_human"] {
+        maintenance
+            .batch_execute(&format!(
+                "create role {login}_{killed} nologin; grant connect on database {killed} to {login}_{killed}"
+            ))
+            .expect("a login of the database");
+    }
+    kill_a_session_on(&mut maintenance, &killed);
+    let _busy_session =
+        Client::connect(&format!("{server}/{busy}"), NoTls).expect("a session on busy");
+
+    // Seconds old: the default (180 minutes) and any setting above their age
+    // keep every one, connected or not.
+    for minutes in [None, Some("180"), Some("5")] {
+        let (ran, said) = scenario_db_sweep(&prefix, minutes);
+        assert!(ran, "the sweep with {minutes:?}: {said}");
+        for name in [&killed, &quiet, &busy] {
+            assert!(
+                database_exists(&mut maintenance, name),
+                "{name} after a sweep with {minutes:?} minutes: {said}"
+            );
+        }
+        assert_eq!(
+            logins_of(&mut maintenance, &killed),
+            3,
+            "a database that is still there keeps its logins ({minutes:?}): {said}"
+        );
+    }
+    // A setting that is not a whole number of minutes drops no database.
+    for minutes in ["ten", "-1", "1.5"] {
+        let (ran, said) = scenario_db_sweep(&prefix, Some(minutes));
+        assert!(ran, "the sweep with {minutes}: {said}");
+        assert!(
+            said.contains("no database is swept"),
+            "the sweep with {minutes}: {said}"
+        );
+        for name in [&killed, &quiet, &busy] {
+            assert!(
+                database_exists(&mut maintenance, name),
+                "{name} after a sweep with {minutes}: {said}"
+            );
+        }
+    }
+    // 0: every leftover nothing is connected to goes, then the killed run's
+    // logins; the busy one stays.
+    let (ran, said) = scenario_db_sweep(&prefix, Some("0"));
+    assert!(ran, "the sweep with 0: {said}");
+    assert!(
+        !database_exists(&mut maintenance, &killed),
+        "killed: {said}"
+    );
+    assert!(!database_exists(&mut maintenance, &quiet), "quiet: {said}");
+    assert!(database_exists(&mut maintenance, &busy), "busy: {said}");
+    assert_eq!(logins_of(&mut maintenance, &killed), 0, "{said}");
+    assert!(
+        said.contains(&format!("sweep {prefix}: dropped 3 of 3")),
+        "{said}"
+    );
+}
+
 #[test]
 fn migrations_racing_on_one_server_all_succeed() {
     // Roles and grants are shared by the whole server: parallel migrations of
