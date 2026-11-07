@@ -16,8 +16,7 @@ use crate::PostgresStore;
 
 /// The event watermark and the database's clock, in one index-only read:
 /// an idle pass costs the loop one statement (objective 023).
-pub(crate) const CLOCK: &str =
-    "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
+pub(crate) const CLOCK: &str = "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
 
 /// The database's clock alone, the one every bound is measured by.
 pub(crate) const NOW: &str = "select spawn_now_ms()";

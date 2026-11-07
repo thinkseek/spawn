@@ -193,7 +193,9 @@ impl Settings {
     pub(crate) fn from_env() -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let secs = |name: &str, default: u64, warnings: &mut Vec<String>| -> i64 {
-            number(name, default, warnings).saturating_mul(1000).cast_signed()
+            number(name, default, warnings)
+                .saturating_mul(1000)
+                .cast_signed()
         };
         let settings = Self {
             check_ms: secs("SPAWN_ALERT_CHECK_SECS", 30, &mut warnings).max(1),
@@ -499,7 +501,9 @@ impl Monitor {
             let open = self
                 .known
                 .iter()
-                .filter(|(_, row)| row.open() && row.kind == "postgres_crash" && row.subject == log.subject)
+                .filter(|(_, row)| {
+                    row.open() && row.kind == "postgres_crash" && row.subject == log.subject
+                })
                 .max_by_key(|(_, row)| row.fired_at_ms);
             if let Some((_, row)) = open {
                 log.last_match_ms = row.fired_at_ms;
@@ -573,10 +577,7 @@ impl Monitor {
                     "mission": id, "record": kind, "event_id": event_id,
                     "before": before, "after": after,
                 }),
-                text: format!(
-                    "mission #{id}: {} (by {kind})",
-                    changed(&before, &after)
-                ),
+                text: format!("mission #{id}: {} (by {kind})", changed(&before, &after)),
                 notice: true,
             });
         }
@@ -734,17 +735,29 @@ times in a row)",
     }
 
     /// An admission's wait and its clear.
-    fn admission_record(&mut self, event_id: i64, at_ms: i64, record: &Value, out: &mut Vec<Event>) {
+    fn admission_record(
+        &mut self,
+        event_id: i64,
+        at_ms: i64,
+        record: &Value,
+        out: &mut Vec<Event>,
+    ) {
         let kind = record["kind"].as_str().unwrap_or("execution");
         let matched = if kind == "execution" {
-            format!("execution:{}", record["agent_id"].as_str().unwrap_or_default())
+            format!(
+                "execution:{}",
+                record["agent_id"].as_str().unwrap_or_default()
+            )
         } else {
             format!("gate:{}", record["task"].as_i64().unwrap_or_default())
         };
         match record["type"].as_str().unwrap_or_default() {
             "admission.waiting" => {
                 let subject = if kind == "execution" {
-                    record["agent_id"].as_str().unwrap_or("an execution").to_string()
+                    record["agent_id"]
+                        .as_str()
+                        .unwrap_or("an execution")
+                        .to_string()
                 } else {
                     record["task"]
                         .as_i64()
@@ -964,7 +977,8 @@ times in a row)",
         for command in commands.as_array().into_iter().flatten() {
             let id = command["command"].as_i64().unwrap_or_default();
             let key = command["key"].as_str().unwrap_or_default();
-            if key.starts_with("owner-note-") || self.known.contains_key(&format!("command_failed:{id}"))
+            if key.starts_with("owner-note-")
+                || self.known.contains_key(&format!("command_failed:{id}"))
             {
                 continue;
             }
@@ -995,7 +1009,9 @@ times in a row)",
             if task.state.as_deref() != Some("assigned") || !task.agent_free {
                 continue;
             }
-            let due = task.assigned_at.saturating_add(self.settings.undelivered_ms);
+            let due = task
+                .assigned_at
+                .saturating_add(self.settings.undelivered_ms);
             if now < due {
                 continue;
             }
@@ -1043,7 +1059,8 @@ times in a row)",
                 }),
                 text: format!(
                     "{} has waited {} s to be admitted",
-                    matched, now.saturating_sub(pending.at_ms) / 1000
+                    matched,
+                    now.saturating_sub(pending.at_ms) / 1000
                 ),
                 notice: false,
             });
@@ -1115,7 +1132,8 @@ times in a row)",
         }
         match available_mb() {
             Ok(measured) => {
-                if measured < self.settings.memory_low_mb && self.open_keys("memory_low", "host").is_empty()
+                if measured < self.settings.memory_low_mb
+                    && self.open_keys("memory_low", "host").is_empty()
                 {
                     out.push(Event::Fire {
                         key: format!("memory_low:{now}"),
@@ -1210,7 +1228,11 @@ times in a row)",
                 return;
             }
             Err(error) => {
-                self.say_once(index, &format!("alerts: {}: {error}", path.display()), lines);
+                self.say_once(
+                    index,
+                    &format!("alerts: {}: {error}", path.display()),
+                    lines,
+                );
                 return;
             }
         };
@@ -1281,7 +1303,13 @@ times in a row)",
 
     /// Record `events`, in order, each once: the store refuses a second
     /// `alert.fired` for a key, so two loops at once still fire once.
-    fn flush(&mut self, store: &PostgresStore, now: i64, events: &[Event], lines: &mut Vec<String>) {
+    fn flush(
+        &mut self,
+        store: &PostgresStore,
+        now: i64,
+        events: &[Event],
+        lines: &mut Vec<String>,
+    ) {
         for event in events {
             let key = event.key().to_string();
             let record = match event {
@@ -1381,7 +1409,10 @@ times in a row)",
                     .known
                     .contains_key(&format!("task_undelivered:{id}:{assigned}"))
             {
-                next = next.min(task.assigned_at.saturating_add(self.settings.undelivered_ms));
+                next = next.min(
+                    task.assigned_at
+                        .saturating_add(self.settings.undelivered_ms),
+                );
             }
         }
         for pending in self.admitted.values() {
@@ -1670,9 +1701,7 @@ fn top_processes() -> Value {
         processes
             .into_iter()
             .take(3)
-            .map(|(rss_kb, pid, name)| {
-                json!({"pid": pid, "rss_mb": rss_kb / 1024, "name": name})
-            })
+            .map(|(rss_kb, pid, name)| json!({"pid": pid, "rss_mb": rss_kb / 1024, "name": name}))
             .collect(),
     )
 }
@@ -1712,7 +1741,10 @@ fn read_appended(path: &Path, log: &mut LogWatch) -> Result<Option<(String, bool
     log.carry.push_str(&String::from_utf8_lossy(&bytes));
     // A line the reading cut waits for its end in the next one.
     let (complete, carry) = match log.carry.rfind('\n') {
-        Some(at) => (log.carry[..=at].to_string(), log.carry[at + 1..].to_string()),
+        Some(at) => (
+            log.carry[..=at].to_string(),
+            log.carry[at + 1..].to_string(),
+        ),
         None => (String::new(), std::mem::take(&mut log.carry)),
     };
     log.carry = carry;
@@ -1979,10 +2011,7 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         let alerts = window(&store, since.as_deref())?;
         let alerts = alerts.as_array().cloned().unwrap_or_default();
         if json {
-            println!(
-                "{}",
-                Value::Array(alerts.clone())
-            );
+            println!("{}", Value::Array(alerts.clone()));
         } else {
             for alert in &alerts {
                 println!("{}", line(alert));
