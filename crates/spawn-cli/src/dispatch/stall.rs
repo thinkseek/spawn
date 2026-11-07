@@ -663,15 +663,34 @@ struct Context<'a> {
     judged_next: BTreeSet<i64>,
 }
 
-/// The stall items for the current facts, and the earliest time a stall
-/// this pass has not escalated yet becomes due: one item per open task (or
-/// halted mission) whose step has stood still for its bound or longer.
-/// Whether the supervisor was told already is the digest's business (the
-/// tag): an item whose tag is in `told` was sent and is not sent again, so
-/// it waits for no time. The times are on the database's clock
-/// ([`Stalls::now_ms`], which the ages are measured against), never this
-/// host's.
+/// The stall items for the current facts: one per open task (or halted
+/// mission) whose step has stood still for its bound or longer. Whether
+/// the supervisor was told already is the digest's business (the tag).
 pub(crate) fn items(
+    rows: &[Facts],
+    work: &Work,
+    stalls: &Stalls,
+    bounds: &Bounds,
+) -> Vec<Escalation> {
+    walk(rows, work, stalls, bounds).0
+}
+
+/// When the dispatcher's next step is due for a stall it has not escalated
+/// yet: the earliest `since + bound` among the tasks and halted missions
+/// [`items`] measures, on the database's clock. One whose tag the supervisor
+/// was told waits for no time: it is never sent again while its record
+/// stands. `None`: no open task is at a step.
+pub(crate) fn next_due(
+    rows: &[Facts],
+    work: &Work,
+    stalls: &Stalls,
+    bounds: &Bounds,
+) -> Option<i64> {
+    walk(rows, work, stalls, bounds).1
+}
+
+/// [`items`] and [`next_due`] from one walk of the same records.
+fn walk(
     rows: &[Facts],
     work: &Work,
     stalls: &Stalls,
@@ -682,7 +701,7 @@ pub(crate) fn items(
         .iter()
         .find(|facts| facts.session_id == SUPERVISOR_SESSION)
         .map_or(&empty, |facts| &facts.told);
-    let context = Context {
+    let mut context = Context {
         stalls,
         work,
         facts: rows
@@ -696,11 +715,10 @@ pub(crate) fn items(
     let now = stalls.now_ms;
     let mut items = Vec::new();
     let mut due: Option<i64> = None;
-    let mut deadline = |session: &str, id: String, at: i64| {
-        if told.contains(&format!("{session} {id}")) {
-            return;
+    let mut deadline = |session: &str, id: &str, at: i64| {
+        if !context.told.contains(&format!("{session} {id}")) {
+            due = Some(due.map_or(at, |known: i64| known.min(at)));
         }
-        due = Some(due.map_or(at, |known| known.min(at)));
     };
     for task in &stalls.tasks {
         let Some(record) = &task.record else {
@@ -712,8 +730,11 @@ pub(crate) fn items(
         };
         let step = measured.step.word();
         let id = format!("stall-{}-{step}-{}", task.id, measured.n);
-        let at = measured.since_ms.saturating_add(measured.bound_ms);
-        deadline(&task.session_id, id.clone(), at);
+        deadline(
+            &task.session_id,
+            &id,
+            measured.since_ms.saturating_add(measured.bound_ms),
+        );
         let still = now - measured.since_ms;
         if still < measured.bound_ms {
             continue;
@@ -743,7 +764,7 @@ pub(crate) fn items(
         let id = format!("stall-mission-{}-halted-{}", halt.mission_id, record.id);
         deadline(
             "missions",
-            id.clone(),
+            &id,
             record.at_ms.saturating_add(bounds.halted),
         );
         let still = now - record.at_ms;
