@@ -562,6 +562,40 @@ select coalesce(jsonb_agg(jsonb_build_object(
      where x.r ->> 'type' in ('task.gated', 'task.aborted', 'task.cancelled')
      order by x.seq desc limit 1) o on true";
 
+/// The work an ephemeral objective task starts from: the newest earlier
+/// task of its objective that ended without landing (cancelled, aborted or
+/// yielded) and left work, a checkpoint of its own (`tool_completed`,
+/// `turn_stopped`, `execution_ended`) recorded while it ran, as
+/// `{task, commit}` with its last checkpoint that is not a set-aside; null
+/// for a resident's task, a task with no objective, or none such. The same
+/// window as [`OBJECTIVE_PRIOR_WORK`]: from the task's assignment until its
+/// session's next task. `$1` the task.
+pub(crate) const OBJECTIVE_FORK: &str = r"
+select coalesce((
+  select jsonb_build_object('task', p.id, 'commit', c.commit)
+    from mission_tasks k
+    join mission_tasks p on p.mission_id = k.mission_id and p.objective = k.objective
+                        and p.id < k.id and p.state = 'cancelled'
+   cross join lateral (
+     select coalesce((select min(n.created_at_ms) from mission_tasks n
+                       where n.session_id = p.session_id
+                         and n.created_at_ms > p.created_at_ms),
+                     9223372036854775807) as until) w
+   cross join lateral (
+     select a.kind -> 'detail' -> 'artifact' ->> 'commit' as commit
+       from spawn_events a
+      where a.session_id = p.session_id and a.event_name = 'artifact.committed'
+        and a.recorded_at_ms >= p.created_at_ms and a.recorded_at_ms < w.until
+        and a.kind -> 'detail' ->> 'reason' is distinct from 'set_aside'
+      order by a.id desc limit 1) c
+   where k.id = $1 and k.kind = 'ephemeral' and k.objective is not null
+     and exists (select 1 from spawn_events a
+                  where a.session_id = p.session_id and a.event_name = 'artifact.committed'
+                    and a.recorded_at_ms >= p.created_at_ms and a.recorded_at_ms < w.until
+                    and a.kind -> 'detail' ->> 'reason'
+                        in ('tool_completed', 'turn_stopped', 'execution_ended'))
+   order by p.id desc limit 1), 'null'::jsonb)";
+
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
 /// the integrator may judge, land, or hold to its budget, with the brief and
@@ -987,6 +1021,12 @@ impl PostgresStore {
         limit: i64,
     ) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_PRIOR_WORK, &[&mission, &objective, &limit])
+    }
+
+    /// The predecessor's work an ephemeral objective task starts from, or
+    /// null ([`OBJECTIVE_FORK`]).
+    pub fn objective_fork(&self, task: i64) -> Result<Value, StoreError> {
+        self.query_json(OBJECTIVE_FORK, &[&task])
     }
 
     /// Take the integrator's lock. False means another integrator runs now.

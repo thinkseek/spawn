@@ -762,6 +762,19 @@ pub(crate) fn step(
                 }
             }
         }
+        // A re-assigned objective's ephemeral task starts from the work
+        // its predecessor left, with main merged in ([`fork_before`]); a
+        // fork that fails holds the Start until a later pass, so the task
+        // never starts from main over work it should continue.
+        if let Some(root) = root {
+            match fork_before(store, root, &mut order) {
+                Ok(line) => lines.extend(line),
+                Err(error) => {
+                    lines.push(format!("deliver: {error}; tried again next pass"));
+                    continue;
+                }
+            }
+        }
         // A task typed into a live worker starts from the source's main:
         // merged into its idle workspace first, and the brief says what the
         // merge did ([`crate::main_merge`]). A worker found busy at the
@@ -827,6 +840,50 @@ fn set_aside_before(
         }
         _ => None,
     })
+}
+
+/// Fork the branch of the ephemeral objective task `order` starts from
+/// the work its objective's earlier task left without landing, with main
+/// merged in ([`crate::main_merge::fork_from_prior`]), and add to the
+/// Start's prompt what it starts from and what the merge did. Nothing for
+/// any other order, or a task with no such predecessor (its branch forks
+/// from main at the Start, as before). Returns a log line when it forked.
+pub(crate) fn fork_before(
+    store: &std::sync::Arc<PostgresStore>,
+    root: &Path,
+    order: &mut Order,
+) -> Result<Option<String>, String> {
+    let CommandAction::Start { prompt, .. } = &mut order.action else {
+        return Ok(None);
+    };
+    let Some(task) = order.task else {
+        return Ok(None);
+    };
+    let prior: Option<crate::main_merge::PriorWork> = serde_json::from_value(
+        store
+            .objective_fork(task)
+            .map_err(|error| format!("task #{task}'s earlier work: {error}"))?,
+    )
+    .map_err(|error| format!("task #{task}'s earlier work: {error}"))?;
+    let Some(prior) = prior else {
+        return Ok(None);
+    };
+    let Some(merge) = crate::main_merge::fork_from_prior(
+        store,
+        root,
+        &order.agent_id,
+        &order.session_id,
+        &prior,
+    )?
+    else {
+        return Ok(None);
+    };
+    prompt.push_str("\n\n");
+    prompt.push_str(&crate::main_merge::fork_note(&prior, &merge));
+    Ok(Some(format!(
+        "deliver: task #{task} starts from task #{}'s work {}: main {merge:?}",
+        prior.task, prior.commit
+    )))
 }
 
 /// Merge main into the workspace of the live worker `order` types a task
