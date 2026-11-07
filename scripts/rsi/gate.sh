@@ -34,8 +34,8 @@
 #   `check-*` scenarios are invariants and always must pass. A check that
 #   fails on the candidate is run again there; one that fails twice is run
 #   on the base: passing there, it is a regression (rejected); failing there
-#   too, it is no verdict on the candidate (a host or harness fault, as a
-#   harness error on the base: exit 4). One that passes the second time is
+#   too, it is no verdict on the candidate (a host or harness fault: exit 6,
+#   below). One that passes the second time is
 #   a flake, said in the log, and the gate goes on ("Checks run twice"
 #   below).
 #
@@ -44,8 +44,11 @@
 # tool, an unreachable database, a timeout kill). Each is judged on the base
 # BEFORE any candidate code runs, since both share the test server and a
 # candidate could otherwise sabotage the base's run: 0 = solved, 1 (twice,
-# from two runs that agree) = unsolved, anything else aborts the gate (exit
-# 4, no verdict: the integrator records an abort, never a skip). The base's
+# from two runs that agree) = unsolved, anything else is a host fault (exit
+# 6 with its fact in the verdict file, no verdict: the integrator records
+# `host_fault`, retried after a backoff and counted toward no halt, never a
+# skip). Exit 4 is left for a run the gate itself lost (ended without a
+# result). The base's
 # runs all end before the candidate builds; within each phase, scenarios run
 # SPAWN_GATE_JOBS at a time, the log and the verdict still the serial
 # order's ("Parallel runs" below). Results are
@@ -304,6 +307,36 @@ verdict() {
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
     fi
     echo "$json"
+}
+
+# host_fault <scenario> <on> <runs> <reason>: no verdict on the candidate,
+# a fact about the host or the harness instead (exit 6), written where a
+# verdict would be: `{"host_fault":true,"scenario","on","runs","reason",
+# "base","candidate"}`. `on` is where it failed: `base` (a scenario's
+# harness error on the base, before any candidate code ran: its runs did
+# not agree, or it exited neither 0 nor 1) or `candidate and base` (a check
+# that failed twice on the candidate and once on the base). The integrator
+# believes the fact only from its own verdict file with exit 6 (the sandbox
+# never sees that file) and records `host_fault`: retried after a backoff,
+# counted toward no halt (gate.rs `HOST_FAULT_EXIT`).
+host_fault() {
+    # Base only judges no candidate and writes no verdict file: no
+    # verdict, as before (exit 4).
+    if [ -n "$base_only" ]; then
+        echo "| $4"
+        exit 4
+    fi
+    stage_close host_fault
+    gate_times
+    stage_emit gate host_fault "$(($(stage_now) - gate_started))" total
+    json="{\"host_fault\":true,\"scenario\":\"$(json_string "$1")\",\"on\":\"$2\""
+    json="$json,\"runs\":\"$(json_string "$3")\",\"reason\":\"$(json_string "$4")\""
+    json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
+    if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
+        printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
+    fi
+    echo "$json"
+    exit 6
 }
 
 # What the verdict is about: both commits, resolved once.
@@ -1617,7 +1650,18 @@ base_job() {
         ;;
     esac
     if [ -z "$result" ]; then
-        job_say "| $name exited $first on the base: a harness error, not a verdict; the gate aborts"
+        printf '%s\n' "$first" >"$job/runs"
+                # A base that disagrees with itself (1, then 0) keeps objective 033's
+        # statement and exit 4: base_printed exits with that pair below, and
+        # gate.rs records it `host_fault` with evidence `base_disagrees`.
+        # Any other harness error on the base is exit 6 with its fact
+        # (`host_fault` in base_printed): a base-only host fault that counts
+        # toward no halt.
+        if [ "$first" = "1, then 0" ]; then
+            job_say "| $name exited $first on the base: a harness error, not a verdict; the gate aborts"
+        else
+            job_say "| $name exited $first on the base: a harness error, not a verdict on the candidate"
+        fi
         job_stage "$(($(stage_now) - run_at))" aborted "$run_name"
         job_done abort
         return 0
@@ -1650,9 +1694,20 @@ base_printed() {
         run_on_base="$run_on_base $printed_name"
         result=$2
         ;;
+    abort)
+        phase_time base
+        # Objective 033: a base that disagrees with itself is stated by the
+        # gate's own pair and exit 4 (gate.rs `base_disagrees`), never by the
+        # host fact too: one run is one record.
+        if [ "$(cat "$1/runs" 2>/dev/null)" = "1, then 0" ]; then
+            exit 4
+        fi
+        host_fault "$printed_name" base "$(cat "$1/runs" 2>/dev/null)" \
+            "$printed_name exited $(cat "$1/runs" 2>/dev/null) on the base, before any candidate code ran: a host or harness fault, not a verdict on the candidate"
+        ;;
     *)
         phase_time base
-        [ "$2" = abort ] || echo "| $printed_name: the gate could not run it on the base; the gate aborts"
+        echo "| $printed_name: the gate could not run it on the base; the gate aborts"
         exit 4
         ;;
     esac
@@ -1839,8 +1894,9 @@ fi
 # - passes the second time: a flake, not a regression (said in the log);
 # - fails twice, passes on the base: a regression, rejected as before;
 # - fails twice and on the base: no verdict on the candidate, a host or
-#   harness fault: the gate aborts (exit 4), as for a harness error on the
-#   base, and the integrator judges the task again later.
+#   harness fault: exit 6 with its fact (`host_fault` above), as for a
+#   harness error on the base, and the integrator judges the task again
+#   after a backoff.
 # The first run's block keeps its header, so the integrator reads
 # check-tests' failures from the first run (integrate/host.rs `section`).
 # candidate_job <job>: one scenario on the candidate (its runs), in the
@@ -1874,6 +1930,7 @@ candidate_job() {
             job_say "| == $base_name"
             if ! base_ready; then
                 job_say "| the base cannot be built to run it: no verdict on the candidate"
+                printf '%s\n' "$run_status, then $again on the candidate; the base does not build" >"$job/runs"
                 run_status=abort
             else
                 on_base=0
@@ -1885,6 +1942,7 @@ candidate_job() {
                     run_status=$again
                 else
                     job_say "| $(basename "$job_scenario") fails on the base too ($on_base): a host or harness fault, no verdict on the candidate"
+                    printf '%s\n' "$run_status, then $again on the candidate; $on_base on the base" >"$job/runs"
                     run_status=abort
                 fi
                 run_name=$base_name
@@ -1945,10 +2003,11 @@ candidate_printed() {
         exit 3
     fi
     if [ "$printed_status" = abort ]; then
-        run_stage "aborted|$(cat "$1/last")" "$printed_ms"
+        run_stage "host_fault|$(cat "$1/last")" "$printed_ms"
         phase_time candidate
-        echo "| $(basename "$printed_scenario") fails on the candidate and on the base: the gate aborts (no verdict)"
-        exit 4
+        echo "| $(basename "$printed_scenario") fails on the candidate and on the base: a host or harness fault, no verdict"
+        host_fault "$(basename "$printed_scenario")" "candidate and base" "$(cat "$1/runs" 2>/dev/null)" \
+            "$(basename "$printed_scenario") failed twice on the candidate and on the base: a host or harness fault, not a verdict on the candidate"
     fi
     if [ -e "$1/task" ]; then
         # The metric is the scenario's: one line on its stdout. Stderr is

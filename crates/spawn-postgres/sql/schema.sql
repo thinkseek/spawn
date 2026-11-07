@@ -2836,10 +2836,15 @@ begin
     end if;
     -- A host fault names its evidence (§14): the failures the gate printed,
     -- each the host's, and, when the test database's log decided it, the
-    -- crash lines stamped inside the gate's window; and its backoff.
+    -- crash lines stamped inside the gate's window (`failures`,
+    -- `server_log`); the base's own disagreement (objective 033's
+    -- `base_disagrees`, with its scenario, both exits and its run); or the
+    -- gate's own fact (`gate`: a scenario's harness error on the base, or a
+    -- check failing on the candidate and the base, naming the scenario and
+    -- where); and its backoff.
     if p_record ->> 'type' = 'task.gated' and p_record ->> 'verdict' = 'host_fault'
        and (coalesce(p_record ->> 'evidence', '') not in ('failures', 'server_log',
-                                                          'base_disagrees')
+                                                          'base_disagrees', 'gate')
             or jsonb_typeof(p_record -> 'backoff_ms') is distinct from 'number'
             or (p_record ->> 'evidence' in ('failures', 'server_log')
                 and (case when jsonb_typeof(p_record -> 'failures') = 'array'
@@ -2857,7 +2862,10 @@ begin
                      or jsonb_typeof(p_record -> 'alert') is distinct from 'boolean'
                      or p_record ->> 'escalate' is distinct from 'false'
                      or (p_record ? 'setup_s'
-                         and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))) then
+                         and jsonb_typeof(p_record -> 'setup_s') is distinct from 'number')))
+            or (p_record ->> 'evidence' = 'gate'
+                and (coalesce(p_record -> 'fact' ->> 'scenario', '') !~ '^[^[:space:]|]+$'
+                     or coalesce(p_record -> 'fact' ->> 'on', '') not in ('base', 'candidate and base')))) then
         raise exception 'a host_fault verdict names its evidence, its facts and backoff_ms: %',
                         p_record;
     end if;

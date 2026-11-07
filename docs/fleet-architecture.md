@@ -1147,9 +1147,10 @@ the tree's own:
   time, it is a flake (said in the log) and the gate goes on; failing
   twice, it is run on the base (built for it when every base result came
   from the cache): passing there, it is a regression; failing there too, it
-  is a host or harness fault, no verdict (exit 4). That base run follows
+  is a host or harness fault, no verdict (exit 6, a `host_fault`, §10.3:
+  backed off, never counted toward a halt). That base run follows
   candidate code on the shared test server, so it can only turn a
-  rejection into an abort, never into an acceptance. (2026-11-07: one e2e
+  rejection into a host fault, never into an acceptance. (2026-11-07: one e2e
   run that failed under load rejected task 127's 85-minute gate; the same
   tree passes it.)
 - everything the candidate controls runs in a bubblewrap sandbox (docs/rsi.md
@@ -1191,10 +1192,12 @@ the tree's own:
   records `no_room` with its own measurement only when that is under the
   floor. It does this in two cases: the gate exited 5 (it measures the
   gate's `TMPDIR`), or the integrator could not create or use its private
-  directory for the gate (it measures that directory's parent). Any other
-  status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
-  `TMPDIR`, a floor that is not whole GiB), exit 4 (the base's run errored,
-  or a check failed on the candidate twice and on the base),
+  directory for the gate (it measures that directory's parent). It exits 6
+  with a host-fault fact (a scenario's harness error on the base, or a
+  check failing on the candidate and the base): `host_fault`, §10.3. Any
+  other status is an abort: exit 3 (no bwrap, a missing bind directory, an unreadable
+  `TMPDIR`, a floor that is not whole GiB), exit 4 (a run the gate lost:
+  ended without a result),
   a timeout or a signal. The integrator measures the same floor, free
   memory and the test database itself before it starts the gate (§10.3,
   step 3), so a short host is found before a gate runs; the gate's own
@@ -1512,6 +1515,21 @@ record of what was judged (§14 of design.md).
      pair of lines named in the record (`scenario`, `exits`), never on the
      reason's text, on time or on a scenario's name; the wait rests on the
      recorded `due_ms`.
+     The gate reports host faults of its own too: exit 6 with its fact in
+     the verdict file (`{"host_fault":true,"scenario","on","runs",
+     "reason"}`, gate.rs `HOST_FAULT_EXIT`), for a scenario's harness error
+     on the base that is not the disagreement above (its two runs did not
+     end 1 and then 0: an exit neither 0 nor 1, or 1 and then something
+     else; `on` `base`), and for a check that failed twice on the candidate
+     and on the base (`on` `candidate and base`, §10.2). Each is recorded
+     `host_fault` with `evidence` `gate` and the gate's `fact`, under the
+     same backoff, escalation and counts: `gate_aborts` does not move. The
+     fact counts only from the integrator's own verdict file, which the
+     sandbox never sees, and only with exit 6. A base that disagrees with
+     itself stays the disagreement above: the gate keeps its exit 4 and its
+     pair for it (`base_disagrees`), so the two never describe one run; a
+     base-only fault of either evidence never counts toward
+     `SPAWN_GATE_HOST_FAULT_CAP` and is never capped (§10.3).
   6. moves `main` on the source with a compare-and-swap push
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
