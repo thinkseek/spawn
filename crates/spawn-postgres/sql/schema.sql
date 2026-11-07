@@ -1658,6 +1658,10 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
+    when 'task.report_unfinished' then
+        -- A report still a draft, not taken (spawn_task_report_unfinished):
+        -- the task stays delivered, so nothing is folded.
+        null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
         case p_record ->> 'table'
@@ -1961,6 +1965,51 @@ create or replace function spawn_task_reported(p_task bigint, p_report text)
 returns boolean language plpgsql security definer as $$
 begin
     return spawn_task_reported(p_task, p_report, null);
+end $$;
+
+-- Whether a report of `p_task` whose content has digest `p_digest` was
+-- already found unfinished for the task's current revision (its
+-- `task.report_unfinished` record): its worker was told, once, for that
+-- content.
+create or replace function spawn_task_report_unfinished_recorded(p_task bigint, p_digest text)
+returns boolean language sql stable security definer as $$
+    select exists (
+        select 1
+          from spawn_events e
+          join mission_tasks k on k.id = p_task
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.report_unfinished'
+           and e.kind -> 'detail' -> 'record' ->> 'id' = p_task::text
+           and e.kind -> 'detail' -> 'record' ->> 'digest' = p_digest
+           and (e.kind -> 'detail' -> 'record' ->> 'revision')::integer = k.revisions)
+$$;
+
+-- Record that a delivered task's report was read and not taken: it is still
+-- a draft (crates/spawn-cli/src/deliver/unfinished.rs). The record names the
+-- task's revision, the content's `digest`, the `markers` found (each with
+-- its line) and the note that tells the worker (`note`, its idempotency key,
+-- and `command_id`). Once per revision and content: false, and nothing
+-- recorded, when that content was recorded already, or the task is not
+-- delivered. The task stays delivered.
+create or replace function spawn_task_report_unfinished(p_task bigint, p_digest text,
+                                                        p_markers jsonb, p_note text,
+                                                        p_command bigint)
+returns boolean language plpgsql security definer as $$
+begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record reports', session_user using errcode = '42501';
+    end if;
+    if not exists (select 1 from mission_tasks where id = p_task and state = 'delivered')
+       or spawn_task_report_unfinished_recorded(p_task, p_digest) then
+        return false;
+    end if;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'task.report_unfinished', 'id', p_task,
+        'revision', (select revisions from mission_tasks where id = p_task),
+        'digest', p_digest, 'markers', p_markers, 'note', p_note, 'command_id', p_command));
+    return true;
 end $$;
 
 -- Review a report: accept, or send it back with a note. `p_revision` names
@@ -2770,6 +2819,8 @@ begin
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
+        'spawn_task_report_unfinished(bigint, text, jsonb, text, bigint)',
+        'spawn_task_report_unfinished_recorded(bigint, text)',
         'spawn_control_apply(jsonb, bigint, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
