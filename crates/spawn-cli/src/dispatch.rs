@@ -62,7 +62,7 @@
 //! mission rows, the control stream and the queue. It runs when the log's
 //! watermark has moved since it last ran (a record it decides from may be
 //! new), and otherwise only when a time one of those records names has come
-//! ([`Reading::due_ms`]): a delivery's retry ([`deliver::Attempts`]: the
+//! ([`Reading::due_ms`]): a delivery's retry (`deliver::attempts`: the
 //! wait after a refusal that typed nothing, or the doubling wait after a
 //! failure), a stall's bound ([`stall`], measured from the record the step
 //! stands on), a failed Stop's retry ([`stops`]), a background job's bound
