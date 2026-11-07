@@ -399,6 +399,24 @@ const RESOLVE_MARKERS: &str = "Resolve them by editing the marked regions (<<<<<
      from memory. The checkpoint after the last marker is gone records the merge, with main as \
      its second parent.";
 
+impl Merge {
+    /// Its name in a `conflict` verdict's record (`merge`): whether the
+    /// worker got conflicts to resolve (`marked`, `unmarked`) or main could
+    /// not go in, or went in cleanly (the others). The objective queue counts
+    /// only the first kind as a failed attempt (`objectives::Outcome`).
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Merge::Current => "current",
+            Merge::Merged { .. } => "merged",
+            Merge::Marked { .. } => "marked",
+            Merge::Unmarked { .. } => "unmarked",
+            Merge::NotMounted => "not_mounted",
+            Merge::Busy(_) => "busy",
+            Merge::Failed(_) => "failed",
+        }
+    }
+}
+
 /// The note a `conflict` verdict sends back, after `merge` merged `main`
 /// into the workspace.
 pub(crate) fn conflict_note(main: &str, merge: &Merge) -> String {

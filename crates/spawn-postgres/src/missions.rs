@@ -450,6 +450,55 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
   from mission_tasks k
  where k.mission_id = $1 and k.state = 'landed' and k.objective is not null";
 
+/// The outcomes of an objective mission's tasks, oldest first, from the
+/// control stream: `[{seq, type, task, objective, verdict, merge}]`, the
+/// gate verdicts, the aborts and the yields (a `task.cancelled` that names
+/// `yielded`). What spawn-cli's `objectives::attempts` counts. `$1` mission.
+/// Each task's records by the record-id index, the record taken out of
+/// `kind` once per row (`offset 0` keeps the subquery whole): a gate
+/// verdict's record carries its log, and reading a field of `kind` per
+/// field and per task joined made it 180 ms on the live log (2026-11-08),
+/// 5 ms so.
+pub(crate) const OBJECTIVE_OUTCOMES: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object(
+         'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
+         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge')
+         order by o.seq), '[]'::jsonb)
+  from mission_tasks k
+ cross join lateral (
+   select e.session_seq as seq, e.kind -> 'detail' -> 'record' as r
+     from spawn_events e
+    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+      and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+   offset 0) o
+ where k.mission_id = $1 and k.objective is not null
+   and (o.r ->> 'type' in ('task.gated', 'task.aborted')
+        or (o.r ->> 'type' = 'task.cancelled' and o.r ->> 'yielded' = 'true'))";
+
+/// The yields (`task.cancelled` naming `yielded`) not told to the
+/// supervisor yet: a digest that reached it carrying the tag
+/// `missions objective-yielded-<event_id>`, however long ago.
+pub(crate) const OBJECTIVE_YIELDS: &str = r"
+with told as (
+  select distinct tag
+    from spawn_commands d
+   cross join lateral jsonb_array_elements_text(
+           case when jsonb_typeof(d.action -> 'tags') = 'array'
+                then d.action -> 'tags' else '[]'::jsonb end) tag
+   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
+)
+select coalesce(jsonb_agg(jsonb_build_object(
+         'event_id', e.id, 'at_ms', e.recorded_at_ms, 'id', x.r -> 'id',
+         'mission', k.mission_id, 'objective', x.r -> 'objective',
+         'failures', x.r -> 'failures', 'limit', x.r -> 'limit', 'reason', x.r ->> 'reason')
+         order by e.session_seq), '[]'::jsonb)
+  from spawn_events e
+ cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
+  left join mission_tasks k on k.id = (x.r ->> 'id')::bigint
+ where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+   and x.r ->> 'type' = 'task.cancelled' and x.r ->> 'yielded' = 'true'
+   and not exists (select 1 from told where tag = 'missions objective-yielded-' || e.id)";
+
 /// Gate verdicts on one objective's tasks, newest first, from the control
 /// stream: `[{task, verdict, reason, metric, at_ms}]`, `incompatible` (sent
 /// back because main moved, not a rejection) among them. `$1` mission,
@@ -468,6 +517,50 @@ select coalesce(jsonb_agg(z.h order by z.seq desc), '[]'::jsonb)
                                          where mission_id = $1 and objective = $2)
          order by e.session_seq desc
          limit $3) z";
+
+/// The earlier tasks of one objective that ended without landing (cancelled
+/// by a human, aborted over budget, or yielded: all `cancelled`), newest
+/// first, with the work each left: `[{task, branch, commit, outcome,
+/// reason, report}]`. `branch` and `commit` are the last checkpoint its
+/// session recorded from its assignment until the session's next task (a
+/// resident's), not a set-aside; null when it recorded none. `outcome` and
+/// `reason` are its last gate verdict, abort or cancel (`yielded` for a
+/// yield). Read from the records the fold keeps (`task.assigned`'s task
+/// row, `artifact.committed`, the control stream), nothing new. `$1`
+/// mission, `$2` objective, `$3` limit.
+pub(crate) const OBJECTIVE_PRIOR_WORK: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object(
+         'task', k.id, 'branch', c.branch, 'commit', c.commit, 'outcome', o.outcome,
+         'reason', o.reason, 'report', k.report) order by k.id desc), '[]'::jsonb)
+  from (select id, session_id, report, created_at_ms from mission_tasks
+         where mission_id = $1 and objective = $2 and state = 'cancelled'
+         order by id desc limit $3) k
+  left join lateral (
+    select a.kind -> 'detail' -> 'artifact' ->> 'branch' as branch,
+           a.kind -> 'detail' -> 'artifact' ->> 'commit' as commit
+      from spawn_events a
+     where a.session_id = k.session_id and a.event_name = 'artifact.committed'
+       and a.recorded_at_ms >= k.created_at_ms
+       and a.recorded_at_ms < coalesce((select min(n.created_at_ms) from mission_tasks n
+                                         where n.session_id = k.session_id
+                                           and n.created_at_ms > k.created_at_ms),
+                                        9223372036854775807)
+       and a.kind -> 'detail' ->> 'reason' is distinct from 'set_aside'
+     order by a.id desc limit 1) c on true
+  left join lateral (
+    select case x.r ->> 'type'
+             when 'task.gated' then x.r ->> 'verdict'
+             when 'task.aborted' then 'aborted'
+             else case when x.r ->> 'yielded' = 'true' then 'yielded' else 'cancelled' end
+           end as outcome,
+           x.r ->> 'reason' as reason
+      from (select e.session_seq as seq, e.kind -> 'detail' -> 'record' as r
+              from spawn_events e
+             where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+               and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+            offset 0) x
+     where x.r ->> 'type' in ('task.gated', 'task.aborted', 'task.cancelled')
+     order by x.seq desc limit 1) o on true";
 
 /// Missions with a gate that are open, or closed with work the closure rule
 /// (`spawn_task_may_continue`) still lets go on, with that work: every task
@@ -858,6 +951,18 @@ impl PostgresStore {
             .get(0))
     }
 
+    /// An objective mission's task outcomes, oldest first
+    /// ([`OBJECTIVE_OUTCOMES`]).
+    pub fn objective_outcomes(&self, mission: i64) -> Result<Value, StoreError> {
+        self.query_json(OBJECTIVE_OUTCOMES, &[&mission])
+    }
+
+    /// The objective yields not told to the supervisor yet
+    /// ([`OBJECTIVE_YIELDS`]).
+    pub fn objective_yields(&self) -> Result<Value, StoreError> {
+        self.query_json(OBJECTIVE_YIELDS, &[])
+    }
+
     /// An objective mission's landed tasks, newest first.
     pub fn objective_landings(&self, mission: i64) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_LANDINGS, &[&mission])
@@ -871,6 +976,17 @@ impl PostgresStore {
         limit: i64,
     ) -> Result<Value, StoreError> {
         self.query_json(OBJECTIVE_HISTORY, &[&mission, &objective, &limit])
+    }
+
+    /// The earlier tasks of one objective that ended without landing, newest
+    /// first, with the work each left ([`OBJECTIVE_PRIOR_WORK`]).
+    pub fn objective_prior_work(
+        &self,
+        mission: i64,
+        objective: i32,
+        limit: i64,
+    ) -> Result<Value, StoreError> {
+        self.query_json(OBJECTIVE_PRIOR_WORK, &[&mission, &objective, &limit])
     }
 
     /// Take the integrator's lock. False means another integrator runs now.

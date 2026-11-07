@@ -24,11 +24,12 @@
 //!    session's events, readings (`screen.observed`,
 //!    `observation.recorded`) left out; a gap counts at most
 //!    `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the model's
-//!    progress (a tool, a job, a message, a stopped turn), not in a failed
-//!    turn or a command; a gap inside a tool or job that ended counts while
-//!    the whole fleet was alive. So no outage (the fleet stopped, a frozen
-//!    host, a dead engine, the model API down) can by itself put a task
-//!    over budget;
+//!    progress (a tool, a job, a stopped turn), not in a failed turn, a
+//!    prompt or a command; a gap inside a tool or job that ended counts
+//!    while the whole fleet was alive. So no outage (the fleet stopped, a
+//!    frozen host, a dead engine, the model API down) can by itself put a
+//!    task over budget (a subagent's job open across a model API outage
+//!    adds up to its retry window, see [`active_ms`]);
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
@@ -346,14 +347,15 @@ pub(crate) fn budget_gap(text: Option<&str>) -> Duration {
 }
 
 /// The events that are the model's progress: a gap ending in one is time a
-/// worker worked ([`active_ms`]).
-const PROGRESS: [&str; 7] = [
+/// worker worked ([`active_ms`]). Not `message.received`: that is a prompt
+/// arriving (ingest's user turn: a delivery, a nudge, a job's
+/// notification), and the gap before it is the worker waiting for it.
+const PROGRESS: [&str; 6] = [
     "tool.started",
     "tool.completed",
     "tool.failed",
     "job.started",
     "job.ended",
-    "message.received",
     "turn.stopped",
 ];
 
@@ -366,11 +368,12 @@ const PROGRESS: [&str; 7] = [
 ///
 /// The points are the delivery, each event and now. A gap that ends in the
 /// model's progress (a tool call starting or ending, a background job
-/// starting or ending, a message, a turn stopping: [`PROGRESS`]) counts,
-/// at most `gap_ms`: a worker at work makes progress far more often. Any
-/// other gap counts nothing: one that ends in a failed turn (the model API
-/// did not answer), in a command (a delivery, a nudge, a resume: the worker
-/// waited), or in the engine's own events (a start, an unmount). The gap
+/// starting or ending, a turn stopping: [`PROGRESS`]) counts, at most
+/// `gap_ms`: a worker at work makes progress far more often. Any other gap
+/// counts nothing: one that ends in a failed turn (the model API did not
+/// answer), in a prompt arriving or a command (a delivery, a nudge, a
+/// resume: the worker waited), or in the engine's own events (a start, an
+/// unmount). The gap
 /// from the last event to now counts at most `gap_ms`. A long tool still
 /// counts: a gap inside a tool call or background job that later ended (its
 /// `tool.completed`, `tool.failed` or `job.ended` with the same id) gets
@@ -387,8 +390,15 @@ const PROGRESS: [&str; 7] = [
 /// a busy pane, whose readings are no points; each retried turn ends in
 /// `turn.failed` and each nudge in a command, which count nothing; only the
 /// model's first progress after it counts the gap before it, at most
-/// `gap_ms`. So an outage of any length or cause adds at most `gap_ms`.
-/// The safe side: a model answer that streams for longer than `gap_ms`
+/// `gap_ms`. So an outage of any length or cause adds at most `gap_ms`,
+/// with one bound that is not the cap: a subagent (an agent job,
+/// `job.started` kind `agent`) open across a model API outage retries in
+/// sidechain lines the log does not carry, and once it fails its
+/// `job.ended` pairs with its start, so its gap counts the fleet's alive
+/// time, which a model API outage does not interrupt. That adds up to
+/// Claude Code's retry window for the subagent, not the outage's length:
+/// a failed subagent ends its job (rev-e, session 145 on 2026-11-07).
+/// The safe side: a model that thinks or streams for longer than `gap_ms`
 /// without a tool call counts `gap_ms`, and a hung tool that never ends
 /// counts `gap_ms` (the stall rules own a hung session).
 pub(crate) fn active_ms(
@@ -1347,7 +1357,7 @@ impl Integrator {
         if let Some(reason) = halt_reason(mission, count) {
             return halt(store, mission, &reason).map(|()| false);
         }
-        Self::enforce_budget(store, mission)?;
+        let aborted = Self::enforce_budget(store, mission)?;
         let Some(source) = mission.source.as_deref() else {
             return Ok(false);
         };
@@ -1415,8 +1425,18 @@ impl Integrator {
         }
         // An objective mission's free slots get their objectives, whatever
         // its gate is doing; a closed mission gets none.
+        // A task this pass aborted, or one whose gate runs now, yields
+        // nothing: the first is over, the second is being judged.
+        let mut settled: std::collections::BTreeSet<i64> = aborted.into_iter().collect();
+        settled.extend(
+            self.running
+                .borrow()
+                .iter()
+                .filter(|gate| gate.mission == mission.id)
+                .map(|gate| gate.task),
+        );
         if mission.state != "done"
-            && let Err(error) = objectives::assign_next(store, mission)
+            && let Err(error) = objectives::assign_next(store, mission, &settled)
         {
             eprintln!("integrate: mission {}: {error}", mission.id);
         }
@@ -1544,12 +1564,12 @@ impl Integrator {
         Ok(())
     }
 
-    /// Abort delivered tasks over budget. True when it aborted one.
-    fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<bool, String> {
+    /// Abort delivered tasks over budget; the ids of those it aborted.
+    fn enforce_budget(store: &PostgresStore, mission: &Mission) -> Result<Vec<i64>, String> {
         let Some(budget) = &mission.budget else {
-            return Ok(false);
+            return Ok(Vec::new());
         };
-        let mut aborted = false;
+        let mut aborted = Vec::new();
         let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
         let gap_ms = budget_gap(crate::config::env_value("SPAWN_BUDGET_GAP_SECS").as_deref())
             .as_millis()
@@ -1583,7 +1603,7 @@ impl Integrator {
                     &json!({"type": "task.aborted", "id": task.id, "reason": reason}),
                 )?;
                 println!("integrate: task {} aborted: {reason}", task.id);
-                aborted = true;
+                aborted.push(task.id);
             }
         }
         Ok(aborted)
@@ -1730,7 +1750,9 @@ impl Judge {
             .conflict_markers(main, &branch)
             .map_err(|error| error.to_string())?;
         if let Some(note) = markers_note(repo.has_pending_merge(&task.agent_id), &marked) {
-            return gated("conflict", json!({ "note": note }));
+            // Markers of an earlier merge, still in the branch: the
+            // worker has them to resolve.
+            return gated("conflict", json!({ "note": note, "merge": "pending" }));
         }
         let message = landing_message(task, &branch);
         let Some(candidate) = landing_candidate(&mirror_path, main, &branch, &message)? else {
@@ -1744,7 +1766,7 @@ impl Judge {
             );
             return gated(
                 "conflict",
-                json!({"note": main_merge::conflict_note(main, &merge)}),
+                json!({"note": main_merge::conflict_note(main, &merge), "merge": merge.kind()}),
             );
         };
         let tree_of = |commit: &str| {
@@ -2789,7 +2811,7 @@ fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Option<(i64, i6
         .find_map(|other| other.in_flight().map(|task| (other.id, task.id)))
 }
 
-fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
+pub(crate) fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
     store
         .integrator_record(value)
         .map(|_| ())
@@ -2809,11 +2831,17 @@ fn halt(store: &PostgresStore, mission: &Mission, reason: &str) -> Result<(), St
 /// command's: one that fails is pursued and escalated by the dispatcher
 /// (`dispatch::stops`), like every Stop.
 fn stop(store: &PostgresStore, task: &Task) -> Result<(), String> {
+    stop_worker(store, task, "integrate-abort")
+}
+
+/// Submit the Stop of `task`'s worker, keyed `<key>-<task>` so a retried
+/// pass submits it once (an abort over budget, a yield of its slot).
+pub(crate) fn stop_worker(store: &PostgresStore, task: &Task, key: &str) -> Result<(), String> {
     let error = |error: &dyn std::fmt::Display| format!("stop task {}'s worker: {error}", task.id);
     let submission = Submission {
         agent_id: AgentId::new(task.agent_id.clone()).map_err(|e| error(&e))?,
         session_id: SessionId::new(task.session_id.clone()).map_err(|e| error(&e))?,
-        idempotency_key: IdempotencyKey::new(format!("integrate-abort-{}", task.id))
+        idempotency_key: IdempotencyKey::new(format!("{key}-{}", task.id))
             .map_err(|e| error(&e))?,
         action: CommandAction::Stop,
     };
@@ -4286,7 +4314,7 @@ mod tests {
         // A clock that steps back counts nothing.
         let back = [
             event(1, 10 * MIN, "tool.started", Some("a")),
-            event(2, MIN, "message.received", None),
+            event(2, MIN, "turn.stopped", None),
         ];
         assert_eq!(active_ms(0, MIN, &back, GAP, never_asked), Ok(GAP));
     }
@@ -4317,12 +4345,17 @@ mod tests {
         let outage_end = events.last().expect("events").at_ms;
         let before = active_ms(0, outage_end, &events, GAP, never_asked).expect("active");
         assert_eq!(before, 10 * MIN + 5_000, "the outage itself counts nothing");
+        // A nudge's prompt arriving is no progress: the worker waited for it.
         events.push(next("message.received", 12 * MIN));
-        let after = active_ms(0, at, &events, GAP, never_asked).expect("active");
+        let last = |events: &[spawn_postgres::ActivityEvent]| events.last().expect("events").at_ms;
+        let prompted = active_ms(0, last(&events), &events, GAP, never_asked).expect("active");
+        assert_eq!(prompted, before, "a prompt arriving counts nothing");
+        events.push(next("tool.started", 2 * MIN));
+        let after = active_ms(0, last(&events), &events, GAP, never_asked).expect("active");
         assert_eq!(
             after,
-            before + GAP,
-            "the model's first answer counts one cap"
+            before + 2 * MIN,
+            "the model's first progress counts the gap before it, at most a cap"
         );
         assert!(over_budget(&json!({"minutes": 20}), after, 0).is_none());
     }
@@ -6301,8 +6334,9 @@ mod database_tests {
             &json!({"tool_use_id": "toolu_open"}),
         );
         session_event(&db, &task, now - min, "command.accepted", &json!({}));
-        assert!(
-            !Integrator::enforce_budget(&db.store, &gated()).expect("the pass"),
+        assert_eq!(
+            Integrator::enforce_budget(&db.store, &gated()).expect("the pass"),
+            Vec::<i64>::new(),
             "five hours of wall clock, about 20 minutes of work"
         );
         assert_eq!(task_state(&db, mission, stopped), "delivered");
@@ -6320,7 +6354,10 @@ mod database_tests {
             )
             .expect("deliver 70 minutes ago");
         tool_work(&db, &ready_task(&db, overran), delivered + 5_000, now);
-        assert!(Integrator::enforce_budget(&db.store, &gated()).expect("the pass"));
+        assert_eq!(
+            Integrator::enforce_budget(&db.store, &gated()).expect("the pass"),
+            vec![overran]
+        );
         assert_eq!(
             task_state(&db, mission, stopped),
             "delivered",
@@ -6336,6 +6373,335 @@ mod database_tests {
             .expect("the stop")
             .get(0);
         assert_eq!(stops, 1, "the worker is stopped");
+    }
+
+    /// An objective mission on no real source: a backlog of `objectives`,
+    /// an approved resident, `workers` slots and `budget`.
+    fn backlog_mission(
+        db: &Db,
+        base: &Path,
+        name: &str,
+        objectives: &[u32],
+        workers: u32,
+        budget: Option<&Value>,
+    ) -> i64 {
+        let backlog = base.join("backlog");
+        let scenarios = base.join("scenarios");
+        std::fs::create_dir_all(&backlog).expect("backlog");
+        std::fs::create_dir_all(&scenarios).expect("scenarios");
+        for id in objectives {
+            std::fs::write(
+                backlog.join(format!("{id:03}.json")),
+                json!({"id": id, "title": format!("Objective {id}"), "prompt": "Do it."})
+                    .to_string(),
+            )
+            .expect("objective");
+        }
+        db.store
+            .resident_propose(name, "Pursues objectives")
+            .expect("propose");
+        db.store.resident_approve(name).expect("approve");
+        let mission = db
+            .store
+            .mission_add(
+                name,
+                &json!([base.join("source.git").to_string_lossy()]),
+                "human",
+            )
+            .expect("add");
+        db.store
+            .mission_configure(
+                mission,
+                Some(&scenarios.to_string_lossy()),
+                "gate",
+                budget,
+                Some(
+                    &json!({"backlog": backlog.to_string_lossy(), "resident": name,
+                             "workers": workers}),
+                ),
+            )
+            .expect("configure");
+        mission
+    }
+
+    /// The mission as the integrator reads it in a pass.
+    fn snapshot(db: &Db, mission: i64) -> super::Mission {
+        let missions: Vec<super::Mission> =
+            serde_json::from_value(db.store.gated_missions().expect("gated")).expect("missions");
+        missions
+            .into_iter()
+            .find(|row| row.id == mission)
+            .expect("the mission")
+    }
+
+    /// `(task, objective)` of the mission's tasks in flight, by task.
+    fn flying(db: &Db, mission: i64) -> Vec<(i64, u32)> {
+        let mut tasks: Vec<(i64, u32)> = snapshot(db, mission)
+            .tasks
+            .iter()
+            .filter_map(|task| Some((task.id, task.objective?)))
+            .collect();
+        tasks.sort_unstable();
+        tasks
+    }
+
+    fn objective_task(db: &Db, mission: i64, objective: u32) -> super::Task {
+        snapshot(db, mission)
+            .tasks
+            .into_iter()
+            .find(|task| task.objective == Some(objective))
+            .expect("the objective's task")
+    }
+
+    /// `task` delivered, reported, and sent back by `conflicts` gate
+    /// verdicts of a merge that left markers.
+    fn conflicts(db: &Db, task: i64, conflicts: i32) {
+        for revision in 0..conflicts {
+            db.store.task_delivered(task, 1).expect("delivered");
+            assert!(
+                db.store
+                    .task_reported(task, "## Outcome\nhalf of it")
+                    .expect("reported")
+            );
+            db.record(
+                &json!({"type": "task.gated", "id": task, "revision": revision,
+                              "verdict": "conflict", "merge": "marked", "base": "b",
+                              "reason": "main conflicts with your branch"}),
+            );
+        }
+    }
+
+    /// A checkpoint of `task`'s session at `at`, written straight into the log.
+    fn checkpoint(db: &Db, task: &super::Task, at: i64, commit: &str, reason: &str) {
+        db.admin()
+            .execute(
+                "insert into spawn_events (agent_id, session_id, source, kind, session_seq,
+                                           recorded_at_ms)
+                 values ($1, $2, 'bridge',
+                         jsonb_build_object('name', 'artifact.committed', 'detail',
+                           jsonb_build_object('reason', $3::text, 'artifact',
+                             jsonb_build_object('branch', $1::text, 'commit', $4::text,
+                                                'project', 'missions'))),
+                         (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                           where session_id = $2), $5)",
+                &[&task.agent_id, &task.session_id, &reason, &commit, &at],
+            )
+            .expect("a checkpoint");
+    }
+
+    /// The integrator cancels only an objective's task being worked, to
+    /// yield: not without `yielded`, not `reported` (an objective's task
+    /// waiting for its gate), not a task of a mission without objectives.
+    fn integrator_refuses_other_cancels(db: &Db, base: &Path, objective_task: i64) {
+        let cancel = |task: i64, yielded: bool| {
+            db.store
+                .integrator_record(&json!({"type": "task.cancelled", "id": task,
+                                           "yielded": yielded}))
+        };
+        assert!(cancel(objective_task, false).is_err(), "it does not yield");
+        db.store
+            .task_delivered(objective_task, 1)
+            .expect("delivered");
+        assert!(
+            db.store
+                .task_reported(objective_task, "again")
+                .expect("reported")
+        );
+        assert!(
+            cancel(objective_task, true).is_err(),
+            "it waits for its gate"
+        );
+        let plain = db.gated_mission("/nowhere.git", &base.join("scenarios"));
+        let plain_task = db
+            .store
+            .task_assign(plain, "ephemeral", "w", "brief", "default")
+            .expect("assign");
+        assert!(cancel(plain_task, true).is_err(), "no objective");
+    }
+
+    /// `task.cancelled` records by spawn-integrate for `tasks` alone, each
+    /// with its worker stopped once.
+    fn yields_recorded(db: &Db, tasks: &[i64]) {
+        let mut admin = db.admin();
+        let yielded: Vec<(i64, String)> = admin
+            .query(
+                "select (kind -> 'detail' -> 'record' ->> 'id')::bigint,
+                        kind -> 'detail' -> 'record' ->> 'by'
+                   from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.cancelled'
+                  order by session_seq",
+                &[],
+            )
+            .expect("the yields")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let expected: Vec<(i64, String)> = tasks
+            .iter()
+            .map(|task| (*task, "spawn-integrate".to_string()))
+            .collect();
+        assert_eq!(yielded, expected);
+        let keys: Vec<String> = tasks
+            .iter()
+            .map(|task| format!("integrate-yield-{task}"))
+            .collect();
+        let stops: i64 = admin
+            .query_one(
+                "select count(*) from spawn_commands where idempotency_key = any($1)",
+                &[&keys],
+            )
+            .expect("the stops")
+            .get(0);
+        assert_eq!(
+            stops,
+            i64::try_from(tasks.len()).expect("few"),
+            "each worker stopped"
+        );
+    }
+
+    /// Mission 4's stall (2026-11-07), on the store: three slots, two of
+    /// them held by objectives at their limit of failed attempts, one by
+    /// an objective under it. The pass yields the two (worker stopped,
+    /// `task.cancelled` with `yielded` by spawn-integrate, the supervisor
+    /// told once), leaves the third, and fills the slots fewest attempts
+    /// first: 025, then 019 again, whose brief names the yielded task's
+    /// branch and last checkpoint (not its set-aside). The store refuses
+    /// any other cancel by the integrator.
+    #[test]
+    fn objectives_at_their_limit_yield_and_the_next_get_the_slots() {
+        let base = std::env::temp_dir().join(format!("spawn-db-yield-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("objective_yield");
+        let mission = backlog_mission(&db, &base, "ry", &[19, 21, 23, 25], 3, None);
+        let none = std::collections::BTreeSet::new();
+        let pass = || {
+            crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+                .expect("a pass")
+        };
+        pass();
+        let first = flying(&db, mission);
+        assert_eq!(
+            first.iter().map(|(_, o)| *o).collect::<Vec<_>>(),
+            [19, 21, 23]
+        );
+        let task_19 = objective_task(&db, mission, 19);
+        let (t19, t21, t23) = (first[0].0, first[1].0, first[2].0);
+        conflicts(&db, t19, 3);
+        conflicts(&db, t21, 3);
+        conflicts(&db, t23, 2);
+        let assigned_at: i64 = db
+            .admin()
+            .query_one(
+                "select created_at_ms from mission_tasks where id = $1",
+                &[&t19],
+            )
+            .expect("the task")
+            .get(0);
+        let work = "1111111111111111111111111111111111111111";
+        let before = "0000000000000000000000000000000000000000";
+        checkpoint(&db, &task_19, assigned_at - 1, before, "tool_completed");
+        checkpoint(&db, &task_19, assigned_at + 1, before, "tool_completed");
+        checkpoint(&db, &task_19, assigned_at + 2, work, "tool_completed");
+        integrator_refuses_other_cancels(&db, &base, t23);
+
+        assert_eq!(pass().len(), 2);
+        assert_eq!(task_state(&db, mission, t19), "cancelled");
+        assert_eq!(task_state(&db, mission, t21), "cancelled");
+        assert_eq!(
+            task_state(&db, mission, t23),
+            "reported",
+            "under its limit, untouched"
+        );
+        let now_flying: Vec<u32> = flying(&db, mission)
+            .iter()
+            .filter(|(task, _)| *task != t19 && *task != t21)
+            .map(|(_, objective)| *objective)
+            .collect();
+        assert_eq!(
+            now_flying,
+            [23, 25, 19],
+            "by task: 023 kept, then 025, and 019 again"
+        );
+        yields_recorded(&db, &[t19, t21]);
+        let told = db.store.objective_yields().expect("the yields to tell");
+        assert_eq!(told.as_array().map(Vec::len), Some(2));
+
+        let again = objective_task(&db, mission, 19).brief;
+        for part in [
+            "Start from that work, do not redo it".to_string(),
+            format!("- task {t19}: yielded (objective 19 had 3 failed attempts"),
+            format!("branch `{}` at commit {work}", task_19.agent_id),
+            "> half of it".to_string(),
+        ] {
+            assert!(again.contains(&part), "{part}: {again}");
+        }
+        // The set-aside the dispatcher records after the cancel is not the work.
+        checkpoint(&db, &task_19, assigned_at + 3, &"2".repeat(40), "set_aside");
+        let prior = db
+            .store
+            .objective_prior_work(mission, 19, 3)
+            .expect("prior work");
+        assert_eq!(prior[0]["commit"], work);
+        let fresh = objective_task(&db, mission, 25).brief;
+        assert!(!fresh.contains("Earlier tasks"), "a first task has none");
+
+        assert!(pass().is_empty(), "nothing more yields, no slot is free");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pass that aborts a task over budget does not re-issue its
+    /// objective (task 113 aborted at 23:05:46, task 160 for objective 023
+    /// at 23:05:51): its slot frees from the next pass on, and goes to the
+    /// objective with the fewest attempts, 025, not 023.
+    #[test]
+    fn an_aborted_objective_is_not_reissued_at_once() {
+        let base = std::env::temp_dir().join(format!("spawn-db-reissue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("objective_reissue");
+        let mission = backlog_mission(
+            &db,
+            &base,
+            "rr",
+            &[23, 25],
+            1,
+            Some(&json!({"minutes": 60})),
+        );
+        let none = std::collections::BTreeSet::new();
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("first fill");
+        let task = objective_task(&db, mission, 23);
+        db.store.task_delivered(task.id, 1).expect("delivered");
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let delivered = now - 70 * 60_000;
+        db.admin()
+            .execute(
+                "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                &[&task.id, &delivered],
+            )
+            .expect("deliver 70 minutes ago");
+        tool_work(&db, &task, delivered + 5_000, now);
+        let pass = snapshot(&db, mission);
+        let aborted = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
+        assert_eq!(aborted, vec![task.id]);
+        let settled = aborted.into_iter().collect();
+        assert!(
+            crate::objectives::assign_next(&db.store, &pass, &settled)
+                .expect("the same pass")
+                .is_empty(),
+            "nothing in the pass that aborted"
+        );
+        crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+            .expect("the next pass");
+        let next: Vec<u32> = flying(&db, mission)
+            .iter()
+            .filter(|(id, _)| *id != task.id)
+            .map(|(_, objective)| *objective)
+            .collect();
+        assert_eq!(next, [25], "the fewest attempts, not the aborted objective");
+        let brief = objective_task(&db, mission, 25).brief;
+        assert!(!brief.contains("Earlier tasks"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The task as the integrator reads it.
