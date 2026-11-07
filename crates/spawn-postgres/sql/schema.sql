@@ -391,6 +391,13 @@ create index if not exists spawn_commands_open
 create index if not exists spawn_commands_session
     on spawn_commands (session_id, id);
 
+-- Commands that finished failed, since a time: the alert step's notice of a
+-- failed command, found without reading the queue (docs/fleet-architecture.md
+-- §3.4).
+create index if not exists spawn_commands_failed
+    on spawn_commands (finished_at_ms)
+    where succeeded = false;
+
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
 -- pattern such as `agent_worker_*`, so the supervisor can command every worker
