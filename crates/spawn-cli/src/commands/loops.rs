@@ -348,8 +348,9 @@ impl Fleet {
             if due {
                 self.steps_at = Some(std::time::Instant::now());
                 let ran = self.steps(&open, watermark, now, &mut lines, &mut warnings, &mut failed);
-            if std::env::var_os("SPAWN_LOOP_TRACE").is_some() {
-                eprintln!("trace: wm={watermark} ran={ran:?} lines={}", lines.len());
+                if std::env::var_os("SPAWN_LOOP_TRACE").is_some() {
+                    eprintln!("trace: wm={watermark} ran={ran:?} lines={}", lines.len());
+                }
             }
         }
         // The screens and transcripts the Bridge reads are not announced by
