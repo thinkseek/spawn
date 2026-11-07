@@ -7153,6 +7153,105 @@ mod database_tests {
             .get(0)
     }
 
+    /// An overrun counts toward no halt: three in a row leave the mission's
+    /// counters alone, and each task leaves flight.
+    #[test]
+    fn three_overruns_halt_nothing() {
+        let db = Db::new("overrun_halt");
+        let (base, source, scenarios, _integrator) = world("overrun-halt", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let mut tasks = Vec::new();
+        for worker in ["a", "b", "c"] {
+            let task = db
+                .store
+                .task_assign(mission, "ephemeral", worker, "brief", "default")
+                .expect("assign");
+            db.store.task_delivered(task, 1).expect("delivered");
+            db.record(&json!({"type": "task.over_budget", "id": task,
+                              "reason": "the task made more than 5 tool calls",
+                              "tool_calls": 6, "elapsed_ms": 1_000,
+                              "budget": {"tool_calls": 5}}));
+            tasks.push(task);
+        }
+        let row = snapshot(&db, mission);
+        assert_eq!((row.gate_aborts, row.gate_rejections), (0, 0));
+        assert_eq!(
+            super::halt_reason(&row, 0),
+            None,
+            "no halt counts an overrun"
+        );
+        for task in tasks {
+            let state: String = db
+                .admin()
+                .query_one("select state from mission_tasks where id = $1", &[&task])
+                .expect("the task")
+                .get(0);
+            assert_eq!(state, "cancelled", "an overrun leaves flight");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The work an overrun keeps: its branch's commit and that commit's
+    /// diff stat against main; waited for while the push is pending, and
+    /// lost (said so) when it never reaches the source.
+    #[test]
+    fn an_overrun_keeps_the_work_its_branch_holds() {
+        let db = Db::new("overrun_kept");
+        let (base, source, scenarios, _integrator) = world("overrun-kept", "#!/bin/sh\nexit 0\n");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = ready_task(&db, db.reported_task(mission, "kept"));
+        let clone = base.join("kept-clone");
+        let clone_path = clone.to_string_lossy().to_string();
+        git(&["clone", "-q", &source, &clone_path]).expect("clone");
+        std::fs::write(clone.join("big.txt"), "line\n").expect("write");
+        super::tests::commit_in(&clone_path, "the big work");
+        let commit = git(&["-C", &clone_path, "rev-parse", "HEAD"]).expect("head");
+        git(&[
+            "-C",
+            &clone_path,
+            "push",
+            "-q",
+            "origin",
+            &format!("{commit}:refs/heads/spawn/{}", task.agent_id),
+        ])
+        .expect("push the branch");
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        checkpoint(&db, &task, now, &commit, "tool_completed");
+        let row = snapshot(&db, mission);
+        let kept = super::kept_work(&db.store, &row, &task).expect("the work");
+        let super::Kept::Work {
+            branch,
+            commit: kept_commit,
+            diff,
+        } = kept
+        else {
+            panic!("the branch holds it: {kept:?}");
+        };
+        assert_eq!(branch, format!("spawn/{}", task.agent_id));
+        assert_eq!(kept_commit, commit);
+        assert!(
+            diff.contains("big.txt") && diff.contains("insertion"),
+            "{diff}"
+        );
+        // A checkpoint the pusher has not made it there yet: wait, until
+        // the push has had its time, then say it was lost.
+        let unpushed = "0123456789abcdef0123456789abcdef01234567";
+        checkpoint(&db, &task, now, unpushed, "tool_completed");
+        assert_eq!(
+            super::kept_work(&db.store, &row, &task).expect("kept"),
+            super::Kept::Waiting
+        );
+        checkpoint(&db, &task, now - 120_000, unpushed, "tool_completed");
+        assert!(
+            matches!(
+                super::kept_work(&db.store, &row, &task).expect("kept"),
+                super::Kept::Lost { .. }
+            ),
+            "a push that never came is lost"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The task as the integrator reads it.
     fn ready_task(db: &Db, task: i64) -> super::Task {
         let missions: Vec<super::Mission> =
