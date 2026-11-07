@@ -16,6 +16,8 @@
 //!   judgement, events, judgements and commands.
 //! - `alerts` prints the alerts Spawn raised, once or as they are recorded
 //!   (docs/fleet-architecture.md, "Alerts").
+//! - `backup` dumps, bundles and drills the fleet's record off this host
+//!   (docs/storage.md, "Where state lives").
 //! - `run` starts the engine inside the terminal, records its exit, and
 //!   forwards its exit code.
 //! - `version` prints `spawn <crate version>`.
@@ -28,6 +30,7 @@
 //! Bridge/Observer assembly in [`runtime`].
 
 mod alerts;
+mod backup;
 mod commands;
 mod config;
 mod context;
@@ -59,7 +62,7 @@ const USAGE: &str = "usage: spawn <init-db|submit|tick|loop|mission|task|residen
 
 /// The commands the contract's line does not hold, each on a line of its own
 /// after it.
-const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]";
+const MORE_USAGE: &str = "       spawn scorecard [--mission N] [--since <time>] [--until <time>] [--json] [--root <dir>]\n       spawn alerts --once [--json] [--since <90s|30m|2h|1d|ms>]\n       spawn alerts --follow [--json] [--since <event id>]\n       spawn backup dump|bundle|verify [--root <dir>]";
 
 fn main() {
     let code = match dispatch() {
@@ -95,6 +98,7 @@ pub(crate) fn dispatch() -> Result<i32, String> {
         "resident" => missions::resident(&rest),
         "fleet" => inspect::fleet(),
         "alerts" => alerts::command(&rest),
+        "backup" => backup::command(&rest),
         "tail" => inspect::tail(&Flags::parse(&rest)?),
         "run" => engine::run(&rest),
         "version" => {
