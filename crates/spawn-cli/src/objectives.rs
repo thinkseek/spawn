@@ -1134,7 +1134,7 @@ mod tests {
         ];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &untried(), 3)),
+            ids(&choose(&backlog, &[], &none, &untried(), &BTreeSet::new(), 3)),
             vec![1, 2, 3],
             "lowest first"
         );
@@ -1142,15 +1142,15 @@ mod tests {
         let solved = [landing(1, None)];
         let flying = BTreeSet::from([2]);
         assert_eq!(
-            ids(&choose(&backlog, &solved, &flying, &untried(), 3)),
+            ids(&choose(&backlog, &solved, &flying, &untried(), &BTreeSet::new(), 3)),
             vec![3, 4]
         );
         // No free slot, nothing.
-        assert!(choose(&backlog, &[], &none, &untried(), 0).is_empty());
+        assert!(choose(&backlog, &[], &none, &untried(), &BTreeSet::new(), 0).is_empty());
         // Fewer open objectives than slots: only those.
         let three_solved = [landing(1, None), landing(2, None), landing(3, None)];
         assert_eq!(
-            ids(&choose(&backlog, &three_solved, &none, &untried(), 3)),
+            ids(&choose(&backlog, &three_solved, &none, &untried(), &BTreeSet::new(), 3)),
             vec![4]
         );
     }
@@ -1165,12 +1165,12 @@ mod tests {
         )];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &missed, &none, &untried(), 2)),
+            ids(&choose(&backlog, &missed, &none, &untried(), &BTreeSet::new(), 2)),
             vec![1, 2]
         );
         let flying = BTreeSet::from([1]);
         assert_eq!(
-            ids(&choose(&backlog, &missed, &flying, &untried(), 2)),
+            ids(&choose(&backlog, &missed, &flying, &untried(), &BTreeSet::new(), 2)),
             vec![2]
         );
     }
@@ -1455,7 +1455,7 @@ mod tests {
                 report: Some("x".repeat(5000)),
             },
         ];
-        let text = brief(&objective(59, false), None, &prior, &[]);
+        let text = brief(&objective(59, false), None, &prior, &[], None);
         assert!(text.contains("Their reports below say what each did and found"));
         assert!(!text.contains("branch"), "{text}");
         assert!(text.contains(
@@ -1466,7 +1466,7 @@ mod tests {
         assert!(text.contains("- task 150: yielded; it recorded no checkpoint"));
         assert!(text.contains("… (cut)"), "a long report is cut");
         assert!(text.len() < 5000);
-        let first = brief(&objective(59, false), None, &[], &[]);
+        let first = brief(&objective(59, false), None, &[], &[], None);
         assert!(!first.contains("Earlier tasks"), "a first task has none");
     }
 
@@ -1536,14 +1536,14 @@ mod tests {
         let backlog = vec![objective(28, false), objective(29, false), later, gone];
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &untried(), 4)),
+            ids(&choose(&backlog, &[], &none, &untried(), &BTreeSet::new(), 4)),
             vec![28, 29]
         );
         let one = [landing(28, None)];
-        assert_eq!(ids(&choose(&backlog, &one, &none, &untried(), 4)), vec![29]);
+        assert_eq!(ids(&choose(&backlog, &one, &none, &untried(), &BTreeSet::new(), 4)), vec![29]);
         let both = [landing(29, None), landing(28, None), landing(22, None)];
         assert_eq!(
-            ids(&choose(&backlog, &both, &none, &untried(), 4)),
+            ids(&choose(&backlog, &both, &none, &untried(), &BTreeSet::new(), 4)),
             vec![30, 32]
         );
 
