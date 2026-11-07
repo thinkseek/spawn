@@ -1286,28 +1286,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod bench_dump {
-    /// Prints the loop's fixed reads for the offline EXPLAIN bench
-    /// (temporary).
-    #[test]
-    fn dump_loop_sql() {
-        if std::env::var_os("BENCH_DUMP").is_none() {
-            return;
-        }
-        for (name, sql) in [
-            ("DELIVERY_TASKS", super::DELIVERY_TASKS),
-            ("STALL_FACTS", super::STALL_FACTS),
-            ("MISSION_NEWS", super::MISSION_NEWS),
-            ("RESIDENTS_TO_KEEP", super::RESIDENTS_TO_KEEP),
-            ("CANCELLED_DELIVERIES", super::CANCELLED_DELIVERIES),
-            ("RETIRED_RESIDENTS", super::RETIRED_RESIDENTS),
-            ("GATE_ROOM", super::GATE_ROOM_ESCALATIONS),
-            ("GATE_HOST_FAULT", super::GATE_HOST_FAULT_ESCALATIONS),
-            ("HOLD_EXPIRIES", super::HOLD_EXPIRIES),
-        ] {
-            println!("----{name}----");
-            println!("{sql}");
-        }
-    }
-}

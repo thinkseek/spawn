@@ -514,15 +514,3 @@ impl PostgresStore {
     }
 }
 
-#[cfg(test)]
-mod bench_dump {
-    /// Prints the dispatcher's facts SQL for the offline EXPLAIN bench that
-    /// counts its scans (temporary).
-    #[test]
-    fn dump_dispatch_facts() {
-        if std::env::var_os("BENCH_DUMP").is_none() {
-            return;
-        }
-        println!("{}", super::DISPATCH_FACTS);
-    }
-}
