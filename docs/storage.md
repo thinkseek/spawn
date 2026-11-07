@@ -155,7 +155,15 @@ commit with a key no agent holds cannot hang or fail a test.
     text names the files of every `base_merged` record since the last
     delivery the worker was typed, not only this attempt's merge: a
     delivery refused before typing (a pane not ready) is retried, and the
-    retry's merge finds main already in.
+    retry's merge finds main already in;
+  - the dispatcher's fork of a re-assigned objective's ephemeral task from
+    the work its predecessor left (docs/fleet-architecture.md §10.4), before
+    its Start, when nothing of the agent runs: the branch is created at that
+    work's last checkpoint and main merged into it cleanly, or, on a
+    conflict, into the workspace mounted for it, the markers committed (a
+    plain commit, recorded `base_merged` with no file, so the merge stays
+    pending and the Start's mount keeps it) and the workspace unmounted.
+    The Start's prompt says what the merge did.
 
   A clean merge is a merge commit recorded as `artifact.committed`
   (`base_merged`, its files) and then pushed at once (a push that fails

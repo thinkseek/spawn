@@ -1515,7 +1515,8 @@ record of what was judged (§14 of design.md).
     open in the mission; every other task goes to a new per-task worker
     (kind `ephemeral`, agent `agent_worker_objective_<task>`, session
     `session_worker_objective_<task>`). It needs no approval, starts from
-    the source's main as it is then, keeps no context, and is stopped by the
+    the source's main as it is then (or from its objective's earlier work,
+    below), keeps no context, and is stopped by the
     dispatcher once its task lands or is cancelled (`retire-task-<id>`). Its
     report reaches the supervisor's digest only in a review-mode mission;
     a gate-mode mission's reports do not (§10.3). With N = 1 this
@@ -1538,9 +1539,25 @@ record of what was judged (§14 of design.md).
     cancel), its branch and last checkpoint (the latest `artifact.committed`
     of its session while it ran, not a set-aside), and its report, with the
     instruction to start from that work and not redo it (task 161 rebuilt
-    2264 lines that task 155 had mostly written). A worker's workspace is an
-    export without `.git`, so the brief names the work; it does not put the
-    files in the new workspace.
+    2264 lines that task 155 had mostly written).
+  - **An ephemeral task starts from that work.** When the newest earlier
+    task of its objective that ended without landing left work (a
+    checkpoint of its own while it ran), the dispatcher, before the task's
+    Start, creates the worker's branch at that task's last checkpoint that
+    is not a set-aside, and merges main into it the way a worker's
+    delivery does (storage.md, "Main into a workspace"): cleanly, as a
+    `base_merged` checkpoint; or, on a conflict, in the workspace mounted
+    for the merge, with markers where they show, committed (a `base_merged`
+    checkpoint naming no file) so the branch carries them and the Start's
+    mount keeps the pending merge, the workspace unmounted again. The
+    Start's prompt says which task's work and commit it starts from and
+    what the merge did (the files it changed, or the files with markers to
+    resolve first). A fork that fails holds the Start to the next pass:
+    the task never starts from main over work it should continue. With no
+    such earlier work its branch forks from main at the Start, as before;
+    a resident keeps its own branch. (A worker's workspace is an export
+    without `.git`: it cannot read another branch, so the work has to be in
+    its tree.)
   - The task's scenario is `rsi/scenarios/<id>.sh`.
   - A one-shot objective is solved once a task for it lands. A recurring one
     (`recurring`, `metric`, `target`) stays open until the metric of its
