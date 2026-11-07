@@ -1506,7 +1506,7 @@ begin
                                     gate_room_last_ms = null, gate_room_waits = 0,
                                     gate_room_escalated = false, gate_host_faults = 0,
                                     gate_host_task = null, gate_host_due_ms = null,
-                                    updated_at_ms = p_at
+                                    gate_base_disagrees = 0, updated_at_ms = p_at
          where id = v_id;
     when 'source.moved' then
         -- The owner moved a source's main on purpose: a deploy behind
