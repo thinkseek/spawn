@@ -922,30 +922,26 @@ times in a row)",
             let stuck = judgement["stuck"].as_f64();
             let open = self.open_keys("agent_stuck", &session);
             let stopped = observation["ended_cause"].as_str() == Some("stopped");
-            if open.is_empty()
-                && let Some(stuck) = stuck
-                && stuck >= LIKELY
-            {
-                        out.push(Event::Fire {
-                            key: format!("agent_stuck:{session}:{event_id}"),
-                            kind: "agent_stuck",
-                            subject: session.clone(),
-                            evidence: json!({
-                                "agent_id": observation["agent_id"], "stuck": stuck,
-                                "state": judgement["state"], "judge": judgement["judge"],
-                                "event_id": event_id,
-                            }),
-                            text: format!(
-                                "{session} is stuck ({stuck:.2}): {}",
-                                judgement["state"].as_str().unwrap_or("unknown")
-                            ),
-                            notice: false,
-                        });
-                        continue;
-                    }
-                }
+            if open.is_empty() && stuck.is_some_and(|stuck| stuck >= LIKELY) {
+                out.push(Event::Fire {
+                    key: format!("agent_stuck:{session}:{event_id}"),
+                    kind: "agent_stuck",
+                    subject: session.clone(),
+                    evidence: json!({
+                        "agent_id": observation["agent_id"], "stuck": stuck,
+                        "state": judgement["state"], "judge": judgement["judge"],
+                        "event_id": event_id,
+                    }),
+                    text: format!(
+                        "{session} is stuck ({:.2}): {}",
+                        stuck.unwrap_or_default(),
+                        judgement["state"].as_str().unwrap_or("unknown")
+                    ),
+                    notice: false,
+                });
+                continue;
             }
-            if stopped && !open.is_empty() {
+            if stopped {
                 for key in open {
                     out.push(Event::Clear {
                         key,
@@ -1084,13 +1080,16 @@ times in a row)",
                 notice: false,
             });
         }
+        self.quiet_crashes(now, out);
+    }
+
+    /// A crash line that no ready line followed, and that has been silent
+    /// for `SPAWN_ALERT_PG_QUIET_SECS`, clears itself.
+    fn quiet_crashes(&self, now: i64, out: &mut Vec<Event>) {
         for log in &self.logs {
             let open = self.open_keys("postgres_crash", log.subject);
-            if open.is_empty() {
-                continue;
-            }
             let quiet = now.saturating_sub(log.last_match_ms);
-            if quiet < self.settings.quiet_ms {
+            if open.is_empty() || quiet < self.settings.quiet_ms {
                 continue;
             }
             for key in open {
@@ -1380,13 +1379,12 @@ times in a row)",
             if task.state.as_deref() != Some("assigned") || !task.agent_free {
                 continue;
             }
-            if let Some(assigned) = task.assigned_event {
-                if !self
+            if let Some(assigned) = task.assigned_event
+                && !self
                     .known
                     .contains_key(&format!("task_undelivered:{id}:{assigned}"))
-                {
-                    next = next.min(task.assigned_at.saturating_add(self.settings.undelivered_ms));
-                }
+            {
+                next = next.min(task.assigned_at.saturating_add(self.settings.undelivered_ms));
             }
         }
         for pending in self.admitted.values() {
@@ -1401,13 +1399,12 @@ times in a row)",
             ("dump", self.settings.dump_max_age_ms),
             ("bundle", self.settings.bundle_max_age_ms),
         ] {
-            if let Some(backup) = self.backups.get(subject) {
-                if !self
+            if let Some(backup) = self.backups.get(subject)
+                && !self
                     .known
                     .contains_key(&format!("backup_stale:{subject}:{}", backup.event_id))
-                {
-                    next = next.min(backup.at_ms.saturating_add(max_age));
-                }
+            {
+                next = next.min(backup.at_ms.saturating_add(max_age));
             }
         }
         for log in &self.logs {
@@ -1507,10 +1504,8 @@ fn apply_mission(mission: &mut Mission, record: &Value) {
         "mission.configured" => {
             mission.accept = record["accept"].as_str().map(str::to_string);
         }
-        "task.assigned" => {
-            if mission.state == "open" {
-                mission.state = "active".to_string();
-            }
+        "task.assigned" if mission.state == "open" => {
+            mission.state = "active".to_string();
         }
         "task.aborted" => mission.aborts += 1,
         _ => {}
@@ -1825,11 +1820,11 @@ fn zone(text: &str) -> Option<(i32, &str)> {
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = (year - era * 400) as u64;
+    let yoe = (year - era * 400).cast_unsigned();
     let mp = u64::from(if month > 2 { month - 3 } else { month + 9 });
     let doy = (153 * mp + 2) / 5 + u64::from(day) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i64 - 719_468
+    era * 146_097 + doe.cast_signed() - 719_468
 }
 
 /// The civil date and time of an epoch in ms, in UTC.
@@ -1839,9 +1834,9 @@ fn civil(ms: i64) -> (i64, u32, u32, u32, u32, u32) {
     let rest = seconds.rem_euclid(86_400);
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
+    let doe = (z - era * 146_097).cast_unsigned();
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe as i64 + era * 400;
+    let year = yoe.cast_signed() + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
@@ -1998,15 +1993,13 @@ pub(crate) fn command(arguments: &[String]) -> Result<i32, String> {
         }
         return Ok(0);
     }
-    let after = match since.as_deref() {
-        Some(text) => text
-            .trim()
+    let after = if let Some(text) = since.as_deref() {
+        text.trim()
             .parse::<i64>()
-            .map_err(|_| format!("--since {text:?} is not an event id\n{USAGE}"))?,
-        None => {
-            let rows = store.alert_rows().map_err(|error| error.to_string())?;
-            rows["cursor"].as_i64().unwrap_or_default()
-        }
+            .map_err(|_| format!("--since {text:?} is not an event id\n{USAGE}"))?
+    } else {
+        let rows = store.alert_rows().map_err(|error| error.to_string())?;
+        rows["cursor"].as_i64().unwrap_or_default()
     };
     follow_stream(&store, after, json)
 }
