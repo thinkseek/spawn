@@ -585,6 +585,33 @@ outside Spawn's cleanup), the mirrors under `<root>/.sources`, which hold
 branches, and the transcript archive under `<root>/.transcripts`, which
 holds the agents' history; none of them is pruned automatically.
 
+## Alerts
+
+What went wrong is recorded, not printed into a pane
+([fleet-architecture.md](fleet-architecture.md) §3.4). Each alert transition
+is a control record in the stream, in the same shape as everything else:
+
+- `alert.fired {key, kind, subject, evidence, text, notice?}` — one
+  occurrence. `key` names it (a task's state change, a halt's record, a
+  crash line's stamp and pid, a reading's time, a backup's record, and so
+  on); `evidence` holds the record's `event_id` or the reading's measure and
+  threshold. A notice (`notice: true`) is news and never clears.
+- `alert.cleared {key, kind, subject, evidence}` — what cleared it, with the
+  clearing record's `event_id` (or the log line, or the reading).
+
+The records are written by the loop through `spawn_alert_record` (owner
+only) and folded into `spawn_alerts`, one row per key: `key` (primary key),
+`kind`, `subject`, `state` (`open`, `notice` or `cleared`), `notice`,
+`text`, `evidence`, `fired_event_id`, `fired_at_ms`, and `cleared_event_id`,
+`cleared_at_ms`, `cleared_evidence`. The fold — and the writer — refuses a
+second `alert.fired` for a key, an `alert.cleared` without its `alert.fired`
+and a second `alert.cleared`, so an alert fires once per occurrence and
+clears at most once, across restarts and two loops at once. The loop reads
+the keys back on start and fires nothing twice; `spawn alerts --once`,
+`spawn alerts --follow` and `/api/alerts` read the table, so the fleet, the
+supervisor and the dashboard see the same alerts (`spawn_reader` and the
+supervisor's login may read it; only the owner writes it).
+
 ## Not built
 
 - **Files over the cap**: they stay in the workspace only; nothing keeps

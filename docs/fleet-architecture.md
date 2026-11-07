@@ -809,6 +809,75 @@ systemd restarts it (`Restart=always`). Engines use the relay only where
 unset or `off`, every engine runs on Claude Code's own settings, nothing
 probes a relay, and a cheap start fails.
 
+### 3.4 Alerts: what Spawn tells about itself
+
+The fleet used to be watched by a monitor the supervisor ran by hand: a loop
+in its pane, its state in its process. Nothing of it was recorded, a restart
+re-reported what was still true and forgot what changed, and no view of Spawn
+showed an alert. `spawn loop` now raises its own, from records and readings
+(`crates/spawn-cli/src/alerts.rs`):
+
+- **A record per transition.** Each alert is two control records at most:
+  `alert.fired {key, kind, subject, evidence, text}` and `alert.cleared {key,
+  kind, subject, evidence}`, written through the owner-only
+  `spawn_alert_record` and folded into `spawn_alerts`
+  ([storage.md](storage.md#alerts)). `key` names the occurrence; the store
+  refuses a second `alert.fired` for it, an `alert.cleared` without its
+  `alert.fired`, and a second `alert.cleared`. The step reads the keys back
+  on start, so a restart fires nothing twice, and two loops at once still
+  record each transition once.
+- **What fires.** Notices, for every mission: `task_state` (a control record
+  after which the task's state differs, with `from` and `to`),
+  `mission_state` (its `state`, `halted`, `gate_rejections`, `gate_aborts` or
+  `gate_room_escalated` differs, with `before` and `after`),
+  `gate_base_disagrees` (objective 033's host fault with `alert`), and
+  `command_failed` (a command that finished failed; an owner's note is not
+  news). Conditions: `task_undelivered` (assigned longer than
+  `SPAWN_ALERT_UNDELIVERED_SECS`, default 300, while its agent holds no
+  delivered or reported task), `mission_halted` (cleared at its
+  `mission.resumed`), `postgres_crash` (a `terminated by signal`, `No space
+  left` or `could not resize` line in a database's log, cleared by the
+  first `database system is ready to accept connections` line after it or by
+  `SPAWN_ALERT_PG_QUIET_SECS` of silence, default 900), `memory_low`
+  (MemAvailable under `SPAWN_ALERT_MEMORY_LOW_MB`, default 4096; clears at
+  `SPAWN_ALERT_MEMORY_OK_MB`, default 8192), `tmpfs_high` (the used space of
+  the filesystem holding `SPAWN_ALERT_TMPFS_PATH`, default `/tmp`, over
+  `SPAWN_ALERT_TMPFS_HIGH_MB`, default 8000; clears under
+  `SPAWN_ALERT_TMPFS_OK_MB`, default 6000), `agent_stuck` (the session's
+  latest judgement at or above the Observer's 0.5, whatever the dispatcher
+  does with it), `admission_wait` (objective 029's record older than
+  `SPAWN_ALERT_ADMISSION_SECS`, default 600, with no admission after it),
+  `backup_stale` (the newest dump older than
+  `SPAWN_ALERT_BACKUP_DUMP_MAX_AGE_SECS`, default 7200, or bundle older than
+  `SPAWN_ALERT_BACKUP_BUNDLE_MAX_AGE_SECS`, default 93600; no record at all
+  is no alert), `backup_budget` (objective 031's `over_alert`), `drill_failed`
+  (a `backup.verified` with `ok` false) and `model_auth` (objective 028's
+  `execution.interrupted` with cause `model_auth`). Each fires once per
+  occurrence and clears with the record or reading that cleared it; a
+  threshold of `0` disables its check.
+- **When.** A record-borne alert is recorded within one pass of its record; a
+  host reading or a log line within `SPAWN_ALERT_CHECK_SECS` (default 30)
+  and one pass; a bound within one pass of falling due, never before,
+  measured on the database's clock from the record's `recorded_at_ms`. The
+  step runs when the event watermark moved or one of its timers is due, and
+  an idle pass reads the watermark once and nothing else (§14; objective
+  023). Like the disk watch it never fails a pass: an error is said and
+  tried at the next check.
+- **The same alerts everywhere.** `spawn alerts --once [--json] [--since
+  <span>]` prints every open alert and the window's transitions
+  (`SPAWN_ALERT_WINDOW_SECS`, default a day); `spawn alerts --follow
+  [--json]` prints each transition as it is recorded; `GET /api/alerts`
+  answers the same array as `--once --json`, from the same store method; the
+  dashboard shows the open alerts on every page and an Alerts view with
+  their evidence and their clearing. The supervisor's charter names the
+  command: its hand-run monitor retires, and the fleet's alerting is the
+  record's.
+- **Causality (§14).** An alert rests on a named record (its `event_id``) or
+  on a recorded reading (its measure and threshold); a clearing names what
+  cleared it; nothing rests on the step's memory, on absence, or on time
+  without a record. Evidence never holds a secret: no database URL with its
+  password, no environment, process names without their arguments.
+
 ## 4. Experience
 
 Nothing is stored outside the log. Every model judgement is an
@@ -1015,7 +1084,8 @@ controller. Missions, tasks, residents and landings are events in
   `task.aborted`, `task.over_budget`, `resident.proposed`, `resident.approved`,
   `resident.retired`, `legacy.imported`, `host.disk`,
   `source.push_requested`, `source.push_refused` (§10.3, "The owner's
-  landings").
+  landings"), and the loop's alerts: `alert.fired` and `alert.cleared`
+  (§3.4, folded into `spawn_alerts`).
   `task.report_unfinished` is a delivered task's report the dispatcher read
   and did not take because it is still a draft: it names the task's
   `revision`, the content's `digest`, the `markers` (each with its `line`,
@@ -1039,9 +1109,11 @@ controller. Missions, tasks, residents and landings are events in
   owner's landings: `source.moved` naming a `request`,
   `source.push_refused`), `source.moved` (`spawn mission moved`), the
   owner's `source.push_requested` (`spawn mission push`; folded into no
-  table, nor is `source.push_refused`) and the loop's `host.disk` (through
+  table, nor is `source.push_refused`), the loop's `host.disk` (through
   `spawn_host_record`; folded into no table,
-  [storage.md](storage.md#disk-room)) need the owner's login. The
+  [storage.md](storage.md#disk-room)) and the loop's `alert.fired` and
+  `alert.cleared` (through `spawn_alert_record`, §3.4) need the owner's
+  login. The
   restricted logins write no events at all: `spawn_append` refuses them.
 - **The tables are a projection.** `spawn_control_apply(record)` is the only
   writer of `mission_*`, and it runs in the same transaction as the append.
