@@ -213,6 +213,11 @@ pub(crate) fn base_disagrees_alerts(records: &[Value]) -> Vec<Escalation> {
         .filter_map(|record| {
             let id = record["event_id"].as_i64()?;
             let task = record["id"].as_i64()?;
+            // Only the record that makes the run three carries the alert;
+            // the other ones of the run are no news.
+            if record["alert"].as_bool() != Some(true) {
+                return None;
+            }
             let mission = record["mission"]
                 .as_i64()
                 .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
