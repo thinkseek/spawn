@@ -965,7 +965,11 @@ impl Bridge {
                 }
             }
             EventKind::ExecutionEnded { .. } if current && event.source == Source::Bridge => {
-                view.active = None;
+                if let Some(active) = view.active.take()
+                    && let Some(watch) = &self.config.watch
+                {
+                    watch.unwatch(&watch_key(&active.execution_id));
+                }
             }
             // An exit report of an old runner (engine-sourced; runners now
             // write SPAWN_EXIT_FILE): only old logs hold one.
@@ -1522,7 +1526,6 @@ impl Bridge {
             return Ok(());
         }
         active.follow.screen = Some((reading.state, now));
-        active.follow.again = false;
         self.append(
             agent_id,
             session,
@@ -3437,6 +3440,11 @@ pub fn transcript_path(projects: &str, workspace: &WorkspaceId, native: &str) ->
         "{}/{directory}/{native}.jsonl",
         projects.trim_end_matches('/')
     )
+}
+
+/// The watch key of an execution's files.
+fn watch_key(execution: &ExecutionId) -> String {
+    format!("execution:{execution}")
 }
 
 /// Where the runner writes the engine's exit status. `.spawn/` is never
