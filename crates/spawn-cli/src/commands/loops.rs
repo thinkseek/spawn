@@ -378,11 +378,7 @@ impl Fleet {
     ) -> Vec<&'static str> {
         let mut ran = Vec::new();
         let trace = std::env::var_os("SPAWN_LOOP_TRACE").is_some();
-        let mut scans = |open: &std::sync::Arc<PostgresStore>| -> i64 {
-            if !trace { return 0 }
-            open.scans().unwrap_or(0)
-        };
-        let mut at = scans(open);
+        let mut at = if trace { open.scans().unwrap_or(0) } else { 0 };
         macro_rules! mark {
             ($name:literal) => {
                 if trace {

@@ -61,6 +61,18 @@ impl PostgresStore {
         Ok(self.query_one_prepared(NEXT_LEASE, &[])?.get(0))
     }
 
+    /// Every user table's scans in this database so far (`seq_scan` and
+    /// `idx_scan`), for the loop's own accounting.
+    pub fn scans(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .query_one(
+                "select coalesce(sum(seq_scan + coalesce(idx_scan, 0)), 0)::bigint \
+                   from pg_stat_user_tables",
+                &[],
+            )?
+            .get(0))
+    }
+
     /// Listen for this database's event notifications on a connection of
     /// its own ([`Listener`]).
     pub fn listen(&self) -> Result<Listener, StoreError> {
