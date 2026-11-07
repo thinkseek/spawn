@@ -49,17 +49,44 @@
 //!    landing failed may have moved main before its record; it is applied
 //!    or refused by a later pass). A main moved with no record at all (a
 //!    push behind Spawn's back) still halts;
-//! 2. a delivered task over its mission's budget is aborted and its worker
-//!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
-//!    session's events, readings (`screen.observed`,
-//!    `observation.recorded`) left out; a gap counts at most
-//!    `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the model's
-//!    progress (a tool, a job, a stopped turn), not in a failed turn, a
-//!    prompt or a command; a gap inside a tool or job that ended counts
-//!    while the whole fleet was alive. So no outage (the fleet stopped, a
-//!    frozen host, a dead engine, the model API down) can by itself put a
-//!    task over budget (a subagent's job open across a model API outage
-//!    adds up to its retry window, see [`active_ms`]);
+//! 2. a delivered task over its mission's budget keeps its work. Its worker
+//!    is stopped (the Stop, and its final checkpoint on the task's branch)
+//!    and the overrun is its own record, `task.over_budget` {`reason`,
+//!    `tool_calls`, `elapsed_ms`, `budget`, and the work it keeps: `branch`,
+//!    `commit`, `diff`} — never `task.aborted`, which keeps its other
+//!    meaning (a landing gone stale after its mission was done). It counts
+//!    toward no halt: `gate_aborts` and `gate_rejections` stay as they were,
+//!    no run of either is broken or started, and the task leaves flight
+//!    without a report or a gate. The record is written once the work has
+//!    reached the source's `spawn/<agent>` (the pusher's head holds the
+//!    final checkpoint, read from the source after the Stop, never
+//!    assumed), so its `commit` and `diff` (`git diff --stat main
+//!    <commit>`) name what the objective's next task continues; when the
+//!    push failed, it says so instead. Its minutes are active time
+//!    ([`active_ms`]): the gaps of its session's events, readings
+//!    (`screen.observed`, `observation.recorded`) left out; a gap counts at
+//!    most `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the
+//!    model's progress (a tool, a job, a stopped turn), not in a failed
+//!    turn, a prompt or a command; a gap inside a tool or job that ended
+//!    counts while the whole fleet was alive. So no outage (the fleet
+//!    stopped, a frozen host, a dead engine, the model API down) can by
+//!    itself put a task over budget (a subagent's job open across a model
+//!    API outage adds up to its retry window, see [`active_ms`]);
+//!    - the objective's next task continues it (`objectives.rs`): it is
+//!      assigned once the overrun's work is on that branch, its
+//!      `task.assigned` names `continues` (the overrun task) and its brief
+//!      names that task, the branch, the commit and its diff stat, so its
+//!      workspace starts from the work (`main_merge::fork_from_prior`) and
+//!      not from main: 51 minutes of work are continued, not redone;
+//!    - a second overrun of a task that continues one is escalated to the
+//!      supervisor once (`dispatch::digest::over_budget_escalations`, the
+//!      digest tag `host over-budget-<record>`), naming both tasks, the
+//!      objective, the branch and its diff stat, the budget and the tool
+//!      calls, and what can be done; the objective is then held — no task is
+//!      issued for it — until the mission is configured again (a
+//!      `mission.configured` record newer than the overrun's), while the
+//!      mission's other objectives go on with the freed slot. A third
+//!      overrun after such a configure is treated as a first;
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
