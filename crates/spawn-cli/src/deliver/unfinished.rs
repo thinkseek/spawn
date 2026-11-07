@@ -108,7 +108,7 @@ pub(crate) fn markers(report: &str) -> Vec<Marker> {
             push(Kind::Placeholder(token));
         }
         if let Some(title) = heading(&text) {
-            let title = plain(title);
+            let title = unemphasized(plain(title));
             outcome_first_line = false;
             if let Some(rest) = after_word(&title.to_lowercase(), "outcome") {
                 outcome_first_line = true;
@@ -222,7 +222,8 @@ fn heading(line: &str) -> Option<&str> {
 }
 
 /// A line's words without what only frames them: a quote's `>`, a list
-/// item's bullet or number, a checkbox, and emphasis around it.
+/// item's bullet or number, a checkbox. Emphasis stays: it may mark a label
+/// (`**Results.**`, [`labelled`]).
 fn plain(line: &str) -> &str {
     let mut text = line.trim();
     loop {
@@ -242,6 +243,11 @@ fn plain(line: &str) -> &str {
             break;
         }
     }
+    text
+}
+
+/// `text` without the emphasis (`*`, `_`) and spaces around it.
+fn unemphasized(text: &str) -> &str {
     text.trim_matches(|c: char| c == '*' || c == '_' || c.is_whitespace())
 }
 
@@ -263,7 +269,7 @@ fn labelled(line: &str) -> Option<(&str, &str)> {
     let words = label.chars().all(|c| {
         c.is_alphanumeric() || c == ' ' || c == '-' || c == '/' || c == '*' || c == '_'
     });
-    let label = label.trim_matches(|c: char| c == '*' || c == '_' || c.is_whitespace());
+    let label = unemphasized(label);
     (words && !label.is_empty() && label.chars().count() <= 40)
         .then_some((label, value.trim_start_matches(punctuation)))
 }
@@ -273,10 +279,7 @@ fn labelled(line: &str) -> Option<(&str, &str)> {
 /// in them: a bare one is a state, "Payout 3: pending"), with emphasis and
 /// a closing `.`, `:` or `!` around it.
 fn only_placeholder(text: &str) -> Option<&str> {
-    let word = text
-        .trim_matches(|c: char| c == '*' || c == '_' || c.is_whitespace())
-        .trim_end_matches(['.', ':', '!'])
-        .trim_matches(|c: char| c == '*' || c == '_' || c.is_whitespace());
+    let word = unemphasized(unemphasized(text).trim_end_matches(['.', ':', '!']));
     let inner = word
         .strip_prefix('(')
         .and_then(|rest| rest.strip_suffix(')'))
@@ -408,8 +411,7 @@ PENDING_ISSUES\n";
             "**Status:** draft\n",
         ] {
             assert!(
-                kinds(report).contains(&(1, Kind::Draft))
-                    || kinds(report).iter().any(|(_, kind)| *kind == Kind::Draft),
+                kinds(report).iter().any(|(_, kind)| *kind == Kind::Draft),
                 "{report:?}: {:?}",
                 kinds(report)
             );
