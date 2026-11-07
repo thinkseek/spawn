@@ -213,3 +213,50 @@ fn a_tasks_texts_read_in_full_and_a_missing_task_reads_none() {
     assert!(texts["updated_at_ms"].as_i64().is_some());
     assert_eq!(store.task_texts(task + 1000).expect("reads"), None);
 }
+
+#[test]
+fn the_label_facts_carry_each_missions_text_and_tasks_and_the_residents() {
+    let (store, _schema) = store("label_facts");
+    let mission = store
+        .mission_add(
+            "Owner work on Spawn: changes the owner reviews.",
+            &json!(["/x/spawn.git"]),
+            "human",
+        )
+        .expect("add");
+    let brief = format!(
+        "Owner work on Spawn: a report that is still a draft is not taken.\n{}",
+        "more\n".repeat(300)
+    );
+    let task = store
+        .task_assign(mission, "ephemeral", "draft_report", &brief, "default")
+        .expect("assign");
+    let facts = store.label_facts().expect("the facts read");
+    let row = facts["missions"]
+        .as_array()
+        .expect("missions")
+        .iter()
+        .find(|row| row["id"] == mission)
+        .expect("the mission")
+        .clone();
+    assert_eq!(
+        row["text"],
+        "Owner work on Spawn: changes the owner reviews."
+    );
+    assert_eq!(row["sources"], json!(["/x/spawn.git"]));
+    assert_eq!(row["gate"], json!(null));
+    let tasks = row["tasks"].as_array().expect("tasks");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], task);
+    assert_eq!(tasks[0]["state"], "assigned");
+    assert_eq!(tasks[0]["objective"], json!(null));
+    let start = tasks[0]["brief"].as_str().expect("a brief");
+    assert!(brief.starts_with(start), "the brief's start");
+    assert_eq!(start.chars().count(), 600, "only its start");
+    assert!(tasks[0]["session_id"].as_str().is_some());
+    assert!(
+        tasks[0].get("report").is_none(),
+        "no report: a label never reads it"
+    );
+    assert!(facts["residents"].is_array());
+}
