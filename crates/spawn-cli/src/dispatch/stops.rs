@@ -90,3 +90,27 @@ pub(super) fn pursue(facts: &Facts, now_ms: i64) -> Decision {
         action,
     ))
 }
+
+/// When the dispatcher's next step is due for a failed Stop: the wait after
+/// that failure ends, [`retry_wait_ms`]. `None` while the stop is not under
+/// way, its latest attempt is in flight or succeeded, or its retries are
+/// spent (it waits for no clock then: the escalation goes with the next
+/// step).
+pub(super) fn next_due(facts: &Facts) -> Option<i64> {
+    let (Some(_first), Some(last)) = (facts.stops.first(), facts.stops.last()) else {
+        return None;
+    };
+    if last.succeeded != Some(false) || facts.open_command {
+        return None;
+    }
+    let failures = facts
+        .stops
+        .iter()
+        .filter(|stop| stop.succeeded == Some(false))
+        .count();
+    if failures > DELIVERY_RETRIES {
+        return None;
+    }
+    let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+    Some(finished.saturating_add(retry_wait_ms(failures)))
+}
