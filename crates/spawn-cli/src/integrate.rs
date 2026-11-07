@@ -1696,6 +1696,9 @@ impl Integrator {
             if let Some(continues) = task.continues {
                 overrun["continues"] = json!(continues);
             }
+            if let Some(objective) = task.objective {
+                overrun["objective"] = json!(objective);
+            }
             if commit.is_none() {
                 overrun["pushed"] = json!(false);
             }
