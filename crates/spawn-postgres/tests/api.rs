@@ -2495,6 +2495,7 @@ fn dispatch_facts_count_resumes_lost_again_at_once() {
 /// later reading) is not one, nor is anyone else's resume; an execution
 /// that stayed up starts over (task 132).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn dispatch_facts_name_the_resume_lost_before_its_engine_became_ready() {
     /// How an execution's engine became ready, if it did.
     #[derive(Clone, Copy)]
