@@ -22,6 +22,8 @@
 //! (the facts' `age_ms`). It is an item, never an action: stopping the job
 //! or the worker is the supervisor's decision.
 
+use std::collections::BTreeSet;
+
 use super::stall::took;
 use super::{Escalation, Facts, Job, Why, is_worker};
 
