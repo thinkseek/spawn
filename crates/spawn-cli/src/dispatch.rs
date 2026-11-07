@@ -1644,7 +1644,7 @@ mod tests {
             "exits": [1, 0], "setup_s": 244, "backoff_ms": 16_000,
             "due_ms": 1_793_930_000_000_i64,
         });
-        let host = super::digest::base_disagrees_alerts(&[record.clone()]);
+        let host = super::digest::base_disagrees_alerts(std::slice::from_ref(&record));
         assert_eq!(host.len(), 1);
         assert_eq!(host[0].why, Why::GateBaseDisagrees);
         assert_eq!(host[0].tag(), "host gate-base-disagrees-87");
