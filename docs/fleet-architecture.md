@@ -948,13 +948,16 @@ controller. Missions, tasks, residents and landings are events in
   `task.delivered`, `task.report_unfinished`, `task.reported`,
   `task.reviewed`, `task.cancelled`, `task.gated`, `task.landed`,
   `task.aborted`, `resident.proposed`, `resident.approved`,
-  `resident.retired`, `legacy.imported`, `host.disk`.
+  `resident.retired`, `legacy.imported`, `host.disk`,
+  `source.push_requested`, `source.push_refused` (§10.3, "The owner's
+  landings").
   `task.report_unfinished` is a delivered task's report the dispatcher read
   and did not take because it is still a draft: it names the task's
   `revision`, the content's `digest`, the `markers` (each with its `line`,
   `kind`, `marker` and `text`) and the note that told the worker (`note`,
   its idempotency key, and `command_id`); one per revision and content,
   folded into no table (the task stays delivered).
+
   `legacy.imported` carries one row of the mission tables as it stood
   before the control stream existed: a database with mission rows and no
   records imports them once, on migration. A `task.cancelled` names `by`,
@@ -966,8 +969,12 @@ controller. Missions, tasks, residents and landings are events in
   ([design.md](design.md) §15).
 - **Who writes it:** only the checked mission functions, through
   `spawn_control_record`. The integrator's records (`task.gated`,
-  `task.landed`, `task.aborted`, `mission.halted`), `source.moved` and the
-  loop's `host.disk` (through `spawn_host_record`; folded into no table,
+  `task.landed`, `task.aborted`, `mission.halted`, and the outcomes of the
+  owner's landings: `source.moved` naming a `request`,
+  `source.push_refused`), `source.moved` (`spawn mission moved`), the
+  owner's `source.push_requested` (`spawn mission push`; folded into no
+  table, nor is `source.push_refused`) and the loop's `host.disk` (through
+  `spawn_host_record`; folded into no table,
   [storage.md](storage.md#disk-room)) need the owner's login. The
   restricted logins write no events at all: `spawn_append` refuses them.
 - **The tables are a projection.** `spawn_control_apply(record)` is the only
@@ -1083,7 +1090,8 @@ record of what was judged (§14 of design.md).
   gate run on revision 0 never lands, or sends back, revision 1.
 - **The integrator:** `spawn integrate` (unit `spawn-integrate`). A pass
   first records the owner's holds past their bound as expired (below,
-  "Landing: the owner's hold"). A mission
+  "Landing: the owner's hold"), then applies the owner's pending landings
+  (below, "The owner's landings"), then visits the missions. A mission
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
   another mission's task in `landing` waits for it (the push may have moved
@@ -1398,7 +1406,12 @@ record of what was judged (§14 of design.md).
     and leave the count);
   - the scenario count below its floor (the most scenarios a gate run of
     the mission has counted since it was configured or last resumed);
-  - the source's `main` not where the last landing left it.
+  - the source's `main` not where the last landing left it, read only
+    from a fetch that succeeded, while no other mission's landing on the
+    source is unresolved, and while no owner's landing on the source is
+    pending (step 0 below applies them first; one still pending, its
+    landing failed, may have moved `main` before its record). A move that
+    no record explains (a push behind Spawn's back) halts.
 
   A halted mission lands nothing until a human runs `spawn mission resume`.
   No rule counts host faults, however many in a row: a halt needs a human,
@@ -1412,6 +1425,53 @@ record of what was judged (§14 of design.md).
   `source.moved` (`spawn mission moved`, run by `deploy/deploy.sh`), and the
   missions on that source take the new `main` as their baseline instead of
   halting.
+- **The owner's landings** (objective 21). The owner lands on a mission
+  source with one command and never stops the integrator for it:
+  `spawn mission push --source <source> --commit <commit>` (owner only;
+  `<commit>` is resolved in the git repository of the current directory,
+  `--repo <dir>` names another, or is already in the source). It puts the
+  commit in the source at `refs/spawn-owner/<hash>`, touching no branch,
+  records `source.push_requested` {`source`, `commit`, `ref`, `by`:
+  `human`} and prints `{request, source, commit}` (`request`: that event's
+  id); `--wait <seconds>` also waits for the outcome and prints it, exit 0
+  applied, 1 refused, 3 still pending. The source must be a directory on
+  this host with a mission (a remote one is refused, as a gate on it is).
+  The running integrator applies it as **step 0** of its next pass (after
+  the holds past their bound are recorded), before the steps of the
+  missions on that source: every pending request (no outcome names it yet),
+  oldest first, under the landing lock (`spawn_landing_hold`'s, so no task
+  landing's push and its record are ever split by it). The owner's hold
+  (above) stops task landings, not the owner's own: a request on a held
+  source is applied too, as `spawn mission moved` is recorded (an owner
+  gating a candidate against the held `main` does not push meanwhile). It reads the source's `main` M from the source itself
+  (never its mirror, which a judging may be using); when M is in the
+  commit's history it moves `main` from M to the commit, otherwise to a
+  merge commit (first parent M, second the commit, by `main`'s merge rules
+  and the landing identity, its message naming the owner's landing, the
+  request and the commit's subject), with a compare-and-swap
+  (`update-ref <branch> <new> <M>` in the source); in the same hold it
+  records `source.moved` {`source`, `from`: M, `to`, `missions`, `request`,
+  `by`: `human`}: `missions` are the missions on the source at M and not
+  halted, as `spawn_source_moved` names them, and the fold moves their
+  baselines; the missions on the source with no baseline yet (new, or
+  resumed) are named in `without_baseline` and take `to` as their first,
+  so a gate of theirs judging against M when it landed does not leave them
+  at M. A conflict, a commit the source does not have, or a
+  compare-and-swap that fails twice records `source.push_refused`
+  {`request`, `reason`}: nothing moves and nothing halts. A request whose
+  commit `main` already holds was applied by an integrator that stopped
+  before its record: it is recorded then, from the baseline its move began
+  at. While a task landing on the source went out without its record, the
+  request waits for it. It waits for no gate: a judging of another mission
+  or source keeps running and lands by the usual rules, and one on the same
+  source finishes, its verdict is recorded as it comes, and its landing's
+  compare-and-swap finds `main` moved and records `stale`, so the task is
+  judged again against the new `main` (merged and gated again; never
+  discarded silently, never counted). So the owner's landing is a record
+  (the request, then the outcome that names it), and the integrator acts on
+  that record, never on a `main` that changed under it ([design.md](design.md)
+  §14). `spawn mission moved` still records a move the owner made behind
+  Spawn's back; updating the controller (`deploy/`) stays the owner's step.
 
 ### 10.4 RSI as a mission
 
