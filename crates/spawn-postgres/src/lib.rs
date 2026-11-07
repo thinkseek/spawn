@@ -53,9 +53,10 @@ macro_rules! died_young {
 macro_rules! lost_before_ready {
     ($x:literal) => {
         concat!(
-            "(",
+            "(coalesce(",
             $x,
-            ".cause = 'lost' and not exists (select 1 from spawn_events r where r.session_id = ",
+            ".cause, '') = 'lost' and not exists (select 1 from spawn_events r where \
+             r.session_id = ",
             $x,
             ".session_id and r.source = 'bridge' and r.source_event_id = ",
             $x,
