@@ -1139,9 +1139,10 @@ impl Bridge {
     /// when the watch says they changed, and its pane captured when a
     /// command is in flight on it, when its transcript has held still and
     /// the screen was not read since (or a reading awaits its twin), or
-    /// every [`BridgeConfig::screen_refresh`] as a backstop. The liveness
-    /// question (`runner`: a tmux call) and the runner's exit file ride on
-    /// the same decision, so an idle fleet costs no call per agent per pass.
+    /// every [`BridgeConfig::screen_refresh`] as a backstop. Its terminal's
+    /// liveness was already asked once for the whole fleet
+    /// ([`Self::fleet_runners`]), so an idle fleet costs no call per agent
+    /// per pass; a terminal found gone is looked at at once.
     fn advance(
         &self,
         agent_id: &AgentId,
