@@ -1381,9 +1381,8 @@ fn heads_of(source: &str) -> Result<BTreeMap<String, String>, String> {
 
 /// Whether the source still holds a commit (`git cat-file -e`).
 fn holds(source: &str, commit: &str) -> bool {
-    Command::new("git")
+    crate::sources::controller_git()
         .args(["-C", source, "cat-file", "-e", commit])
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1689,7 +1688,7 @@ fn append_slice(source: &Path, target: &Path, offset: u64, size: u64) -> Result<
 
 /// A git bundle of every ref of `source`, but not `not`'s commits.
 fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
-    let mut command = Command::new("git");
+    let mut command = crate::sources::controller_git();
     command
         .args(["-C", source, "bundle", "create"])
         .arg(file)
