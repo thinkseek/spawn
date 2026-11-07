@@ -486,17 +486,23 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
 pub(crate) const OBJECTIVE_OUTCOMES: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
          'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
-         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded')
+         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded',
+         'event_id', o.event_id, 'at_ms', o.at_ms,
+         'continues', (o.r ->> 'continues')::bigint,
+         'branch', o.r ->> 'branch', 'commit', o.r ->> 'commit', 'diff', o.r ->> 'diff',
+         'tool_calls', o.r -> 'tool_calls', 'budget', o.r -> 'budget',
+         'reason', o.r ->> 'reason')
          order by o.seq), '[]'::jsonb)
   from mission_tasks k
  cross join lateral (
-   select e.session_seq as seq, e.kind -> 'detail' -> 'record' as r
+   select e.id as event_id, e.recorded_at_ms as at_ms, e.session_seq as seq,
+          e.kind -> 'detail' -> 'record' as r
      from spawn_events e
     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
       and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
    offset 0) o
  where k.mission_id = $1 and k.objective is not null
-   and (o.r ->> 'type' in ('task.gated', 'task.aborted')
+   and (o.r ->> 'type' in ('task.gated', 'task.aborted', 'task.over_budget')
         or (o.r ->> 'type' = 'task.cancelled' and o.r ->> 'yielded' = 'true'))";
 
 /// The yields not told to the supervisor yet: a `task.cancelled` of the
@@ -653,6 +659,10 @@ from (
          m.gate_room_waits, m.gate_room_escalated, m.gate_host_faults, m.gate_host_task,
          m.gate_host_due_ms, m.objectives, m.sources ->> 0 as source,
          (select h.hold from mission_source_holds h where h.source = m.sources ->> 0) as hold,
+         (select max(e.recorded_at_ms) from spawn_events e
+           where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+             and e.kind -> 'detail' -> 'record' ->> 'type' = 'mission.configured'
+             and e.kind -> 'detail' -> 'record' ->> 'id' = m.id::text) as configured_ms,
          coalesce(t.tasks, '[]'::jsonb) as tasks
     from mission_missions m
     left join lateral (
@@ -662,7 +672,8 @@ from (
                'candidate', k.candidate, 'scenario', k.scenario,
                'delivered_at_ms', k.delivered_at_ms, 'objective', k.objective,
                'revisions', k.revisions, 'brief', k.brief, 'report', k.report,
-               'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by)
+               'updated_at_ms', k.updated_at_ms, 'held_by', k.held_by,
+               'continues', k.continues)
                order by k.id) as tasks
         from mission_tasks k
         left join mission_residents r on r.agent_id = k.agent_id
@@ -1077,11 +1088,12 @@ impl PostgresStore {
         objective: i32,
         scenario: Option<&str>,
         brief: &str,
+        continues: Option<i64>,
     ) -> Result<i64, StoreError> {
         Ok(self
             .query_one(
-                "select spawn_objective_assign($1, $2, $3, $4)",
-                &[&mission, &objective, &scenario, &brief],
+                "select spawn_objective_assign($1, $2, $3, $4, $5)",
+                &[&mission, &objective, &scenario, &brief, &continues],
             )?
             .get(0))
     }
