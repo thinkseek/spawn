@@ -1,13 +1,14 @@
 import { PanelRight } from "lucide-react";
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 
-import { fetchAttention, fetchOverview, fetchSession, usePoll } from "./api";
+import { fetchAlerts, fetchAttention, fetchOverview, fetchSession, usePoll } from "./api";
 import type { PollResult, SessionDetail } from "./api";
 import { markNeedsHuman, needsHuman } from "./attention";
 import { DetailsRail, RailContent } from "./components/DetailsRail";
 import { MobileNav, Sidebar } from "./components/Sidebar";
 import { StateBadge } from "./components/StateDot";
 import { Timeline } from "./components/Timeline";
+import { AlertsView, OpenAlerts } from "./components/alerts/AlertsView";
 import { FleetView } from "./components/fleet/FleetView";
 import { MissionsView } from "./components/missions/MissionsView";
 import { RsiView } from "./components/rsi/RsiView";
@@ -25,7 +26,14 @@ const ShowView = lazy(() =>
   import("./components/show/ShowView").then((module) => ({ default: module.ShowView })),
 );
 
-export type View = "fleet" | "missions" | "rsi" | "scorecard" | "show" | "sessions";
+export type View =
+  | "fleet"
+  | "missions"
+  | "rsi"
+  | "alerts"
+  | "scorecard"
+  | "show"
+  | "sessions";
 
 interface Route {
   view: View;
@@ -38,6 +46,7 @@ function routeFromHash(): Route {
   if (hash.startsWith("#/sessions")) return { view: "sessions", agent: null };
   if (hash.startsWith("#/rsi")) return { view: "rsi", agent: null };
   if (hash.startsWith("#/missions")) return { view: "missions", agent: null };
+  if (hash.startsWith("#/alerts")) return { view: "alerts", agent: null };
   if (hash.startsWith("#/scorecard")) return { view: "scorecard", agent: null };
   if (hash.startsWith("#/show")) return { view: "show", agent: null };
   const match = /^#\/fleet\/(.+)$/.exec(hash);
@@ -59,6 +68,7 @@ function hashFor(route: Route): string {
       : "#/fleet";
   }
   if (route.view === "missions") return "#/missions";
+  if (route.view === "alerts") return "#/alerts";
   if (route.view === "scorecard") return "#/scorecard";
   // The Show view keeps its options (`?present`, `?replay`) in its hash.
   if (route.view === "show") {
@@ -83,6 +93,12 @@ export default function App() {
   // the dispatcher's view (/api/attention), never a judge's flag.
   const fleetPoll = usePoll("fleet", fetchFleet, 3_000);
   const attention = usePoll("attention", fetchAttention, 3_000);
+  // The alerts Spawn raised, on every page: the open ones are a strip at the
+  // top, and the Alerts view shows the window.
+  const alerts = usePoll("alerts", fetchAlerts, 5_000);
+  const openAlerts = (alerts.data ?? []).filter(
+    (alert) => alert.state === "open",
+  ).length;
   const needs = useMemo(
     () => (attention.data ? needsHuman(attention.data) : null),
     [attention.data],
@@ -188,6 +204,7 @@ export default function App() {
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
+        onShowAlerts={() => setView("alerts")}
         onShowScorecard={() => setView("scorecard")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
@@ -204,6 +221,8 @@ export default function App() {
         onShowFleet={() => setView("fleet")}
         onShowMissions={() => setView("missions")}
         onShowRsi={() => setView("rsi")}
+        onShowAlerts={() => setView("alerts")}
+        openAlerts={openAlerts}
         onShowScorecard={() => setView("scorecard")}
         onShowShow={() => setView("show")}
         onShowSessions={() => setView("sessions")}
@@ -213,6 +232,8 @@ export default function App() {
         }}
       />
 
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <OpenAlerts alerts={alerts} onOpen={() => setView("alerts")} />
       {view === "fleet" ? (
         <FleetView
           fleet={fleet}
@@ -226,6 +247,8 @@ export default function App() {
         <MissionsView missions={missions} />
       ) : view === "rsi" ? (
         <RsiView onOpenSession={openTimeline} />
+      ) : view === "alerts" ? (
+        <AlertsView />
       ) : view === "scorecard" ? (
         <ScorecardView missions={missions.data} />
       ) : view === "show" ? (
@@ -329,6 +352,7 @@ export default function App() {
           )}
         </div>
       )}
+      </div>
     </div>
   );
 }
