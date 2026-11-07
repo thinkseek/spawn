@@ -524,9 +524,6 @@ impl Monitor {
             return;
         };
         match kind {
-            "alert.fired" | "alert.cleared" => {
-                // The step's own records: nothing to decide from them.
-            }
             "task.assigned" | "task.delivered" | "task.reported" | "task.gated"
             | "task.reviewed" | "task.landed" | "task.aborted" | "task.over_budget"
             | "task.cancelled" => self.task_record(event_id, at_ms, record, out),
