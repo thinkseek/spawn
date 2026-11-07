@@ -46,6 +46,14 @@ translated (`LANG=zh_CN.UTF-8`) would otherwise get git's messages in its
 language. tmux is given no locale: it has no translations, and one given to
 the command that starts its server would reach every pane.
 
+Spawn's own commits never sign, whatever the host's git configuration says:
+a checkpoint is `commit-tree`, which ignores `commit.gpgSign`, and a landing
+passes `--no-gpg-sign` (a test forces signing and makes both). A test's own
+git (a seed's `init`, `add` and `commit`) runs through
+`spawn_host::test_git_command` (feature `testing`), without the user's or
+the system's git configuration, so a host whose `~/.gitconfig` signs every
+commit with a key no agent holds cannot hang or fail a test.
+
 - **Checkpoint** (every tool call, turn end, exit): the Bridge commits the
   tree against the kept index (a stat cache: only changed files are hashed).
   Cost is proportional to what changed. The same tree is built for the
