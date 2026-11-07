@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { normalizeAttention, type Attention } from "./attention";
 import { chooseToken, type TokenChoice } from "./token";
+import { pageHidden, Validated } from "./validated";
 
 export type SessionState =
   "working" | "waiting" | "blocked" | "completed" | "unknown";
@@ -347,24 +348,27 @@ export function apiHeaders(): Record<string, string> {
   return headers;
 }
 
-async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(url, {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) throw apiError(response.status);
-  return response.json();
+/** The page's last answer at each URL, with its tag (validated.ts). */
+const reads = new Validated();
+
+/** GET an API read and normalize it; answered "not modified" (304), the
+ * value read last time, the same object. Every module's reads go here. */
+export function readApi<T>(
+  url: string,
+  signal: AbortSignal,
+  normalize: (raw: unknown) => T,
+): Promise<T> {
+  return reads.read(url, normalize, { signal, headers: apiHeaders(), fail: apiError });
 }
 
 export async function fetchOverview(signal: AbortSignal): Promise<Overview> {
-  return normalizeOverview(await getJson("/api/overview", signal));
+  return readApi("/api/overview", signal, normalizeOverview);
 }
 
 /** The Escalations queue as the dispatcher computes it. Throws on an
  * older server without `/api/attention` (404): the queue falls back. */
 export async function fetchAttention(signal: AbortSignal): Promise<Attention> {
-  return normalizeAttention(await getJson("/api/attention", signal));
+  return readApi("/api/attention", signal, normalizeAttention);
 }
 
 /** `POST /api/session/<id>/input` with `body` (a person's input, or the
@@ -403,25 +407,41 @@ export async function fetchSession(
   signal: AbortSignal,
 ): Promise<SessionDetail> {
   const url = `/api/session/${encodeURIComponent(id)}?after=0&limit=300`;
-  return normalizeSession(await getJson(url, signal));
+  return readApi(url, signal, normalizeSession);
 }
 
 export interface PollResult<T> {
   data: T | null;
   error: string | null;
+  /** When the last answer arrived, a "not modified" one included: the
+   * data held then. Kept only for a poll that asks (`checked`); null
+   * before the first answer. */
+  checkedAt?: number | null;
 }
 
-/** Poll a read endpoint every `intervalMs`, starting immediately. */
+export interface PollOptions {
+  /** Keep `checkedAt`: a view that says how fresh its data is. Its owner
+   * renders again on every answer, so the others do not ask. */
+  checked?: boolean;
+}
+
+/** Poll a read endpoint every `intervalMs`, starting immediately. While
+ * the page is hidden (another tab, a locked phone) it does not poll, and
+ * it polls at once when the page shows again. An answer that did not
+ * change is the same object, so nothing renders again. */
 export function usePoll<T>(
   key: string,
   load: (signal: AbortSignal) => Promise<T>,
   intervalMs = 2_000,
+  options: PollOptions = {},
 ): PollResult<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [checkedAt, setCheckedAt] = useState<number | null>(null);
   const loadRef = useRef(load);
   loadRef.current = load;
   const keyRef = useRef<string | null>(null);
+  const checked = options.checked === true;
 
   useEffect(() => {
     let cancelled = false;
@@ -433,10 +453,11 @@ export function usePoll<T>(
       keyRef.current = key;
       setData(null);
       setError(null);
+      setCheckedAt(null);
     }
 
     const tick = async () => {
-      if (inFlight) return;
+      if (inFlight || pageHidden(document)) return;
       inFlight = true;
       controller = new AbortController();
       try {
@@ -444,6 +465,7 @@ export function usePoll<T>(
         if (!cancelled) {
           setData(next);
           setError(null);
+          if (checked) setCheckedAt(Date.now());
         }
       } catch (cause) {
         const aborted =
@@ -455,15 +477,20 @@ export function usePoll<T>(
         inFlight = false;
       }
     };
+    const onVisibility = () => {
+      if (!pageHidden(document)) void tick();
+    };
 
     void tick();
     const timer = window.setInterval(() => void tick(), intervalMs);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
       controller?.abort();
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [key, intervalMs]);
+  }, [key, intervalMs, checked]);
 
-  return { data, error };
+  return { data, error, checkedAt };
 }

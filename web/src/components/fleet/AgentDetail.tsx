@@ -29,6 +29,7 @@ import {
   stateLabelUpper,
 } from "../../fleet";
 import { clockTime, formatDuration, relativeTime } from "../../format";
+import { freshAt } from "../../validated";
 import { LiveBadge, TerminalBlock, TerminalPanel } from "../Terminal";
 import { Ago, Button, Card, CardHeader, Drawer, EmptyState, cx } from "../ui";
 import {
@@ -512,6 +513,7 @@ function LivePane({ sessionId }: { sessionId: string }) {
     `pane:${sessionId}`,
     (signal) => fetchAgentPane(sessionId, signal),
     3_000,
+    { checked: true },
   );
   const data = pane.data;
   return (
@@ -536,7 +538,7 @@ function LivePane({ sessionId }: { sessionId: string }) {
           </span>
           {data?.captured_at_ms ? (
             <span className="tnum text-caption text-faint-foreground">
-              {relativeTime(data.captured_at_ms)}
+              {relativeTime(freshAt(data.captured_at_ms, pane.checkedAt))}
             </span>
           ) : null}
           <LiveBadge live={data?.live === true} known={data !== null} />

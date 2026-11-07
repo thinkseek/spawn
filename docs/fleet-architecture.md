@@ -643,6 +643,18 @@ and, with no token set at all, a client socket the owner's uid holds;
 `Content-Type: application/json` (415), which no form can send without a
 preflight; a body of at most 16 KiB (413); a key and a text a person types:
 not blank, at most 8 KiB, no control character but tab and line ends (400).
+
+`/api/missions` and `/api/rsi` send what the lists show: a task's brief,
+report and review note come as their first lines with their whole length
+(`<field>_bytes`), and `/api/missions/task/<id>` answers the whole texts
+when a task is opened; an objective's prompt comes as its first lines and
+`/api/rsi/objective/<mission>/<id>` answers it whole when the objective is
+pointed at. Every answer carries a weak `ETag` and a read that
+sends it back (`If-None-Match`) gets 304 while nothing it shows changed; a
+read that says `Cache-Control: max-age=1`, as the page's polls do, may be
+given the answer computed for another reader up to a second ago, so one
+computation serves every open page (`crates/spawn-cli/src/serve/answers.rs`).
+The page polls only while it is visible and reads again the moment it shows.
 Humans talk to the supervisor through that box (top of the Fleet page), its
 pane, or `spawn submit --session session_supervisor --action
 '{"type":"input",...}'`.
@@ -1194,7 +1206,8 @@ record of what was judged (§14 of design.md).
   objective mission with its backlog's objectives (status, landed metric
   values), its tasks with their `task.gated` verdicts, the halt reason and
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
-  `/api/rsi/task/<id>` answers one task; `/api/rsi/pane` shows the
+  `/api/rsi/task/<id>` answers one task, `/api/rsi/objective/<mission>/<id>`
+  one objective's whole prompt; `/api/rsi/pane` shows the
   resident's terminal.
 - **One gate at a time, for now.** A judging (fetch, gate, landing) runs
   on a thread of its own. A mission has at most one in flight, and so does

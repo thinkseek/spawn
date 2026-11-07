@@ -43,6 +43,7 @@ import { Fact, SectionLabel } from "../fleet/bits";
 import { VerdictBadge, useNow } from "../rsi/Phase";
 import { Ago, Card, CardHeader, EmptyState, FOCUS_RING, GroupHeader, LiveStatus, PageHeader, cx } from "../ui";
 import { Markdown } from "./Markdown";
+import { TaskText, useTaskTexts } from "./TaskTexts";
 import { AgentLink, Collapsible } from "./parts";
 import { ViewToggle, useStoredChoice } from "../ViewToggle";
 import type { ViewOption } from "../ViewToggle";
@@ -622,6 +623,9 @@ function TaskRow({
   group: TaskGroup<MissionTask>;
 }) {
   const title = taskTitle(task, { missionName });
+  // The board sends the texts' first lines; the whole is read when asked
+  // (the brief opened, a "show the whole" pressed), one GET for the three.
+  const texts = useTaskTexts(task, false);
   return (
     <li
       className={cx(
@@ -735,7 +739,14 @@ function TaskRow({
             </span>
           </div>
           {task.review_note ? (
-            <Markdown source={task.review_note} className="mt-1" />
+            <TaskText
+              what="note"
+              excerpt={task.review_note}
+              bytes={task.review_note_bytes}
+              full={texts.texts?.review_note}
+              read={texts}
+                className="mt-1"
+            />
           ) : (
             <p className="mt-1 text-caption text-faint-foreground">
               No review note.
@@ -746,21 +757,40 @@ function TaskRow({
       {task.review_note && task.state !== "revise" && task.revisions === 0 && (
         <div className="rounded-md border border-surface-border px-3 py-2">
           <SectionLabel>Review note</SectionLabel>
-          <Markdown source={task.review_note} className="mt-1" />
+          <TaskText
+            what="note"
+            excerpt={task.review_note}
+            bytes={task.review_note_bytes}
+            full={texts.texts?.review_note}
+            read={texts}
+            className="mt-1"
+          />
         </div>
       )}
 
       <EarlierAttempts group={group} missionName={missionName} />
 
       {task.brief && (
-        <Collapsible label="Brief">
-          <Markdown source={task.brief} />
+        <Collapsible label="Brief" onToggle={(open) => open && texts.want()}>
+          <TaskText
+            what="brief"
+            excerpt={task.brief}
+            bytes={task.brief_bytes}
+            full={texts.texts?.brief}
+            read={texts}
+          />
         </Collapsible>
       )}
 
-      {task.report ? (
+      {task.report !== null || (task.report_bytes ?? 0) > 0 ? (
         <Collapsible label="Report" defaultOpen>
-          <Markdown source={task.report} />
+          <TaskText
+            what="report"
+            excerpt={task.report}
+            bytes={task.report_bytes}
+            full={texts.texts?.report}
+            read={texts}
+          />
         </Collapsible>
       ) : (
         <p className="text-caption text-faint-foreground">No report yet.</p>

@@ -4,7 +4,8 @@
 // field is normalized, so a server that omits one renders an empty value
 // instead of crashing the page.
 
-import { apiError, apiHeaders } from "./api";
+import { readApi } from "./api";
+import { isCut } from "./validated";
 
 export type Direction = "lower" | "higher";
 
@@ -42,6 +43,11 @@ export interface RsiTask {
   scenario: string | null;
   brief: string | null;
   review_note: string | null;
+  /** Whole lengths in bytes of `brief` and `review_note`, which
+   * `/api/rsi` sends as null (no list shows them; the task's own read,
+   * `/api/rsi/task/<id>`, sends them whole, and no length). */
+  brief_bytes?: number | null;
+  review_note_bytes?: number | null;
   created_by: string | null;
   created_at_ms: number;
   delivered_at_ms: number | null;
@@ -61,7 +67,11 @@ export interface RsiLanding {
 export interface RsiObjective {
   id: number;
   title: string;
+  /** The prompt's first lines (about 1 KB); the whole one is read when the
+   * objective is pointed at (`fetchWholePrompt`). */
   prompt: string;
+  /** The whole prompt's length in bytes; null from an older server. */
+  prompt_bytes?: number | null;
   recurring: boolean;
   metric: string | null;
   unit: string;
@@ -205,6 +215,8 @@ function normalizeTask(value: unknown): RsiTask {
     scenario: optionalText(raw.scenario),
     brief: optionalText(raw.brief),
     review_note: optionalText(raw.review_note),
+    brief_bytes: optionalNumber(raw.brief_bytes),
+    review_note_bytes: optionalNumber(raw.review_note_bytes),
     created_by: optionalText(raw.created_by),
     created_at_ms: number(raw.created_at_ms),
     delivered_at_ms: optionalNumber(raw.delivered_at_ms),
@@ -237,6 +249,7 @@ function normalizeObjective(value: unknown): RsiObjective {
     id,
     title: text(raw.title, `Objective ${id}`),
     prompt: text(raw.prompt),
+    prompt_bytes: optionalNumber(raw.prompt_bytes),
     recurring: raw.recurring === true,
     metric: optionalText(raw.metric),
     unit: text(raw.unit),
@@ -402,27 +415,17 @@ export function metricPoints(objective: RsiObjective | null): MetricPoint[] {
   }));
 }
 
-async function getJson(url: string, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(url, {
-    signal,
-    cache: "no-store",
-    headers: apiHeaders(),
-  });
-  if (!response.ok) throw apiError(response.status);
-  return response.json();
-}
-
 export async function fetchDashboard(
   signal: AbortSignal,
 ): Promise<RsiDashboard> {
-  return normalizeDashboard(await getJson("/api/rsi", signal));
+  return readApi("/api/rsi", signal, normalizeDashboard);
 }
 
 export async function fetchTask(
   task: number,
   signal: AbortSignal,
 ): Promise<RsiTaskDetail> {
-  return normalizeTaskDetail(await getJson(`/api/rsi/task/${task}`, signal));
+  return readApi(`/api/rsi/task/${task}`, signal, normalizeTaskDetail);
 }
 
 export async function fetchPane(
@@ -430,5 +433,32 @@ export async function fetchPane(
   signal: AbortSignal,
 ): Promise<RsiPane> {
   const query = mission === null ? "" : `?mission=${mission}`;
-  return normalizePane(await getJson(`/api/rsi/pane${query}`, signal));
+  return readApi(`/api/rsi/pane${query}`, signal, normalizePane);
+}
+
+/** An objective's prompt as a pointer's title shows it until the whole
+ * one is read: its first lines, marked when the rest was not sent. */
+export function promptTitle(objective: Pick<RsiObjective, "prompt" | "prompt_bytes">): string {
+  return isCut(objective.prompt, objective.prompt_bytes ?? null)
+    ? `${objective.prompt}…`
+    : objective.prompt;
+}
+
+/** One objective's whole prompt (`/api/rsi/objective/<mission>/<id>`). */
+export interface WholePrompt {
+  prompt: string;
+  prompt_bytes: number | null;
+}
+
+export function normalizeWholePrompt(value: unknown): WholePrompt {
+  const raw = object(value);
+  return { prompt: text(raw.prompt), prompt_bytes: optionalNumber(raw.prompt_bytes) };
+}
+
+export async function fetchWholePrompt(
+  mission: number,
+  objective: number,
+  signal: AbortSignal,
+): Promise<WholePrompt> {
+  return readApi(`/api/rsi/objective/${mission}/${objective}`, signal, normalizeWholePrompt);
 }
