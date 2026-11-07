@@ -124,7 +124,7 @@
 | `FLEET_HEALTH`（健康条） | 122 ms | 87 ms | 一天、一小时的窗口按时间读（`spawn_events_name_time`），一天的判定只取判定者 |
 | `scorecard.rs` 的 `FACTS` | 443 ms | 81 ms | lateral 里的 `offset 0` 让记录只从 `kind` 取出一次；被内联时三十处 `x.r` 各取一次（gate 日志、brief 这样的大文本） |
 
-`spawn-postgres/tests/dashboard.rs` 锁住这些改写的口径（状态始于、当前工具、健康条计数、任务全文）。计分卡剩下的时间主要在 `spawn serve` 读转录（约 0.25 s），不在 SQL。
+`spawn-postgres/tests/dashboard.rs` 锁住这些改写的口径（状态始于、当前工具、健康条计数、任务全文）。计分卡剩下的时间主要在 `spawn serve` 读转录（约 0.23 s，读 211 MB），不在 SQL。
 
 ## 9. 投影
 
