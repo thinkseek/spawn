@@ -747,9 +747,9 @@ select coalesce(jsonb_agg((r - 'log') || jsonb_build_object('event_id', e.id,
    and e.kind -> 'detail' -> 'record' ->> 'escalate' = 'true'
    and not exists (select 1 from told where tag = 'host gate-host-fault-' || e.id)";
 
-/// The `task.over_budget` records of a task that continues an overrun task
-/// of its objective (its `continues` is named): a second overrun in a chain,
-/// escalated to the supervisor once. A digest that reached the supervisor
+/// The `task.over_budget` records that are a second overrun in a chain (a
+/// task that continues an overrun task of its objective, with no configure
+/// between: its `chain` is true), escalated to the supervisor once. A digest that reached the supervisor
 /// carrying the tag `host over-budget-<event_id>` means it was told,
 /// however long ago. Each carries its `event_id`, `at_ms`, its `mission`,
 /// and the record's fields (`id`, `continues`, `objective`, `branch`,
