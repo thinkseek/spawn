@@ -44,6 +44,32 @@ macro_rules! died_young {
     };
 }
 
+/// SQL: whether the `agent_executions` row aliased `$x` ended lost before
+/// its engine became ready: the log has no Bridge `screen.observed` of it
+/// in state `ready` (the ready wait of a start or resume records one keyed
+/// `<execution>:screen:ready` before it types; the Bridge's follow records
+/// others). A start whose ready wait failed is abandoned and ends so,
+/// whatever its duration.
+macro_rules! lost_before_ready {
+    ($x:literal) => {
+        concat!(
+            "(",
+            $x,
+            ".cause = 'lost' and not exists (select 1 from spawn_events r where r.session_id = ",
+            $x,
+            ".session_id and r.source = 'bridge' and r.source_event_id = ",
+            $x,
+            ".execution_id || ':screen:ready') and not exists (select 1 from spawn_events r \
+             where r.session_id = ",
+            $x,
+            ".session_id and r.event_name = 'screen.observed' and r.source = 'bridge' and \
+             r.execution_id = ",
+            $x,
+            ".execution_id and r.kind -> 'detail' ->> 'state' = 'ready'))"
+        )
+    };
+}
+
 mod command_queue;
 mod event_log;
 mod fleet;
