@@ -12,7 +12,9 @@
 //! No objective holds a slot for ever. A failed attempt is an outcome that
 //! says the work did not make it: a gate's `rejected`, `incompatible` or
 //! `conflict` (unless main could not be merged into the workspace, or merged
-//! cleanly: `merge` names how), or an abort over budget (`task.aborted`).
+//! cleanly: `merge` names how). An overrun over budget is not one: the work
+//! is kept and continued ([`Overrun`]), and a record from before an overrun
+//! was its own record (`task.aborted`) counts as it was written.
 //! The host's outcomes (`no_room`, `host_fault`, a gate `aborted`) are not
 //! the work's and count for nothing, as for the halt rules. Once an
 //! objective has `SPAWN_OBJECTIVE_ATTEMPTS` (3) failed attempts since its
