@@ -8,6 +8,7 @@ import { test } from "node:test";
 import {
   formatBytes,
   isCut,
+  OnDemand,
   pageHidden,
   SHARED_FOR,
   utf8Bytes,
@@ -136,4 +137,28 @@ test("a hidden page is one whose visibility says hidden", () => {
   assert.equal(pageHidden({ visibilityState: "hidden" }), true);
   assert.equal(pageHidden({ visibilityState: "visible" }), false);
   assert.equal(pageHidden(undefined), false);
+});
+
+test("a value read on demand is read once per key, and a failure is read again", async () => {
+  const wanted = new OnDemand<string>(2);
+  let reads = 0;
+  const read = (value: string) => () => {
+    reads += 1;
+    return Promise.resolve(value);
+  };
+  const [first, second] = await Promise.all([
+    wanted.get("7/4/2000", read("whole")),
+    wanted.get("7/4/2000", read("other")),
+  ]);
+  assert.equal(first, "whole");
+  assert.equal(second, "whole", "the second want shares the first read");
+  assert.equal(reads, 1);
+
+  await assert.rejects(wanted.get("7/5/10", () => Promise.reject(new Error("down"))));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(await wanted.get("7/5/10", read("back")), "back", "a failure is not kept");
+
+  await wanted.get("7/6/10", read("third"));
+  assert.equal(wanted.size, 2, "past the limit the oldest goes");
+  assert.equal(await wanted.get("7/4/2000", read("again")), "again", "the oldest was read again");
 });
