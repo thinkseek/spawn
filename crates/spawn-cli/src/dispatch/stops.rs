@@ -114,3 +114,91 @@ pub(super) fn next_due(facts: &Facts) -> Option<i64> {
     let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
     Some(finished.saturating_add(retry_wait_ms(failures)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::next_due;
+    use crate::deliver::{DELIVERY_RETRIES, retry_wait_ms};
+    use crate::dispatch::{Facts, StopSent};
+    use spawn_core::event::ModelProfile;
+
+    fn stopping(stops: Vec<StopSent>) -> Facts {
+        Facts {
+            session_id: "session_resident_core".to_string(),
+            agent_id: "agent_resident_core".to_string(),
+            live: true,
+            execution_id: Some("exec_1".to_string()),
+            end_cause: None,
+            observation: None,
+            observation_event_id: None,
+            observation_at_ms: None,
+            evidence_seq: None,
+            turn_ended: false,
+            checkpoint: None,
+            episode: None,
+            open_command: false,
+            dispatched: Vec::new(),
+            told: std::collections::BTreeSet::new(),
+            last_delivery: None,
+            model: ModelProfile::Default,
+            resumed_young: 0,
+            failed_resume: None,
+            stops,
+            charter: None,
+            jobs: Vec::new(),
+        }
+    }
+
+    fn stop(id: i64, finished: i64, succeeded: Option<bool>) -> StopSent {
+        StopSent {
+            id,
+            key: format!("switch-model-7-0-{id}"),
+            principal: "spawn-dispatch".to_string(),
+            action: "stop".to_string(),
+            created_at_ms: finished - 500,
+            finished_at_ms: Some(finished),
+            succeeded,
+            error: succeeded
+                .filter(|ok| !ok)
+                .map(|_| "kill-session refused".to_string()),
+        }
+    }
+
+    /// A failed Stop's retry is due one wait after the failure finished
+    /// (`retry_wait_ms`, doubling), and the waits stop when the retries are
+    /// spent: then the step escalates instead of waiting.
+    #[test]
+    fn a_failed_stop_is_due_one_wait_after_it_failed() {
+        let failed = stopping(vec![stop(1, 100_000, Some(false))]);
+        assert_eq!(next_due(&failed), Some(100_000 + retry_wait_ms(1)));
+        let twice = stopping(vec![stop(1, 100_000, Some(false)), stop(2, 200_000, Some(false))]);
+        assert_eq!(next_due(&twice), Some(200_000 + retry_wait_ms(2)));
+        let spent = stopping(
+            (0..=DELIVERY_RETRIES)
+                .map(|n| stop(i64::try_from(n).expect("small"), 100_000 + n as i64 * 1000, Some(false)))
+                .collect(),
+        );
+        assert_eq!(next_due(&spent), None, "the retries are spent: escalate");
+    }
+
+    /// Nothing waits while the latest Stop is in flight or succeeded, or
+    /// while a command of the session is in flight (the retry would be
+    /// queued behind it anyway).
+    #[test]
+    fn a_stop_that_is_not_failing_waits_for_no_time() {
+        assert_eq!(next_due(&stopping(Vec::new())), None);
+        assert_eq!(
+            next_due(&stopping(vec![stop(1, 100_000, None)])),
+            None,
+            "in flight"
+        );
+        assert_eq!(
+            next_due(&stopping(vec![stop(1, 100_000, Some(true))])),
+            None,
+            "done"
+        );
+        let mut busy = stopping(vec![stop(1, 100_000, Some(false))]);
+        busy.open_command = true;
+        assert_eq!(next_due(&busy), None, "a command is in flight");
+    }
+}
