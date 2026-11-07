@@ -7047,17 +7047,7 @@ mod database_tests {
             .expect("the aborts")
             .get(0);
         assert_eq!(aborts, 0, "an overrun is no abort");
-        let (gate_aborts, gate_rejections): (i32, i32) = {
-            let row = db
-                .admin()
-                .query_one(
-                    "select gate_aborts, gate_rejections from mission_missions where id = $1",
-                    &[&mission],
-                )
-                .expect("the mission");
-            (row.get(0), row.get(1))
-        };
-        assert_eq!((gate_aborts, gate_rejections), (0, 0));
+        assert_eq!(gate_counters(&db, mission), (0, 0), "an overrun is no gate abort");
         let told = db.store.objective_yields().expect("the yields to tell");
         assert!(
             told.as_array().expect("a list").is_empty(),
@@ -7146,6 +7136,18 @@ mod database_tests {
             "the overrun task is the work the brief says ended: {brief}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A mission's run of gate aborts and rejections.
+    fn gate_counters(db: &Db, mission: i64) -> (i32, i32) {
+        let row = db
+            .admin()
+            .query_one(
+                "select gate_aborts, gate_rejections from mission_missions where id = $1",
+                &[&mission],
+            )
+            .expect("the mission");
+        (row.get(0), row.get(1))
     }
 
     /// The objective a task pursues, as the store folded it.
