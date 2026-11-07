@@ -727,7 +727,7 @@ pub(crate) fn read_plan(
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
 /// stalls past their `bounds` among its escalations ([`stall`]), without
 /// its new executions while the disk is under its floor ([`crate::disk`]).
-/// Returns log lines.
+/// Returns log lines, and when the next step is due ([`Reading::due_ms`]).
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -735,7 +735,7 @@ pub(crate) fn step(
     root: Option<&Path>,
     disk: &crate::disk::Monitor,
     bounds: &Bounds,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<i64>), String> {
     let (mut rows, mut work) = load(store)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
         deliver::collect_reports(store, &work, &rows, root, now_ms())
@@ -748,6 +748,7 @@ pub(crate) fn step(
         work,
         mut plan,
         lines: read,
+        due_ms,
         ..
     } = read_plan(
         store,
@@ -814,7 +815,7 @@ pub(crate) fn step(
         submit(store, &principal, order)?;
         lines.push(line);
     }
-    Ok(lines)
+    Ok((lines, due_ms))
 }
 
 /// Set aside the work of the cancelled task `task` before `order`, its
