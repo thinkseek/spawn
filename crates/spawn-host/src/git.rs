@@ -3123,6 +3123,7 @@ mod tests {
     /// no file of the crate, its tests included, starts git another way.
     #[test]
     fn every_test_git_is_built_by_test_git_command() {
+        use std::ffi::OsStr;
         fn sources(directory: &Path, found: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(directory).expect("a source directory") {
                 let path = entry.expect("an entry").path();
@@ -3133,7 +3134,6 @@ mod tests {
                 }
             }
         }
-        use std::ffi::OsStr;
         let command = super::test_git_command();
         let envs: Vec<_> = command.get_envs().collect();
         for expected in [
