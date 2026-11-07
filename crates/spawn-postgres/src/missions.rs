@@ -1412,6 +1412,12 @@ impl PostgresStore {
         self.query_json(GATE_HOST_FAULT_ESCALATIONS, &[])
     }
 
+    /// The base disagreements that carry `alert` and were not told to the
+    /// supervisor yet ([`GATE_BASE_DISAGREES_ALERTS`]).
+    pub fn gate_base_disagrees_alerts(&self) -> Result<Value, StoreError> {
+        self.query_json(GATE_BASE_DISAGREES_ALERTS, &[])
+    }
+
     /// The second overrun of an objective's chain that the supervisor was
     /// not told of yet ([`OVER_BUDGET_ESCALATIONS`]).
     pub fn over_budget_escalations(&self) -> Result<Value, StoreError> {
