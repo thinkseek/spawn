@@ -12,9 +12,13 @@ use crate::{Flags, open_store};
 
 const USAGE: &str = "usage:
   spawn mission add --text <mission> [--source <git repo path or URL>] [<settings>]
-  spawn mission configure --id N <settings>
+  spawn mission configure --id N [<settings>] [--clear <names>]   (owner only)
+      changes only the settings it is given and keeps the mission's others; --clear removes
+      some, a comma-separated list of gate, budget, minutes, tool-calls, objectives, workers
+      (e.g. --clear minutes,workers). Prints every setting the mission has after the change.
       settings: --gate <scenarios dir> [--accept review|gate] [--minutes N] [--tool-calls N]
-                [--backlog <dir> --resident <name> [--workers N]]   (owner only)
+                [--backlog <dir> --resident <name> [--workers N]]
+                (with add, all of them at once; with configure, any of them alone)
                 (--workers: objective tasks in flight at once, 1 to 16, default 1: the
                 resident takes one, per-task workers the rest)
   spawn mission resume --id N
@@ -236,6 +240,118 @@ impl Settings {
     }
 }
 
+/// What `--clear` may name, and the setting (and key in it) each clears.
+const CLEARABLE: [(&str, &str, Option<&str>); 6] = [
+    ("gate", "gate", None),
+    ("budget", "budget", None),
+    ("minutes", "budget", Some("minutes")),
+    ("tool-calls", "budget", Some("tool_calls")),
+    ("objectives", "objectives", None),
+    ("workers", "objectives", Some("workers")),
+];
+
+/// The change `spawn mission configure` asks for: only the settings its
+/// flags name, for `spawn_mission_reconfigure` to merge into the mission's
+/// own; `--clear a,b` sets the named ones to null. A setting both given and
+/// cleared, an unknown name, or no change at all is refused.
+fn change(flags: &Flags) -> Result<Value, String> {
+    const KNOWN: [&str; 9] = [
+        "id",
+        "gate",
+        "accept",
+        "minutes",
+        "tool-calls",
+        "backlog",
+        "resident",
+        "workers",
+        "clear",
+    ];
+    if let Some(unknown) = flags.names().find(|name| !KNOWN.contains(name)) {
+        return Err(format!(
+            "spawn mission configure has no --{unknown}\n{USAGE}"
+        ));
+    }
+    let number = |name: &str| -> Result<Option<i64>, String> {
+        flags
+            .get(name)
+            .map(|text| {
+                text.parse()
+                    .map_err(|_| format!("--{name} must be a number, not {text}"))
+            })
+            .transpose()
+    };
+    let mut change = serde_json::Map::new();
+    let mut part = |setting: &str, key: Option<&str>, value: Value| match key {
+        None => {
+            change.insert(setting.to_string(), value);
+        }
+        Some(key) => {
+            if let Some(map) = change
+                .entry(setting.to_string())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+            {
+                map.insert(key.to_string(), value);
+            }
+        }
+    };
+    if let Some(gate) = directory(flags, "gate")? {
+        part("gate", None, json!(gate));
+    }
+    if let Some(accept) = flags.get("accept") {
+        part("accept", None, json!(accept));
+    }
+    if let Some(minutes) = number("minutes")? {
+        part("budget", Some("minutes"), json!(minutes));
+    }
+    if let Some(calls) = number("tool-calls")? {
+        part("budget", Some("tool_calls"), json!(calls));
+    }
+    if let Some(backlog) = directory(flags, "backlog")? {
+        part("objectives", Some("backlog"), json!(backlog));
+    }
+    if let Some(resident) = flags.get("resident") {
+        part("objectives", Some("resident"), json!(resident));
+    }
+    if let Some(workers) = number("workers")? {
+        part("objectives", Some("workers"), json!(workers));
+    }
+    // Every value flag and the setting (and key) it writes.
+    let written = [
+        ("gate", "gate", None),
+        ("accept", "accept", None),
+        ("minutes", "budget", Some("minutes")),
+        ("tool-calls", "budget", Some("tool_calls")),
+        ("backlog", "objectives", Some("backlog")),
+        ("resident", "objectives", Some("resident")),
+        ("workers", "objectives", Some("workers")),
+    ];
+    for name in flags.get("clear").iter().flat_map(|list| list.split(',')) {
+        let name = name.trim();
+        let Some((_, setting, key)) = CLEARABLE.iter().find(|(flag, _, _)| *flag == name) else {
+            return Err(format!(
+                "--clear names gate, budget, minutes, tool-calls, objectives or workers, not \
+                 {name}\n{USAGE}"
+            ));
+        };
+        let conflict = written.iter().any(|(flag, written_setting, written_key)| {
+            flags.get(flag).is_some()
+                && written_setting == setting
+                && (key.is_none() || written_key == key)
+        });
+        if conflict {
+            return Err(format!(
+                "--clear {name} and a value for it together\n{USAGE}"
+            ));
+        }
+        part(setting, *key, Value::Null);
+    }
+    if change.is_empty() {
+        return Err(format!("nothing to change\n{USAGE}"));
+    }
+    Ok(Value::Object(change))
+}
+
 /// `spawn mission ...`
 pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
     let (verb, flags) = split(rest)?;
@@ -274,12 +390,9 @@ pub(crate) fn mission(rest: &[String]) -> Result<i32, String> {
         }
         "configure" => {
             let mission = id(&flags, "id")?;
-            let settings = Settings::from(&flags)?;
-            settings.apply(&store, mission)?;
-            print(
-                &json!({ "mission": mission, "gate": settings.gate, "accept": settings.accept,
-                           "objectives": settings.objectives }),
-            );
+            let change = change(&flags)?;
+            let settings = store.mission_reconfigure(mission, &change).map_err(err)?;
+            print(&settings);
         }
         "resume" => {
             let mission = id(&flags, "id")?;
@@ -403,8 +516,82 @@ pub(crate) fn resident(rest: &[String]) -> Result<i32, String> {
 mod tests {
     use spawn_core::event::ModelProfile;
 
-    use super::{hold_bound, model};
+    use serde_json::json;
+
+    use super::{change, hold_bound, model};
     use crate::Flags;
+
+    #[test]
+    fn configure_sends_only_the_settings_it_is_given() {
+        // The trap of 2026-11-08: --tool-calls alone replaced every setting.
+        assert_eq!(
+            change(&flags(&["--id", "4", "--tool-calls", "600"])),
+            Ok(json!({"budget": {"tool_calls": 600}}))
+        );
+        assert_eq!(
+            change(&flags(&["--id", "4", "--workers", "3", "--accept", "gate"])),
+            Ok(json!({"accept": "gate", "objectives": {"workers": 3}}))
+        );
+        let gate = std::env::temp_dir().display().to_string();
+        assert_eq!(
+            change(&flags(&["--id", "4", "--gate", &gate, "--minutes", "45"])),
+            Ok(json!({"gate": gate, "budget": {"minutes": 45}}))
+        );
+    }
+
+    #[test]
+    fn configure_clears_only_what_clear_names() {
+        assert_eq!(
+            change(&flags(&["--id", "4", "--clear", "minutes,workers"])),
+            Ok(json!({"budget": {"minutes": null}, "objectives": {"workers": null}}))
+        );
+        assert_eq!(
+            change(&flags(&["--id", "4", "--clear", "gate,objectives,budget"])),
+            Ok(json!({"gate": null, "objectives": null, "budget": null}))
+        );
+        assert_eq!(
+            change(&flags(&[
+                "--id",
+                "4",
+                "--minutes",
+                "30",
+                "--clear",
+                "tool-calls"
+            ])),
+            Ok(json!({"budget": {"minutes": 30, "tool_calls": null}}))
+        );
+    }
+
+    #[test]
+    fn configure_refuses_an_empty_unknown_or_contradictory_change() {
+        for (words, said) in [
+            (vec!["--id", "4"], "nothing to change"),
+            (
+                vec!["--id", "4", "--toolcalls", "600"],
+                "has no --toolcalls",
+            ),
+            (vec!["--id", "4", "--clear", "accept"], "--clear names"),
+            (
+                vec!["--id", "4", "--minutes", "5", "--clear", "budget"],
+                "together",
+            ),
+            (
+                vec!["--id", "4", "--minutes", "5", "--clear", "minutes"],
+                "together",
+            ),
+            (
+                vec!["--id", "4", "--workers", "2", "--clear", "objectives"],
+                "together",
+            ),
+            (
+                vec!["--id", "4", "--resident", "r", "--clear", "objectives"],
+                "together",
+            ),
+        ] {
+            let refused = change(&flags(&words)).expect_err(said);
+            assert!(refused.contains(said), "{words:?}: {refused}");
+        }
+    }
 
     #[test]
     fn a_holds_bound_is_one_second_to_a_day_three_hours_by_default() {

@@ -254,6 +254,11 @@ impl Flags {
         self.values.get(name).cloned()
     }
 
+    /// The names of the flags given, in no order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.values.keys().map(String::as_str)
+    }
+
     pub(crate) fn required(&self, name: &str) -> Result<String, String> {
         self.get(name)
             .ok_or_else(|| format!("--{name} is required"))

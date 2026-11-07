@@ -2225,6 +2225,78 @@ begin
         'accept', coalesce(p_accept, 'review'), 'budget', p_budget, 'objectives', p_objectives));
 end $$;
 
+-- Change some of a mission's settings and keep the rest (owner only;
+-- `spawn mission configure`). `p_change` names only what changes: `gate`
+-- and `accept` replace theirs when present (a JSON null gate clears it);
+-- `budget` and `objectives` merge key by key into the current ones (a key
+-- set to null is removed, the whole setting set to null is cleared, and one
+-- left empty is cleared). The merge is read and recorded under the append
+-- lock, so a concurrent change is never lost, and `spawn_mission_configure`
+-- checks the result and records it whole: `mission.configured` always
+-- carries every setting the mission has. Returns them.
+create or replace function spawn_mission_reconfigure(p_mission bigint, p_change jsonb)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_gate text;
+    v_accept text;
+    v_budget jsonb;
+    v_objectives jsonb;
+    v_key text;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only a human sets a mission''s gate' using errcode = '42501';
+    end if;
+    if jsonb_typeof(p_change) is distinct from 'object' then
+        raise exception 'a mission''s change is a JSON object, not %', p_change;
+    end if;
+    for v_key in select jsonb_object_keys(p_change) loop
+        if v_key not in ('gate', 'accept', 'budget', 'objectives') then
+            raise exception 'a mission has no setting %', v_key;
+        end if;
+    end loop;
+    select gate, accept, budget, objectives into v_gate, v_accept, v_budget, v_objectives
+      from mission_missions where id = p_mission and state in ('open', 'active');
+    if not found then
+        raise exception 'mission % is not open', p_mission;
+    end if;
+    if p_change ? 'gate' then
+        v_gate := p_change ->> 'gate';
+    end if;
+    if p_change ? 'accept' then
+        v_accept := p_change ->> 'accept';
+    end if;
+    v_budget := spawn_settings_merge(v_budget, p_change, 'budget');
+    v_objectives := spawn_settings_merge(v_objectives, p_change, 'objectives');
+    perform spawn_mission_configure(p_mission, v_gate, v_accept, v_budget, v_objectives);
+    return jsonb_build_object('mission', p_mission, 'gate', v_gate,
+                              'accept', coalesce(v_accept, 'review'),
+                              'budget', v_budget, 'objectives', v_objectives);
+end $$;
+
+-- One setting of `spawn_mission_reconfigure`: `p_current` with
+-- `p_change -> p_name` merged into it key by key. Absent from `p_change`:
+-- unchanged. A JSON null: cleared. A key set to null: removed. Empty after
+-- the merge: cleared (null).
+create or replace function spawn_settings_merge(p_current jsonb, p_change jsonb, p_name text)
+returns jsonb language plpgsql immutable as $$
+declare
+    v_change jsonb := p_change -> p_name;
+    v_merged jsonb;
+begin
+    if not p_change ? p_name then
+        return p_current;
+    end if;
+    if jsonb_typeof(v_change) = 'null' then
+        return null;
+    end if;
+    if jsonb_typeof(v_change) is distinct from 'object' then
+        raise exception 'a mission''s % is a JSON object, not %', p_name, v_change;
+    end if;
+    v_merged := jsonb_strip_nulls(coalesce(p_current, '{}'::jsonb) || v_change);
+    return case when v_merged = '{}'::jsonb then null else v_merged end;
+end $$;
+
 -- The integrator assigns one of an objective mission's open objectives
 -- (owner only). At most `objectives ->> 'workers'` (default 1) of the
 -- mission's tasks are in flight at once (assigned until landed or
@@ -2879,6 +2951,7 @@ begin
         'spawn_task_fork_failed(bigint, bigint, text, text)',
         'spawn_control_apply(jsonb, bigint, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
+        'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',

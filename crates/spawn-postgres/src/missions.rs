@@ -992,6 +992,20 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// Change only the settings `change` names and keep the rest of the
+    /// mission's (owner only; `spawn_mission_reconfigure`): `gate` and
+    /// `accept` replace theirs, `budget` and `objectives` merge key by key, a
+    /// null clears. Returns the mission's settings after the change, as
+    /// `mission.configured` records them.
+    pub fn mission_reconfigure(&self, mission: i64, change: &Value) -> Result<Value, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_mission_reconfigure($1, $2)",
+                &[&mission, change],
+            )?
+            .get(0))
+    }
+
     /// Assign an objective mission's next task to its resident (owner only).
     pub fn objective_assign(
         &self,
