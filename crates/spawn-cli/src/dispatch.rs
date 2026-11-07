@@ -104,6 +104,38 @@ pub(crate) struct StopSent {
     pub(crate) error: Option<String>,
 }
 
+/// A resume that started an execution which ended lost before its engine
+/// became ready ([`Facts::failed_resume`]), with what the log says of it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub(crate) struct FailedResume {
+    /// The execution the resume started.
+    pub(crate) execution_id: String,
+    /// The resume command.
+    #[serde(default)]
+    pub(crate) command_id: Option<i64>,
+    #[serde(default)]
+    pub(crate) ended_at_ms: Option<i64>,
+    /// The `evidence` of the execution's end: for a start abandoned at its
+    /// ready wait, `its start failed: pane never became ready, last state
+    /// <state>…`.
+    #[serde(default)]
+    pub(crate) evidence: Option<String>,
+    /// The resume command's error.
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
+impl FailedResume {
+    /// What the log says of how it failed: the end's evidence, else the
+    /// command's error.
+    pub(crate) fn why(&self) -> &str {
+        self.evidence
+            .as_deref()
+            .or(self.error.as_deref())
+            .unwrap_or("no evidence recorded")
+    }
+}
+
 /// Facts about one session, as `dispatch_facts` returns them.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Facts {
@@ -163,6 +195,13 @@ pub(crate) struct Facts {
     /// that stayed up.
     #[serde(default)]
     pub(crate) resumed_young: u32,
+    /// The latest execution one of the dispatcher's resumes started that
+    /// ended lost before its engine became ready (whatever its command's
+    /// outcome), since the session's last execution that stayed up: a
+    /// failed resume, read from the log rather than from the key of the
+    /// session's latest execution, which no resume was sent under.
+    #[serde(default)]
+    pub(crate) failed_resume: Option<FailedResume>,
     /// Every Stop and Discard sent into the session since its live
     /// execution started (none when it is not live), oldest first.
     #[serde(default)]
