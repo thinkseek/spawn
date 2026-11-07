@@ -687,6 +687,13 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
+    host.extend(digest::base_disagrees_alerts(
+        store
+            .gate_base_disagrees_alerts()
+            .map_err(|error| format!("gate base disagreement records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
     host.extend(digest::over_budget_escalations(
         store
             .over_budget_escalations()
