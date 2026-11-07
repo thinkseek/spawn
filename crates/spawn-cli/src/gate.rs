@@ -63,6 +63,14 @@ pub(crate) const GATE_ENV: &[&str] = &[
     // checks the same floor before it starts the gate ([`Room`]); its
     // memory floor, SPAWN_GATE_MIN_FREE_MEMORY_MB, is its own and stays out.
     "SPAWN_GATE_MIN_FREE_GB",
+    // How many scenarios the gate runs at once, and the test server's
+    // programs it runs a server of its own from (GitHub issue #6): a docker
+    // image, or the host's directory of them; all read outside the sandbox
+    // only. A gate that gets no test database
+    // ([`crate::integrate::NO_TEST_DATABASE`]) gets no server either.
+    "SPAWN_GATE_JOBS",
+    "SPAWN_GATE_PG_IMAGE",
+    "SPAWN_GATE_PG_BIN",
 ];
 
 /// The gate's exit status when TMPDIR has no room to judge now
@@ -1294,6 +1302,9 @@ mod tests {
             }
             "SPAWN_TEST_DATABASE_URL" => Some("postgres://t:p@127.0.0.1:15434/spawn_test".into()),
             "SPAWN_GATE_MIN_FREE_GB" => Some("10".into()),
+            "SPAWN_GATE_JOBS" => Some("4".into()),
+            "SPAWN_GATE_PG_IMAGE" => Some("postgres:16-alpine".into()),
+            "SPAWN_GATE_PG_BIN" => Some("/usr/lib/postgresql/16/bin".into()),
             "SPAWN_DATABASE_URL" => Some("postgres://o:p@127.0.0.1:15433/spawn".into()),
             "SPAWN_JUDGE_URL" | "http_proxy" | "SSH_AUTH_SOCK" => Some("secret".into()),
             _ => None,
@@ -1310,7 +1321,10 @@ mod tests {
                 "CARGO_HOME",
                 "RUSTUP_HOME",
                 "SPAWN_TEST_DATABASE_URL",
-                "SPAWN_GATE_MIN_FREE_GB"
+                "SPAWN_GATE_MIN_FREE_GB",
+                "SPAWN_GATE_JOBS",
+                "SPAWN_GATE_PG_IMAGE",
+                "SPAWN_GATE_PG_BIN"
             ]
         );
         let unset = |name: &str| (name == "PATH").then(|| "/usr/bin".to_string());

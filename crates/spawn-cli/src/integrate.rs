@@ -1054,6 +1054,16 @@ pub(crate) fn needs_test_database(scenarios: &Path) -> bool {
     !scenarios.join(NO_TEST_DATABASE).exists()
 }
 
+/// The gate's variables a mission marked [`NO_TEST_DATABASE`] does not get:
+/// the shared test server's URL, and the programs (a docker image, or the
+/// host's directory of them) the gate would run a server of its own from.
+fn withheld_without_test_database(name: &str) -> bool {
+    matches!(
+        name,
+        "SPAWN_TEST_DATABASE_URL" | "SPAWN_GATE_PG_IMAGE" | "SPAWN_GATE_PG_BIN"
+    )
+}
+
 /// Whether a judging must wait for a gate: only one that shares the test
 /// server, when `shared_running` such judgings already fill the `cap`.
 fn waits_for_gate(shares_server: bool, shared_running: usize, cap: usize) -> bool {
@@ -1654,7 +1664,7 @@ impl Judge {
                 spawn_postgres::cluster_identity(url).map_err(|error| error.to_string())
             });
         if !needs_test_database(scenarios) {
-            gate_env.retain(|(name, _)| name != "SPAWN_TEST_DATABASE_URL");
+            gate_env.retain(|(name, _)| !withheld_without_test_database(name));
         }
         if let Some(warning) = warning {
             eprintln!("integrate: {warning}");
@@ -2701,6 +2711,7 @@ mod tests {
         Freshness, Mission, NO_TEST_DATABASE, aborted, freshness, halt_reason, markers_note,
         merged_tree, needs_test_database, no_room, over_budget, pinned, report_freshness,
         room_backoff, room_wait, short_of_room, task_scenario, waits_for_gate, wall_clock_minutes,
+        withheld_without_test_database,
     };
     use crate::gate::{GateFailure, Shortfall};
     use serde_json::json;
@@ -4009,6 +4020,25 @@ mod tests {
         std::fs::write(dir.join(NO_TEST_DATABASE), "").expect("the marker");
         assert!(!needs_test_database(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gate_without_the_test_database_gets_no_server_of_its_own_either() {
+        for name in [
+            "SPAWN_TEST_DATABASE_URL",
+            "SPAWN_GATE_PG_IMAGE",
+            "SPAWN_GATE_PG_BIN",
+        ] {
+            assert!(withheld_without_test_database(name), "{name}");
+        }
+        for name in [
+            "PATH",
+            "TMPDIR",
+            "SPAWN_GATE_JOBS",
+            "SPAWN_GATE_MIN_FREE_GB",
+        ] {
+            assert!(!withheld_without_test_database(name), "{name}");
+        }
     }
 
     #[test]

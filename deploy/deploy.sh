@@ -66,9 +66,11 @@
 #      every gated mission whose baseline was the old main takes the new one
 #      (so the deploy is not mistaken for a push outside the gate), and
 #      deploy.pending is removed;
-#   7. the services restart, then each relay whose script changed gets it and
-#      a try-restart; a relay unit that is not installed is skipped, any
-#      other relay failure is reported after the deploy is live.
+#   7. the services restart; the base cache is warmed for the new main in
+#      the background (see warm_base_cache); then each relay whose script
+#      changed gets it and a try-restart; a relay unit that is not installed
+#      is skipped, any other relay failure is reported after the deploy is
+#      live.
 # Any failure after the integrator stopped completes a pending deploy (when
 # main is its head) and restarts the services before the deploy exits (with
 # whatever binary is installed by then: the previous one, unless the failure
@@ -310,6 +312,85 @@ fi
 restart
 stopped=0
 say "restarted; live at $head"
+
+# warm_base_cache: the gate's base phase for the new main, run now in the
+# background (scripts/rsi/gate.sh --base-only), so the next gates judged
+# against it (the integrator's, the owner's) take their base results from
+# the cache instead of 30-60 minutes of base runs. The same key those gates
+# compute: the controller's gate and scenarios, and the integrator's own
+# gate environment, read from the running integrator (/proc/<pid>/environ,
+# the variables gate.rs passes the gate) and never from a command line, as
+# its database URL must not be. With a server of the gate's own
+# (SPAWN_GATE_PG_IMAGE or SPAWN_GATE_PG_BIN) it does not get the shared
+# SPAWN_TEST_DATABASE_URL; without one it gets it only when its server is
+# not the owner's (by text; the integrator also asks the servers), and its
+# base runs share that server with whatever else uses it, the integrator's
+# next gate included. It never delays or fails the
+# deploy: it runs in a session of its own, with the deploy's lock closed,
+# and anything that keeps it from starting is said and skipped. A gate that
+# starts meanwhile waits on the per-key lock for what it is running, and
+# judges the rest itself; results are written whole or not at all. The log
+# is $live/gate-warm/<head>.log (logs older than a week go).
+warm_base_cache() {
+  local pid controller log assignment name keep=() cached
+  controller=$(readlink -f "$live/controllers/spawn") && [ -f "$controller/scripts/rsi/gate.sh" ] || {
+    say "base cache: no controller at $live/controllers/spawn; not warmed"
+    return 0
+  }
+  pid=$(systemctl --user show -p MainPID --value spawn-integrate 2>/dev/null) || pid=""
+  if ! [[ $pid =~ ^[1-9][0-9]*$ ]] || [ ! -r "/proc/$pid/environ" ]; then
+    say "base cache: the integrator's environment is not readable (spawn-integrate is not running); not warmed"
+    return 0
+  fi
+  # shellcheck source=scripts/pg-url.sh
+  . "$controller/scripts/pg-url.sh"
+  local own="" test_url="" home=$HOME
+  while IFS= read -r -d '' assignment; do
+    name=${assignment%%=*}
+    case $name in
+    PATH | HOME | LANG | TMPDIR | CARGO_HOME | RUSTUP_HOME | SPAWN_GATE_MIN_FREE_GB | SPAWN_GATE_JOBS)
+      keep+=("$assignment") ;;
+    SPAWN_GATE_PG_IMAGE | SPAWN_GATE_PG_BIN)
+      own=${own:-${assignment#*=}}
+      keep+=("$assignment")
+      ;;
+    SPAWN_TEST_DATABASE_URL) test_url=${assignment#*=} ;;
+    esac
+    [ "$name" != HOME ] || home=${assignment#*=}
+  done <"/proc/$pid/environ"
+  if [ -z "$own" ] && [ -n "$test_url" ]; then
+    local owner_server="" test_server=""
+    pg_url_parse "${SPAWN_DATABASE_URL-}" && owner_server="$pg_url_host:$pg_url_port"
+    pg_url_parse "$test_url" && test_server="$pg_url_host:$pg_url_port"
+    if [ -n "$test_server" ] && [ "$test_server" != "$owner_server" ]; then
+      keep+=("SPAWN_TEST_DATABASE_URL=$test_url")
+    fi
+  fi
+  mkdir -p "$live/gate-warm"
+  find "$live/gate-warm" -maxdepth 1 -name '*.log' -type f -mtime +7 -delete 2>/dev/null || true
+  log=$live/gate-warm/$head.log
+  (
+    exec 8>&- 9>&- </dev/null >>"$log" 2>&1
+    # Nor anything else the deploy's caller left open (a pipe it reads to
+    # its end would wait for the warm-up). 255 is bash's own, close-on-exec.
+    local fd
+    for fd in /proc/"$BASHPID"/fd/*; do
+      fd=${fd##*/}
+      case $fd in
+      0 | 1 | 2 | 255) ;;
+      *) eval "exec $fd>&-" 2>/dev/null || true ;;
+      esac
+    done
+    # The integrator's gate environment, and nothing else of the deploy's.
+    for name in $(compgen -e); do unset "$name" 2>/dev/null || true; done
+    for assignment in "${keep[@]}"; do export "$assignment"; done
+    echo "deploy: base-only gate of $head, started $(date -Is)"
+    exec setsid sh "$controller/scripts/rsi/gate.sh" --base-only "$missions" "$head" "$controller/rsi/scenarios"
+  ) &
+  cached=${home}/.cache/spawn/gate-base
+  say "base cache: warming it for $head in the background (pid $!), with ${own:-the shared test server}: log $log, results in $cached"
+}
+warm_base_cache || say "base cache: not warmed (above)"
 # The relays run from the live bin directory too; restart one only when its
 # script changed, so a deploy does not drop engines' model calls needlessly.
 # Last, so a relay cannot stop the deploy halfway. A relay whose unit is not

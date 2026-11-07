@@ -1220,7 +1220,10 @@ fn a_gateway_submission_returns_its_own_command() {
 fn views_are_closed_to_other_roles() {
     let (_store, schema) = store("revoke");
     let mut client = admin(&schema);
-    let role = format!("spawn_reader_{}", std::process::id());
+    // Roles are the server's, not the schema's: named by the schema, which
+    // is this run's alone (the pid alone is the same in every gate's PID
+    // namespace, and two gates on one server would share the role).
+    let role = format!("{schema}_reader");
     client
         .batch_execute(&format!(
             "drop role if exists {role}; create role {role}; \
