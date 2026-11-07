@@ -283,6 +283,7 @@ cat >"$work/gitconfig" <<'EOF'
 EOF
 
 metric=""
+flakes=""
 
 # JSON string body: backslash, quote and tab escaped, newlines as \n, other
 # control characters dropped.
@@ -302,6 +303,9 @@ verdict() {
     json="{\"verdict\":\"$1\""
     [ -n "${2-}" ] && json="$json,\"reason\":\"$(json_string "$2")\""
     [ -n "$metric" ] && json="$json,\"metric\":\"$(json_string "$metric")\""
+    # The checks that failed once and passed again on the candidate (a
+    # flake, not a regression), in the log's order.
+    [ -n "${flakes-}" ] && json="$json,\"flakes\":[$flakes]"
     json="$json,\"base\":\"$base_commit\",\"candidate\":\"$candidate_commit\"}"
     if [ -n "${SPAWN_GATE_VERDICT-}" ]; then
         printf '%s\n' "$json" >"$SPAWN_GATE_VERDICT"
@@ -1921,6 +1925,7 @@ candidate_job() {
         job_output 2
         if [ "$again" -eq 0 ]; then
             job_say "| $(basename "$job_scenario") failed once ($run_status) and passed again on the candidate: a flake, not a regression"
+            basename "$job_scenario" >"$job/flake"
             run_status=0
         else
             again_ms=$(($(stage_now) - run_at))
@@ -1993,6 +1998,10 @@ candidate_finished() {
 # candidate_printed <job> <n>: its block, then what it means.
 candidate_printed() {
     job_print "$1"
+    # A check that failed once and passed again: named in the verdict.
+    if [ -s "$1/flake" ]; then
+        flakes="${flakes:+$flakes,}\"$(json_string "$(cat "$1/flake")")\""
+    fi
     printed_name=$(cat "$1/section")
     printed_ms=$(cat "$1/ms" 2>/dev/null || echo 0)
     printed_status=$(cat "$1/result")

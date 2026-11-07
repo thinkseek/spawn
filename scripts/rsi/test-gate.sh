@@ -257,8 +257,8 @@ echo "probe: a load flake"
 exit 1
 EOF
 flaky=$(commit flaky)
-expect "a check that fails once and then passes is a flake, not a regression" \
-    "$(judge "$flaky")" 'exit=0 {"verdict":"accepted"}'
+expect "a check that fails once and then passes is a flake, not a regression, named in the verdict" \
+    "$(judge "$flaky")" 'exit=0 {"verdict":"accepted","flakes":["check-probe.sh"]}'
 expect "the log says it" "$(cat "$work/gate.out")" \
     'check-probe.sh failed once (1) and passed again on the candidate: a flake, not a regression'
 broken_scenarios=$work/broken

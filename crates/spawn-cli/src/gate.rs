@@ -676,6 +676,10 @@ pub(crate) struct Verdict {
     pub(crate) reason: String,
     /// The candidate's task metric, from the verdict only.
     pub(crate) metric: Option<String>,
+    /// The checks that failed once and passed again on the candidate (the
+    /// verdict's `flakes`: a flake, not a regression), in the log's order;
+    /// only names of checks (`check-*.sh`) are kept.
+    pub(crate) flakes: Vec<String>,
     /// Everything the gate printed, stderr marked `! `, the verdict last.
     pub(crate) output: String,
 }
@@ -1104,8 +1108,32 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
         accepted,
         reason: text("reason").unwrap_or_else(|| "gate rejected the candidate".to_string()),
         metric: text("metric"),
+        flakes: flakes(&value),
         output,
     })
+}
+
+/// The verdict's `flakes`: the names of checks (`check-<name>.sh`, no path)
+/// that failed once and passed again; anything else in the list is dropped.
+fn flakes(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("flakes")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|name| {
+                    name.strip_prefix("check-")
+                        .and_then(|rest| rest.strip_suffix(".sh"))
+                        .is_some_and(|stem| !stem.is_empty())
+                        && name.len() <= 100
+                        && !name.contains('/')
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The no-room fact of a verdict file, `(free_kb, min_gb, tmpdir)`: one
@@ -1496,6 +1524,26 @@ mod tests {
 
     fn path_only() -> Vec<(String, String)> {
         vec![("PATH".to_string(), "/usr/bin:/bin".to_string())]
+    }
+
+    /// A verdict names the checks that failed once and passed again
+    /// (`flakes`); only check names are kept, and a verdict without the key
+    /// (every gate before it) has none.
+    #[test]
+    fn a_verdict_names_its_flakes_and_keeps_only_check_names() {
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"accepted\",\"flakes\":[\"check-e2e.sh\",\"../x.sh\",\"007.sh\",3,\"check-tests.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert_eq!(verdict.flakes, ["check-e2e.sh", "check-tests.sh"]);
+        let gate = FakeGate::new(
+            "echo '{\"verdict\":\"rejected\",\"reason\":\"r\",\"flakes\":[\"check-clippy.sh\"]}' >\"$SPAWN_GATE_VERDICT\"\n",
+        );
+        let verdict = gate.judge(&path_only()).expect("verdict");
+        assert!(!verdict.accepted);
+        assert_eq!(verdict.flakes, ["check-clippy.sh"]);
+        let gate = FakeGate::new("echo '{\"verdict\":\"accepted\"}' >\"$SPAWN_GATE_VERDICT\"\n");
+        assert!(gate.judge(&path_only()).expect("verdict").flakes.is_empty());
     }
 
     #[test]
