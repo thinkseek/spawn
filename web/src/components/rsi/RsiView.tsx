@@ -215,12 +215,12 @@ function ObjectiveCard({ mission }: { mission: RsiMission }) {
                   : "open"
                 : objective.status}
           </Eyebrow>
-          <h2
+          <ObjectiveName
+            heading
+            mission={mission.id}
+            objective={objective}
             className="mt-0.5 truncate text-title-sm font-semibold text-foreground"
-            title={promptTitle(objective)}
-          >
-            {objective.title}
-          </h2>
+          />
         </div>
         <StatusPill status={objective.status} />
       </div>
@@ -584,12 +584,11 @@ function ObjectivesCard({
               <span className="tnum w-6 font-mono text-caption text-faint-foreground">
                 {objective.id}
               </span>
-              <span
+              <ObjectiveName
+                mission={mission.id}
+                objective={objective}
                 className="min-w-0 flex-1 truncate text-label text-foreground/90"
-                title={promptTitle(objective)}
-              >
-                {objective.title}
-              </span>
+              />
               {objective.metric && (
                 <button
                   type="button"
