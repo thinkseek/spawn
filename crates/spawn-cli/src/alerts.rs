@@ -2179,9 +2179,9 @@ mod tests {
         }
     }
 
-    fn feed(monitor: &mut Monitor, event_id: i64, at_ms: i64, record: Value) -> Vec<Event> {
+    fn feed(monitor: &mut Monitor, event_id: i64, at_ms: i64, record: &Value) -> Vec<Event> {
         let mut out = Vec::new();
-        monitor.feed(event_id, at_ms, &record, &mut out);
+        monitor.feed(event_id, at_ms, record, &mut out);
         out
     }
 
@@ -2416,7 +2416,7 @@ mod tests {
     #[test]
     fn a_crash_line_is_parsed_with_utc_and_offset_stamps() {
         let base = days_from_civil(2026, 11, 8) * 86_400_000
-            + (18 * 3600 + 25 * 60 + 0) * 1000
+            + (18 * 3600 + 25 * 60) * 1000
             + 123;
         let now = base + 5_000;
         let (stamp, prefix) = crash_stamp(
