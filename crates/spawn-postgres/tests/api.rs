@@ -2534,7 +2534,7 @@ fn a_sweep_drops_only_the_logins_of_gone_databases_under_its_prefix() {
             .query(
                 "select rolname::text from pg_roles
                   where rolname ~ ('^spawn_(supervisor|reader|human)_' || $1)
-                  order by 1 collate \"C\"",
+                  order by rolname collate \"C\"",
                 &[&pattern],
             )
             .expect("the logins")
