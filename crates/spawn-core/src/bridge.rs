@@ -3459,7 +3459,7 @@ fn exit_file(active: &Active) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex};
 
     use super::{Bridge, BridgeConfig};
     use crate::command::{CommandAction, Submission};
@@ -3469,7 +3469,7 @@ mod tests {
         WorkspaceId,
     };
     use crate::memory::{MemoryStore, MemoryWatch};
-    use crate::port::{CommandQueue, EventLog, FileWatch, Launch, TerminalError, TerminalHost};
+    use crate::port::{EventLog, Launch, TerminalError, TerminalHost};
     use crate::time::{ManualClock, Timestamp};
     use std::time::Duration;
 
@@ -3698,19 +3698,14 @@ mod tests {
                 .collect()
         }
 
-        fn screens(&self) -> Vec<&'static str> {
-            self.screen_states()
-        }
-
-        /// The screen states the Bridge recorded, with what each came from.
-        fn screen_states(&self) -> Vec<&'static str> {
-            let _ = &self.screens;
+        /// The screen states the Bridge recorded, in order.
+        fn screens(&self) -> Vec<crate::screen::ScreenState> {
             self.store
                 .read_global(GlobalPosition(0), 500)
                 .expect("read")
                 .into_iter()
                 .filter_map(|record| match record.event.kind {
-                    EventKind::ScreenObserved { state, .. } => Some(state.key()),
+                    EventKind::ScreenObserved { state, .. } => Some(state),
                     _ => None,
                 })
                 .collect()
