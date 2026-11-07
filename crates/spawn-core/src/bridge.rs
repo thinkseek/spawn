@@ -1436,8 +1436,10 @@ impl Bridge {
         let key = watch_key(&active.execution_id);
         if self.touched.contains(&key) {
             active.follow.watch.dirty = true;
-        } else if active.follow.watch.dirty {
-            // Nothing new, and the watch is set: no system call at all.
+        } else if !active.follow.watch.dirty {
+            // Nothing new and the watch is set: no system call at all. A
+            // dirty execution calls again, so a watch the kernel dropped
+            // (its directory went) is carried again or falls back.
             return;
         }
         let mut paths = vec![exit_file(active)];
@@ -1461,7 +1463,6 @@ impl Bridge {
                 return;
             }
         }
-        active.follow.watch.dirty = true;
     }
 
     /// Whether this pass looks at the execution: reads the runner's exit
