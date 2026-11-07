@@ -2725,7 +2725,6 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
     );
 }
 
-<<<<<<< 086dd79f79512e065f02af8c386088e5654d11e2
 /// A report still a draft is not taken (crates/spawn-cli/src/deliver.rs):
 /// `task.report_unfinished` records the check, once per content and
 /// revision, only while the task is delivered, and folds into nothing.
@@ -2789,7 +2788,52 @@ fn an_unfinished_report_is_recorded_once_per_content_and_revision_and_moves_noth
             .task_report_unfinished(task, "d1", &markers, "report-unfinished-d1-r1", 11)
             .expect("revision 1")
     );
-=======
+
+    let live = tables(&mut client);
+    refold(&mut client);
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
+    let record: serde_json::Value = client
+        .query_one(
+            "select kind -> 'detail' -> 'record' from spawn_events
+              where session_id = 'session_control'
+                and kind -> 'detail' -> 'record' ->> 'type' = 'task.report_unfinished'
+              order by session_seq limit 1",
+            &[],
+        )
+        .expect("the first record")
+        .get(0);
+    assert_eq!(
+        record,
+        json!({"type": "task.report_unfinished", "id": task, "revision": 0, "digest": "d1",
+               "markers": markers, "note": "report-unfinished-d1", "command_id": 7})
+    );
+    let stages: Vec<String> = store
+        .task_stages(task)
+        .expect("stages")
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|stage| stage["stage"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            "assigned",
+            "delivered",
+            "report_unfinished",
+            "report_unfinished",
+            "reported",
+            "reviewed",
+            "delivered",
+            "report_unfinished"
+        ]
+    );
+}
+
 /// A gated mission on `source` whose first verdict left `baseline`.
 fn mission_at(store: &PostgresStore, source: &str, baseline: &str) -> i64 {
     let mission = store
@@ -2983,54 +3027,12 @@ fn an_owner_landing_is_a_request_and_one_outcome_and_only_the_move_folds() {
     let pending = store.source_pushes_pending().expect("pending");
     assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
     assert_eq!(pending[0]["request"], json!(third));
->>>>>>> 16890fb0b5ac7879cc586ecb8cfba06cb6dc4960
 
     let live = tables(&mut client);
     refold(&mut client);
     assert_eq!(
         tables(&mut client),
         live,
-<<<<<<< 086dd79f79512e065f02af8c386088e5654d11e2
-        "the tables are the fold of the log"
-    );
-    let record: serde_json::Value = client
-        .query_one(
-            "select kind -> 'detail' -> 'record' from spawn_events
-              where session_id = 'session_control'
-                and kind -> 'detail' -> 'record' ->> 'type' = 'task.report_unfinished'
-              order by session_seq limit 1",
-            &[],
-        )
-        .expect("the first record")
-        .get(0);
-    assert_eq!(
-        record,
-        json!({"type": "task.report_unfinished", "id": task, "revision": 0, "digest": "d1",
-               "markers": markers, "note": "report-unfinished-d1", "command_id": 7})
-    );
-    let stages: Vec<String> = store
-        .task_stages(task)
-        .expect("stages")
-        .as_array()
-        .expect("a list")
-        .iter()
-        .map(|stage| stage["stage"].as_str().unwrap_or_default().to_string())
-        .collect();
-    assert_eq!(
-        stages,
-        [
-            "assigned",
-            "delivered",
-            "report_unfinished",
-            "report_unfinished",
-            "reported",
-            "reviewed",
-            "delivered",
-            "report_unfinished"
-        ]
-    );
-}
-=======
         "the log folds to the same tables"
     );
     let types = control_types(&mut client);
@@ -3085,4 +3087,3 @@ fn an_owner_landing_takes_the_landing_holds_lock() {
         )
         .expect("released with the hold");
 }
->>>>>>> 16890fb0b5ac7879cc586ecb8cfba06cb6dc4960
