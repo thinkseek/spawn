@@ -479,6 +479,23 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
         .expect("capture succeeds");
     assert!(pane.contains("hello from spawn"), "pane: {pane}");
 
+    // One call answers for the whole fleet: the session here, and one that
+    // is not there.
+    let missing = terminal("missing");
+    let states = host
+        .runners(&[
+            (name.clone(), workspace()),
+            (missing.clone(), workspace()),
+        ])
+        .expect("runners succeeds");
+    assert_eq!(
+        states,
+        vec![
+            (name.clone(), spawn_core::port::Runner::Running),
+            (missing, spawn_core::port::Runner::Gone),
+        ]
+    );
+
     host.terminate(&name, &workspace())
         .expect("terminate succeeds");
     assert!(
@@ -487,6 +504,10 @@ fn tmux_types_into_a_terminal_and_sees_the_echo() {
             .expect("is_alive after terminate"),
         "the session is gone"
     );
+    let states = host
+        .runners(&[(name.clone(), workspace())])
+        .expect("runners after terminate");
+    assert_eq!(states, vec![(name, spawn_core::port::Runner::Gone)]);
 }
 
 /// A prompt longer than tmux's message size (16 KiB; an objective's brief
