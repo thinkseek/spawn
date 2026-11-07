@@ -266,9 +266,9 @@ fn labelled(line: &str) -> Option<(&str, &str)> {
         }
     }
     let (label, value) = line.split_once(':')?;
-    let words = label.chars().all(|c| {
-        c.is_alphanumeric() || c == ' ' || c == '-' || c == '/' || c == '*' || c == '_'
-    });
+    let words = label
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '/' || c == '*' || c == '_');
     let label = unemphasized(label);
     (words && !label.is_empty() && label.chars().count() <= 40)
         .then_some((label, value.trim_start_matches(punctuation)))
@@ -283,7 +283,10 @@ fn only_placeholder(text: &str) -> Option<&str> {
     let inner = word
         .strip_prefix('(')
         .and_then(|rest| rest.strip_suffix(')'))
-        .or_else(|| word.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')))
+        .or_else(|| {
+            word.strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+        })
         .map(str::trim);
     let bare = word.to_lowercase();
     let matched = match inner.map(str::to_lowercase) {
@@ -310,12 +313,23 @@ fn says_draft(text: &str) -> bool {
     let begins = ["draft", "wip"]
         .iter()
         .any(|word| after_word(start, word).is_some())
-        || ["in progress", "in-progress", "work in progress", "still in progress"]
-            .iter()
-            .any(|words| start.starts_with(words));
-    let tagged = ["draft", "wip", "in progress", "in-progress", "work in progress"]
+        || [
+            "in progress",
+            "in-progress",
+            "work in progress",
+            "still in progress",
+        ]
         .iter()
-        .any(|words| lower.contains(&format!("({words})")) || lower.contains(&format!("[{words}]")));
+        .any(|words| start.starts_with(words));
+    let tagged = [
+        "draft",
+        "wip",
+        "in progress",
+        "in-progress",
+        "work in progress",
+    ]
+    .iter()
+    .any(|words| lower.contains(&format!("({words})")) || lower.contains(&format!("[{words}]")));
     begins || tagged
 }
 

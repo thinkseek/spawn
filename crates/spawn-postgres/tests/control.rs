@@ -2791,7 +2791,11 @@ fn an_unfinished_report_is_recorded_once_per_content_and_revision_and_moves_noth
 
     let live = tables(&mut client);
     refold(&mut client);
-    assert_eq!(tables(&mut client), live, "the tables are the fold of the log");
+    assert_eq!(
+        tables(&mut client),
+        live,
+        "the tables are the fold of the log"
+    );
     let record: serde_json::Value = client
         .query_one(
             "select kind -> 'detail' -> 'record' from spawn_events

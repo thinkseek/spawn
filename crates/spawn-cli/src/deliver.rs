@@ -1305,7 +1305,13 @@ fn refuse_unfinished(
     let command = send_note(store, task, &key, unfinished_note(task.id, markers))?;
     let records = markers.iter().map(unfinished::Marker::record).collect();
     store
-        .task_report_unfinished(task.id, &digest, &serde_json::Value::Array(records), &key, command)
+        .task_report_unfinished(
+            task.id,
+            &digest,
+            &serde_json::Value::Array(records),
+            &key,
+            command,
+        )
         .map_err(error)?;
     let named: Vec<String> = markers.iter().map(unfinished::Marker::describe).collect();
     Ok(Some(format!(
@@ -1341,7 +1347,12 @@ fn note_retry(key: &str, facts: &Facts, now_ms: i64) -> Option<String> {
 
 /// Submit the note `text` to `task`'s worker under `key`, as the dispatcher:
 /// the command's id. A key already used gives the command it named.
-fn send_note(store: &PostgresStore, task: &TaskRow, key: &str, text: String) -> Result<i64, String> {
+fn send_note(
+    store: &PostgresStore,
+    task: &TaskRow,
+    key: &str,
+    text: String,
+) -> Result<i64, String> {
     use spawn_core::command::Submission;
     use spawn_core::id::{AgentId, IdempotencyKey, Principal, SessionId};
     use spawn_core::port::CommandQueue;
@@ -2632,7 +2643,11 @@ mod tests {
         use spawn_core::bridge::{MAY_HAVE_TYPED, PANE_NOT_READY};
         let key = "report-unfinished-7-0-00000000000000ab";
         let mut facts = worker(true, true);
-        assert_eq!(note_retry(key, &facts, 0), None, "never sent: nothing to retry");
+        assert_eq!(
+            note_retry(key, &facts, 0),
+            None,
+            "never sent: nothing to retry"
+        );
         let refused = format!("pane state Busy {PANE_NOT_READY}");
         facts.dispatched = vec![note_sent(key, 1_000, Some(&refused))];
         assert_eq!(
@@ -2645,19 +2660,43 @@ mod tests {
             Some("report-unfinished-7-0-00000000000000ab-retry-1")
         );
         facts.dispatched = vec![note_sent(key, 1_000, None)];
-        assert_eq!(note_retry(key, &facts, i64::MAX / 2), None, "typed: told once");
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "typed: told once"
+        );
         let maybe = format!("the text {MAY_HAVE_TYPED}");
         facts.dispatched = vec![note_sent(key, 1_000, Some(&maybe))];
-        assert_eq!(note_retry(key, &facts, i64::MAX / 2), None, "may have been typed");
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "may have been typed"
+        );
         facts.dispatched = (0..=NOT_READY_FREE)
             .map(|n| {
-                let attempt = if n == 0 { key.to_string() } else { format!("{key}-retry-{n}") };
+                let attempt = if n == 0 {
+                    key.to_string()
+                } else {
+                    format!("{key}-retry-{n}")
+                };
                 note_sent(&attempt, 1_000, Some(&refused))
             })
             .collect();
-        assert_eq!(note_retry(key, &facts, i64::MAX / 2), None, "its tries are spent");
-        facts.dispatched = vec![note_sent("report-unfinished-7-0-ffffffffffffffff", 1_000, Some(&refused))];
-        assert_eq!(note_retry(key, &facts, i64::MAX / 2), None, "another content's note");
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "its tries are spent"
+        );
+        facts.dispatched = vec![note_sent(
+            "report-unfinished-7-0-ffffffffffffffff",
+            1_000,
+            Some(&refused),
+        )];
+        assert_eq!(
+            note_retry(key, &facts, i64::MAX / 2),
+            None,
+            "another content's note"
+        );
     }
 
     /// A schema of its own in the test database, dropped afterwards.
@@ -2694,7 +2733,10 @@ mod tests {
         fn task(&self, task: i64) -> (String, Option<String>) {
             let row = self
                 .client()
-                .query_one("select state, report from mission_tasks where id = $1", &[&task])
+                .query_one(
+                    "select state, report from mission_tasks where id = $1",
+                    &[&task],
+                )
                 .expect("the task");
             (row.get(0), row.get(1))
         }
@@ -2816,18 +2858,31 @@ PENDING_ISSUES\n";
             matches!(lines.as_slice(), [line] if line.contains(&format!("task #{} report not taken, unfinished", task.id))),
             "{lines:?}"
         );
-        assert_eq!(db.task(task.id), ("delivered".to_string(), None), "not taken");
-        assert!(report.is_file(), "the draft stays where the worker wrote it");
+        assert_eq!(
+            db.task(task.id),
+            ("delivered".to_string(), None),
+            "not taken"
+        );
+        assert!(
+            report.is_file(),
+            "the draft stays where the worker wrote it"
+        );
         let notes = db.notes(&task.session_id);
         let [(command, key, text)] = notes.as_slice() else {
             panic!("one note: {notes:?}");
         };
-        assert!(key.starts_with(&format!("report-unfinished-{}-0-", task.id)), "{key}");
+        assert!(
+            key.starts_with(&format!("report-unfinished-{}-0-", task.id)),
+            "{key}"
+        );
         for words in [
             "Your report is not finished: line 9: the placeholder PENDING_RESULTS («**Results.** \
              PENDING_RESULTS»); line 13: the placeholder PENDING_ISSUES («PENDING_ISSUES»); write \
              `.spawn/report.md` once, when everything is done",
-            &format!("[Your report on task #{} was not taken — this is not a new task]", task.id),
+            &format!(
+                "[Your report on task #{} was not taken — this is not a new task]",
+                task.id
+            ),
         ] {
             assert!(text.contains(words), "{words:?} in {text}");
         }
@@ -2924,8 +2979,16 @@ PENDING_ISSUES\n";
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0]["commit"], "c1");
         assert!(!workspace.join(REPORT).exists(), "moved aside");
-        assert!(workspace.join(format!(".spawn/reports/task-{}.md", task.id)).is_file());
-        assert_eq!(db.notes(&task.session_id).len(), 1, "a finished report adds no note");
+        assert!(
+            workspace
+                .join(format!(".spawn/reports/task-{}.md", task.id))
+                .is_file()
+        );
+        assert_eq!(
+            db.notes(&task.session_id).len(),
+            1,
+            "a finished report adds no note"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
