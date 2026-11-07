@@ -14,10 +14,12 @@ use spawn_core::port::StoreError;
 
 use crate::PostgresStore;
 
-/// The event watermark: the newest event id, one index-only read.
-pub(crate) const WATERMARK: &str = "select coalesce(max(id), 0) from spawn_events";
+/// The event watermark and the database's clock, in one index-only read:
+/// an idle pass costs the loop one statement (objective 023).
+pub(crate) const CLOCK: &str =
+    "select coalesce(max(id), 0), spawn_now_ms() from spawn_events";
 
-/// The database's clock, the one every bound is measured by.
+/// The database's clock alone, the one every bound is measured by.
 pub(crate) const NOW: &str = "select spawn_now_ms()";
 
 /// The missions and tasks the loop compares a record against, with what a
@@ -179,9 +181,11 @@ impl PostgresStore {
             .get(0))
     }
 
-    /// The newest event id ([`WATERMARK`]).
-    pub fn alert_watermark(&self) -> Result<i64, StoreError> {
-        Ok(self.query_one(WATERMARK, &[])?.get(0))
+    /// The newest event id and the database's clock, in one statement
+    /// ([`CLOCK`]).
+    pub fn alert_clock(&self) -> Result<(i64, i64), StoreError> {
+        let row = self.query_one(CLOCK, &[])?;
+        Ok((row.get(0), row.get(1)))
     }
 
     /// The database's clock in epoch ms ([`NOW`]).
