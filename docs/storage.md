@@ -354,7 +354,11 @@ commit with a key no agent holds cannot hang or fail a test.
   `SPAWN_TEST_DATABASE_LOG`, shows a crash during the gate) is gated
   `host_fault`: no verdict on the work, never counted, the task left where it
   was and judged again after a backoff from the record's `due_ms`, two in a
-  row escalated to the supervisor (fleet-architecture.md §10.3); marker blocks in the files
+  row escalated to the supervisor; or one whose own base disagreed with
+  itself (a scenario of it exited 1 and then 0, before any candidate code
+  ran) is gated `host_fault` with the evidence `base_disagrees`, never
+  counted, judged again after the same run's backoff and alerted at three in
+  a row in the record itself (fleet-architecture.md §10.3); marker blocks in the files
   the branch changes are gated `conflict`, a pending merge of `main` (it lives with the workspace
   directory, on the Bridge's host) blocks judging when that directory is on
   the integrator's host, and its markers, once checkpointed and pushed, are
