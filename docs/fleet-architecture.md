@@ -708,9 +708,10 @@ stream (§10.1).
 
 **When a task closes.** A task closes by landing (or, without a gate,
 acceptance), or by a cancel: `spawn task cancel`, the supervisor's, the
-integrator's abort over budget (`task.aborted`), a gate rejection the
-closure rule turns into a cancel, or a mission closed or a resident retired
-under it (§10). A cancelled task's live work ends with it, at the source:
+integrator's overrun over budget (`task.over_budget`, whose work the
+objective's next task continues, §10.4), a gate rejection the closure rule
+turns into a cancel, or a mission closed or a resident retired under it
+(§10). A cancelled task's live work ends with it, at the source:
 
 - *Stopped.* When a delivered task is cancelled and it was its worker's
   latest delivery, the dispatcher stops the worker at once, in the middle of
