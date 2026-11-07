@@ -67,10 +67,8 @@ No layer calls another layer's process directly; they meet in the log.
 ### 1.1 Synchronization points
 
 Work runs in parallel between synchronization points and joins only at
-them. A synchronization point is where work changes hands: from whoever
-asks to the worker, from the worker to a reviewer, from a report to its
-mission, from a branch to `main`, from `main` to the live host, from the
-owner's checkout to its remote. Between two points no one waits on another's
+them. A synchronization point is where work changes hands: the points
+are named in the table below, one row per hand-off. Between two points no one waits on another's
 progress; all waiting happens at a point (a landing that waits for a hold to
 end or for its turn, §10.3, waits at the Gate). At a point nothing moves on
 until a record names exactly what it covers (the task, the report's
@@ -87,12 +85,12 @@ session. A *ccd* is a Claude Code session run interactively with
 
 | Point | Joins | Moves on when | Record | Decided by | Enforced today |
 | --- | --- | --- | --- | --- | --- |
-| Brief | asker → worker | the task names its goal, inputs and done criteria, and reaches its worker in the worker's turn (§3.2) | `task.assigned`, then `task.delivered` | supervisor, the integrator for objective tasks (§10.4), or the owner | yes; the base the work starts from is recorded with the work (`artifact.committed` `base_merged`, `execution.started` `fork.commit`), not in `task.assigned` |
+| Brief | asker → worker | the task names its goal, inputs and done criteria, and is delivered once its worker has reported its previous task (§3.2) | `task.assigned`, then `task.delivered` | supervisor, the integrator for objective tasks (§10.4), or the owner | the records, and a brief that is not empty; its content is not checked. The base is the agent's latest `artifact.committed` at delivery (`reason` `base_merged` when the delivery merged `main`), or `execution.started` `fork.commit` for a branch the start created; it is not in `task.assigned` |
 | Review | worker → reviewer | a verdict names the task, the report's revision and the commit it read | review verdict | a ccd session that did not write the work | not in code: the lead runs it, outside the log (§9) |
 | Accept | report → mission | in a review-mode mission, the accept or reject names the revision it judged | `task.reviewed` (§10.3) | supervisor, or the owner | the revision check when `--revision` is given, a note on every send-back, and a refusal in a gate-mode mission; citing a review verdict is not checked (§9) |
 | Gate, fleet | branch → `main` | the gate's verdict names the candidate; the baseline moves only to that commit, by compare-and-swap | `task.gated`, `task.landed` (§10.2, §10.3) | integrator | yes |
 | Gate, owner work | owner's checkout → candidate | the owner's gate names the candidate and the base it judged against (the missions' `main`) | the gate's verdict file | the owner's gate | only at Deploy: accepted owner work reaches the owner's checkout before any gate |
-| Deploy | candidate → `main` and live | the verdict is `accepted`, its candidate is HEAD, its base is the missions' `main`, and the tree is clean | `source.moved` (`spawn mission moved`, §10.3) | `deploy/deploy.sh` | yes, by `deploy/deploy.sh` |
+| Deploy | candidate → `main` and live | the verdict is `accepted`, its candidate is HEAD, its base is the missions' `main`, and the tree is clean | `source.moved` when `main` moves (`spawn mission moved`, §10.3) | `deploy/deploy.sh` | yes, by `deploy/deploy.sh` |
 | Publish | owner's checkout → remote | the pushed commit passed its gate and a secret scan | the push | owner | by the owner's procedure, not by code |
 
 **The review.** A report gets a review before it moves on: in a
