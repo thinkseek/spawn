@@ -21,6 +21,17 @@
 //! under the floor (SPAWN_GATE_MIN_FREE_GB, default 10). Otherwise the run is
 //! an abort, as is a fact with any other exit status.
 //!
+//! **A host fault is no verdict either.** Exit [`HOST_FAULT_EXIT`] *and* a
+//! host-fault fact in the verdict file (`{"host_fault":true,"scenario",
+//! "on","runs","reason"}`) means the gate found a scenario failing where the
+//! candidate is not to blame ([`GateFailure::HostFault`]): a scenario's
+//! harness error on the base, before any candidate code ran (`on` `base`),
+//! or a check that failed twice on the candidate and once on the base (`on`
+//! `candidate and base`). The integrator records `host_fault`, retried after
+//! a backoff and counted toward no halt. The fact counts only from the
+//! verdict file the sandbox never sees, and only with that exit; exit 6
+//! without it is an abort.
+//!
 //! **The host's room is measured before a gate, not learned from its
 //! crash.** Before it starts a gate, the integrator checks the host
 //! ([`Room::check`]), in this order, stopping at the first that falls short:
@@ -94,6 +105,11 @@ pub(crate) const GATE_ENV: &[&str] = &[
 /// (scripts/rsi/gate.sh). It counts only with the no-room fact in the
 /// verdict file.
 pub(crate) const NO_ROOM_EXIT: i32 = 5;
+
+/// The gate's exit status when it found a host or harness fault instead of
+/// a verdict (scripts/rsi/gate.sh `host_fault`). It counts only with the
+/// host-fault fact in the verdict file.
+pub(crate) const HOST_FAULT_EXIT: i32 = 6;
 
 /// The gate's exit status when a scenario's two base runs disagreed
 /// (scripts/rsi/gate.sh: the first exited 1, the second did not exit 1). It
@@ -683,6 +699,17 @@ pub(crate) enum GateFailure {
         tmpdir: String,
         log: String,
     },
+    /// The gate found a scenario failing where the candidate is not to
+    /// blame (exit [`HOST_FAULT_EXIT`] with its fact): `scenario`, where it
+    /// failed (`on`: `base`, or `candidate and base`), its runs' exits as
+    /// the gate says them, and the gate's reason.
+    HostFault {
+        scenario: String,
+        on: String,
+        runs: String,
+        reason: String,
+        log: String,
+    },
     /// The base disagreed with itself: one of its scenarios exited 1 and then
     /// 0, before any candidate code ran (exit [`BASE_DISAGREES_EXIT`] and the
     /// gate's own pair of lines). A fact about the host, not the work.
@@ -1030,6 +1057,23 @@ fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
             log: record(&run.stdout),
         });
     }
+    if run.status.code() == Some(HOST_FAULT_EXIT)
+        && let Some(GateFailure::HostFault {
+            scenario,
+            on,
+            runs,
+            reason,
+            ..
+        }) = verdict.and_then(host_fault)
+    {
+        return Err(GateFailure::HostFault {
+            scenario,
+            on,
+            runs,
+            reason,
+            log: record(&run.stdout),
+        });
+    }
     if !run.status.success() {
         return Err(aborted(format!("the gate ended with {}", run.status)));
     }
@@ -1079,6 +1123,30 @@ fn no_room(file: &str) -> Option<(u64, u64, String)> {
     let min_gb = value.get("min_gb")?.as_u64()?;
     let tmpdir = value.get("tmpdir")?.as_str()?;
     (!tmpdir.is_empty()).then(|| (free_kb, min_gb, tmpdir.to_string()))
+}
+
+/// The host-fault fact of a verdict file: one JSON line with `host_fault`
+/// true, a scenario, where it failed (`base` or `candidate and base`), its
+/// runs and a reason, and no verdict. Its `log` is left empty.
+fn host_fault(file: &str) -> Option<GateFailure> {
+    let line = file.trim();
+    if line.contains('\n') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("host_fault")?.as_bool() != Some(true) || value.get("verdict").is_some() {
+        return None;
+    }
+    let text = |name: &str| value.get(name)?.as_str().map(str::to_string);
+    let scenario = text("scenario").filter(|scenario| !scenario.is_empty())?;
+    let on = text("on").filter(|on| on == "base" || on == "candidate and base")?;
+    Some(GateFailure::HostFault {
+        scenario,
+        on,
+        runs: text("runs").unwrap_or_default(),
+        reason: text("reason").unwrap_or_default(),
+        log: String::new(),
+    })
 }
 
 fn failed(error: &std::io::Error) -> GateFailure {
@@ -1857,6 +1925,78 @@ mod tests {
             gate.judge(&path_only()),
             Err(GateFailure::NoRoom { .. })
         ));
+    }
+
+    /// The gate's fact of a host fault (scripts/rsi/gate.sh `host_fault`).
+    const HOST_FAULT_FACT: &str = "{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\
+         \"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}";
+
+    #[test]
+    fn exit_6_with_the_host_fault_fact_is_a_host_fault() {
+        let gate = FakeGate::new(&format!(
+            "echo '| == base: 012.sh'\necho '{HOST_FAULT_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"
+        ));
+        let Err(GateFailure::HostFault {
+            scenario,
+            on,
+            runs,
+            reason,
+            log,
+        }) = gate.judge(&path_only())
+        else {
+            panic!("exit 6 with its fact is a host fault");
+        };
+        assert_eq!(
+            (scenario.as_str(), on.as_str(), runs.as_str()),
+            ("012.sh", "base", "1, then 0")
+        );
+        assert!(reason.contains("on the base"), "{reason}");
+        assert!(
+            log.contains("| == base: 012.sh"),
+            "the gate's output: {log}"
+        );
+        let both = HOST_FAULT_FACT
+            .replace("\"on\":\"base\"", "\"on\":\"candidate and base\"")
+            .replace("012.sh", "check-e2e.sh");
+        let gate = FakeGate::new(&format!("echo '{both}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n"));
+        assert!(matches!(
+            gate.judge(&path_only()),
+            Err(GateFailure::HostFault { on, .. }) if on == "candidate and base"
+        ));
+    }
+
+    #[test]
+    fn the_host_fault_fact_counts_only_whole_and_with_exit_6() {
+        // Another status, the fact on stdout only, or a fact that names no
+        // scenario, an unknown place, or a verdict too: an abort, which is
+        // what a gate that dies is.
+        let cases = [
+            format!("echo '{HOST_FAULT_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 4\n"),
+            format!("echo '{HOST_FAULT_FACT}' >\"$SPAWN_GATE_VERDICT\"\nexit 0\n"),
+            format!("echo '{HOST_FAULT_FACT}'\nexit 6\n"),
+            "exit 6\n".to_string(),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                HOST_FAULT_FACT.replace("\"scenario\":\"012.sh\"", "\"scenario\":\"\"")
+            ),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                HOST_FAULT_FACT.replace("\"on\":\"base\"", "\"on\":\"candidate\"")
+            ),
+            format!(
+                "echo '{}' >\"$SPAWN_GATE_VERDICT\"\nexit 6\n",
+                HOST_FAULT_FACT.replace('{', "{\"verdict\":\"accepted\",")
+            ),
+        ];
+        for script in cases {
+            assert!(
+                matches!(
+                    FakeGate::new(&script).judge(&path_only()),
+                    Err(GateFailure::Aborted { .. })
+                ),
+                "{script}"
+            );
+        }
     }
 
     #[test]

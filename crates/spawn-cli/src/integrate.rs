@@ -182,6 +182,14 @@
 //!    other gate failure, the gate's own exit 3 included (a missing bind
 //!    directory, a bad SPAWN_GATE_MIN_FREE_GB), is an abort and counts;
 //!
+//!    **The gate's own host faults.** A gate that exits
+//!    [`gate::HOST_FAULT_EXIT`] with its fact ([`GateFailure::HostFault`]: a
+//!    scenario's harness error on the base, before any candidate code ran,
+//!    or a check that failed twice on the candidate and once on the base)
+//!    is gated `host_fault` with `evidence` `gate` and the gate's `fact`
+//!    ([`gate_host_fault_fields`]), under the backoff, escalation and counts
+//!    below: never an abort;
+//!
 //!    **A host fault is not a verdict.** When the gate rejects C with
 //!    [`host::CHECK_TESTS_REGRESSION`], the integrator reads the failures
 //!    check-tests.sh printed in the gate's recorded output
@@ -970,6 +978,47 @@ pub(crate) fn base_disagrees_fields(
 /// itself (its own scenario failing and then passing, before any candidate
 /// code ran): objective 020's verdict with this objective's evidence.
 pub(crate) const BASE_DISAGREES: &str = "base_disagrees";
+
+/// The record of a host fault the gate reported itself
+/// ([`GateFailure::HostFault`], exit [`gate::HOST_FAULT_EXIT`] with its
+/// fact), the `faults`-th host fault in a row on the mission, with its
+/// `backoff`: `evidence` `gate` and the gate's `fact` (`scenario`, `on`:
+/// `base` or `candidate and base`, `runs`), and the rest as
+/// [`host_fault_fields`] writes it. Neither `gate_aborts` nor
+/// `gate_rejections` moves.
+pub(crate) fn gate_host_fault_fields(
+    failure: &GateFailure,
+    faults: u32,
+    backoff: Duration,
+) -> Value {
+    let GateFailure::HostFault {
+        scenario,
+        on,
+        runs,
+        reason,
+        log,
+    } = failure
+    else {
+        return aborted(failure);
+    };
+    let place = if on == "base" {
+        format!("{scenario} exited {runs} on the base, before any candidate code ran")
+    } else {
+        format!("{scenario} failed on the candidate and on the base ({runs})")
+    };
+    json!({
+        "reason": format!(
+            "host fault: {place}; not a verdict on the work, judged again in {}",
+            spoken(backoff)
+        ),
+        "log": log,
+        "evidence": "gate",
+        "fact": {"scenario": scenario, "on": on, "runs": runs, "reason": reason},
+        "host_faults": faults,
+        "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+        "escalate": faults == HOST_FAULT_ESCALATE_AT,
+    })
+}
 
 /// The record of a gate that had no room to judge `task`, at `now_ms`: the
 /// reason with the free space and TMPDIR, the facts themselves, and
@@ -2263,6 +2312,15 @@ impl Judge {
                         }
                         gated("host_fault", extra)
                     }
+                    Rejection::HeadHostFault { failure, head } => {
+                        let mut extra = self.gate_host_fault(mission, task.id, &failure);
+                        if let (Some(target), Some(head)) =
+                            (extra.as_object_mut(), head.as_object())
+                        {
+                            target.extend(head.clone());
+                        }
+                        gated("host_fault", extra)
+                    }
                 }
             }
             // No room in TMPDIR: a fact about the host, never a count.
@@ -2304,12 +2362,35 @@ impl Judge {
                 );
                 gated("host_fault", extra)
             }
+            // The gate found a host or harness fault, not a verdict: a
+            // scenario's harness error on the base, or a check failing on
+            // the candidate and the base. `host_fault`: retried after a
+            // backoff, never counted toward a halt.
+            Err(failure @ GateFailure::HostFault { .. }) => {
+                let mut extra = self.gate_host_fault(mission, task.id, &failure);
+                extra["candidate"] = json!(candidate);
+                gated("host_fault", extra)
+            }
             Err(failure) => gated("aborted", aborted(&failure)),
         }
     }
 }
 
 impl Judge {
+    /// The record of a host fault the gate itself reported
+    /// ([`GateFailure::HostFault`]) for `task`: the mission's next in a row,
+    /// with its backoff, said on stdout as the other host faults are.
+    fn gate_host_fault(&self, mission: &Mission, task: i64, failure: &GateFailure) -> Value {
+        let faults = mission.gate_host_faults.saturating_add(1);
+        let backoff = host_fault_backoff(self.host.backoff, faults);
+        let extra = gate_host_fault_fields(failure, faults, backoff);
+        println!(
+            "integrate: task {task}: {}",
+            extra["reason"].as_str().unwrap_or_default()
+        );
+        extra
+    }
+
     /// The test database's log lines that show a crash stamped inside the
     /// gate's window [`started`, `ended`] (with [`host::WINDOW_SLACK_MS`]
     /// around it). None to read (unset, unreadable): no evidence, said once.
@@ -2662,6 +2743,10 @@ enum Rejection {
         log: String,
         head: Value,
     },
+    /// The head's own run found a host fault (a scenario's harness error on
+    /// the base, a check failing on both trees): `host_fault`, as any, with
+    /// `head` added.
+    HeadHostFault { failure: GateFailure, head: Value },
 }
 
 /// The record of a gate rejection: the reason, the gate's output and the
@@ -2897,6 +2982,10 @@ fn rejection(
             log,
             head: named,
         },
+        Err(failure @ GateFailure::HostFault { .. }) => Rejection::HeadHostFault {
+            failure,
+            head: named,
+        },
         Err(failure) => {
             let mut record = aborted(&failure);
             if let Some(reason) = record["reason"].as_str() {
@@ -2937,6 +3026,12 @@ fn aborted(failure: &GateFailure) -> Value {
             "scenario": scenario,
             "log": log,
         }),
+        // Recorded as `host_fault` by the caller, likewise.
+        GateFailure::HostFault {
+            scenario, on, log, ..
+        } => {
+            json!({"reason": format!("the gate found {scenario} failing on the {on}"), "log": log})
+        }
     }
 }
 
@@ -8944,6 +9039,149 @@ mod database_tests {
             (0, None, None),
             "the landing ends the run"
         );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate's own host faults (exit 6 with its fact, gate.rs
+    /// `HOST_FAULT_EXIT`): a scenario's harness error on the base (012.sh
+    /// exited 1, then 0: Supply PA's gate aborted twice on that, 2026-11-08)
+    /// and a check failing on the candidate and on the base (task 127's
+    /// e2e) are each `host_fault` by the gate's fact: `gate_aborts` does not
+    /// move, the task stays reported and is held until its due time, the
+    /// second in a row escalates with its backoff doubled, and the next run
+    /// that accepts lands it.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_gates_own_host_faults_are_held_and_never_counted() {
+        let dir = std::env::temp_dir().join(format!("spawn-db-gate-fault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runs = dir.join("runs");
+        let runs_path = runs.display();
+        let gate = format!(
+            "n=$(cat '{runs_path}' 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >'{runs_path}'\n\
+             if [ \"$n\" -eq 1 ]; then\n\
+               echo '| == base: 012.sh'\n\
+               echo '| 012.sh exited 1, then 0 on the base: a harness error, not a verdict on the candidate'\n\
+               printf '{{\"host_fault\":true,\"scenario\":\"012.sh\",\"on\":\"base\",\"runs\":\"1, then 0\",\"reason\":\"012.sh exited 1, then 0 on the base\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               exit 6\n\
+             elif [ \"$n\" -eq 2 ]; then\n\
+               echo '| == regression: check-e2e.sh must still pass'\n\
+               printf '{{\"host_fault\":true,\"scenario\":\"check-e2e.sh\",\"on\":\"candidate and base\",\"runs\":\"1, then 1 on the candidate; 1 on the base\",\"reason\":\"check-e2e.sh failed twice on the candidate and on the base\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n\
+               exit 6\n\
+             fi\n\
+             printf '{{\"verdict\":\"accepted\"}}\\n' >\"$SPAWN_GATE_VERDICT\"\n"
+        );
+        let (base, source, scenarios, mut integrator) = world("gate-fault", &gate);
+        integrator.judge.host = super::HostSettings {
+            server_log: None,
+            backoff: std::time::Duration::from_secs(2),
+        };
+        let db = Db::new("gate_host_fault");
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "w");
+        let agent = db.mission(mission)["tasks"][0]["agent_id"]
+            .as_str()
+            .expect("the task's agent")
+            .to_string();
+        push_work(&base, &source, &agent, "work.txt");
+        let count = || {
+            std::fs::read_to_string(&runs).map_or(0, |text| text.trim().parse::<u32>().unwrap_or(0))
+        };
+        let pass = || {
+            integrator.pass_on(&db.store).expect("a pass");
+            integrator.settle();
+        };
+        let wait_until = |due: i64| {
+            let left = due - super::now_ms();
+            if left > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    u64::try_from(left).unwrap_or(0) + 50,
+                ));
+            }
+        };
+
+        // A scenario's harness error on the base.
+        pass();
+        assert_eq!(count(), 1);
+        let (record, event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["evidence"], "gate");
+        assert_eq!(
+            record["fact"],
+            json!({"scenario": "012.sh", "on": "base", "runs": "1, then 0",
+                   "reason": "012.sh exited 1, then 0 on the base"})
+        );
+        assert!(
+            record["reason"].as_str().is_some_and(
+                |reason| reason.starts_with("host fault: 012.sh exited 1, then 0 on the base")
+            ),
+            "{record}"
+        );
+        assert!(
+            record["log"]
+                .as_str()
+                .is_some_and(|log| log.contains("| == base: 012.sh"))
+        );
+        assert_eq!(
+            (
+                &record["host_faults"],
+                &record["escalate"],
+                &record["backoff_ms"]
+            ),
+            (&json!(1), &json!(false), &json!(2000))
+        );
+        assert_eq!(record["due_ms"], at + 2000);
+        assert!(record["candidate"].is_string());
+        let after = gated(&db, mission);
+        assert_eq!(
+            (
+                after.gate_host_faults,
+                after.gate_host_task,
+                after.gate_aborts,
+                after.gate_rejections
+            ),
+            (1, Some(task), 0, 0),
+            "a host fault, not an abort"
+        );
+        assert_eq!(
+            (after.tasks[0].state, after.tasks[0].revisions),
+            (spawn_core::mission::TaskState::Reported, 0)
+        );
+        pass();
+        assert_eq!(count(), 1, "not judged again before due_ms");
+        assert_eq!(last_verdict(&db).1, event);
+        wait_until(at + 2000);
+
+        // A check failing on the candidate and on the base.
+        pass();
+        assert_eq!(count(), 2);
+        let (record, event, at) = last_verdict(&db);
+        assert_eq!(record["verdict"], "host_fault", "{record}");
+        assert_eq!(record["fact"]["scenario"], "check-e2e.sh");
+        assert_eq!(record["fact"]["on"], "candidate and base");
+        assert_eq!(
+            (
+                &record["host_faults"],
+                &record["escalate"],
+                &record["backoff_ms"]
+            ),
+            (&json!(2), &json!(true), &json!(4000))
+        );
+        let escalations = db.store.gate_host_fault_escalations().expect("escalations");
+        assert_eq!(escalations[0]["event_id"], event, "{escalations}");
+        let after = gated(&db, mission);
+        assert_eq!((after.gate_host_faults, after.gate_aborts), (2, 0));
+        assert_eq!(super::halt_reason(&after, 0), None);
+
+        pass();
+        assert_eq!(count(), 2, "held again, for the doubled backoff");
+        wait_until(at + 4000);
+        pass();
+        assert_eq!(count(), 3);
+        assert_eq!(db.mission(mission)["tasks"][0]["state"], "landed");
+        assert_eq!(gated(&db, mission).gate_aborts, 0);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&dir);
     }

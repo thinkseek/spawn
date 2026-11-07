@@ -266,11 +266,12 @@ cp -r "$scenarios" "$broken_scenarios"
 printf '#!/bin/sh\necho "broken: fails on every tree"\nexit 1\n' >"$broken_scenarios/check-broken.sh"
 printf '#!/bin/sh\nexit 0\n' >"$broken_scenarios/check-tests.sh"
 expect "a check that fails on the candidate and on the base is no verdict" \
-    "$(judge "$good" "" "$broken_scenarios")" 'exit=4 '
+    "$(judge "$good" "" "$broken_scenarios")" \
+    'exit=6 {"host_fault":true,"scenario":"check-broken.sh","on":"candidate and base","runs":"1, then 1 on the candidate; 1 on the base"'
 expect "the log says so" "$(cat "$work/gate.out")" \
-    'check-broken.sh fails on the candidate and on the base: the gate aborts (no verdict)'
+    'check-broken.sh fails on the candidate and on the base: a host or harness fault, no verdict'
 expect "with every base result cached the base is built for it" \
-    "$(judge "$good" "" "$broken_scenarios")" 'exit=4 '
+    "$(judge "$good" "" "$broken_scenarios")" 'exit=6 {"host_fault":true,"scenario":"check-broken.sh"'
 expect "the cached run still judged it on the base" "$(cat "$work/gate.out")" \
     'check-broken.sh fails on the base too (1)'
 expect "check-tests.sh runs first among the regressions" \
@@ -1127,8 +1128,9 @@ expect "and says why" "$(cat "$work/gate.out")" 'which the sandbox shows'
 # A harness error on the base aborts the gate: no verdict, never a skip.
 server break >/dev/null
 printf '# changed again, so not cached\n' >>"$objectives/011.sh"
-expect "a harness exit on the base aborts the gate" "$(judge "$good" "" "$objectives")" 'exit=4 '
-refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" 'verdict'
+expect "a harness exit on the base is a host fault, no verdict" "$(judge "$good" "" "$objectives")" \
+    'exit=6 {"host_fault":true,"scenario":"011.sh","on":"base","runs":"2"'
+refuse "with no verdict" "$(cat "$integrator/verdict" 2>/dev/null || true)" '"verdict"'
 expect "and says why" "$(cat "$work/gate.out")" '011.sh exited 2 on the base: a harness error'
 server fix >/dev/null
 
@@ -1137,8 +1139,8 @@ task_scenarios=$work/task-objectives
 cp -r "$objectives" "$task_scenarios"
 rm "$task_scenarios/011.sh"
 printf '#!/bin/sh\n[ "$(cat value)" = two ] || exit 7\n' >"$task_scenarios/012.sh"
-expect "a task scenario that exits 7 on the base aborts" \
-    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=4 '
+expect "a task scenario that exits 7 on the base is a host fault" \
+    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=6 {"host_fault":true,"scenario":"012.sh","on":"base","runs":"7"'
 cat >"$task_scenarios/012.sh" <<'EOF'
 #!/bin/sh
 # Flaky on the base: fails the first time, passes the second.
@@ -1148,7 +1150,8 @@ exit 1
 EOF
 server reset >/dev/null
 expect "an unsolved result needs two runs that agree" \
-    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" 'exit=4 '
+    "$(judge "$good" "$task_scenarios/012.sh" "$task_scenarios")" \
+    'exit=6 {"host_fault":true,"scenario":"012.sh","on":"base","runs":"1, then 0"'
 expect "the flake is named" "$(cat "$work/gate.out")" 'exited 1, then 0 on the base'
 unset SPAWN_TEST_DATABASE_URL
 
@@ -1307,7 +1310,7 @@ printf '#!/bin/sh\n[ "$(cat "%s/marker" 2>/dev/null)" = here ]\n' "$owner_inputs
 # Unseen on the base as on the candidate: the check fails on both, which the
 # gate takes for a harness fault (no verdict, exit 4).
 expect "an unlisted directory under \$HOME is not visible" \
-    "$(judge "$good" "" "$unlisted_scenarios")" 'exit=4 '
+    "$(judge "$good" "" "$unlisted_scenarios")" 'exit=6 {"host_fault":true,"scenario":"check-owner-inputs.sh"'
 expect "on the candidate or the base" "$(cat "$work/gate.out")" \
     'check-owner-inputs.sh fails on the base too (1)'
 listed_inputs=$work/listed-inputs
@@ -1424,7 +1427,7 @@ expect "one put on the list is judged again, alone" \
     '| base results from the cache: 071.sh 073.sh; run on the base: 072.sh'
 rm "$alone/serial"
 expect "the control: without the list, 071 meets its neighbours" \
-    "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=4 '
+    "$(with_jobs 4 alone-control "$good" "$alone")" 'exit=6 {"host_fault":true,'
 
 # 16d. The base phase ends before any candidate code runs: each base run
 # leaves a mark in the base tree, and each candidate run wants all of them.
@@ -1458,8 +1461,8 @@ printf '#!/bin/sh\nsleep 2\n' >"$abort/091.sh"
 printf '#!/bin/sh\nexit 3\n' >"$abort/092.sh"
 printf '#!/bin/sh\nsleep 29.5\n' >"$abort/093.sh"
 started=$(date +%s)
-expect "a harness error among parallel base runs aborts the gate" \
-    "$(with_jobs 4 abort "$good" "$abort")" 'exit=4 '
+expect "a harness error among parallel base runs ends the gate: a host fault" \
+    "$(with_jobs 4 abort "$good" "$abort")" 'exit=6 {"host_fault":true,'
 expect "without waiting for the runs after it" "$([ $(($(date +%s) - started)) -lt 25 ] && echo early)" early
 expect "after the blocks before it" "$(cat "$work/gate.out")" '| == base: 091.sh: solved'
 expect "and says why" "$(cat "$work/gate.out")" '092.sh exited 3 on the base'

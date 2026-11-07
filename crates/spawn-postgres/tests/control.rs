@@ -2678,6 +2678,25 @@ fn a_host_fault_moves_no_count_and_its_run_is_folded() {
         record["evidence"] = json!("server_log");
         record["crash"] = json!([]);
     }));
+    // The gate's own fact (evidence `gate`): it names its scenario and
+    // where it failed, and needs no failures.
+    let gate_fact = |record: &mut serde_json::Value| {
+        record["evidence"] = json!("gate");
+        record["failures"] = json!([]);
+        record["fact"] = json!({"scenario": "012.sh", "on": "base", "runs": "1, then 0"});
+    };
+    assert!(refused(&|record| {
+        gate_fact(record);
+        record.as_object_mut().expect("object").remove("fact");
+    }));
+    assert!(refused(&|record| {
+        gate_fact(record);
+        record["fact"]["scenario"] = json!("");
+    }));
+    assert!(refused(&|record| {
+        gate_fact(record);
+        record["fact"]["on"] = json!("candidate");
+    }));
 
     // A rejection and an abort first: the runs a host fault must leave.
     verdict(task, 0, "rejected");
