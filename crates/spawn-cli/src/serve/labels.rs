@@ -39,8 +39,9 @@ use crate::supervise::SUPERVISOR_SESSION;
 
 /// Most characters of a label: a bound against a runaway text, never met by
 /// the parts themselves (a mission name, a whole title, a reference), so a
-/// label is never cut mid-phrase. Two lines of the page.
-pub(super) const LABEL_MAX: usize = 160;
+/// label is never cut mid-phrase. Two lines of a row; the supervisor's
+/// card, which spans the page, may take a third.
+pub(super) const LABEL_MAX: usize = 200;
 
 /// Most characters of a task title.
 pub(super) const TITLE_MAX: usize = 120;
@@ -277,6 +278,11 @@ impl Context {
             Some(mission) => task_label(mission, task),
             None => task_words(task),
         };
+        self.with_state(task, phrase)
+    }
+
+    /// `phrase · <state>`, unless the task is being worked.
+    fn with_state(&self, task: &Task, phrase: String) -> String {
         match state_phrase(&task.state, self.gated(task)) {
             "working" => phrase,
             state => format!("{phrase}{JOIN}{state}"),
@@ -370,22 +376,36 @@ impl Context {
             return "reading a dispatcher digest".to_string();
         };
         let reference = match self.tasks_of(&session).first() {
-            Some(task) => format!("task {}{JOIN}{}", task.id, self.task_phrase(task)),
+            // The task's id names it; its title says what it is, whole (no
+            // mission: the id is enough to find it, and the label stays
+            // within its bound).
+            Some(task) => {
+                self.with_state(task, format!("task {}{JOIN}{}", task.id, task_words(task)))
+            }
             None if session == "host" || session == "missions" => session.clone(),
             None => humanized(&session),
         };
-        // One line, its heading: up to the first ':' outside parentheses.
-        let kind = heading(kind.lines().next().unwrap_or("")).to_lowercase();
-        let doing = if kind.starts_with("completed") {
+        // One line, its heading: up to the first ':' outside parentheses,
+        // and a repeat's count (`attention (2 of them, the latest)`).
+        let (kind, repeats) = repeated(heading(kind.lines().next().unwrap_or("")));
+        let kind = kind.to_lowercase();
+        let counted = match repeats {
+            Some(count) => format!("{kind} ({count})"),
+            None => kind.clone(),
+        };
+        let doing = if kind.starts_with("completed") || kind.starts_with("report") {
+            // A report waits for review: the task's own "reported" would
+            // say it twice.
+            let reference = reference.strip_suffix(" · reported").unwrap_or(&reference);
             format!("reviewing the report of {reference}")
         } else if kind.starts_with("idle") {
             format!("next step for {reference}")
         } else if kind.starts_with("human message") {
             format!("following up a human's message to {reference}")
         } else if kind.starts_with("attention") || kind.starts_with("stalled") {
-            format!("checking {reference} ({})", kind.trim())
+            format!("checking {reference}{JOIN}{counted}")
         } else {
-            format!("handling {reference}: {}", kind.trim())
+            format!("handling {reference}: {counted}")
         };
         match updates(text) {
             Some(count) if count > 1 => format!("{doing} (+{} more)", count - 1),
@@ -425,6 +445,17 @@ fn heading(kind: &str) -> &str {
         }
     }
     kind.trim()
+}
+
+/// A heading without a repeat's ` (<n> of them, the latest)`, and `n`.
+fn repeated(heading: &str) -> (&str, Option<u64>) {
+    if let Some(open) = heading.rfind(" (")
+        && let Some(inner) = heading[open + 2..].strip_suffix(" of them, the latest)")
+        && let Ok(count) = inner.parse()
+    {
+        return (heading[..open].trim_end(), Some(count));
+    }
+    (heading, None)
 }
 
 /// The count of a digest's `Spawn dispatcher: <n> update(s) for you.`
@@ -1291,11 +1322,11 @@ mod tests {
         let context = Context::from_board(&board(), &Titles::new());
         assert_eq!(
             label_of(&context, SUPERVISOR_SESSION, None, Some("WORKING")),
-            "supervisor · reviewing the report of task 162 · Supply PA · Implement extras · objective 62 (+1 more)"
+            "supervisor · reviewing the report of task 162 · Implement extras in Supply PA (+1 more)"
         );
         assert_eq!(
             label_of(&context, SUPERVISOR_SESSION, None, Some("COMPLETED")),
-            "supervisor · idle · last: reviewing the report of task 162 · Supply PA · Implement extras · objective 62 (+1 more)"
+            "supervisor · idle · last: reviewing the report of task 162 · Implement extras in Supply PA (+1 more)"
         );
         let mut noted = board();
         noted["inputs"][0] = json!({"session_id": "session_supervisor", "principal": "human",
@@ -1310,7 +1341,7 @@ mod tests {
         let context = Context::from_board(&noted, &Titles::new());
         assert_eq!(
             label_of(&context, SUPERVISOR_SESSION, None, None),
-            "supervisor · next step for task 157 · Supply PA · owner work · Make 048's restart test deterministic · reported"
+            "supervisor · next step for task 157 · Make 048's restart test deterministic · reported"
         );
         // No input: the reports waiting in its review missions.
         let mut quiet = board();
@@ -1513,6 +1544,32 @@ mod tests {
         );
         assert_eq!(first_update("Owner note: hello"), None);
         assert_eq!(updates("Spawn dispatcher: 4 updates for you."), Some(4));
+        // A report digest reads as a review, like a completed one, never
+        // as a raw heading (rev-b: "· reported: report, review it (name…").
+        let context = Context::from_board(&board(), &Titles::new());
+        let report = context.digest_phrase(
+            "Spawn dispatcher: 1 update for you. - session_worker_flaky_157 — report, review it (name its revision): rev 0",
+        );
+        assert_eq!(
+            report,
+            "reviewing the report of task 157 · Make 048's restart test deterministic"
+        );
+        assert!(!report.contains("report, review it"));
+        // A repeated item: its count, not the digest's wording.
+        assert_eq!(
+            context.digest_phrase(
+                "Spawn dispatcher: 1 update for you. - session_worker_flaky_157 — attention (2 of them, the latest): WAITING"
+            ),
+            "checking task 157 · Make 048's restart test deterministic · reported · attention (2)"
+        );
+        assert_eq!(
+            repeated("attention (2 of them, the latest)"),
+            ("attention", Some(2))
+        );
+        assert_eq!(
+            repeated("host faults (the host's, two runs)"),
+            ("host faults (the host's, two runs)", None)
+        );
         assert_eq!(
             cancelled_task("[Task #149 was cancelled — this is not a new task]"),
             Some(149)
