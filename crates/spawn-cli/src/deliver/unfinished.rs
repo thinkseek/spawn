@@ -84,7 +84,7 @@ pub(crate) fn markers(report: &str) -> Vec<Marker> {
     let mut fence: Option<String> = None;
     // Inside an Outcome section whose first body line is not read yet.
     let mut outcome_first_line = false;
-    for (index, raw) in report.lines().enumerate() {
+    for (index, raw) in report.trim_start_matches('\u{feff}').lines().enumerate() {
         let line = index + 1;
         let mut push = |kind: Kind| {
             found.push(Marker {
@@ -454,6 +454,14 @@ None, but pending review by the owner.\n";
         let report = "## Outcome\ndone\n## What changed\nThe check reads `PENDING_RESULTS` \
 and `` `TODO` ``.\n~~~\n(pending)\n~~~\n";
         assert_eq!(kinds(report), []);
+    }
+
+    #[test]
+    fn a_byte_order_mark_and_crlf_lines_hide_no_marker() {
+        assert_eq!(
+            kinds("\u{feff}## Outcome\r\nIn progress\r\n## Results\r\nTODO\r\n"),
+            [(2, Kind::Draft), (4, Kind::Pending("TODO".to_string()))]
+        );
     }
 
     #[test]
