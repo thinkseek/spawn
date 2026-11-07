@@ -674,7 +674,7 @@ fn a_stall_reaches_the_supervisor_once_under_its_heading() {
 #[test]
 fn each_step_is_due_at_its_record_plus_its_bound() {
     let facts = [worker(SemanticState::Waiting, true)];
-    let at = |tasks: serde_json::Value, rows: &[serde_json::Value], now: i64| {
+    let at = |tasks: serde_json::Value, rows: &[serde_json::Value]| {
         let found = stalls(tasks);
         next_due(&facts, &work(rows), &found, &bounds())
     };
@@ -683,7 +683,6 @@ fn each_step_is_due_at_its_record_plus_its_bound() {
         at(
             json!({"tasks": [open(7, "assigned", (120, "task.assigned", 100_000))]}),
             &[row(7, "assigned", SESSION)],
-            NOW,
         ),
         Some(NOW - 100_000 + 600_000)
     );
@@ -692,7 +691,6 @@ fn each_step_is_due_at_its_record_plus_its_bound() {
         at(
             json!({"tasks": [open(7, "delivered", (121, "task.delivered", 100_000))]}),
             &[row(7, "delivered", SESSION)],
-            NOW,
         ),
         Some(NOW - 100_000 + 900_000)
     );
@@ -701,7 +699,6 @@ fn each_step_is_due_at_its_record_plus_its_bound() {
         at(
             json!({"tasks": [open(7, "reported", (122, "task.reported", 100_000))]}),
             &[row(7, "reported", SESSION)],
-            NOW,
         ),
         Some(NOW - 100_000 + 1_800_000)
     );
@@ -710,7 +707,6 @@ fn each_step_is_due_at_its_record_plus_its_bound() {
         at(
             json!({"tasks": [open(7, "landing", (123, "task.gated", 100_000))]}),
             &[],
-            NOW,
         ),
         Some(NOW - 100_000 + 600_000)
     );
