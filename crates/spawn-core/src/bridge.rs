@@ -1470,6 +1470,13 @@ impl Bridge {
             || self.due_to_read(active)
             || self.in_flight(session)
             || !matches!(self.screen_wanted(session, active), Wanted::Nothing)
+            // A terminal killed from outside, or one hosting no runner of
+            // ours, is asked about on every pass: its end is due now, and
+            // the fleet's answer already holds it.
+            || self
+                .runners
+                .as_ref()
+                .is_some_and(|runners| !matches!(runners.get(&active.terminal()), Some(Runner::Running)))
     }
 
     /// The liveness of every live execution's terminal in one call, when the
