@@ -1429,6 +1429,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
         Ok(settings) => settings,
         Err(error) => {
             eprintln!("spawn backup bundle: {error}");
+            record_refusal("bundle", &error);
             return Ok(2);
         }
     };
