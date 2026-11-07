@@ -548,6 +548,92 @@ fn delivery_attempts<'a>(task: &TaskRow, facts: &'a Facts) -> Vec<&'a crate::dis
         .collect()
 }
 
+/// When the mission layer's next step is due, from the rows and facts this
+/// pass decided with: the earliest retry that is not due yet
+/// ([`Attempts::Retry`]), a cancelled resident's notice after its wait
+/// ([`cancel_order`]), or a report note refused before typing
+/// ([`note_retry`]). On this host's clock, the one those waits are compared
+/// against. `None`: nothing here waits for a clock.
+pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> {
+    let facts: BTreeMap<&str, &Facts> = rows
+        .iter()
+        .map(|facts| (facts.session_id.as_str(), facts))
+        .collect();
+    let mut due: Option<i64> = None;
+    let mut soon = |at: i64| due = Some(due.map_or(at, |known: i64| known.min(at)));
+    let next = next_up(work);
+    for task in &work.tasks {
+        if !matches!(task.state, TaskState::Assigned | TaskState::Revise) || !next.contains(&task.id)
+        {
+            continue;
+        }
+        let Some(found) = facts.get(task.session_id.as_str()).copied() else {
+            continue;
+        };
+        if let Attempts::Retry { due_ms, .. } = attempts(task, found) {
+            soon(due_ms);
+        }
+    }
+    for cancelled in work.cancelled.iter().filter(|cancelled| !cancelled.told) {
+        let Some(found) = facts.get(cancelled.session_id.as_str()).copied() else {
+            continue;
+        };
+        if found.open_command || found.stopping() || found.live {
+            continue;
+        }
+        let prefix = cancelled.notice_prefix();
+        let tries: Vec<&crate::dispatch::Sent> = found
+            .dispatched
+            .iter()
+            .filter(|sent| sent.key.starts_with(&prefix))
+            .collect();
+        if let Some(last) = tries.last()
+            && last.succeeded == Some(false)
+        {
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            soon(finished.saturating_add(retry_wait_ms(tries.len())));
+        }
+    }
+    for found in rows {
+        for (key, tries) in notes(&found.dispatched) {
+            let Some(last) = tries.last() else {
+                continue;
+            };
+            if crate::dispatch::reached_with(last.succeeded, last.error.as_deref())
+                || tries.len() > NOT_READY_FREE
+            {
+                continue;
+            }
+            let finished = last.finished_at_ms.unwrap_or(last.created_at_ms);
+            soon(finished.saturating_add(NOT_READY_RETRY_MS));
+        }
+        let _ = now_ms;
+    }
+    due
+}
+
+/// The report notes among the commands the dispatcher sent into one session,
+/// by the note's own key, each with its attempts oldest first
+/// ([`note_retry`]).
+fn notes<'a>(sent: &'a [crate::dispatch::Sent]) -> BTreeMap<&'a str, Vec<&'a crate::dispatch::Sent>> {
+    let mut notes: BTreeMap<&str, Vec<&crate::dispatch::Sent>> = BTreeMap::new();
+    for command in sent {
+        let key = match command.key.rsplit_once("-retry-") {
+            Some((base, number))
+                if !number.is_empty()
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+                    && base.starts_with(UNFINISHED_KEY) =>
+            {
+                base
+            }
+            _ if command.key.starts_with(UNFINISHED_KEY) => command.key.as_str(),
+            _ => continue,
+        };
+        notes.entry(key).or_default().push(command);
+    }
+    notes
+}
+
 /// Where a waiting task's current delivery stands, from its attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempts {
