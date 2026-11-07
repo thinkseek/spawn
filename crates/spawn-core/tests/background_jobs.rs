@@ -532,6 +532,7 @@ fn the_bridge_records_the_jobs_of_an_execution_from_its_transcript() {
             parent_session_id: None,
             from: None,
             model: None,
+            charter: None,
         },
     );
     bridge.tick().expect("start");
