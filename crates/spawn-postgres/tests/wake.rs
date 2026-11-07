@@ -97,12 +97,6 @@ fn the_dispatch_facts_do_not_scan_the_command_table() {
     assert_eq!(rows, 20_000);
 
     let plan = store.dispatch_facts_plan().expect("explain");
-    let text = serde_json::to_string(&plan).expect("json");
-    let plan = if text.starts_with('[') {
-        serde_json::from_str::<Value>(&text).expect("json")
-    } else {
-        Value::Array(vec![plan])
-    };
     let mut scans = Vec::new();
     collect(&plan, &mut scans);
     assert!(
