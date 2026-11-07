@@ -57,6 +57,22 @@
 //! [`Plan`] ([`decide_with`]), reads it from the store ([`read_plan`], which
 //! the UI's attention queue calls too: `GET /api/attention`) and submits it
 //! ([`step`]).
+//!
+//! When the step runs. A step is a decision over records: the facts, the
+//! mission rows, the control stream and the queue. It runs when the log's
+//! watermark has moved since it last ran (a record it decides from may be
+//! new), and otherwise only when a time one of those records names has come
+//! ([`Reading::due_ms`]): a delivery's retry ([`deliver::Attempts`]: the
+//! wait after a refusal that typed nothing, or the doubling wait after a
+//! failure), a stall's bound ([`stall`], measured from the record the step
+//! stands on), a failed Stop's retry ([`stops`]), a background job's bound
+//! ([`jobs`]), a cancelled resident's notice, a report note refused before
+//! typing. Every time it returns is computed from a record — an attempt's
+//! `finished_at_ms`, a stall's record, a job's start — never counted by the
+//! loop, and one it cannot date is due now, never later. Nothing it decides
+//! depends on how often it ran: the same records and the same clock make
+//! the same orders, deliveries, escalations and digests, under the same
+//! keys and tags (docs/fleet-architecture.md §3, docs/design.md §14).
 
 mod charter;
 mod digest;
