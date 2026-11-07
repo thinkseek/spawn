@@ -1447,7 +1447,7 @@ mod tests {
         // none on 2026-11-06 14:43, and both are its own.
         let runs = "| base runs: 17 in 139 s, 5 at a time (their own time: 576 s)\n";
         for trailing in [
-            format!("{runs}"),
+            runs.to_string(),
             format!("{runs}{GATE_TIME_LINE}"),
             format!("{GATE_TIME_LINE}{runs}"),
         ] {
