@@ -1342,10 +1342,10 @@ impl Bridge {
                 return Ok(());
             }
         };
-        let now = self.clock.now().0;
         if !bytes.is_empty() {
-            active.follow.growth = Some(now);
-            active.follow.fresh = true;
+            // The transcript grew: its screen is looked at once it holds
+            // still, not while it is being written.
+            active.follow.unread_since = Some(self.clock.now().0);
             active.follow.due_at = None;
         }
         let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
@@ -1503,15 +1503,12 @@ impl Bridge {
             return Wanted::Now;
         }
         let now = self.clock.now().0;
-        if follow.fresh {
+        if let Some(grown) = follow.unread_since {
             // The transcript grew: wait until it has held still long enough
             // for the screen to say what the transcript cannot (the prompt
             // is back), then read it until two readings agree.
             let quiet = i64::try_from(self.config.screen_quiet.as_millis()).unwrap_or(i64::MAX);
-            return if follow
-                .growth
-                .is_none_or(|growth| now.saturating_sub(growth) >= quiet)
-            {
+            return if now.saturating_sub(grown) >= quiet {
                 Wanted::Now
             } else {
                 Wanted::Nothing
@@ -1591,7 +1588,7 @@ impl Bridge {
         };
         let now = self.clock.now().0;
         active.follow.last_capture = Some(now);
-        active.follow.fresh = false;
+        active.follow.unread_since = None;
         let reading = read_claude_screen(&pane);
         let confirmed = active.follow.seen == Some(reading.state);
         active.follow.seen = Some(reading.state);
