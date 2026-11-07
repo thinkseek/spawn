@@ -732,6 +732,15 @@ select coalesce(jsonb_object_agg(z.task, z.gate), '{}'::jsonb)
            and r ->> 'type' = 'task.gated'
          order by r ->> 'id', e.session_seq desc) z";
 
+/// Open objective missions with their backlog directory, `[{mission,
+/// backlog}]`: what the dispatcher checks the backlog's named order of.
+pub(crate) const OBJECTIVE_BACKLOGS: &str = r"
+select coalesce(jsonb_agg(jsonb_build_object('mission', m.id,
+                                             'backlog', m.objectives ->> 'backlog')
+                          order by m.id), '[]'::jsonb)
+  from mission_missions m
+ where m.objectives ->> 'backlog' is not null and m.state in ('open', 'active')";
+
 /// Open objective missions (`objectives` = `{backlog, resident}`), for the
 /// RSI page: settings, the resident, and every task newest first with its
 /// gate verdicts from the control stream (oldest first, without logs).
@@ -1340,6 +1349,12 @@ impl PostgresStore {
     /// access to `spawn_events` (the owner, the dashboard's reader).
     pub fn last_gates(&self) -> Result<Value, StoreError> {
         self.query_json(LAST_GATES, &[])
+    }
+
+    /// Open objective missions with their backlog directory
+    /// ([`OBJECTIVE_BACKLOGS`]).
+    pub fn objective_backlogs(&self) -> Result<Value, StoreError> {
+        self.query_json(OBJECTIVE_BACKLOGS, &[])
     }
 
     /// Open objective missions with their resident and their tasks' gate

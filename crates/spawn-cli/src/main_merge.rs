@@ -1578,7 +1578,16 @@ mod tests {
             .expect("no fork")
             .expect("said");
         assert!(line.contains("holds nothing main lacks"), "{line}");
-        assert_eq!(prompt(&order), "the task");
+        assert_eq!(
+            prompt(&order),
+            format!(
+                "the task\n\nTask #{}'s last checkpoint (commit {main}) holds nothing the \
+                 source's main lacks: its work is already in main, and your workspace starts \
+                 from main.",
+                third.0
+            ),
+            "the brief's mention of that checkpoint does not send it looking"
+        );
         assert!(
             git(&[
                 "--git-dir",
@@ -1657,6 +1666,11 @@ mod tests {
         assert_eq!(crate::dispatch::fork_give_up_ms(None), 300_000);
         assert_eq!(crate::dispatch::fork_give_up_ms(Some(" 60 ")), 60_000);
         assert_eq!(crate::dispatch::fork_give_up_ms(Some("0")), 300_000);
+        assert_eq!(
+            crate::dispatch::fork_give_up_ms(Some("9223372036854775807")),
+            i64::MAX,
+            "an absurd setting saturates"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

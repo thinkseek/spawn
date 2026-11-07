@@ -45,6 +45,11 @@
 //! (`"after": [28, 29]`): it is not assigned while one of them is open (a
 //! named objective the backlog does not hold must have landed). Order is
 //! kept only where it is named; otherwise fewest attempts first decides.
+//! An order that cannot be met (an id the backlog does not hold and that
+//! has not landed, or objectives that come after each other) would hold
+//! them back for ever without a word, so the dispatcher checks each open
+//! mission's backlog ([`order_problems`]) and tells the supervisor once per
+//! content of the problems (`missions objective-order-<mission>-<digest>`).
 //!
 //! The mission's resident takes a task
 //! whenever it has none open in the mission; every other task goes to a new
@@ -303,6 +308,62 @@ fn ordered(task: &Task, backlog: &[Task], landings: &[Landing]) -> bool {
                 |other| !is_open(other, landings),
             )
     })
+}
+
+/// What is wrong with the order `backlog` names: each `after` id the
+/// backlog does not hold (its objective waits until that id lands, which
+/// no task of this backlog can make happen), and each cycle of objectives
+/// that come after each other (none of them is ever assigned), once each,
+/// by id.
+pub(crate) fn order_problems(backlog: &[Task]) -> Vec<String> {
+    let ids: BTreeSet<u32> = backlog.iter().map(|task| task.id).collect();
+    let mut problems = Vec::new();
+    for task in backlog {
+        for before in &task.after {
+            if !ids.contains(before) {
+                problems.push(format!(
+                    "objective {} comes after {before}, which the backlog does not hold: it \
+                     waits until {before} lands",
+                    task.id
+                ));
+            }
+        }
+    }
+    let after: BTreeMap<u32, &[u32]> = backlog
+        .iter()
+        .map(|task| (task.id, task.after.as_slice()))
+        .collect();
+    let mut cycles: BTreeSet<Vec<u32>> = BTreeSet::new();
+    for start in after.keys() {
+        // Every path from `start` back to it, shortest first by search order.
+        let mut stack: Vec<Vec<u32>> = vec![vec![*start]];
+        while let Some(path) = stack.pop() {
+            let last = *path.last().unwrap_or(start);
+            for next in after.get(&last).copied().unwrap_or_default() {
+                if next == start {
+                    let lowest = path
+                        .iter()
+                        .position(|id| id == path.iter().min().unwrap_or(start));
+                    let mut cycle = path.clone();
+                    cycle.rotate_left(lowest.unwrap_or(0));
+                    cycles.insert(cycle);
+                } else if !path.contains(next) && after.contains_key(next) {
+                    let mut longer = path.clone();
+                    longer.push(*next);
+                    stack.push(longer);
+                }
+            }
+        }
+    }
+    for cycle in cycles {
+        let mut shown: Vec<String> = cycle.iter().map(u32::to_string).collect();
+        shown.push(cycle[0].to_string());
+        problems.push(format!(
+            "objectives {} come after each other: none of them is ever assigned",
+            shown.join(" after ")
+        ));
+    }
+    problems
 }
 
 /// The objectives that fill `free` slots: the open ones without a task in
@@ -759,7 +820,7 @@ fn assign(
 mod tests {
     use super::{
         Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
-        choose, load_backlog, metric_lines, next_open, workers, yields,
+        choose, load_backlog, metric_lines, next_open, order_problems, workers, yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1292,5 +1353,41 @@ mod tests {
         for free in [29, 30, 31, 33] {
             assert!(after(free).is_empty(), "{free}");
         }
+    }
+
+    /// An order no task can meet is found: an `after` id the backlog does
+    /// not hold, and every cycle once (two and three objectives), by its
+    /// lowest id; a sound order, and the repository's backlog, have none.
+    #[test]
+    fn an_order_that_cannot_be_met_is_found() {
+        let task = |id: u32, after: &[u32]| {
+            let mut task = objective(id, false);
+            task.after = after.to_vec();
+            task
+        };
+        assert!(order_problems(&[task(28, &[]), task(32, &[28])]).is_empty());
+        let problems = order_problems(&[
+            task(28, &[30]),
+            task(30, &[28]),
+            task(31, &[33]),
+            task(32, &[31]),
+            task(33, &[32, 99]),
+        ]);
+        assert_eq!(
+            problems,
+            [
+                "objective 33 comes after 99, which the backlog does not hold: it waits until \
+                 99 lands",
+                "objectives 28 after 30 after 28 come after each other: none of them is ever \
+                 assigned",
+                "objectives 31 after 33 after 32 after 31 come after each other: none of them \
+                 is ever assigned",
+            ]
+        );
+        let backlog = load_backlog(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rsi/backlog"),
+        )
+        .expect("the backlog");
+        assert!(order_problems(&backlog).is_empty());
     }
 }
