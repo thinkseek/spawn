@@ -350,8 +350,11 @@ fleet` and continue supervising per your charter.",
 
 /// Keep every approved resident alive: resumed after an outage, given its
 /// charter (and its current task) when a new native session must start.
-pub(crate) fn keep_residents(store: &PostgresStore) -> Result<Vec<String>, String> {
+/// Returns the log lines, and the earliest time the rule waits for (a
+/// resident whose revival is backing off).
+pub(crate) fn keep_residents(store: &PostgresStore) -> Result<(Vec<String>, Option<i64>), String> {
     let mut lines = Vec::new();
+    let mut due: Option<i64> = None;
     for (agent, session, charter) in store
         .residents_to_keep()
         .map_err(|error| error.to_string())?
@@ -390,9 +393,13 @@ task; when it is finished, write `{REPORT}` once, with everything done (draft an
                 facts.cause.as_deref().unwrap_or("unknown")
             )
         };
-        lines.extend(revive(store, &agent, &session, resume, start)?);
+        let (line, next) = revive(store, &agent, &session, resume, start)?;
+        lines.extend(line);
+        if let Some(next) = next {
+            due = Some(due.map_or(next, |known| known.min(next)));
+        }
     }
-    Ok(lines)
+    Ok((lines, due))
 }
 
 #[cfg(test)]
