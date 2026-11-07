@@ -396,6 +396,17 @@ mod tests {
     }
 
     #[test]
+    /// The monitor retires: the fleet's alerts are Spawn's own records now,
+    /// read through the supervisor's restricted login.
+    #[test]
+    fn the_charter_names_the_alerts_command_in_place_of_a_monitor() {
+        let text = charter("spawn", "mission.md");
+        assert!(text.contains("spawn alerts --once"), "{text}");
+        assert!(text.contains("spawn alerts --follow"), "{text}");
+        assert!(text.contains("no monitor of your own"), "{text}");
+    }
+
+    #[test]
     fn the_charter_says_when_a_task_runs_cheap() {
         let text = charter("spawn", "mission.md");
         assert!(text.contains("--model cheap"));
