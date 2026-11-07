@@ -484,8 +484,6 @@ pub(crate) struct Outcome {
     #[serde(default)]
     pub(crate) task: i64,
     #[serde(default)]
-    pub(crate) event_id: Option<i64>,
-    #[serde(default)]
     pub(crate) at_ms: Option<i64>,
     /// A `task.over_budget`'s work: the task it continues (a second overrun
     /// in a chain), the branch, its commit and the diff stat against main,
