@@ -2490,6 +2490,15 @@ enum Rejection {
         log: String,
         head: Value,
     },
+    /// The head's own run found the base disagreeing with itself:
+    /// `host_fault` with that evidence, as any, with `head` (the fields
+    /// naming the head and the rejected merge) added.
+    HeadBaseDisagrees {
+        scenario: String,
+        setup_s: Option<u64>,
+        log: String,
+        head: Value,
+    },
 }
 
 /// The record of a gate rejection: the reason, the gate's output and the
@@ -2712,6 +2721,16 @@ fn rejection(
             free_kb,
             min_gb,
             tmpdir,
+            log,
+            head: named,
+        },
+        Err(GateFailure::BaseDisagrees {
+            scenario,
+            setup_s,
+            log,
+        }) => Rejection::HeadBaseDisagrees {
+            scenario,
+            setup_s,
             log,
             head: named,
         },
