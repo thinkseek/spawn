@@ -391,6 +391,13 @@ create index if not exists spawn_commands_open
 create index if not exists spawn_commands_session
     on spawn_commands (session_id, id);
 
+-- Commands that finished failed, since a time: the alert step's notice of a
+-- failed command, found without reading the queue (docs/fleet-architecture.md
+-- §3.4).
+create index if not exists spawn_commands_failed
+    on spawn_commands (finished_at_ms)
+    where succeeded = false;
+
 -- A grant either lets a principal read an agent's views (`read`) or also
 -- submit commands for it (`all`). `agent_id` is an id, `*`, or a prefix
 -- pattern such as `agent_worker_*`, so the supervisor can command every worker
@@ -1350,6 +1357,30 @@ create table if not exists mission_source_holds (
     expires_ms bigint not null
 );
 
+-- What went wrong, in the record (docs/fleet-architecture.md, "Alerts";
+-- docs/storage.md, "Alerts"). One row per occurrence, keyed by the key its
+-- `alert.fired` and `alert.cleared` records share: an alert fires once and
+-- clears at most once, across loop restarts and two loops at once. A notice
+-- is a `fired` that never clears. The loop writes the records
+-- (`spawn_alert_record`, owner only); the table is their fold, so a
+-- restarted loop reads its alerts back and fires nothing twice.
+create table if not exists spawn_alerts (
+    key              text    primary key,
+    kind             text    not null,
+    subject          text    not null,
+    state            text    not null,
+    notice           boolean not null default false,
+    text             text,
+    evidence         jsonb   not null default '{}'::jsonb,
+    fired_event_id   bigint  not null,
+    fired_at_ms      bigint  not null,
+    cleared_event_id bigint,
+    cleared_at_ms    bigint,
+    cleared_evidence jsonb
+);
+
+create index if not exists spawn_alerts_time on spawn_alerts (fired_at_ms);
+
 
 -- Who may call the mission functions: the owner (humans' CLI, the
 -- controller) and the supervisor's login; not the reader's, and not the web
@@ -1698,6 +1729,32 @@ begin
         -- A fact about this host's free disk (spawn loop, crate disk.rs):
         -- read from the log, folded into no table.
         null;
+    when 'alert.fired' then
+        -- An alert's one occurrence (spawn loop, crate alerts.rs): one row
+        -- per key, and a second `fired` for it is refused (also by
+        -- `spawn_alert_record`, the writer). A notice never clears.
+        if exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was already fired', p_record ->> 'key';
+        end if;
+        insert into spawn_alerts (key, kind, subject, state, notice, text, evidence,
+                                  fired_event_id, fired_at_ms)
+        values (p_record ->> 'key', p_record ->> 'kind', p_record ->> 'subject',
+                case when coalesce((p_record ->> 'notice')::boolean, false)
+                     then 'notice' else 'open' end,
+                coalesce((p_record ->> 'notice')::boolean, false),
+                p_record ->> 'text', coalesce(p_record -> 'evidence', '{}'::jsonb),
+                p_event, p_at);
+    when 'alert.cleared' then
+        -- What cleared an alert, once: the row must be open (a notice never
+        -- clears, and a cleared alert is cleared at most once).
+        if not exists (select 1 from spawn_alerts
+                        where key = p_record ->> 'key' and state = 'open') then
+            raise exception 'alert % is not open: nothing to clear', p_record ->> 'key';
+        end if;
+        update spawn_alerts
+           set state = 'cleared', cleared_event_id = p_event, cleared_at_ms = p_at,
+               cleared_evidence = coalesce(p_record -> 'evidence', '{}'::jsonb)
+         where key = p_record ->> 'key';
     when 'task.report_unfinished' then
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
@@ -1789,6 +1846,7 @@ declare
 begin
     perform pg_advisory_xact_lock(1399957335);
     delete from mission_source_holds;
+    delete from spawn_alerts;
     delete from mission_tasks;
     delete from mission_residents;
     delete from mission_missions;
@@ -3081,6 +3139,49 @@ create index if not exists spawn_events_host_disk
     where session_id = 'session_control' and event_name = 'control.recorded'
       and kind -> 'detail' -> 'record' ->> 'type' = 'host.disk';
 
+-- The alert transitions: the loop's `alert.fired` and `alert.cleared`
+-- records (`spawn_alert_record`, owner only), each once per occurrence
+-- (docs/fleet-architecture.md, "Alerts"). The checked writer refuses a
+-- second `fired` for a key, a `cleared` without its `fired`, and a second
+-- `cleared`; the fold does the same, so the log and the table agree.
+create or replace function spawn_alert_record(p_record jsonb)
+returns bigint language plpgsql security definer as $$
+declare
+    v_type text := p_record ->> 'type';
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record alerts', session_user using errcode = '42501';
+    end if;
+    if v_type not in ('alert.fired', 'alert.cleared') then
+        raise exception 'not an alert record: %', v_type;
+    end if;
+    if nullif(p_record ->> 'key', '') is null or nullif(p_record ->> 'kind', '') is null
+       or nullif(p_record ->> 'subject', '') is null then
+        raise exception 'an alert record names a key, a kind and a subject: %', p_record;
+    end if;
+    if v_type = 'alert.fired' then
+        if exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was already fired', p_record ->> 'key';
+        end if;
+    else
+        if not exists (select 1 from spawn_alerts where key = p_record ->> 'key') then
+            raise exception 'alert % was not fired', p_record ->> 'key';
+        end if;
+        if exists (select 1 from spawn_alerts
+                    where key = p_record ->> 'key' and state <> 'open') then
+            raise exception 'alert % is not open: nothing to clear', p_record ->> 'key';
+        end if;
+    end if;
+    return spawn_control_record(p_record);
+end $$;
+
+-- The alert transitions, found without reading the rest of the stream.
+create index if not exists spawn_events_alert
+    on spawn_events (session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' in ('alert.fired', 'alert.cleared');
+
 -- The `source.moved` records (deploys), found without reading the rest of
 -- the stream: the dispatcher reads the latest on every step
 -- (`LATEST_SOURCE_MOVED`).
@@ -3235,7 +3336,7 @@ begin
 end
 $$;
 
-revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds from public;
+revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds, spawn_alerts from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -3260,6 +3361,7 @@ begin
         'spawn_mission_reconfigure(bigint, jsonb)', 'spawn_settings_merge(jsonb, jsonb, text)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
+        'spawn_alert_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text, bigint)', 'spawn_task_stages(bigint)',
         'spawn_landing_hold(bigint)', 'spawn_landing_release()',
         'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
@@ -3278,7 +3380,8 @@ begin
                        spawn_login_role('spawn_supervisor'));
     end loop;
     execute format('grant select on mission_missions, mission_residents, mission_tasks, '
-                   'mission_source_holds to %I', spawn_login_role('spawn_supervisor'));
+                   'mission_source_holds, spawn_alerts to %I',
+                   spawn_login_role('spawn_supervisor'));
 end
 $$;
 
