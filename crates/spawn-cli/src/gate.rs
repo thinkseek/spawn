@@ -1403,14 +1403,9 @@ mod tests {
         "| gate time: base 141 s (2 scenario runs, 19 results from the cache), candidate 0 s, \
          setup 244 s (exports, socket scan, static checks), total 385 s\n";
 
-    /// A gate that prints `output` and exits with `status`.
+    /// A gate that prints `output` on stdout, then runs `status`.
     fn printing_gate(output: &str, status: &str) -> FakeGate {
-        FakeGate::new(&format!(
-            "cat >>'$SPAWN_GATE_VERDICT.log' <<'GATE'\n{output}GATE\n\
-             while IFS= read -r line; do echo \"$line\"; done <'$SPAWN_GATE_VERDICT.log'\n\
-             rm -f '$SPAWN_GATE_VERDICT.log'\n\
-             {status}\n"
-        ))
+        FakeGate::new(&format!("cat <<'GATE'\n{output}GATE\n{status}\n"))
     }
 
     #[test]
