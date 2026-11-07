@@ -3854,17 +3854,19 @@ mod tests {
             vec!["tool.started"],
             "nothing read twice"
         );
-        // Half a line, with no change reported afterwards: the read that
-        // took it left it half-written, so the next pass reads again.
-        world
-            .store
-            .append_file(&world.path, "{\"type\":\"user\",\"uuid\":\"u1\"");
+        // Half a line: the read that took it left it half-written, so the
+        // next pass reads again even though no change is reported for the
+        // rest (the write and the read raced).
+        world.store.append_file(
+            &world.path,
+            "{\"type\":\"system\",\"subtype\":\"turn_dur",
+        );
         world.watch.changed(&world.path);
         world.tick();
         assert_eq!(world.engine_events(), vec!["tool.started"]);
         world
             .store
-            .append_file(&world.path, ",\"timestamp\":\"2099-01-01T00:00:00.000Z\"}\n");
+            .append_file(&world.path, "ation\",\"uuid\":\"t2\"}\n");
         world.tick();
         assert_eq!(
             world.engine_events(),
