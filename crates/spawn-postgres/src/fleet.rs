@@ -218,10 +218,6 @@ with execs as materialized (
   select e.session_id, e.execution_id, e.started_at_ms, e.ended_at_ms, e.cause,
          e.exit_code, e.duration_ms, e.command_id
     from agent_executions e
-), cmds as materialized (
-  select c.id, c.principal, c.idempotency_key, c.session_id, c.action, c.state,
-         c.succeeded, c.error, c.created_at_ms, c.finished_at_ms
-    from spawn_commands c
 )
 select coalesce(jsonb_agg(row_to_json(w) order by w.session_id), '[]'::jsonb)
 from (
@@ -254,7 +250,7 @@ from (
         and j.execution_id = s.execution_id) as jobs,
     ep.id as episode,
     ep.action ->> 'type' as episode_action,
-    exists (select 1 from cmds c
+    exists (select 1 from spawn_commands c
              where c.session_id = s.session_id and c.state <> 'finished') as open_command,
     coalesce((select e.kind -> 'detail' ->> 'model' from spawn_events e
                where e.session_id = s.session_id and e.event_name = 'execution.started'
@@ -267,7 +263,7 @@ from (
               'finished_at_ms', c.finished_at_ms,
               'succeeded', c.succeeded,
               'error', c.error) order by c.id), '[]'::jsonb)
-       from cmds c
+       from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and (c.created_at_ms > spawn_now_ms() - 86400000
              or c.idempotency_key like 'deliver-%'
@@ -285,7 +281,7 @@ from (
               'finished_at_ms', c.finished_at_ms,
               'succeeded', c.succeeded,
               'error', c.error) order by c.id), '[]'::jsonb)
-       from cmds c
+       from spawn_commands c
       where s.live and c.session_id = s.session_id
         and c.action ->> 'type' in ('stop', 'discard')
         and c.id > (select x.command_id from execs x
@@ -295,17 +291,17 @@ from (
     -- every other session's is not gathered.
     case when s.session_id = 'session_supervisor' then
       (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
-         from cmds c, jsonb_array_elements_text(c.action -> 'tags') tag
+         from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
         where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
           and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array')
     else '[]'::jsonb end as told,
-    (select c.idempotency_key from cmds c
+    (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'
         and (c.succeeded is distinct from false or position($1 in coalesce(c.error, '')) > 0)
       order by c.id desc limit 1) as last_delivery,
     (select count(*) from execs x
-       join cmds c on c.id = x.command_id
+       join spawn_commands c on c.id = x.command_id
       where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'dispatch-resume-%' and c.succeeded
         and x.started_at_ms > (select coalesce(max(h.started_at_ms), 0)
@@ -326,7 +322,7 @@ from (
                      'finished_at_ms', c.finished_at_ms,
                      'succeeded', c.succeeded,
                      'error', c.error) order by c.id), '[]'::jsonb)
-                   from cmds c
+                   from spawn_commands c
                    cross join lateral (
                      select min(substr(tag, length('charter ') + 1)) as hash
                        from jsonb_array_elements_text(
@@ -348,7 +344,7 @@ from (
                             order by e.id limit 1),
               'error', c.error)
        from execs x
-       join cmds c on c.id = x.command_id
+       join spawn_commands c on c.id = x.command_id
       where x.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'dispatch-resume-%'
         and ",
@@ -384,7 +380,7 @@ from (
      from spawn_events n
      join spawn_events x on x.session_id = n.session_id and x.event_name = 'execution.started'
                         and x.execution_id = n.execution_id
-     join cmds c on c.id = (x.kind -> 'detail' ->> 'command_id')::bigint
+     join spawn_commands c on c.id = (x.kind -> 'detail' ->> 'command_id')::bigint
     where s.session_id = 'session_supervisor'
       and n.session_id = s.session_id and n.event_name = 'session.native_started'
       and n.kind -> 'detail' ->> 'native_session_id' =
@@ -392,7 +388,7 @@ from (
             where l.session_id = s.session_id and l.event_name = 'session.native_started'
             order by l.id desc limit 1)
     order by n.id limit 1) born on true
-  left join lateral (select c.id, c.action from cmds c
+  left join lateral (select c.id, c.action from spawn_commands c
      where c.session_id = s.session_id
        and (c.principal <> 'spawn-dispatch'
             or (c.idempotency_key like 'deliver-%'
