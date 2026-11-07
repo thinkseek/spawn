@@ -37,11 +37,10 @@ matched=0
 failed_names=""
 
 # A scenario's database, and the restricted logins its init-db made: they are
-# the cluster's, named after the database (spawn_login_role).
+# the cluster's, named after the database (spawn_login_role). One way for
+# every scenario, here and in rsi/scenarios: scripts/blackbox/scenario-db.sh.
 drop_database() {
-    $SPAWN_PSQL -d postgres -tA -c "drop database if exists $1 with (force)" >/dev/null 2>&1
-    $SPAWN_PSQL -d postgres -tA -c \
-        "drop role if exists spawn_supervisor_$1, spawn_reader_$1, spawn_human_$1" >/dev/null 2>&1
+    sh "$root/scripts/blackbox/scenario-db.sh" drop "$1" >/dev/null 2>&1
     return 0
 }
 
@@ -71,6 +70,9 @@ for scenario in "$root"/scripts/blackbox/scenarios/$pattern; do
     slug=$(basename "$scenario" .sh)
     db="bb_${slug//[^a-zA-Z0-9]/_}_$run"
     work=$(mktemp -d)
+    # Logins of this scenario's databases that a runner killed before its
+    # cleanup left behind: this prefix only.
+    sh "$root/scripts/blackbox/scenario-db.sh" sweep "${db%"$run"}" >/dev/null 2>&1
 
     if ! $SPAWN_PSQL -d postgres -tA -c "create database $db" >/dev/null 2>&1; then
         stage_emit blackbox fail 0 "$slug (create database)"
