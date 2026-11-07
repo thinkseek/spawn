@@ -158,7 +158,15 @@ select jsonb_build_object(
 /// (`told`: the escalations its digests carried, however long ago);
 /// `resumed_young` counts the executions its
 /// resumes started that died young (`died_young!`) since the session's last
-/// execution that did not; `stops` are the Stops and Discards anyone sent
+/// execution that did not; `failed_resume` is the latest execution one of
+/// its resumes (`dispatch-resume-%`, whatever its command's outcome) started
+/// that ended lost before its engine became ready (`lost_before_ready!`),
+/// since the session's last execution that stayed up (neither died young
+/// nor ended lost before ready), with its end's `evidence` and its
+/// command's `error`, or `null`: what the log records about the session,
+/// not the key of its latest execution, which a resume that started an
+/// execution and failed never sends (docs/fleet-architecture.md §3, the
+/// one-resume rule); `stops` are the Stops and Discards anyone sent
 /// during the live execution (after the command that started it, so the
 /// Bridge ran them on it), with their outcomes: a failed one is pursued.
 /// `turn_ended`: the live execution's latest turn event (`message.received`,
