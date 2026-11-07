@@ -150,21 +150,15 @@ fn launch(program: &str, arguments: &[&str], environment: &[(&str, &str)]) -> La
 }
 
 /// What `runner` answers once it stops answering `Running` or `limit`
-/// passes. A dead pane's `pane_dead` flag and its `pane_dead_status` are two
-/// moments of tmux's own: a pane can read dead while its exit status is
-/// still unset, so "dead (exit status none)" is not a settled answer.
+/// passes.
 fn settled(host: &TmuxHost, limit: Duration) -> Runner {
     let deadline = Instant::now() + limit;
     loop {
         let runner = host.runner(&terminal(), &workspace()).expect("runner");
-        let transient = matches!(
-            &runner,
-            Runner::Untracked(why) if why.contains("dead (exit status none)")
-        );
-        if (!transient && runner != Runner::Running) || Instant::now() > deadline {
+        if runner != Runner::Running || Instant::now() > deadline {
             return runner;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -224,8 +218,19 @@ fn a_terminal_hosts_its_runner_only_while_the_launch_lives_in_it() {
     server.tmux(&["set-option", "-g", "remain-on-exit", "on"]);
     host.start(&launch("/bin/sh", &["-c", "exit 3"], &[("A", "1")]))
         .expect("start");
-    let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
-        panic!("a dead pane hosts no runner");
+    // tmux marks the pane dead when its terminal closes, and records the
+    // exit status when it reaps the process, a moment later on a loaded host
+    // ("exit status none" in between: an owner gate, 2026-11-07). Wait for
+    // the status, within the same bound.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let seen = loop {
+        let Runner::Untracked(seen) = settled(&host, Duration::from_secs(5)) else {
+            panic!("a dead pane hosts no runner");
+        };
+        if !seen.contains("exit status none") || Instant::now() > deadline {
+            break seen;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
     assert!(seen.contains("dead (exit status 3)"), "{seen}");
     assert!(host.is_alive(&terminal(), &workspace()).expect("alive"));
