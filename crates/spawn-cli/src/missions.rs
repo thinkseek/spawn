@@ -19,17 +19,14 @@ const USAGE: &str = "usage:
                 resident takes one, per-task workers the rest)
   spawn mission resume --id N
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
+      (recorded as source.moved for every deploy, also when no mission's baseline moves;
+       after it every delivery whose retries are spent, having typed nothing, is tried once more)
   spawn mission hold --source <path> [--reason <text>]   (owner: no task lands on the source until
       a record ends the hold: its release, or its expiry SPAWN_SOURCE_HOLD_SECS after it (1 to
       86400, default 10800); its gates still run and its accepted tasks wait; a hold on a held
       source renews it. Prints the hold and the main it was taken at: gate against that main)
   spawn mission release --source <path>   (owner: the waiting tasks land at the next pass; with
       no hold it records nothing and prints `released` null)
-=======
-      (recorded as source.moved for every deploy, also when no mission's baseline moves;
-       after it every delivery whose retries are spent, having typed nothing, is tried once more)
->>>>>>> 83c68eea2b7cc405677b80d6d87fdd20e7ca6fe0
   spawn mission list [--limit N]   (every task with its stages)
   spawn mission close --id N --state done|dropped [--summary <text>]
   spawn task assign --mission N --kind ephemeral|resident --worker <label|resident> --brief <text>

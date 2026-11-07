@@ -1267,18 +1267,15 @@ create table if not exists mission_tasks (
     -- The models the task's worker runs on (docs/fleet-architecture.md,
     -- "Engine models"): `default`, or `cheap` for simple, well-specified work.
     model           text   not null default 'default' check (model in ('default', 'cheap')),
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
     -- The owner's hold this landing task last waited behind (`task.held`,
     -- the `source.held` record's event id): its `land()` pushed nothing
     -- under it. Set only by `task.held`; the hold's end does not clear it.
-    held_by         bigint
-=======
+    held_by         bigint,
     -- The task this one re-issues (its `task.assigned` names it): a first
     -- delivery spent without typing is cancelled and assigned again once,
     -- by the dispatcher (`spawn_task_reissue`); a re-issue is never
     -- re-issued again.
     reissue_of      bigint
->>>>>>> 83c68eea2b7cc405677b80d6d87fdd20e7ca6fe0
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1309,11 +1306,8 @@ alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
-<<<<<<< 479b4ec0fd644f46f90fba276c69c87c984a04cd
 alter table mission_tasks add column if not exists held_by bigint;
-=======
 alter table mission_tasks add column if not exists reissue_of bigint;
->>>>>>> 83c68eea2b7cc405677b80d6d87fdd20e7ca6fe0
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
