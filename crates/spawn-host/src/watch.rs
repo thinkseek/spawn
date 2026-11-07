@@ -120,20 +120,24 @@ impl InotifyWatch {
         let Some(anchor) = anchor(file) else {
             return Err(WatchError(format!("no directory of {path} exists to watch")));
         };
-        let descriptor = match state.dirs.iter().find(|(_, dir)| dir.path == anchor) {
-            Some((descriptor, _)) => *descriptor,
-            None => {
-                let descriptor = rustix::fs::inotify::add_watch(&self.fd, &anchor, Self::flags())
-                    .map_err(|error| WatchError(format!("{}: {error}", anchor.display())))?;
-                state.dirs.insert(
-                    descriptor,
-                    Dir {
-                        path: anchor.clone(),
-                        keys: BTreeSet::new(),
-                    },
-                );
-                descriptor
-            }
+        let watched = state
+            .dirs
+            .iter()
+            .find(|(_, dir)| dir.path == anchor)
+            .map(|(descriptor, _)| *descriptor);
+        let descriptor = if let Some(descriptor) = watched {
+            descriptor
+        } else {
+            let descriptor = rustix::fs::inotify::add_watch(&self.fd, &anchor, Self::flags())
+                .map_err(|error| WatchError(format!("{}: {error}", anchor.display())))?;
+            state.dirs.insert(
+                descriptor,
+                Dir {
+                    path: anchor.clone(),
+                    keys: BTreeSet::new(),
+                },
+            );
+            descriptor
         };
         if let Some(dir) = state.dirs.get_mut(&descriptor) {
             dir.keys.insert(key.to_string());
@@ -141,15 +145,13 @@ impl InotifyWatch {
         let previous = state
             .wanted
             .insert((key.to_string(), path.to_string()), anchor.clone());
-        match previous {
-            Some(previous) if previous != anchor => {
+        if previous.is_some_and(|previous| previous != anchor) {
+            if let Some(previous) = previous {
                 self.release(state, key, &previous);
-                // The change that moved the watch may have landed in the
-                // directory just joined: it is due once more.
-                state.recheck.insert(key.to_string());
             }
-            Some(_) => {}
-            None => {}
+            // The change that moved the watch may have landed in the
+            // directory just joined: it is due once more.
+            state.recheck.insert(key.to_string());
         }
         Ok(())
     }
