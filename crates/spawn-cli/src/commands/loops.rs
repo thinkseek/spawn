@@ -319,7 +319,7 @@ impl Fleet {
             match open_store().map(std::sync::Arc::new) {
                 Ok(open) => self.store = Some(open),
                 Err(error) => {
-                    self.fail(&mut failed, "store", &error);
+                    Fleet::fail(&mut failed, "store", &error);
                 }
             }
             self.listener = None;
@@ -328,7 +328,7 @@ impl Fleet {
             Some(open) => match open.watermark() {
                 Ok(watermark) => Some(watermark),
                 Err(error) => {
-                    self.fail(&mut failed, "watermark", &error.to_string());
+                    Fleet::fail(&mut failed, "watermark", &error.to_string());
                     None
                 }
             },
@@ -342,7 +342,7 @@ impl Fleet {
         // keeps an engine's turn end seen as soon as it is written.
         match self.bridge.poll() {
             Ok(report) => warnings.extend(report.warnings),
-            Err(error) => self.fail(&mut failed, "bridge", &error.to_string()),
+            Err(error) => Fleet::fail(&mut failed, "bridge", &error.to_string()),
         }
         for warning in &warnings {
             eprintln!("spawn loop warning: {warning}");
@@ -384,13 +384,13 @@ impl Fleet {
                         Some(now)
                     } else {
                         open.next_lease_ms().unwrap_or_else(|error| {
-                            self.fail(failed, "bridge", &error.to_string());
+                            Fleet::fail(failed, "bridge", &error.to_string());
                             None
                         })
                     };
                     self.schedule.bridge.ran(watermark, due);
                 }
-                Err(error) => self.fail(failed, "bridge", &error.to_string()),
+                Err(error) => Fleet::fail(failed, "bridge", &error.to_string()),
             }
         }
         if self.schedule.observer.runs(watermark, now) {
@@ -399,7 +399,7 @@ impl Fleet {
                     .schedule
                     .observer
                     .ran(watermark, self.observer.next_due_ms()),
-                Err(error) => self.fail(failed, "observer", &error.to_string()),
+                Err(error) => Fleet::fail(failed, "observer", &error.to_string()),
             }
         }
         // The disk watch never fails a pass: a fleet must not stop because it
@@ -423,7 +423,7 @@ impl Fleet {
                     lines.extend(more);
                     self.schedule.dispatch.ran(watermark, due);
                 }
-                Err(error) => self.fail(failed, "dispatch", &error),
+                Err(error) => Fleet::fail(failed, "dispatch", &error),
             }
         }
         // Under the disk floor no resident is revived (a new execution); the
@@ -434,7 +434,7 @@ impl Fleet {
                     lines.extend(more);
                     self.schedule.residents.ran(watermark, due);
                 }
-                Err(error) => self.fail(failed, "residents", &error),
+                Err(error) => Fleet::fail(failed, "residents", &error),
             }
         }
         if self.supervised && self.schedule.alive.runs(watermark, now) {
@@ -443,13 +443,13 @@ impl Fleet {
                     lines.extend(line);
                     self.schedule.alive.ran(watermark, due);
                 }
-                Err(error) => self.fail(failed, "supervise", &error),
+                Err(error) => Fleet::fail(failed, "supervise", &error),
             }
         }
     }
 
     /// Log a failed step and mark the pass failed.
-    fn fail(&self, failed: &mut bool, what: &str, error: &str) {
+    fn fail(failed: &mut bool, what: &str, error: &str) {
         *failed = true;
         eprintln!("spawn loop: {what}: {error}");
     }
@@ -494,7 +494,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use super::{Step, backoff, earliest, pause_unless_stopped, stop_on_signal};
+    use super::{Schedule, Step, backoff, pause_unless_stopped, stop_on_signal};
 
     /// A step runs on a record or on a time, never on the clock: a pass
     /// whose watermark is unchanged and whose due times are in the future
@@ -558,7 +558,7 @@ mod tests {
             "the first waits for a time not come"
         );
         assert!(steps[1].runs(5, now), "the second's time has come");
-        assert_eq!(earliest(&[&steps[0], &steps[1]]), Some(3_000));
+        assert_eq!(schedule_of(&steps).earliest(), Some(3_000));
     }
 
     /// The wait is never longer than the next due time, and the loop has no
@@ -568,9 +568,9 @@ mod tests {
         let mut steps = [Step::new(), Step::new()];
         steps[0].ran(1, Some(4_000));
         steps[1].ran(1, None);
-        assert_eq!(earliest(&[&steps[0], &steps[1]]), Some(4_000));
+        assert_eq!(schedule_of(&steps).earliest(), Some(4_000));
         steps[0].ran(1, None);
-        assert_eq!(earliest(&[&steps[0], &steps[1]]), None);
+        assert_eq!(schedule_of(&steps).earliest(), None);
     }
 
     /// A deploy's SIGTERM ends the loop's pause instead of the process, so
