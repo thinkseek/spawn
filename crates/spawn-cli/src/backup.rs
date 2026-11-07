@@ -656,14 +656,13 @@ pub(crate) fn tiers_for(now: Stamp, earlier: &[Stamp]) -> Vec<Tier> {
 
 /// Whether a bundle is a full one: the first of an ISO week, or no full
 /// bundle recorded within the last seven days.
-pub(crate) fn full_bundle(now: Stamp, earlier: &[(Stamp, bool)], now_ms: i64, record_ms: &[i64]) -> bool {
+pub(crate) fn full_bundle(now: Stamp, earlier: &[(Stamp, bool, i64)], now_ms: i64) -> bool {
     let fresh = earlier
         .iter()
-        .any(|(stamp, full)| *full && stamp.monday == now.monday);
+        .any(|(stamp, full, _)| *full && stamp.monday == now.monday);
     let recent_full = earlier
         .iter()
-        .zip(record_ms)
-        .any(|((_, full), at)| *full && now_ms.saturating_sub(*at) < 7 * 86_400_000);
+        .any(|(_, full, at)| *full && now_ms.saturating_sub(*at) < 7 * 86_400_000);
     !fresh || !recent_full
 }
 
@@ -1245,34 +1244,6 @@ header = \"x-amz-meta-sha256: {}\"\nheader = \"x-amz-meta-spawn-events: {}\"\n",
     Ok(())
 }
 
-/// One object's bytes (and the response's headers), or `None` when the
-/// bucket does not hold it.
-fn get_object(settings: &Settings, key: &str) -> Result<Option<Response>, String> {
-    let scratch = Scratch::new("fetch")?;
-    let output = scratch.join("object");
-    let options = format!(
-        "output = \"{}\"\n",
-        escape_config(&output.display().to_string())
-    );
-    let response = bucket_request(settings, &settings.r2.url(key), &options)?;
-    if response.status == 404 {
-        return Ok(None);
-    }
-    if response.status != 200 {
-        return Err(format!(
-            "GET {key} answered {}: {}",
-            response.status,
-            first_line(&response.body)
-        ));
-    }
-    let body = fs::read_to_string(&output).unwrap_or_default();
-    Ok(Some(Response {
-        status: 200,
-        body,
-        headers: response.headers,
-    }))
-}
-
 /// `spawn backup dump`'s body is above; `bundle` and `verify` follow.
 ///
 /// One `backup.bundled` record, as the run reads the earlier ones.
@@ -1416,16 +1387,15 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let now = Stamp::at(now_ms);
     let earlier = bundle_records(&store, now_ms)?;
     let base = earlier.last();
-    let stamps: Vec<(Stamp, bool)> = earlier
+    let stamps: Vec<(Stamp, bool, i64)> = earlier
         .iter()
         .filter_map(|entry| {
             let key = entry.record["keys"].as_array()?.first()?.as_str()?;
             let kind = entry.record["kind"].as_str()?;
-            Some((Stamp::parse(key)?, kind == "full"))
+            Some((Stamp::parse(key)?, kind == "full", entry.at_ms))
         })
         .collect();
-    let at_ms: Vec<i64> = earlier.iter().map(|entry| entry.at_ms).collect();
-    let full = full_bundle(now, &stamps, now_ms, &at_ms);
+    let full = full_bundle(now, &stamps, now_ms);
     let sources = store
         .mission_sources()
         .map_err(|error| error.to_string())?
@@ -1746,15 +1716,14 @@ fn verify(flags: &Flags) -> Result<i32, String> {
         "expected": expected,
     });
     let outcome = restore_and_compare(&settings, &drill_url, latest);
-    let (ok, reason, drilled, counts) = match outcome {
-        Ok(drilled) => (true, String::new(), drilled, None),
-        Err(RestoreError { reason, drilled }) => (false, reason, drilled, None),
+    let (ok, reason, drilled) = match outcome {
+        Ok(drilled) => (true, String::new(), drilled),
+        Err(RestoreError { reason, drilled }) => (false, reason, drilled),
     };
     let mut record = naming;
-    record["events"] = counts
-        .map(|(events, _)| json!(events))
-        .unwrap_or_else(|| json!(drilled_events(&drilled)));
+    record["events"] = json!(drilled.events);
     record["max_event_id"] = json!(drilled.max_event_id);
+    record["server"] = json!(parse_pg_url(&drill_url).map(|url| url.server()).unwrap_or_default());
     let code = if ok {
         record_verified(Some(&store), true, "", &record, &drilled, started);
         0
@@ -1776,10 +1745,6 @@ fn verify(flags: &Flags) -> Result<i32, String> {
     Ok(code)
 }
 
-fn drilled_events(drilled: &Drilled) -> i64 {
-    drilled.events.unwrap_or(0)
-}
-
 /// A drill that failed, with what it had made when it did.
 struct RestoreError {
     reason: String,
@@ -1797,14 +1762,14 @@ fn restore_and_compare(
     let fail = |reason: String, drilled: Drilled| RestoreError { reason, drilled };
     let key = latest.record["keys"][0].as_str().unwrap_or_default();
     let expected_sha = latest.record["sha256"].as_str().unwrap_or_default();
-    let response = get_object(settings, key).map_err(|error| fail(error, drilled))?;
-    let Some(response) = response else {
+    let Some((bytes, headers)) = get_object_bytes(settings, key).map_err(|error| fail(error, drilled))?
+    else {
         return Err(RestoreError {
             reason: format!("the bucket does not hold {key}"),
             drilled,
         });
     };
-    if let Some(meta) = header_value(&response.headers, "x-amz-meta-sha256")
+    if let Some(meta) = header_value(&headers, "x-amz-meta-sha256")
         && meta != expected_sha
     {
         return Err(RestoreError {
@@ -1814,19 +1779,6 @@ fn restore_and_compare(
     }
     let scratch = Scratch::new("drill").map_err(|error| fail(error, drilled))?;
     let encrypted = scratch.join("dump.gpg");
-    fs::write(&encrypted, response.body.as_bytes())
-        .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled))?;
-    // The object is bytes, not text: write them back as they came.
-    let bytes = match get_object_bytes(settings, key) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            return Err(RestoreError {
-                reason: format!("the bucket does not hold {key}"),
-                drilled,
-            });
-        }
-        Err(error) => return Err(RestoreError { reason: error, drilled }),
-    };
     fs::write(&encrypted, &bytes)
         .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled))?;
     let raw = scratch.join("dump");
@@ -1897,8 +1849,8 @@ fn restore_and_compare(
     }
 }
 
-/// The object's bytes, as they are (not through a String).
-fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<Vec<u8>>, String> {
+/// The object's bytes, as they are (not through a String), and its headers.
+fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<(Vec<u8>, String)>, String> {
     let scratch = Scratch::new("fetch")?;
     let output = scratch.join("object");
     let options = format!(
@@ -1907,9 +1859,10 @@ fn get_object_bytes(settings: &Settings, key: &str) -> Result<Option<Vec<u8>>, S
     );
     let response = bucket_request(settings, &settings.r2.url(key), &options)?;
     match response.status {
-        200 => Ok(Some(
+        200 => Ok(Some((
             fs::read(&output).map_err(|error| format!("{}: {error}", output.display()))?,
-        )),
+            response.headers,
+        ))),
         404 => Ok(None),
         status => Err(format!("GET {key} answered {status}")),
     }
