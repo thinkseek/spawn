@@ -501,6 +501,9 @@ pub(crate) struct Plan {
     /// Tasks whose delivery command succeeded, as (task, command): they
     /// are marked delivered.
     pub(crate) delivered: Vec<(i64, i64)>,
+    /// Tasks whose first delivery is spent without typing: cancelled and
+    /// assigned again ([`deliver::reissues`]).
+    pub(crate) reissues: Vec<deliver::Reissue>,
     pub(crate) orders: Vec<Order>,
     /// Escalations not delivered yet, whether or not a digest goes out now.
     pub(crate) pending: Vec<Escalation>,
@@ -543,6 +546,7 @@ pub(crate) fn decide_with(
     let told = digest::told(supervisor);
     let mut plan = Plan {
         delivered: deliver::delivered(work, rows),
+        reissues: deliver::reissues(work, rows, now_ms),
         orders: deliver::orders(work, rows, now_ms),
         ..Plan::default()
     };
@@ -582,12 +586,17 @@ pub(crate) fn decide_with(
     plan
 }
 
-/// Facts and mission rows, read once.
-pub(crate) fn load(store: &PostgresStore) -> Result<(Vec<Facts>, Work), String> {
+/// Facts and mission rows, read once, delivering with `waits`.
+pub(crate) fn load(
+    store: &PostgresStore,
+    waits: deliver::Waits,
+) -> Result<(Vec<Facts>, Work), String> {
     let rows: Vec<Facts> =
         serde_json::from_value(store.dispatch_facts().map_err(|error| error.to_string())?)
             .map_err(|error| format!("dispatch facts: {error}"))?;
-    Ok((rows, Work::load(store)?))
+    let mut work = Work::load(store)?;
+    work.waits = waits;
+    Ok((rows, work))
 }
 
 /// What stalls are measured from, read after the facts and rows: a record
@@ -723,8 +732,8 @@ pub(crate) fn read_plan(
 /// workers under `root` (a draft is not taken: its worker is told instead,
 /// [`deliver::collect_reports`]), then submit the plan ([`read_plan`]), with the
 /// stalls past their `bounds` among its escalations ([`stall`]), without
-/// its new executions while the disk is under its floor ([`crate::disk`]).
-/// Returns log lines.
+/// its new executions while the disk is under its floor ([`crate::disk`]),
+/// delivering with `waits` ([`deliver::Waits`]). Returns log lines.
 pub(crate) fn step(
     store: &std::sync::Arc<PostgresStore>,
     supervised: bool,
@@ -732,14 +741,15 @@ pub(crate) fn step(
     root: Option<&Path>,
     disk: &crate::disk::Monitor,
     bounds: &Bounds,
+    waits: deliver::Waits,
 ) -> Result<Vec<String>, String> {
-    let (mut rows, mut work) = load(store)?;
+    let (mut rows, mut work) = load(store, waits)?;
     let mut lines = root.map_or_else(Vec::new, |root| {
         deliver::collect_reports(store, &work, &rows, root, now_ms())
     });
     if !lines.is_empty() {
         // Collecting a report changed a task's state.
-        (rows, work) = load(store)?;
+        (rows, work) = load(store, waits)?;
     }
     let Reading {
         work,
@@ -771,6 +781,21 @@ pub(crate) fn step(
         lines.push(format!(
             "dispatch: task #{task} delivered (command {command})"
         ));
+    }
+    for reissue in plan.reissues {
+        // A refusal (the task moved on since the facts were read) costs this
+        // pass nothing else: the next pass reads the task as it is.
+        let attempts =
+            serde_json::to_value(&reissue.attempts).map_err(|error| error.to_string())?;
+        lines.push(match store.task_reissue(reissue.task, &attempts) {
+            Ok(new) => format!(
+                "dispatch: task #{} re-issued as task #{new}: its delivery never reached its \
+                 worker ({} attempts, nothing typed)",
+                reissue.task,
+                reissue.attempts.len()
+            ),
+            Err(error) => format!("dispatch: re-issue of task #{}: {error}", reissue.task),
+        });
     }
     let principal = Principal::new(DISPATCHER).map_err(|error| error.to_string())?;
     for mut order in plan.orders {

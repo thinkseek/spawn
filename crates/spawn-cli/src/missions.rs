@@ -44,6 +44,8 @@ const USAGE: &str = "usage:
        gate is stopped, and spawn-integrate is never stopped for it. --wait: wait that long
        for the outcome and print it; exit 0 applied, 1 refused, 3 still pending)
   spawn mission moved --source <path> --from <commit> --to <commit>   (owner: a deploy moved main)
+      (recorded as source.moved for every deploy, also when no mission's baseline moves;
+       after it every delivery whose retries are spent, having typed nothing, is tried once more)
   spawn mission hold --source <path> [--reason <text>]   (owner: no task lands on the source until
       a record ends the hold: its release, or its expiry SPAWN_SOURCE_HOLD_SECS after it (1 to
       86400, default 10800); its gates still run and its accepted tasks wait; a hold on a held
