@@ -167,10 +167,24 @@ pub struct BridgeConfig {
     /// directory), as the terminal host sees it.
     pub claude_projects: String,
     /// A busy screen is recorded again this often while it stays busy, so
-    /// the Observer keeps a current fact for a long turn.
+    /// the Observer keeps a current fact for a long turn. It is also the
+    /// backstop of a screen that changes with nothing in the transcript (a
+    /// dialog, a crash to a shell): every live pane is captured at least
+    /// this often.
     pub screen_refresh: Duration,
+    /// How long a live execution's transcript must hold still before its
+    /// pane is read for what the transcript cannot say: the prompt is back.
+    /// A turn's end is read from the transcript as soon as the file changes;
+    /// this is how long after the last line the screen is compared with what
+    /// was recorded. Shorter is readier sooner and costs more captures.
+    pub screen_quiet: Duration,
     /// The model relay, when Claude Code engines go through one.
     pub model_relay: Option<ModelRelay>,
+    /// The watch on the files the engines write (transcripts and exit
+    /// statuses), when the host has one. `None` reads every live execution's
+    /// files on every pass, as Spawn did before watches: correct, and the
+    /// cost grows with the fleet.
+    pub watch: Option<Arc<dyn FileWatch>>,
 }
 
 impl BridgeConfig {
@@ -190,7 +204,9 @@ impl BridgeConfig {
             input_wait_retry: Duration::from_secs(1),
             claude_projects: "/root/.claude/projects".to_string(),
             screen_refresh: Duration::from_secs(30),
+            screen_quiet: Duration::from_millis(500),
             model_relay: None,
+            watch: None,
         }
     }
 }
