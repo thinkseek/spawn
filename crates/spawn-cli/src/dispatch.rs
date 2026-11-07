@@ -636,6 +636,10 @@ pub(crate) struct Reading {
 /// supervisor the `deployed` charter if it holds another ([`charter::give`];
 /// `None`: no input, as for a reader that submits nothing). [`step`]
 /// submits what it returns; `GET /api/attention` (crate::serve) shows it.
+/// The tags of the backlog order items this process logged
+/// ([`read_plan`]): each is said once.
+static ORDER_LOGGED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
 /// One function for both, so the queue a person reads is the dispatcher's
 /// own.
 pub(crate) fn read_plan(
@@ -694,14 +698,16 @@ pub(crate) fn read_plan(
     }
     host.extend(jobs::items(&rows, bounds.job));
     let mut plan = decide_with(&rows, &work, &host, supervised, now, spawn);
-    // An order no task can meet is said in the log until the supervisor
-    // was told of it.
-    lines.extend(
-        plan.pending
-            .iter()
-            .filter(|item| item.why == Why::ObjectiveOrder)
-            .map(|item| format!("dispatch: {}", item.line)),
-    );
+    // An order no task can meet is said in the log once per tag, the
+    // first pass that has it untold.
+    if let Ok(mut logged) = ORDER_LOGGED.lock() {
+        lines.extend(
+            plan.pending
+                .iter()
+                .filter(|item| item.why == Why::ObjectiveOrder && logged.insert(item.tag()))
+                .map(|item| format!("dispatch: {}", item.line)),
+        );
+    }
     if let Some(deployed) = deployed.filter(|_| supervised) {
         charter::give(&mut plan, &rows, deployed);
     }
@@ -1601,7 +1607,9 @@ mod tests {
                 && items[0]
                     .line
                     .starts_with("mission 4's backlog names an order no task can meet")
-                && items[0].line.contains("28 after 30 after 28"),
+                && items[0]
+                    .line
+                    .contains("objectives 28, 30 come after each other"),
             "{:?}",
             items[0]
         );
