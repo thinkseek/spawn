@@ -415,7 +415,7 @@ impl Scratch {
         Err("cannot make a scratch directory".to_string())
     }
 
-    fn join(&self, name: &str) -> PathBuf {
+    fn join(&self, name: impl AsRef<Path>) -> PathBuf {
         self.path.join(name)
     }
 }
@@ -450,7 +450,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// The MD5 of a file, as S3's ETag spells it: computed here so no tool or
@@ -1038,7 +1038,7 @@ fn count_events(settings: &Settings, scratch: &Scratch, dump: &Path) -> Result<(
 
 /// gpg: AES256, no compression (the archive is compressed), the passphrase
 /// from its file.
-fn gpg(settings: &Settings, decrypting: bool, input: &Path, output: &Path) -> Result<(), String> {
+fn gpg(settings: &Settings, decrypting: bool, input: &Path, out: &Path) -> Result<(), String> {
     let mut command = Command::new("gpg");
     command
         .args([
@@ -1053,7 +1053,7 @@ fn gpg(settings: &Settings, decrypting: bool, input: &Path, output: &Path) -> Re
         .arg("--passphrase-file")
         .arg(&settings.key_file);
     if decrypting {
-        command.arg("--output").arg(output).arg("--decrypt").arg(input);
+        command.arg("--output").arg(out).arg("--decrypt").arg(input);
     } else {
         command
             .args([
@@ -1064,7 +1064,7 @@ fn gpg(settings: &Settings, decrypting: bool, input: &Path, output: &Path) -> Re
                 "none",
             ])
             .arg("--output")
-            .arg(output)
+            .arg(out)
             .arg(input);
     }
     let (ok, _stdout, stderr) = output(command, "gpg")?;
@@ -1074,12 +1074,12 @@ fn gpg(settings: &Settings, decrypting: bool, input: &Path, output: &Path) -> Re
     Ok(())
 }
 
-fn encrypt(settings: &Settings, input: &Path, output: &Path) -> Result<(), String> {
-    gpg(settings, false, input, output)
+fn encrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
+    gpg(settings, false, input, out)
 }
 
-fn decrypt(settings: &Settings, input: &Path, output: &Path) -> Result<(), String> {
-    gpg(settings, true, input, output)
+fn decrypt(settings: &Settings, input: &Path, out: &Path) -> Result<(), String> {
+    gpg(settings, true, input, out)
 }
 
 /// One exchange with the bucket. `options` is curl config (headers, the
@@ -1415,9 +1415,7 @@ fn bundle(flags: &Flags) -> Result<i32, String> {
     let mut transp_bytes = 0u64;
     let mut sizes = serde_json::Map::new();
     for (path, size) in &window {
-        if let Some(sizes) = sizes.as_object_mut() {
-            sizes.insert(path.clone(), json!(size));
-        }
+        sizes.insert(path.clone(), json!(size));
         let base_size = base
             .and_then(|base| base.record["transcripts"]["sizes"].get(path))
             .and_then(Value::as_u64);
@@ -1648,7 +1646,7 @@ fn git_bundle(source: &str, file: &Path, not: &[String]) -> Result<(), String> {
 }
 
 /// What the drill restored and where, for its record.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Drilled {
     database: Option<String>,
     events: Option<i64>,
@@ -1760,9 +1758,10 @@ fn restore_and_compare(
 ) -> Result<Drilled, RestoreError> {
     let mut drilled = Drilled::default();
     let fail = |reason: String, drilled: Drilled| RestoreError { reason, drilled };
+    let snapshot = |drilled: &Drilled| drilled.clone();
     let key = latest.record["keys"][0].as_str().unwrap_or_default();
     let expected_sha = latest.record["sha256"].as_str().unwrap_or_default();
-    let Some((bytes, headers)) = get_object_bytes(settings, key).map_err(|error| fail(error, drilled))?
+    let Some((bytes, headers)) = get_object_bytes(settings, key)X
     else {
         return Err(RestoreError {
             reason: format!("the bucket does not hold {key}"),
@@ -1777,7 +1776,7 @@ fn restore_and_compare(
             drilled,
         });
     }
-    let scratch = Scratch::new("drill").map_err(|error| fail(error, drilled))?;
+    let scratch = Scratch::new("drill")X;
     let encrypted = scratch.join("dump.gpg");
     fs::write(&encrypted, &bytes)
         .map_err(|error| fail(format!("{}: {error}", encrypted.display()), drilled))?;
@@ -1798,7 +1797,7 @@ fn restore_and_compare(
         }
         Err(error) => return Err(RestoreError { reason: error, drilled }),
     }
-    let url = parse_pg_url(drill_url).map_err(|error| fail(error, drilled))?;
+    let url = parse_pg_url(drill_url)X;
     let base = if url.database.is_empty() {
         "postgres".to_string()
     } else {
