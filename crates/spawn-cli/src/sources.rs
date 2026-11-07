@@ -85,12 +85,14 @@ fn unavailable(text: String) -> WorkspaceError {
 /// git itself, before any helper runs.
 pub(crate) const ALLOWED_PROTOCOLS: &str = "file:https:ssh";
 
-/// `git`, as every controller-side call runs it: only
-/// [`ALLOWED_PROTOCOLS`], whatever the installed git defaults to or the
-/// host's configuration allows (`GIT_ALLOW_PROTOCOL` overrides
-/// `protocol.*.allow`), and no standard input.
+/// `git`, as every controller-side call runs it: in the C locale
+/// ([`spawn_host::git_command`]), so what it answers reads the same on a
+/// host whose locale is translated; only [`ALLOWED_PROTOCOLS`], whatever
+/// the installed git defaults to or the host's configuration allows
+/// (`GIT_ALLOW_PROTOCOL` overrides `protocol.*.allow`); and no standard
+/// input.
 pub(crate) fn controller_git() -> Command {
-    let mut command = Command::new("git");
+    let mut command = spawn_host::git_command("git");
     command
         .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
         .env("GIT_PROTOCOL_FROM_USER", "0")
@@ -168,6 +170,26 @@ pub(crate) fn git(arguments: &[&str]) -> Result<String, WorkspaceError> {
         return Err(unavailable(format!(
             "git {}: {}",
             arguments.first().copied().unwrap_or_default(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// [`git`] as a test runs its own (a seed's `init`, `add` and `commit`, a
+/// look at a ref): [`spawn_host::test_git_command`], which no setting of
+/// the host's git configuration reaches, so a host that signs every commit
+/// cannot hang a test. What Spawn itself runs stays on [`git`].
+#[cfg(test)]
+pub(crate) fn test_git(arguments: &[&str]) -> Result<String, WorkspaceError> {
+    let output = spawn_host::test_git_command()
+        .args(arguments)
+        .output()
+        .map_err(|error| unavailable(format!("run git: {error}")))?;
+    if !output.status.success() {
+        return Err(unavailable(format!(
+            "git {}: {}",
+            arguments.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
@@ -642,12 +664,14 @@ impl Drop for MissionWorkspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        MissionSource, ensure_mirror, fetch_pushed_into, git, mirror_name, receives_branches,
+        MissionSource, ensure_mirror, fetch_pushed_into, mirror_name, receives_branches,
+        test_git as git,
     };
     use crate::push::{Pushed, Pusher, push_branch};
     use spawn_core::id::{BranchName, WorkspaceId};
     use spawn_core::port::{Commit, WorkspaceStore};
     use spawn_host::GitWorkspace;
+    use std::ffi::OsStr;
     use std::path::Path;
 
     /// One host's checkpoint of `agent` in its mirror: a new file.
@@ -795,14 +819,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Issue #8: a push that loses the source's ref lock to another push
-    /// (git says `[remote rejected]`) is a failure, retried until it lands;
-    /// only git's own refusal of a rewritten branch (`[rejected]`) is not
-    /// retried. Such a push used to count as refused, and was never made.
-    #[test]
-    fn a_push_that_loses_the_ref_lock_is_retried_and_a_rewritten_branch_is_refused() {
-        let base = std::env::temp_dir().join(format!("spawn-sources-lock-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+    /// A source with one commit on `main` under a new `base`, and this
+    /// host's mirror of it (under `<base>/host`), with `agent_x` checkpointed
+    /// once and published: `(source, mirror, host)`.
+    fn published_source(base: &Path) -> (String, std::path::PathBuf, GitWorkspace) {
+        let _ = std::fs::remove_dir_all(base);
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).expect("seed directory");
         let seed_path = seed.to_string_lossy().to_string();
@@ -826,9 +847,41 @@ mod tests {
         let root = base.join("host");
         let mirror = ensure_mirror(&root, Some(&source)).expect("mirror");
         let host = GitWorkspace::new(&mirror, &root);
-        let landing = "refs/spawn-integrate/agent_x";
         checkpoint(&host, "agent_x", "one.txt");
         assert_eq!(push_branch(&mirror, &source, "agent_x"), Pushed::Done);
+        (source, mirror, host)
+    }
+
+    /// `agent_x` of `mirror` moved back to `main`, under the head the
+    /// source holds, and checkpointed again: a rewritten branch.
+    fn rewrite(mirror: &Path, host: &GitWorkspace) {
+        let path = mirror.to_string_lossy().to_string();
+        let main = git(&["--git-dir", &path, "rev-parse", "refs/heads/main"]).expect("main");
+        git(&[
+            "--git-dir",
+            &path,
+            "update-ref",
+            "refs/heads/agent_x",
+            &main,
+        ])
+        .expect("rewrite");
+        checkpoint(host, "agent_x", "three.txt");
+    }
+
+    /// Issue #8: a push that loses the source's ref lock to another push
+    /// (git says `[remote rejected]`) is a failure, retried until it lands;
+    /// only git's own refusal of a rewritten branch (`[rejected]`) is not
+    /// retried. Such a push used to count as refused, and was never made.
+    ///
+    /// The retry is waited for until it is settled, not until it leaves the
+    /// queue: a retry the background thread is making has left the queue
+    /// and not landed yet, and the fetch that followed it used to find the
+    /// old head (about one run in five, in any locale).
+    #[test]
+    fn a_push_that_loses_the_ref_lock_is_retried_and_a_rewritten_branch_is_refused() {
+        let base = std::env::temp_dir().join(format!("spawn-sources-lock-{}", std::process::id()));
+        let (source, mirror, host) = published_source(&base);
+        let landing = "refs/spawn-integrate/agent_x";
         let head = checkpoint(&host, "agent_x", "two.txt");
 
         // Another push holds the ref's lock.
@@ -846,12 +899,14 @@ mod tests {
             ),
             "a lost lock is no refusal"
         );
+        // While the lock is held no retry can land: the branch is owed its
+        // push, queued or being retried, however slow this host is.
         assert!(pusher.waiting(&mirror, "agent_x"), "it waits for its retry");
         std::fs::remove_file(&lock).expect("the other push ends");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pusher.waiting(&mirror, "agent_x") && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        assert!(
+            pusher.settled(&mirror, "agent_x", std::time::Duration::from_mins(2)),
+            "the retry ends"
+        );
         assert_eq!(
             fetch_pushed_into(&mirror, &source, "agent_x", landing).expect("fetched"),
             Some(head),
@@ -860,17 +915,7 @@ mod tests {
 
         // A branch rewritten under its published head is refused, not
         // retried and not overwritten.
-        let path = mirror.to_string_lossy().to_string();
-        let main = git(&["--git-dir", &path, "rev-parse", "refs/heads/main"]).expect("main");
-        git(&[
-            "--git-dir",
-            &path,
-            "update-ref",
-            "refs/heads/agent_x",
-            &main,
-        ])
-        .expect("rewrite");
-        checkpoint(&host, "agent_x", "three.txt");
+        rewrite(&mirror, &host);
         assert!(matches!(
             push_branch(&mirror, &source, "agent_x"),
             Pushed::Rejected(why) if why.contains("[rejected]")
@@ -976,9 +1021,9 @@ mod tests {
                 .output()
                 .expect("git runs")
         };
-        let mut plain = std::process::Command::new("git");
-        plain.stdin(std::process::Stdio::null());
-        let _ = allowing(plain);
+        // A git without the controller's rule: the configuration given on
+        // the command (`GIT_CONFIG_*`, as a host's would be) lets it run.
+        let _ = allowing(spawn_host::test_git_command());
         assert!(marker.exists(), "the host's configuration would run it");
         std::fs::remove_file(&marker).expect("reset");
         let refused = allowing(super::controller_git());
@@ -990,28 +1035,218 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Every git the controller runs is built by `controller_git`: no other
-    /// module of the CLI starts git itself (tests aside).
+    /// Every git the controller runs is built by `controller_git`, on
+    /// `spawn_host::git_command`, so it runs in the C locale; every git a
+    /// test runs for itself by `test_git` (`spawn_host::test_git_command`),
+    /// which no setting of the host's git configuration reaches. No file of
+    /// the CLI, its tests included, starts git itself, and no test runs its
+    /// own git through the controller's `git`.
     #[test]
     fn every_controller_git_is_built_in_one_place() {
-        for (name, text) in [
-            ("push.rs", include_str!("push.rs")),
-            ("integrate.rs", include_str!("integrate.rs")),
-            ("missions.rs", include_str!("missions.rs")),
-            ("config.rs", include_str!("config.rs")),
-            ("deliver.rs", include_str!("deliver.rs")),
-            ("supervise.rs", include_str!("supervise.rs")),
-            ("runtime.rs", include_str!("runtime.rs")),
-        ] {
-            let code = text.split("#[cfg(test)]").next().unwrap_or(text);
+        fn sources(directory: &Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        /// Whether `code` names the controller's `git`: by a path (`::`
+        /// then `git`, the needle is spelled apart so this file does not
+        /// name it), or alone in a `use` list (`test_git as git` is the
+        /// test's).
+        fn names_git(code: &str) -> bool {
+            let needle = concat!(":", ":git");
+            let path = code.match_indices(needle).any(|(at, _)| {
+                !code[at + needle.len()..]
+                    .starts_with(|next: char| next.is_alphanumeric() || next == '_')
+            });
+            let listed = code.match_indices("use ").any(|(at, _)| {
+                let line = code[..at].rfind('\n').map_or(0, |newline| newline + 1);
+                code[line..at].trim().is_empty()
+                    && code[at..]
+                        .split(';')
+                        .next()
+                        .and_then(|statement| statement.split_once('{'))
+                        .is_some_and(|(_, items)| {
+                            items
+                                .split([',', '{', '}'])
+                                .any(|item| item.trim() == "git")
+                        })
+            });
+            path || listed
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        sources(&root.join("src"), &mut files);
+        sources(&root.join("tests"), &mut files);
+        assert!(
+            files.iter().any(|file| file.ends_with("src/sources.rs")),
+            "{files:?}"
+        );
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read a source");
             assert!(
-                !code.contains("Command::new(\"git\")"),
-                "{name} starts git without controller_git"
+                !text.contains("Command::new(\"git\")"),
+                "{} starts git without controller_git or test_git",
+                file.display()
+            );
+            let tests = if file.starts_with(root.join("tests")) || file.ends_with("tests.rs") {
+                text.as_str()
+            } else {
+                text.split_once("#[cfg(test)]\nmod ")
+                    .map_or("", |(_, tests)| tests)
+            };
+            assert!(
+                !names_git(tests),
+                "{} runs a test's own git through the controller's git, not test_git",
+                file.display()
             );
         }
+        assert!(names_git(concat!("let git = crate::sources:", ":git;")));
+        assert!(names_git("    use crate::sources::{ensure_mirror, git};"));
+        assert!(!names_git(
+            "    use crate::sources::{ensure_mirror, test_git as git};"
+        ));
+        assert!(!names_git("let git = crate::sources::test_git;"));
         let own = include_str!("sources.rs");
-        let code = own.split("#[cfg(test)]").next().unwrap_or(own);
-        assert_eq!(code.matches("Command::new(\"git\")").count(), 1);
+        let code = own.split("#[cfg(test)]\nmod ").next().unwrap_or(own);
+        assert_eq!(code.matches("spawn_host::git_command(\"git\")").count(), 1);
+        let command = super::controller_git();
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))));
+        assert!(envs.contains(&(OsStr::new("LANGUAGE"), None)));
+    }
+
+    /// Marks a line of [`decisions_in_this_locale`]'s output.
+    const DECISION: &str = "spawn-decision: ";
+
+    /// Marks the line of [`decisions_in_this_locale`]'s output that shows
+    /// git's own answer, outside Spawn.
+    const PLAIN: &str = "plain-git: ";
+
+    /// What Spawn makes of git in this process's locale, one line each, the
+    /// run's scratch directory written `<base>`: a push that lost the ref
+    /// lock, a push of a rewritten branch, a fetch from a source that is
+    /// gone. Then, outside Spawn, what a plain git says about a missing
+    /// repository. Run by
+    /// [`a_translated_locale_changes_nothing_spawn_reads_from_git`] in one
+    /// process per locale; alone it only prints.
+    #[test]
+    #[ignore = "run by a_translated_locale_changes_nothing_spawn_reads_from_git"]
+    fn decisions_in_this_locale() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-sources-locale-{}", std::process::id()));
+        let shown = base.to_string_lossy().to_string();
+        let say = |mark: &str, decision: String| {
+            println!("{mark}{}", decision.replace(&shown, "<base>"));
+        };
+        let (source, mirror, host) = published_source(&base);
+        checkpoint(&host, "agent_x", "two.txt");
+
+        // Another push holds the ref's lock: a failure, retried.
+        let lock = Path::new(&source).join("refs/heads/spawn/agent_x.lock");
+        std::fs::write(&lock, "").expect("lock");
+        let pushed = push_branch(&mirror, &source, "agent_x");
+        assert!(
+            matches!(&pushed, Pushed::Failed(why) if why.contains("[remote rejected]")),
+            "{pushed:?}"
+        );
+        say(DECISION, format!("{pushed:?}"));
+        std::fs::remove_file(&lock).expect("the other push ends");
+
+        // A rewritten branch: refused.
+        rewrite(&mirror, &host);
+        let pushed = push_branch(&mirror, &source, "agent_x");
+        assert!(
+            matches!(&pushed, Pushed::Rejected(why) if why.contains("[rejected]")),
+            "{pushed:?}"
+        );
+        say(DECISION, format!("{pushed:?}"));
+
+        // A source that is gone: an error, not "nothing published".
+        let gone = base.join("gone.git").to_string_lossy().to_string();
+        let fetched = fetch_pushed_into(&mirror, &gone, "agent_x", "refs/spawn-integrate/x");
+        assert!(fetched.is_err(), "{fetched:?}");
+        say(DECISION, format!("{fetched:?}"));
+
+        // git's own answer in this process's locale: a test's git, given
+        // back the locale `test_git_command` takes away.
+        let mut own = spawn_host::test_git_command();
+        for name in ["LC_ALL", "LANGUAGE"] {
+            match std::env::var_os(name) {
+                Some(value) => own.env(name, value),
+                None => own.env_remove(name),
+            };
+        }
+        let plain = own
+            .args(["--git-dir", &gone, "rev-parse", "HEAD"])
+            .output()
+            .expect("git runs");
+        say(
+            PLAIN,
+            String::from_utf8_lossy(&plain.stderr)
+                .trim()
+                .replace('\n', " "),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every git the controller runs is in the C locale
+    /// ([`super::controller_git`]), so a host whose locale is translated
+    /// changes nothing Spawn reads from git: the same pushes and fetch, made
+    /// in a process whose whole environment is Chinese (`LC_ALL`, `LANG`,
+    /// `LC_MESSAGES`, `LANGUAGE`), come to the same decisions, the texts
+    /// they quote included, as in C. Before, the texts were git's Chinese.
+    /// On a host without zh_CN (`locale -a`) or git's Chinese messages,
+    /// nothing is translated and the comparison holds anyway.
+    #[test]
+    fn a_translated_locale_changes_nothing_spawn_reads_from_git() {
+        let program = std::env::current_exe().expect("the test binary");
+        let run = |locale: &str, language: Option<&str>| {
+            let mut command = std::process::Command::new(&program);
+            command
+                .args([
+                    "--exact",
+                    "sources::tests::decisions_in_this_locale",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("LC_ALL", locale)
+                .env("LANG", locale)
+                .env("LC_MESSAGES", locale);
+            match language {
+                Some(language) => command.env("LANGUAGE", language),
+                None => command.env_remove("LANGUAGE"),
+            };
+            let output = command.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{locale}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let marked = |mark: &str| -> Vec<String> {
+                stdout
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(mark))
+                    .map(str::to_string)
+                    .collect()
+            };
+            (marked(DECISION), marked(PLAIN))
+        };
+        let (english, plain_english) = run("C", None);
+        assert_eq!(english.len(), 3, "{english:?}");
+        let (translated, plain_translated) = run("zh_CN.UTF-8", Some("zh_CN:zh"));
+        if plain_translated == plain_english {
+            eprintln!("this host does not translate git ({plain_translated:?}): nothing to prove");
+        }
+        assert_eq!(
+            translated, english,
+            "git's answer here: {plain_translated:?}"
+        );
     }
 
     #[test]

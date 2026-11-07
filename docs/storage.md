@@ -38,6 +38,22 @@ output, `.spawn/` and the engine's own runtime files ("The engine's runtime
 files", below). The branch head alone is the whole workspace, so everything
 below is a git operation.
 
+Every git Spawn runs, the store's and the controller's, runs in the C
+locale (`LC_ALL=C`, no `LANGUAGE`; `spawn_host::git_command`). Spawn reads
+what git answers (a push's summary, a merge's conflict kinds, listings, the
+error it quotes in a record or a note), and a host whose locale is
+translated (`LANG=zh_CN.UTF-8`) would otherwise get git's messages in its
+language. tmux is given no locale: it has no translations, and one given to
+the command that starts its server would reach every pane.
+
+Spawn's own commits never sign, whatever the host's git configuration says:
+a checkpoint is `commit-tree`, which ignores `commit.gpgSign`, and a landing
+passes `--no-gpg-sign` (a test forces signing and makes both). A test's own
+git (a seed's `init`, `add` and `commit`) runs through
+`spawn_host::test_git_command` (feature `testing`), without the user's or
+the system's git configuration, so a host whose `~/.gitconfig` signs every
+commit with a key no agent holds cannot hang or fail a test.
+
 - **Checkpoint** (every tool call, turn end, exit): the Bridge commits the
   tree against the kept index (a stat cache: only changed files are hashed).
   Cost is proportional to what changed. The same tree is built for the

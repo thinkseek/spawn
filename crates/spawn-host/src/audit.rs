@@ -19,7 +19,7 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 fn git(directory: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = crate::git::test_git_command()
         .arg("-C")
         .arg(directory)
         .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
