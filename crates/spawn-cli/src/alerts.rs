@@ -2179,9 +2179,10 @@ mod tests {
         }
     }
 
-    fn feed(monitor: &mut Monitor, event_id: i64, at_ms: i64, record: &Value) -> Vec<Event> {
+    #[allow(clippy::needless_pass_by_value)]
+    fn feed(monitor: &mut Monitor, event_id: i64, at_ms: i64, record: Value) -> Vec<Event> {
         let mut out = Vec::new();
-        monitor.feed(event_id, at_ms, record, &mut out);
+        monitor.feed(event_id, at_ms, &record, &mut out);
         out
     }
 
