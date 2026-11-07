@@ -77,7 +77,14 @@ impl Db {
         (rows, plan)
     }
 
-    fn submit(&self, principal: &str, agent: &AgentId, session: &SessionId, key: &str, action: CommandAction) -> CommandId {
+    fn submit(
+        &self,
+        principal: &str,
+        agent: &AgentId,
+        session: &SessionId,
+        key: &str,
+        action: CommandAction,
+    ) -> CommandId {
         self.store
             .submit(
                 &Principal::new(principal).expect("principal"),
@@ -184,11 +191,33 @@ fn the_129_sequence_replayed_from_events_escalates() {
         workspace: Some(workspace.clone()),
     };
     // Its task: started, ready, typed; half an hour later the host moved.
-    let task = db.submit("spawn_supervisor", &agent, &session, "task-129", start("objective 129"));
-    let claimed = db.store.claim("bridge", Duration::from_mins(1)).expect("claim").expect("the start");
+    let task = db.submit(
+        "spawn_supervisor",
+        &agent,
+        &session,
+        "task-129",
+        start("objective 129"),
+    );
+    let claimed = db
+        .store
+        .claim("bridge", Duration::from_mins(1))
+        .expect("claim")
+        .expect("the start");
     let first = ExecutionId::for_command(task);
-    db.record(&agent, &session, None, format!("{}:mounted", task.0), mounted(task));
-    db.record(&agent, &session, Some(&first), format!("{first}:started"), started(task));
+    db.record(
+        &agent,
+        &session,
+        None,
+        format!("{}:mounted", task.0),
+        mounted(task),
+    );
+    db.record(
+        &agent,
+        &session,
+        Some(&first),
+        format!("{first}:started"),
+        started(task),
+    );
     db.record(
         &agent,
         &session,
@@ -199,7 +228,9 @@ fn the_129_sequence_replayed_from_events_escalates() {
             evidence: "❯".to_string(),
         },
     );
-    db.store.finish(&claimed, &Outcome::Succeeded).expect("typed");
+    db.store
+        .finish(&claimed, &Outcome::Succeeded)
+        .expect("typed");
     db.age(1_800_000);
     db.record(
         &agent,
@@ -219,11 +250,27 @@ fn the_129_sequence_replayed_from_events_escalates() {
     assert_eq!(sent, [format!("dispatch-resume-{first}")], "resumed once");
 
     // Accepted (by the submission), mounted, started, ended lost.
-    let claimed = db.store.claim("bridge", Duration::from_mins(1)).expect("claim").expect("the resume");
+    let claimed = db
+        .store
+        .claim("bridge", Duration::from_mins(1))
+        .expect("claim")
+        .expect("the resume");
     let resume = claimed.command_id;
     let second = ExecutionId::for_command(resume);
-    db.record(&agent, &session, None, format!("{}:mounted", resume.0), mounted(resume));
-    db.record(&agent, &session, Some(&second), format!("{second}:started"), started(resume));
+    db.record(
+        &agent,
+        &session,
+        None,
+        format!("{}:mounted", resume.0),
+        mounted(resume),
+    );
+    db.record(
+        &agent,
+        &session,
+        Some(&second),
+        format!("{second}:started"),
+        started(resume),
+    );
     db.record(
         &agent,
         &session,
@@ -249,7 +296,11 @@ fn the_129_sequence_replayed_from_events_escalates() {
     let failed = facts.failed_resume.as_ref().expect("the failed resume");
     assert_eq!(failed.execution_id, second.as_str());
     assert_eq!(failed.command_id, Some(resume.0));
-    assert!(plan.orders.is_empty(), "not resumed again: {:?}", plan.orders);
+    assert!(
+        plan.orders.is_empty(),
+        "not resumed again: {:?}",
+        plan.orders
+    );
     assert_eq!(plan.pending.len(), 1, "{:?}", plan.pending);
     let item = &plan.pending[0];
     assert_eq!(item.why, Why::ResumeFailed);
@@ -309,7 +360,13 @@ impl World {
     /// prompt, and the Bridge ended the execution as lost.
     fn lost_after_half_an_hour(&mut self) -> ExecutionId {
         let (agent, session) = (self.agent.clone(), self.session.clone());
-        let task = self.db.submit("spawn_supervisor", &agent, &session, "task", start("the task"));
+        let task = self.db.submit(
+            "spawn_supervisor",
+            &agent,
+            &session,
+            "task",
+            start("the task"),
+        );
         self.host.set_pane(&Self::terminal(task), READY);
         self.tick();
         self.db.age(1_800_000);
@@ -338,7 +395,11 @@ fn a_resume_the_bridge_abandons_at_its_ready_wait_is_escalated_not_resumed_again
         resumes.extend(world.db.send(plan));
         world.tick();
     }
-    assert_eq!(resumes, [format!("dispatch-resume-{first}")], "resumed once");
+    assert_eq!(
+        resumes,
+        [format!("dispatch-resume-{first}")],
+        "resumed once"
+    );
     let (rows, plan) = world.db.plan();
     let facts = only(&rows);
     let failed = facts.failed_resume.as_ref().expect("the failed resume");

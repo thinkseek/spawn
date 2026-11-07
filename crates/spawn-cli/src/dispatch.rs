@@ -46,6 +46,8 @@
 //! ([`step`]).
 
 mod digest;
+#[cfg(test)]
+mod resume_replay;
 mod stall;
 mod stops;
 mod worker;
