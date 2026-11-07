@@ -18,9 +18,9 @@
 #
 # The rule, and why a sweep cannot take a live run's logins, is in
 # scripts/blackbox/drop-logins.sql: never a database, never a login a
-# database on the server still has, holds anything or is logged in as, only
-# under the server's migration lock, and never on a server whose port is
-# 15433 (the live server). It prints one line, `<what>: dropped <n> of <m>`
+# database on the server still has, holds anything or is logged in as, a
+# sweep only under the server's migration lock, and never on a server whose
+# port is 15433 (the live server). It prints one line, `<what>: dropped <n> of <m>`
 # or `<what>: skipped: <why>`, and exits 0 when the statement ran, 1 when it
 # could not (no server, no psql), 2 on bad usage.
 #
