@@ -110,10 +110,10 @@ pub(crate) fn next_due(facts: &LivenessFacts, now_ms: i64) -> Option<i64> {
     {
         return None;
     }
-    let due = facts
-        .last_failure_ms
-        .map(|failed| failed.saturating_add(pause_ms(facts.failures)))
-        .unwrap_or(now_ms);
+    let due = facts.last_failure_ms.map_or_else(
+        || now_ms,
+        |failed| failed.saturating_add(pause_ms(facts.failures)),
+    );
     Some(due)
 }
 

@@ -621,7 +621,7 @@ pub(crate) fn next_due(work: &Work, rows: &[Facts], now_ms: i64) -> Option<i64> 
 /// The report notes among the commands the dispatcher sent into one session,
 /// by the note's own key, each with its attempts oldest first
 /// ([`note_retry`]).
-fn notes<'a>(sent: &'a [crate::dispatch::Sent]) -> BTreeMap<&'a str, Vec<&'a crate::dispatch::Sent>> {
+fn notes(sent: &[crate::dispatch::Sent]) -> BTreeMap<&str, Vec<&crate::dispatch::Sent>> {
     let mut notes: BTreeMap<&str, Vec<&crate::dispatch::Sent>> = BTreeMap::new();
     for command in sent {
         let key = match command.key.rsplit_once("-retry-") {

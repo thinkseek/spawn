@@ -728,13 +728,12 @@ impl PostgresStore {
             .prepared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let statement = match prepared.get(sql) {
-            Some(statement) => statement.clone(),
-            None => {
-                let statement = client.prepare(sql).map_err(|error| backend(&error))?;
-                prepared.insert(sql, statement.clone());
-                statement
-            }
+        let statement = if let Some(statement) = prepared.get(sql) {
+            statement.clone()
+        } else {
+            let statement = client.prepare(sql).map_err(|error| backend(&error))?;
+            prepared.insert(sql, statement.clone());
+            statement
         };
         drop(prepared);
         client
