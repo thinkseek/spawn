@@ -2602,8 +2602,8 @@ impl Bridge {
         prompt: &str,
     ) -> Result<Outcome, StoreError> {
         let mut last = ScreenState::Unknown;
-        // Answered once per wait: a second answer would land in the input box.
-        let mut trusted = false;
+        // Whether this wait answered the trust dialog already.
+        let mut answered = false;
         // The trust dialog comes before the engine draws any prompt: once a
         // prompt was seen, nothing on the pane is that dialog any more.
         let mut prompt_seen = false;
@@ -2641,12 +2641,12 @@ impl Bridge {
             // whether the session is fresh or resumed. Answer once (a second
             // answer would land in the input box), and only the dialog
             // itself: on two equal reads, before any prompt.
-            if !trusted && !prompt_seen && is_trust_dialog(&pane) {
+            if !answered && !prompt_seen && is_trust_dialog(&pane) {
                 if dialog.as_deref() != Some(pane.as_str()) {
                     dialog = Some(pane);
                     continue;
                 }
-                trusted = true;
+                answered = true;
                 if let Err(error) =
                     self.terminals
                         .send_keys(&active.terminal(), &active.workspace, &TRUST_KEYS)
