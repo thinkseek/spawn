@@ -842,17 +842,51 @@ fn set_aside_before(
     })
 }
 
+/// How long the dispatcher holds a Start whose fork keeps failing, from
+/// its first failure's record, before it starts the task without the fork:
+/// `SPAWN_FORK_GIVE_UP_SECS`, a whole number of seconds from 1 up (300,
+/// under the delivery stall's 600); anything else is the default.
+pub(crate) fn fork_give_up_ms(text: Option<&str>) -> i64 {
+    const DEFAULT: i64 = 300;
+    1_000
+        * text
+            .and_then(|text| text.trim().parse::<i64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(DEFAULT)
+}
+
 /// Fork the branch of the ephemeral objective task `order` starts from
 /// the work its objective's earlier task left without landing, with main
 /// merged in ([`crate::main_merge::fork_from_prior`]), and add to the
 /// Start's prompt what it starts from and what the merge did. Nothing for
-/// any other order, or a task with no such predecessor (its branch forks
+/// any other order, or a task with no such predecessor, or whose
+/// predecessor's checkpoint holds no change of its own (its branch forks
 /// from main at the Start, as before). Returns a log line when it forked.
+///
+/// A fork that fails holds the Start, so the task does not start from
+/// main over work it should continue; its first failure is recorded
+/// (`task.fork_failed`, once per task), and once that record is
+/// [`fork_give_up_ms`] old the Start goes without the fork, its prompt
+/// saying so ([`crate::main_merge::fork_failed_note`]): a fork that can
+/// never succeed does not hold the task's slot for ever (rev-e on a114a9e).
 pub(crate) fn fork_before(
     store: &std::sync::Arc<PostgresStore>,
     root: &Path,
     order: &mut Order,
 ) -> Result<Option<String>, String> {
+    let give_up = fork_give_up_ms(crate::config::env_value("SPAWN_FORK_GIVE_UP_SECS").as_deref());
+    fork_before_within(store, root, order, give_up)
+}
+
+/// [`fork_before`], giving up on a failing fork `give_up_ms` after its
+/// first failure.
+pub(crate) fn fork_before_within(
+    store: &std::sync::Arc<PostgresStore>,
+    root: &Path,
+    order: &mut Order,
+    give_up_ms: i64,
+) -> Result<Option<String>, String> {
+    use crate::main_merge::Fork;
     let CommandAction::Start { prompt, .. } = &mut order.action else {
         return Ok(None);
     };
@@ -868,22 +902,54 @@ pub(crate) fn fork_before(
     let Some(prior) = prior else {
         return Ok(None);
     };
-    let Some(merge) = crate::main_merge::fork_from_prior(
+    match crate::main_merge::fork_from_prior(
         store,
         root,
         &order.agent_id,
         &order.session_id,
         &prior,
-    )?
-    else {
-        return Ok(None);
-    };
-    prompt.push_str("\n\n");
-    prompt.push_str(&crate::main_merge::fork_note(&prior, &merge));
-    Ok(Some(format!(
-        "deliver: task #{task} starts from task #{}'s work {}: main {merge:?}",
-        prior.task, prior.commit
-    )))
+    ) {
+        Ok(Fork::Forked(merge)) => {
+            prompt.push_str("\n\n");
+            prompt.push_str(&crate::main_merge::fork_note(&prior, &merge));
+            Ok(Some(format!(
+                "deliver: task #{task} starts from task #{}'s work {}: main {merge:?}",
+                prior.task, prior.commit
+            )))
+        }
+        Ok(Fork::NoWork) => Ok(Some(format!(
+            "deliver: task #{task}: task #{}'s checkpoint {} holds nothing main lacks; it \
+             starts from main",
+            prior.task, prior.commit
+        ))),
+        Ok(Fork::NoSource) => Ok(None),
+        Err(error) => {
+            let age = store
+                .task_fork_failed(task, prior.task, &prior.commit, &error)
+                .map_err(|failure| format!("{error}; and its record: {failure}"))?;
+            match age {
+                Some(age) if age >= give_up_ms => {
+                    let head = crate::main_merge::branch_head(store, root, &order.agent_id);
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&crate::main_merge::fork_failed_note(
+                        &prior,
+                        &error,
+                        head.as_deref(),
+                    ));
+                    Ok(Some(format!(
+                        "deliver: task #{task} starts without task #{}'s work after its fork \
+                         failed for {} s: {error}",
+                        prior.task,
+                        age / 1_000
+                    )))
+                }
+                _ => Err(format!(
+                    "task #{task}'s Start waits: its fork from task #{}'s work failed: {error}",
+                    prior.task
+                )),
+            }
+        }
+    }
 }
 
 /// Merge main into the workspace of the live worker `order` types a task

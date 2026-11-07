@@ -280,15 +280,14 @@ pub(crate) struct PriorWork {
 /// workspace unmounted; a conflict markers cannot show leaves main's copies
 /// as at any merge. Everything is recorded in `session` and published. A
 /// retried Start finds the branch there (`from` is then ignored) and merges
-/// again, which finds main in, or the same conflict still marked. `None`:
-/// the agent has no mission source on this host, nothing to fork.
+/// again, which finds main in, or the same conflict still marked.
 pub(crate) fn fork_from_prior(
     store: &Arc<PostgresStore>,
     root: &Path,
     agent: &str,
     session: &str,
     prior: &PriorWork,
-) -> Result<Option<Merge>, String> {
+) -> Result<Fork, String> {
     let error = |what: &str, error: &dyn std::fmt::Display| {
         format!(
             "fork {agent} from task #{}'s work {}: {what}: {error}",
@@ -297,10 +296,34 @@ pub(crate) fn fork_from_prior(
     };
     let source = match store.agent_source(agent) {
         Ok(Some(Some(source))) => source,
-        Ok(_) => return Ok(None),
+        Ok(_) => return Ok(Fork::NoSource),
         Err(failure) => return Err(error("its mission source", &failure)),
     };
     let mirror = sources::ensure_mirror(root, Some(&source)).map_err(|e| error("mirror", &e))?;
+    // The work is what the commit changed since its base with main: none
+    // (a checkpoint main already holds) is no work to continue.
+    sources::refresh(&mirror, &source).map_err(|e| error("refresh main", &e))?;
+    let path = mirror.to_string_lossy();
+    let base = sources::git(&[
+        "--git-dir",
+        &path,
+        "merge-base",
+        "refs/heads/main",
+        &prior.commit,
+    ])
+    .map_err(|e| error("its base with main", &e))?;
+    let changed = sources::git(&[
+        "--git-dir",
+        &path,
+        "diff",
+        "--name-only",
+        &base,
+        &prior.commit,
+    ])
+    .map_err(|e| error("its changes", &e))?;
+    if changed.trim().is_empty() {
+        return Ok(Fork::NoWork);
+    }
     let factory: sources::Factory = {
         let root = root.to_path_buf();
         Arc::new(move |repo: &Path| GitWorkspace::new(repo, &root))
@@ -326,33 +349,9 @@ pub(crate) fn fork_from_prior(
             files,
         },
         BaseMerge::Conflicted { .. } => {
-            let workspace = workspaces
-                .mount(&branch)
-                .map_err(|e| error("mount for the merge", &e))?;
-            let merge = into_workspace_when(&workspaces, &mirror, root, agent, &|| Ok(()));
-            let committed = if matches!(merge, Merge::Marked { .. }) {
-                workspaces
-                    .commit(
-                        &workspace,
-                        &format!(
-                            "spawn: main merged into the work of task #{}, its conflicts marked",
-                            prior.task
-                        ),
-                    )
-                    .map_err(|e| error("commit the markers", &e))
-            } else {
-                Ok(Commit::Unchanged)
-            };
-            let unmounted = workspaces.unmount(&workspace);
-            if let Commit::Created(commit) = committed? {
-                let markers = Merge::Merged {
-                    commit: commit.as_str().to_string(),
-                    files: Vec::new(),
-                };
-                record(store, &project, agent, session, "-", &markers)
-                    .map_err(|e| error("record the markers' checkpoint", &e))?;
-            }
-            unmounted.map_err(|e| error("unmount", &e))?;
+            let merge =
+                marked_in_workspace(store, &workspaces, &mirror, root, agent, session, prior)
+                    .map_err(|(what, why)| error(what, &why))?;
             if let Merge::Failed(why) | Merge::Busy(why) = &merge {
                 return Err(error("merge main into the workspace", why));
             }
@@ -369,14 +368,108 @@ pub(crate) fn fork_from_prior(
     {
         eprintln!("fork {agent}: the push of {head} failed; it stays queued and is retried: {why}");
     }
-    Ok(Some(merge))
+    Ok(Fork::Forked(merge))
+}
+
+/// Main merged into `agent`'s branch, which conflicts with it, in its
+/// workspace mounted for the merge: markers where they show, committed so
+/// the branch carries them (a `base_merged` checkpoint naming no file),
+/// then unmounted. The merge, or what failed and why.
+fn marked_in_workspace(
+    store: &PostgresStore,
+    workspaces: &sources::MissionWorkspaces,
+    mirror: &Path,
+    root: &Path,
+    agent: &str,
+    session: &str,
+    prior: &PriorWork,
+) -> Result<Merge, (&'static str, String)> {
+    let branch = BranchName::new(agent).map_err(|e| ("branch", e.to_string()))?;
+    let workspace = workspaces
+        .mount(&branch)
+        .map_err(|e| ("mount for the merge", e.to_string()))?;
+    let merge = into_workspace_when(workspaces, mirror, root, agent, &|| Ok(()));
+    let committed = if matches!(merge, Merge::Marked { .. }) {
+        workspaces
+            .commit(
+                &workspace,
+                &format!(
+                    "spawn: main merged into the work of task #{}, its conflicts marked",
+                    prior.task
+                ),
+            )
+            .map_err(|e| ("commit the markers", e.to_string()))
+    } else {
+        Ok(Commit::Unchanged)
+    };
+    let unmounted = workspaces.unmount(&workspace);
+    if let Commit::Created(commit) = committed? {
+        let markers = Merge::Merged {
+            commit: commit.as_str().to_string(),
+            files: Vec::new(),
+        };
+        record(store, workspaces.project(), agent, session, "-", &markers)
+            .map_err(|e| ("record the markers' checkpoint", e))?;
+    }
+    unmounted.map_err(|e| ("unmount", e.to_string()))?;
+    Ok(merge)
+}
+
+/// What [`fork_from_prior`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Fork {
+    /// The branch starts from the work, with main merged in as `Merge`.
+    Forked(Merge),
+    /// The commit holds no change of its own since its base with main (a
+    /// checkpoint main already holds): nothing forked, the task starts
+    /// from main.
+    NoWork,
+    /// The agent has no mission source on this host: nothing forked.
+    NoSource,
+}
+
+/// The head of `agent`'s branch on this host, if it has one: what a
+/// Start finds after a fork that failed partway.
+pub(crate) fn branch_head(store: &PostgresStore, root: &Path, agent: &str) -> Option<String> {
+    let Ok(Some(Some(source))) = store.agent_source(agent) else {
+        return None;
+    };
+    let mirror = sources::ensure_mirror(root, Some(&source)).ok()?;
+    GitWorkspace::new(&mirror, root)
+        .commit_id_of(&format!("refs/heads/{agent}"))
+        .ok()
+}
+
+/// What a task is told when its fork from `prior`'s work kept failing
+/// (`error`) and it starts without it: from the branch as far as the fork
+/// got (`head`), or from main.
+pub(crate) fn fork_failed_note(prior: &PriorWork, error: &str, head: Option<&str>) -> String {
+    let opening = format!(
+        "Spawn could not prepare your workspace from task #{}'s work (commit {}): {}.",
+        prior.task,
+        prior.commit,
+        crate::deliver::one_line(error, 300)
+    );
+    match head {
+        Some(head) => format!(
+            "{opening} Your workspace holds that work as far as the preparation got (commit \
+             {head}); the source's main is merged in at your start only where it merges \
+             cleanly. Your brief's reports say what task #{} did.",
+            prior.task
+        ),
+        None => format!(
+            "{opening} Your workspace starts from the source's main; your brief's reports say \
+             what task #{} did and found: use them, and do not redo what they established.",
+            prior.task
+        ),
+    }
 }
 
 /// What a task forked from `prior`'s work is told at its start.
 pub(crate) fn fork_note(prior: &PriorWork, merge: &Merge) -> String {
     let opening = format!(
-        "Your workspace starts from the work task #{} left, its last checkpoint {}, not from \
-         main. Continue that work; do not redo it.",
+        "Your workspace already contains task #{}'s work (its last checkpoint, commit {}), not \
+         a fresh copy of main: continue it; do not redo it.",
         prior.task, prior.commit
     );
     let merged = match merge {
@@ -1226,7 +1319,8 @@ mod tests {
         assert!(told.starts_with("the task\n\n"), "{told}");
         assert!(
             told.contains(&format!(
-                "starts from the work task #{} left, its last checkpoint {checkpoint}, not from main",
+                "Your workspace already contains task #{}'s work (its last checkpoint, commit \
+                 {checkpoint}), not a fresh copy of main: continue it",
                 first.0
             )) && told.contains("without a conflict; it changed added.txt"),
             "{told}"
@@ -1292,7 +1386,7 @@ mod tests {
             .expect("it forked");
         let told = prompt(&order);
         assert!(
-            told.contains(&format!("starts from the work task #{} left", first.0))
+            told.contains(&format!("already contains task #{}'s work", first.0))
                 && told.contains("these files carry conflict markers: README.md")
                 && told.contains("Resolve them first"),
             "{told}"
@@ -1346,6 +1440,266 @@ mod tests {
             parents.ends_with(&main),
             "main is the second parent: {parents}"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A checkpoint `commit` recorded in `task`'s session, with `reason`
+    /// and, for a set-aside, its key.
+    fn checkpoint_record(
+        db: &Db,
+        task: &(i64, String, String),
+        commit: &str,
+        reason: spawn_core::event::CheckpointReason,
+        key: Option<String>,
+    ) {
+        use spawn_core::event::{ArtifactRef, EventKind, NewEvent, Source};
+        use spawn_core::id::{AgentId, CommitId, SessionId};
+        use spawn_core::port::EventLog;
+        db.store
+            .append(NewEvent {
+                agent_id: AgentId::new(task.1.clone()).expect("agent"),
+                session_id: SessionId::new(task.2.clone()).expect("session"),
+                execution_id: None,
+                source: Source::Bridge,
+                source_event_id: key,
+                kind: EventKind::ArtifactCommitted {
+                    reason,
+                    artifact: ArtifactRef {
+                        project: "missions".to_string(),
+                        branch: BranchName::new(task.1.clone()).expect("branch"),
+                        commit: CommitId::new(commit.to_string()).expect("commit"),
+                    },
+                    files: Vec::new(),
+                },
+            })
+            .expect("a checkpoint");
+    }
+
+    fn assigned(db: &Db, mission: i64, objective: i32) -> (i64, String, String) {
+        let id = db
+            .store
+            .objective_assign(mission, objective, None, "brief")
+            .expect("assign");
+        let mut client = postgres::Client::connect(&db.url, postgres::NoTls).expect("connection");
+        client
+            .batch_execute(&format!("set search_path to {}", db.schema))
+            .expect("schema");
+        let row = client
+            .query_one(
+                "select agent_id, session_id from mission_tasks where id = $1",
+                &[&id],
+            )
+            .expect("the task");
+        (id, row.get(0), row.get(1))
+    }
+
+    /// rev-e on a114a9e: a resident predecessor. Its window ends at its
+    /// task's set-aside, so the checkpoint picked is its work, not the
+    /// set-aside nor the merge of main recorded on top of it for its next
+    /// delivery (whose tree is main: objective 55's task 149). A resident
+    /// checkpoint main already holds is no work: the task starts from main.
+    #[test]
+    fn a_resident_predecessors_work_is_its_checkpoint_before_its_set_aside() {
+        use spawn_core::event::CheckpointReason;
+        let db = Db::new("prior_fork_resident");
+        let (base, source, root, mirror, store) = world("prior-fork-resident");
+        db.store
+            .resident_propose("rr", "objectives")
+            .expect("propose");
+        db.store.resident_approve("rr").expect("approve");
+        let mission = db
+            .store
+            .mission_add("fork", &serde_json::json!([source]), "human")
+            .expect("mission");
+        db.store
+            .mission_configure(
+                mission,
+                Some("/nowhere/scenarios"),
+                "gate",
+                None,
+                Some(&serde_json::json!({"backlog": "/nowhere", "resident": "rr",
+                                          "workers": 3})),
+            )
+            .expect("configure");
+        // The resident's task for objective 7 works, then yields; its work
+        // is set aside and main merged on top for its next task.
+        let first = assigned(&db, mission, 7);
+        let workspace = agent_with_work(&store, &first.1, |directory| {
+            std::fs::write(directory.join("work.txt"), "the resident's\n").expect("write");
+        });
+        store.unmount(&workspace).expect("unmount");
+        let work = head(&mirror, &first.1);
+        checkpoint_record(&db, &first, &work, CheckpointReason::ToolCompleted, None);
+        db.store
+            .integrator_record(&serde_json::json!({"type": "task.cancelled", "id": first.0,
+                                                    "yielded": true}))
+            .expect("it yields");
+        let main = head(&mirror, "main");
+        checkpoint_record(
+            &db,
+            &first,
+            &"5".repeat(40),
+            CheckpointReason::SetAside,
+            Some(format!("set-aside:{}", first.0)),
+        );
+        checkpoint_record(&db, &first, &main, CheckpointReason::BaseMerged, None);
+        let _resident = assigned(&db, mission, 9);
+        let second = assigned(&db, mission, 7);
+        assert_ne!(second.1, first.1, "an ephemeral worker");
+        assert_eq!(
+            db.store.objective_fork(second.0).expect("fork"),
+            serde_json::json!({"task": first.0, "commit": work})
+        );
+        let mut order = start(&second);
+        crate::dispatch::fork_before(&db.store, &root, &mut order)
+            .expect("the fork")
+            .expect("it forked");
+        assert_eq!(
+            show(&mirror, &head(&mirror, &second.1), "work.txt").as_deref(),
+            Some("the resident's")
+        );
+
+        // Objective 8's earlier task recorded a checkpoint main already
+        // holds: no work, so its next task starts from main.
+        let third = assigned(&db, mission, 8);
+        checkpoint_record(&db, &third, &main, CheckpointReason::ToolCompleted, None);
+        db.store
+            .integrator_record(&serde_json::json!({"type": "task.cancelled", "id": third.0,
+                                                    "yielded": true}))
+            .expect("it yields");
+        let fourth = assigned(&db, mission, 8);
+        assert_eq!(
+            db.store.objective_fork(fourth.0).expect("fork")["task"],
+            third.0,
+            "the query picks it; git finds no work in it"
+        );
+        let mut order = start(&fourth);
+        let line = crate::dispatch::fork_before(&db.store, &root, &mut order)
+            .expect("no fork")
+            .expect("said");
+        assert!(line.contains("holds nothing main lacks"), "{line}");
+        assert_eq!(prompt(&order), "the task");
+        assert!(
+            git(&[
+                "--git-dir",
+                &mirror.to_string_lossy(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", fourth.1),
+            ])
+            .is_err(),
+            "its branch forks from main at the Start"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// rev-e on a114a9e: a fork that fails every pass. Its first failure is
+    /// recorded once (`task.fork_failed`, with the error); the Start waits
+    /// until that record is the give-up bound old, then goes without the
+    /// fork, from main, its prompt saying why.
+    #[test]
+    fn a_fork_that_keeps_failing_gives_up_and_starts_from_main() {
+        use spawn_core::event::CheckpointReason;
+        let db = Db::new("prior_fork_wedge");
+        let (base, source, root, mirror, store) = world("prior-fork-wedge");
+        let (first, second, _) = reassigned(&db, &store, &mirror, &source, |directory| {
+            std::fs::write(directory.join("work.txt"), "half of it\n").expect("write");
+        });
+        // Its newest checkpoint names a commit no repository holds.
+        let lost = "6".repeat(40);
+        checkpoint_record(&db, &first, &lost, CheckpointReason::ToolCompleted, None);
+        let mut order = start(&second);
+        for _ in 0..2 {
+            let held = crate::dispatch::fork_before_within(&db.store, &root, &mut order, 3_600_000)
+                .expect_err("held");
+            assert!(
+                held.contains("Start waits") && held.contains(&lost),
+                "{held}"
+            );
+        }
+        assert_eq!(prompt(&order), "the task");
+        let recorded = |db: &Db| -> Vec<String> {
+            let mut client =
+                postgres::Client::connect(&db.url, postgres::NoTls).expect("connection");
+            client
+                .batch_execute(&format!("set search_path to {}", db.schema))
+                .expect("schema");
+            client
+                .query(
+                    "select kind -> 'detail' -> 'record' ->> 'error' from spawn_events
+                      where session_id = 'session_control'
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.fork_failed'",
+                    &[],
+                )
+                .expect("records")
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+        let errors = recorded(&db);
+        assert_eq!(errors.len(), 1, "once per task");
+        assert!(errors[0].contains(&lost), "{errors:?}");
+
+        let line = crate::dispatch::fork_before_within(&db.store, &root, &mut order, 0)
+            .expect("it gives up")
+            .expect("said");
+        assert!(line.contains("starts without"), "{line}");
+        let told = prompt(&order);
+        assert!(
+            told.contains(&format!(
+                "Spawn could not prepare your workspace from task #{}'s work (commit {lost})",
+                first.0
+            )) && told.contains("Your workspace starts from the source's main"),
+            "{told}"
+        );
+        assert_eq!(recorded(&db).len(), 1);
+        assert_eq!(crate::dispatch::fork_give_up_ms(None), 300_000);
+        assert_eq!(crate::dispatch::fork_give_up_ms(Some(" 60 ")), 60_000);
+        assert_eq!(crate::dispatch::fork_give_up_ms(Some("0")), 300_000);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The fork when main conflicts with the work in a way markers cannot
+    /// show (the work deleted README.md, main changed it): nothing is
+    /// committed, the prompt names main's copy, and the Start's mount puts
+    /// that copy in the workspace.
+    #[test]
+    fn a_reassigned_task_gets_main_copies_for_an_unmarked_conflict() {
+        let db = Db::new("prior_fork_unmarked");
+        let (base, source, root, mirror, store) = world("prior-fork-unmarked");
+        let (_, second, _) = reassigned(&db, &store, &mirror, &source, |directory| {
+            std::fs::remove_file(directory.join("README.md")).expect("delete");
+            std::fs::write(directory.join("work.txt"), "mine\n").expect("write");
+        });
+        main_moves(&base, &source, &mirror, |clone| {
+            std::fs::write(clone.join("README.md"), "one\ntwo (main)\nthree\n").expect("write");
+        });
+        let mut order = start(&second);
+        crate::dispatch::fork_before(&db.store, &root, &mut order)
+            .expect("the fork")
+            .expect("it forked");
+        let told = prompt(&order);
+        assert!(
+            told.contains("The source's main conflicts with it")
+                && told.contains(".spawn/main")
+                && told.contains("README.md"),
+            "{told}"
+        );
+        assert!(!store.has_pending_merge(&second.1));
+        let branch = BranchName::new(second.1.clone()).expect("branch");
+        assert!(matches!(
+            store.merge_main_clean(&branch).expect("the start's merge"),
+            spawn_core::port::BaseMerge::Conflicted { marked: false, .. }
+        ));
+        let workspace = store.mount(&branch).expect("the start's mount");
+        let directory = Path::new(workspace.path());
+        assert_eq!(
+            std::fs::read_to_string(directory.join(super::MAIN_COPIES).join("README.md"))
+                .expect("main's copy"),
+            "one\ntwo (main)\nthree\n"
+        );
+        assert!(directory.join("work.txt").exists(), "the work is there");
         let _ = std::fs::remove_dir_all(&base);
     }
 

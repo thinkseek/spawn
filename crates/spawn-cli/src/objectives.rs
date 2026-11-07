@@ -33,10 +33,18 @@
 //!
 //! An objective assigned again after earlier tasks of it ended without
 //! landing (cancelled, aborted, yielded) gets their work in its brief: each
-//! one's id, branch and last checkpoint, its last verdict or reason, and its
-//! report, with the instruction to build on it, not redo it
-//! ([`PriorWork`], read from the records at assignment). Task 161 rebuilt
-//! 2264 lines that task 155 had mostly written.
+//! one's id, last checkpoint, last verdict or reason, and report, with the
+//! instruction to use the reports and not redo what they established
+//! ([`PriorWork`], read from the records at assignment). A worker has no
+//! `.git` and cannot read another branch: an ephemeral task's workspace is
+//! forked from the newest such work instead, and its first prompt says so
+//! (`main_merge::fork_from_prior`). Task 161 rebuilt 2264 lines that task
+//! 155 had mostly written.
+//!
+//! **Order.** A backlog objective may name the objectives it comes after
+//! (`"after": [28, 29]`): it is not assigned while one of them is open (a
+//! named objective the backlog does not hold must have landed). Order is
+//! kept only where it is named; otherwise fewest attempts first decides.
 //!
 //! The mission's resident takes a task
 //! whenever it has none open in the mission; every other task goes to a new
@@ -87,6 +95,9 @@ pub(crate) struct Task {
     pub(crate) unit: String,
     pub(crate) lower_is_better: bool,
     pub(crate) target: Option<f64>,
+    /// The objectives it comes after (`"after": [..]`): it is not assigned
+    /// while one of them is open ([`choose`]).
+    pub(crate) after: Vec<u32>,
 }
 
 impl Task {
@@ -185,6 +196,19 @@ pub(crate) fn load_backlog(directory: &Path) -> Result<Vec<Task>, String> {
             unit: text_field("unit").unwrap_or_default(),
             lower_is_better: text_field("direction").as_deref() != Some("higher"),
             target: value.get("target").and_then(serde_json::Value::as_f64),
+            after: match value.get("after") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(after) => after
+                    .as_array()
+                    .and_then(|ids| {
+                        ids.iter()
+                            .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+                            .collect::<Option<Vec<u32>>>()
+                    })
+                    .ok_or_else(|| {
+                        format!("{}: `after` is not a list of objective ids", path.display())
+                    })?,
+            },
         };
         // Without both, a recurring objective could never be met.
         if task.recurring && (task.metric.is_none() || task.target.is_none()) {
@@ -223,8 +247,6 @@ pub(crate) struct GateRecord {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PriorWork {
     pub(crate) task: i64,
-    #[serde(default)]
-    pub(crate) branch: Option<String>,
     #[serde(default)]
     pub(crate) commit: Option<String>,
     #[serde(default)]
@@ -269,9 +291,24 @@ pub(crate) fn next_open<'a>(backlog: &'a [Task], landings: &[Landing]) -> Option
     backlog.iter().find(|task| is_open(task, landings))
 }
 
+/// Whether every objective `task` comes after is solved: not open in
+/// `backlog`, or, when the backlog does not hold it, landed.
+fn ordered(task: &Task, backlog: &[Task], landings: &[Landing]) -> bool {
+    task.after.iter().all(|before| {
+        backlog
+            .iter()
+            .find(|other| other.id == *before)
+            .map_or_else(
+                || landings.iter().any(|landing| landing.objective == *before),
+                |other| !is_open(other, landings),
+            )
+    })
+}
+
 /// The objectives that fill `free` slots: the open ones without a task in
-/// flight (`in_flight`), fewest attempts first (yields, then failed attempts
-/// since the last yield, then the lowest id), at most `free` of them.
+/// flight (`in_flight`) whose `after` objectives are solved, fewest attempts
+/// first (yields, then failed attempts since the last yield, then the
+/// lowest id), at most `free` of them.
 pub(crate) fn choose<'a>(
     backlog: &'a [Task],
     landings: &[Landing],
@@ -281,7 +318,11 @@ pub(crate) fn choose<'a>(
 ) -> Vec<&'a Task> {
     let mut open: Vec<&Task> = backlog
         .iter()
-        .filter(|task| is_open(task, landings) && !in_flight.contains(&task.id))
+        .filter(|task| {
+            is_open(task, landings)
+                && !in_flight.contains(&task.id)
+                && ordered(task, backlog, landings)
+        })
         .collect();
     open.sort_by_key(|task| {
         let tried = attempts.get(&task.id).cloned().unwrap_or_default();
@@ -305,6 +346,11 @@ pub(crate) struct Outcome {
     /// `Merge::kind`); absent on records from before it was named.
     #[serde(default)]
     pub(crate) merge: Option<String>,
+    /// The task yielded its objective's slot by this record: a
+    /// `task.cancelled` of the integrator's, or a `task.aborted` whose
+    /// abort was the objective's last failed attempt before its limit.
+    #[serde(default)]
+    pub(crate) yielded: Option<bool>,
 }
 
 impl Outcome {
@@ -325,8 +371,10 @@ impl Outcome {
         }
     }
 
+    /// A yield: an abort that yields counts as the failure that reached
+    /// the limit, then as the yield, which ends the count.
     fn is_yield(&self) -> bool {
-        self.kind == "task.cancelled"
+        self.kind == "task.cancelled" || (self.kind == "task.aborted" && self.yielded == Some(true))
     }
 }
 
@@ -424,6 +472,57 @@ pub(crate) fn yields(
         .collect()
 }
 
+/// Whether aborting `task` (of `objective`) over budget is its objective's
+/// last failed attempt before `limit`: then the abort is recorded as the
+/// yield ([`abort_yield`]), since the task is gone and nothing else would
+/// yield the slot. Without this the objective kept no yield and its
+/// failures, sorted ahead, and the next task for it yielded at once (rev-b
+/// on 226fa4a: objective 023, task 113 aborted with its fifth failure).
+pub(crate) fn abort_yields(
+    attempts: &BTreeMap<u32, Attempts>,
+    task: i64,
+    objective: u32,
+    limit: usize,
+) -> Option<Yield> {
+    let mut failures = attempts
+        .get(&objective)
+        .map(|tried| tried.failures.clone())
+        .unwrap_or_default();
+    failures.push("aborted over budget".to_string());
+    (failures.len() >= limit).then_some(Yield {
+        task,
+        objective,
+        failures,
+    })
+}
+
+/// The yield an abort of `task` over budget makes, read from the store:
+/// the fields its `task.aborted` record adds (`yielded`, `objective`,
+/// `failures`, `limit`, `yield_reason`), or none.
+pub(crate) fn abort_yield(
+    store: &PostgresStore,
+    mission: &Mission,
+    task: &crate::integrate::Task,
+) -> Result<Option<serde_json::Value>, String> {
+    let (Some(_), Some(objective)) = (&mission.objectives, task.objective) else {
+        return Ok(None);
+    };
+    let outcomes: Vec<Outcome> = serde_json::from_value(
+        store
+            .objective_outcomes(mission.id)
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("objective outcomes: {error}"))?;
+    let limit = attempt_limit(crate::config::env_value("SPAWN_OBJECTIVE_ATTEMPTS").as_deref());
+    Ok(
+        abort_yields(&attempts(&outcomes), task.id, objective, limit).map(|slot| {
+            json!({"yielded": true, "objective": slot.objective,
+               "failures": slot.failures.len(), "limit": limit,
+               "yield_reason": slot.reason()})
+        }),
+    )
+}
+
 /// An objective mission's worker limit: `objectives ->> 'workers'`, 1 when
 /// absent (every mission configured before the limit existed).
 pub(crate) fn workers(objectives: &serde_json::Value) -> usize {
@@ -477,8 +576,9 @@ pub(crate) fn brief(
     if !prior.is_empty() {
         brief.push_str(
             "\nEarlier tasks on this objective ended without landing, newest first. Their \
-             work is kept on their branches. Start from that work, do not redo it: read what \
-             each did and found, keep what holds, and finish or fix the rest.\n",
+             reports below say what each did and found: use them, and do not redo what they \
+             established. When your workspace starts from one's work, your first prompt says \
+             so.\n",
         );
         for work in prior {
             let _ = write!(
@@ -490,11 +590,11 @@ pub(crate) fn brief(
             if let Some(reason) = &work.reason {
                 let _ = write!(brief, " ({})", cut(reason, REASON_CHARS));
             }
-            match (&work.branch, &work.commit) {
-                (Some(branch), Some(commit)) => {
-                    let _ = write!(brief, "; branch `{branch}` at commit {commit}");
+            match &work.commit {
+                Some(commit) => {
+                    let _ = write!(brief, "; its last checkpoint {commit}");
                 }
-                _ => brief.push_str("; it recorded no checkpoint"),
+                None => brief.push_str("; it recorded no checkpoint"),
             }
             brief.push('\n');
             if let Some(report) = work
@@ -658,8 +758,8 @@ fn assign(
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempts, Landing, Outcome, PriorWork, Task, attempt_limit, attempts, brief, choose,
-        load_backlog, metric_lines, next_open, workers, yields,
+        Attempts, Landing, Outcome, PriorWork, Task, abort_yields, attempt_limit, attempts, brief,
+        choose, load_backlog, metric_lines, next_open, workers, yields,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -678,6 +778,7 @@ mod tests {
             unit: "ns".to_string(),
             lower_is_better: true,
             target: recurring.then_some(1100.0),
+            after: Vec::new(),
         }
     }
 
@@ -816,6 +917,7 @@ mod tests {
             objective,
             verdict: verdict.map(str::to_string),
             merge: merge.map(str::to_string),
+            yielded: None,
         }
     }
 
@@ -1036,14 +1138,13 @@ mod tests {
     }
 
     /// A re-assigned objective's brief carries its predecessors' work: id,
-    /// outcome and reason, branch and commit, report, and the instruction
-    /// to start from it.
+    /// outcome and reason, last checkpoint, report, and the instruction to
+    /// use the reports; it sends no worker to a branch it cannot read.
     #[test]
     fn a_brief_carries_the_earlier_tasks_work() {
         let prior = [
             PriorWork {
                 task: 155,
-                branch: Some("agent_worker_objective_155".to_string()),
                 commit: Some("c245db93e981880756015f1efac78939fbbfe11c".to_string()),
                 outcome: Some("aborted".to_string()),
                 reason: Some("the task ran past its 90-minute budget".to_string()),
@@ -1051,7 +1152,6 @@ mod tests {
             },
             PriorWork {
                 task: 150,
-                branch: None,
                 commit: None,
                 outcome: Some("yielded".to_string()),
                 reason: None,
@@ -1059,10 +1159,11 @@ mod tests {
             },
         ];
         let text = brief(&objective(59, false), None, &prior, &[]);
-        assert!(text.contains("Start from that work, do not redo it"));
+        assert!(text.contains("Their reports below say what each did and found"));
+        assert!(!text.contains("branch"), "{text}");
         assert!(text.contains(
-            "- task 155: aborted (the task ran past its 90-minute budget); branch \
-             `agent_worker_objective_155` at commit c245db93e981880756015f1efac78939fbbfe11c"
+            "- task 155: aborted (the task ran past its 90-minute budget); its last checkpoint \
+             c245db93e981880756015f1efac78939fbbfe11c"
         ));
         assert!(text.contains("  > mostly done\n"));
         assert!(text.contains("- task 150: yielded; it recorded no checkpoint"));
@@ -1070,5 +1171,126 @@ mod tests {
         assert!(text.len() < 5000);
         let first = brief(&objective(59, false), None, &[], &[]);
         assert!(!first.contains("Earlier tasks"), "a first task has none");
+    }
+
+    /// rev-b on 226fa4a: an objective whose limit-th failure is an abort
+    /// over budget. The abort is recorded as the yield, so the objective
+    /// goes behind the others as any yield does, and its next task starts
+    /// a fresh count instead of yielding at once.
+    #[test]
+    fn an_abort_that_reaches_the_limit_is_the_yield() {
+        let before = attempts(&[gated(23, "conflict"), gated(23, "conflict")]);
+        let slot = abort_yields(&before, 113, 23, 3).expect("the abort yields");
+        assert_eq!(
+            slot.failures,
+            ["conflict", "conflict", "aborted over budget"]
+        );
+        assert!(slot.reason().contains("task #113 yields its slot"));
+        assert!(
+            abort_yields(&before, 113, 23, 4).is_none(),
+            "under the limit"
+        );
+        assert!(abort_yields(&attempts(&[]), 113, 23, 3).is_none());
+
+        let mut aborted = outcome("task.aborted", 23, None, None);
+        aborted.yielded = Some(true);
+        let outcomes = [
+            gated(23, "conflict"),
+            gated(23, "conflict"),
+            aborted,
+            gated(25, "rejected"),
+            outcome("task.cancelled", 25, None, None),
+        ];
+        let tried = attempts(&outcomes);
+        assert_eq!(
+            tried[&23],
+            Attempts {
+                yields: 1,
+                failures: Vec::new()
+            }
+        );
+        let backlog: Vec<Task> = [23, 25, 26].map(|id| objective(id, false)).to_vec();
+        assert_eq!(
+            ids(&choose(&backlog, &[], &BTreeSet::new(), &tried, 3)),
+            vec![26, 23, 25],
+            "the untried first, then the yielded"
+        );
+        let next = mission(1, &[(200, 23, "assigned")]);
+        assert!(
+            yields(&next, &tried, 3, &BTreeSet::new()).is_empty(),
+            "its next task does not yield at once"
+        );
+        // An abort under the limit stays a failure, as before.
+        let plain = attempts(&[outcome("task.aborted", 23, None, None)]);
+        assert_eq!(plain[&23].failures, ["aborted over budget"]);
+        assert_eq!(plain[&23].yields, 0);
+    }
+
+    /// An objective that names the objectives it comes after is not chosen
+    /// while one of them is open; a named objective the backlog does not
+    /// hold must have landed. `after` is read from the backlog's JSON, and
+    /// one that is not a list of ids is an error.
+    #[test]
+    fn an_objective_waits_for_those_it_comes_after() {
+        let mut later = objective(30, false);
+        later.after = vec![28, 29];
+        let mut gone = objective(32, false);
+        gone.after = vec![22];
+        let backlog = vec![objective(28, false), objective(29, false), later, gone];
+        let none = BTreeSet::new();
+        assert_eq!(
+            ids(&choose(&backlog, &[], &none, &untried(), 4)),
+            vec![28, 29]
+        );
+        let one = [landing(28, None)];
+        assert_eq!(ids(&choose(&backlog, &one, &none, &untried(), 4)), vec![29]);
+        let both = [landing(29, None), landing(28, None), landing(22, None)];
+        assert_eq!(
+            ids(&choose(&backlog, &both, &none, &untried(), 4)),
+            vec![30, 32]
+        );
+
+        let dir = std::env::temp_dir().join(format!("spawn-backlog-after-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("030.json"),
+            r#"{"id": 30, "prompt": "p", "after": [28, 29]}"#,
+        )
+        .expect("write");
+        std::fs::write(dir.join("031.json"), r#"{"id": 31, "prompt": "p"}"#).expect("write");
+        let read = load_backlog(&dir).expect("valid");
+        assert_eq!(read[0].after, [28, 29]);
+        assert!(read[1].after.is_empty());
+        std::fs::write(
+            dir.join("031.json"),
+            r#"{"id": 31, "prompt": "p", "after": "028"}"#,
+        )
+        .expect("write");
+        assert!(load_backlog(&dir).is_err(), "not a list of ids");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The backlog names the one order its objectives need: 032, the
+    /// soak that exercises 028's wait paths, after 028. The owner's order
+    /// of 028-033 is a preference the prompts say may be broken (029 "with
+    /// or after 028", 033 "with or after 020", 030 "can be solved before
+    /// 028, 029, 031 and 033"): no `after` holds them back.
+    #[test]
+    fn the_backlog_names_its_order() {
+        let backlog = load_backlog(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rsi/backlog"),
+        )
+        .expect("the backlog");
+        let after = |id: u32| {
+            backlog
+                .iter()
+                .find(|task| task.id == id)
+                .map(|task| task.after.clone())
+                .expect("in the backlog")
+        };
+        assert_eq!(after(32), [28]);
+        for free in [29, 30, 31, 33] {
+            assert!(after(free).is_empty(), "{free}");
+        }
     }
 }

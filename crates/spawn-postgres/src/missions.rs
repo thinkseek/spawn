@@ -49,7 +49,8 @@ from (
 /// - `told`: a notice of the cancel (`cancel-notice-<task>-<n>`) reached the
 ///   worker, however long ago;
 /// - `closed_by` and `reason`: the task's last control record (`task.aborted`
-///   carries the integrator's reason).
+///   carries the integrator's reason); `yielded` when that record yielded
+///   its objective's slot, and `yield_reason`, an abort's reason for it.
 pub(crate) const CANCELLED_DELIVERIES: &str = r"
 with latest as materialized (
   -- At most one per resident: its latest delivery, when that is cancelled.
@@ -71,7 +72,8 @@ from (
                   where c.session_id = k.session_id and c.principal = 'spawn-dispatch'
                     and c.idempotency_key like 'cancel-notice-' || k.id || '-%'
                     and c.succeeded) as told,
-         last.type as closed_by, last.reason
+         last.type as closed_by, last.reason, last.yield_reason,
+         coalesce(last.yielded, false) as yielded
     from latest k
     left join lateral (
       select e.id, (e.kind -> 'detail' -> 'record' ->> 'command_id')::bigint as command_id
@@ -101,7 +103,9 @@ from (
        order by e.id desc limit 1) aside on true
     left join lateral (
       select e.kind -> 'detail' -> 'record' ->> 'type' as type,
-             e.kind -> 'detail' -> 'record' ->> 'reason' as reason
+             e.kind -> 'detail' -> 'record' ->> 'reason' as reason,
+             e.kind -> 'detail' -> 'record' ->> 'yield_reason' as yield_reason,
+             coalesce(e.kind -> 'detail' -> 'record' ->> 'yielded', '') = 'true' as yielded
         from spawn_events e
        where e.session_id = 'session_control' and e.event_name = 'control.recorded'
          and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
@@ -462,7 +466,7 @@ select coalesce(jsonb_agg(jsonb_build_object('objective', k.objective, 'metric',
 pub(crate) const OBJECTIVE_OUTCOMES: &str = r"
 select coalesce(jsonb_agg(jsonb_build_object(
          'seq', o.seq, 'type', o.r ->> 'type', 'task', k.id, 'objective', k.objective,
-         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge')
+         'verdict', o.r ->> 'verdict', 'merge', o.r ->> 'merge', 'yielded', o.r -> 'yielded')
          order by o.seq), '[]'::jsonb)
   from mission_tasks k
  cross join lateral (
@@ -475,29 +479,37 @@ select coalesce(jsonb_agg(jsonb_build_object(
    and (o.r ->> 'type' in ('task.gated', 'task.aborted')
         or (o.r ->> 'type' = 'task.cancelled' and o.r ->> 'yielded' = 'true'))";
 
-/// The yields (`task.cancelled` naming `yielded`) not told to the
-/// supervisor yet: a digest that reached it carrying the tag
-/// `missions objective-yielded-<event_id>`, however long ago.
+/// The yields not told to the supervisor yet: a `task.cancelled` of the
+/// integrator's, or a `task.aborted` that was the objective's last failed
+/// attempt, naming `yielded` (its `yield_reason` is the reason told), that
+/// no digest which reached the supervisor carried the tag
+/// `missions objective-yielded-<event_id>` of, however long ago. Read from
+/// the cancelled objective tasks (`mission_tasks`), each one's records by
+/// the record-id index with the record taken out once (`offset 0`), and the
+/// supervisor's digests checked for the few yields found: not every control
+/// record (16 ms and growing with the log; rev-b on 226fa4a).
 pub(crate) const OBJECTIVE_YIELDS: &str = r"
-with told as (
-  select distinct tag
-    from spawn_commands d
-   cross join lateral jsonb_array_elements_text(
-           case when jsonb_typeof(d.action -> 'tags') = 'array'
-                then d.action -> 'tags' else '[]'::jsonb end) tag
-   where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch' and d.succeeded
-)
 select coalesce(jsonb_agg(jsonb_build_object(
-         'event_id', e.id, 'at_ms', e.recorded_at_ms, 'id', x.r -> 'id',
+         'event_id', x.id, 'at_ms', x.at_ms, 'id', k.id,
          'mission', k.mission_id, 'objective', x.r -> 'objective',
-         'failures', x.r -> 'failures', 'limit', x.r -> 'limit', 'reason', x.r ->> 'reason')
-         order by e.session_seq), '[]'::jsonb)
-  from spawn_events e
- cross join lateral (select e.kind -> 'detail' -> 'record' as r) x
-  left join mission_tasks k on k.id = (x.r ->> 'id')::bigint
- where e.session_id = 'session_control' and e.event_name = 'control.recorded'
-   and x.r ->> 'type' = 'task.cancelled' and x.r ->> 'yielded' = 'true'
-   and not exists (select 1 from told where tag = 'missions objective-yielded-' || e.id)";
+         'failures', x.r -> 'failures', 'limit', x.r -> 'limit',
+         'reason', coalesce(x.r ->> 'yield_reason', x.r ->> 'reason'))
+         order by x.seq), '[]'::jsonb)
+  from mission_tasks k
+ cross join lateral (
+   select e.id, e.recorded_at_ms as at_ms, e.session_seq as seq,
+          e.kind -> 'detail' -> 'record' as r
+     from spawn_events e
+    where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+      and e.kind -> 'detail' -> 'record' ->> 'id' = k.id::text
+   offset 0) x
+ where k.state = 'cancelled' and k.objective is not null
+   and x.r ->> 'type' in ('task.cancelled', 'task.aborted') and x.r ->> 'yielded' = 'true'
+   and not exists (
+     select 1 from spawn_commands d
+      where d.session_id = 'session_supervisor' and d.principal = 'spawn-dispatch'
+        and d.succeeded and jsonb_typeof(d.action -> 'tags') = 'array'
+        and d.action -> 'tags' ? ('missions objective-yielded-' || x.id))";
 
 /// Gate verdicts on one objective's tasks, newest first, from the control
 /// stream: `[{task, verdict, reason, metric, at_ms}]`, `incompatible` (sent
@@ -567,9 +579,12 @@ select coalesce(jsonb_agg(jsonb_build_object(
 /// yielded) and left work, a checkpoint of its own (`tool_completed`,
 /// `turn_stopped`, `execution_ended`) recorded while it ran, as
 /// `{task, commit}` with its last checkpoint that is not a set-aside; null
-/// for a resident's task, a task with no objective, or none such. The same
-/// window as [`OBJECTIVE_PRIOR_WORK`]: from the task's assignment until its
-/// session's next task. `$1` the task.
+/// for a resident's task, a task with no objective, or none such. The
+/// window: from the predecessor's assignment until its session's next task
+/// or its own set-aside, whichever comes first (a resident's set-aside, and
+/// the merge of main on top of it for its next delivery, hold none of the
+/// work: rev-e on a114a9e, objective 55's task 149). spawn-cli checks in
+/// git that the commit holds changes of its own. `$1` the task.
 pub(crate) const OBJECTIVE_FORK: &str = r"
 select coalesce((
   select jsonb_build_object('task', p.id, 'commit', c.commit)
@@ -577,10 +592,18 @@ select coalesce((
     join mission_tasks p on p.mission_id = k.mission_id and p.objective = k.objective
                         and p.id < k.id and p.state = 'cancelled'
    cross join lateral (
-     select coalesce((select min(n.created_at_ms) from mission_tasks n
-                       where n.session_id = p.session_id
-                         and n.created_at_ms > p.created_at_ms),
-                     9223372036854775807) as until) w
+     -- A resident's window ends at its task's set-aside: what is recorded
+     -- on top of it (the main merge of its next delivery) is not the work.
+     select least(
+              coalesce((select min(n.created_at_ms) from mission_tasks n
+                         where n.session_id = p.session_id
+                           and n.created_at_ms > p.created_at_ms),
+                       9223372036854775807),
+              coalesce((select min(a.recorded_at_ms) from spawn_events a
+                         where a.session_id = p.session_id
+                           and a.event_name = 'artifact.committed'
+                           and a.source_event_id = 'set-aside:' || p.id),
+                       9223372036854775807)) as until) w
    cross join lateral (
      select a.kind -> 'detail' -> 'artifact' ->> 'commit' as commit
        from spawn_events a
@@ -1441,6 +1464,25 @@ impl PostgresStore {
             .query_one(
                 "select spawn_task_report_unfinished($1, $2, $3, $4, $5)",
                 &[&task, &digest, markers, &note, &command],
+            )?
+            .get(0))
+    }
+
+    /// Record that the fork of assigned task `task`'s workspace from task
+    /// `from`'s work (`commit`) failed with `error`: once per task. How long
+    /// ago its first failure was recorded, in ms (0: now); `None` when the
+    /// task is not assigned (nothing recorded).
+    pub fn task_fork_failed(
+        &self,
+        task: i64,
+        from: i64,
+        commit: &str,
+        error: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .query_one(
+                "select spawn_task_fork_failed($1, $2, $3, $4)",
+                &[&task, &from, &commit, &error],
             )?
             .get(0))
     }

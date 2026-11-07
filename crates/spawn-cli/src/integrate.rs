@@ -1598,11 +1598,22 @@ impl Integrator {
                 // fails, the next pass finds the task still delivered and
                 // over budget, and submits (a no-op) and records again.
                 stop(store, task)?;
-                record(
-                    store,
-                    &json!({"type": "task.aborted", "id": task.id, "reason": reason}),
-                )?;
+                // An abort that is its objective's last failed attempt
+                // before the limit is the yield too: the task is gone, and
+                // nothing else would yield the slot.
+                let mut aborted_record =
+                    json!({"type": "task.aborted", "id": task.id, "reason": reason});
+                if let Some(yielded) = objectives::abort_yield(store, mission, task)?
+                    && let (Some(record), Some(fields)) =
+                        (aborted_record.as_object_mut(), yielded.as_object())
+                {
+                    record.extend(fields.clone());
+                }
+                record(store, &aborted_record)?;
                 println!("integrate: task {} aborted: {reason}", task.id);
+                if let Some(why) = aborted_record["yield_reason"].as_str() {
+                    println!("integrate: mission {}: {why}", mission.id);
+                }
                 aborted.push(task.id);
             }
         }
@@ -6629,9 +6640,9 @@ mod database_tests {
 
         let again = objective_task(&db, mission, 19).brief;
         for part in [
-            "Start from that work, do not redo it".to_string(),
+            "Their reports below say what each did and found".to_string(),
             format!("- task {t19}: yielded (objective 19 had 3 failed attempts"),
-            format!("branch `{}` at commit {work}", task_19.agent_id),
+            format!("its last checkpoint {work}"),
             "> half of it".to_string(),
         ] {
             assert!(again.contains(&part), "{part}: {again}");
@@ -6647,6 +6658,105 @@ mod database_tests {
         assert!(!fresh.contains("Earlier tasks"), "a first task has none");
 
         assert!(pass().is_empty(), "nothing more yields, no slot is free");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// rev-b on 226fa4a, on the store: objective 023 has two failed
+    /// attempts when its task is aborted over budget, its third. The abort
+    /// is recorded as the yield (`yielded`, its count and reason), told to
+    /// the supervisor once, and the objective goes behind the untried 025;
+    /// when 023 is assigned again its new task does not yield at once. An
+    /// abort under the limit stays a plain abort.
+    #[test]
+    fn an_abort_at_the_limit_is_recorded_as_the_yield() {
+        let base =
+            std::env::temp_dir().join(format!("spawn-db-abort-yield-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::new("abort_yield");
+        let mission = backlog_mission(
+            &db,
+            &base,
+            "ra",
+            &[23, 25],
+            2,
+            Some(&json!({"minutes": 60})),
+        );
+        let none = std::collections::BTreeSet::new();
+        let pass = || {
+            crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
+                .expect("a pass")
+        };
+        pass();
+        let first = objective_task(&db, mission, 23);
+        let other = objective_task(&db, mission, 25);
+        conflicts(&db, first.id, 2);
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let overrun = |task: &super::Task| {
+            db.store.task_delivered(task.id, 1).expect("delivered");
+            let delivered = now - 70 * 60_000;
+            db.admin()
+                .execute(
+                    "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                    &[&task.id, &delivered],
+                )
+                .expect("deliver 70 minutes ago");
+            tool_work(&db, task, delivered + 5_000, now);
+        };
+        overrun(&first);
+        // 025's first abort: under the limit, a plain abort.
+        overrun(&other);
+        let aborted =
+            Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
+        assert_eq!(aborted, vec![first.id, other.id]);
+        let record = |task: i64| -> Value {
+            db.admin()
+                .query_one(
+                    "select kind -> 'detail' -> 'record' from spawn_events
+                      where session_id = 'session_control'
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'
+                        and kind -> 'detail' -> 'record' ->> 'id' = $1",
+                    &[&task.to_string()],
+                )
+                .expect("the abort")
+                .get(0)
+        };
+        let yielded = record(first.id);
+        assert_eq!(yielded["yielded"], true);
+        assert_eq!(
+            (yielded["objective"].as_i64(), yielded["failures"].as_i64()),
+            (Some(23), Some(3))
+        );
+        let why = yielded["yield_reason"]
+            .as_str()
+            .expect("its reason")
+            .to_string();
+        assert!(
+            why.contains("objective 23 had 3 failed attempts")
+                && why.contains("conflict, conflict, aborted over budget"),
+            "{why}"
+        );
+        assert!(record(other.id).get("yielded").is_none(), "under the limit");
+        let told = db.store.objective_yields().expect("the yields to tell");
+        let told = told.as_array().expect("a list");
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0]["id"], first.id);
+        assert_eq!(told[0]["reason"].as_str(), Some(why.as_str()));
+
+        // Both slots free: 025 (one failure, no yield) first, then 023.
+        pass();
+        let flying: Vec<u32> = flying(&db, mission)
+            .iter()
+            .filter(|(task, _)| *task != first.id && *task != other.id)
+            .map(|(_, objective)| *objective)
+            .collect();
+        assert_eq!(flying, [25, 23]);
+        let again = objective_task(&db, mission, 23);
+        assert!(pass().is_empty(), "nothing yields, no slot is free");
+        assert_eq!(
+            task_state(&db, mission, again.id),
+            "assigned",
+            "023's new task stays"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -228,6 +228,13 @@ pub(crate) struct Cancelled {
     pub(crate) closed_by: Option<String>,
     #[serde(default)]
     pub(crate) reason: Option<String>,
+    /// That record yielded the task's objective's slot
+    /// (`objectives::yields`, `objectives::abort_yield`).
+    #[serde(default)]
+    pub(crate) yielded: bool,
+    /// An abort's reason for yielding as well (`yield_reason`).
+    #[serde(default)]
+    pub(crate) yield_reason: Option<String>,
 }
 
 impl Cancelled {
@@ -265,7 +272,22 @@ pub(crate) fn cancel_notice(cancelled: &Cancelled) -> String {
             format!(" by the integrator ({})", one_line(reason, 300))
         }
         (Some("task.aborted"), None) => " by the integrator".to_string(),
+        (Some("task.cancelled"), Some(reason)) if cancelled.yielded => format!(
+            " by the integrator, to yield its objective's slot ({})",
+            one_line(reason, 400)
+        ),
         _ => String::new(),
+    };
+    let by = match cancelled.yield_reason.as_deref() {
+        Some(why)
+            if cancelled.yielded && cancelled.closed_by.as_deref() == Some("task.aborted") =>
+        {
+            format!(
+                "{by}; it also yields its objective's slot ({})",
+                one_line(why, 400)
+            )
+        }
+        _ => by,
     };
     format!(
         "[Task #{id} was cancelled — this is not a new task]\nTask #{id} of mission #{mission} \
@@ -2471,6 +2493,8 @@ mod tests {
             told,
             closed_by: Some("task.cancelled".to_string()),
             reason: None,
+            yielded: false,
+            yield_reason: None,
         }
     }
 
@@ -2644,6 +2668,40 @@ mod tests {
             text.contains("cancelled by the integrator (over budget: 5 hours)"),
             "{text}"
         );
+    }
+
+    /// A yield says why in the notice: the integrator's cancel, or an
+    /// abort that yielded as well; a human's cancel names no reason.
+    #[test]
+    fn the_notice_of_a_yield_gives_its_reason() {
+        let why = "objective 19 had 3 failed attempts since its last turn (conflict, conflict, \
+                   rejected); task #7 yields its slot to the next objective, its work set aside";
+        let mut yielded = cancelled(false);
+        yielded.reason = Some(why.to_string());
+        yielded.yielded = true;
+        let text = super::cancel_notice(&yielded);
+        assert!(
+            text.contains(&format!(
+                "was cancelled by the integrator, to yield its objective's slot ({why})"
+            )),
+            "{text}"
+        );
+        let mut aborted = cancelled(false);
+        aborted.closed_by = Some("task.aborted".to_string());
+        aborted.reason = Some("the task worked past its 60-minute budget".to_string());
+        aborted.yielded = true;
+        aborted.yield_reason = Some(why.to_string());
+        let text = super::cancel_notice(&aborted);
+        assert!(
+            text.contains(&format!(
+                "by the integrator (the task worked past its 60-minute budget); it also yields \
+                 its objective's slot ({why})"
+            )),
+            "{text}"
+        );
+        let mut human = cancelled(false);
+        human.reason = Some("not needed".to_string());
+        assert!(!super::cancel_notice(&human).contains("not needed"));
     }
 
     /// A note about an unfinished report, attempt `key`, finished at
