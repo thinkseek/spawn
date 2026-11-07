@@ -3392,3 +3392,90 @@ fn an_owner_landing_takes_the_landing_holds_lock() {
         )
         .expect("released with the hold");
 }
+
+/// An overrun is its own record, not a gate abort (objective 026,
+/// docs/fleet-architecture.md §10.4): the fold takes the task out of flight
+/// and moves no counter, and the integrator may record it only for a
+/// delivered task.
+#[test]
+fn an_overrun_takes_its_task_out_of_flight_and_moves_no_counter() {
+    let (store, schema) = store("control_over_budget");
+    let mission = store
+        .mission_add("Over budget", &json!(["/tmp/source.git"]), "human")
+        .expect("add");
+    store
+        .mission_configure(
+            mission,
+            Some("/controller/rsi/scenarios"),
+            "gate",
+            Some(&json!({"tool_calls": 5})),
+            None,
+        )
+        .expect("configure");
+    let task = store
+        .task_assign(mission, "ephemeral", "w", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task, 1).expect("delivered");
+    let counters = |client: &mut Client| -> (i32, i32) {
+        let row = client
+            .query_one(
+                "select gate_aborts, gate_rejections from mission_missions where id = $1",
+                &[&mission],
+            )
+            .expect("the mission");
+        (row.get(0), row.get(1))
+    };
+    let mut client = admin(&schema);
+    store
+        .integrator_record(&json!({"type": "task.over_budget", "id": task,
+                                   "reason": "the task made more than 5 tool calls",
+                                   "tool_calls": 6, "elapsed_ms": 1_000,
+                                   "budget": {"tool_calls": 5}}))
+        .expect("the overrun");
+    let state: String = client
+        .query_one("select state from mission_tasks where id = $1", &[&task])
+        .expect("the task")
+        .get(0);
+    assert_eq!(state, "cancelled", "the task leaves flight");
+    assert_eq!(counters(&mut client), (0, 0), "no halt counts it");
+
+    // The record names its reason, its tool calls and its budget.
+    let task2 = store
+        .task_assign(mission, "ephemeral", "v", "brief", "default")
+        .expect("assign");
+    store.task_delivered(task2, 1).expect("delivered");
+    for record in [
+        json!({"type": "task.over_budget", "id": task2, "reason": "",
+               "tool_calls": 6, "budget": {"tool_calls": 5}}),
+        json!({"type": "task.over_budget", "id": task2,
+               "reason": "over", "budget": {"tool_calls": 5}}),
+        json!({"type": "task.over_budget", "id": task2, "reason": "over",
+               "tool_calls": 6}),
+    ] {
+        assert!(
+            store.integrator_record(&record).is_err(),
+            "a record that does not name what it measured is refused: {record}"
+        );
+    }
+    // Only a delivered task: not one still assigned, not one reported.
+    let assigned = store
+        .task_assign(mission, "ephemeral", "u", "brief", "default")
+        .expect("assign");
+    assert!(
+        store
+            .integrator_record(&json!({"type": "task.over_budget", "id": assigned,
+                                       "reason": "over", "tool_calls": 6,
+                                       "budget": {"tool_calls": 5}}))
+            .is_err(),
+        "not a delivered task"
+    );
+    assert!(store.task_reported(task2, "done").expect("reported"));
+    assert!(
+        store
+            .integrator_record(&json!({"type": "task.over_budget", "id": task2,
+                                       "reason": "over", "tool_calls": 6,
+                                       "budget": {"tool_calls": 5}}))
+            .is_err(),
+        "not a reported task"
+    );
+}
