@@ -1310,10 +1310,10 @@ mod tests {
         ]);
         let none = BTreeSet::new();
         assert_eq!(
-            ids(&choose(&backlog, &[], &none, &tried, 5)),
+            ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 5)),
             vec![25, 26, 21, 23, 19]
         );
-        assert_eq!(ids(&choose(&backlog, &[], &none, &tried, 1)), vec![25]);
+        assert_eq!(ids(&choose(&backlog, &[], &none, &tried, &BTreeSet::new(), 1)), vec![25]);
     }
 
     /// Three slots held by three objectives at the limit: the tasks being
@@ -1410,7 +1410,7 @@ mod tests {
             .map(|id| objective(id, false))
             .to_vec();
         let flying = BTreeSet::from([19, 21]);
-        assert_eq!(ids(&choose(&backlog, &[], &flying, &tried, 1)), vec![25]);
+        assert_eq!(ids(&choose(&backlog, &[], &flying, &tried, &BTreeSet::new(), 1)), vec![25]);
         // Had 127 been sent back to revise, it would yield as well, and 026
         // take its slot.
         let sent_back = mission(3, &[(127, 19, "revise"), (106, 21, "reported")]);
