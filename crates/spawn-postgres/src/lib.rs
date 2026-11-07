@@ -206,6 +206,30 @@ impl PostgresStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// A store over a connection of its own, in this store's schema and as
+    /// its owner: `SELECT`s go through the caller (no migration, no lock on
+    /// the shared connection). The integrator uses one for an owner's
+    /// landing, so the landing hold it takes is its own session's and is
+    /// never granted again on the shared connection a judging records
+    /// through; the landing's records still go through the shared store.
+    pub fn new_connection(&self) -> Result<PostgresStore, StoreError> {
+        // The schema this store's session is in (a test store connects into
+        // a schema the URL does not name).
+        let schema: String = self
+            .lock()
+            .query_one("select current_schema()", &[])
+            .map_err(|error| backend(&error))?
+            .get(0);
+        let store = PostgresStore::connect(&self.url)?;
+        {
+            let mut client = store.lock();
+            client
+                .batch_execute(&format!("set search_path to {schema}"))
+                .map_err(|error| backend(&error))?;
+        }
+        Ok(store)
+    }
+
     /// Install or refresh the schema, and set the logins' passwords.
     /// Idempotent: every process of one install derives the same ones.
     pub fn migrate(&self) -> Result<(), StoreError> {
