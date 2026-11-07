@@ -1,5 +1,44 @@
 //! `tick` and `loop`: one pass, and the resident loop. Landing and RSI
 //! objectives run in `spawn integrate` (crate::integrate).
+//!
+//! The loop's rule, in one sentence: **the loop acts on records and on the
+//! times records name, never on the clock.** Every pass reads the log's
+//! watermark (`max(spawn_events.id)`, one index-only read of the primary
+//! key); a step runs when that watermark has moved since it last ran, or
+//! when a time its own records named has come. A step is:
+//!
+//! - the Bridge's reading of the log and its claim of the command queue
+//!   ([`Bridge::work`]), which waits for the earliest lease still running
+//!   (`lease_until_ms`), or for the next pass when its claim stopped at the
+//!   per-tick limit;
+//! - the Observer's read of new events ([`Observer::tick`]), which waits for
+//!   its own schedule (a fact settling, a recheck of a running execution, a
+//!   judge's backoff);
+//! - the dispatcher ([`dispatch::step`]), which waits for a delivery's retry
+//!   (`attempts()`: [`NOT_READY_RETRY_MS`] after a refusal, `retry_wait_ms()`
+//!   after a failure), a stall's bound ([`dispatch::Bounds`]), a failed
+//!   Stop's retry, a background job's bound, or a report note's retry;
+//! - the liveness rule ([`supervise::keep_residents`],
+//!   [`supervise::keep_alive`]), which waits for the end of a failed
+//!   revival's backoff.
+//!
+//! What does not follow this rule is what no append announces: the Bridge's
+//! reading of each engine's screen and transcript runs every pass (objective
+//! 025 gives that schedule its own bounds), and the disk watch reads free
+//! space on its own clock ([`disk::CHECK_EVERY`]).
+//!
+//! A pass where nothing moved and nothing is due reads the watermark and
+//! runs no step: on an idle fleet that is the only statement it makes, and
+//! it costs one scan. Between passes the loop waits on `LISTEN
+//! spawn_events` with a timeout of the earlier of the pass interval and the
+//! next due time, so a change ends the wait at once (a notification is a
+//! hint; the watermark is the record) and a notification lost costs at most
+//! one interval.
+//!
+//! Every wait a step returns is checked by a unit test against the rule it
+//! belongs to, and none of them moves a decision: given the same records and
+//! the same clock, a step run on every pass and a step run on change make
+//! the same orders, deliveries, escalations and digests.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
