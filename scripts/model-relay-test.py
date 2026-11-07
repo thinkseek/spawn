@@ -43,6 +43,8 @@ class Upstream:
         # Streams still to cut, and how: "close" drops the connection
         # partway, "end" ends the body cleanly without message_stop.
         self.cuts = []
+        # Requests still to refuse with a 500, as a loaded DeepSeek does.
+        self.failures = 0
         upstream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -78,6 +80,9 @@ class Upstream:
                     self.end_headers()
                 elif request.get("unauthorized"):
                     self._json(401, {"type": "error", "error": {"type": "authentication_error"}})
+                elif request.get("stream") and upstream.failures:
+                    upstream.failures -= 1
+                    self._json(500, {"type": "error", "error": {"type": "api_error"}})
                 elif request.get("stream"):
                     self._stream()
                 else:
@@ -359,6 +364,19 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(events, WHOLE)
         self.assertEqual(len(self.deepseek.requests), 3)
         self.assertEqual(self.deepseek.cuts, [])
+
+    def test_a_deepseek_stream_refused_with_a_server_error_is_asked_for_again(self):
+        self.fast_retries()
+        self.deepseek.release.set()
+        self.deepseek.failures = 2
+        self.deepseek.cuts = ["end"]
+        connection, response = self.stream()
+        self.assertEqual(response.status, 200)
+        events = response.read().replace(relay.PING, b"")
+        connection.close()
+        self.assertEqual(events, WHOLE)
+        self.assertEqual(len(self.deepseek.requests), 4)
+        self.assertEqual((self.deepseek.failures, self.deepseek.cuts), (0, []))
 
     def test_a_deepseek_stream_cut_every_time_is_an_overloaded_error(self):
         self.fast_retries()
