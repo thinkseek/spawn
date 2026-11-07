@@ -701,9 +701,17 @@ pub(crate) fn read_plan(
     if let Some(at) = deliver::next_due(&work, &rows, now) {
         soon(at);
     }
+    if let Some(left) = disk_due(bounds.disk_news_ms, now) {
+        soon(left);
+    }
     for facts in rows.iter().filter(|facts| is_worker(facts)) {
         if let Some(at) = stops::next_due(facts) {
             soon(at);
+        }
+        // A worker held back from its one nudge by the hourly limit is due
+        // when the oldest nudge of that hour leaves it.
+        if let Some(left) = worker::due_in(facts, now) {
+            soon(now.saturating_add(left));
         }
     }
     // A stall read that failed costs this pass its stall items, never its
