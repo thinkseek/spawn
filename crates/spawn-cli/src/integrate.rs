@@ -2788,6 +2788,17 @@ fn aborted(failure: &GateFailure) -> Value {
         GateFailure::NoRoom { tmpdir, log, .. } => {
             json!({"reason": format!("the gate had no room in {tmpdir}"), "log": log})
         }
+        // Recorded as `host_fault` with evidence `base_disagrees` by the
+        // caller; counted here only if a caller forgets that.
+        GateFailure::BaseDisagrees { scenario, log, .. } => json!({
+            "reason": format!(
+                "host fault: the base disagrees with itself: {scenario} exited 1, then 0 on the \
+                 base; not a verdict, judged again later"
+            ),
+            "evidence": BASE_DISAGREES,
+            "scenario": scenario,
+            "log": log,
+        }),
     }
 }
 
