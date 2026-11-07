@@ -599,7 +599,7 @@ work.",
             last_kind: Some("resume".to_string()),
             ..facts()
         };
-        for (failures, pause) in [(1, 20_000), (2, 40_000), (3, 80_000)] {
+        for (failures, pause) in [(1, 20_000), (2, 40_000)] {
             let facts = failed(failures);
             assert_eq!(
                 next_due(&facts, 100_000 + pause - 1),
@@ -621,6 +621,14 @@ work.",
                 "a time already reached is due now"
             );
         }
+        // The third failure's pause ends in a new native session, not a
+        // resume (the rule hands off after `RESUME_ATTEMPTS`).
+        let exhausted = failed(3);
+        assert_eq!(next_due(&exhausted, 100_000 + 79_999), Some(100_000 + 80_000));
+        assert_eq!(
+            decide(&exhausted, 100_000 + 80_000),
+            Revive::Start { handoff: true }
+        );
         let live = LivenessFacts {
             live: true,
             failures: 2,
