@@ -28,12 +28,15 @@ for one: DeepSeek's stream. DeepSeek cuts streams partway when loaded (seen
 Claude Code ends its turn on a cut stream ("Connection lost mid-response").
 So a DeepSeek stream is passed on only once it is whole, ending in
 `message_stop`. A cut one is asked for again, up to STREAM_ATTEMPTS times in
-all. The client gets a `ping` event (which it skips, as it skips the API's
-own pings) every PING_EVERY seconds meanwhile, so its connection stays
-alive. If every attempt is cut, it gets an `overloaded_error` event, which
-Claude Code retries. A redirect is passed back to the client, never
-followed: following it would send the request's credentials to whatever
-host it names.
+all, and so is one DeepSeek refuses with a server error (SERVER_ERRORS: when
+loaded it answers 500 after 15 s to a quarter or more of requests, and
+Claude Code's own ten tries were seen to run out). The client gets a `ping`
+event (which it skips, as it skips the API's own pings) every PING_EVERY
+seconds meanwhile, so its connection stays alive. If every attempt fails,
+it gets an `overloaded_error` event, which Claude Code retries.
+
+A redirect is passed back to the client, never followed: following it would
+send the request's credentials to whatever host it names.
 
 The DeepSeek key stays in this process. It never enters Spawn's environment,
 the engine's environment, the event log, or an agent's terminal.
@@ -101,6 +104,8 @@ STREAM_BACKOFF = (2, 4, 8, 16)
 PING_EVERY = 10
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 STREAM_END = b"event: message_stop"
+# Statuses of an upstream that could not serve this time: asked again.
+SERVER_ERRORS = {500, 502, 503, 504, 529}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -287,8 +292,16 @@ def handler(settings):
                 except urllib.error.HTTPError as error:
                     response = error
                 status = response.status if hasattr(response, "status") else response.code
-                if route == "deepseek" and status == 200 and wants_stream(body):
-                    sent, attempts = self._pass_whole_stream(response, request)
+                if (
+                    route == "deepseek"
+                    and (status == 200 or status in SERVER_ERRORS)
+                    and wants_stream(body)
+                ):
+                    if status != 200:
+                        response.close()
+                        response = None
+                    sent, attempts, whole = self._pass_whole_stream(response, request)
+                    status = 200 if whole else "overloaded"
                 else:
                     sent = self._pass(response, status)
             except (BrokenPipeError, ConnectionResetError) as error:
@@ -411,18 +424,18 @@ def handler(settings):
             return response
 
         def _pass_whole_stream(self, response, request):
-            """Send DeepSeek's stream once whole (see the module's notes);
-            returns the body bytes sent and the attempts it took."""
+            """Send DeepSeek's stream once whole (see the module's notes),
+            `response` its first attempt (None if that failed); returns the
+            body bytes sent, the attempts it took, and whether it was whole."""
             self._started = True
             self.send_response(200)
-            for name, value in response.headers.items():
-                if name.lower() not in HOP:
-                    self.send_header(name, value)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             self.wfile.flush()
             attempts = 1
-            data, whole = self._await(response)
+            data, whole = self._await(response) if response is not None else (b"", False)
             while not whole and attempts < STREAM_ATTEMPTS:
                 self._pause(STREAM_BACKOFF[min(attempts, len(STREAM_BACKOFF)) - 1])
                 attempts += 1
@@ -430,14 +443,16 @@ def handler(settings):
                 if again is not None:
                     data, whole = self._await(again)
             if not whole:
-                message = f"model relay: DeepSeek cut its stream {attempts} times; try again"
+                message = (
+                    f"model relay: DeepSeek failed or cut its stream {attempts} times; try again"
+                )
                 error = {"type": "error", "error": {"type": "overloaded_error", "message": message}}
                 data = b"event: error\ndata: " + json.dumps(error).encode() + b"\n\n"
             for start in range(0, len(data), CHUNK):
                 self._chunk(data[start : start + CHUNK])
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-            return len(data), attempts
+            return len(data), attempts, whole
 
         do_POST = _relay
         do_GET = _relay
