@@ -44,7 +44,7 @@ begin
     end if;
     if current_database() <> 'postgres' then
         perform set_config('spawn_logins.result',
-                           'skipped: run in the postgres database, where the migration lock is', false);
+                           'skipped: run in the postgres database, on the server as a whole', false);
         return;
     end if;
     for v_login in
