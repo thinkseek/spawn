@@ -278,10 +278,14 @@ from (
         and c.id > (select x.command_id from agent_executions x
                      where x.session_id = s.session_id
                        and x.execution_id = s.execution_id)) as stops,
-    (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
-       from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
-      where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
-        and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array') as told,
+    -- Only the supervisor's told set is read (the tags its digests filed):
+    -- every other session's is not gathered.
+    case when s.session_id = 'session_supervisor' then
+      (select coalesce(jsonb_agg(distinct tag), '[]'::jsonb)
+         from spawn_commands c, jsonb_array_elements_text(c.action -> 'tags') tag
+        where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
+          and c.succeeded and jsonb_typeof(c.action -> 'tags') = 'array')
+    else '[]'::jsonb end as told,
     (select c.idempotency_key from spawn_commands c
       where c.session_id = s.session_id and c.principal = 'spawn-dispatch'
         and c.idempotency_key like 'deliver-%'
