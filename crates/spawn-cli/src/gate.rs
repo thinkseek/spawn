@@ -872,6 +872,16 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 /// The verdict of a finished gate run: the verdict file's, only after a
 /// clean exit.
+///
+/// Two failures are facts about the host rather than aborts, each an exit
+/// status together with a fact the gate states: exit [`NO_ROOM_EXIT`] with
+/// its no-room fact in the verdict file ([`no_room`]), and exit
+/// [`BASE_DISAGREES_EXIT`] with its own pair of lines at the end of stdout
+/// ([`base_disagrees`]: a scenario that exited 1 and then 0 on the base,
+/// before any candidate code ran). Every other non-zero or signalled exit is
+/// an abort with the whole record, the gate's stdout then its stderr marked
+/// `! `: the pair with any other exit, a base run that exited 2 or `1, then
+/// 2`, and a nested gate's line (`| | …`) in a scenario's log.
 fn decide(run: &Run, verdict: Option<&str>) -> Result<Verdict, GateFailure> {
     // The record: stdout, then stderr marked `! ` so no line of it can pass
     // for a verdict or a section header. An abort keeps all of it.
