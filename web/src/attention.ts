@@ -93,6 +93,23 @@ export interface OnOwnJob {
   jobs: OwnJob[];
 }
 
+/** The owner's hold on a mission source (`spawn mission hold`): while it
+ * lasts no task lands there; its gates still run and its accepted tasks
+ * wait. It ends by a record: its release, or its expiry at `expires_ms`. */
+export interface SourceHold {
+  source: string;
+  /** The event id of its `source.held` record. */
+  hold: number;
+  /** The source's main when it was taken: what an owner gate judges against. */
+  main: string | null;
+  by: string | null;
+  reason: string | null;
+  held_at_ms: number | null;
+  expires_ms: number | null;
+  /** The tasks waiting behind it, oldest first. */
+  waiting: number[];
+}
+
 export interface Attention {
   generated_at_ms: number;
   pending: AttentionItem[];
@@ -100,6 +117,10 @@ export interface Attention {
   supervisor: SupervisorView | null;
   /** Workers on their own background jobs, not escalated. */
   on_own_jobs: OnOwnJob[];
+  /** The owner's holds with a task waiting behind them: work a person
+   * holds. Not escalations: the supervisor is told of an expiry, never of a
+   * hold. */
+  holds: SourceHold[];
   warnings: string[];
 }
 
@@ -248,6 +269,33 @@ function normalizeSupervisor(value: unknown): SupervisorView | null {
   };
 }
 
+/** A list of the owner's holds (`holds` of `/api/attention` and
+ * `/api/missions`), each normalized; an entry without a source or a hold id
+ * is dropped. */
+export function normalizeHolds(value: unknown): SourceHold[] {
+  return list(value).flatMap((entry) => {
+    const raw = object(entry);
+    const source = raw ? optionalText(raw.source) : null;
+    const hold = raw ? optionalNumber(raw.hold) : null;
+    if (!raw || source === null || hold === null) return [];
+    return [
+      {
+        source,
+        hold,
+        main: optionalText(raw.main),
+        by: optionalText(raw.by),
+        reason: optionalText(raw.reason),
+        held_at_ms: optionalNumber(raw.held_at_ms),
+        expires_ms: optionalNumber(raw.expires_ms),
+        waiting: list(raw.waiting).flatMap((task) => {
+          const id = optionalNumber(task);
+          return id === null ? [] : [id];
+        }),
+      },
+    ];
+  });
+}
+
 /** `/api/attention`, every field normalized: a server that omits one gives
  * an empty value, never a crash. Throws when the answer is not the
  * dispatcher's view at all (no `pending` list), so the caller falls back. */
@@ -267,6 +315,7 @@ export function normalizeAttention(value: unknown): Attention {
     told: items(raw.told, true),
     supervisor: normalizeSupervisor(raw.supervisor),
     on_own_jobs: normalizeOnOwnJobs(raw.on_own_jobs),
+    holds: normalizeHolds(raw.holds),
     warnings: list(raw.warnings).filter(
       (warning): warning is string => typeof warning === "string",
     ),

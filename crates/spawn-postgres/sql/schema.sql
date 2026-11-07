@@ -1266,7 +1266,11 @@ create table if not exists mission_tasks (
     delivered_at_ms bigint,
     -- The models the task's worker runs on (docs/fleet-architecture.md,
     -- "Engine models"): `default`, or `cheap` for simple, well-specified work.
-    model           text   not null default 'default' check (model in ('default', 'cheap'))
+    model           text   not null default 'default' check (model in ('default', 'cheap')),
+    -- The owner's hold this landing task last waited behind (`task.held`,
+    -- the `source.held` record's event id): its `land()` pushed nothing
+    -- under it. Set only by `task.held`; the hold's end does not clear it.
+    held_by         bigint
 );
 
 -- Columns added since the first shape of these tables (see spawn_grants).
@@ -1297,6 +1301,7 @@ alter table mission_tasks add column if not exists scenario text;
 alter table mission_tasks add column if not exists delivered_at_ms bigint;
 alter table mission_tasks add column if not exists model text not null default 'default'
     check (model in ('default', 'cheap'));
+alter table mission_tasks add column if not exists held_by bigint;
 
 -- The first task states had no landing: a check from then is replaced, once.
 do $$
@@ -1314,6 +1319,25 @@ end
 $$;
 
 create index if not exists mission_tasks_agent on mission_tasks (agent_id, id);
+
+-- The owner's holds on mission sources (docs/fleet-architecture.md §10.3,
+-- "Landing: the owner's hold"): the fold of `source.held` (keyed by source:
+-- a source has at most one active hold, and a new one renews it) less the
+-- `source.released` or `source.hold_expired` naming its hold. While a source
+-- has a row here, no task lands on it: the integrator reads the row under
+-- the landing lock before any push. `hold` is the `source.held` record's
+-- event id, `main` the source's main when it was taken, `held_at_ms` its
+-- record's time and `expires_ms` that time plus its bound, written into the
+-- record by the store. Only a record ends a hold, never the clock.
+create table if not exists mission_source_holds (
+    source     text   primary key,
+    hold       bigint not null,
+    main       text   not null,
+    by         text   not null,
+    reason     text,
+    held_at_ms bigint not null,
+    expires_ms bigint not null
+);
 
 
 -- Who may call the mission functions: the owner (humans' CLI, the
@@ -1373,8 +1397,10 @@ $$;
 -- `spawn_control_apply`, in the same transaction as the event. The checked
 -- functions below validate against the tables, then record. Applying a
 -- record never validates: the log is the truth, and replaying it must give
--- the same tables.
-create or replace function spawn_control_apply(p_record jsonb, p_at bigint)
+-- the same tables. `p_at` is the record's time and `p_event` its event's id
+-- (a hold is named by its `source.held` event).
+drop function if exists spawn_control_apply(jsonb, bigint);
+create or replace function spawn_control_apply(p_record jsonb, p_at bigint, p_event bigint)
 returns void language plpgsql as $$
 declare
     v_type text := p_record ->> 'type';
@@ -1440,6 +1466,25 @@ begin
            and (p_record -> 'missions' is null
                 or id in (select m::bigint
                             from jsonb_array_elements_text(p_record -> 'missions') m));
+    when 'source.held' then
+        -- The owner holds landings on a source (spawn_source_hold): the
+        -- source's active hold is this one. A hold on a source already held
+        -- renews it: the previous one ends here, with no record of its own.
+        insert into mission_source_holds (source, hold, main, by, reason, held_at_ms, expires_ms)
+        values (p_record ->> 'source', p_event, p_record ->> 'main', p_record ->> 'by',
+                p_record ->> 'reason', p_at, (p_record ->> 'expires_ms')::bigint)
+        on conflict (source) do update
+           set hold = excluded.hold, main = excluded.main, by = excluded.by,
+               reason = excluded.reason, held_at_ms = excluded.held_at_ms,
+               expires_ms = excluded.expires_ms;
+    when 'source.released', 'source.hold_expired' then
+        -- The record that ends a hold: only the one naming the active hold.
+        delete from mission_source_holds
+         where source = p_record ->> 'source' and hold = (p_record ->> 'hold')::bigint;
+    when 'task.held' then
+        -- A landing that pushed nothing: its source is held. It stays
+        -- `landing`, waiting behind that hold.
+        update mission_tasks set held_by = (p_record ->> 'hold')::bigint where id = v_id;
     when 'task.delivered' then
         update mission_tasks set state = 'delivered', command_id = (p_record ->> 'command_id')::bigint,
                                  delivered_at_ms = p_at, updated_at_ms = p_at
@@ -1662,7 +1707,15 @@ begin
            set kind = jsonb_set(kind, '{detail,record}', p_record)
          where id = v_id;
     end if;
-    perform spawn_control_apply(p_record, v_at);
+    -- An owner's hold expires `bound_s` after its own record, the same way.
+    if p_record ->> 'type' = 'source.held' and jsonb_typeof(p_record -> 'bound_s') = 'number' then
+        p_record := p_record || jsonb_build_object(
+            'expires_ms', v_at + (p_record ->> 'bound_s')::numeric::bigint * 1000);
+        update spawn_events
+           set kind = jsonb_set(kind, '{detail,record}', p_record)
+         where id = v_id;
+    end if;
+    perform spawn_control_apply(p_record, v_at, v_id);
     return v_id;
 end $$;
 
@@ -1674,16 +1727,17 @@ declare
     v_event record;
 begin
     perform pg_advisory_xact_lock(1399957335);
+    delete from mission_source_holds;
     delete from mission_tasks;
     delete from mission_residents;
     delete from mission_missions;
     for v_event in
-        select e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
+        select e.id, e.kind -> 'detail' -> 'record' as record, e.recorded_at_ms
           from spawn_events e
          where e.session_id = 'session_control' and e.event_name = 'control.recorded'
          order by e.session_seq
     loop
-        perform spawn_control_apply(v_event.record, v_event.recorded_at_ms);
+        perform spawn_control_apply(v_event.record, v_event.recorded_at_ms, v_event.id);
     end loop;
 end $$;
 
@@ -2187,21 +2241,46 @@ begin
 end $$;
 
 -- The integrator's records (`spawn integrate`, owner only): gate verdicts,
--- landings, aborts over budget, and halts.
+-- landings, aborts over budget, halts, the landings an owner's hold keeps
+-- waiting (`task.held`) and the holds past their bound (`source.hold_expired`).
+-- Returns the record's event id; null for a `task.held` already recorded for
+-- the task and hold (it records nothing).
 create or replace function spawn_integrator_record(p_record jsonb)
 returns bigint language plpgsql security definer as $$
 declare
     v_mission bigint;
     v_stale bigint;
     v_recorded bigint;
+    v_hold mission_source_holds;
 begin
     -- Check and record under the append lock, so no other change interleaves.
     perform pg_advisory_xact_lock(1399957335);
     if spawn_mission_caller() is distinct from 'owner' then
         raise exception '% may not record landings', session_user using errcode = '42501';
     end if;
-    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted') then
+    if p_record ->> 'type' not in ('task.gated', 'task.landed', 'task.aborted', 'mission.halted',
+                                   'task.held', 'source.hold_expired') then
         raise exception 'the integrator does not record %', p_record ->> 'type';
+    end if;
+    -- A hold past its bound ends by this record alone, and only the active
+    -- hold of its source, once the database's clock has reached its
+    -- `expires_ms`: a release or a renewal recorded first wins. The store
+    -- names the bound and the tasks waiting behind it, oldest first.
+    if p_record ->> 'type' = 'source.hold_expired' then
+        select * into v_hold from mission_source_holds where source = p_record ->> 'source';
+        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold' then
+            raise exception 'hold % is not the active hold of %', p_record ->> 'hold',
+                            p_record ->> 'source';
+        end if;
+        if spawn_now_ms() < v_hold.expires_ms then
+            raise exception 'hold % on % expires at %, not before', v_hold.hold, v_hold.source,
+                            v_hold.expires_ms;
+        end if;
+        return spawn_control_record(p_record || jsonb_build_object(
+            'expires_ms', v_hold.expires_ms,
+            'waiting', (select coalesce(jsonb_agg(k.id order by k.id), '[]'::jsonb)
+                          from mission_tasks k
+                         where k.state = 'landing' and k.held_by = v_hold.hold)));
     end if;
     if p_record ->> 'type' = 'task.gated'
        and p_record ->> 'verdict' not in ('accepted', 'rejected', 'conflict', 'incompatible',
@@ -2245,9 +2324,33 @@ begin
          where id = (p_record ->> 'id')::bigint
            and state = any (case p_record ->> 'type'
                               when 'task.landed' then array['landing']
+                              when 'task.held' then array['landing']
                               when 'task.aborted' then array['delivered']
                               else array['reported', 'accepted', 'landing'] end)) then
         raise exception 'task % is not waiting for %', p_record ->> 'id', p_record ->> 'type';
+    end if;
+    -- A landing that waits behind the active hold of its mission's source
+    -- (the integrator read it under the landing lock and pushed nothing),
+    -- recorded once per task and hold: a second records nothing.
+    if p_record ->> 'type' = 'task.held' then
+        select h.* into v_hold
+          from mission_tasks k
+          join mission_missions m on m.id = k.mission_id
+          join mission_source_holds h on h.source = m.sources ->> 0
+         where k.id = (p_record ->> 'id')::bigint;
+        if v_hold.hold is null or v_hold.hold::text is distinct from p_record ->> 'hold'
+           or v_hold.source is distinct from p_record ->> 'source' then
+            raise exception 'hold % is not the active hold on task %''s source %',
+                            p_record ->> 'hold', p_record ->> 'id', p_record ->> 'source';
+        end if;
+    end if;
+    if p_record ->> 'type' = 'task.held' and exists (
+        select 1 from spawn_events e
+         where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+           and e.kind -> 'detail' -> 'record' ->> 'id' = p_record ->> 'id'
+           and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.held'
+           and e.kind -> 'detail' -> 'record' ->> 'hold' = p_record ->> 'hold') then
+        return null;
     end if;
     -- A verdict names the revision of the report it judged (the task's
     -- `revisions` when the gate began). The gate runs for minutes: one on a
@@ -2347,6 +2450,131 @@ returns void language plpgsql security definer as $$
 begin
     perform pg_advisory_unlock(1399957337);
 end $$;
+
+-- The owner's hold on a mission source (docs/fleet-architecture.md §10.3,
+-- "Landing: the owner's hold"): while a source is held no task lands on it
+-- (its gates still run, its accepted tasks wait), and everything else goes
+-- on. The hold and its end are records: `source.held`, then
+-- `source.released` (the owner) or `source.hold_expired` (the integrator,
+-- once the database's clock reached its `expires_ms`).
+--
+-- A source the owner may hold: one a mission names as its first source,
+-- whatever the mission's state, of a checked shape, and a directory on this
+-- host (nothing lands on a remote one). Raises otherwise, so a mistyped path
+-- never looks like a hold.
+create or replace function spawn_source_holdable(p_source text)
+returns void language plpgsql as $$
+begin
+    if not spawn_source_allowed(p_source) then
+        raise exception 'a source is an absolute path or an https:// or ssh:// URL, not %',
+            coalesce(p_source, 'null') using errcode = '22023';
+    end if;
+    if not exists (select 1 from mission_missions where sources ->> 0 = p_source) then
+        raise exception 'no mission names % as its source: nothing lands there to hold',
+            p_source using errcode = '22023';
+    end if;
+    if p_source not like '/%' then
+        raise exception '% is remote: nothing lands there to hold', p_source
+            using errcode = '22023';
+    end if;
+end $$;
+
+-- Take the integrator's landing lock (spawn_landing_hold's) for an owner's
+-- hold on `p_source` (owner only): a landing whose compare-and-swap push has
+-- begun records its outcome first, so the main the caller reads next is the
+-- one that landing left, and none starts until the hold is recorded. Released
+-- by spawn_landing_release (or with the connection).
+create or replace function spawn_source_hold_lock(p_source text)
+returns void language plpgsql security definer as $$
+begin
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner holds a source' using errcode = '42501';
+    end if;
+    perform spawn_source_holdable(p_source);
+    perform pg_advisory_lock(1399957337);
+end $$;
+
+-- Record the owner's hold on `p_source` (owner only, under the landing lock
+-- taken by spawn_source_hold_lock): `source.held` naming the source's main
+-- `p_main` as the caller read it under that lock, `by` human, `bound_s` and
+-- the `reason` when given (at most 500 characters); the store writes its
+-- `expires_ms` (its own time + `bound_s` x 1000). A hold on a source already
+-- held renews it: `renews` names the active hold, which ends with this
+-- record. Returns `{hold, source, main, expires_ms, renews}`.
+create or replace function spawn_source_hold(p_source text, p_main text, p_bound_s integer,
+                                             p_reason text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_renews bigint;
+    v_id bigint;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner holds a source' using errcode = '42501';
+    end if;
+    perform spawn_source_holdable(p_source);
+    if not exists (select 1 from pg_locks
+                    where locktype = 'advisory' and pid = pg_backend_pid() and granted
+                      and classid = 0 and objid = 1399957337 and objsubid = 1) then
+        raise exception 'a hold is recorded under the landing lock (spawn_source_hold_lock)';
+    end if;
+    if coalesce(p_main, '') !~ '^[0-9a-f]{40}([0-9a-f]{24})?$' then
+        raise exception 'a hold names the source''s main as a full commit id, not %',
+            coalesce(p_main, 'null') using errcode = '22023';
+    end if;
+    if p_bound_s is null or p_bound_s < 1 or p_bound_s > 86400 then
+        raise exception 'SPAWN_SOURCE_HOLD_SECS is a whole number of seconds from 1 to 86400, not %',
+            coalesce(p_bound_s::text, 'null') using errcode = '22023';
+    end if;
+    if length(p_reason) > 500 then
+        raise exception 'a hold''s reason is at most 500 characters, not %', length(p_reason)
+            using errcode = '22023';
+    end if;
+    select hold into v_renews from mission_source_holds where source = p_source;
+    v_id := spawn_control_record(jsonb_build_object(
+        'type', 'source.held', 'source', p_source, 'main', p_main, 'by', 'human',
+        'bound_s', p_bound_s, 'renews', v_renews)
+        || case when p_reason is null then '{}'::jsonb
+                else jsonb_build_object('reason', p_reason) end);
+    return (select jsonb_build_object('hold', h.hold, 'source', h.source, 'main', h.main,
+                                      'expires_ms', h.expires_ms, 'renews', v_renews)
+              from mission_source_holds h where h.source = p_source and h.hold = v_id);
+end $$;
+
+-- The owner releases the active hold on `p_source` (owner only): records
+-- `source.released` naming it and returns `{source, released, waiting}`, the
+-- tasks waiting behind it, oldest first; they land at the integrator's next
+-- pass by the existing rules. With no active hold (never held, released or
+-- expired) it records nothing and returns `released` null, so a deploy that
+-- releases on every exit path never fails on it.
+create or replace function spawn_source_release(p_source text)
+returns jsonb language plpgsql security definer as $$
+declare
+    v_hold bigint;
+    v_waiting jsonb;
+begin
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception 'only the owner releases a source' using errcode = '42501';
+    end if;
+    select hold into v_hold from mission_source_holds where source = p_source;
+    if v_hold is null then
+        return jsonb_build_object('source', p_source, 'released', null, 'waiting', '[]'::jsonb);
+    end if;
+    select coalesce(jsonb_agg(k.id order by k.id), '[]'::jsonb) into v_waiting
+      from mission_tasks k where k.state = 'landing' and k.held_by = v_hold;
+    perform spawn_control_record(jsonb_build_object(
+        'type', 'source.released', 'source', p_source, 'hold', v_hold, 'by', 'human'));
+    return jsonb_build_object('source', p_source, 'released', v_hold, 'waiting', v_waiting);
+end $$;
+
+-- The records that end a hold, by source, found without reading the rest of
+-- the stream: a landing's stall is measured from the latest one on its
+-- source (dispatch/stall.rs).
+create index if not exists spawn_events_hold_end
+    on spawn_events ((kind -> 'detail' -> 'record' ->> 'source'), session_seq)
+    where session_id = 'session_control' and event_name = 'control.recorded'
+      and kind -> 'detail' -> 'record' ->> 'type' in ('source.released', 'source.hold_expired');
 
 -- A task's (or a mission's) records in the control stream, found without
 -- reading the rest: its stages, and the dispatcher's stall facts (`STALL_FACTS`).
@@ -2526,7 +2754,7 @@ begin
 end
 $$;
 
-revoke all on mission_missions, mission_residents, mission_tasks from public;
+revoke all on mission_missions, mission_residents, mission_tasks, mission_source_holds from public;
 -- Every mission function: search_path pinned, closed to public. The
 -- supervisor may call the ones it decides with; the rest are the owner's
 -- (humans, the dispatcher, the integrator).
@@ -2542,12 +2770,14 @@ begin
         'spawn_resident_retire(text)', 'spawn_resident_approve(text)',
         'spawn_task_delivered(bigint, bigint)', 'spawn_task_reported(bigint, text)',
         'spawn_task_reported(bigint, text, text)',
-        'spawn_control_apply(jsonb, bigint)', 'spawn_control_record(jsonb)',
+        'spawn_control_apply(jsonb, bigint, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',
         'spawn_source_moved(text, text, text)', 'spawn_host_record(jsonb)',
         'spawn_objective_assign(bigint, integer, text, text)', 'spawn_task_stages(bigint)',
-        'spawn_landing_hold(bigint)', 'spawn_landing_release()'] loop
+        'spawn_landing_hold(bigint)', 'spawn_landing_release()',
+        'spawn_source_holdable(text)', 'spawn_source_hold_lock(text)',
+        'spawn_source_hold(text, text, integer, text)', 'spawn_source_release(text)'] loop
         execute format('alter function %s set search_path = %I, pg_temp', v_function, current_schema());
         execute format('revoke execute on function %s from public', v_function);
     end loop;
@@ -2560,8 +2790,8 @@ begin
         execute format('grant execute on function %s to %I', v_function,
                        spawn_login_role('spawn_supervisor'));
     end loop;
-    execute format('grant select on mission_missions, mission_residents, mission_tasks to %I',
-                   spawn_login_role('spawn_supervisor'));
+    execute format('grant select on mission_missions, mission_residents, mission_tasks, '
+                   'mission_source_holds to %I', spawn_login_role('spawn_supervisor'));
 end
 $$;
 

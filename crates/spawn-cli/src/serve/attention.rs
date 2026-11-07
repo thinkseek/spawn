@@ -23,6 +23,10 @@
 //!     "told": false, "told_at_ms": null
 //!   }],
 //!   "told": [ ...the same, "told": true, "told_at_ms": <first digest that carried it> | null ],
+//!   "holds": [{                    // the owner's holds with a task waiting behind them
+//!     "source", "hold", "main", "by", "reason", "held_at_ms", "expires_ms",
+//!     "waiting": [12]              // the tasks waiting, oldest first
+//!   }],
 //!   "supervisor": null | {
 //!     "session_id", "agent_id", "live", "execution_id", "end_cause",
 //!     "busy",                      // a command into it is in flight
@@ -52,6 +56,11 @@
 //! their open jobs and each one's age on the database's clock: the reason
 //! they are in no queue. A job past its bound is an item of its own in
 //! `pending` or `told` (`background job past its bound`).
+//!
+//! `holds` is not among `pending` or `told`: the supervisor is told of a
+//! hold's expiry, never of a hold. It lists the owner's active holds on
+//! mission sources (`spawn mission hold`) that have at least one task waiting
+//! behind them, as the mission board shows them: work a person is holding.
 //!
 //! The supervisor's question is shown when its turn ended at its prompt
 //! and its judgement asks for a person: BLOCKED or WAITING with
@@ -158,7 +167,14 @@ pub(super) fn attention() -> Result<Value, String> {
         .iter()
         .map(|(text, at_ms)| json!({ "text": text, "at_ms": at_ms }))
         .collect();
-    Ok(answer(
+    let holds = match store.source_holds() {
+        Ok(holds) => waiting_holds(&holds),
+        Err(error) => {
+            warnings.push(format!("attention: the owner's holds: {error}"));
+            Value::Array(Vec::new())
+        }
+    };
+    let mut view = answer(
         &reading.rows,
         &reading.plan,
         &told_at,
@@ -166,7 +182,29 @@ pub(super) fn attention() -> Result<Value, String> {
         &Value::Array(for_owner),
         &warnings,
         super::now_ms(),
-    ))
+    );
+    if let Some(fields) = view.as_object_mut() {
+        fields.insert("holds".to_string(), holds);
+    }
+    Ok(view)
+}
+
+/// The owner's holds of `holds` (`PostgresStore::source_holds`: `{now_ms,
+/// holds}`) that have at least one task waiting behind them.
+fn waiting_holds(holds: &Value) -> Value {
+    Value::Array(
+        holds["holds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|hold| {
+                hold["waiting"]
+                    .as_array()
+                    .is_some_and(|tasks| !tasks.is_empty())
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 /// The answer from what was read: `plan` as [`dispatch::decide_with`] made
@@ -454,7 +492,7 @@ fn line_time(line: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said};
+    use super::{FOR_OWNER_ITEMS, answer, asking, asks, for_owner, question, said, waiting_holds};
     use crate::deliver::Work;
     use crate::dispatch::{Escalation, Facts, Why, decide_with};
     use serde_json::{Value, json};
@@ -1056,5 +1094,24 @@ mod tests {
             observation.ambiguity = None;
         }
         assert!(asking(&working).is_none());
+    }
+
+    /// Objective 34: the attention view lists the owner's holds only while a
+    /// task waits behind them, beside `pending` and `told`, never among them.
+    #[test]
+    fn a_hold_is_listed_only_while_a_task_waits_behind_it() {
+        let holds = json!({"now_ms": 5, "holds": [
+            {"source": "/srv/a.git", "hold": 7, "main": "m", "by": "human", "reason": null,
+             "held_at_ms": 1, "expires_ms": 10_800_001_i64, "waiting": [12, 15]},
+            {"source": "/srv/b.git", "hold": 9, "main": "n", "by": "human",
+             "reason": "owner gate", "held_at_ms": 2, "expires_ms": 20_002, "waiting": []},
+        ]});
+        let listed = waiting_holds(&holds);
+        assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+        assert_eq!(listed[0]["source"], "/srv/a.git");
+        assert_eq!(listed[0]["hold"], 7);
+        assert_eq!(listed[0]["waiting"], json!([12, 15]));
+        assert_eq!(waiting_holds(&json!({"now_ms": 5, "holds": []})), json!([]));
+        assert_eq!(waiting_holds(&json!({})), json!([]));
     }
 }

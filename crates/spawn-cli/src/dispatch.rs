@@ -399,20 +399,30 @@ pub(crate) enum Why {
     Charter,
     /// A worker's background job has run longer than its bound ([`jobs`]).
     BackgroundJob,
+    /// An owner's hold on a mission source reached its bound and the
+    /// integrator ended it by record ([`digest::hold_expiries`]): landings
+    /// there resumed, and an owner verdict judged against its main may be
+    /// stale.
+    HoldExpired,
 }
 
 impl Why {
     /// Whether an item of this kind is news rather than a condition: told
     /// once, it leaves nothing to resolve. A disk recovery, an approval, a
-    /// human's message and a pair of host faults at the gate (the
-    /// integrator judges again on its own) are news. Every other item is a
+    /// human's message, a pair of host faults at the gate (the integrator
+    /// judges again on its own) and an expired hold (its landings resumed
+    /// on their own) are news. Every other item is a
     /// condition that holds while its facts do (a worker's state, a stall,
     /// a path still low on disk, a gate still without room): told, it stays
     /// in [`Plan::told`] until its facts change.
     pub(crate) fn is_news(self) -> bool {
         matches!(
             self,
-            Self::DiskRecovered | Self::Approved | Self::Human | Self::GateHostFault
+            Self::DiskRecovered
+                | Self::Approved
+                | Self::Human
+                | Self::GateHostFault
+                | Self::HoldExpired
         )
     }
 }
@@ -612,7 +622,8 @@ pub(crate) struct Reading {
 
 /// The plan for this moment, reading only: the host's news (the disk items
 /// `disk` gives for the moment's clock, the gate-room and gate host-fault
-/// records, the stalls past their `bounds`, [`stall`], and the background
+/// records, the owner's holds that expired, the stalls past their `bounds`,
+/// [`stall`], and the background
 /// jobs past theirs, [`jobs`]) added to the facts and mission rows
 /// `loaded` ([`load`]), then [`decide_with`], then the input that gives the
 /// supervisor the `deployed` charter if it holds another ([`charter::give`];
@@ -644,6 +655,13 @@ pub(crate) fn read_plan(
         store
             .gate_host_fault_escalations()
             .map_err(|error| format!("gate host fault records: {error}"))?
+            .as_array()
+            .map_or(&[][..], Vec::as_slice),
+    ));
+    host.extend(digest::hold_expiries(
+        store
+            .hold_expiries()
+            .map_err(|error| format!("source hold records: {error}"))?
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
@@ -1391,6 +1409,99 @@ mod tests {
         assert!(
             plan.orders.is_empty() && plan.pending.is_empty(),
             "told once"
+        );
+    }
+
+    /// Objective 34: an owner's hold that reached its bound and was ended by
+    /// the integrator's `source.hold_expired` reaches an idle supervisor
+    /// once, as an item of `missions` tagged
+    /// `missions source-hold-expired-<event id>`, under its own heading, its
+    /// line naming the source, the hold (event id, reason, when taken, its
+    /// bound), when it expired, each waiting task with its mission, and that
+    /// landings resumed. Two expiries keep a line each.
+    #[test]
+    fn an_expired_hold_reaches_an_idle_supervisor_once_with_its_waiting_tasks() {
+        let records = [
+            serde_json::json!({"event_id": 88, "at_ms": 1_793_930_021_000_i64,
+                "source": "/srv/missions/spawn.git", "hold": 71,
+                "expires_ms": 1_793_930_020_000_i64, "reason": "owner gate ffc9fe7\nsecond line",
+                "held_at_ms": 1_793_919_220_000_i64, "bound_s": 10_800,
+                "main": "a3543c2e0f1b2c3d4e5f60718293a4b5c6d7e8f9",
+                "waiting": [{"task": 85, "mission": 4}, {"task": 91, "mission": 6}]}),
+            serde_json::json!({"event_id": 95, "at_ms": 1_793_930_030_000_i64,
+                "source": "/srv/missions/supply-pa.git", "hold": 90,
+                "expires_ms": 1_793_930_029_000_i64, "held_at_ms": 1_793_930_009_000_i64,
+                "bound_s": 20, "main": "b3543c2e0f1b2c3d4e5f60718293a4b5c6d7e8f9",
+                "waiting": []}),
+        ];
+        let items = super::digest::hold_expiries(&records);
+        let tags: Vec<String> = items.iter().map(Escalation::tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "missions source-hold-expired-88",
+                "missions source-hold-expired-95"
+            ]
+        );
+        assert!(items.iter().all(|item| item.why == Why::HoldExpired));
+        assert_eq!(items[0].since_ms, Some(1_793_930_021_000));
+        let line = &items[0].line;
+        for part in [
+            "the owner's hold 71 (\"owner gate ffc9fe7 second line\") on source \
+             /srv/missions/spawn.git",
+            "taken 2026-11-0",
+            "a bound of 10800 s",
+            "expired at 2026-11-0",
+            "ended by record 88",
+            "task #85 of mission 4, task #91 of mission 6 waited behind it",
+            "landings on /srv/missions/spawn.git resumed",
+            "against its main a3543c2e0f1b may be stale now: tell the owner",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+        assert!(
+            items[1].line.contains("no task waited behind it"),
+            "{}",
+            items[1].line
+        );
+        assert!(items.iter().all(|item| !item.line.contains('\n')));
+        assert!(
+            super::digest::hold_expiries(&[serde_json::json!({"source": "/srv/x.git"})]).is_empty(),
+            "a record without its event is no item"
+        );
+
+        let rows = [idle_supervisor()];
+        let plan = decide_with(&rows, &Work::default(), &items, true, NOW, "spawn");
+        let CommandAction::Input { text, tags } = &plan.orders[0].action else {
+            panic!("a digest is typed input");
+        };
+        assert_eq!(
+            tags,
+            &[
+                "missions source-hold-expired-88",
+                "missions source-hold-expired-95"
+            ]
+        );
+        let line = text
+            .lines()
+            .find(|line| line.contains("task #85"))
+            .expect("the first expiry's line");
+        assert!(
+            line.starts_with("- missions — a source hold expired: the owner's hold 71")
+                && line.contains("/srv/missions/spawn.git"),
+            "{line}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("/srv/missions/supply-pa.git")),
+            "each expiry keeps its own line: {text}"
+        );
+        let mut supervisor = idle_supervisor();
+        delivered(&mut supervisor, &plan.orders[0]);
+        let plan = decide_with(&[supervisor], &Work::default(), &items, true, NOW, "spawn");
+        assert!(
+            plan.orders.is_empty() && plan.pending.is_empty() && plan.told.is_empty(),
+            "told once, and resolved by the telling"
         );
     }
 

@@ -339,12 +339,15 @@ it, on the same ladder.
   | `activity` | delivered, waiting for its worker (a worker idle at its prompt with no report collected included) | the later of `task.delivered` and the session's latest fact (a record of the session that is not the Observer's nor storage's) | `SPAWN_STALL_ACTIVITY_SECS` (900) |
   | `judgement` | reported, under review | `task.reported` | `SPAWN_STALL_REVIEW_SECS` (1800) |
   | `judgement` | in a gated mission, the task the integrator judges next (`Mission::ready`'s order) | the later of the record that made it ready and the mission's latest verdict that is not `stale` | `SPAWN_STALL_GATE_SECS` (3600) |
-  | `landing` | landing | its `task.gated` accepted | `SPAWN_STALL_LANDING_SECS` (600) |
+  | `landing` | landing, its source not held by the owner (§10.3, "Landing: the owner's hold") | the later of its `task.gated` accepted and the record that ended the latest hold on its source | `SPAWN_STALL_LANDING_SECS` (600) |
   | `stop` | an ephemeral task closed (accepted without a gate, landed, cancelled) whose worker still runs | the record that closed it | `SPAWN_STALL_STOP_SECS` (300) |
   | `halted` | a halted mission with open tasks | its `mission.halted` | `SPAWN_STALL_HALTED_SECS` (0) |
 
   A task queued behind another of its session, or behind the task its
-  mission's gate judges next, is not escalated: the one ahead of it is. The
+  mission's gate judges next, is not escalated: the one ahead of it is. A
+  landing on a source the owner holds waits behind the hold, not for the
+  integrator: its `landing` step is not escalated while the hold lasts, and
+  after a record ends it the step is measured from that record. The
   tasks of a halted mission that wait for the gate or a landing are the
   halt's, escalated once per halt about session `missions`
   (`stall-mission-<mission>-halted-<record>`), with the reason and the open
@@ -1020,14 +1023,18 @@ record of what was judged (§14 of design.md).
   review takes the report as it is now). The checked functions refuse a
   verdict on a revision the task has left, and the fold applies none: a
   gate run on revision 0 never lands, or sends back, revision 1.
-- **The integrator:** `spawn integrate` (unit `spawn-integrate`). A mission
+- **The integrator:** `spawn integrate` (unit `spawn-integrate`). A pass
+  first records the owner's holds past their bound as expired (below,
+  "Landing: the owner's hold"). A mission
   whose source it cannot fetch this pass is skipped: the mirror's last copy
   of `main` is no reading of the source's. A mission whose source has
   another mission's task in `landing` waits for it (the push may have moved
-  `main` before its `task.landed`). Every pass visits every mission (its
+  `main` before its `task.landed`), unless that task waits behind the
+  owner's hold on the source (its `task.held` names the active hold: it
+  pushed nothing). Every pass visits every mission (its
   halts, budget, landing and objective assignment never wait for another
   mission's gate); only a landing makes the rest of its source wait for the
-  next pass. A free gate goes to the ready task that has waited longest,
+  next pass, and a task waiting behind a hold is no landing. A free gate goes to the ready task that has waited longest,
   across missions, counted from its report or from the end of its
   mission's previous judging, whichever is later; the mission id decides
   nothing. For a mission's lowest ready task (one per mission at a time:
@@ -1190,8 +1197,97 @@ record of what was judged (§14 of design.md).
      (`--force-with-lease` on the base); if `main` moved meanwhile the
      verdict is `stale` and the task is judged again, unless the candidate
      is already in `main`'s history (an earlier push of this landing whose
-     record was lost), which is a landing;
+     record was lost), which is a landing. Under the landing lock, before
+     the push, it reads the owner's hold on the source from the store: on a
+     held source it pushes nothing (below);
   7. records `task.landed` (`from`, `to` = C).
+- **Landing: the owner's hold.** An owner deploy of Spawn gates a candidate
+  against the live `main` for 25-80 minutes, then `deploy/deploy.sh`
+  refuses unless the verdict's base is still the live `main`: a task landing
+  in between makes the verdict stale (2026-11-06 21:45: task 85 landed
+  during the owner's gate). Stopping `spawn-integrate` for the whole gate
+  prevented that and stopped everything else too: every mission's gates
+  (killed with no record) and objective assignment, which runs only in the
+  integrator. The hold stops landings on one source and nothing else:
+  - `spawn mission hold --source <source> [--reason <text>]` (owner only;
+    the supervisor's login is refused). `<source>` is a mission source as
+    the missions name it (the first source of at least one mission, whatever
+    its state); a source no mission names, or a remote one, is refused and
+    nothing is recorded. Under the integrator's landing lock (so a landing
+    whose push has begun records its outcome first) it reads the source's
+    `main` M and records `source.held` {`source`, `main`: M, `by`: `human`,
+    `bound_s`, `reason` (at most 500 characters, when given), `renews`};
+    the store writes `expires_ms`, the record's own time + `bound_s` x 1000.
+    `bound_s` is `SPAWN_SOURCE_HOLD_SECS` in the command's environment, a
+    whole number from 1 to 86400, 10800 (3 h) by default: longer than the
+    slowest owner gate plus a deploy, and than the gate's default wall
+    clock. Any other value is refused, naming the variable. It prints
+    `{hold, source, main, expires_ms, renews}`: gate the candidate against
+    that `main`. A hold on a source already held renews it: a new
+    `source.held` naming `renews` (the active hold), which ends with it (no
+    release or expiry is recorded for it). A source has at most one active
+    hold.
+  - `spawn mission release --source <source>` (owner only) records
+    `source.released` {`source`, `hold`, `by`: `human`} and prints
+    `{source, released, waiting}`. With no active hold it records nothing
+    and prints `released` null, so a deploy may release on every exit path.
+  - The fold keeps the active holds in `mission_source_holds` (by source:
+    `hold`, `main`, `by`, `reason`, `held_at_ms`, `expires_ms`), set by
+    `source.held` and removed by the `source.released` or
+    `source.hold_expired` naming the hold; `spawn_control_refold()`
+    rebuilds it, and each task's `held_by`.
+  - While a source is held, no task lands on it. `land()` reads the hold
+    from the store under the landing lock, before its push, never from
+    memory, and pushes nothing. A candidate already in `main`'s history
+    landed before the hold and is recorded `task.landed`; any other records
+    `task.held` {`id`, `hold`, `source`} once per task and hold (the store
+    records nothing for a second, and accepts one only for a task in
+    `landing` and the active hold on its mission's source), and the task
+    stays `landing` (`held_by` the hold). So a hold never splits a push from
+    its record. The source's gates still run and record their verdicts (a
+    judging thread's own `land()` records its `task.held`). A task waiting
+    behind the hold ends nothing early: its mission's step goes on to the
+    baseline check and objective assignment, its source is not counted as
+    moved, and the mission's other ready tasks wait behind it (one task per
+    mission between its gate and its landing); the other missions on the
+    source are judged as usual. Assignment, the gates and landings of other
+    sources, halts, budgets and `spawn mission moved` go on, and the halt
+    for a `main` moved with no record stays.
+  - After a record ends the hold, a waiting task lands at the next pass by
+    the rules above: when `main` moved meanwhile (a deploy that recorded
+    `source.moved`) its landing is `stale` and it is judged again against
+    the new `main`, never discarded and never counted.
+  - The bound. At the start of each pass, before any mission's step, the
+    integrator records `source.hold_expired` {`source`, `hold`,
+    `expires_ms`, `waiting`: the tasks waiting behind it, oldest first} for
+    every active hold whose `expires_ms` the database's clock
+    (`spawn_now_ms()`) has reached; the store refuses it before then and for
+    a hold that is not the active one, so a release or renewal recorded first
+    wins. Only that record ends the hold: past `expires_ms` without it
+    nothing lands, and a hold that expired while the integrator was down is
+    recorded expired at its first pass, before anything lands. The
+    dispatcher's digest tells the supervisor once ("a source hold expired",
+    session `missions`, tag `missions source-hold-expired-<event>`): the
+    source, the hold (its event, reason, when it was taken and its bound),
+    when it expired, each waiting `task #<id>` with its mission, and that
+    landings resumed, so an owner verdict judged against the hold's `main`
+    may be stale. A released hold is told to nobody.
+  - Visible: `spawn mission list` and `GET /api/missions` carry `holds`
+    (every active hold with its `waiting` tasks) and each mission's `hold`
+    (the active hold on its source, or null); `GET /api/attention` carries
+    `holds`, only those with a task waiting, beside `pending` and `told`
+    (the supervisor is told of an expiry, never of a hold); `spawn task
+    stages` shows `held`. A task waiting behind a hold is no landing stall
+    (§3, "Stalls").
+  - The owner's use (`deploy/hold.sh`, `deploy/deploy.sh`): hold the Spawn
+    source, gate the candidate against the hold's `main`, deploy; the
+    deploy releases the hold once `main` moved forward and `source.moved`
+    is recorded, or on any failure. A hold forgotten or left by a crash
+    expires by itself. Nothing in it stops or restarts `spawn-integrate`.
+    Every decision rests on records read from the store under the landing
+    lock (design.md §14); the expiry's only use of time is the recorded
+    `expires_ms` against the database's clock, and what ends the hold is
+    its record, not the clock.
 - **On rejection:** the task goes back to the worker (`revise`), with the
   gate log as the note. A `rejected` decided after a run of the head alone
   names `head`, `head_base` and `head_verdict` (`rejected`), so the record

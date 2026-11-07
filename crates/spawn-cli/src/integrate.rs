@@ -1,8 +1,14 @@
 //! `spawn integrate`: the one landing path (docs/fleet-architecture.md
 //! §10.3).
 //!
-//! For every open mission with a gate, and every done one while the closure
-//! rule (`spawn_task_may_continue`) lets its work go on, one pass:
+//! A pass first records, before any mission's step, `source.hold_expired`
+//! for every owner's hold whose recorded `expires_ms` the database's clock
+//! (`spawn_now_ms()`) has reached ([`expire_holds`]; the hold, below at 3).
+//! Only that record ends a hold: past `expires_ms` without it nothing lands,
+//! and a hold that expired while the integrator was down is recorded at its
+//! first pass, before anything lands. Then, for every open mission with a
+//! gate, and every done one while the closure rule
+//! (`spawn_task_may_continue`) lets its work go on, one step:
 //!
 //! 1. a halt rule that fired stops the mission's landings until a human
 //!    resumes it: three gate rejections in a row, three aborts in a row
@@ -15,7 +21,19 @@
 //!    (its push may have moved main before its record);
 //! 2. a delivered task over its mission's budget is aborted and its worker
 //!    stopped;
-//! 3. a task whose gate passed is landed (again, after a crash);
+//! 3. a task whose gate passed is landed (again, after a crash), unless the
+//!    owner holds its source (`spawn mission hold`, a `source.held` record):
+//!    [`land`] reads the hold from the store under the landing lock, before
+//!    its push, never from memory, and on a held source pushes nothing. A
+//!    candidate already under main landed before the hold and is recorded
+//!    `task.landed`; any other records `task.held` (once per task and hold)
+//!    and stays `landing`, so a hold never splits a push from its record.
+//!    A task waiting behind the hold ends nothing early: the step goes on to
+//!    the baseline check and the assignment (5), its source is not counted
+//!    as moved, and the mission's other ready tasks wait behind it. After a
+//!    record ends the hold (`source.released`, `source.hold_expired`) it
+//!    lands at the next pass by the rules below (`stale` and judged again
+//!    when main moved meanwhile);
 //! 4. otherwise the next ready task is judged: accepted by the supervisor
 //!    (`accept` = review), or also just reported (`gate`). The candidate is
 //!    what the agent published: the source's `refs/heads/spawn/<agent>`
@@ -187,7 +205,10 @@
 //! mission. Only a landing ends anything early: it moves its source's main
 //! and the baselines of the missions on it, so the rest of that source
 //! waits for the next pass, which reads everything again; other sources go
-//! on. The ready tasks the pass found are given gates after every mission
+//! on. A task waiting behind the owner's hold is no landing: it moved
+//! nothing, and once its `task.held` names the active hold it is no landing
+//! in flight either ([`landing_elsewhere`]), so the other missions on the
+//! held source are judged as usual (their accepted tasks wait too). The ready tasks the pass found are given gates after every mission
 //! had its step ([`Integrator::start_ready`]): the one that has waited
 //! longest first, from when it was reported or from when its mission's
 //! previous judging ended, whichever is later. The mission id decides
@@ -420,6 +441,12 @@ pub(crate) struct Mission {
     pub(crate) objectives: Option<Value>,
     #[serde(default)]
     pub(crate) source: Option<String>,
+    /// The owner's active hold on its source (the `source.held` record's
+    /// event id), if one, as the pass read it: which of its landing tasks
+    /// wait behind it ([`Mission::in_flight`]). A landing never trusts it:
+    /// [`land`] reads the hold from the store under the landing lock.
+    #[serde(default)]
+    pub(crate) hold: Option<i64>,
     /// Its tasks the closure rule lets go on: every open task of an open
     /// mission; of a done one, delivered, reported, accepted and landing.
     #[serde(default)]
@@ -461,6 +488,10 @@ pub(crate) struct Task {
     /// left it ready): how long it has waited for a gate.
     #[serde(default)]
     pub(crate) updated_at_ms: i64,
+    /// The owner's hold its landing last waited behind (its latest
+    /// `task.held`), if any.
+    #[serde(default)]
+    pub(crate) held_by: Option<i64>,
 }
 
 impl Mission {
@@ -478,6 +509,17 @@ impl Mission {
         self.tasks
             .iter()
             .find(|task| task.state == TaskState::Landing)
+    }
+
+    /// A landing in flight: a task in `landing` whose push may have moved
+    /// main before its record. Not one whose `task.held` names the active
+    /// hold on its source: its `land()` pushed nothing, so main says nothing
+    /// about it.
+    fn in_flight(&self) -> Option<&Task> {
+        self.tasks.iter().find(|task| {
+            task.state == TaskState::Landing
+                && !(task.held_by.is_some() && task.held_by == self.hold)
+        })
     }
 }
 
@@ -828,7 +870,7 @@ fn git(arguments: &[&str]) -> Result<String, String> {
 }
 
 /// The source's default branch and its commit, as `git ls-remote` sees it.
-fn source_head(source: &str) -> Result<(String, String), String> {
+pub(crate) fn source_head(source: &str) -> Result<(String, String), String> {
     let source = sources::MissionSource::parse(source)?;
     let listing = git(&["ls-remote", "--symref", "--", source.as_str(), "HEAD"])?;
     let mut branch = "refs/heads/main".to_string();
@@ -1117,6 +1159,9 @@ impl Integrator {
 
     /// One pass over every gated mission, holding the integrator's lock.
     fn pass_on(&self, store: &Arc<PostgresStore>) -> Result<(), String> {
+        // A hold past its bound ends by its record, before any mission's
+        // step: nothing lands on its source until then.
+        expire_holds(store)?;
         let missions: Vec<Mission> =
             serde_json::from_value(store.gated_missions().map_err(|error| error.to_string())?)
                 .map_err(|error| format!("gated missions: {error}"))?;
@@ -1179,11 +1224,18 @@ impl Integrator {
         // gate of its own, or of another mission on its source, runs (they
         // share the mirror and the main it judges against).
         let mut judgeable = None;
+        // A task that waits behind the owner's hold on the source keeps the
+        // mission's other ready tasks waiting (one task per mission between
+        // its gate and its landing) and ends nothing early.
+        let mut held = false;
         if !self.busy(mission) {
             let mirror = sources::ensure_mirror(&self.judge.root, Some(source))
                 .map_err(|error| error.to_string())?;
             if let Some(task) = mission.landing() {
-                return land(store, &mirror, source, task).map(|()| true);
+                match land(store, &mirror, source, task)? {
+                    Landing::Held(_) => held = true,
+                    Landing::Landed | Landing::Stale | Landing::Gone => return Ok(true),
+                }
             }
             // Another mission's landing on this source may have moved main
             // without its record yet (a crash between the push and
@@ -1234,29 +1286,11 @@ impl Integrator {
         {
             eprintln!("integrate: mission {}: {error}", mission.id);
         }
+        if held {
+            return Ok(false);
+        }
         if let (Some((mirror, main)), Some(task)) = (judgeable, mission.ready()) {
-            // The gate had no room last time: wait out the backoff, then try.
-            if let Some(wait) = room_wait(mission, task.id, now_ms()) {
-                println!(
-                    "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
-                    mission.id,
-                    task.id,
-                    wait.as_secs()
-                );
-                return Ok(false);
-            }
-            // The gate's last run on it was a host fault: wait until the
-            // recorded due time, then judge it again. The mission's other
-            // tasks wait behind it, as they do behind a `no_room`.
-            if let Some(wait) = host_wait(mission, task.id, now_ms()) {
-                println!(
-                    "integrate: mission {}: the gate's last run on task {} was a host fault ({} \
-                     in a row); it is judged again in {}s",
-                    mission.id,
-                    task.id,
-                    mission.gate_host_faults,
-                    wait.as_millis().div_ceil(1000)
-                );
+            if gate_waits(mission, task) {
                 return Ok(false);
             }
             let mut gated = mission.clone();
@@ -1661,7 +1695,8 @@ impl Judge {
                     candidate: Some(candidate),
                     ..task.clone()
                 };
-                land(store, mirror, source, &landing)
+                // On a held source this records its `task.held`: it waits.
+                land(store, mirror, source, &landing).map(|_| ())
             }
             // A rejection whose every failure is the host's (the test
             // database failed) is no verdict on the work: `host_fault`, not
@@ -2328,22 +2363,79 @@ fn now_ms() -> i64 {
     spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0
 }
 
+/// Whether `task`'s gate waits this pass, said when it does: the gate had
+/// no room last time (it waits out the backoff, then tries), or its last run
+/// on it was a host fault (it waits until the recorded due time, then judges
+/// it again). The mission's other tasks wait behind it.
+fn gate_waits(mission: &Mission, task: &Task) -> bool {
+    if let Some(wait) = room_wait(mission, task.id, now_ms()) {
+        println!(
+            "integrate: mission {}: the gate had no room; task {} is judged again in {}s",
+            mission.id,
+            task.id,
+            wait.as_secs()
+        );
+        return true;
+    }
+    if let Some(wait) = host_wait(mission, task.id, now_ms()) {
+        println!(
+            "integrate: mission {}: the gate's last run on task {} was a host fault ({} in a \
+             row); it is judged again in {}s",
+            mission.id,
+            task.id,
+            mission.gate_host_faults,
+            wait.as_millis().div_ceil(1000)
+        );
+        return true;
+    }
+    false
+}
+
+/// What [`land`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// Recorded `task.landed`: the push moved main, or the candidate was
+    /// already under it.
+    Landed,
+    /// Main moved past the task's base without it (or it had none): gated
+    /// `stale`, judged again.
+    Stale,
+    /// No longer landing (its mission was dropped).
+    Gone,
+    /// Its source is held (the hold's event id): nothing was pushed, and the
+    /// task waits behind the hold, `task.held` recorded once per hold.
+    Held(i64),
+}
+
 /// Move the source's default branch from the task's base to its candidate,
 /// only if it is still at the base, and record the landing. A branch that
 /// moved meanwhile sends the task back to be judged again, unless the
 /// candidate is already in its history: a push of an earlier pass that was
 /// never recorded (the integrator stopped in between), with main moved on
 /// top of it since. That landing happened, and is recorded so.
-fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Result<(), String> {
+///
+/// The owner's hold on the source is read from the store under the landing
+/// lock, before any push, never from memory: on a held source nothing is
+/// pushed. A candidate already under main landed before the hold and is
+/// recorded `task.landed`; any other records `task.held` (once per task and
+/// hold) and stays `landing`. So a hold never splits a push from its record.
+fn land(
+    store: &PostgresStore,
+    mirror: &Path,
+    source: &str,
+    task: &Task,
+) -> Result<Landing, String> {
     let (Some(base), Some(candidate)) = (task.base.as_deref(), task.candidate.as_deref()) else {
         return record(
             store,
             &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
                     "revision": task.revisions}),
-        );
+        )
+        .map(|()| Landing::Stale);
     };
-    // Held until the landing is recorded: dropping the mission waits for it.
-    let Some(_hold) = store
+    // Held until the landing is recorded: dropping the mission waits for it,
+    // and so does an owner's hold.
+    let Some(_lock) = store
         .landing_hold(task.id)
         .map_err(|error| error.to_string())?
     else {
@@ -2351,10 +2443,17 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
             "integrate: task {} is no longer landing (its mission was dropped)",
             task.id
         );
-        return Ok(());
+        return Ok(Landing::Gone);
     };
-    let (branch, _) = source_head(source)?;
+    // The owner's hold, read now, under the lock: no push on a held source.
+    if let Some(hold) = store
+        .active_hold(source)
+        .map_err(|error| error.to_string())?
+    {
+        return land_held(store, mirror, source, task, (base, candidate), hold);
+    }
     let mirror_path = mirror.to_string_lossy().to_string();
+    let (branch, _) = source_head(source)?;
     let pushed = git(&[
         "--git-dir",
         &mirror_path,
@@ -2390,7 +2489,8 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
                 store,
                 &json!({"type": "task.gated", "id": task.id, "verdict": "stale",
                         "revision": task.revisions}),
-            );
+            )
+            .map(|()| Landing::Stale);
         }
         println!(
             "integrate: task {}: {candidate} is already under {branch} ({now})",
@@ -2410,6 +2510,106 @@ fn land(store: &PostgresStore, mirror: &Path, source: &str, task: &Task) -> Resu
         &json!({"type": "task.landed", "id": task.id, "from": base, "to": candidate}),
     )?;
     println!("integrate: task {} landed {candidate} on {source}", task.id);
+    Ok(Landing::Landed)
+}
+
+/// [`land`] on a source the owner holds (`hold`, read under the landing
+/// lock the caller holds): nothing is pushed. A candidate already in the
+/// source's main landed before the hold, and is recorded `task.landed`; any
+/// other waits behind the hold, `task.held` recorded once per task and hold.
+/// A fetch that fails shows nothing under main: the task waits.
+fn land_held(
+    store: &PostgresStore,
+    mirror: &Path,
+    source: &str,
+    task: &Task,
+    (base, candidate): (&str, &str),
+    hold: i64,
+) -> Result<Landing, String> {
+    let (branch, now) = source_head(source)?;
+    let under_main = now == candidate
+        || (sources::refresh(mirror, source).is_ok()
+            && git(&[
+                "--git-dir",
+                &mirror.to_string_lossy(),
+                "merge-base",
+                "--is-ancestor",
+                candidate,
+                &now,
+            ])
+            .is_ok());
+    if under_main {
+        println!(
+            "integrate: task {}: {candidate} is already under {branch} ({now}), from before \
+             hold {hold}",
+            task.id
+        );
+        record(
+            store,
+            &json!({"type": "task.landed", "id": task.id, "from": base, "to": candidate}),
+        )?;
+        return Ok(Landing::Landed);
+    }
+    if store
+        .task_held(task.id, hold, source)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        println!(
+            "integrate: task {} waits behind the owner's hold {hold} on {source}: nothing lands \
+             there until a record ends it",
+            task.id
+        );
+    }
+    Ok(Landing::Held(hold))
+}
+
+/// One active owner's hold, as [`PostgresStore::source_holds`] reads it.
+#[derive(Debug, Clone, Deserialize)]
+struct SourceHold {
+    source: String,
+    hold: i64,
+    expires_ms: i64,
+}
+
+/// The active holds and the database's clock when they were read.
+#[derive(Debug, Clone, Deserialize)]
+struct SourceHolds {
+    now_ms: i64,
+    #[serde(default)]
+    holds: Vec<SourceHold>,
+}
+
+/// The holds whose `expires_ms` the database's clock (`now_ms`) has reached.
+fn expired(holds: &SourceHolds) -> impl Iterator<Item = &SourceHold> {
+    holds
+        .holds
+        .iter()
+        .filter(move |hold| hold.expires_ms <= holds.now_ms)
+}
+
+/// Record `source.hold_expired` for every active hold whose `expires_ms` the
+/// database's clock has reached, whichever missions are on its source. Only
+/// that record ends the hold: past `expires_ms` without it nothing lands.
+/// The store refuses it for a hold released or renewed meanwhile (the
+/// record first wins), which is said and changes nothing.
+fn expire_holds(store: &PostgresStore) -> Result<(), String> {
+    let holds: SourceHolds =
+        serde_json::from_value(store.source_holds().map_err(|error| error.to_string())?)
+            .map_err(|error| format!("source holds: {error}"))?;
+    for hold in expired(&holds) {
+        match store.hold_expired(&hold.source, hold.hold) {
+            Ok(event) => println!(
+                "integrate: the owner's hold {} on {} reached its bound: expired (record {event}); \
+                 landings there resume",
+                hold.hold, hold.source
+            ),
+            Err(error) => eprintln!(
+                "integrate: the owner's hold {} on {}: {error}",
+                hold.hold, hold.source
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -2430,12 +2630,14 @@ fn unlandable(source: &str) -> Option<String> {
 }
 
 /// Another mission's task landing on `mission`'s source, if one is:
-/// `(mission, task)`. Its push may have moved main before its record.
+/// `(mission, task)`. Its push may have moved main before its record. A task
+/// waiting behind the active hold on the source is not one
+/// ([`Mission::in_flight`]).
 fn landing_elsewhere(missions: &[Mission], mission: &Mission) -> Option<(i64, i64)> {
     missions
         .iter()
         .filter(|other| other.id != mission.id && other.source == mission.source)
-        .find_map(|other| other.landing().map(|task| (other.id, task.id)))
+        .find_map(|other| other.in_flight().map(|task| (other.id, task.id)))
 }
 
 fn record(store: &PostgresStore, value: &Value) -> Result<(), String> {
@@ -3828,6 +4030,42 @@ mod tests {
         assert!(over_budget(&budget, 46 * 60_000, 0).is_some());
         assert!(over_budget(&budget, 0, 61).is_some());
         assert_eq!(over_budget(&json!({}), i64::MAX, i64::MAX), None);
+    }
+
+    /// Objective 34: a task whose `task.held` names the active hold on its
+    /// source pushed nothing, so it is no landing in flight: the other
+    /// missions on the source do not wait for it. A `landing` task without
+    /// one (not held yet, or held by a hold that ended) still makes them
+    /// wait, as before.
+    #[test]
+    fn landing_elsewhere_ignores_a_task_waiting_behind_the_active_hold() {
+        let on_source = |id: i64, hold: Option<i64>, held_by: Option<i64>| {
+            let mut found = mission(0, 0, 0);
+            found.id = id;
+            found.source = Some("/srv/s.git".to_string());
+            found.hold = hold;
+            found.tasks = serde_json::from_value(json!([
+                {"id": id * 10, "agent_id": "agent_a", "session_id": "session_a",
+                 "state": "landing", "held_by": held_by},
+            ]))
+            .expect("tasks");
+            found
+        };
+        let waiting = on_source(2, None, None);
+        for (hold, held_by, waits) in [
+            (Some(7), Some(7), false),
+            (Some(7), None, true),
+            (Some(9), Some(7), true),
+            (None, Some(7), true),
+            (None, None, true),
+        ] {
+            let missions = [waiting.clone(), on_source(1, hold, held_by)];
+            assert_eq!(
+                super::landing_elsewhere(&missions, &missions[0]),
+                waits.then_some((1, 10)),
+                "hold {hold:?}, held_by {held_by:?}"
+            );
+        }
     }
 
     #[test]
@@ -6754,6 +6992,370 @@ mod database_tests {
         assert_eq!(record["verdict"], "rejected", "{record}");
         let after = gated(&db, mission);
         assert_eq!((after.gate_rejections, after.gate_host_faults), (1, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- the owner's hold (objective 034) --------------------------------
+
+    /// A stub gate that accepts every candidate.
+    const ACCEPTING_GATE: &str =
+        "printf '{\"verdict\":\"accepted\"}\\n' >\"$SPAWN_GATE_VERDICT\"\n";
+
+    /// Hold `source` for `bound` seconds as `spawn mission hold` does: the
+    /// hold's event id.
+    fn hold(db: &Db, source: &str, bound: i32) -> i64 {
+        crate::missions::hold_source(&db.store, source, bound, Some("owner gate test"))
+            .expect("the hold")["hold"]
+            .as_i64()
+            .expect("the hold's event id")
+    }
+
+    /// The event ids of the control records of type `kind` naming task
+    /// `task` (`id`), oldest first.
+    fn task_records(db: &Db, kind: &str, task: i64) -> Vec<i64> {
+        db.admin()
+            .query(
+                "select id from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = $1
+                    and kind -> 'detail' -> 'record' ->> 'id' = $2
+                  order by session_seq",
+                &[&kind, &task.to_string()],
+            )
+            .expect("records")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    /// The control records of type `kind` (`source.%`), oldest first, as
+    /// `(event id, record)`.
+    fn source_records(db: &Db, kind: &str) -> Vec<(i64, Value)> {
+        db.admin()
+            .query(
+                "select id, kind -> 'detail' -> 'record' from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = $1
+                  order by session_seq",
+                &[&kind],
+            )
+            .expect("records")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    fn task_state(db: &Db, mission: i64, task: i64) -> String {
+        db.mission(mission)["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|row| row["id"] == task)
+            .and_then(|row| row["state"].as_str())
+            .expect("the task's state")
+            .to_string()
+    }
+
+    /// `land()` on a held source pushes nothing: it records one `task.held`
+    /// naming the hold (a second call, and the passes after, record none)
+    /// and leaves the task `landing`.
+    #[test]
+    fn a_landing_on_a_held_source_pushes_nothing_and_waits_once_per_hold() {
+        let (base, source, scenarios, integrator) = world("held-landing", "exit 1\n");
+        let db = Db::new("held_landing");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        let work = push_work(&base, &source, &agent_of(&db, mission, task), "w.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": work}));
+        let held = hold(&db, &source, 600);
+        let mirror =
+            crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
+        let landing = ready_task(&db, task);
+        for _ in 0..2 {
+            assert_eq!(
+                super::land(&db.store, &mirror, &source, &landing),
+                Ok(super::Landing::Held(held))
+            );
+        }
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(source_main(&source), b0, "nothing was pushed");
+        assert_eq!(
+            task_records(&db, "task.held", task).len(),
+            1,
+            "once per task and hold"
+        );
+        assert!(task_records(&db, "task.landed", task).is_empty());
+        assert_eq!(task_state(&db, mission, task), "landing");
+        assert!(db.mission(mission)["halted"].is_null());
+        assert_eq!(db.mission(mission)["hold"], held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A candidate already in the source's main (a push from before the hold
+    /// whose record was lost) landed before the hold: recorded `task.landed`
+    /// under the hold, as without one, and main is left where it is.
+    #[test]
+    fn a_landing_already_under_main_is_recorded_landed_under_a_hold() {
+        let (base, source, scenarios, integrator) = world("held-under-main", "exit 1\n");
+        let db = Db::new("held_under_main");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        let c1 = main_moves(&base, &source, "landed.txt");
+        let c2 = main_moves(&base, &source, "on-top.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": c1}));
+        hold(&db, &source, 600);
+        crate::sources::ensure_mirror(&integrator.judge.root, Some(&source)).expect("mirror");
+
+        integrator.pass_on(&db.store).expect("a pass");
+        assert_eq!(task_state(&db, mission, task), "landed");
+        assert!(task_records(&db, "task.held", task).is_empty());
+        assert_eq!(db.mission(mission)["baseline"], c1.as_str());
+        assert_eq!(source_main(&source), c2, "main is left where it is");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The hold is taken under the landing lock: while a landing holds it
+    /// (its compare-and-swap push begun), the hold waits for the landing's
+    /// record, then names the main that landing left.
+    #[test]
+    fn a_hold_taken_while_a_landing_holds_the_lock_waits_for_its_record() {
+        let (base, source, scenarios, _integrator) = world("hold-waits", "exit 1\n");
+        let db = Db::new("hold_waits");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": "c"}));
+        let owner = PostgresStore::connect_in_schema(&db.url, &db.schema).expect("the owner's CLI");
+        let lock = db
+            .store
+            .landing_hold(task)
+            .expect("the landing lock")
+            .expect("still landing");
+        let held_source = source.clone();
+        let holder = std::thread::spawn(move || {
+            crate::missions::hold_source(&owner, &held_source, 600, None)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        assert!(
+            !holder.is_finished(),
+            "the hold waits for the landing's lock"
+        );
+        let c1 = main_moves(&base, &source, "landed.txt");
+        db.record(&json!({"type": "task.landed", "id": task, "from": b0, "to": c1}));
+        drop(lock);
+        let held = holder.join().expect("the holder").expect("the hold");
+        assert_eq!(held["main"], c1.as_str(), "the main the landing left");
+        let landed = task_records(&db, "task.landed", task);
+        assert!(
+            held["hold"].as_i64() > landed.first().copied(),
+            "the landing's record comes first: {held} after {landed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A task waiting behind the hold ends nothing early: its mission's step
+    /// goes on to assign its next objective, and its source is not counted
+    /// as moved. Once its `task.held` names the active hold, another mission
+    /// on the held source is judged as usual (its gate runs and records its
+    /// verdict), and its accepted task waits behind the hold too.
+    #[test]
+    fn a_task_waiting_behind_a_hold_ends_nothing_early() {
+        let marks = fresh_marks("spawn-db-held-step");
+        let _release = Release(marks.clone());
+        let (base, source, scenarios, integrator) = world("held-step", &holding_gate(&marks));
+        let db = Db::new("held_step");
+        let b0 = source_main(&source);
+        let a = objective_mission(&db, &base, &source, &scenarios, "rh", 2);
+        integrator
+            .pass_on(&db.store)
+            .expect("objective 1 is assigned");
+        let tasks = |mission: i64| db.mission(mission)["tasks"].as_array().map_or(0, Vec::len);
+        assert_eq!(tasks(a), 1);
+        let first = db.mission(a)["tasks"][0]["id"].as_i64().expect("its task");
+        db.store.task_delivered(first, 1).expect("delivered");
+        assert!(db.store.task_reported(first, "done").expect("reported"));
+        let work = push_work(&base, &source, &agent_of(&db, a, first), "a.txt");
+        db.record(&json!({"type": "task.gated", "id": first, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": work}));
+        let c = db.gated_mission(&source, &scenarios);
+        let ready = db.reported_task(c, "c");
+        let pushed = push_work(&base, &source, &agent_of(&db, c, ready), "c.txt");
+        let held = hold(&db, &source, 600);
+        std::fs::write(
+            base.join("backlog-rh").join("002.json"),
+            r#"{"id": 2, "title": "Two", "prompt": "Do two."}"#,
+        )
+        .expect("objective 2");
+
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass under the hold");
+        assert_eq!(
+            tasks(a),
+            2,
+            "objective 2 is assigned while the source is held"
+        );
+        assert_eq!(task_records(&db, "task.held", first).len(), 1);
+        assert!(
+            started(&marks).is_empty(),
+            "C waited for A's task, not held yet when read"
+        );
+        integrator.pass_on(&db.store).expect("the next pass");
+        let started = wait_started(&marks, 1);
+        let mirror = mirror_of(&integrator, &source);
+        assert_eq!(
+            parent(&[&mirror], &started[0], 2),
+            pushed,
+            "C's gate runs on the held source: A's waiting task is no landing in flight and \
+             its source was not counted as moved"
+        );
+        std::fs::write(marks.join("release"), "").expect("release");
+        integrator.settle();
+        assert_eq!(
+            verdicts(&db, ready),
+            ["accepted"],
+            "the gate on a held source recorded"
+        );
+        assert_eq!(task_state(&db, c, ready), "landing");
+        assert_eq!(
+            task_records(&db, "task.held", ready).len(),
+            1,
+            "its judging's land()"
+        );
+        assert_eq!(task_state(&db, a, first), "landing");
+        assert_eq!(
+            source_main(&source),
+            b0,
+            "nothing landed on the held source"
+        );
+        for mission in [a, c] {
+            assert!(db.mission(mission)["halted"].is_null());
+            assert_eq!(db.mission(mission)["hold"], held);
+        }
+        for base in [base, marks] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// After the release a waiting task lands at the next pass, after the
+    /// release's record. When main moved meanwhile (an owner deploy that
+    /// recorded `source.moved`), its landing is `stale` and it is judged
+    /// again against the new main: never discarded, never counted, no halt.
+    #[test]
+    fn after_the_release_a_waiting_task_lands_or_is_judged_again_on_a_moved_main() {
+        let (base, source, scenarios, integrator) = world("held-release", ACCEPTING_GATE);
+        let db = Db::new("held_release");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let first = db.reported_task(mission, "one");
+        push_work(&base, &source, &agent_of(&db, mission, first), "one.txt");
+        hold(&db, &source, 600);
+        integrator
+            .pass_on(&db.store)
+            .expect("judged under the hold");
+        integrator.settle();
+        assert_eq!(verdicts(&db, first), ["accepted"]);
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass under the hold");
+        assert_eq!(task_state(&db, mission, first), "landing");
+        assert_eq!(task_records(&db, "task.held", first).len(), 1);
+        assert_eq!(source_main(&source), b0);
+        let released = db.store.source_release(&source).expect("the release");
+        assert_eq!(released["waiting"], json!([first]));
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after the release");
+        assert_eq!(task_state(&db, mission, first), "landed");
+        let (release, _) = source_records(&db, "source.released")[0].clone();
+        assert!(task_records(&db, "task.landed", first)[0] > release);
+        let landed = source_main(&source);
+        assert_ne!(landed, b0);
+
+        // Held again; the owner moves main and records it; then the release.
+        let second = db.reported_task(mission, "two");
+        push_work(&base, &source, &agent_of(&db, mission, second), "two.txt");
+        hold(&db, &source, 600);
+        integrator
+            .pass_on(&db.store)
+            .expect("judged under the hold");
+        integrator.settle();
+        assert_eq!(task_state(&db, mission, second), "landing");
+        let deployed = main_moves(&base, &source, "deploy.txt");
+        assert_eq!(
+            db.store
+                .source_moved(&source, &landed, &deployed)
+                .expect("moved"),
+            1
+        );
+        db.store.source_release(&source).expect("the release");
+        integrator
+            .pass_on(&db.store)
+            .expect("its landing finds main moved");
+        assert_eq!(verdicts(&db, second), ["accepted", "stale"]);
+        assert_eq!(
+            task_state(&db, mission, second),
+            "reported",
+            "judged again, not discarded"
+        );
+        integrator
+            .pass_on(&db.store)
+            .expect("judged again on the new main");
+        integrator.settle();
+        assert_eq!(verdicts(&db, second), ["accepted", "stale", "accepted"]);
+        assert_eq!(task_state(&db, mission, second), "landed");
+        assert_eq!(parent(&[&source], &source_main(&source), 1), deployed);
+        let after = gated(&db, mission);
+        assert_eq!(after.halted, None);
+        assert_eq!(
+            (after.gate_rejections, after.gate_aborts),
+            (0, 0),
+            "nothing counted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A hold past its bound is recorded expired at the start of a pass,
+    /// before anything lands, once; the task waiting behind it is named in
+    /// the record and lands after it.
+    #[test]
+    fn an_expired_hold_is_recorded_before_anything_lands_once() {
+        let (base, source, scenarios, integrator) = world("held-expired", "exit 1\n");
+        let db = Db::new("held_expired");
+        let b0 = source_main(&source);
+        let mission = db.gated_mission(&source, &scenarios);
+        let task = db.reported_task(mission, "l");
+        let work = push_work(&base, &source, &agent_of(&db, mission, task), "w.txt");
+        db.record(&json!({"type": "task.gated", "id": task, "revision": 0,
+                          "verdict": "accepted", "base": b0, "candidate": work}));
+        let held = hold(&db, &source, 1);
+        integrator
+            .pass_on(&db.store)
+            .expect("a pass under the hold");
+        assert_eq!(task_state(&db, mission, task), "landing");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        integrator
+            .pass_on(&db.store)
+            .expect("the pass after its bound");
+        let expired = source_records(&db, "source.hold_expired");
+        assert_eq!(expired.len(), 1);
+        let (event, record) = &expired[0];
+        assert_eq!(record["hold"], held);
+        assert_eq!(record["source"], source.as_str());
+        assert_eq!(record["waiting"], json!([task]));
+        assert_eq!(task_state(&db, mission, task), "landed");
+        assert!(
+            task_records(&db, "task.landed", task)[0] > *event,
+            "the expiry first"
+        );
+        assert_eq!(source_main(&source), work);
+        integrator.pass_on(&db.store).expect("another pass");
+        assert_eq!(source_records(&db, "source.hold_expired").len(), 1, "once");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
