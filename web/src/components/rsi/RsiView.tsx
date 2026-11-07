@@ -9,13 +9,13 @@ import type { RsiDashboard, RsiMission, RsiObjective, RsiTask } from "../../rsi"
 import {
   chartObjective,
   fetchDashboard,
-  promptTitle,
   focusObjective,
   metricPoints,
   openTask,
 } from "../../rsi";
 import { Button, Card, CardHeader, Eyebrow, LiveStatus, PageHeader, cx } from "../ui";
 import { AgentPane } from "./AgentPane";
+import { ObjectiveName } from "./ObjectiveName";
 import { ChartLegend, MetricChart } from "./MetricChart";
 import { PhaseBadge, VerdictBadge, formatMetric, formatNumber, phaseStyle, useNow } from "./Phase";
 import { GateVerdicts } from "./GateVerdicts";
