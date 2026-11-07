@@ -94,6 +94,29 @@ pub(crate) const GATE_ENV: &[&str] = &[
 /// verdict file.
 pub(crate) const NO_ROOM_EXIT: i32 = 5;
 
+/// The gate's exit status when a scenario's two base runs disagreed
+/// (scripts/rsi/gate.sh: the first exited 1, the second did not exit 1). It
+/// counts only with the gate's own pair of lines at the end of its stdout
+/// ([`base_disagrees`]); with any other output it is an abort.
+pub(crate) const BASE_DISAGREES_EXIT: i32 = 4;
+
+/// The gate's `| gate time:` line, which may follow the base-disagreement
+/// pair and nothing else may.
+const GATE_TIME_LINE: &str = "| gate time:";
+
+/// The tail of a base run's `exited` line
+/// (`| <name> exited 1, then 0 on the base: …`).
+const BASE_EXITED_TAIL: &str = " exited 1, then 0 on the base";
+
+/// The rest of the gate's `exited` line, after the scenario's name.
+const BASE_EXITED_SAID: &str = ": a harness error, not a verdict; the gate aborts";
+
+/// The head of the stage line the gate closes a disagreeing base with.
+const BASE_STAGE_HEAD: &str = "| stage gate aborted ";
+
+/// The rest of that stage line, after its milliseconds and `base: <name>`.
+const BASE_STAGE_SAID: &str = " again (unsolved needs two runs that agree)";
+
 /// The gate's floor when SPAWN_GATE_MIN_FREE_GB is unset (scripts/disk.sh).
 const DEFAULT_MIN_FREE_GB: u64 = 10;
 
