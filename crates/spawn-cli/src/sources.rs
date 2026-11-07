@@ -1104,7 +1104,7 @@ mod tests {
                 file.display()
             );
         }
-        assert!(names_git("let git = crate::sources::git;"));
+        assert!(names_git(concat!("let git = crate::sources:", ":git;")));
         assert!(names_git("    use crate::sources::{ensure_mirror, git};"));
         assert!(!names_git(
             "    use crate::sources::{ensure_mirror, test_git as git};"
