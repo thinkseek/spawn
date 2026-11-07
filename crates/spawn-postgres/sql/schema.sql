@@ -1229,7 +1229,15 @@ create table if not exists mission_missions (
     -- other verdict, a landing and a resume end it.
     gate_host_faults integer not null default 0,
     gate_host_task   bigint,
-    gate_host_due_ms bigint
+    gate_host_due_ms bigint,
+    -- The gate's current run of `host_fault` outcomes whose evidence is a
+    -- base that disagreed with itself (objective 033: a scenario of the base
+    -- exited 1 and then 0, before any candidate code ran), in a row across
+    -- the mission: the record that makes it 3 carries `alert`, and every
+    -- other one does not. No verdict on the work, so it counts toward no
+    -- halt. `no_room` and `stale` leave the run; every other verdict
+    -- (020's host faults included), a landing and a resume end it.
+    gate_base_disagrees integer not null default 0
 );
 
 create table if not exists mission_residents (
@@ -1308,6 +1316,7 @@ alter table mission_missions add column if not exists objectives jsonb;
 alter table mission_missions add column if not exists gate_host_faults integer not null default 0;
 alter table mission_missions add column if not exists gate_host_task bigint;
 alter table mission_missions add column if not exists gate_host_due_ms bigint;
+alter table mission_missions add column if not exists gate_base_disagrees integer not null default 0;
 alter table mission_tasks add column if not exists base text;
 alter table mission_tasks add column if not exists candidate text;
 alter table mission_tasks add column if not exists gate_log text;
