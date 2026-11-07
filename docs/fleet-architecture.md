@@ -571,7 +571,9 @@ The API is read-only: `/api/overview`, `/api/fleet` (with
 `/api/missions` and `/api/rsi` send what the lists show: a task's brief,
 report and review note come as their first lines with their whole length
 (`<field>_bytes`), and `/api/missions/task/<id>` answers the whole texts
-when a task is opened. Every answer carries a weak `ETag` and a read that
+when a task is opened; an objective's prompt comes as its first lines and
+`/api/rsi/objective/<mission>/<id>` answers it whole when the objective is
+pointed at. Every answer carries a weak `ETag` and a read that
 sends it back (`If-None-Match`) gets 304 while nothing it shows changed; a
 read that says `Cache-Control: max-age=1`, as the page's polls do, may be
 given the answer computed for another reader up to a second ago, so one
@@ -1126,7 +1128,8 @@ record of what was judged (§14 of design.md).
   objective mission with its backlog's objectives (status, landed metric
   values), its tasks with their `task.gated` verdicts, the halt reason and
   the baseline (the shape is documented in `crates/spawn-cli/src/serve.rs`);
-  `/api/rsi/task/<id>` answers one task; `/api/rsi/pane` shows the
+  `/api/rsi/task/<id>` answers one task, `/api/rsi/objective/<mission>/<id>`
+  one objective's whole prompt; `/api/rsi/pane` shows the
   resident's terminal.
 - **One gate at a time, for now.** A judging (fetch, gate, landing) runs
   on a thread of its own. A mission has at most one in flight, and so does
