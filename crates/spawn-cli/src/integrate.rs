@@ -7012,7 +7012,7 @@ mod database_tests {
             let overrun = record(task);
             assert!(overrun["tool_calls"].as_i64().unwrap_or_default() > 0);
             assert_eq!(overrun["budget"], json!({"minutes": 60}));
-            assert_eq!(overrun["objective"], task_objective(&db, task));
+            assert_eq!(overrun["objective"].as_u64().map(|id| id as i64), objective_of(&db, task));
         }
         let aborts: i64 = db
             .admin()
@@ -7052,7 +7052,7 @@ mod database_tests {
         assert_eq!(flying, [23, 25], "the continuation first, then 025");
         let again = objective_task(&db, mission, 23);
         assert_eq!(
-            read_task(&db, again.id).continues,
+            continues_of(&db, again.id),
             Some(first.id),
             "023's task continues the overrun"
         );
@@ -7110,8 +7110,8 @@ mod database_tests {
             .collect();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].1, 23, "the overrun's objective, continued");
-        let again = read_task(&db, next[0].0);
-        assert_eq!(again.continues, Some(task.id));
+        let again = objective_task(&db, mission, 23);
+        assert_eq!(continues_of(&db, again.id), Some(task.id));
         let brief = again.brief;
         assert!(
             brief.contains(&format!("continues task #{},", task.id)),
@@ -7119,6 +7119,26 @@ mod database_tests {
         );
         assert!(!brief.contains("Earlier tasks"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The objective a task pursues, as the store folded it.
+    fn objective_of(db: &Db, task: i64) -> Option<i64> {
+        db.admin()
+            .query_one(
+                "select objective from mission_tasks where id = $1",
+                &[&task],
+            )
+            .expect("the task")
+            .get::<_, Option<i32>>(0)
+            .map(i64::from)
+    }
+
+    /// The task a continuation continues, as the store folded it.
+    fn continues_of(db: &Db, task: i64) -> Option<i64> {
+        db.admin()
+            .query_one("select continues from mission_tasks where id = $1", &[&task])
+            .expect("the task")
+            .get(0)
     }
 
     /// The task as the integrator reads it.
