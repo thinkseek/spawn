@@ -310,23 +310,12 @@ impl Active {
 /// last recorded screen is folded from the log.
 #[derive(Debug, Clone)]
 struct Follow {
-    /// Its files changed since the last read (or no watch says otherwise).
-    /// A session read on every pass keeps it set, so a read that left a line
-    /// half-written or a checkpoint uncommitted tries again next pass.
-    dirty: bool,
-    /// No watch could be set on its files: they are read on every pass, as
-    /// before watches, and [`Follow::watch_warned`] says so once.
-    poll: bool,
-    /// The fallback to reading on every pass was reported.
-    watch_warned: bool,
-    /// The watch on its files is set.
-    watched: bool,
-    /// When its transcript last grew, by the Bridge's clock, if it has.
-    growth: Option<i64>,
-    /// Its transcript grew and its screen has not been read since: the pane
-    /// is due once the transcript has held still for
-    /// [`BridgeConfig::screen_quiet`].
-    fresh: bool,
+    /// The watch on its files.
+    watch: Watching,
+    /// When its transcript last grew and its screen has not been read since,
+    /// by the Bridge's clock. The pane is due once the transcript has held
+    /// still for [`BridgeConfig::screen_quiet`].
+    unread_since: Option<i64>,
     /// Its last capture could not be recorded (one reading is not a fact, or
     /// it read [`ScreenState::Unknown`]): capture again next pass.
     again: bool,
@@ -370,16 +359,36 @@ struct Follow {
     evidence: Option<String>,
 }
 
-impl Default for Follow {
+/// The watch on an execution's files ([`FileWatch`]).
+#[derive(Debug, Clone)]
+struct Watching {
+    /// Its files changed since the last read. A session read on every pass
+    /// keeps it set, so a read that left a line half-written or a checkpoint
+    /// uncommitted tries again next pass.
+    dirty: bool,
+    /// No watch could be set on its files: they are read on every pass, as
+    /// before watches, and [`Watching::said`] says so once.
+    poll: bool,
+    /// The fallback to reading on every pass was said.
+    said: bool,
+}
+
+impl Default for Watching {
     fn default() -> Self {
         Self {
             // Nothing has been read yet: the first pass reads.
             dirty: true,
             poll: false,
-            watch_warned: false,
-            watched: false,
-            growth: None,
-            fresh: false,
+            said: false,
+        }
+    }
+}
+
+impl Default for Follow {
+    fn default() -> Self {
+        Self {
+            watch: Watching::default(),
+            unread_since: None,
             again: false,
             last_capture: None,
             due_at: None,
@@ -1291,8 +1300,8 @@ impl Bridge {
         active: &mut Active,
         report: &mut TickReport,
     ) -> Result<(), StoreError> {
-        let watched = self.config.watch.is_some() && !active.follow.poll;
-        if watched && !active.follow.dirty && !self.due_to_read(active) {
+        let watched = self.config.watch.is_some() && !active.follow.watch.poll;
+        if watched && !active.follow.watch.dirty && !self.due_to_read(active) {
             return Ok(());
         }
         let Some(native) = native else {
@@ -1317,7 +1326,7 @@ impl Bridge {
                 // The file's appearance is a change the watch reports: with
                 // one set, it is not asked again every pass, only once at
                 // the grace that reports a transcript that never came.
-                active.follow.dirty = false;
+                active.follow.watch.dirty = false;
                 active.follow.due_at = (!active.follow.warned).then(|| since.saturating_add(60_001));
                 return Ok(());
             }
@@ -1346,7 +1355,7 @@ impl Bridge {
             // still being written: it is read next pass.
             if bytes.len() >= READ_LIMIT {
                 active.follow.offset += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                active.follow.dirty = false;
+                active.follow.watch.dirty = false;
                 report.warnings.push(format!(
                     "{session}: skipped a line over {READ_LIMIT} bytes in {path}"
                 ));
@@ -1398,7 +1407,7 @@ impl Bridge {
             }
         }
         active.follow.offset += u64::try_from(end + 1).unwrap_or(u64::MAX);
-        active.follow.dirty = false;
+        active.follow.watch.dirty = false;
         Ok(())
     }
 
@@ -1426,8 +1435,8 @@ impl Bridge {
         };
         let key = watch_key(&active.execution_id);
         if self.touched.contains(&key) {
-            active.follow.dirty = true;
-        } else if active.follow.watched {
+            active.follow.watch.dirty = true;
+        } else if active.follow.watch.dirty {
             // Nothing new, and the watch is set: no system call at all.
             return;
         }
@@ -1441,10 +1450,10 @@ impl Bridge {
         }
         for path in paths {
             if let Err(error) = watch.watch(&key, &path) {
-                active.follow.poll = true;
-                active.follow.dirty = true;
-                if !active.follow.watch_warned {
-                    active.follow.watch_warned = true;
+                active.follow.watch.poll = true;
+                active.follow.watch.dirty = true;
+                if !active.follow.watch.said {
+                    active.follow.watch.said = true;
                     report.warnings.push(format!(
                         "{session}: no watch on {path} ({error}); its files are read on every pass"
                     ));
@@ -1452,7 +1461,7 @@ impl Bridge {
                 return;
             }
         }
-        active.follow.watched = true;
+        active.follow.watch.dirty = true;
     }
 
     /// Whether this pass looks at the execution: reads the runner's exit
@@ -1466,8 +1475,8 @@ impl Bridge {
             || active.checkpoint.is_some()
             || active.follow.stale.is_some()
             || active.follow.end_failures > 0
-            || active.follow.poll
-            || active.follow.dirty
+            || active.follow.watch.poll
+            || active.follow.watch.dirty
             || self.due_to_read(active)
             || self.in_flight(session)
             || !matches!(self.screen_wanted(session, active), Wanted::Nothing)
@@ -1486,7 +1495,7 @@ impl Bridge {
         let follow = &active.follow;
         // No watch: read on every pass, as before watches. A command in
         // flight reads it too: its next move waits on what the pane says.
-        if self.config.watch.is_none() || follow.poll || self.in_flight(session) {
+        if self.config.watch.is_none() || follow.watch.poll || self.in_flight(session) {
             return Wanted::Now;
         }
         if follow.again {
@@ -1576,7 +1585,7 @@ impl Bridge {
         else {
             // A pane that cannot be read says nothing: the reading is due
             // again on the next pass, never read as a state (§14).
-            active.follow.again = self.config.watch.is_some() && !active.follow.poll;
+            active.follow.again = self.config.watch.is_some() && !active.follow.watch.poll;
             return Ok(());
         };
         let now = self.clock.now().0;
