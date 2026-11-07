@@ -218,6 +218,41 @@
 //!    lines named in the record, never on the reason's text alone; the wait
 //!    rests on the recorded `due_ms`;
 //!
+//!    **A base that disagrees with itself is the host's, not an abort.** The
+//!    gate judges every objective scenario on the base before any candidate
+//!    code runs, and an unsolved result needs two runs that agree. A first
+//!    run that exits 1 and a second that exits 0 is no verdict on the
+//!    candidate: no candidate code has run yet, and the base is code that
+//!    already landed. It says the host was too loaded or too flaky to judge
+//!    ([`GateFailure::BaseDisagrees`]: exit [`gate::BASE_DISAGREES_EXIT`]
+//!    with the gate's own pair of lines at the end of its stdout, naming the
+//!    scenario and both exits). The task is gated `host_fault` with the
+//!    evidence [`BASE_DISAGREES`], never `aborted`: the task stays where it
+//!    was, its revisions and note do not move, nothing goes back to the
+//!    worker, and neither `gate_rejections` nor `gate_aborts` grows or
+//!    resets. The record names, besides `base`, `candidate`, `revision`,
+//!    `scenarios`, `reason` and `log`, `evidence` `base_disagrees`,
+//!    `scenario`, `exits` ([1, 0]), `setup_s` (the gate's `| gate time:`
+//!    line's `setup <n> s`, left out when it printed none), `host_faults`
+//!    (020's run in a row, which both evidences share), `backoff_ms`,
+//!    `due_ms` (the store's), `base_disagrees` (this evidence's own run in a
+//!    row, folded by the store) and `alert`. A base disagreement never
+//!    carries `escalate`: the one that makes the run
+//!    [`BASE_DISAGREES_ALERT_AT`] carries `alert` true instead, and every
+//!    other one, the later ones of the same run too, carries false. That
+//!    record is the alert until objective 030 exists (named by its event
+//!    id, no second record of it), and the dispatcher's digest takes it to
+//!    the supervisor once ([`crate::dispatch::digest::base_disagrees_alerts`],
+//!    the tag `host gate-base-disagrees-<event id>`); 030 raises its
+//!    `gate_base_disagrees` notice from the same record. No halt counts a
+//!    host fault, whatever its evidence, and the task waits its recorded
+//!    `due_ms` like any ([`host_wait`]). Every other harness error on the
+//!    base (a first run that exits 2, `1, then 2`, the pair with any other
+//!    exit) stays an abort and counts. The decision rests on the gate's
+//!    recorded exit status and the pair of lines named in the record, never
+//!    on the reason's text, on time or on a scenario's name; the wait rests
+//!    on the recorded `due_ms`;
+//!
 //!    **The host's room is measured before the gate, never learned from
 //!    its crash** ([`gate::Room`]). At the start of each judging, after the
 //!    candidate is built and before the gate starts (only for a task that
