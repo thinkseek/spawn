@@ -543,7 +543,10 @@ fn a_failed_retry_does_not_change_the_delivery_tag() {
 /// that may have typed is not tried again, and its stall still is.
 #[test]
 fn a_delivery_given_up_gets_no_stall_item() {
-    let tasks = work(&[row(7, "assigned", SESSION)]);
+    // A re-issue: its spent delivery is escalated as delivery failed.
+    let mut reissue = row(7, "assigned", SESSION);
+    reissue["reissue_of"] = json!(6);
+    let tasks = work(&[reissue]);
     let found = stalls(json!({"tasks": [open(7, "assigned", (120, "task.assigned", 2_000_000))]}));
     let mut facts = worker(SemanticState::Waiting, true);
     let error = "terminal gone: no pane";
@@ -568,6 +571,27 @@ fn a_delivery_given_up_gets_no_stall_item() {
     );
     let whys: Vec<Why> = plan.pending.iter().map(|item| item.why).collect();
     assert_eq!(whys, [Why::DeliveryFailed], "{:?}", plan.pending);
+    // A first delivery spent the same way is re-issued: neither escalated
+    // nor stalled.
+    let first = work(&[row(7, "assigned", SESSION)]);
+    let plan = decide_with(
+        &[facts.clone()],
+        &first,
+        &items(&[facts.clone()], &first, &found, &bounds()),
+        false,
+        NOW,
+        "spawn",
+    );
+    assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+    assert!(
+        plan.reissues.is_empty(),
+        "its last attempt finished 100 s ago: the re-issue waits 300 s"
+    );
+    let later = NOW + 200_000;
+    let plan = decide_with(&[facts.clone()], &first, &[], false, later, "spawn");
+    assert!(plan.pending.is_empty(), "{:?}", plan.pending);
+    assert_eq!(plan.reissues.len(), 1);
+    assert_eq!(plan.reissues[0].task, 7);
     // One that may have typed: not retried, and its stall is escalated.
     let mut unsure = worker(SemanticState::Waiting, true);
     unsure

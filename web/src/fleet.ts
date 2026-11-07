@@ -3,6 +3,8 @@
 // so a server that omits one renders an empty value instead of crashing.
 
 import type { SessionState } from "./api";
+import type { Labels } from "./label.ts";
+import { labels } from "./label.ts";
 import { readApi } from "./api";
 import type { GateRoom, Memory } from "./resources";
 import { normalizeGateRoom, normalizeMemory } from "./resources";
@@ -71,7 +73,9 @@ export interface Activity {
   executions: number | null;
 }
 
-export interface FleetAgent {
+/** An agent on the board. Its `label` says what it is doing
+ * (crates/spawn-cli/src/serve/labels.rs); a row leads with it. */
+export interface FleetAgent extends Labels {
   session_id: string;
   agent_id: string;
   role: Role;
@@ -327,6 +331,7 @@ function normalizeAgent(value: unknown): FleetAgent | null {
   const agentRole = role(raw.role);
   const judgement = normalizeJudgement(raw.judgement);
   return {
+    ...labels(raw),
     session_id: sessionId,
     agent_id: text(raw.agent_id),
     role: agentRole,

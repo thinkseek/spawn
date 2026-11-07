@@ -70,6 +70,8 @@ pub(crate) fn heading(why: Why) -> &'static str {
         Why::Charter => "new charter not typed",
         Why::BackgroundJob => "background job past its bound",
         Why::HoldExpired => "a source hold expired",
+        Why::ObjectiveYielded => "an objective ran out of attempts and yielded its slot",
+        Why::ObjectiveOrder => "a backlog names an order no task can meet",
     }
 }
 
@@ -94,6 +96,8 @@ fn lines(pending: &[Escalation]) -> Vec<(Line<'_>, Vec<String>)> {
         match lines.iter_mut().find(|(line, _)| {
             item.session_id != HOST_SESSION
                 && item.why != Why::HoldExpired
+                && item.why != Why::ObjectiveYielded
+                && item.why != Why::ObjectiveOrder
                 && line.first.session_id == item.session_id
                 && line.first.why == item.why
         }) {
@@ -188,6 +192,116 @@ pub(crate) fn host_fault_escalations(records: &[Value]) -> Vec<Escalation> {
             })
         })
         .collect()
+}
+
+/// The digest items for `records`, the integrator's yields (`task.cancelled`
+/// naming `yielded`) that no delivered digest told yet
+/// (`PostgresStore::objective_yields`). Each is an item of session
+/// `missions`, id `objective-yielded-<event id>`: the task, its mission and
+/// objective, and the record's one-line reason, told once.
+pub(crate) fn objective_yields(records: &[Value]) -> Vec<Escalation> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let id = record["event_id"].as_i64()?;
+            let task = record["id"].as_i64()?;
+            let mission = record["mission"]
+                .as_i64()
+                .map_or_else(|| "its mission".to_string(), |id| format!("mission {id}"));
+            let reason = record["reason"].as_str().map_or_else(
+                || format!("task #{task} yielded its slot"),
+                |reason| one_line(reason, 400),
+            );
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("objective-yielded-{id}"),
+                why: Why::ObjectiveYielded,
+                line: format!(
+                    "{mission}: {reason}. It is tried again after the other open objectives; \
+                     nothing halts. Split the objective, sharpen its brief, or raise its budget \
+                     if it keeps failing."
+                ),
+                since_ms: record["at_ms"].as_i64(),
+            })
+        })
+        .collect()
+}
+
+/// The digest items for `missions` (`PostgresStore::objective_backlogs`):
+/// one per open objective mission whose backlog names an order that cannot
+/// be met ([`crate::objectives::order_problems`]), of session `missions`,
+/// id `objective-order-<mission>-<digest of the problems>`, so it is told
+/// once for each content and holds until the backlog is fixed. A backlog
+/// that cannot be read is the integrator's to report: no item.
+pub(crate) fn objective_order(missions: &[Value]) -> Vec<Escalation> {
+    missions
+        .iter()
+        .filter_map(|row| {
+            let mission = row["mission"].as_i64()?;
+            let problems = backlog_problems(std::path::Path::new(row["backlog"].as_str()?))?;
+            if problems.is_empty() {
+                return None;
+            }
+            let digest = crate::sources::fnv(&problems.join("\n"));
+            Some(Escalation {
+                session_id: MISSIONS_SESSION.to_string(),
+                id: format!("objective-order-{mission}-{digest:016x}"),
+                why: Why::ObjectiveOrder,
+                line: format!(
+                    "mission {mission}'s backlog names an order no task can meet: {}. Fix \
+                     `after` in the backlog.",
+                    problems.join("; ")
+                ),
+                since_ms: None,
+            })
+        })
+        .collect()
+}
+
+/// What a backlog directory's files are now: each JSON file's name, size
+/// and modification time, by name.
+type Fingerprint = Vec<(std::ffi::OsString, u64, u128)>;
+
+fn fingerprint(directory: &std::path::Path) -> Option<Fingerprint> {
+    let mut files: Fingerprint = std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
+            Some((entry.file_name(), metadata.len(), modified))
+        })
+        .collect();
+    files.sort();
+    Some(files)
+}
+
+/// The order problems of the backlog in `directory`
+/// ([`crate::objectives::order_problems`]), parsed again only when its
+/// files' names, sizes or modification times changed: the dispatcher asks
+/// every pass, and the backlog is over a megabyte of JSON. `None` when the
+/// directory or a file cannot be read (the integrator reports that).
+fn backlog_problems(directory: &std::path::Path) -> Option<Vec<String>> {
+    type Cache = std::collections::BTreeMap<std::path::PathBuf, (Fingerprint, Vec<String>)>;
+    static CACHE: std::sync::Mutex<Cache> = std::sync::Mutex::new(Cache::new());
+    let now = fingerprint(directory)?;
+    if let Ok(cache) = CACHE.lock()
+        && let Some((seen, problems)) = cache.get(directory)
+        && *seen == now
+    {
+        return Some(problems.clone());
+    }
+    let problems =
+        crate::objectives::order_problems(&crate::objectives::load_backlog(directory).ok()?);
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(directory.to_path_buf(), (now, problems.clone()));
+    }
+    Some(problems)
 }
 
 /// The session of escalations about missions rather than an agent (a
