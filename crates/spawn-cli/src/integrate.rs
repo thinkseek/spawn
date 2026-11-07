@@ -6990,59 +6990,71 @@ mod database_tests {
             tool_work(&db, task, delivered + 5_000, now);
         };
         overrun(&first);
-        // 025's first abort: under the limit, a plain abort.
         overrun(&other);
-        let aborted =
+        let over =
             Integrator::enforce_budget(&db.store, &snapshot(&db, mission)).expect("the budget");
-        assert_eq!(aborted, vec![first.id, other.id]);
+        assert_eq!(over, vec![first.id, other.id]);
         let record = |task: i64| -> Value {
             db.admin()
                 .query_one(
                     "select kind -> 'detail' -> 'record' from spawn_events
                       where session_id = 'session_control'
-                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'
+                        and kind -> 'detail' -> 'record' ->> 'type' = 'task.over_budget'
                         and kind -> 'detail' -> 'record' ->> 'id' = $1",
                     &[&task.to_string()],
                 )
-                .expect("the abort")
+                .expect("the overrun")
                 .get(0)
         };
-        let yielded = record(first.id);
-        assert_eq!(yielded["yielded"], true);
-        assert_eq!(
-            (yielded["objective"].as_i64(), yielded["failures"].as_i64()),
-            (Some(23), Some(3))
-        );
-        let why = yielded["yield_reason"]
-            .as_str()
-            .expect("its reason")
-            .to_string();
-        assert!(
-            why.contains("objective 23 had 3 failed attempts")
-                && why.contains("conflict, conflict, aborted over budget"),
-            "{why}"
-        );
-        assert!(record(other.id).get("yielded").is_none(), "under the limit");
+        // An overrun is its own record, at the attempt limit too: no abort,
+        // no yield, no counter.
+        for task in [first.id, other.id] {
+            let overrun = record(task);
+            assert!(overrun["tool_calls"].as_i64().unwrap_or_default() > 0);
+            assert_eq!(overrun["budget"], json!({"minutes": 60}));
+            assert_eq!(overrun["objective"], task_objective(&db, task));
+        }
+        let aborts: i64 = db
+            .admin()
+            .query_one(
+                "select count(*) from spawn_events
+                  where session_id = 'session_control'
+                    and kind -> 'detail' -> 'record' ->> 'type' = 'task.aborted'",
+                &[],
+            )
+            .expect("the aborts")
+            .get(0);
+        assert_eq!(aborts, 0, "an overrun is no abort");
+        let (gate_aborts, gate_rejections): (i32, i32) = {
+            let row = db
+                .admin()
+                .query_one(
+                    "select gate_aborts, gate_rejections from mission_missions where id = $1",
+                    &[&mission],
+                )
+                .expect("the mission");
+            (row.get(0), row.get(1))
+        };
+        assert_eq!((gate_aborts, gate_rejections), (0, 0));
         let told = db.store.objective_yields().expect("the yields to tell");
-        let told = told.as_array().expect("a list");
-        assert_eq!(told.len(), 1);
-        assert_eq!(told[0]["id"], first.id);
-        assert_eq!(told[0]["reason"].as_str(), Some(why.as_str()));
+        assert!(
+            told.as_array().expect("a list").is_empty(),
+            "an overrun yields nothing"
+        );
 
-        // Both slots free: 025 (one failure, no yield) first, then 023.
+        // The next pass assigns 023's continuation of the overrun, not 025.
         pass();
         let flying: Vec<u32> = flying(&db, mission)
             .iter()
             .filter(|(task, _)| *task != first.id && *task != other.id)
             .map(|(_, objective)| *objective)
             .collect();
-        assert_eq!(flying, [25, 23]);
+        assert_eq!(flying, [23, 25], "the continuation first, then 025");
         let again = objective_task(&db, mission, 23);
-        assert!(pass().is_empty(), "nothing yields, no slot is free");
         assert_eq!(
-            task_state(&db, mission, again.id),
-            "assigned",
-            "023's new task stays"
+            read_task(&db, again.id).continues,
+            Some(first.id),
+            "023's task continues the overrun"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -7079,24 +7091,32 @@ mod database_tests {
             .expect("deliver 70 minutes ago");
         tool_work(&db, &task, delivered + 5_000, now);
         let pass = snapshot(&db, mission);
-        let aborted = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
-        assert_eq!(aborted, vec![task.id]);
-        let settled = aborted.into_iter().collect();
+        let over = Integrator::enforce_budget(&db.store, &pass).expect("the budget");
+        assert_eq!(over, vec![task.id]);
+        let settled = over.into_iter().collect();
         assert!(
             crate::objectives::assign_next(&db.store, &pass, &settled)
                 .expect("the same pass")
                 .is_empty(),
-            "nothing in the pass that aborted"
+            "nothing in the pass that overran"
         );
+        // The next pass assigns the overrun's continuation, and it says so:
+        // the work is continued, not redone.
         crate::objectives::assign_next(&db.store, &snapshot(&db, mission), &none)
             .expect("the next pass");
-        let next: Vec<u32> = flying(&db, mission)
-            .iter()
+        let next: Vec<(i64, u32)> = flying(&db, mission)
+            .into_iter()
             .filter(|(id, _)| *id != task.id)
-            .map(|(_, objective)| *objective)
             .collect();
-        assert_eq!(next, [25], "the fewest attempts, not the aborted objective");
-        let brief = objective_task(&db, mission, 25).brief;
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].1, 23, "the overrun's objective, continued");
+        let again = read_task(&db, next[0].0);
+        assert_eq!(again.continues, Some(task.id));
+        let brief = again.brief;
+        assert!(
+            brief.contains(&format!("continues task #{},", task.id)),
+            "{brief}"
+        );
         assert!(!brief.contains("Earlier tasks"));
         let _ = std::fs::remove_dir_all(&base);
     }
