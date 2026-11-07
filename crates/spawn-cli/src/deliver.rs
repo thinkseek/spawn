@@ -1474,9 +1474,9 @@ fn send_note(
 #[cfg(test)]
 mod tests {
     use super::{
-        Cancelled, DELIVERY_RETRIES, News, REPORT, TaskRow, Work, delivered, delivery_mark,
-        mark_delivery, new_report, news_items, notice_task, put_aside, report_contract, report_due,
-        task_prompt,
+        Cancelled, DELIVERY_RETRIES, NOT_READY_RETRY_MS, News, REPORT, TaskRow, Work, delivered,
+        delivery_mark, mark_delivery, new_report, news_items, next_due, notice_task, put_aside,
+        report_contract, report_due, retry_wait_ms, task_prompt,
     };
     use crate::dispatch::{Facts, Order, Sent, Why};
     use serde_json::json;
@@ -3124,16 +3124,15 @@ PENDING_ISSUES\n";
     /// on it then) or when its retries are spent.
     #[test]
     fn a_waiting_delivery_is_due_at_the_end_of_its_own_wait() {
-        let refused = worker_of(true, true);
-        let mut refused = refused;
-        refused.dispatched = vec![sent_of(
+        let mut refused = worker(true, true);
+        refused.dispatched = vec![sent(
             30,
             "deliver-7-0",
             100_000,
             Some("pane state Busy does not accept input"),
         )];
         let tasks = Work {
-            tasks: vec![task_of(7, TaskState::Assigned)],
+            tasks: vec![task(7, TaskState::Assigned)],
             ..Work::default()
         };
         assert_eq!(
@@ -3147,14 +3146,14 @@ PENDING_ISSUES\n";
             "a wait already over is the step's to act on now"
         );
 
-        let mut failed = worker_of(true, true);
-        failed.dispatched = vec![sent_of(31, "deliver-7-0", 500_000, Some("terminal gone"))];
+        let mut failed = worker(true, true);
+        failed.dispatched = vec![sent(31, "deliver-7-0", 500_000, Some("terminal gone"))];
         assert_eq!(
             next_due(&tasks, &[failed.clone()], 500_000),
             Some(500_000 + retry_wait_ms(1)),
             "a failed attempt waits its doubling wait"
         );
-        failed.dispatched.push(sent_of(
+        failed.dispatched.push(sent(
             32,
             "deliver-7-0-retry-1",
             700_000,
@@ -3173,18 +3172,18 @@ PENDING_ISSUES\n";
     #[test]
     fn a_delivery_with_nothing_to_retry_waits_for_no_time() {
         let tasks = Work {
-            tasks: vec![task_of(7, TaskState::Assigned)],
+            tasks: vec![task(7, TaskState::Assigned)],
             ..Work::default()
         };
-        let mut fresh = worker_of(true, true);
+        let mut fresh = worker(true, true);
         fresh.dispatched = Vec::new();
         assert_eq!(next_due(&tasks, &[fresh.clone()], 0), None, "its first try");
-        let mut through = worker_of(true, true);
-        through.dispatched = vec![sent_of(30, "deliver-7-0", 100_000, None)];
+        let mut through = worker(true, true);
+        through.dispatched = vec![sent(30, "deliver-7-0", 100_000, None)];
         assert_eq!(next_due(&tasks, &[through], 100_000), None, "it got through");
-        let mut busy = worker_of(true, true);
+        let mut busy = worker(true, true);
         busy.open_command = true;
-        busy.dispatched = vec![sent_of(
+        busy.dispatched = vec![sent(
             31,
             "deliver-7-0",
             100_000,
