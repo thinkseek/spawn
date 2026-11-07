@@ -619,6 +619,12 @@ pub(crate) struct Reading {
     pub(crate) plan: Plan,
     /// Log lines: what could not be read (a stall read that failed).
     pub(crate) lines: Vec<String>,
+    /// When the dispatcher's next step is due even if no record is written
+    /// meanwhile: the earliest retry, stall bound, Stop retry or job bound
+    /// the records this pass read name (`None`: no clock is waited for).
+    /// On this host's clock, and after this pass: a time already reached is
+    /// the step's to act on now, not a wait.
+    pub(crate) due_ms: Option<i64>,
 }
 
 /// The plan for this moment, reading only: the host's news (the disk items
@@ -666,10 +672,40 @@ pub(crate) fn read_plan(
             .as_array()
             .map_or(&[][..], Vec::as_slice),
     ));
+    // Every timer the records read here name: the times at which this step
+    // would decide something new even though nothing is appended meanwhile.
+    // A time already reached is no wait (the step acts on it now), so only
+    // later ones count.
+    let mut due: Option<i64> = None;
+    let mut soon = |at: i64| {
+        if at > now {
+            due = Some(due.map_or(at, |known: i64| known.min(at)));
+        }
+    };
+    if let Some(at) = deliver::next_due(&work, &rows, now) {
+        soon(at);
+    }
+    for facts in rows.iter().filter(|facts| is_worker(facts)) {
+        if let Some(at) = stops::next_due(facts) {
+            soon(at);
+        }
+    }
     // A stall read that failed costs this pass its stall items, never its
     // deliveries: the next pass measures the same stalls again.
     match load_stalls(store) {
-        Ok(stalls) => host.extend(stall::items(&rows, &work, &stalls, bounds)),
+        Ok(stalls) => {
+            host.extend(stall::items(&rows, &work, &stalls, bounds));
+            // Stalls and jobs are measured on the database's clock, which
+            // `stalls.now_ms` names; the loop waits on its own. Only the
+            // interval between them is read from the database's.
+            let on_host = |at: i64| now.saturating_add(at.saturating_sub(stalls.now_ms));
+            if let Some(at) = stall::next_due(&rows, &work, &stalls, bounds) {
+                soon(on_host(at));
+            }
+            if let Some(at) = jobs::next_due(&rows, bounds.job) {
+                soon(on_host(at));
+            }
+        }
         Err(error) => lines.push(format!("dispatch: stalls: {error}")),
     }
     host.extend(jobs::items(&rows, bounds.job));
@@ -682,6 +718,7 @@ pub(crate) fn read_plan(
         work,
         plan,
         lines,
+        due_ms: due,
     })
 }
 
