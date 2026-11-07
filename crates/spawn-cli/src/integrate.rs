@@ -631,6 +631,12 @@ pub(crate) struct Mission {
     pub(crate) gate_host_task: Option<i64>,
     #[serde(default)]
     pub(crate) gate_host_due_ms: Option<i64>,
+    /// The mission's current run of `host_fault` gate outcomes whose
+    /// evidence is a base that disagreed with itself (objective 033), folded
+    /// by the store: the record that makes it [`BASE_DISAGREES_ALERT_AT`]
+    /// carries `alert`, and every other one does not.
+    #[serde(default)]
+    pub(crate) gate_base_disagrees: u32,
     #[serde(default)]
     pub(crate) objectives: Option<Value>,
     /// When the mission was last configured (`mission.configured`), on the
