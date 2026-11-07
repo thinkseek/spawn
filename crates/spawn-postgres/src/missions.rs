@@ -616,13 +616,22 @@ pub(crate) const TOOL_CALLS_SINCE: &str = "select count(*) from spawn_events
 
 /// A session's events after a time, in log order, with the tool call's or
 /// background job's id where they have one: what a task's active time is
-/// measured from (spawn-cli's `integrate::active_ms`).
+/// measured from (spawn-cli's `integrate::active_ms`). Readings are left
+/// out: the Bridge records a busy pane every 30 s and the observer each
+/// reading, also while Claude Code only retries a model API that is down,
+/// so they say the pane is busy, not that work moves. Read by the
+/// session's own index: from its first event after `$2`.
 pub(crate) const SESSION_ACTIVITY: &str = "select id, recorded_at_ms, event_name,
                         coalesce(kind -> 'detail' ->> 'tool_use_id',
                                  kind -> 'detail' ->> 'job_id')
                    from spawn_events
-                  where session_id = $1 and recorded_at_ms > $2
-                  order by id";
+                  where session_id = $1
+                    and session_seq > coalesce((select max(session_seq) from spawn_events
+                                                 where session_id = $1
+                                                   and recorded_at_ms <= $2), 0)
+                    and recorded_at_ms > $2
+                    and event_name not in ('screen.observed', 'observation.recorded')
+                  order by session_seq";
 
 /// How long the whole fleet was alive between two events of the log (ids
 /// `$1` and `$2`): the gaps between consecutive events of any session, in
@@ -966,7 +975,7 @@ impl PostgresStore {
         self.query_json(SOURCE_HOLDS, &[])
     }
 
-    /// `session`'s events recorded after `since_ms`, in log order
+    /// `session`'s events recorded after `since_ms`, readings left out, in log order
     /// ([`SESSION_ACTIVITY`]).
     pub fn session_activity(
         &self,

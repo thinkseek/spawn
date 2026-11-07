@@ -20,11 +20,15 @@
 //!    and only while no other mission's landing on the source is unresolved
 //!    (its push may have moved main before its record);
 //! 2. a delivered task over its mission's budget is aborted and its worker
-//!    stopped. Its minutes are active time ([`active_ms`]): each silence of
-//!    its session counts at most `SPAWN_BUDGET_GAP_SECS` (300 s), a gap
-//!    inside a tool or job that ended counts while the whole fleet was
-//!    alive, so no outage (the fleet stopped, a frozen host, a dead engine,
-//!    the model API down) can by itself put a task over budget;
+//!    stopped. Its minutes are active time ([`active_ms`]): the gaps of its
+//!    session's events, readings (`screen.observed`,
+//!    `observation.recorded`) left out; a gap counts at most
+//!    `SPAWN_BUDGET_GAP_SECS` (300 s), and only if it ends in the model's
+//!    progress (a tool, a job, a message, a stopped turn), not in a failed
+//!    turn or a command; a gap inside a tool or job that ended counts while
+//!    the whole fleet was alive. So no outage (the fleet stopped, a frozen
+//!    host, a dead engine, the model API down) can by itself put a task
+//!    over budget;
 //! 3. a task whose gate passed is landed (again, after a crash), unless the
 //!    owner holds its source (`spawn mission hold`, a `source.held` record):
 //!    [`land`] reads the hold from the store under the landing lock, before
@@ -341,27 +345,52 @@ pub(crate) fn budget_gap(text: Option<&str>) -> Duration {
         .map_or(BUDGET_GAP, Duration::from_secs)
 }
 
+/// The events that are the model's progress: a gap ending in one is time a
+/// worker worked ([`active_ms`]).
+const PROGRESS: [&str; 7] = [
+    "tool.started",
+    "tool.completed",
+    "tool.failed",
+    "job.started",
+    "job.ended",
+    "message.received",
+    "turn.stopped",
+];
+
 /// Milliseconds a task delivered at `delivered_at_ms` could work by
 /// `now_ms`: what its minute budget measures. `events` are its session's
-/// events since delivery, in log order.
+/// events since delivery, in log order, without the readings (the Bridge's
+/// `screen.observed`, the observer's `observation.recorded`: a busy pane
+/// is re-read every 30 s, also while Claude Code only retries a model API
+/// that is down, so a reading says the pane is busy, not that work moves).
 ///
-/// The points are the delivery, each event and now. Between two of them
-/// the task gets the gap, at most `gap_ms`: a worker at work leaves events
-/// (tool calls, screen readings, messages) far more often, and a silence
-/// past the cap is a worker that could not work (no live execution, the
-/// fleet stopped, the host frozen or rebooted, the model API down), which
-/// adds only the cap. One exception keeps a long tool counted: a gap inside
-/// a tool call or background job that later ended (its `tool.completed`,
-/// `tool.failed` or `job.ended` with the same id) gets the time the whole
-/// fleet was alive in it (`fleet_alive(from_id, to_id)`: the log's gaps
-/// between those two events, each capped at `gap_ms`), at least the cap and
-/// at most the gap. An outage stops the tool's engine (it never ends) or
-/// writes nothing anywhere (a frozen host), so it still adds at most one
-/// cap.
+/// The points are the delivery, each event and now. A gap that ends in the
+/// model's progress (a tool call starting or ending, a background job
+/// starting or ending, a message, a turn stopping: [`PROGRESS`]) counts,
+/// at most `gap_ms`: a worker at work makes progress far more often. Any
+/// other gap counts nothing: one that ends in a failed turn (the model API
+/// did not answer), in a command (a delivery, a nudge, a resume: the worker
+/// waited), or in the engine's own events (a start, an unmount). The gap
+/// from the last event to now counts at most `gap_ms`. A long tool still
+/// counts: a gap inside a tool call or background job that later ended (its
+/// `tool.completed`, `tool.failed` or `job.ended` with the same id) gets
+/// the time the whole fleet was alive in it (`fleet_alive(from_id, to_id)`:
+/// the log's gaps between those two events, all events, readings included,
+/// each capped at `gap_ms`), at least the cap and at most the gap.
 ///
-/// Why no outage can by itself put a task over budget: an outage is a
-/// silence, and every silence, whatever its length or cause, adds at most
-/// `gap_ms`.
+/// Why no outage can by itself put a task over budget. The fleet stopped,
+/// the host frozen or rebooted, a dead engine: the session is silent, and
+/// the gap ends in the restart's command, which counts nothing, or is the
+/// gap to now, at most `gap_ms`; a tool it interrupted never ends, so its
+/// gap is not inside one, and a frozen host writes nothing anywhere, so the
+/// fleet's own gap is capped. A model API outage: Claude Code retries behind
+/// a busy pane, whose readings are no points; each retried turn ends in
+/// `turn.failed` and each nudge in a command, which count nothing; only the
+/// model's first progress after it counts the gap before it, at most
+/// `gap_ms`. So an outage of any length or cause adds at most `gap_ms`.
+/// The safe side: a model answer that streams for longer than `gap_ms`
+/// without a tool call counts `gap_ms`, and a hung tool that never ends
+/// counts `gap_ms` (the stall rules own a hung session).
 pub(crate) fn active_ms(
     delivered_at_ms: i64,
     now_ms: i64,
@@ -394,15 +423,23 @@ pub(crate) fn active_ms(
             _ => {}
         }
     }
-    let mut total = capped(delivered_at_ms, first.at_ms) + capped(last.at_ms, now_ms);
+    let progress = |event: &ActivityEvent| PROGRESS.contains(&event.name.as_str());
+    let first_gap = if progress(first) {
+        capped(delivered_at_ms, first.at_ms)
+    } else {
+        0
+    };
+    let mut total = first_gap + capped(last.at_ms, now_ms);
     let mut inside = 0;
     for (index, pair) in events.windows(2).enumerate() {
         inside += covered[index];
         let gap = (pair[1].at_ms - pair[0].at_ms).max(0);
         total += if inside > 0 && gap > gap_ms {
             fleet_alive(pair[0].id, pair[1].id)?.clamp(gap_ms, gap)
-        } else {
+        } else if inside > 0 || progress(&pair[1]) {
             gap.min(gap_ms)
+        } else {
+            0
         };
     }
     Ok(total)
@@ -4248,10 +4285,67 @@ mod tests {
         );
         // A clock that steps back counts nothing.
         let back = [
-            event(1, 10 * MIN, "screen.observed", None),
-            event(2, MIN, "x", None),
+            event(1, 10 * MIN, "tool.started", Some("a")),
+            event(2, MIN, "message.received", None),
         ];
         assert_eq!(active_ms(0, MIN, &back, GAP, never_asked), Ok(GAP));
+    }
+
+    /// A model API outage (rev-e on 988c85d): Claude Code retries behind a
+    /// busy pane for 30 minutes and the turn fails; the dispatcher nudges
+    /// three times an hour and each nudged turn fails too. The readings are
+    /// not in `events` (the store leaves them out); the failed turns and the
+    /// commands count nothing, so two hours of it add nothing, and the
+    /// model's first progress afterwards adds one cap.
+    #[test]
+    fn a_model_api_outage_counts_nothing_but_one_cap() {
+        let mut events = steady(0, 10 * MIN, 1);
+        let mut id = 1_000;
+        let mut at = 10 * MIN;
+        let mut next = |name: &str, step: i64| {
+            id += 1;
+            at += step;
+            event(id, at, name, None)
+        };
+        events.push(next("turn.failed", 30 * MIN));
+        for _ in 0..6 {
+            events.push(next("command.accepted", 20 * MIN));
+            events.push(next("command.step", 1_000));
+            events.push(next("command.finished", 1_000));
+            events.push(next("turn.failed", 9 * MIN));
+        }
+        let outage_end = events.last().expect("events").at_ms;
+        let before = active_ms(0, outage_end, &events, GAP, never_asked).expect("active");
+        assert_eq!(before, 10 * MIN + 5_000, "the outage itself counts nothing");
+        events.push(next("message.received", 12 * MIN));
+        let after = active_ms(0, at, &events, GAP, never_asked).expect("active");
+        assert_eq!(
+            after,
+            before + GAP,
+            "the model's first answer counts one cap"
+        );
+        assert!(over_budget(&json!({"minutes": 20}), after, 0).is_none());
+    }
+
+    /// The fleet's restart after a stop: the gap ends in the restart's
+    /// command, which counts nothing, then work goes on and counts.
+    #[test]
+    fn a_restart_counts_nothing_for_the_stop() {
+        let mut events = steady(0, 5 * MIN, 1);
+        let stop = events.last().expect("events").at_ms;
+        events.push(event(500, stop + 300 * MIN, "command.accepted", None));
+        events.push(event(
+            501,
+            stop + 300 * MIN + 2_000,
+            "session.native_started",
+            None,
+        ));
+        events.extend(steady(stop + 301 * MIN, stop + 311 * MIN, 600));
+        let active = active_ms(0, stop + 311 * MIN, &events, GAP, never_asked).expect("active");
+        // Five minutes before, ten after, and the first tool call after the
+        // engine's start: about a minute.
+        assert!(active < 17 * MIN, "{active}");
+        assert!(active > 15 * MIN, "{active}");
     }
 
     #[test]
@@ -6121,6 +6215,127 @@ mod database_tests {
         for base in [base_a, base_b, marks] {
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    /// One event of `task`'s session at `at`, written straight into the log.
+    fn session_event(db: &Db, task: &super::Task, at: i64, name: &str, detail: &Value) {
+        db.admin()
+            .execute(
+                "insert into spawn_events (agent_id, session_id, source, kind, session_seq, recorded_at_ms)
+                 values ($1, $2, 'test', jsonb_build_object('name', $3::text, 'detail', $4::jsonb),
+                         (select coalesce(max(session_seq), 0) + 1 from spawn_events
+                           where session_id = $2),
+                         $5)",
+                &[&task.agent_id, &task.session_id, &name, detail, &at],
+            )
+            .expect("write an event");
+    }
+
+    /// Tool calls every 30 s in `task`'s session from `from` to `to`, with
+    /// the Bridge's screen readings between them.
+    fn tool_work(db: &Db, task: &super::Task, from: i64, to: i64) {
+        let mut at = from;
+        let mut call = 0;
+        while at < to {
+            let id = json!({"tool_use_id": format!("toolu_{}_{call}", task.id)});
+            session_event(db, task, at, "tool.started", &id);
+            session_event(db, task, at + 10_000, "tool.completed", &id);
+            session_event(db, task, at + 20_000, "screen.observed", &json!({}));
+            at += 30_000;
+            call += 1;
+        }
+    }
+
+    /// The integrator's budget pass end to end, on the store: a task that
+    /// worked 13 minutes, then sat through a five-hour stop of the fleet,
+    /// is not aborted by the first pass after it (2026-11-07 23:05:46, task
+    /// 159); one that worked past its budget is, with the worker stopped.
+    #[test]
+    fn the_budget_pass_aborts_an_overrun_and_not_a_stop() {
+        let db = Db::new("budget_pass");
+        let mission = db
+            .store
+            .mission_add("budget", &json!(["/nowhere.git"]), "human")
+            .expect("add");
+        db.store
+            .mission_configure(
+                mission,
+                Some("/nowhere/scenarios"),
+                "gate",
+                Some(&json!({"minutes": 60})),
+                None,
+            )
+            .expect("configure");
+        let gated = || -> super::Mission {
+            let missions: Vec<super::Mission> =
+                serde_json::from_value(db.store.gated_missions().expect("gated"))
+                    .expect("missions");
+            missions
+                .into_iter()
+                .find(|row| row.id == mission)
+                .expect("the mission")
+        };
+        let now = spawn_core::time::Clock::now(&spawn_core::time::SystemClock).0;
+        let min = 60_000;
+
+        let stopped = db
+            .store
+            .task_assign(mission, "ephemeral", "worker_stopped", "brief", "default")
+            .expect("assign");
+        db.store.task_delivered(stopped, 1).expect("delivered");
+        let delivered = now - 5 * 60 * min - 13 * min;
+        db.admin()
+            .execute(
+                "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                &[&stopped, &delivered],
+            )
+            .expect("deliver five hours ago");
+        let task = ready_task(&db, stopped);
+        tool_work(&db, &task, delivered + 5_000, delivered + 13 * min);
+        // The fleet stopped with a tool open; the restart's commands.
+        session_event(
+            &db,
+            &task,
+            delivered + 13 * min,
+            "tool.started",
+            &json!({"tool_use_id": "toolu_open"}),
+        );
+        session_event(&db, &task, now - min, "command.accepted", &json!({}));
+        assert!(
+            !Integrator::enforce_budget(&db.store, &gated()).expect("the pass"),
+            "five hours of wall clock, about 20 minutes of work"
+        );
+        assert_eq!(task_state(&db, mission, stopped), "delivered");
+
+        let overran = db
+            .store
+            .task_assign(mission, "ephemeral", "worker_overran", "brief", "default")
+            .expect("assign");
+        db.store.task_delivered(overran, 1).expect("delivered");
+        let delivered = now - 70 * min;
+        db.admin()
+            .execute(
+                "update mission_tasks set delivered_at_ms = $2 where id = $1",
+                &[&overran, &delivered],
+            )
+            .expect("deliver 70 minutes ago");
+        tool_work(&db, &ready_task(&db, overran), delivered + 5_000, now);
+        assert!(Integrator::enforce_budget(&db.store, &gated()).expect("the pass"));
+        assert_eq!(
+            task_state(&db, mission, stopped),
+            "delivered",
+            "the stop still counts once"
+        );
+        assert_eq!(task_state(&db, mission, overran), "cancelled");
+        let stops: i64 = db
+            .admin()
+            .query_one(
+                "select count(*) from spawn_commands where idempotency_key = $1",
+                &[&format!("integrate-abort-{overran}")],
+            )
+            .expect("the stop")
+            .get(0);
+        assert_eq!(stops, 1, "the worker is stopped");
     }
 
     /// The task as the integrator reads it.
