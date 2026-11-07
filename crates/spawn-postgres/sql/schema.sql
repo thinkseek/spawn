@@ -1662,6 +1662,11 @@ begin
         -- A report still a draft, not taken (spawn_task_report_unfinished):
         -- the task stays delivered, so nothing is folded.
         null;
+    when 'task.fork_failed' then
+        -- The dispatcher could not fork an objective task's workspace from
+        -- its predecessor's work (spawn_task_fork_failed): read from the
+        -- log, folded into no table.
+        null;
     when 'legacy.imported' then
         -- A row from before the control stream, as it was.
         case p_record ->> 'table'
@@ -2010,6 +2015,41 @@ begin
         'revision', (select revisions from mission_tasks where id = p_task),
         'digest', p_digest, 'markers', p_markers, 'note', p_note, 'command_id', p_command));
     return true;
+end $$;
+
+-- The dispatcher's fork of an assigned objective task's workspace from its
+-- predecessor's work failed (crates/spawn-cli/src/main_merge.rs
+-- `fork_from_prior`). Recorded once per task, the first failure's error,
+-- the predecessor and its commit; returns how long ago that first failure
+-- was recorded (ms, the database's clock), from which the dispatcher stops
+-- holding the task's Start and starts it without the fork. A task that is
+-- not assigned records nothing (null).
+create or replace function spawn_task_fork_failed(p_task bigint, p_from bigint, p_commit text,
+                                                  p_error text)
+returns bigint language plpgsql security definer as $$
+declare
+    v_first bigint;
+begin
+    -- Check and record under the append lock, so no other change interleaves.
+    perform pg_advisory_xact_lock(1399957335);
+    if spawn_mission_caller() is distinct from 'owner' then
+        raise exception '% may not record forks', session_user using errcode = '42501';
+    end if;
+    if not exists (select 1 from mission_tasks where id = p_task and state = 'assigned') then
+        return null;
+    end if;
+    select min(e.recorded_at_ms) into v_first
+      from spawn_events e
+     where e.session_id = 'session_control' and e.event_name = 'control.recorded'
+       and e.kind -> 'detail' -> 'record' ->> 'id' = p_task::text
+       and e.kind -> 'detail' -> 'record' ->> 'type' = 'task.fork_failed';
+    if v_first is null then
+        perform spawn_control_record(jsonb_build_object(
+            'type', 'task.fork_failed', 'id', p_task, 'from', p_from, 'commit', p_commit,
+            'error', p_error));
+        return 0;
+    end if;
+    return spawn_now_ms() - v_first;
 end $$;
 
 -- Review a report: accept, or send it back with a note. `p_revision` names
@@ -2836,6 +2876,7 @@ begin
         'spawn_task_reported(bigint, text, text)',
         'spawn_task_report_unfinished(bigint, text, jsonb, text, bigint)',
         'spawn_task_report_unfinished_recorded(bigint, text)',
+        'spawn_task_fork_failed(bigint, bigint, text, text)',
         'spawn_control_apply(jsonb, bigint, bigint)', 'spawn_control_record(jsonb)',
         'spawn_control_refold()', 'spawn_mission_configure(bigint, text, text, jsonb, jsonb)',
         'spawn_mission_resume(bigint)', 'spawn_integrator_record(jsonb)',

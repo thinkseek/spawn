@@ -1502,15 +1502,26 @@ record of what was judged (§14 of design.md).
     `task.cancelled` with `yielded`, `objective`, `failures`, `limit` and a
     one-line `reason` (the store adds `by: spawn-integrate` and refuses
     any other cancel by the integrator). Its work is set aside like any
-    cancel's, no halt counts it, and the supervisor's digest tells it once
-    (`missions objective-yielded-<event id>`). The objective goes to the
-    back of the queue. A task whose gate runs now, or that this pass
+    cancel's, no halt counts it, the supervisor's digest tells it once
+    (`missions objective-yielded-<event id>`), and a resident's cancel
+    notice gives the reason. An abort over budget that is the objective's
+    limit-th failed attempt is the yield itself: its `task.aborted` carries
+    `yielded`, the count and a `yield_reason`, and is told the same way
+    (otherwise the objective kept its failures and no yield, sorted ahead,
+    and its next task yielded at once). The objective goes to the back of
+    the queue. A task whose gate runs now, or that this pass
     aborted, does not yield; the slot an abort frees is filled from the
     next pass on, fewest attempts first, so the aborted objective is not
     re-issued at once. Before this, on 2026-11-07, three objectives whose
     tasks kept failing held mission 4's three slots for a day (an abort was
     followed by a new task for the same objective five seconds later), and
     objectives 025 to 034 were never assigned.
+  - **Named order.** A backlog objective may name the objectives it comes
+    after (`"after": [28]` in its JSON, versioned with the backlog): it is
+    not assigned while one of them is open (one the backlog does not hold
+    must have landed). Only 032 names one (after 028, whose wait paths its
+    soak exercises); the owner's preferred order of 028-033 stays prose,
+    since those prompts say each may be solved before or with the others.
   - Who gets which task: the resident takes a task whenever it has none
     open in the mission; every other task goes to a new per-task worker
     (kind `ephemeral`, agent `agent_worker_objective_<task>`, session
@@ -1536,28 +1547,42 @@ record of what was judged (§14 of design.md).
     attempts, all read from the log at assignment. For each of the last
     three tasks of the objective that were cancelled, aborted or yielded:
     its id, its outcome and reason (its last gate verdict, abort or
-    cancel), its branch and last checkpoint (the latest `artifact.committed`
-    of its session while it ran, not a set-aside), and its report, with the
-    instruction to start from that work and not redo it (task 161 rebuilt
-    2264 lines that task 155 had mostly written).
+    cancel), its last checkpoint (the latest `artifact.committed` of its
+    session while it ran, not a set-aside), and its report, with the
+    instruction to use the reports and not redo what they established (task
+    161 rebuilt 2264 lines that task 155 had mostly written). The brief
+    names no branch: a worker has no `.git` and cannot read one. The first
+    prompt of a forked task (below) says its workspace already contains
+    that work.
   - **An ephemeral task starts from that work.** When the newest earlier
     task of its objective that ended without landing left work (a
-    checkpoint of its own while it ran), the dispatcher, before the task's
-    Start, creates the worker's branch at that task's last checkpoint that
-    is not a set-aside, and merges main into it the way a worker's
-    delivery does (storage.md, "Main into a workspace"): cleanly, as a
-    `base_merged` checkpoint; or, on a conflict, in the workspace mounted
-    for the merge, with markers where they show, committed (a `base_merged`
-    checkpoint naming no file) so the branch carries them and the Start's
-    mount keeps the pending merge, the workspace unmounted again. The
-    Start's prompt says which task's work and commit it starts from and
-    what the merge did (the files it changed, or the files with markers to
-    resolve first). A fork that fails holds the Start to the next pass:
-    the task never starts from main over work it should continue. With no
-    such earlier work its branch forks from main at the Start, as before;
-    a resident keeps its own branch. (A worker's workspace is an export
-    without `.git`: it cannot read another branch, so the work has to be in
-    its tree.)
+    checkpoint of its own while it ran, before its set-aside if it was a
+    resident's), the dispatcher, before the task's Start, creates the
+    worker's branch at that task's last such checkpoint (never the
+    set-aside, nor the merge of main a resident's next delivery put on top
+    of it), and merges main into it the way a worker's delivery does
+    (storage.md, "Main into a workspace"): cleanly, as a `base_merged`
+    checkpoint; or, on a conflict, in the workspace mounted for the merge,
+    with markers where they show, committed (a `base_merged` checkpoint
+    naming no file) so the branch carries them and the Start's mount keeps
+    the pending merge, the workspace unmounted again; a conflict markers
+    cannot show leaves main's copies under `.spawn/main/`, which the
+    Start's mount puts back. The Start's prompt says the workspace already
+    contains that task's work (its commit) and what the merge did (the
+    files it changed, the files with markers to resolve first, or the
+    copies). A checkpoint that holds no change main lacks (in git: nothing
+    between its merge base with main and it) is no work: the task starts
+    from main. A fork that fails holds the Start, so the task does not
+    start from main over work it should continue; its first failure is
+    recorded (`task.fork_failed`, once per task: the predecessor, its
+    commit, the error), and once that record is `SPAWN_FORK_GIVE_UP_SECS`
+    old (300, under the delivery stall's 600) the Start goes without the
+    fork, from the branch as far as the fork got or from main, its prompt
+    saying so and pointing to the brief's reports. With no such earlier
+    work its branch forks from main at the Start, as before; a resident
+    keeps its own branch. (A worker's workspace is an export without
+    `.git`: it cannot read another branch, so the work has to be in its
+    tree.)
   - The task's scenario is `rsi/scenarios/<id>.sh`.
   - A one-shot objective is solved once a task for it lands. A recurring one
     (`recurring`, `metric`, `target`) stays open until the metric of its

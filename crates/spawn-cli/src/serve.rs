@@ -2536,6 +2536,7 @@ mod tests {
             unit: "ns".to_string(),
             lower_is_better: true,
             target: recurring.then_some(1100.0),
+            after: Vec::new(),
         }
     }
 
